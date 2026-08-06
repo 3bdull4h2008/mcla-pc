@@ -61,6 +61,19 @@ Phase 3 component groundwork is implemented and validated headlessly as of
   by back-buffer so `BeginFrame()`'s existing fence wait already guarantees the
   region is safe to rewrite. `mcla.exe` and both validators rebuild clean;
   `backend_validator` and `phase3_validator` both report **CLEAN**.
+- Capture-time guest-memory evidence slice (2026-08-06): `capture_hooks` now
+  dumps the raw guest bytes referenced by each captured draw to
+  `<trace>/guestmem/vb_<addr>_<size>.bin` and `<trace>/guestmem/ib_<addr>_<size>.bin`,
+  deduplicated by (address,size) through the checked `GuestMemoryView`. This is
+  the unblocker for Phase 3 guest-vertex wiring: the live corpus confirms every
+  VFETCH is `vf=0`/fetch-constant-relative, so format+stride must be recovered
+  from guest fetch-constant descriptors — the dumps give the evidence to prove
+  those offsets instead of guessing them. A new standalone
+  `capture_dump_validator.exe` cross-checks a `.mclatrace` against its dumps
+  (header/packet integrity, per-stream coverage vs `stride*indexCount`, and
+  aggregated (format,stride) layout evidence); its built-in self-test and
+  directory scan mode both report **CLEAN**, and `mcla.exe` / all three
+  validators rebuild clean.
 
 ## Definition of Done
 

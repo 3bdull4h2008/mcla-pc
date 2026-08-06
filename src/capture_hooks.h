@@ -62,11 +62,30 @@ private:
 
     // Runtime shader-microcode dumping (Phase 1 / Phase 5 research aid).
     // Each unique VS/PS program guest address is dumped once, so captured
-    // draws can be re-parsed offline with XenosRecomp-style container structs.
+    // draws can be re-parsed offline with D3DRePro-style container structs.
     void DumpShaderIfNew(uint32_t guestAddr, bool isVertex, const std::filesystem::path& dir);
     std::unordered_set<uint32_t> m_dumpedVs;
     std::unordered_set<uint32_t> m_dumpedPs;
     std::filesystem::path m_shaderDumpDir;
+
+    // Guest-memory evidence dumping (Phase 3 research aid). Writes the raw
+    // vertex/index bytes from each captured draw's referenced guest memory so
+    // the DrawPacket layout (vertex stride, per-stream format, index buffer
+    // address/size) can be validated against the live guest struct rather than
+    // guessed. Deduplicated: same (address, len) is written once per session.
+    struct GuestDumpKey {
+        uint32_t address;
+        uint32_t size;
+        bool operator==(const GuestDumpKey&) const = default;
+    };
+    struct GuestDumpKeyHash {
+        size_t operator()(const GuestDumpKey& k) const {
+            return (static_cast<size_t>(k.address) << 20) ^ k.size;
+        }
+    };
+    void DumpPacketGuestMemory(const DrawPacket& packet, const std::filesystem::path& dir);
+    std::unordered_set<GuestDumpKey, GuestDumpKeyHash> m_dumpedRanges;
+    std::filesystem::path m_memDumpDir;
 };
 
 DrawPacketAccumulator* GetDrawAccumulator();

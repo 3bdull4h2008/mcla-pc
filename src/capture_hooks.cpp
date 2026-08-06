@@ -2,6 +2,7 @@
 #include "renderer_mode.h"
 
 #include <chrono>
+#include <algorithm>
 #include <vector>
 #include <fstream>
 #include <cstdio>
@@ -41,9 +42,12 @@ void DrawPacketAccumulator::SetCaptureEnabled(bool enabled, const std::filesyste
     if (m_captureEnabled && !tracePath.empty()) {
         m_writer.Open(tracePath);
         m_shaderDumpDir = tracePath.parent_path() / "shaders";
+        m_memDumpDir = tracePath.parent_path() / "guestmem";
+        m_dumpedRanges.clear();
     } else {
         m_writer.Close();
         m_shaderDumpDir.clear();
+        m_memDumpDir.clear();
     }
 }
 
@@ -158,6 +162,11 @@ void DrawPacketAccumulator::OnSubmit(::MclaGpuContext* gpuCtx, uint32_t) {
             if (packet.sqVsProgram) DumpShaderIfNew(packet.sqVsProgram, true, m_shaderDumpDir);
             if (packet.sqPsProgram) DumpShaderIfNew(packet.sqPsProgram, false, m_shaderDumpDir);
         }
+        if (!m_memDumpDir.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(m_memDumpDir, ec);
+            DumpPacketGuestMemory(packet, m_memDumpDir);
+        }
         if (m_writer.IsOpen()) {
             m_writer.WritePacket(packet);
         } else {
@@ -202,6 +211,54 @@ void DrawPacketAccumulator::DumpShaderIfNew(uint32_t guestAddr, bool isVertex,
 
     REXLOG_INFO("ShaderDump: {} ({}) -> {} ({} bytes)", name,
                 isVertex ? "VS" : "PS", outPath.string(), written);
+}
+
+void DrawPacketAccumulator::DumpPacketGuestMemory(const DrawPacket& packet,
+                                                  const std::filesystem::path& dir) {
+    // Phase 3 evidence capture: write raw guest bytes referenced by the draw
+    // so the vertex/index layout can be proven from live data instead of
+    // guessed offsets. Each unique (address, size) range is written once.
+    auto dumpRange = [&](uint32_t guestAddr, uint32_t size, const char* tag) {
+        if (!guestAddr || size == 0) return;
+        GuestDumpKey key{ guestAddr, size };
+        if (!m_dumpedRanges.insert(key).second) return;
+
+        if (!m_memoryView.IsValidRange(guestAddr, size)) {
+            REXLOG_WARN("GuestMemDump: range invalid addr=0x{:08X} size={}", guestAddr, size);
+            return;
+        }
+
+        char name[96];
+        std::snprintf(name, sizeof(name), "%s_%08X_%06X.bin", tag, guestAddr, size);
+        std::ofstream out(dir / name, std::ios::binary);
+        if (!out.is_open()) return;
+
+        std::vector<uint8_t> chunk(0x1000);
+        uint32_t written = 0;
+        while (written < size) {
+            const uint32_t want = std::min<uint32_t>(0x1000, size - written);
+            if (!m_memoryView.ReadBytes(guestAddr + written, chunk.data(), want)) break;
+            out.write(reinterpret_cast<const char*>(chunk.data()), want);
+            written += want;
+        }
+        out.close();
+        REXLOG_INFO("GuestMemDump: {} addr=0x{:08X} size={} -> {} ({} bytes)",
+                    tag, guestAddr, size, (dir / name).string(), written);
+    };
+
+    for (uint32_t i = 0; i < packet.vertexStreamCount; ++i) {
+        const auto& s = packet.vertexStreams[i];
+        // Capture a bounded prefix; a full indexCount*stride range could be
+        // huge for instanced/streamed geometry, but a few pages is enough to
+        // identify the real vertex layout offline.
+        const uint32_t stride = s.stride ? s.stride : 32;
+        const uint32_t maxBytes = stride * (packet.indexCount > 0 ? packet.indexCount : 1);
+        const uint32_t dumpBytes = std::min(maxBytes, 0x10000u);
+        dumpRange(s.guestAddress, dumpBytes, "vb");
+    }
+    if (packet.indexBufferAddress && packet.indexBufferSize) {
+        dumpRange(packet.indexBufferAddress, packet.indexBufferSize, "ib");
+    }
 }
 
 uint64_t DrawPacketAccumulator::ComputeStateHash(const DrawPacket& packet) const {
