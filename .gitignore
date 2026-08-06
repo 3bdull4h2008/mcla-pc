@@ -1,0 +1,32 @@
+# ── Build output ─────────────────────────────────────────────
+/build/
+
+# ── Derived / regenerable ───────────────────────────────────
+# Recompilation output (never editable; regenerated from game)
+/generated/
+# Node tooling install + lock-backed deps
+/node_modules/
+npm-debug.log*
+
+# ── Large / copyrighted third-party data (do not version) ────
+# Extracted game content / shader corpus
+/mcla extracted cache/
+# Reference recomp projects and research notes
+/.research/
+# Archived reference source
+/_archive/
+# Vendored SDK hier (binaries + headers)
+/rexglue-sdk/
+
+# ── Downloaded installers / binaries ─────────────────────────
+/SDL3.zip
+/SDL3_extract/
+/OXM0DD3R_RPF_TOOL.exe
+/xcompress32.dll
+
+# ── Misc ─────────────────────────────────────────────────────
+*.tracy
+*.dmp
+*.log
+Thumbs.db
+.DS_Store
