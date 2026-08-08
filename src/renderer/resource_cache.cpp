@@ -1,5 +1,7 @@
 #include "resource_cache.h"
 
+#include "texture_decode.h"
+
 namespace mcla::native {
 
 const char* ResourceKindName(ResourceKind kind) {
@@ -66,6 +68,29 @@ bool ResourceCache::NeedsUpload(const ResourceKey& key) const {
 void ResourceCache::Clear() {
     map_.clear();
     order_.clear();
+}
+
+TextureLayout ComputeTextureLayout(uint32_t xenosFormat, uint32_t width,
+                                   uint32_t height) {
+    TextureLayout layout = {};
+    const TextureFormatInfo* info = GetTextureFormatInfo(xenosFormat);
+    if (!info || info->dxgiFormat == 0 || width == 0 || height == 0) return layout;
+    layout.dxgiFormat = info->dxgiFormat;
+    uint32_t blocksX = 0, blocksY = 0;
+    const uint32_t blocks = GetTextureBlockSpan(xenosFormat, width, height,
+                                                &blocksX, &blocksY);
+    if (blocks == 0) return layout;
+    layout.blocksX = blocksX;
+    layout.blocksY = blocksY;
+    layout.bytesPerBlock = GetTextureBytesPerBlock(xenosFormat);
+    if (layout.bytesPerBlock == 0 || (layout.bytesPerBlock & (layout.bytesPerBlock - 1)) != 0 ||
+        layout.bytesPerBlock > 64) {
+        return layout;  // non-power-of-two bpb not addressable by tiled math
+    }
+    layout.bpbLog2 = 31 - uint32_t(__builtin_clz(layout.bytesPerBlock));
+    layout.byteSize = uint32_t(uint64_t(blocksX) * blocksY * layout.bytesPerBlock);
+    layout.valid = layout.byteSize != 0;
+    return layout;
 }
 
 } // namespace mcla::native

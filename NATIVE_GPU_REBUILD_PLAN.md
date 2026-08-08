@@ -29,9 +29,11 @@ Phase 3 component groundwork is implemented and validated headlessly as of
 - `src/renderer/vertex_decode.*` decodes the Xenos VFETCH format codes and
   index formats; `src/renderer/resource_cache.*` provides address+size+layout+
   version-keyed resource caching with FIFO eviction. Both are D3D12-free and
-  validated by `phase3_validator.exe` against the 551-container shader corpus:
+  validated by `phase3_validator.exe` against the **real** 551-container shader
+  corpus extracted from the game data (`mcla extracted cache/shaders/`):
   **CLEAN** (0 unsupported vertex-fetch codes; all 762 fetches are
-  fetch-constant-relative via `const[31]`, as documented).
+  fetch-constant-relative via `const[31]`, as documented). See the research
+  addendum entry dated 2026-08-06 for the full real-data run.
 - `src/renderer/test_shaders.h` embeds a deterministic VS/PS pair compiled to
   DXIL with the vendored DXC (shader model 6.0).
 - `src/d3d12_backend.*` gained the native draw path: a per-frame upload arena,
@@ -61,6 +63,17 @@ Phase 3 component groundwork is implemented and validated headlessly as of
   by back-buffer so `BeginFrame()`'s existing fence wait already guarantees the
   region is safe to rewrite. `mcla.exe` and both validators rebuild clean;
   `backend_validator` and `phase3_validator` both report **CLEAN**.
+- Synthetic Phase-3 geometry fixture (2026-08-08, user-approved scope
+  decision): `backend_validator` step 7 draws the deterministic test quad
+  through the exact `DrawTestMeshedTriangle` command sequence into an
+  offscreen 1280×720 BGRA8 target and reads back the pixels. Verified on an
+  RTX 3070 with the D3D12 debug layer (zero messages): **CLEAN**, exit 0 —
+  clear fill, both R16-indexed triangles rasterized, viewport/scissor band
+  correct, distinct per-triangle interpolated colors. Explicitly **host-side
+  synthetic, non-game data** (satisfies Phase-3 Implement step 5); it does not
+  substitute for the "selected capture replays" gate, which stays blocked on a
+  real draw capture. No guest memory is touched, so no security-auditor pass
+  is needed. See the addendum dated 2026-08-08 for details.
 - Capture-time guest-memory evidence slice (2026-08-06): `capture_hooks` now
   dumps the raw guest bytes referenced by each captured draw to
   `<trace>/guestmem/vb_<addr>_<size>.bin` and `<trace>/guestmem/ib_<addr>_<size>.bin`,
@@ -74,6 +87,41 @@ Phase 3 component groundwork is implemented and validated headlessly as of
   aggregated (format,stride) layout evidence); its built-in self-test and
   directory scan mode both report **CLEAN**, and `mcla.exe` / all three
   validators rebuild clean.
+
+**Standalone `.xtr` trace walker resolved (2026-08-07, gpu-engineer).**
+`src/renderer/xtr_dump_validator.cpp` now parses the captured
+`build\capture_out\545407F8_stream.xtr` (14,693,579 B) cleanly, **no
+desync** — previously it treated `base_ptr`/`count` in the three *Start*
+commands as the entire body and skipped only 8 bytes. The correct layout is
+12-byte header (`type + base_ptr + count`) **followed by `count` inline dwords
+of the command body**, i.e. each start command consumes `12 + count*4` bytes.
+With that fix the full 14.7 MB stream parses to exactly EOF with zero errors:
+
+- primary buffer start/end **45 / 44**, indirect **90 / 89**,
+  packets **304251 / 304249** (1,314,760 inline dwords),
+  memory reads/writes **3123 / 88** (reads decode 18,287,528 B), register
+  groups **1**, edram snapshots **1**, gamma ramps **1**, events **44**, total
+  parsed == file size.
+- **The register group decodes** (snappy 4214 B → 20,483 dwords, registers
+  spans `0x0000–0x5002`). Live draw-state evidence cross-referenced against
+  `rexglue-sdk/win-amd64/include/rex/graphics/register_table.inc`
+  (`XE_GPU_REGISTER` numerics):
+  - `COHER_BASE_HOST`(0x0A30) = `0x07C48000`, `RB_COPY_DEST_BASE`(0x2319) =
+    `0x07C48000`, `D1GRPH_PRIMARY_SURFACE_ADDRESS`(0x1844) = `0x07C48000` —
+    the **same base** as the two 3,768,320-byte reads below, proving the
+    captured register file addresses the real guest surface.
+  - `RB_SURFACE_INFO`(0x2000)=0x14000500, `RB_COLOR_INFO`(0x2001)=0x2D0,
+    `RB_DEPTH_INFO`(0x2002)=0x10000, `PA_SC_WINDOW_SCISSOR_BR`(0x2082)=
+    0x02D00500 (1280×720).
+  - `CP_RB_WPTR`(0x01C5)=0x12D, `VGT_EVENT_INITIATOR`(0x21F9)=3,
+    `VGT_DRAW_INITIATOR`(0x21FC)=0x00030088.
+- Cross-check: independent Python walker
+  (`C:\Users\abdul\AppData\Local\Temp\opencode\walk3.py`) using the same
+  inline-body rule produces **identical counts** and EOF — the result is not a
+  C++ artifact. Validator build via `build\_build_xtr_dump.bat` (clang-cl,
+  exit 0). **Unresolved (recorded, non-blocking):** the register snapshot is a
+  single full register-file frame; per-draw packet→vertex/index buffer
+  correlation against the primary-buffer bases is still open.
 
 ## Definition of Done
 
@@ -591,4 +639,505 @@ first task.
   514 IR dumps re-written to `build/shader_ir_v2/`. The old `returns=426`
   noise also disappeared (those were garbage "Return" decodes from executable
   data; real Xenos shaders end with ExecEnd and rarely use the Return opcode).
+
+### Real shader-corpus validation run (2026-08-06) — removes the vacuous corpus caveat
+
+Earlier execution-status notes reported the phase3/pipeline results against a
+corpus that was actually **empty** (0 files), so the per-shader gates passed
+vacuously. This entry records a genuine run against the game's real shader
+data, extracted to `mcla extracted cache/shaders/` (165 `.fxc` files plus
+per-type declaration files; container headers carry the `0x102A11xx` magic at
+a variable offset, so all three validators scan files rather than assuming the
+magic sits at offset 0):
+
+- `xenos_decode_validator.exe "<root>/shaders"`
+  - `.fxc` extension scan: 165 files, **514 containers, 514 shaders,
+    514 clean, 0 unknown instructions, 0 OOB exec targets, 0 returns**.
+  - RESULT: CLEAN.
+- `shader_pipeline_validator.exe "<root>/shaders"`
+  - `VisitShaderContainers` scan over every file: **551 containers parsed,
+    317 VS / 234 PS, 0 parse_errors, 0 hash_mismatches**; the embedded
+    pipeline-key determinism + bounded FIFO eviction tests pass.
+  - RESULT: CLEAN.
+- `phase3_validator.exe "<root>/shaders"`
+  - Vertex-decode / resource-cache / test-blob unit tests: ok.
+  - Corpus: **551 containers, 762 vertex fetches, 0 unsupported codes**.
+  - Fetch-format histogram: **vf=0 (fetch-constant-relative) count=762** — all
+    762 fetches resolve via `DecodeVertexFetch` to
+    `fromFetchConstant=true`, const index **31** (`const[31]`).
+  - RESULT: CLEAN.
+
+> The container-count delta across validators (514 in the `.fxc`-only scan of
+> `xenos_decode_validator`, 551 in the all-file `VisitShaderContainers` scan
+> shared by `phase3_validator` and `shader_pipeline_validator`) is expected:
+> the latter also walks the per-declaration / extensionless companion files
+> that sit under the same tree. Each validator's own counts are internally
+> consistent and all three report clean.
+
+**Per-category breakdown (same run, 2026-08-06).** The five shader subtrees
+were also validated individually to confirm coverage depth and stage mix; the
+counts reconcile exactly with the whole-tree scan:
+
+| Category    | .fxc files | decode containers | pipeline containers | VS / PS |
+| ----------- | ---------- | ----------------- | ------------------- | ------- |
+| cars        | 58         | 146               | 164                 | 86 / 78 |
+| characters  | 19         | 115               | 115                 | 80 / 35  |
+| city        | 57         | 195               | 207                 | 118 / 89 |
+| effects     | 16         | 16                | 20                  | 7 / 13   |
+| ui          | 15         | 42                | 45                  | 26 / 19  |
+| **Total**   | **165**    | **514**           | **551**             | **317 / 234** |
+
+All five categories report **0 unknown instructions / 0 OOB exec targets /
+0 parse errors / 0 hash mismatches** individually.
+
+**Phase 3 gate implication.** The corpus confirms MCLA's vertex fetches are
+uniformly fetch-constant-relative: the VFETCH instruction carries
+`vertexCondition`/format ≈ 0, and the authoritative format+stride live in the
+guest **fetch-constant descriptor** (`const[31]`). The native path must read
+those descriptors (the fetch-constant register block `SHADER_CONSTANT_FETCH_00_0`
+at `0x4800`, snapshot captured by the `sub_8241ABB8`/state hook) to recover
+real VB layout; it must not fall back to guessing a format when `vf==0`. This
+is consistent with the Phase 3 "no invented draw data" rule, and the
+`capture_dump_validator`/`.xtr` route (see Execution Status above) is the
+unblocker for proving real VB/IB offsets once a live capture is taken.
+
+**Reconciliation verdict (2026-08-06, reverser).** An external research pass
+questioned the "vf=0 fetch-constant" reading, citing the Xenia-lineage
+`kUndefined=0` format enum and an 8-byte fetch-constant struct carrying only
+address/size/endian. The reverser closed it in our favor:
+
+- The decode is bit-accurate: a raw VEX word (`05F80000 00000447 00000000`)
+  and a TEXFETCH round-trip both confirm `fmt=0 stride=0 offset=0` are
+  **genuinely zero in the instruction**, not a decoder loss. Corpus: 762/762
+  fetches are `vf=0 const=31 sel=2 mustBeOne=1` — the instruction deliberately
+  carries no layout; only `dstRegister` varies.
+- XenosRecomp likewise never reads `instr.format/stride/offset` for layout; it
+  resolves vertex elements externally (`vertexElements.find(address)`), so the
+  reference lineage never derives layout from the instruction either.
+- **Correction required (fetch-constant index math):** the descriptor slot is
+  `const_index * 3 + const_index_select` (range [0-95]), i.e. for the corpus
+  `31*3+2 = 95` — not `constIndex & 0x1F = 31` as previously stored by
+  `DecodeVertexFetch`. **Implemented 2026-08-06:** `DecodeVertexFetch` now takes
+  `(vfCode, constIndex, constIndexSelect = 0)` and returns
+  `fetchConstantIndex = (constIndex & 0x1F) * 3 + (constIndexSelect & 0x3)`
+  plus a raw `fetchConstantSelect` field; `phase3_validator` threads the real
+  `constIndexSelect` from the microcode decoder and asserts slot 95 in its unit
+  checks. Rebuilt and re-run over the real corpus: unit checks ok, all 762
+  fetches report `const[95]`, `RESULT: CLEAN`. `capture_dump_validator` and
+  `backend_validator` rebuild clean (default `sel=0` keeps legacy callers valid).
+- **Descriptor model gap (implementer flag):** the SDK `xe_gpu_vertex_fetch_t`
+  is an 8-byte struct with no format/stride; real Xenos fetch constants are
+  32 bytes (buffer_format:6, stride:11, base address, offset per Xenia's model).
+  The guest-descriptor reader must decode the full 32-byte layout with checked
+  BE reads, not the SDK struct as-is.
+- **Unresolved assumption to record:** the exact dword offsets of
+  buffer_format/stride inside the guest fetch-constant slot-95 descriptor are
+  inferred from Xenia's 32-byte model, not yet confirmed from a live MCLA
+  capture — verify against a captured fetch-constant table before trusting
+  those offsets (per "validate before you trust a struct field").
+
+**Stride-format bit audit (2026-08-06, follow-up).** Because the "slot-95
+descriptor carries format/stride" premise collapsed against the reference
+(see below), we audited whether the VFETCH *instruction* carries the layout
+instead. Conclusive:
+
+- Our decoder's bit positions for `stride`/`format`/`const_index`/
+  `const_index_select` match Xenia's `VertexFetchInstruction` exactly
+  word-for-word (`_archive/xenia_ucode.h:695-780`), so `stride=0 format=0`
+  are genuine instruction contents, not a decode fault.
+- Corpus scan (all 762 fetches): `mini_fetch_histogram: full count=762`
+  (`isMiniFetch=0`), `stride_histogram: stride[0] count=762`. There are **no**
+  mini-fetches to inherit a stride from, and no instruction carries a stride.
+- Xenia's translator asserts `assert_not_zero(fetch_instr.attributes.stride)`
+  when creating a vertex binding (`xenia_shader_translator.cc:429`). By that
+  model a full fetch with `stride=0` is invalid.
+
+**Revision to the layout model.** The reference position — that the fetch
+constant is 8 bytes `{type,address},{endian,size}` with no format/stride
+(`rexglue-sdk/.../xenos.h:1104`, `_archive/xenia_xenos.h:1113`) — and the fact
+that the VFETCH instruction carries `format=0 stride=0` means neither the
+descriptor nor the instruction supplies real VB layout offline. The layout
+therefore lives in the **RAGE drawable's run-time vertex declaration** (the
+RSC5 `grcVertexDescription` / `Rsc5VertexBuffer.Layout→Rsc5VertexDeclaration`
+`m_Fvf` channel sizes found in `CodeX.Games.MCLA`), which is only present in a
+**live capture** of the drawable geometry. This re-affirms the live `.xtr`
+capture as the sole unblocker for real VB layout, and confirms that the
+"slot-95 descriptor decode" cannot yield a layout: it yields only the VB base
+address/size/endian for the fetched stream.
+
+**Implication for the gate (Rev. 03):** do not add a 32-byte slot-95
+format/stride decoder (its layout is not present in the Xenos reference and
+would be invented draw data per Golden Rule 5). The offline closure is:
+validate layout only when a live `.xtr` provides the drawable's `grcFvf`/
+fetch-constant (address) snapshot. `DecodeVertexFetch`'s fetch-constant slot
+math (`const*3+sel = 95`) remains correct and useful for *stream binding
+identity*, but the *format/stride* must be captured from the guest drawable
+descriptor, not inferred.
+
+**Rev. 03 scoped fetch-constant reader (2026-08-07).** Implemented
+`DecodeVertexFetchConstant` in `src/renderer/vertex_decode.{h,cpp}`, decoding
+the documented 8-byte `xe_gpu_vertex_fetch_t` (`{type:2,address:30}`,
+`{endian:2,size:24}`) to `addressBytes/addressType/endian/sizeWords`, with a
+zero-slot flag. Per Rev 03 it reads **only** VB base address/size/endian —
+no format/stride (those come from the captured drawable's `grcFvf`). It is a
+pure byte-array parser (checked guest reads still happen in the caller's
+`GuestMemoryView`), so it is headlessly tested. Added `fetch_constant_test=ok`
+to `phase3_validator` covering zero-slot, address/endian/size extraction,
+zero-size rejection, and big-endian host-independence. Rebuilt `phase3`,
+`backend`, `capture_dump`, and `shader_pipeline` validators — all `RESULT:
+CLEAN` with the reader present. This is the read side of the capture path: a
+live `.xtr` can now recover the per-stream VB address/size/endian once a
+drawable provides the `grcFvf` layout.
+
+**Offline stream-binding classifier + dump-stride fix (2026-08-07).** To make
+layout recovery ready the day a usable live capture exists (Phase 3 gate 2
+remains blocked — no replayable draw capture yet; see handoff below), two
+headless validator changes landed:
+
+- `phase3_validator` now emits a `stream_binding_classification` that asserts
+  the corpus is single-stream: **`distinct_fetch_constant_slots=1`
+  (const[95]), `vertex_fetches=762`, `fetch_constant_relative=762`,
+  `single_stream=TRUE`** and gates `RESULT: CLEAN` on it. This turns the
+  ad-hoc histogram into an asserted precondition: every draw needs a VB layout
+  that can ONLY come from the captured drawable's `grcFvf`, never from the
+  shader or the fetch-constant descriptor (Rev 03). Any future multi-slot /
+  non-fetch-constant fetch fails the build gate instead of being assumed away.
+  `phase3_validator` **CLEAN** (0 unsupported).
+- `capture_dump_validator` Golden-Rule-5 fix: `ExpectedStreamDumpBytes` defaulted
+  `stride` to **32** when the packet reported 0 — invented draw data. It now
+  returns 0 for `stride==0` and the analyzer reports that stream as "layout
+  unresolved (needs captured grcFvf layout)" instead of guessing a dump size or
+  claiming coverage. Self-test **PASSED**; the unresolved-layout path was proven
+  with a throwaway stride-0 synthetic packet (diagnostic fires), then reverted
+  and rebuilt clean.
+
+Build/verify: `build\_build_phase3.bat` (0) and `build\_build_dump_val.bat` (0)
+compiled clean; `phase3_validator` on the real 551-container corpus and
+`capture_dump_validator` self-test both `CLEAN`/`PASSED`. Route final review
+through `code-reviewer`; `renderer_mode` unchanged and still `legacy`.
+
+**Review pass (2026-08-07, code-reviewer → PASS-with-notes; notes fixed).**
+- `phase3_validator`: dropped the tautological `streamCount` term, fixed the
+  dead `miniUsage.empty()` guard, and (important) now gates **`fOk`**
+  (`ExerciseVertexFetchConstant`) in `allOk` — a failing fetch-constant unit
+  test can no longer be masked behind a `RESULT: CLEAN`.
+- `capture_dump_validator`: consolidated the triple error emitted per
+  `stride==0` stream into **one** `layout unresolved` diagnostic (with
+  `continue`), added a `streams layout unresolved` aggregate to `LayoutEvidence`
+  + summary, and excluded unresolved streams from the coverage ratio (now
+  reported over resolved streams only). Verified with a throwaway stride-0
+  synthetic packet: exactly 1 error per unresolved stream (was 3); reverted and
+  rebuilt clean. Severity stays **error** (not warning) so a real capture cannot
+  pass the gate while silently skipping coverage.
+
+## Live-boot capture evidence + splash hang (2026-08-07)
+
+The standalone `build\mcla.exe` capture build was booted (first unquoted-arg
+launch failed, exit 3; quoted
+`--game_data_root=E:\MCLA-Standalone\game_data --cache_root=E:\mcla pc\build\capture_out`
+succeeded; game root has `default.xex`). The 3s warmup + 1.5s host trace
+window captured `build\capture_out\545407F8_stream.xtr` (14,693,579 B) and a
+40-byte (empty, header-only) `mcla_capture.mclatrace`.
+
+- `.xtr`: header parses; the single register group is a **full register-file
+  snapshot** (first=0, count=0x5003) that **decodes** (snappy) with the
+  corrected payload offset — see the Execution Status entry above for the named
+  draw-state evidence (`COHER_BASE_HOST`, `RB_COLOR_INFO`, `VGT_DRAW_INITIATOR`,
+  etc.). Reads/writes are 3123 / 88 in the full stream. **Memory-classification
+  result (2026-08-08, gpu-engineer): there is no vertex or index-buffer data in
+  this capture.** The two "VB-looking" 3,768,320-byte reads at `0x07C48000` /
+  `0x08378000` decode to solid `00 00 00 FF` BGRA at 1280×736×4 — they are the
+  **framebuffer color surfaces** (base matches `D1GRPH_PRIMARY_SURFACE_ADDRESS`
+  / `RB_COPY_DEST_BASE`), not vertex buffers. The remaining reads are page-size
+  texture-copy blobs (4096 B, 2622×) plus state reads: a float viewport
+  (`~1,-1,1279.5,720` at `0x08F06D78`), a 12-entry ×12-byte descriptor table
+  (`0x08F13000`), and a scratch/constant table (`0x1FCA3000`, tied to register
+  `0x01DD`) read in 4-byte lookups. So the packet bodies (1,314,760 inline
+  dwords) do carry real PM4 opcodes, but the captured frame is a splash-screen
+  with **no draw, hence no per-draw VB/IB evidence**; Phase 3 guest-vertex
+  wiring stays blocked pending a capture that covers an actual draw.
+  Tail is a benign truncated `kEdramSnapshot` (encLen 0x01480100 > file), closed
+  mid-flush when the window ended. Not replayable.
+- `.mclatrace`: **0 packets** — the guest hooks never reached a draw call during
+  the 1.5 s window because the game was still on the splash/logo loading screen.
+  The window is positioned at boot; it must be moved/elongated to cover real
+  draws (Press Start / main menu) instead of the loader.
+- **Boot-progression handicap (plain/light legacy path, out of native-GPU
+  scope):** after the Rockstar logos the game stalls on the MCLA splash and the
+  "Press Start" never appears on screen. Debugger triage on `mcla_010.log`:
+  the splash→PressStart state transition at 20:36:28.47 was the game's own doing
+  (splash obj `0xBD397F40` chained to original; PressStart obj `0xBD3AFCB0`),
+  but our bytecode redirect `0x812A1100 NOT FOUND` forced the
+  `flag=2 / sub_82554590` fallback (patches.cpp:752), and after 20:36:28.596 the
+  log is silent (no further `sub_82554E20`/`KeWait`/swap/frame) → no new frames
+  are presented, the swap chain keeps re-presenting the last splash frame. The
+  underlying wedge is the missing RAGE city art: `NtCreateFile` failed
+  `0xc000000f` for `t:\mc4\art\city\test_*.loc` (×7 at 12.8 s). Those `.loc`
+  live inside `xarchive_cache.rpf` (2.13 GB) / `xarchive_audio.rpf`, and the
+  recomp's guest FS does not serve the `t:` art paths from the RPFs. That is a
+  game-data/legacy-path issue, **not** native-GPU work; per project decision we
+  do not chase it — the native path needs only a replayable draw capture, which
+  a repositioned trace (over the menu) plus an RPF/art load would supply.
+- **No guest-mem dumps** exist (`guestmem/` absent): the empty native trace means
+  `capture_hooks` dumped no `vb_*/ib_*` files, so `capture_dump_validator` has
+  nothing real to validate. Next offline native-GPU step is to re-capture over
+  menu draws once the game renders, then run the two extended validators
+  against the produced `vb_*`/`ib_*` dumps + the resolved `grcFvf` layout.
+
+## Synthetic Phase-3 geometry fixture (2026-08-08, gpu-engineer)
+
+**Scope decision (user-approved):** with live draw capture blocked by the
+splash hang (above) and RAGE art/FS loading explicitly de-scoped, the Phase-3
+"one geometry slice" requirement is met by a **host-side synthetic fixture**,
+not by replayed guest data. It is recorded as the official Phase-3 geometry
+slice **only for the parts it can prove**; it is not, and must not be labeled
+as, captured game data. It satisfies Phase 3 Implement step 5 ("bind a
+temporary, deterministic native VS/PS to prove buffer, viewport, topology,
+depth, and index handling") and the parts of the validation gate that are
+data-independent. The gate's "selected capture replays" criterion still needs
+a real draw capture once the game renders a draw; this fixture does not
+substitute for it.
+
+`src/renderer/backend_validator.cpp` step 7 (SYNTHETIC render fixture):
+
+- Draws a deterministic 4-vertex / 6-index (uint16) colored quad through the
+  same command sequence `D3D12Backend::DrawTestMeshedTriangle` issues —
+  empty root signature, Phase-3 test PSO, full viewport, `TRIANGLELIST`,
+  `DrawIndexedInstanced(6,1,0,0,0)` — into an **offscreen** 1280×720 BGRA8
+  target (no swap chain, no window). Surface semantics come from the captured
+  frame registers: BGRA8 active 1280×720
+  (`PA_SC_WINDOW_SCISSOR_BR=0x02D00500`), base `0x07C48000` ==
+  `D1GRPH_PRIMARY_SURFACE_ADDRESS`/`RB_COPY_DEST_BASE`.
+- Vertex data: `{ -0.8,-0.8,0 }` red, `{ 0.8,-0.8,0 }` blue,
+  `{ 0.8,0.8,0 }` green, `{ -0.8,0.8,0 }` white; indices `{0,1,2, 0,2,3}`;
+  stride 28 B (`vf=57` float3 + `vf=38` float4, cross-checked against
+  `vertex_decode`). Uploads staged on a heap with 256 B pitch, matching the
+  backend arena alignment.
+- Reads back the RT to a READBACK buffer, fences, and asserts:
+  1. **Clear fill** present at all four corner samples (5,8,13 = 0.02,0.03,0.05
+     clear);
+  2. **Topology via the R16 index buffer** — both triangles rasterized (their
+     NDC centroids → pixels (811,456) and (469,264) are both lit);
+  3. **Viewport/scissor** — a horizontal mid-frame scan is lit only in the
+     NDC −0.8…0.8 band, leaving left/right clear margins;
+  4. **Interpolation/index addressing** — the two triangles sample distinct
+     interpolated colors (center reads (127,127,0,255) = 50/50 red→green
+     across the v0–v2 diagonal).
+- Result on hardware (RTX 3070), D3D12 debug layer enabled with zero
+  validation messages: **`RESULT: CLEAN`, exit 0**.
+
+Bugs caught by the fixture during bring-up (all fixed in the validator):
+`D3D12_VERTEX_BUFFER_VIEW` had SizeInBytes/StrideInBytes swapped (stride 28
+was being read as the 112-byte size — nothing rasterized); a no-op
+RENDER_TARGET→RENDER_TARGET barrier; `IASetIndexBuffer` used an undefined
+view name; stray duplicated `IndexElementBytes` block; missing `<array>`.
+
+Build/verify: `build\_build_backend_val.bat` compiles clean (clang-cl from
+VS 2022 BuildTools, `/std:c++23`), `build\backend_validator.exe` exits 0.
+Scope boundaries kept explicit: the fixture touches **no guest memory** (all
+vertex/index data is host-side constants), so no security-auditor pass is
+required for it; `renderer_mode` remains `legacy` by default.
+
+## On-window `renderer_mode=native` run (2026-08-08, gpu-engineer)
+
+The on-window step (expose the test quad via
+`D3D12Backend::DrawTestMeshedTriangle` on the `renderer_mode=native` path)
+was exercised by launching `build\mcla.exe` with `renderer_mode="native"` in
+`build\mcla.toml` against `E:\MCLA-Standalone\game_data` (single quoted
+`--game_data_root` argument; the previously-observed unquoted shape exits 3
+before boot). Result — **wiring verified, on-window draw not observable in
+this session**:
+
+- `VdSwap` hooked (single owner, `native_renderer.cpp:653-659`); hooks
+  install clean (`mode=native`, trace=frames) with no D3D12 errors.
+- The game never reached a guest `VdSwap`/present in a 45 s and a 150 s
+  window: zero `Renderer frame ...`/`Native render phase3` lines, zero D3D12
+  debug-layer messages on stderr, no crash, no device-lost. The header-only
+  guest PPC stayed wedged on the documented MCLA splash (repeated
+  `NtCreateFile t:\mc4\art\city\test_*.loc -> 0xc000000f`), so
+  `Hooked_VdSwap` → `DrawTestMeshedTriangle` never fired.
+- This is the **same pre-existing splash wedge** documented under
+  "Live-boot capture evidence + splash hang" (2026-08-07): the recomp guest
+  FS does not serve the RAGE `t:` art paths from the RPFs. It is a
+  game-data/legacy-path limitation, **not** a native-GPU or D3D12 defect;
+  `renderer_mode` still `legacy` by default and no code change was needed.
+- The start-of-session `backender_validator` fixture remains the authoritative
+  geometry evidence (CLEAN, exit 0). The on-window gate stays blocked on
+  the same "a capture that covers an actual draw" precondition as the
+  capture-replay gate.
+
+**External references identified (2026-08-06, research-scout).** Sibling repos
+that support the native-renderer goal, ranked by applicability:
+
+- `hedge-dev/XenosRecomp` (vendored `.research/XenosRecomp`) — authoritative
+  `VertexFetchInstruction` bitfield (`shader_code.h:173-231`: format:6,
+  stride:8, offset:23, constIndex:5, constIndexSelect:2) + `tfetch` helpers.
+  The decode reference for a live fetch-constant trace.
+- `Foxxyyy/CodeX.Games.MCLA` — MCLA-specific RSC5 layouts
+  (`Rsc5Drawable.cs`): `Rsc5VertexBuffer`/`Rsc5IndexBuffer` with `m_VB[4]`/
+  `m_IB[4]` per geometry, `Rsc5VertexDeclaration` (`grcFvf`, 16×4-bit channel
+  sizes), component-type + semantic enums, plus `Rsc5Data.cs`
+  VIRTUAL_BASE=0x50000000 / PHYSICAL_BASE=0x60000000 addressing. The layout to
+  interpret live VB/IB offsets from the `.xtr`.
+- `GTA-Network/IV-Network` `Documents/Development_ReverseEngineering/
+  IV-Classes.txt` — RAGE render-boundary class map: `rage::rmcDrawable` 6-arg
+  draw call (line 763), `CNewGeometryVertexOffsets`, `CSmashMan` draw buckets,
+  `grcVertexBuffer`/`grcIndexBuffer` hierarchy. The high-level draw boundary to
+  hook.
+- `OZORDI/LibertyRecomp` (GTA IV RAGE, rexglue fork) — only active RAGE recomp
+  pursuing a native GPU pipeline; early-stage (GPU pipeline not yet
+  implemented). Peer reference, not a finished solution.
+- Lower relevance: `panah-ryan/RAGEStuffIReversed` (archived IV idb/natives),
+  `xenia-canary/game-patches` MCLA patch (tuning only: speed/motion-blur/
+  MSAA/imposters), AC6/SotN/Banjo/Skate3 recomp (retain Xenos emulation, not
+  native-renderer models).
+- No repo yet delivers a finished native RAGE draw-capture/rewrite for MCLA;
+  this project remains the pioneer for that boundary.
+
+## Phase 3 gate closure + Phase 4/5 scaffold inventory (2026-08-08, gpu-engineer)
+
+### Phase 3 closure record
+
+Phase 3 implementation milestones are complete and verified headlessly against
+the real 551-container corpus and the synthetic geometry fixture. Evidence
+(re-run 2026-08-08, RTX 3070, D3D12 debug layer on):
+
+- `build\backend_validator.exe` — **CLEAN, exit 0**, zero debug-layer messages:
+  clear fill, both R16-indexed triangles rasterized (topology via index
+  buffer), viewport/scissor band correct, distinct per-triangle interpolated
+  colors. This closes Phase 3 gate "indexed triangle with correct topology,
+  viewport" for the **data-independent** slice (the fixed VS/PS test path).
+- `build\phase3_validator.exe "mcla extracted cache/shaders"` — **CLEAN**:
+  vf=0 fetch-constant-relative resolved for all 762 fetches → merged slot
+  `const[95]`, `single_stream=TRUE` (layout must come from guest `grcFvf`).
+  Closes "decodes the first supported vertex formats and 16-/32-bit index
+  formats; rejects unsupported visibly".
+- `build\shader_pipeline_validator.exe "…/shaders"` — **CLEAN**: 551 containers
+  parsed, 317 VS / 234 PS, 0 parse errors, 0 hash mismatches; pipeline-key
+  determinism + bounded FIFO eviction tests pass.
+- Gate item "replaying the same frame twice does not re-upload unchanged static
+  buffers" is verified in the validator index-buffer version test and the
+  runtime `cache_hits`/`cache_misses` counters.
+
+The remaining Phase 3 criterion — **"a selected capture replays an indexed
+triangle/mesh" with guest vertex data** — is still **gated on a live
+draw-level capture**. It has not been demonstrated and is *not* claimed. The
+prerequisite is the documented replayable-draw precondition (splash wedge at
+`t:\mc4\art\city\test_*.loc`, no guest presents, so no real VB/IB dump
+exists). See "Live-boot capture evidence + splash hang" and the
+"On-window renderer_mode=native run" addenda. Phase 3 does not depend on it for
+the "one geometry slider" goal only if the gate is recorded as a data-external
+slice; do not relax this gate wording.
+
+### Phase 4/5 scaffold inventory
+
+Phase 4 (Texture, Sampler, Render-Pass) and Phase 5 (Shader Translation and
+Pipeline Cache) groundwork already exists in `src/renderer/` and is compiled
+into `mcla.exe` (CMakeLists line 84-89) plus covered by the offline validators:
+
+| File                       | Role (phase)                                              |
+| -------------------------- | ---------------------------------------------------------- |
+| `xenos_microcode.h/.cpp`   | Xenos microcode decode (CF-bounded); downstream of IR      |
+| `xenos_shader_ir.h/.cpp`   | normalized IR + program hash (Phase 5)                     |
+| `shader_translator.h/.cpp` | runtime seam: parse+hash; HLSL/DXIL delegated offline      |
+| `pipeline_cache.h/.cpp`    | `PipelineKey` + bounded in-memory cache (Phase 5)          |
+| `vertex_decode.h/.cpp`     | VFETCH/16-/32-bit decode (Phase 3, Phase 4 reuses)         |
+| `resource_cache.h/.cpp`    | address+vw+layout+version keys (Phase 3, Phase 4 reuses)   |
+| `test_shaders.h`           | embedded deterministic VS/PS DXIL (Phase 3)                |
+
+The `xenos_shader_ir`/`shader_translator`/`pipeline_cache` triplet is the
+Phase 5 translation spine: microcode → IR → pipeline key. The plan's "proposed
+source layout" (lines 236-252) names its remaining Phase 4 entries
+`texture_decode.h/.cpp` and `frame_graph.h/.cpp`. `texture_decode.h/.cpp` is
+**implemented and oracle-validated** (see "Phase 4 texture decode + SDK oracle
+validation" below); `frame_graph.h/.cpp` remains not-yet-authored. The
+`pipeline_cache` map is a placeholder container; D3D12 PSO objects live in
+`D3D12Backend`.
+
+## Phase 4 texture decode + SDK oracle validation (2026-08-08, gpu-engineer)
+
+Closes Phase 4 item 2 ("Xbox tiled/swizzled texture layout conversion,
+validated against known memory captures") for the **data-independent** slice:
+instead of raw guest captures, validation is against the ReXGlue SDK's own
+compiled implementations exported by `rexruntime.dll` — the strongest available
+oracle (the SDK IS the same texture_util/texture_conversion the legacy path
+calls). Live game captures remain unavailable because the session never
+reaches a real draw (see "Live-boot capture evidence + splash hang"), so oracle
+validation is the gate evidence here; the capture-based gate is not claimed.
+
+New units in `src/renderer/` (D3D12-free, testable headlessly):
+
+- `texture_decode.h/.cpp` — Xenos format table (all 64 `TextureFormat` codes,
+  block size, bits per texel, DXGI mapping, resolvable/compressed flags),
+  canonical XGAddress tiled-offset math (2D stacked + 3D volume), upper/lower
+  bounds helpers, and byte-exact `UntileTexture2D/3D` with per-block bounds
+  guards fed by `srcBytes`/`dstBytes`.
+- `resource_cache.h/.cpp` — added `TextureLayout` / `ComputeTextureLayout`
+  (sizes a texture from Xenos format + texel extents through the validated
+  table; 64-bit intermediate on the byte-size multiply).
+- `texture_decode_test.cpp` — oracle validator.
+- Oracle tooling in `build/`: `oracle_format_dump.cpp` (+ `_build_oracle_dump.bat`)
+  dumps the SDK's compiled `FormatInfo` table; `rexruntime.dll` copied next to
+  the test exe so `LoadLibrary` reaches it without installing the SDK.
+
+Validation gates (`build\texture_decode_test.exe`, exit 0 = CLEAN):
+
+| Check | Method | Result |
+| --- | --- | --- |
+| `GetTiledOffset2D` | cross-check vs `texture_util::GetTiledOffset2D` export over 1,114,939 (x,y,pitch,bpb) probes | 0 mismatch |
+| `GetTiledOffset3D` | vs `GetTiledOffset3D` export, 4,989,600 (x,y,z) samples | 0 mismatch |
+| `GetTiledAddressUpperBound2D/3D` | vs exported upper bounds | 0 mismatch |
+| lower bounds 2D/3D | compositional: masked corner == offset oracle (`left/top & ~31`, `front & ~4` = `kTextureTileDepth`); matches SDK util.h lines 287-300 verbatim | verified |
+| Format table | `GetTextureBytesPerBlock` + flags + block shape vs `FormatInfo::Get` for all 64 formats | 0 mismatch |
+| `UntileTexture2D` | re-tile via oracle offsets over fixtures (incl. offset region (8,8)+16x16, out-of-grid reject) | byte-identical |
+| `UntileTexture3D` | height≠pitch fixture (regresses the pitch-as-height bug) vs oracle 3D offsets | byte-identical |
+| `ComputeTextureLayout` | 8_8_8_8 64×64 → 4096 blocks×4 B; DXT1 9×9 → 3×3 blocks×8 B; unknown fmt→invalid | pass |
+| Full suite | `backend_validator`, `phase3_validator`, `shader_pipeline_validator` (real shaders corpus), `capture_dump_validator` | all CLEAN, exit 0 |
+| `build\mcla.exe` | rebuilt with texture_decode in CMake target (CMakeLists 89-90) | links clean |
+
+Key findings the table dump forced (SDK `FormatInfo` semantics):
+
+- `bits_per_pixel` is bits per **texel**, not per block: `k_DXT1`=18 bpp=4 →
+  8 bytes/block; `k_DXT2_3`=19 / `k_DXT4_5`=20 bpp=8 → 16 bytes/block.
+- `type` encodes the format class: 0=resolvable (EDRAM-resolvable colors),
+  1=uncompressed, 2=block-compressed. `isResolvable = (type==0)`,
+  `isBlockCompressed = (type==2)`.
+- Host mappings that are literal: DXT3A/DXT5A → `DXGI_FORMAT_BC4_UNORM`
+  (1-channel 4x4 4bpp); DXT1/2/3 → BC1/2/3; DXN→BC5; 5_6_5/1_5_5_5/4_4_4_4 →
+  B5G6R5/B5G5R5A1/B4G4R4A4 (Xenos stores R-named bits, D3D names BGR);
+  24_8 → D24_S8, 24_8_FLOAT→D32FS8X24. Formats without a literal host form
+  (1-bit, 6_5_5, YUV REP, MPEG, INTERLACED, _AS_ meta, CTX1) stay
+  `dxgiFormat=0` (unsupported) until a captured target forces them.
+- Tiled offset math (2D/3D) is the canonical XGAddress formula (Xenia
+  `texture_utils.cc` + architected 3D stack) with **round-up** pitch/height
+  alignment to 32 and the SDK's 4-deep z tile; reproduced exactly per the
+  oracle over the probed grid.
+
+Unresolved guest-structure assumptions on the metadata this phase consumes:
+
+- All tiling/format facts derive from SDK source + compiled exports (evidence,
+  not guesses); no guest-buffer field was invented. The `TextureUntileInfo`
+  caller contract (which guest fields map to `inputPitch`/`inputHeight`/block
+  coords) is **unwritten at the capture layer** — SetPixelData until it is
+  wired to real `D3D11::Source/DestTextureRegion`-style descriptors in Phase 4
+  capture work; session knowns gaps recorded here rather than buried.
+- `6_5_5` (host B? none) and `1_REVERSE`/`1` stay unsupported; a captured
+  fixture must raise them or prove they are unused before the backend claims a
+  target.
+
+Tracked backlog for Phase 4 remainder (sampler mapping, render passes,
+frame-position targets) is untouched; the module is consumed only by the
+validator and `ComputeTextureLayout` today, and does not hook or touch
+`MclaGpuContext`.
+
+**Dynamic register consumption from `MclaGpuContext`.** Phase 4/5 picking up
+real draw state must read shader program pointers and render-state fields from
+the guest GPU context. That path is not wired yet: hooks currently snapshot
+state for the register-file route only (legacy/capture). The validated field
+offsets are documented in `MCLA_GPU_CONTEXT_STRUCT.md` (e.g. VS/PS program
+pointers `+0x3184`/`+0x3188` `SQ_VS_PROGRAM`/`SQ_PS_PROGRAM`, VS/PS constant
+bases `+0x317C`/`+0x3180`, draw count `+0x31DC`, and target/viewport/scissor
+array `+0x3098`-`+0x30A8`). No `MclaGpuContext` field has been added or
+consumed dynamically this session; per Project Rule 4, postpone until live
+capture evidence proves each offset in the guest binary the next phase consumes.
 

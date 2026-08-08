@@ -87,6 +87,7 @@ add_executable(mcla WIN32
       src/renderer/pipeline_cache.cpp src/renderer/pipeline_cache.h
       src/renderer/vertex_decode.cpp src/renderer/vertex_decode.h
       src/renderer/resource_cache.cpp src/renderer/resource_cache.h
+      src/renderer/texture_decode.cpp src/renderer/texture_decode.h
       src/renderer/test_shaders.h
     src/compat.cpp src/compat.h
     "src/rex_app.cpp"

@@ -75,4 +75,27 @@ private:
 // Deterministic 64-bit hash of a ResourceKey (for trace/debug reporting).
 uint64_t HashResourceKey(const ResourceKey& key);
 
+// ---------------------------------------------------------------------------
+// Texture sizing (Phase 4). Reuses texture_decode's oracle-validated format
+// table so the backend and the cache share one code path for turning Xenos
+// texture parameters into byte sizes and host format info.
+// ---------------------------------------------------------------------------
+
+struct TextureLayout {
+    uint32_t dxgiFormat = 0;     // host format code (0 = unsupported)
+    uint32_t blocksX = 0;        // width in blocks (pitch units)
+    uint32_t blocksY = 0;        // height in blocks
+    uint32_t bytesPerBlock = 0;  // per the format table
+    uint32_t bpbLog2 = 0;        // log2(bytesPerBlock), 0 when invalid
+    uint32_t byteSize = 0;       // blocksX * blocksY * bytesPerBlock (1 layer)
+    bool valid = false;
+};
+
+// Size a 2D/stacked texture from its Xenos format code and texel extents.
+// `width`/`height` are texels; pitch is aligned to the format block size.
+// `bpbLog2` is only meaningful when bytesPerBlock is a power of two <= 64
+// (the range the tiled-offset math supports).
+TextureLayout ComputeTextureLayout(uint32_t xenosFormat, uint32_t width,
+                                   uint32_t height);
+
 } // namespace mcla::native
