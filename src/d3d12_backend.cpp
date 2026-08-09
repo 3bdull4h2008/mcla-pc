@@ -1,6 +1,7 @@
 #include "d3d12_backend.h"
 #include "renderer/test_shaders.h"
 #include "renderer/vertex_decode.h"
+#include "renderer/pipeline_cache.h"
 #include <rex/logging.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -58,6 +59,10 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     if (!CreateTestPipeline()) return false;
     if (!CreateStaticIndexBuffer()) return false;
     if (!CreateSrvHeap()) return false;
+
+    // Initialize pipeline cache worker thread and set fallback PSO (test pipeline)
+    m_pipelineCache.StartWorker(m_device, m_rootSignature);
+    m_pipelineCache.SetFallbackPipeline(m_testPipeline);
 
     m_initialized = true;
     REXLOG_INFO("D3D12Backend: Successfully initialized D3D12 native renderer skeleton + Phase 3 test pipeline");
@@ -621,6 +626,58 @@ bool D3D12Backend::CreateTestPipeline() {
     return true;
 }
 
+bool D3D12Backend::CreatePipelineFromDxil(const std::vector<uint8_t>& vsDxil,
+                                          const std::vector<uint8_t>& psDxil,
+                                          const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout,
+                                          const renderer::PipelineState& state,
+                                          Microsoft::WRL::ComPtr<ID3D12PipelineState>& outPso) {
+    if (vsDxil.empty() || psDxil.empty()) {
+        REXLOG_ERROR("D3D12Backend: CreatePipelineFromDxil: empty DXIL blob");
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = m_rootSignature.Get();
+    psoDesc.VS = { vsDxil.data(), vsDxil.size() };
+    psoDesc.PS = { psDxil.data(), psDxil.size() };
+    psoDesc.InputLayout = { inputLayout.data(), static_cast<UINT>(inputLayout.size()) };
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    // RTV formats from PipelineState
+    for (uint32_t i = 0; i < renderer::kMaxRenderTargets; ++i) {
+        if (state.targetFormats[i] != 0) {
+            psoDesc.RTVFormats[i] = static_cast<DXGI_FORMAT>(state.targetFormats[i]);
+        }
+    }
+    psoDesc.NumRenderTargets = 1;  // default; could be extended
+    psoDesc.SampleDesc.Count = state.sampleCount;
+    psoDesc.SampleMask = UINT_MAX;
+
+    // Rasterizer state
+    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.RasterizerState.DepthClipEnable = TRUE;
+
+    // Blend state
+    psoDesc.BlendState.AlphaToCoverageEnable = FALSE;
+    psoDesc.BlendState.IndependentBlendEnable = FALSE;
+    for (UINT i = 0; i < 8; ++i) {
+        psoDesc.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+
+    // Depth/stencil state
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+
+    HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&outPso));
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: CreateGraphicsPipelineState(translated) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    REXLOG_INFO("D3D12Backend: Live pipeline created from DXIL (VS={} bytes, PS={} bytes)", vsDxil.size(), psDxil.size());
+    return true;
+}
+
 // Phase 3 test draw: an indexed triangle whose colors pulse per frame.
 // Exercises the upload arena, index/vertex buffer binding, viewport, and
 // primitive topology on the native path. The draw body is shared with the
@@ -684,6 +741,12 @@ bool D3D12Backend::DrawTestMeshedTriangle(uint32_t frame) {
 // (Position:float3 + Color:float4 = 28 bytes) — anything else is refused so we
 // never draw with a mismatched layout.
 bool D3D12Backend::DrawDynamicMesh(const DynamicMeshDesc& desc) {
+    return DrawDynamicMeshWithPipeline(desc, m_testPipeline.Get());
+}
+
+// Overload that accepts a specific PSO to use instead of the default test pipeline.
+bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
+                                               ID3D12PipelineState* pipeline) {
     // Guard the whole body (including MapUpload / m_frameIndex / m_stats /
     // m_inFrame mutation) so it cannot race with Resize()/Shutdown() from the
     // window/app thread. BeginFrame() re-locks the same recursive mutex.
@@ -780,7 +843,10 @@ bool D3D12Backend::DrawDynamicMesh(const DynamicMeshDesc& desc) {
     }
 
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
-    m_commandList->SetPipelineState(m_testPipeline.Get());
+
+    // Use the provided pipeline or fall back to test pipeline
+    ID3D12PipelineState* pso = pipeline ? pipeline : m_testPipeline.Get();
+    m_commandList->SetPipelineState(pso);
     BindDecodedTexture();  // no-op unless a decoded texture is active
 
     if (desc.indexed) {
@@ -950,6 +1016,9 @@ void D3D12Backend::Shutdown() {
     if (!m_initialized) return;
 
     WaitForGpu();
+
+    // Stop pipeline cache worker thread
+    m_pipelineCache.StopWorker();
 
     if (m_fenceEvent) {
         CloseHandle(m_fenceEvent);

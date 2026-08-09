@@ -84,6 +84,8 @@ add_executable(mcla WIN32
     src/renderer/xenos_microcode.cpp src/renderer/xenos_microcode.h
     src/renderer/xenos_shader_ir.cpp src/renderer/xenos_shader_ir.h
       src/renderer/shader_translator.cpp src/renderer/shader_translator.h
+      src/renderer/shader_dxc_compile.cpp
+      src/renderer/dxc_runtime.cpp src/renderer/dxc_runtime.h
       src/renderer/pipeline_cache.cpp src/renderer/pipeline_cache.h
       src/renderer/vertex_decode.cpp src/renderer/vertex_decode.h
       src/renderer/resource_cache.cpp src/renderer/resource_cache.h
@@ -104,17 +106,23 @@ set(RENDERER_IR_TUS
     src/renderer/xenos_microcode.cpp
     src/renderer/xenos_shader_ir.cpp
     src/renderer/shader_translator.cpp
+    src/renderer/shader_dxc_compile.cpp
+    src/renderer/dxc_runtime.cpp
     src/renderer/pipeline_cache.cpp)
 
 # Shared flags for all validator targets (clang-cl).
-set(VALIDATOR_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set(VALIDATOR_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    "${CMAKE_CURRENT_SOURCE_DIR}/rexglue-sdk/win-amd64/include")
 set(VALIDATOR_COMPILE_DEFS NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 
 # shader_pipeline_validator: Phase 4/5 gate — parse + translate every shader
 # container, fail (exit 1) if any unknown/unsupported opcode or empty HLSL.
 add_executable(shader_pipeline_validator
     src/renderer/shader_pipeline_validator.cpp ${RENDERER_IR_TUS})
-target_include_directories(shader_pipeline_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_include_directories(shader_pipeline_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/thirdparty/dxc-bin/inc")
 target_compile_definitions(shader_pipeline_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
 # xenos_decode_validator: raw Xenos microcode decode over the shader corpus.

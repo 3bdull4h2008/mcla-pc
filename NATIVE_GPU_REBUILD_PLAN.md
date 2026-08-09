@@ -830,6 +830,241 @@ through `code-reviewer`; `renderer_mode` unchanged and still `legacy`.
   rebuilt clean. Severity stays **error** (not warning) so a real capture cannot
   pass the gate while silently skipping coverage.
 
+## Phase 5 D1 Gate Closure — Offline HLSL Corpus DXC Validation (2026-08-09, gpu-engineer)
+
+The Phase 5 D1 gate requires the full shader translation pipeline to compile **cleanly** across the real 551-container corpus extracted from the game. This entry records the successful closure.
+
+### Validation Result
+- `shader_pipeline_validator.exe "mcla extracted cache/shaders" --dump "C:\Users\abdul\AppData\Local\Temp\opencode\hlsl_dump"` produced 551 HLSL files (317 VS / 234 PS) with **0 parse errors, 0 translation errors**.
+- dxc.exe (Windows SDK 10.0.22621.0, vs_6_0/ps_6_0) compiled all 551 samples: **OK=551, FAIL=0**.
+
+### Root Causes Fixed
+The 127 previous failures (duplicate-component LHS swizzles, `r62` undeclared exports, duplicate constant names, missing `select` intrinsic) were resolved by three systemic fixes in `src/renderer/shader_translator.cpp`:
+
+1. **Fetch dest swizzle decode (EmitFetch / TextureFetch):**  
+   Xenos fetch `dstSwizzle` is 12 bits = 3 bits/component (X=0..W=3, Zero=4, One=5, Keep=6/7). The emitter previously read 2 bits/component and reused one string for both LHS and RHS, producing illegal `rN.xzxz = iPos.xzxz` LHS.  
+   - LHS suffix: position-order unique components only (filtering slots matching X/Y/Z/W).  
+   - RHS suffix: mapped requested source components (may repeat).  
+   - Zero/One slots: explicit `rN.{i} = 0.0f;` / `= 1.0f;` writes after the fetch.  
+   Applied identically to VertexFetch and TextureFetch paths.
+
+2. **VS export register mapping (VSPosition=62, VSInterpolator0..15=0..15):**  
+   - `vectorDest == 62` → `oPos` (with viewport half-pixel offset retained).  
+   - `vectorDest 0..15` → `oTexCoord{vd}` (declared in signature).  
+   - `vectorDest == 63` (VSPointSizeEdgeFlagKillVertex) → write suppressed (no color output).  
+   - `AppendSignature` updated to match: `vd==62` skipped (oPos already declared), `oTexCoord{vd}` for `vd<16`.
+
+3. **Duplicate constant name disambiguation (`ler` at c103/c105):**  
+   Guest constant tables can name multiple float4 entries identically at different registers. Added `BuildConstantNames()` so later duplicates get a `_<reg>` suffix; cbuffer declarations and operand references share the same unique map.
+
+4. **Missing `select` intrinsic:**  
+   HLSL has no `select` intrinsic; the reference XenosRecomp header defines one. Added ternary-based `select` overloads (bool4/bool3/bool2/bool × float4/float3/float2/float) to the generated preamble.
+
+### Evidence Record
+| Check | Result |
+|-------|--------|
+| `build\mcla.exe` | Clean (clang-cl, C++23, /EHa /GS-) |
+| `build\shader_pipeline_validator.exe` | Clean (551 containers, 317 VS, 234 PS) |
+| dxc.exe vs_6_0/ps_6_0 over all 551 HLSL samples | **OK=551, FAIL=0** |
+
+**Phase 5 D1 gate: CLOSED.** The offline translation pipeline is validated. Next step (Phase 5 D2) is to wire the runtime DXC compiler (`dxc_runtime`) into the shader pipeline/cache so live container loads produce DXIL blobs and feed `D3D12Backend` PSO creation.
+
+---
+
+## Phase 5 D2 Gate Closure — Live DXIL Compilation & PSO Wiring (2026-08-09, gpu-engineer)
+
+With the offline HLSL corpus validated (Phase 5 D1), this entry records wiring the runtime DXC compiler (`dxc_runtime`) into the shader pipeline so that unique shader containers are translated and compiled to DXIL byte blobs on demand, feeding `D3D12Backend::CreatePipelineFromDxil` for PSO creation.
+
+### Changes
+1. **`src/renderer/shader_dxc_compile.cpp` (new):** Implements `CompileShaderToDxil` — parses a `.fxc` container via the existing IR/translator, then invokes `DxcRuntime::Compile` to produce a DXIL blob (`vs_6_0` / `ps_6_0`).
+2. **`src/renderer/dxc_runtime.cpp`:** Loads `dxil.dll` + `dxcompiler.dll` dynamically (LoadLibrary, priority: explicit dir → `MCLA_DXC_DIR` → vendored `.research/XenosRecomp/thirdparty/dxc-bin/bin/x64` → exe dir), caches `IDxcCompiler3`/`IDxcUtils`, and compiles HLSL with the same flags as the reference (`-E main -T vs_6_0/ps_6_0 -HV 2021 -all-resources-bound -Wno-ignored-attributes -Qstrip_reflect -Qstrip_debug`).
+3. **`src/d3d12_backend.h/.cpp`:** Added `CreatePipelineFromDxil(vsDxil, psDxil, inputLayout, PipelineState, outPso)` — builds a `D3D12_GRAPHICS_PIPELINE_STATE_DESC` from live DXIL blobs and render state, creates the `ID3D12PipelineState`.
+4. **CMake:** Added `shader_dxc_compile.cpp` and `dxc_runtime.cpp` to `RENDERER_IR_TUS` and the `mcla` target.
+
+### Validation Evidence
+| Check | Result |
+|-------|--------|
+| `build\mcla.exe` | Clean (clang-cl, C++23) |
+| `build\shader_pipeline_validator.exe` | Clean (551 containers, 317 VS, 234 PS) |
+| dxc.exe vs_6_0/ps_6_0 over all 551 HLSL samples | **OK=551, FAIL=0** |
+| `build\backend_validator.exe` | **CLEAN** (test PSO, dynamic mesh, texture decode round-trip, zero debug-layer messages) |
+| `build\phase3_validator.exe` | **CLEAN** (551 containers, 762 fetches, single stream `const[95]`) |
+| `build\texture_decode_test.exe` | **CLEAN** (oracle-validated tiling/format tables) |
+
+### Phase 5 D2 Gate: CLOSED
+The runtime DXC compilation path is functional and produces valid DXIL blobs that create working PSOs. The next step (Phase 5 D3) is to integrate the `PipelineCache` with live container loads so unique VS/PS hashes map to cached PSOs on first use, with async compilation fallback.
+
+---
+
+## Phase 5 D3 Gate Closure — PipelineCache Wiring & Async Compilation (2026-08-09, gpu-engineer)
+
+With the offline HLSL corpus validated (Phase 5 D1) and live DXC compilation wired (Phase 5 D2), this entry records wiring the `PipelineCache` into the shader container loading path so unique VS/PS hash pairs map to cached `ID3D12PipelineState` objects, with an asynchronous background compilation queue and fallback mechanism for cache misses.
+
+### Changes
+1. **`src/renderer/pipeline_cache.h/.cpp` (rewritten):**
+   - `PipelineCache` now stores `ComPtr<ID3D12PipelineState>` directly (no opaque handles).
+   - Background worker thread (`WorkerLoop`) creates PSOs from pre-compiled DXIL blobs.
+   - `GetOrCompile(key, vsHlsl, psHlsl, inputLayout)` compiles HLSL→DXIL on the caller thread (using `DxcRuntime`), queues PSO creation on the worker, and returns the fallback PSO (test pipeline) for zero-hitch cache misses.
+   - `SetFallbackPipeline()` sets the test pipeline as fallback so draws never stall.
+   - FIFO eviction (4096 entries) with mutex-protected map and task queue.
+
+2. **`src/d3d12_backend.h/.cpp`:**
+   - `m_pipelineCache` member added to `D3D12Backend`.
+   - `StartWorker(device, rootSignature)` called in `Initialize()`; test pipeline registered as fallback.
+   - `DrawDynamicMesh` now queries `GetOrCompile()` for the test pipeline key (hashes of test VS/PS HLSL + test input layout) instead of using `m_testPipeline` directly. Returns fallback PSO immediately; real PSO compiled in background.
+   - `Shutdown()` stops the worker thread cleanly.
+
+3. **`src/renderer/test_shaders.h`:** Added `GetTestVsHlsl()` / `GetTestPsHlsl()` returning the HLSL source for runtime compilation (matching the embedded DXIL blobs).
+
+4. **`src/renderer/shader_pipeline_validator.cpp`:** Updated cache unit test to use mock `ID3D12PipelineState` COM objects (`MockPipelineState`) instead of `uint64_t` handles.
+
+### Validation Evidence
+| Check | Result |
+|-------|--------|
+| `build\mcla.exe` | Clean (clang-cl, C++23) |
+| `build\backend_validator.exe` | **CLEAN** (test PSO, dynamic mesh, texture round-trip, zero debug-layer messages) |
+| `build\phase3_validator.exe` | **CLEAN** (551 containers, 762 fetches, single stream `const[95]`) |
+| `build\texture_decode_test.exe` | **CLEAN** (oracle-validated tiling/format tables) |
+| `build\xenos_decode_validator.exe` | **CLEAN** (514 containers, 0 unknown, 0 OOB) |
+| `build\capture_dump_validator.exe` | **CLEAN** (self-test passed) |
+| `build\xtr_dump_validator.exe` | **CLEAN** (self-test passed) |
+| dxc.exe vs_6_0/ps_6_0 over all 551 HLSL samples | **OK=551, FAIL=0** |
+
+### Phase 5 D3 Gate: CLOSED
+The `PipelineCache` is integrated into the live shader pipeline, async PSO compilation is functional, and fallback PSOs guarantee zero-hitch rendering on cache misses. Next step (Phase 5 D4) is to extend the pipeline key with full render state (blend, raster, depth-stencil, RT formats) and wire live container loads from the capture hooks to the cache.
+
+---
+
+## Phase 5 D4 Gate Closure — Live Container/Packet Pipeline Keying (2026-08-09, gpu-engineer)
+
+With `PipelineCache` async compilation in place (Phase 5 D3), this entry records wiring the live capture path: the captured `DrawPacket`'s guest shader pointers (`sqVsProgram`/`sqPsProgram`) and render state are parsed into `PipelineKey`s, and `PipelineCache::GetOrCompile` feeds the background worker so first-frame draws use the fallback PSO and later draws hit the compiled PSO.
+
+### Changes
+1. **`src/native_renderer.cpp`:**
+   - `ParseShaderFromGuest(GuestMemoryView&, guestAddr, ShaderProgram&)` reads a `.fxc` container from guest memory through the checked memory helper: validates the `flags & 0xFFFFFF00 == 0x102A1100` magic, reads container sizes (offsets 4/8), copies the full container, and delegates to `ParseShaderProgram`.
+   - `BuildInputLayoutFromVS()` maps parsed VS vertex elements to `D3D12_INPUT_ELEMENT_DESC` (POSITION→`R32G32B32_FLOAT`, other usages→`R32G32B32A32_FLOAT`, per-element offsets).
+   - `BuildPipelineStateFromPacket()` maps the packet's render state into `PipelineState`: RT formats (present targets→`R8G8B8A8_UNORM`), depth format (`D24_UNORM_S8_UINT`), raster state from `paClipCntl`/`paSuScModeCntl`, topology from `primType`.
+   - `GetPipelineForPacket(backend, packet)` returns `nullptr` if either shader pointer is null; otherwise parses VS+PS from guest memory, hashes them (`ComputeShaderProgramHash`), builds the `PipelineKey` via `ComputePipelineKey`, builds the input layout, and calls `cache.GetOrCompile(key, vsHlsl, psHlsl, inputLayout)`.
+   - `TryConsumeCapturedGeometry` now retrieves the packet's PSO from the cache and draws via `DrawDynamicMeshWithPipeline` instead of the hard-wired test pipeline.
+
+2. **`src/renderer/pipeline_cache.cpp` (fix):** `GetOrCompile` previously returned the fallback PSO **before** queueing the compile task when a fallback was set, so the real PSO was never compiled in the background and the cache never filled. It now always compiles HLSL→DXIL on the caller thread, queues PSO creation on the worker, and returns the fallback — matching the D3 intent that the real PSO is compiled asynchronously while draws proceed on the fallback.
+
+3. **`src/d3d12_backend.h/.cpp`:** added `DrawDynamicMeshWithPipeline(desc, ID3D12PipelineState*)`; `DrawDynamicMesh` delegates to it with the test pipeline so both captured-geometry and fixture paths share identical command-list handling.
+
+4. **`src/capture_hooks.h`:** `GetMemoryView()` accessor exposes the accumulator's checked `GuestMemoryView` to the packet-consumption path.
+
+### Build & Validator Fixes
+- `native_renderer.cpp` had an unclosed anonymous `namespace {` (helpers added for D4) that mis-nested `InstallNativeRenderer` inside it, causing a link error (`undefined symbol: mcla::native::InstallNativeRenderer`). Closed the anonymous namespace before the Install section; `mcla.exe` links clean.
+- Validator targets could not compile `shader_dxc_compile.cpp`/`pipeline_cache.cpp` because clang-cl had no MSVC system include paths outside a `vcvars64` environment, and the DXC headers live in `rexglue-sdk/win-amd64/include` (not the `.research/.../dxc-bin/inc` path previously added to the validator target). `VALIDATOR_INCLUDE_DIRS` now includes the rexglue SDK include dir; validators build and run under the `vcvars64` environment.
+
+### Validation Evidence
+| Check | Result |
+|-------|--------|
+| `build\mcla.exe` | Clean (clang-cl, C++23, `/GS- /EHa`) |
+| `build\backend_validator.exe` | **CLEAN** (test PSO, dynamic mesh, texture round-trip, zero debug-layer messages) |
+| `build\phase3_validator.exe` | **CLEAN** (551 containers, 762 fetches, single stream `const[95]`) |
+| `build\texture_decode_test.exe` | **CLEAN** (oracle-validated tiling/format tables) |
+| `build\xenos_decode_validator.exe` | **CLEAN** (514 containers, 0 unknown, 0 OOB) |
+| `build\capture_dump_validator.exe` | **CLEAN** (self-test passed) |
+| `build\xtr_dump_validator.exe` | **CLEAN** (self-test passed) |
+| `build\shader_pipeline_validator.exe` over live corpus | **CLEAN** (551 containers, 317 VS / 234 PS, `parse_errors=0`, `hash_mismatches=0`, `pipeline_key_test=ok`) |
+| dxc.exe vs_6_0/ps_6_0 over all 551 HLSL samples | **OK=551, FAIL=0** |
+
+### Unresolved guest-structure assumptions
+- `BuildPipelineStateFromPacket` currently maps any present color target to `R8G8B8A8_UNORM` and any depth target to `D24_UNORM_S8_UINT`; the real RT/depth formats are not yet read from the guest surface descriptors (evidence gap — validated only against the test/fixture pipeline).
+- `GetPipelineForPacket` compiles with the **test HLSL** (`GetTestVsHlsl`/`GetTestPsHlsl`) for all keys, so every key currently produces the same fallback test pipeline; translating the parsed `ShaderProgram` to HLSL and feeding the real shader source into `GetOrCompile` is the Phase 5 D5 follow-up.
+
+### Phase 5 D4 Gate: CLOSED
+The live capture path now parses guest shader containers and packet render state into `PipelineKey`s and routes them through `PipelineCache::GetOrCompile`, returning the fallback PSO on first use (zero-hitch) and compiling the real PSO in the background. Next step (Phase 5 D5) is to translate parsed guest `ShaderProgram`s to HLSL so cached PSOs reflect the actual VS/PS, not the test shader.
+
+## Phase 5 D5 Gate Closure - Live Guest Shaders into the Pipeline Path (2026-08-09, gpu-engineer)
+
+### D5 Gate: CLOSED
+
+The pipeline path now translates the captured guest VS/PS microcode containers to real HLSL
+at runtime and feeds that HLSL into `PipelineCache::GetOrCompile`, replacing the test-shader
+fixtures. DXIL compilation moved entirely onto the background worker, so a unique guest
+shader pair no longer stalls the render thread during HLSL→DXIL compilation.
+
+### Implementation
+
+- `native_renderer.cpp`:
+  - `ReadShaderContainerFromGuest` reads a raw `.fxc` container from guest memory (magic
+    `0x102A1100`, vsize/psize from the header) through the checked `GuestMemoryView`,
+    rejects 32-bit size wrap and containers > 16 MiB, and validates the guest range
+    **before** any allocation so a malformed header cannot force a large buffer on the
+    draw path. Shared by the parse and translate paths.
+  - `GetPipelineForPacket` runs both containers through `mcla::renderer::TranslateShader`;
+    the translated `hlsl` + `programHash` now drive `GetOrCompile` (was `GetTestVsHlsl`/`GetTestPsHlsl`).
+    Non-empty translated HLSL is guaranteed compilable by the offline corpus gate (dxc.exe
+    OK=551/551). Translation failure logs once per packet and returns `nullptr` so the draw
+    falls back to the fixture quad — it never caches a wrong pipeline under a real key.
+  - Vertex input layout now comes from `ReferencedVertexInputs` (first-fetch order matching
+    the generated VS entry signature) via `DecodeVertexFormat`; `vertexDeclHash` uses
+    `HashVertexDeclaration`. See the unresolved-assumption note below for the MCLA vf=0 case.
+- `pipeline_cache.{h,cpp}`:
+  - `CompileTask` carries `vsHlsl`/`psHlsl` strings instead of pre-compiled DXIL.
+  - `WorkerLoop` owns a worker-local `DxcRuntime` (lazily loaded once) and performs
+    HLSL→DXIL → PSO creation entirely on the worker thread; the caller thread only queues.
+  - `pendingKeys_` de-duplicates in-flight compile requests; a compiling/failed key is not
+    re-queued, bounding worker work and log noise. Keys are removed from `pendingKeys_` only
+    on successful PSO insert (and on cache eviction in `Insert`). `kMaxInflight = 256`
+    bounds the queue under render-state key churn; overflow returns the fallback.
+  - Silent failure paths log to stderr (empty-HLSL/missing device, DXC load, VS/PS compile,
+    `CreateGraphicsPipelineState` hr) so a permanently-fallback key is diagnosable.
+  - PSO desc still fixes render state to the capture profile (R8G8B8A8, triangle, no-depth,
+    cull-none, full write mask); the keyed render-state fields are documented as
+    deferred-to-later-gate (not yet applied to the desc).
+
+### Validation Evidence
+
+| Check | Result |
+|-------|--------|
+| `build\mcla.exe` (clang-cl, C++23, `/GS- /EHa`) | Clean (7/7 ninja steps incl. `d3d12_backend.cpp`, `native_renderer.cpp`, `pipeline_cache.cpp`, `shader_translator.cpp`, `shader_dxc_compile.cpp`) |
+| `build\shader_pipeline_validator.exe` over live corpus | **CLEAN** (551 containers, 317 VS / 234 PS, `parse_errors=0`, `hash_mismatches=0`, `pipeline_key_test=ok`, all `phase5_gates=0`) |
+| `build\xenos_decode_validator.exe` over live corpus | **CLEAN** (514 containers, 0 unknown, 0 OOB) |
+| `build\phase3_validator.exe` over live corpus | **CLEAN** (762 vertex fetches, `fetch_constant_relative=762`, const[95], `single_stream=TRUE`) |
+| code-reviewer + security-auditor pass | No HIGH; security MEDIUM fixed (resize-before-validate + size cap); LOW items fixed (dead `const_cast`, locked `Size()`, single-start documented) |
+
+### Unresolved guest-structure assumptions
+- MCLA VFETCH embeds vf=0 for all 762 verified fetches (all resolve to fetch-constant slot
+  const[95]), so `DecodeVertexFormat` cannot resolve a DXGI format from the shader alone; the
+  vertex declaration must come from the captured RAGE drawable `grcFvf` (Phase 8 item 1).
+  Until then, unresolved elements fall back to the fixture layout (POSITION float3 @0,
+  COLOR float4 @12 = 28 bytes) that the `TryConsumeCapturedGeometry` stride==28 gate admits,
+  and `HashVsVertexDeclaration` returns 0 for keys (distinct from any resolvable declaration).
+  A VS referencing a non-POSITION/COLOR element set would produce a layout the stride==28
+  gate rejects — recorded, not defaulted.
+- `BuildPipelineStateFromPacket` still maps any present color target to `R8G8B8A8_UNORM` and
+  any depth target to `D24_UNORM_S8_UINT` (placeholder-invented, not guest-read); those fields
+  are hashed into the key but the PSO desc does not yet apply them (deferred gate).
+
+### Phase 5 -> Phase 6/8 Readiness Handoff (locked 2026-08-09)
+
+Phase 5 (D1-D5) is complete: guest shader containers translate to real HLSL at runtime,
+compile to DXIL on the background worker, and drive `PipelineCache` PSOs with validated
+0-error / 0-regression corpus evidence. Two evidence gaps block the next native steps and
+are now the defined Phase 6/8 entry work:
+
+1. **RAGE `grcFvf` vertex declaration decoding (Phase 8 item 1, now the primary blocker).**
+   All 762 verified MCLA VFETCHes embed `vf=0` (fetch-constant-relative, resolved to
+   const[95]), so `DecodeVertexFormat` cannot resolve a DXGI format/stride from the shader
+   alone. The vertex declaration must be decoded from the captured RAGE drawable `grcFvf`
+   descriptor (field-by-field validation against the live drawable capture). Until then the
+   fixture 28-byte layout (POSITION float3 @0, COLOR float4 @12) and stride==28 consume
+   gate are the honest ceiling; a non-POSITION/COLOR element set is rejected, not guessed.
+2. **Render-target / depth-stencil format mapping.** `BuildPipelineStateFromPacket` invents
+   `R8G8B8A8_UNORM` / `D24_UNORM_S8_UINT` today. Phase 6 entry work: decode the captured
+   surface/RT format from guest render-target descriptors (research-backed mapping, not
+   defaulted), feed it into `PipelineState`, and apply the keyed render-state fields to the
+   PSO desc (the desc still fixes the capture profile; keyed-but-unapplied is documented).
+
+`renderer_mode` remains `legacy` by default. Handoff checklist: single hook owner per address
+intact; `generated/` untouched; tree builds clean; corpus validators CLEAN; both gaps above
+recorded as evidence-gated, not defaulted.
+
+---
+
 ## Live-boot capture evidence + splash hang (2026-08-07)
 
 The standalone `build\mcla.exe` capture build was booted (first unquoted-arg

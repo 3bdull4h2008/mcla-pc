@@ -15,6 +15,10 @@
 #include <rex/graphics/command_processor.h>
 #include "generated/default/mcla_init.h"
 #include <rex/graphics/xenos.h>
+#include "renderer/shader_translator.h"
+#include "renderer/pipeline_cache.h"
+#include "renderer/xenos_shader_ir.h"
+#include "renderer/vertex_decode.h"
 
 #include <cassert>
 #include <chrono>
@@ -517,6 +521,200 @@ namespace {
 // staging a multi-MB upload.
 constexpr uint32_t kMaxConsumeBytes = 1u << 20;
 
+// Read a raw .fxc shader container from guest memory at `guestAddr`. Returns
+// true on success, filling `out` with the container bytes. Container geometry
+// comes from the header (flags magic 0x102A1100, vsize at +4, psize at +8);
+// the caller owns `out` and must have already validated the guest range.
+static bool ReadShaderContainerFromGuest(GuestMemoryView& memView, uint32_t guestAddr,
+                                         std::vector<uint8_t>& out) {
+    uint32_t header[9] = {};
+    if (!memView.IsValidRange(guestAddr, 36) ||
+        !memView.ReadBytes(guestAddr, header, 36)) {
+        return false;
+    }
+
+    uint32_t flags = renderer::AssembleBE32(reinterpret_cast<const uint8_t*>(header));
+    if ((flags & 0xFFFFFF00) != 0x102A1100) {
+        return false;
+    }
+
+    uint32_t vsize = renderer::AssembleBE32(reinterpret_cast<const uint8_t*>(&header[1]));
+    uint32_t psize = renderer::AssembleBE32(reinterpret_cast<const uint8_t*>(header + 2));
+    // Guard against 32-bit wrap on a malformed guest container; the parser
+    // below bounds-checks against the actual container size.
+    if (vsize + psize < vsize || vsize + psize < psize) {
+        return false;
+    }
+    uint32_t containerSize = vsize + psize;
+    // Reject implausibly large containers before allocating, and validate the
+    // guest range before any allocation, so a malformed header cannot force a
+    // giant buffer on the draw path.
+    if (containerSize > 16 * 1024 * 1024) {
+        return false;
+    }
+    if (!memView.IsValidRange(guestAddr, containerSize)) {
+        return false;
+    }
+
+    out.resize(containerSize);
+    if (!memView.ReadBytes(guestAddr, out.data(), containerSize)) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// Extract vertex input layout from a parsed vertex shader program. Semantic
+// name/index come from ReferencedVertexInputs — the exact entry-signature the
+// translated HLSL declares, in first-fetch order — so the layout always agrees
+// with the generated VS. Format resolution: a concrete Xenos vf code maps to
+// its DXGI format; MCLA VFETCH embeds vf=0 so the format/stride live in a
+// guest fetch-constant descriptor (Phase 3 capture evidence gap). Those
+// elements fall back to the fixture layout (POSITION float3 @0 then COLOR
+// float4 @12 = 28 bytes) that TryConsumeCapturedGeometry's stride==28 gate
+// admits, matching the only VB the pipeline consumes today.
+static std::vector<D3D12_INPUT_ELEMENT_DESC>
+BuildInputLayoutFromVS(const mcla::renderer::ShaderProgram& vsProg) {
+    std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
+    const auto refs = mcla::renderer::ReferencedVertexInputs(vsProg);
+    layout.reserve(refs.size());
+
+    uint32_t fixtureOffset = 0;
+    for (const auto& ref : refs) {
+        D3D12_INPUT_ELEMENT_DESC desc = {};
+        desc.SemanticName = mcla::renderer::VertexUsageSemanticName(ref.usage);
+        desc.SemanticIndex = ref.usageIndex;
+        desc.InputSlot = 0;
+        desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        desc.InstanceDataStepRate = 0;
+
+        const VertexFormatDesc fd = DecodeVertexFormat(ref.vertexFormat);
+        if (fd.valid && fd.dxgiFormat != 0) {
+            desc.Format = static_cast<DXGI_FORMAT>(fd.dxgiFormat);
+            desc.AlignedByteOffset = ref.offset;
+        } else {
+            // Unresolvable vf (MCLA vf=0): use the fixture VB layout the
+            // consume gate requires. No invented format/stride.
+            desc.Format = ref.usage == 0 ? DXGI_FORMAT_R32G32B32_FLOAT
+                                         : DXGI_FORMAT_R32G32B32A32_FLOAT;
+            desc.AlignedByteOffset = fixtureOffset;
+            fixtureOffset += ref.usage == 0 ? 12 : 16;
+        }
+        layout.push_back(desc);
+    }
+    return layout;
+}
+
+// Hash the vertex declaration referenced by a VS (vf + usage + usageIndex
+// triples). Returns 0 when any element is unresolved (MCLA vf=0), which is the
+// documented Phase 3 evidence gap; a 0 vertexDeclHash keeps such keys distinct
+// from any resolvable declaration.
+static uint64_t HashVsVertexDeclaration(const mcla::renderer::ShaderProgram& vsProg) {
+    const auto refs = mcla::renderer::ReferencedVertexInputs(vsProg);
+    std::vector<uint32_t> vf;
+    std::vector<uint8_t> usage, usageIndex;
+    vf.reserve(refs.size());
+    usage.reserve(refs.size());
+    usageIndex.reserve(refs.size());
+    for (const auto& r : refs) {
+        vf.push_back(r.vertexFormat);
+        usage.push_back(static_cast<uint8_t>(r.usage));
+        usageIndex.push_back(static_cast<uint8_t>(r.usageIndex));
+    }
+    return HashVertexDeclaration(vf.data(), usage.data(), usageIndex.data(),
+                                 static_cast<uint32_t>(vf.size()));
+}
+
+// Build a PipelineState from a DrawPacket's captured render state.
+static mcla::renderer::PipelineState
+BuildPipelineStateFromPacket(const DrawPacket& packet) {
+    mcla::renderer::PipelineState state = {};
+
+    // Render target formats (simplified - assume R8G8B8A8_UNORM for now)
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (packet.colorTargets[i] != 0) {
+            state.targetFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+    }
+    if (packet.depthTarget != 0) {
+        state.depthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    }
+
+    // Rasterizer state from PA registers
+    state.rasterState = packet.paClipCntl | (packet.paSuScModeCntl << 16);
+
+    // Primitive topology
+    switch (packet.primType) {
+        case 0: state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; break;
+        case 1: state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; break;
+        case 2: state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; break;
+        case 3: state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; break;
+        case 4: state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT; break;
+        default: state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; break;
+    }
+    state.sampleCount = 1;
+
+    return state;
+}
+
+// Try to get or compile a PSO for the captured draw packet.
+// Returns the PSO to use (fallback test PSO if compilation in progress).
+static Microsoft::WRL::ComPtr<ID3D12PipelineState>
+GetPipelineForPacket(D3D12Backend* backend, const DrawPacket& packet) {
+    if (!packet.sqVsProgram || !packet.sqPsProgram) {
+        return nullptr;
+    }
+
+    // Get the memory view from the accumulator
+    GuestMemoryView& memView = GetDrawAccumulator()->GetMemoryView();
+
+    // Read the raw guest VS/PS containers; they feed both the translator
+    // (real HLSL) and the IR parse (guest vertex input layout).
+    std::vector<uint8_t> vsContainer, psContainer;
+    if (!ReadShaderContainerFromGuest(memView, packet.sqVsProgram, vsContainer)) {
+        REXLOG_WARN("Failed to read VS container at 0x{:08X}", packet.sqVsProgram);
+        return nullptr;
+    }
+    if (!ReadShaderContainerFromGuest(memView, packet.sqPsProgram, psContainer)) {
+        REXLOG_WARN("Failed to read PS container at 0x{:08X}", packet.sqPsProgram);
+        return nullptr;
+    }
+
+    // Translate the captured guest microcode to HLSL (real shaders, not the
+    // test fixtures). The offline corpus gate validates every generated HLSL
+    // with dxc.exe, so non-empty HLSL here is compilable on the worker.
+    mcla::renderer::TranslatedShader vsOut, psOut;
+    if (!mcla::renderer::TranslateShader(vsContainer.data(), vsContainer.size(), {}, vsOut) ||
+        vsOut.hlsl.empty()) {
+        REXLOG_WARN("Failed to translate VS at 0x{:08X}: {}", packet.sqVsProgram, vsOut.error);
+        return nullptr;
+    }
+    if (!mcla::renderer::TranslateShader(psContainer.data(), psContainer.size(), {}, psOut) ||
+        psOut.hlsl.empty()) {
+        REXLOG_WARN("Failed to translate PS at 0x{:08X}: {}", packet.sqPsProgram, psOut.error);
+        return nullptr;
+    }
+
+    // Parse the VS into the IR for the guest input layout.
+    mcla::renderer::ShaderProgram vsProg;
+    if (!ParseShaderProgram(vsContainer.data(), vsContainer.size(), vsProg)) {
+        REXLOG_WARN("Failed to parse VS IR at 0x{:08X}", packet.sqVsProgram);
+        return nullptr;
+    }
+
+    // Build pipeline key from the translated program hashes + guest vertex
+    // declaration. GetOrCompile compiles HLSL in the background and returns
+    // the fallback PSO immediately, so the draw never stalls.
+    mcla::renderer::PipelineState state = BuildPipelineStateFromPacket(packet);
+    mcla::renderer::PipelineKey key = mcla::renderer::ComputePipelineKey(
+        vsOut.programHash, psOut.programHash, HashVsVertexDeclaration(vsProg), state);
+
+    auto inputLayout = BuildInputLayoutFromVS(vsProg);
+
+    auto& cache = backend->GetPipelineCache();
+    return cache.GetOrCompile(key, vsOut.hlsl, psOut.hlsl, inputLayout);
+}
+
 // Attempt to consume the most recently captured DrawPacket as native
 // geometry. Returns true when the packet passes the layout gate AND the draw
 // was submitted; false otherwise (caller falls back to the fixture quad).
@@ -528,7 +726,7 @@ bool TryConsumeCapturedGeometry(D3D12Backend* backend, const DrawPacket* packet)
     auto refuse = [&](const char* reason) {
         std::string key(reason);
         if (s_emittedReasons.insert(key).second) {
-            REXLOG_WARN("Native render: captured draw not consumable ({}) — falling back to fixture quad",
+            REXLOG_WARN("Native render: captured draw not consumable ({}) \u2014 falling back to fixture quad",
                         reason);
         }
         return false;
@@ -565,10 +763,16 @@ bool TryConsumeCapturedGeometry(D3D12Backend* backend, const DrawPacket* packet)
     desc.vertexCount = packet->indexCount;  // non-indexed: indexCount is vertex count
     desc.indexed = false;
 
-    return backend->DrawDynamicMesh(desc);
-}
+    // Get the PSO for this packet from the pipeline cache. On a cache miss
+    // GetOrCompile returns the fallback (test) PSO immediately and queues the
+    // real PSO for background compilation, so the draw never stalls.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline = GetPipelineForPacket(backend, *packet);
+    if (!pipeline) {
+        return refuse("no pipeline available");
+    }
 
-} // namespace
+    return backend->DrawDynamicMeshWithPipeline(desc, pipeline.Get());
+}
 
 REX_FUNC(Hooked_VdSwap) {
     uint32_t obj        = ctx.r3.u32;   // swap chain object + 4
@@ -650,6 +854,8 @@ REX_FUNC(Hooked_VdSwap) {
 
     mcla::renderer::RecordFramePresented();
 }
+
+} // namespace
 
 // â”€â”€ Install â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

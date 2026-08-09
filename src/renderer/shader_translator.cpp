@@ -24,12 +24,73 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace mcla::renderer {
+
+// ---------------------------------------------------------------- reflection
+//
+// Vertex-input reflection shared by the generator (VS entry signature) and the
+// offline PSO smoke test (input layout). A vertex fetch resolves to a
+// (usage, usageIndex) pair through the program's vertexElements by slot
+// address, falling back to the first element when no element matches — the
+// same rule EmitFetch uses. ReferencedVertexInputs returns the unique pairs in
+// first-fetch order plus the format/stride/offset of the fetch that introduced
+// each pair, so the declared signature and the bound layout always agree.
+
+const char* VertexUsageSemanticName(uint32_t usage) {
+    // DeclUsage semantic table (the all-caps counterparts of kUsageVariables).
+    static constexpr const char* kSemantics[] = {
+        "POSITION", "BLENDWEIGHT", "BLENDINDICES", "NORMAL", "POINTSIZE",
+        "TEXCOORD", "TANGENT",     "BINORMAL",     "TESSFACTOR", "POSITIONT",
+        "COLOR",    "FOG",         "DEPTH",        "SAMPLE",
+    };
+    if (usage >= 14) usage = 0;  // clamp, mirroring the translator fallback
+    return kSemantics[usage];
+}
+
+std::vector<VertexInputRef> ReferencedVertexInputs(const ShaderProgram& prog) {
+    std::vector<VertexInputRef> inputs;
+    if (!prog.isVertex) return inputs;
+
+    auto resolve = [&prog](uint32_t addr, uint32_t& usage,
+                           uint32_t& usageIndex) {
+        usage = 0;
+        usageIndex = 0;
+        for (const auto& ve : prog.vertexElements) {
+            if (ve.address == addr) {
+                usage = ve.usage;
+                usageIndex = ve.usageIndex;
+                return;
+            }
+        }
+        if (!prog.vertexElements.empty()) {
+            usage = prog.vertexElements[0].usage;
+            usageIndex = prog.vertexElements[0].usageIndex;
+        }
+    };
+
+    for (const auto& ir : prog.instructions) {
+        if (!ir.isFetch || ir.decoded.kind != InstructionKind::VertexFetch)
+            continue;
+        uint32_t usage = 0, usageIndex = 0;
+        resolve(ir.address, usage, usageIndex);
+        if (usage >= 14) usage = 0;
+        bool seen = false;
+        for (const auto& in : inputs)
+            if (in.usage == usage && in.usageIndex == usageIndex) { seen = true; break; }
+        if (seen) continue;
+        inputs.push_back(VertexInputRef{usage, usageIndex,
+                                        ir.decoded.vertexFormat,
+                                        ir.decoded.stride, ir.decoded.offset});
+    }
+    return inputs;
+}
+
 namespace {
 
 constexpr char kSwizzle[] = {'x', 'y', 'z', 'w', '0', '1', '_', '_'};
@@ -40,9 +101,9 @@ constexpr const char* kUsageVariables[] = {
     "Color",    "Fog",         "Depth",        "Sample",
 };
 
-// Fixed output interpolator set (TexCoord0-7 + Color0/1), matching the
-// reference INTERPOLATORS list for VS output declaration.
-constexpr uint32_t kInterpolatorCount = 10;
+// Xenos VS exports: 62 = position, 0-15 = VSInterpolator0..15, 63 = point
+// size / edge flag / kill vertex (no color output). PS exports are 0-3
+// (color) and 61 (depth), see ExportRegisterName.
 
 // ---------------------------------------------------------------------------
 // Operand selection (mirrors XenosRecomp ShaderRecompiler::op()).
@@ -67,9 +128,7 @@ public:
                   uint64_t& unsupported)
         : prog_(prog), out_(out), unsupported_(unsupported) {
         for (const auto& c : prog_.constants) {
-            if (c.info.registerSet == RegisterSet::Float4)
-                float4Constants_.emplace(c.info.registerIndex, &c);
-            else if (c.info.registerSet == RegisterSet::Sampler)
+            if (c.info.registerSet == RegisterSet::Sampler)
                 samplerConstants_.emplace(c.info.registerIndex, &c);
         }
     }
@@ -78,18 +137,87 @@ public:
         out_.clear();
         const bool ps = !prog_.isVertex;
 
+        // Unique identifiers for named constants, built once so the cbuffer
+        // declaration and every operand reference agree. Guest tables can
+        // contain duplicate names at different registers (e.g. two "ler");
+        // later duplicates get a numeric suffix.
+        BuildConstantNames();
+
+        // Pass 1: emit the body into a scratch buffer, recording every
+        // register / constant / export / input it references (the real emitter
+        // is the source of truth for its own references). Pass 2 then declares
+        // exactly that set and pastes the cached body back, so nothing is
+        // undeclared and nothing is invented.
+        std::string body;
+        {
+            std::string scratch;
+            scratch.swap(out_);      // out_ -> empty; scratch holds caller's old text
+            ResetAnalysis();
+            AppendBody(ps);          // writes into the caller's (now empty) buffer
+            body.swap(out_);         // cache the generated body
+            out_.swap(scratch);      // restore caller's buffer to empty
+        }
+
         AppendHeader(ps);
+        AppendSignature(ps);
         AppendRegisters(ps);
-        AppendBody(ps);
+        out_ += body;
         AppendEpilogue(ps);
+        out_ += "}\n";
     }
 
 private:
     const ShaderProgram& prog_;
     std::string& out_;
     uint64_t& unsupported_;
-    std::unordered_map<uint32_t, const ConstantEntry*> float4Constants_;
     std::unordered_map<uint32_t, const ConstantEntry*> samplerConstants_;
+
+    // What the body referenced during emission (see Generate pass 1). Used to
+    // declare exactly that set: which registers/constants the body reads, which
+    // export surfaces it writes (PS color/depth regs, VS interpolator dests),
+    // and which VS inputs its fetches resolve to.
+    std::vector<bool> referencedRegisters_;      // index -> used
+    std::set<uint32_t> referencedConstants_;     // c-registers referenced
+    std::set<uint32_t> psExportRegs_;            // 0-3 (oC) or 61 (oDepth)
+    std::set<uint32_t> vsExportDests_;           // VS export vectorDest values
+    std::vector<VertexInputRef> vsInputs_;       // VS entry inputs (first-fetch order)
+
+    void ResetAnalysis() {
+        referencedRegisters_.assign(kRegisterCount, false);
+        referencedConstants_.clear();
+        psExportRegs_.clear();
+        vsExportDests_.clear();
+        vsInputs_.clear();
+    }
+
+    void NoteRegister(uint32_t r) {
+        if (r < kRegisterCount) referencedRegisters_[r] = true;
+    }
+    void NoteConstant(uint32_t c) {
+        referencedConstants_.insert(c);
+    }
+    // Record an operand exactly as EmitOperand resolves it: a register read
+    // (select) with the high mask bits stripped, or a constant c{N} read.
+    void NoteOperand(uint32_t reg, bool select) {
+        if (select) {
+            NoteRegister(reg & 0x3F);
+        } else {
+            NoteConstant(reg);
+        }
+    }
+    void NoteExport(bool ps, uint32_t vectorDest) {
+        if (ps) psExportRegs_.insert(vectorDest);
+        else vsExportDests_.insert(vectorDest);
+    }
+    // Record a VS vertex-fetch input reference, deduped by (usage, usageIndex)
+    // so the entry signature lists each resolved input once.
+    void NoteVertexInput(uint32_t usage, uint32_t usageIndex) {
+        if (usage >= 14) usage = 0;  // clamp, mirroring the operand fallback
+        for (const auto& in : vsInputs_) {
+            if (in.usage == usage && in.usageIndex == usageIndex) return;
+        }
+        vsInputs_.push_back(VertexInputRef{usage, usageIndex, 0, 0, 0});
+    }
 
     // ---- helpers ----------------------------------------------------------
 
@@ -105,6 +233,51 @@ private:
         for (char c : name)
             if (!IsIdentifier(c)) return {};
         return name;
+    }
+
+    // The named float4 constant whose register range contains `reg`, or
+    // nullptr when the guest has no nameable constant covering that register
+    // (unnamed entry or bogus index). Used by the operand emitter so every
+    // c{N} reference stays consistent with the cbuffer declarations.
+    const ConstantEntry* FindNamedConstant(uint32_t reg) const {
+        for (const auto& c : prog_.constants) {
+            if (c.info.registerSet != RegisterSet::Float4) continue;
+            if (SanitizedName(c.name).empty()) continue;
+            const uint32_t base = c.info.registerIndex;
+            const uint32_t count = std::max<uint32_t>(c.info.registerCount, 1);
+            if (reg >= base && reg < base + count) return &c;
+        }
+        return nullptr;
+    }
+    bool NamedConstantCovers(uint32_t reg) const {
+        return FindNamedConstant(reg) != nullptr;
+    }
+
+    // Guest constant tables can name multiple float4 entries identically at
+    // different registers; a cbuffer cannot redeclare an identifier. Build a
+    // per-register unique name once (first use keeps the guest name, later
+    // duplicates get "_<reg>") so declarations and operand references agree.
+    std::unordered_map<uint32_t, std::string> constantNames_;
+
+    void BuildConstantNames() {
+        constantNames_.clear();
+        std::set<std::string> used;
+        for (const auto& c : prog_.constants) {
+            if (c.info.registerSet != RegisterSet::Float4) continue;
+            std::string name = SanitizedName(c.name);
+            if (name.empty()) continue;
+            if (used.count(name))
+                name += "_" + std::to_string(c.info.registerIndex);
+            used.insert(name);
+            constantNames_[c.info.registerIndex] = name;
+        }
+    }
+    std::string ConstantName(uint32_t registerIndex) const {
+        auto it = constantNames_.find(registerIndex);
+        return it != constantNames_.end() ? it->second : std::string{};
+    }
+    static std::string RegName(uint32_t reg) {
+        return "r" + std::to_string(reg);
     }
 
     // Build an operand string for `kind`, following the reference op().
@@ -163,33 +336,29 @@ private:
         }
 
         std::string regFormatted;
+        // Record the reference exactly as resolved (register vs constant) so
+        // the declarations in pass 2 cover every operand the body emits.
+        NoteOperand(reg, select);
         if (select) {
             regFormatted = "r" + std::to_string(reg);
         } else {
-            auto it = float4Constants_.find(reg);
-            if (it != float4Constants_.end()) {
-                std::string name = SanitizedName(it->second->name);
-                if (!name.empty()) {
-                    const uint16_t regCount = it->second->info.registerCount;
-                    if (regCount > 1) {
-                        // Named array constant; relative addressing appends aL/a0.
-                        uint32_t offset = reg - it->second->info.registerIndex;
-                        std::string rel;
-                        if (instr.const0Relative)
-                            rel = instr.constAddressRegisterRelative ? " + a0"
-                                                                     : " + aL";
-                        regFormatted = name + "(" + std::to_string(offset) +
-                                       (rel.empty() ? std::string()
-                                                    : std::string(" + ") +
-                                                          (instr.constAddressRegisterRelative
-                                                               ? "a0"
-                                                               : "aL")) +
-                                       ")";
-                    } else {
-                        regFormatted = name;
-                    }
-                } else {
+            // Constant operand. Named entries resolve by name (arrays by index);
+            // anything else falls back to the declared c{N} registers.
+            const ConstantEntry* named = FindNamedConstant(reg);
+            if (named) {
+                const std::string name =
+                        ConstantName(named->info.registerIndex);
+                if (name.empty()) {
                     regFormatted = "c" + std::to_string(reg);
+                } else if (named->info.registerCount > 1) {
+                    // Named array constant; relative addressing appends aL/a0.
+                    uint32_t offset = reg - named->info.registerIndex;
+                    std::string idx = std::to_string(offset);
+                    if (instr.const0Relative)
+                        idx += instr.constAddressRegisterRelative ? " + a0" : " + aL";
+                    regFormatted = name + "[" + idx + "]";
+                } else {
+                    regFormatted = name;
                 }
             } else {
                 regFormatted = "c" + std::to_string(reg);
@@ -257,13 +426,25 @@ private:
         out_ += "#define FLT_MIN 1.17549435e-38\n";
         out_ += "#define FLT_MAX 3.40282346e+38\n";
         out_ += "\n";
+        // Xenos Cnd ops emit select(cond, a, b); HLSL has no select intrinsic,
+        // so provide ternary-based overloads mirroring the reference helper.
+        out_ += "float4 select(bool4 c, float4 a, float4 b) { return c ? a : b; }\n";
+        out_ += "float4 select(bool3 c, float4 a, float4 b) { return bool4(c, false) ? a : b; }\n";
+        out_ += "float4 select(bool2 c, float4 a, float4 b) { return bool4(c, false, false) ? a : b; }\n";
+        out_ += "float4 select(bool c, float4 a, float4 b) { return c ? a : b; }\n";
+        out_ += "float3 select(bool c, float3 a, float3 b) { return c ? a : b; }\n";
+        out_ += "float2 select(bool c, float2 a, float2 b) { return c ? a : b; }\n";
+        out_ += "float select(bool c, float a, float b) { return c ? a : b; }\n";
+        out_ += "\n";
 
         // Constant table. Float4 constants are named where the guest provides
-        // a valid identifier; otherwise they fall back to c{N}.
+        // a valid identifier; otherwise they fall back to c{N}. The cbuffer is
+        // closed over every register the body references (see Analyze), so no
+        // operand's c{N} reference is ever left undeclared.
         out_ += "cbuffer ShaderConstants : register(b0)\n{\n";
         for (const auto& c : prog_.constants) {
             if (c.info.registerSet != RegisterSet::Float4) continue;
-            std::string name = SanitizedName(c.name);
+            std::string name = ConstantName(c.info.registerIndex);
             if (name.empty()) continue;
             if (c.info.registerCount > 1) {
                 out_ += "    float4 " + name + "[" +
@@ -274,6 +455,11 @@ private:
                 out_ += "    float4 " + name + " : packoffset(c" +
                         std::to_string(c.info.registerIndex) + ");\n";
             }
+        }
+        for (uint32_t r : referencedConstants_) {
+            if (NamedConstantCovers(r)) continue;
+            out_ += "    float4 c" + std::to_string(r) + " : packoffset(c" +
+                    std::to_string(r) + ");\n";
         }
         out_ += "};\n\n";
 
@@ -310,15 +496,76 @@ private:
     }
 
     void AppendRegisters(bool ps) {
-        (void)ps;
-        // PS interpolators seed their target register from the matching input.
-        // VS registers start at zero (vertex fetch writes them).
-        out_ += "    float4 r[" + std::to_string(kRegisterCount) + "] = 0;\n";
+        // Per-register float4 locals (a Xenos shader register is one float4).
+        // Registers PS interpolators seed are declared with the seed value
+        // directly; everything else starts at zero (VS fetches overwrite it).
+        std::vector<bool> seeded(kRegisterCount, false);
+        for (const auto& interp : prog_.interpolators)
+            if (interp.reg < kRegisterCount && referencedRegisters_[interp.reg])
+                seeded[interp.reg] = true;
+
+        for (uint32_t r = 0; r < kRegisterCount; r++) {
+            if (!referencedRegisters_[r] || seeded[r]) continue;
+            out_ += "    float4 r" + std::to_string(r) + " = 0.0;\n";
+        }
+        if (ps) {
+            for (const auto& interp : prog_.interpolators) {
+                if (interp.reg >= kRegisterCount || !referencedRegisters_[interp.reg])
+                    continue;
+                const uint32_t usage = interp.usage >= 14 ? 0 : interp.usage;
+                out_ += "    float4 r" + std::to_string(interp.reg) + " = i" +
+                        std::string(kUsageVariables[usage]) +
+                        std::to_string(interp.usageIndex) + ";\n";
+            }
+        }
         out_ += "    float ps = 0.0;\n";
         out_ += "    int a0 = 0;\n";
         out_ += "    int aL = 0;\n";
         out_ += "    bool p0 = false;\n";
         out_ += "\n";
+    }
+
+    // Entry point whose in/out parameter sets match the body's writes exactly
+    // (collected in Analyze): PS consumes iPos + interpolator inputs and writes
+    // the oC*/oDepth exports it uses; VS consumes the resolved vertex inputs
+    // and writes oPos plus the interpolator outputs it exports.
+    void AppendSignature(bool ps) {
+        out_ += "void main(\n";
+        if (ps) {
+            out_ += "    in float4 iPos : SV_Position,\n";
+            for (const auto& interp : prog_.interpolators) {
+                if (interp.reg >= kRegisterCount || !referencedRegisters_[interp.reg])
+                    continue;
+                const uint32_t usage = interp.usage >= 14 ? 0 : interp.usage;
+                out_ += "    in float4 i" + std::string(kUsageVariables[usage]) +
+                        std::to_string(interp.usageIndex) + " : " +
+                        VertexUsageSemanticName(usage) +
+                        std::to_string(interp.usageIndex) + ",\n";
+            }
+            if (psExportRegs_.count(0)) out_ += "    out float4 oC0 : SV_Target0,\n";
+            if (psExportRegs_.count(1)) out_ += "    out float4 oC1 : SV_Target1,\n";
+            if (psExportRegs_.count(2)) out_ += "    out float4 oC2 : SV_Target2,\n";
+            if (psExportRegs_.count(3)) out_ += "    out float4 oC3 : SV_Target3,\n";
+            if (psExportRegs_.count(61)) out_ += "    out float4 oDepth : SV_Depth,\n";
+        } else {
+            for (const auto& in : vsInputs_) {
+                const uint32_t usage = in.usage >= 14 ? 0 : in.usage;
+                out_ += "    in float4 i" + std::string(kUsageVariables[usage]) +
+                        std::to_string(in.usageIndex) + " : " +
+                        VertexUsageSemanticName(usage) +
+                        std::to_string(in.usageIndex) + ",\n";
+            }
+            out_ += "    out float4 oPos : SV_Position,\n";
+            for (uint32_t vd : vsExportDests_) {
+                if (vd == 62 || vd >= 16) continue;
+                out_ += "    out float4 oTexCoord" + std::to_string(vd) +
+                        " : TEXCOORD" + std::to_string(vd) + ",\n";
+            }
+        }
+        // Drop the trailing ",\n" so the last parameter has no dangling comma.
+        if (out_.size() >= 2 && out_.compare(out_.size() - 2, 2, ",\n") == 0)
+            out_.resize(out_.size() - 2);
+        out_ += "\n)\n{\n";
     }
 
     // ---- body -------------------------------------------------------------
@@ -383,12 +630,13 @@ private:
             if (ps) {
                 exportReg = ExportRegisterName(instr, instr.vectorDest);
             } else {
-                if (instr.vectorDest == 0) {
+                // Xenos VS export registers: 62 = position, 0-15 =
+                // VSInterpolator0..15, 63 = point-size/edge-flag/kill vertex.
+                // The 63 write has no color output and is suppressed below.
+                if (instr.vectorDest == 62) {
                     exportReg = "oPos";
-                } else if (instr.vectorDest < kInterpolatorCount) {
-                    exportReg = "o" +
-                                std::string(kUsageVariables[5]) +
-                                std::to_string(instr.vectorDest - 1);
+                } else if (instr.vectorDest < 16) {
+                    exportReg = "oTexCoord" + std::to_string(instr.vectorDest);
                 }
             }
         }
@@ -419,12 +667,19 @@ private:
         uint32_t vectorWriteMask = instr.vectorWriteMask;
         if (instr.exportData) vectorWriteMask &= ~instr.scalarWriteMask;
 
-        if (vectorWriteMask != 0) {
+        // VS export 63 is point-size/edge-flag/kill-vertex state with no color
+        // output; drop the write rather than emitting an undeclared r63.
+        const bool suppressVsExport =
+                instr.exportData && !ps && instr.vectorDest == 63;
+
+        if (vectorWriteMask != 0 && !suppressVsExport) {
             std::string dst;
             if (!exportReg.empty()) {
                 dst = exportReg;
+                NoteExport(ps, instr.vectorDest);
             } else {
-                dst = "r[" + std::to_string(instr.vectorDest) + "]";
+                dst = RegName(instr.vectorDest);
+                NoteRegister(instr.vectorDest);
             }
             dst += '.';
             for (uint32_t i = 0; i < 4; i++) {
@@ -546,7 +801,7 @@ private:
 
         // Scalar clause (skip RetainPrev: it only keeps ps alive).
         if (instr.scalarOpcode != AluScalarOpcode::RetainPrev) {
-            EmitScalarClause(instr, ps, exportReg);
+            EmitScalarClause(instr, ps, exportReg, suppressVsExport);
         }
 
         // Export zero/one fill: untouched vector channels get 0, overlapping
@@ -577,7 +832,8 @@ private:
     }
 
     void EmitScalarClause(const DecodedInstruction& instr, bool ps,
-                          const std::string& exportReg) {
+                          const std::string& exportReg,
+                          bool suppressVsExport) {
         // Setp scalar -> predicate write.
         if (instr.scalarOpcode >= AluScalarOpcode::SetpEq &&
             instr.scalarOpcode <= AluScalarOpcode::SetpRstr) {
@@ -770,12 +1026,14 @@ private:
         // Scalar write.
         uint32_t scalarWriteMask = instr.scalarWriteMask;
         if (instr.exportData) scalarWriteMask &= ~instr.vectorWriteMask;
-        if (scalarWriteMask != 0) {
+        if (scalarWriteMask != 0 && !suppressVsExport) {
             std::string dst;
             if (!exportReg.empty()) {
                 dst = exportReg;
+                NoteExport(ps, instr.vectorDest);
             } else {
-                dst = "r[" + std::to_string(instr.scalarDest) + "]";
+                dst = RegName(instr.scalarDest);
+                NoteRegister(instr.scalarDest);
             }
             dst += '.';
             for (uint32_t i = 0; i < 4; i++) {
@@ -796,13 +1054,33 @@ private:
                     "p0)\n    {\n";
         }
 
-        // Dest swizzle suffix (x/y/z/w repeated per used component).
-        std::string dstSwz;
+        // Xenos fetch dest swizzle: 12 bits, 3 bits per component
+        // (0-3 = x/y/z/w, 4 = zero, 5 = one, 6/7 = keep). The LHS suffix is
+        // written in position order with unique components; the RHS maps to
+        // the requested source components and may repeat. Zero/One dest slots
+        // are filled by separate constant writes.
+        std::string lhsSwz, rhsSwz;
         for (uint32_t i = 0; i < 4; i++) {
-            uint32_t s = (instr.dstSwizzle >> (i * 2)) & 0x3;
-            if (s <= 3) dstSwz += kSwizzle[s];
+            uint32_t s = (instr.dstSwizzle >> (i * 3)) & 0x7;
+            if (s <= 3) {
+                lhsSwz += kSwizzle[i];
+                rhsSwz += kSwizzle[s];
+            }
         }
-        if (dstSwz.empty()) dstSwz = "x";
+        if (lhsSwz.empty()) lhsSwz = "x";
+        if (rhsSwz.empty()) rhsSwz = "x";
+
+        // Zero/One dest slots get explicit constant writes after the fetch.
+        auto emitZeroOne = [&](const std::string& regName) {
+            for (uint32_t i = 0; i < 4; i++) {
+                uint32_t s = (instr.dstSwizzle >> (i * 3)) & 0x7;
+                if (s == 4) {
+                    out_ += "    " + regName + "." + kSwizzle[i] + " = 0.0f;\n";
+                } else if (s == 5) {
+                    out_ += "    " + regName + "." + kSwizzle[i] + " = 1.0f;\n";
+                }
+            }
+        };
 
         if (instr.kind == InstructionKind::VertexFetch) {
             // Vertex fetch: read from the matching vertex element input by
@@ -828,16 +1106,21 @@ private:
             // usage is a 4-bit guest field (0-15) but the table has 14 entries;
             // clamp so a malformed container cannot index past the array.
             if (usage >= 14) usage = 0;
+            NoteRegister(instr.dstRegister);
+            NoteVertexInput(usage, ui);
             const std::string inputName =
                     "i" + std::string(kUsageVariables[usage]) +
                     std::to_string(ui);
-            out_ += "    r[" + std::to_string(instr.dstRegister) + "]." + dstSwz +
-                    " = " + inputName + "." + dstSwz + ";\n";
+            out_ += "    " + RegName(instr.dstRegister) + "." + lhsSwz +
+                    " = " + inputName + "." + rhsSwz + ";\n";
+            emitZeroOne(RegName(instr.dstRegister));
         } else if (instr.kind == InstructionKind::TextureFetch) {
             // Texture fetch: sample the bound texture at the source register
             // coords. Diagnostic-grade: uses a fixed sampler set; the runtime
             // binds real descriptors by sampler constant index.
-            std::string src = "r[" + std::to_string(instr.srcRegister) + "].";
+            NoteRegister(instr.dstRegister);
+            NoteRegister(instr.srcRegister);
+            std::string src = RegName(instr.srcRegister) + ".";
             uint32_t comps = instr.dimension == 3 ? 3
                             : instr.dimension == 2 ? 3
                             : instr.dimension == 1 ? 2 : 1;
@@ -848,8 +1131,9 @@ private:
                                 : instr.dimension == 2 ? "tCube"
                                 : instr.dimension == 1 ? "t2D"
                                                        : "t1D";
-            out_ += "    r[" + std::to_string(instr.dstRegister) + "]." + dstSwz +
+            out_ += "    " + RegName(instr.dstRegister) + "." + lhsSwz +
                     " = " + texName + ".SampleLevel(s0, " + src + ", 0);\n";
+            emitZeroOne(RegName(instr.dstRegister));
         }
 
         if (predicated) {

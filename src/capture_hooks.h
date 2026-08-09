@@ -50,12 +50,15 @@ public:
         return true;
     }
 
-    // Bounded read of `size` bytes at guest `address` into `dst`. Fails (and
+// Bounded read of `size` bytes at guest `address` into `dst`. Fails (and
     // does not touch `dst`) when the range is not fully mapped. Endianness of
-    // the caller's own concern — this only copies raw bytes.
+    // the caller's own concern \u2014 this only copies raw bytes.
     bool ReadGuestRange(uint32_t address, uint32_t size, void* dst) const {
         return m_memoryView.ReadBytes(address, dst, size);
     }
+
+    // Access the guest memory view for shader container parsing.
+    GuestMemoryView& GetMemoryView() { return m_memoryView; }
 
 private:
     uint64_t ComputeStateHash(const DrawPacket& packet) const;

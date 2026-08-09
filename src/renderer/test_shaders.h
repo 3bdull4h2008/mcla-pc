@@ -524,3 +524,28 @@ inline const void* GetTestVsBlob() { return kTestVsBlob; }
 inline const void* GetTestPsBlob() { return kTestPsBlob; }
 inline uint32_t GetTestVsBlobSize() { return kTestVsBlobSize; }
 inline uint32_t GetTestPsBlobSize() { return kTestPsBlobSize; }
+
+// HLSL source for runtime compilation (must match the embedded DXIL blobs).
+inline const char* GetTestVsHlsl() {
+    return R"HLSL(
+struct VSIn { float3 pos : POSITION; float4 color : COLOR; };
+struct VSOut { float4 pos : SV_Position; float4 color : COLOR0; };
+
+VSOut main(VSIn input) {
+    VSOut output;
+    output.pos = float4(input.pos, 1.0);
+    output.color = input.color;
+    return output;
+}
+)HLSL";
+}
+
+inline const char* GetTestPsHlsl() {
+    return R"HLSL(
+struct PSIn { float4 pos : SV_Position; float4 color : COLOR0; };
+
+float4 main(PSIn input) : SV_Target {
+    return input.color;
+}
+)HLSL";
+}

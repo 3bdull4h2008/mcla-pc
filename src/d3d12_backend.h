@@ -17,6 +17,7 @@
 #include <mutex>
 
 #include "renderer/resource_cache.h"
+#include "renderer/pipeline_cache.h"
 
 namespace rex {
 class Runtime;
@@ -77,6 +78,13 @@ public:
     // provably matches the test PSO input layout.
     bool DrawDynamicMesh(const DynamicMeshDesc& desc);
 
+    // Overload that accepts a specific PSO to use instead of the default test pipeline.
+    bool DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
+                                     ID3D12PipelineState* pipeline);
+
+    // Pipeline cache access for Phase 5 shader integration.
+    renderer::PipelineCache& GetPipelineCache() { return m_pipelineCache; }
+
     // Counters for the Phase 3 debug overlay / structured log.
     struct DrawStats {
         uint64_t drawsIssued = 0;
@@ -97,6 +105,15 @@ public:
     // Bind the SRV descriptor table (+ static sampler s0) for the current draw.
     // No-op when no decoded texture has been created.
     void BindDecodedTexture();
+
+    // Phase 5 live DXIL PSO creation: build a graphics pipeline state from
+    // runtime-compiled VS/PS DXIL blobs and the provided render state.
+    // Returns false on any D3D12 failure.
+    bool CreatePipelineFromDxil(const std::vector<uint8_t>& vsDxil,
+                                const std::vector<uint8_t>& psDxil,
+                                const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout,
+                                const renderer::PipelineState& state,
+                                Microsoft::WRL::ComPtr<ID3D12PipelineState>& outPso);
 
     void EndFrame();
 
@@ -184,6 +201,9 @@ private:
 
     bool m_inFrame = false;
     std::recursive_mutex m_mutex;
+
+    // Phase 5 pipeline cache for live shader compilation
+    renderer::PipelineCache m_pipelineCache;
 };
 
 D3D12Backend* GetD3D12Backend();

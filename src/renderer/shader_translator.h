@@ -2,15 +2,14 @@
 
 // Phase 5 runtime-facing shader translation seam.
 //
-// Full HLSL->DXIL translation is performed by the offline pipeline (see
-// .research/SHADER_TRANSLATION_PIPELINE.md and XenosRecompValidate); mcla.exe
-// does not link the recompiler or DXC. This module owns the parts the runtime
-// needs at pipeline-key time: parse a .fxc container into the normalized IR
-// (xenos_shader_ir) and derive a stable program hash / shader-stage info.
-//
-// The TranslateShader contract below is the integration point a runtime
-// backend calls once it wires the recompiler backend in; today its heavy half
-// is satisfied by the offline tool.
+// TranslateShader translates a captured guest .fxc container into HLSL at
+// runtime (guest container parse -> xenos_shader_ir decode -> HLSL emitter),
+// and the resulting HLSL is compiled to DXIL by the background pipeline
+// worker (DxcRuntime) in pipeline_cache.cpp. The offline corpus gate
+// (shader_pipeline_validator) guarantees every generated HLSL compiles under
+// dxc.exe, so non-empty runtime HLSL is worker-compilable. This module also
+// parses containers into the normalized IR for stable program hashes,
+// vertex-input layout, and shader-stage info.
 
 #include "xenos_shader_ir.h"
 
@@ -48,5 +47,36 @@ bool HashShaderContainer(const uint8_t* data, size_t size, bool& isVertex, uint6
 // parsed successfully; `out.dxilOk` reports whether a compiled blob was produced.
 bool TranslateShader(const uint8_t* container, size_t size,
                      std::string_view commonHeader, TranslatedShader& out);
+
+// Reflected vertex input for pipeline input-layout creation: the exact
+// (usage, usageIndex) pair the generated VS entry signature consumes, plus the
+// format/stride/offset of the first vertex fetch that resolves to it.
+struct VertexInputRef {
+    uint32_t usage = 0;        // DeclUsage (see the kUsageVariables table)
+    uint32_t usageIndex = 0;
+    uint32_t vertexFormat = 0; // Xenos 6-bit vf code (0 when unresolved)
+    uint32_t stride = 0;
+    int32_t offset = 0;
+};
+
+// HLSL semantic name for a DeclUsage value (POSITION, TEXCOORD, ...).
+// Out-of-range usages clamp to the first entry (POSITION), matching the
+// translator's vertex-input fallback.
+const char* VertexUsageSemanticName(uint32_t usage);
+
+// Vertex inputs the VS entry signature must declare, resolved exactly the way
+// the generator resolves a vertex fetch (vertex element by slot address, else
+// the first element). The translator uses this for the entry signature; offline
+// PSO smoke tests use it to build the input layout. Empty for pixel shaders.
+std::vector<VertexInputRef> ReferencedVertexInputs(const ShaderProgram& prog);
+
+// DXC is only linked into offline validator targets; mcla.exe never links it.
+class DxcRuntime;
+
+// Compile the translated HLSL for `container` to DXIL via `dxc`. Sets
+// out.dxil / out.dxilOk / out.error. Returns false on any failure.
+// Implemented in shader_dxc_compile.cpp, which the mcla target does not build.
+bool CompileShaderToDxil(const uint8_t* container, size_t size,
+                         const DxcRuntime& dxc, TranslatedShader& out);
 
 }
