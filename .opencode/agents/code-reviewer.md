@@ -3,7 +3,6 @@ description: >-
   Read-only PR/diff review. Checks conventions, hook ownership, and phase
   discipline. Use before claiming any change done.
 mode: subagent
-model: omniroute/gh/claude-sonnet-4.6
 temperature: 0.1
 color: secondary
 permission:

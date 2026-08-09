@@ -39,6 +39,24 @@ public:
     uint64_t GetInvalidPacketCount() const { return m_invalidPackets; }
     uint64_t GetDroppedPacketCount() const { return m_droppedPackets; }
 
+    // Last validated packet captured by OnDrawBuild (i.e. the packet for the
+    // most recent submit), plus a bounded guest-range read helper. The native
+    // renderer uses these to consume a captured draw's geometry when the
+    // captured layout provably matches the native PSO input layout. Returns
+    // false when no valid packet has been captured yet.
+    bool LastPacket(const DrawPacket*& outPacket) const {
+        if (!m_lastPacketValid) return false;
+        outPacket = &m_lastPacket;
+        return true;
+    }
+
+    // Bounded read of `size` bytes at guest `address` into `dst`. Fails (and
+    // does not touch `dst`) when the range is not fully mapped. Endianness of
+    // the caller's own concern — this only copies raw bytes.
+    bool ReadGuestRange(uint32_t address, uint32_t size, void* dst) const {
+        return m_memoryView.ReadBytes(address, dst, size);
+    }
+
 private:
     uint64_t ComputeStateHash(const DrawPacket& packet) const;
     bool ValidatePacket(DrawPacket& packet) const;
@@ -59,6 +77,12 @@ private:
     // Transient context state captured between setup and draw
     DrawPacket m_currentPacket{};
     bool m_lastCaptureFailed = false;
+
+    // Most recently validated packet, kept alive for the native-renderer
+    // consumption path (DrawDynamicMesh). Set by OnSubmit when a valid packet
+    // is present; cleared on OnFrameEnd.
+    DrawPacket m_lastPacket{};
+    bool m_lastPacketValid = false;
 
     // Runtime shader-microcode dumping (Phase 1 / Phase 5 research aid).
     // Each unique VS/PS program guest address is dumped once, so captured

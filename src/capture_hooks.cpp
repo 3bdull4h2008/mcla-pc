@@ -81,8 +81,22 @@ void DrawPacketAccumulator::OnDrawBuild(::MclaGpuContext* gpuCtx, ::PPCContext& 
     m_currentPacket.indexCount = gpuCtx->drawVertexCount;
     m_currentPacket.baseVertex = 0;
 
-    // Infer index type (0 = 16-bit, 1 = 32-bit, 2 = non-indexed)
-    m_currentPacket.indexType = (drawFlags & 0x10) ? 1 : 0;
+    // Index type is encoded in drawFlags bits 4-6. sub_82420BA8
+    // (generated/default/mcla_recomp.26.cpp:20301-20345) sets these from a
+    // struct u16&3 indexed by primitive type: 0 -> flags|0x10, 1 -> flags|0x50,
+    // else -> flags|0x70. Map to the DrawPacket contract (0=16-bit, 1=32-bit,
+    // 2=non-indexed). Unknown encodings are NOT defaulted: the packet is
+    // marked invalid so nothing is consumed from unproven index semantics.
+    const uint32_t indexField = (drawFlags >> 4) & 0x7;
+    switch (indexField) {
+        case 0x1: m_currentPacket.indexType = 0; break;  // 16-bit indexed
+        case 0x5: m_currentPacket.indexType = 1; break;  // 32-bit indexed
+        case 0x7: m_currentPacket.indexType = 2; break;  // non-indexed
+        default:
+            m_currentPacket.indexType = 0;
+            m_lastCaptureFailed = true;
+            break;
+    }
 
     // Rasterizer state
     m_currentPacket.paClipCntl = gpuCtx->paClipCntl;
@@ -151,8 +165,14 @@ void DrawPacketAccumulator::OnSubmit(::MclaGpuContext* gpuCtx, uint32_t) {
     m_totalCapturedDraws++;
     if (packet.isValid) {
         m_validPackets++;
+        // Keep the most recent valid packet for the native-renderer
+        // consumption path. It is cleared at OnFrameEnd so it never carries
+        // into the next frame.
+        m_lastPacket = packet;
+        m_lastPacketValid = true;
     } else {
         m_invalidPackets++;
+        m_lastPacketValid = false;
     }
 
     if (m_captureEnabled) {
@@ -178,6 +198,8 @@ void DrawPacketAccumulator::OnSubmit(::MclaGpuContext* gpuCtx, uint32_t) {
 void DrawPacketAccumulator::OnFrameEnd() {
     m_frameIndex++;
     m_drawInFrame = 0;
+    m_lastPacketValid = false;
+    m_lastPacket = {};
 }
 
 void DrawPacketAccumulator::DumpShaderIfNew(uint32_t guestAddr, bool isVertex,

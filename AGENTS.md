@@ -63,23 +63,25 @@ Full standards: `.opencode/rules/coding-standards.md` · workflow:
 
 ## Agent catalog
 
-Cycle primaries with **Tab**; invoke subagents with `@name`.
+Cycle primaries with **Tab**; invoke subagents with `@name`. Agent models
+inherit the session default (global `model` in `~/.config/opencode/opencode.json`);
+override per agent via the `model:` key in its frontmatter.
 
-| Agent | Mode | Model | Role / when to use |
-| --- | --- | --- | --- |
-| `architect` | primary | `omniroute/gh/claude-opus-4.7` | System design, phase planning, ownership decisions. Start here for design work |
-| `gpu-engineer` | primary (default) | `omniroute/auto/coding` | Native renderer / D3D12 / C++ implementation. Default agent |
-| `reverser` | primary | `omniroute/gh/claude-opus-4.7` | PPC/recomp analysis, guest struct discovery, hook-chain forensics |
-| `perf-engineer` | primary | `omniroute/auto/coding:pro` | GPU/CPU perf, Tracy, upload/cache tuning, frame pacing |
-| `shader-translator` | subagent | `omniroute/gh/claude-opus-4.7` | Xenos microcode decode, IR, HLSL/DXIL codegen |
-| `debugger` | subagent | `omniroute/gh/claude-sonnet-4.6` | Crash/assert/validation-warning triage |
-| `code-reviewer` | subagent | `omniroute/gh/claude-sonnet-4.6` | Read-only PR/diff review, convention + hook-ownership checks |
-| `security-auditor` | subagent | `omniroute/gh/claude-sonnet-4.6` | Read-only memory-safety audit (OOB, bounds, endianness) |
-| `build-specialist` | subagent | `omniroute/auto/coding:fast` | CMake/toolchain/link/ABI issues |
-| `test-engineer` | subagent | `omniroute/auto/coding:cheap` | Offline validators, smoke gates, corpus regression checks |
-| `docs-writer` | subagent | `omniroute/gh/claude-sonnet-4.6` | Plan docs, handoff notes, phase reports |
-| `research-scout` | subagent | `omniroute/auto/best-reasoning` | External reference research (Xenia, XenosRecomp, UnleashedRecomp) |
-| `node-tooling` | subagent | `omniroute/auto/coding` | Manifest/database and node tooling side |
+| Agent | Mode | Role / when to use |
+| --- | --- | --- |
+| `architect` | primary | System design, phase planning, ownership decisions. Start here for design work |
+| `gpu-engineer` | primary (default) | Native renderer / D3D12 / C++ implementation. Default agent |
+| `reverser` | primary | PPC/recomp analysis, guest struct discovery, hook-chain forensics |
+| `perf-engineer` | primary | GPU/CPU perf, Tracy, upload/cache tuning, frame pacing |
+| `shader-translator` | subagent | Xenos microcode decode, IR, HLSL/DXIL codegen |
+| `debugger` | subagent | Crash/assert/validation-warning triage |
+| `code-reviewer` | subagent | Read-only PR/diff review, convention + hook-ownership checks |
+| `security-auditor` | subagent | Read-only memory-safety audit (OOB, bounds, endianness) |
+| `build-specialist` | subagent | CMake/toolchain/link/ABI issues |
+| `test-engineer` | subagent | Offline validators, smoke gates, corpus regression checks |
+| `docs-writer` | subagent | Plan docs, handoff notes, phase reports |
+| `research-scout` | subagent | External reference research (Xenia, XenosRecomp, UnleashedRecomp) |
+| `node-tooling` | subagent | Manifest/database and node tooling side |
 
 ## Routing
 

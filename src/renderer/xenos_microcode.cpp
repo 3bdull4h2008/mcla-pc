@@ -1,5 +1,6 @@
 ﻿#include "xenos_microcode.h"
 
+#include <algorithm>
 #include <array>
 
 namespace mcla::renderer {
@@ -55,10 +56,18 @@ ControlFlowInstruction DecodeControlFlow(uint32_t word0, uint16_t word1) {
 }
 
 size_t ComputeControlFlowByteBound(const uint8_t* code, size_t code_size) {
-    const size_t n_blocks = code_size / 12;
+    // Sequential, self-limiting walk that mirrors the XenosRecomp pass-1
+    // clamp (shader_recompiler.cpp 1654-1701): the loop limit is the evolving
+    // bound, so decode stops at the first executable region instead of
+    // scanning the whole payload (where instruction data can decode as a
+    // bogus exec with a tiny address and truncate the program to ~1 block).
     size_t bound = code_size;
-    for (size_t b = 0; b < n_blocks; ++b) {
-        const uint8_t* blk = code + b * 12;
+    // Only walk fully-contained 12-byte blocks. A malformed stream whose
+    // shaderSize is not a multiple of 12 would otherwise read up to 11 bytes
+    // past the end on the final partial block. Exec-derived bounds are always
+    // multiples of 12, so this only ever trims the initial code_size guard.
+    for (size_t instr_addr = 0; instr_addr + 12 <= bound; instr_addr += 12) {
+        const uint8_t* blk = code + instr_addr;
         uint32_t w0 = AssembleBE32(blk);
         uint32_t w1 = AssembleBE32(blk + 4);
         uint32_t w2 = AssembleBE32(blk + 8);
@@ -169,7 +178,13 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             instr.dimension = (word2 >> 13) & 0x3;
             instr.predicateCondition = ((word2 >> 31) & 0x1) != 0;
         }
-        instr.unknown = static_cast<uint32_t>(instr.fetchOpcode) > 26;
+        // Known fetch opcodes are the sparse FetchOpcode enum members
+        // {0,1,16,17,18,19,24,25,26}; anything else (the f?2..f?15 / f?20..f?23
+        // placeholder values) has no decoder/lowering table entry and must be
+        // flagged unknown so the Phase 5 gate fails it.
+        const uint32_t fo = static_cast<uint32_t>(instr.fetchOpcode);
+        instr.unknown = !(fo == 0 || fo == 1 || (fo >= 16 && fo <= 19) ||
+                          (fo >= 24 && fo <= 26));
         return instr;
     }
 
@@ -183,9 +198,10 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
     //          constAddressRegisterRelative:1, const1Relative:1, const0Relative:1
     //   word2: src3Register:8, src2Register:8, src1Register:8,
     //          vectorOpcode:5, src3Select:1, src2Select:1, src1Select:1
-    instr.kind = InstructionKind::Alu;
+instr.kind = InstructionKind::Alu;
     instr.vectorDest = word0 & 0x3F;
     instr.vectorDestRelative = ((word0 >> 6) & 0x1) != 0;
+    instr.absConstants = ((word0 >> 7) & 0x1) != 0;
     instr.scalarDest = (word0 >> 8) & 0x3F;
     instr.scalarDestRelative = ((word0 >> 14) & 0x1) != 0;
     instr.exportData = ((word0 >> 15) & 0x1) != 0;
@@ -203,6 +219,9 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
     instr.src1Negate = ((word1 >> 26) & 0x1) != 0;
     instr.predicateCondition = ((word1 >> 27) & 0x1) != 0;
     instr.isPredicated = ((word1 >> 28) & 0x1) != 0;
+    instr.constAddressRegisterRelative = ((word1 >> 29) & 0x1) != 0;
+    instr.const1Relative = ((word1 >> 30) & 0x1) != 0;
+    instr.const0Relative = ((word1 >> 31) & 0x1) != 0;
 
     instr.src3Register = word2 & 0xFF;
     instr.src2Register = (word2 >> 8) & 0xFF;

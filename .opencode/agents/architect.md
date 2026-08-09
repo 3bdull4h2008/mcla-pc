@@ -4,7 +4,6 @@ description: >-
   rebuild. Use as the entry point for architecture, target-architecture review,
   phase-gate planning, and component-ownership decisions.
 mode: primary
-model: omniroute/gh/claude-opus-4.7
 temperature: 0.1
 color: primary
 ---

@@ -2,8 +2,10 @@
 
 namespace mcla::native {
 
-// DXGI_FORMAT numeric values (dxgiformat.h). Kept as integer constants so this
-// module has no D3D12 header dependency and stays headlessly testable.
+// DXGI_FORMAT numeric values (dxgiformat.h, Windows SDK 10.0.26100.0). Kept
+// as integer constants so this module has no D3D12 header dependency and stays
+// headlessly testable. Values verified against the installed SDK header:
+// C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\dxgiformat.h
 enum {
     kDxgiR32G32B32A32Float  = 2,
     kDxgiR32G32B32A32Uint   = 3,
@@ -14,16 +16,16 @@ enum {
     kDxgiR16G16B16A16Uint   = 12,
     kDxgiR32G32Float        = 16,
     kDxgiR32G32Uint         = 17,
+    kDxgiR10G10B10A2Unorm   = 24,
+    kDxgiR11G11B10Float     = 26,
+    kDxgiR8G8B8A8Unorm      = 28,
+    kDxgiR8G8B8A8Uint       = 30,
+    kDxgiR8G8B8A8Snorm      = 31,
+    kDxgiR8G8B8A8Sint       = 32,
+    kDxgiR16G16Float        = 34,
+    kDxgiR16G16Unorm        = 35,
     kDxgiR32Float           = 41,
     kDxgiR32Uint            = 42,
-    kDxgiR16G16Float        = 65,
-    kDxgiR16G16Unorm        = 66,
-    kDxgiR10G10B10A2Unorm   = 75,
-    kDxgiR11G11B10Float     = 77,
-    kDxgiR8G8B8A8Unorm      = 79,
-    kDxgiR8G8B8A8Uint       = 81,
-    kDxgiR8G8B8A8Snorm      = 82,
-    kDxgiR8G8B8A8Sint       = 83,
 };
 
 // Xenos vertex format codes (see _archive/xenia_xenos.h VertexFormat).
@@ -67,15 +69,19 @@ VertexFormatDesc DecodeVertexFormat(uint32_t vfCode) {
 }
 
 
-VertexFormatDesc DecodeVertexFetch(uint32_t vfCode, uint32_t constIndex) {
+VertexFormatDesc DecodeVertexFetch(uint32_t vfCode, uint32_t constIndex,
+                                   uint32_t constIndexSelect) {
     VertexFormatDesc d = DecodeVertexFormat(vfCode);
     if (d.valid) return d;
     // vf=0 in MCLA VFETCH means format/stride come from a runtime guest
-    // fetch-constant descriptor indexed by constIndex; mark it as needing
-    // that descriptor so the capture path resolves the real layout.
+    // fetch-constant descriptor; mark it as needing that descriptor so the
+    // capture path resolves the real layout. The concrete descriptor slot is
+    // `const_index * 3 + const_index_select` (Xenos fetch-constant block of
+    // 96 two-dword entries: three 32-byte constants per 5-bit const_index).
     if (vfCode == 0) {
         d.fromFetchConstant = true;
-        d.fetchConstantIndex = constIndex & 0x1F;
+        d.fetchConstantSelect = constIndexSelect & 0x3;
+        d.fetchConstantIndex = ((constIndex & 0x1F) * 3) + d.fetchConstantSelect;
     }
     return d;
 }
@@ -110,6 +116,28 @@ uint32_t IndexElementBytes(uint32_t indexType) {
 }
 }
 
+
+VertexFetchConstant DecodeVertexFetchConstant(const uint8_t* p8) {
+    VertexFetchConstant fc;
+    uint32_t w0 = ((uint32_t(p8[0]) << 24) | (uint32_t(p8[1]) << 16) |
+                   (uint32_t(p8[2]) << 8) | uint32_t(p8[3]));
+    uint32_t w1 = ((uint32_t(p8[4]) << 24) | (uint32_t(p8[5]) << 16) |
+                   (uint32_t(p8[6]) << 8) | uint32_t(p8[7]));
+    if (w0 == 0 && w1 == 0) {
+        fc.isZero = true;
+        return fc;
+    }
+    // xe_gpu_vertex_fetch_t bit layout (see _archive/xenia_xenos.h:1113):
+    //   w0[31:30] type/address_type, w0[29:0]  address (dwords)
+    //   w1[31:30] endian,             w1[29:6]  size (words), w1[5:0] pad
+    fc.addressType = (w0 >> 30) & 0x3;
+    uint32_t addrDwords = w0 & 0x3FFFFFFF;
+    fc.addressBytes = addrDwords * 4;
+    fc.endian = (w1 >> 30) & 0x3;
+    fc.sizeWords = (w1 >> 6) & 0xFFFFFF;
+    if (fc.addressBytes <= 0x40000000 && fc.sizeWords != 0) fc.valid = true;
+    return fc;
+}
 
 uint64_t HashVertexDeclaration(const uint32_t* vfCodes, const uint8_t* usages,
                                const uint8_t* usageIndices, uint32_t count) {

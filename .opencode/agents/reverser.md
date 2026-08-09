@@ -4,7 +4,6 @@ description: >-
   field validation. Use for reverse-engineering questions and validating
   captured state against generated code.
 mode: primary
-model: omniroute/gh/claude-opus-4.7
 temperature: 0.1
 color: warning
 ---

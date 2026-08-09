@@ -18,6 +18,13 @@
 
 #include "renderer/resource_cache.h"
 
+namespace rex {
+class Runtime;
+namespace ui {
+class Presenter;
+}
+} // namespace rex
+
 namespace mcla::native {
 
 class D3D12Backend {
@@ -40,10 +47,35 @@ public:
     bool BeginFrame();
     bool ClearAndPresent(float r, float g, float b, float a);
 
+    // Host-side geometry for DrawDynamicMesh. Data is already validated by the
+    // caller; the backend never interprets guest layouts — it only uploads and
+    // draws with the input layout the PSO declares. `cachedIndexGpu` is set by
+    // the caller to reuse a previously cached static index buffer (0 = none).
+    struct DynamicMeshDesc {
+        const void* vertexBytes = nullptr;  // host vertex data
+        uint32_t vertexBytesSize = 0;
+        uint32_t vertexStride = 0;          // must match the test input layout (28)
+        uint32_t vertexCount = 0;           // non-indexed draw count
+
+        bool indexed = false;
+        const void* indexBytes = nullptr;   // uploaded this frame (indexed case)
+        uint32_t indexBytesSize = 0;
+        DXGI_FORMAT indexFormat = DXGI_FORMAT_R16_UINT;
+        D3D12_GPU_VIRTUAL_ADDRESS cachedIndexGpu = 0;  // cached static IB, or 0
+        uint32_t cachedIndexBytesSize = 0;  // byte size of cachedIndexGpu (required when set)
+        uint32_t indexCount = 0;            // indexed draw count
+    };
+
     // Phase 3 native draw slice: submit a test indexed triangle through the
     // upload arena + test PSO. Proves buffer, index, viewport, topology, and
     // RTV handling end-to-end on the native (non-Xenos) path.
     bool DrawTestMeshedTriangle(uint32_t frame);
+
+    // Generic dynamic-geometry draw: uploads the caller's vertex/index bytes
+    // through the per-frame upload arena and issues one draw (indexed or not).
+    // This is the consumption target for a captured DrawPacket whose layout
+    // provably matches the test PSO input layout.
+    bool DrawDynamicMesh(const DynamicMeshDesc& desc);
 
     // Counters for the Phase 3 debug overlay / structured log.
     struct DrawStats {
@@ -54,6 +86,17 @@ public:
         uint64_t cacheMisses = 0;
     };
     const DrawStats& Stats() const { return m_stats; }
+
+    // Phase 4 texture path (data-independent slice). Uploads host-linear
+    // decoded pixel bytes (already untiled by texture_decode) into a
+    // DEFAULT-heap texture and creates a shader-visible SRV at t0. Returns
+    // false on any D3D12 failure; a failed create leaves the previous texture
+    // untouched.
+    bool CreateDecodedTexture(const uint8_t* linearPixels, uint32_t width,
+                              uint32_t height, uint32_t dxgiFormat);
+    // Bind the SRV descriptor table (+ static sampler s0) for the current draw.
+    // No-op when no decoded texture has been created.
+    void BindDecodedTexture();
 
     void EndFrame();
 
@@ -67,6 +110,10 @@ public:
 
     // Wait for all GPU work to complete
     void WaitForGpu();
+
+    // Wait until the GPU is done with the current back buffer's prior frame.
+    // Must precede writes into this frame's upload arena region.
+    bool WaitForCurrentFrameGpu();
 
     // Phase 3 draw-path resources
     bool CreateUploadHeap();
@@ -92,6 +139,15 @@ public:
     bool CreateStaticIndexBuffer();
     Microsoft::WRL::ComPtr<ID3D12Resource> m_staticIndexBuffer;
     ResourceCache m_resourceCache;
+
+    // Phase 4 texture resources (decoded host-linear pixels -> texture + SRV).
+    bool CreateSrvHeap();
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_srvHeap;
+    uint32_t m_srvDescriptorSize = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_decodedTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_decodedTextureUpload;
+    D3D12_GPU_DESCRIPTOR_HANDLE m_decodedTextureSrvGpu = {};
+    HRESULT m_lastPresentHr = S_OK;
 
     DrawStats m_stats;
 

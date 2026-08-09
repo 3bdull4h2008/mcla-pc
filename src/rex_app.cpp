@@ -38,6 +38,8 @@
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
 
+#include "renderer_mode.h"
+
 #include <fmt/format.h>
 #include <imgui.h>
 
@@ -365,7 +367,19 @@ bool ReXApp::SetupPresentation() {
         SetupOverlays(presenter, immediate_drawer_.get());
       }
     }
-    window_->SetPresenter(presenter);
+    // Native renderer mode: the window's flip-model swap chain is owned by
+    // the native D3D12 backend, not by the emulated-Xenos presenter.
+    // Attaching the presenter would claim the swap chain for the window
+    // (a second CreateSwapChainForHwnd fails with E_ACCESSDENIED
+    // 0x80070005), so skip the attach in native mode. The presenter stays
+    // owned by the graphics system; the game still boots to VdSwap and the
+    // native backend presents on the window instead.
+    if (mcla::renderer::GetRendererMode() != mcla::renderer::RendererMode::Native) {
+      window_->SetPresenter(presenter);
+    } else {
+      REXLOG_INFO("ReXApp: native renderer mode - presenter not attached to window; "
+                  "native D3D12 backend owns the flip-model swap chain");
+    }
   } else if (!graphics_system) {
     // Detached mode: the app brings its own renderer and drives its own paint
     // loop. ReXApp owns the returned drawer via immediate_drawer_.

@@ -96,5 +96,70 @@ rexglue_setup_target_custom(mcla)
 target_compile_options(mcla PRIVATE /GS- /EHa)
 target_compile_definitions(mcla PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
 
+# ---------------------------------------------------------------------------
+# Offline validators (headless; no rexglue). Built by `cmake --build build`.
+# Each is a standalone console tool over the shared renderer TUs.
+# ---------------------------------------------------------------------------
+set(RENDERER_IR_TUS
+    src/renderer/xenos_microcode.cpp
+    src/renderer/xenos_shader_ir.cpp
+    src/renderer/shader_translator.cpp
+    src/renderer/pipeline_cache.cpp)
+
+# Shared flags for all validator targets (clang-cl).
+set(VALIDATOR_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set(VALIDATOR_COMPILE_DEFS NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+
+# shader_pipeline_validator: Phase 4/5 gate — parse + translate every shader
+# container, fail (exit 1) if any unknown/unsupported opcode or empty HLSL.
+add_executable(shader_pipeline_validator
+    src/renderer/shader_pipeline_validator.cpp ${RENDERER_IR_TUS})
+target_include_directories(shader_pipeline_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(shader_pipeline_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+
+# xenos_decode_validator: raw Xenos microcode decode over the shader corpus.
+add_executable(xenos_decode_validator
+    src/renderer/xenos_decode_validator.cpp ${RENDERER_IR_TUS})
+target_include_directories(xenos_decode_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(xenos_decode_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+
+# phase3_validator: vertex fetch + resource/texture decode unit checks.
+add_executable(phase3_validator
+    src/renderer/phase3_validator.cpp ${RENDERER_IR_TUS}
+    src/renderer/vertex_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
+target_include_directories(phase3_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(phase3_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+
+# texture_decode_test: tiled/Xenos texture decode vs rexruntime.dll oracle.
+add_executable(texture_decode_test
+    src/renderer/texture_decode_test.cpp
+    src/renderer/texture_decode.cpp src/renderer/resource_cache.cpp)
+target_include_directories(texture_decode_test PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(texture_decode_test PRIVATE ${VALIDATOR_COMPILE_DEFS})
+
+# capture_dump_validator: cross-checks captured DrawPacket stream vs raw guest memory.
+add_executable(capture_dump_validator
+    src/renderer/capture_dump_validator.cpp src/frame_trace.cpp src/frame_trace.h
+    src/renderer/vertex_decode.cpp)
+target_include_directories(capture_dump_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(capture_dump_validator PRIVATE
+    ${VALIDATOR_COMPILE_DEFS}
+    FMT_HEADER_ONLY=1 SPDLOG_FMT_EXTERNAL SPDLOG_FWRITE_UNLOCKED)
+target_link_libraries(capture_dump_validator PRIVATE
+    fmt::fmt spdlog::spdlog_header_only
+    "${CMAKE_CURRENT_SOURCE_DIR}/rexglue-sdk/win-amd64/lib/rexruntime.lib")
+
+# xtr_dump_validator: standalone capture dumps.
+add_executable(xtr_dump_validator src/renderer/xtr_dump_validator.cpp)
+target_include_directories(xtr_dump_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(xtr_dump_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+
+# backend_validator: D3D12 device + PSO smoke test (mirrors CreateTestPipeline).
+add_executable(backend_validator
+    src/renderer/backend_validator.cpp
+    src/renderer/vertex_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
+target_include_directories(backend_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(backend_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+target_link_libraries(backend_validator PRIVATE d3d12.lib dxgi.lib dxguid.lib)
 
 

@@ -68,7 +68,8 @@ struct ConstantEntry {
 struct VertexInput {
     uint16_t usage = 0;      // DeclUsage
     uint16_t usageIndex = 0;
-    uint16_t address = 0;    // placement in the vertex stream
+    uint16_t address = 0;    // placement in the vertex stream (VS)
+    uint16_t reg = 0;        // guest register target (PS interpolators)
 };
 
 // Pixel shader render-target outputs.
@@ -77,8 +78,8 @@ struct PixelOutputs {
     bool depth = false;
 };
 
-// A decoded instruction in program order. `address` is the byte offset of the
-// instruction within the microcode program (12-byte units * 12).
+// A decoded instruction in program order. `address` is the instruction index
+// within the microcode program (cf.address + i), in 12-byte instruction units.
 struct IrInstruction {
     uint32_t address = 0;
     bool isFetch = false;       // from the exec sequence bit (vs ALU)

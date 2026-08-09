@@ -4,7 +4,6 @@ description: >-
   or updating markdown in the repo (including NATIVE_GPU_REBUILD_PLAN.md
   addenda and .opencode docs).
 mode: subagent
-model: omniroute/gh/claude-sonnet-4.6
 temperature: 0.3
 color: secondary
 permission:

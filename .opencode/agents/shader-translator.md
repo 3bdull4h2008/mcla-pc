@@ -4,7 +4,6 @@ description: >-
   Xbox shaders, building the IR/translator, or triaging decode/validation
   failures.
 mode: subagent
-model: omniroute/gh/claude-opus-4.7
 temperature: 0.1
 color: info
 ---

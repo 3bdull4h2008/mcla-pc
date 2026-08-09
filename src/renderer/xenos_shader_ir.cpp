@@ -44,8 +44,7 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
     out.isVertex  = (out.flags & 0x1) != 0;
 
     // Shader header
-    if (so + kShaderHeaderSize > out.virtualSize) return false;
-    const uint8_t* sp = data + so;
+    if (so + kShaderHeaderSize > out.virtualSize) return false;    const uint8_t* sp = data + so;
     out.physicalOffset   = ReadBE32(sp + 0);
     out.shaderSize       = ReadBE32(sp + 4);
     out.fieldC           = ReadBE32(sp + 12);
@@ -93,14 +92,22 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
     // Constant table
     out.constants.clear();
     uint32_t cto = ReadBE32(data + 16);
-    if (cto != 0 && cto + 24 <= out.virtualSize) {
+    // Promote to size_t before adding: cto/ctSize are 32-bit guest fields and
+    // can wrap past the buffer when summed in uint32_t (a crafted container
+    // with cto near 0xFFFFFFFF would pass the guard and read ~4 GB OOB).
+    if (cto != 0 && size_t(cto) + 24 <= out.virtualSize) {
         const uint8_t* ctd = data + cto;
         uint32_t ctSize      = ReadBE32(ctd + 0);
         uint32_t ctConstants = ReadBE32(ctd + 12);
         uint32_t ctInfoOff   = ReadBE32(ctd + 16);
-        if (cto + ctSize <= out.virtualSize) {
-            for (uint32_t ci = 0; ci < ctConstants; ++ci) {
-                size_t off = ctInfoOff + ci * 16;
+        if (size_t(cto) + ctSize <= out.virtualSize) {
+            // Cap iterations to the validated table region; ctConstants is
+            // unvalidated and could otherwise loop ~4 G times (CPU DoS).
+            const uint32_t maxConstants =
+                uint32_t(std::min<size_t>(ctSize / 16, uint32_t(-1)));
+            uint32_t capped = std::min(ctConstants, maxConstants);
+            for (uint32_t ci = 0; ci < capped; ++ci) {
+                const size_t off = size_t(ctInfoOff) + size_t(ci) * 16;
                 if (off + 16 > ctSize) break;
                 const uint8_t* ciPtr = ctd + off;
                 ConstantEntry entry;
@@ -121,7 +128,7 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
                         size_t remain = ctSize - nameOff;
                         size_t len = 0;
                         while (len < remain && ns[len] != 0) ++len;
-                        entry.name.assign(reinterpret_cast<const char*>(ns), len);
+                        entry.name.assign(ns, ns + len);
                     }
                 }
                 if (entry.info.typeInfo != 0 && entry.info.typeInfo + kTypeInfoSize <= ctSize) {
@@ -144,31 +151,64 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
     out.interpolators.clear();
     out.pixelOutputs = PixelOutputs{};
     if (out.isVertex) {
-        uint32_t veOff = ReadBE32(sp + 24);
-        if (veOff != 0 && so + veOff + 8 <= out.virtualSize) {
-            const uint8_t* vep = data + so + veOff;
-            uint32_t veCount = ReadBE32(vep + 0);
-            // vertex element addresses + usages are packed in the array that follows
+        // VS header: field18 (sp+24) is an entry index into the
+        // vertexElementsAndInterpolators[] array that begins at sp+36.
+        // Vertex element i sits at array index field18 + i; interpolator i at
+        // field18 + vertexElementCount + i. Each entry packs
+        // VertexElement { address:12, usage:4, usageIndex:4 }.
+        uint32_t veStart = ReadBE32(sp + 24);
+        uint32_t veCount = ReadBE32(sp + 28);
+        // Promote to size_t before multiplying: (veStart+veCount+32)*4 can
+        // wrap in uint32_t, letting the guard pass while the element read
+        // wraps ~4 GB OOB (crafted container with veStart near 0xFFFFFFFF).
+        if (veCount <= 32 &&
+            size_t(so) + 36 + (size_t(veStart) + veCount + 32) * 4 <= out.virtualSize) {
             for (uint32_t ve = 0; ve < veCount; ++ve) {
-                size_t veDataOff = veOff + 4 + ve * 4;
-                if (so + veDataOff + 4 > out.virtualSize) break;
-                const uint8_t* veP = data + so + veDataOff;
-                uint32_t val = ReadBE32(veP);
+                uint32_t val = ReadBE32(sp + 36 + (size_t(veStart) + ve) * 4);
                 VertexInput vi;
                 vi.address    = val & 0xFFF;
                 vi.usage      = (val >> 12) & 0xF;
                 vi.usageIndex = (val >> 16) & 0xF;
                 out.vertexElements.push_back(vi);
             }
+            // VS interpolators: emitted outputs, stored right after the vertex
+            // elements in the same array.
+            const uint32_t interpCount = out.interpolatorCount();
+            if (interpCount <= 32 && size_t(so) + 36 +
+                                         (size_t(veStart) + veCount + interpCount) * 4 <=
+                                     out.virtualSize) {
+                for (uint32_t i = 0; i < interpCount; ++i) {
+                    uint32_t word = ReadBE32(sp + 36 + (size_t(veStart) + veCount + i) * 4);
+                    VertexInput in;
+                    in.usageIndex = (word >> 0) & 0xF;
+                    in.usage      = (word >> 4) & 0xF;
+                    in.reg        = (word >> 8) & 0xF;
+                    out.interpolators.push_back(in);
+                }
+            }
         }
     } else {
-        // PS: field18 + output flags + interpolators
-        uint32_t psOutputs = ReadBE32(sp + 24);
+        // PS: field18 (sp+24), outputs (sp+28), interpolators (sp+32...)
+        uint32_t psOutputs = ReadBE32(sp + 28);
         out.pixelOutputs.color0 = (psOutputs & 0x01) != 0;
         out.pixelOutputs.color1 = (psOutputs & 0x02) != 0;
         out.pixelOutputs.color2 = (psOutputs & 0x04) != 0;
         out.pixelOutputs.color3 = (psOutputs & 0x08) != 0;
         out.pixelOutputs.depth  = (psOutputs & 0x10) != 0;
+
+        // Interpolator table follows the outputs field. Each entry is
+        // Interpolator { usageIndex:4, usage:4, reg:4, pad:20 }.
+        const uint32_t interpCount = out.interpolatorCount();
+        if (interpCount <= 32 && size_t(so) + 32 + size_t(interpCount) * 4 <= out.virtualSize) {
+            for (uint32_t i = 0; i < interpCount; ++i) {
+                uint32_t word = ReadBE32(sp + 32 + i * 4);
+                VertexInput in;
+                in.usageIndex = (word >> 0) & 0xF;
+                in.usage      = (word >> 4) & 0xF;
+                in.reg        = (word >> 8) & 0xF;
+                out.interpolators.push_back(in);
+            }
+        }
     }
 
     return true;

@@ -11,6 +11,8 @@ npm-debug.log*
 # ── Large / copyrighted third-party data (do not version) ────
 # Extracted game content / shader corpus
 /mcla extracted cache/
+# Extracted game content under game_data (art/city test .loc stubs, etc.)
+/game_data/
 # Reference recomp projects and research notes
 /.research/
 # Archived reference source
@@ -28,5 +30,6 @@ npm-debug.log*
 *.tracy
 *.dmp
 *.log
+crash_log_early.txt
 Thumbs.db
 .DS_Store

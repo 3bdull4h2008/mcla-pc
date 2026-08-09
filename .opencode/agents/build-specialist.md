@@ -3,7 +3,6 @@ description: >-
   CMake / clang-cl / MSVC toolchain, linker, and ABI issues. Use for
   configure-stage problems, link errors, symbol mismatches, or build config.
 mode: subagent
-model: omniroute/auto/coding:fast
 temperature: 0.2
 color: secondary
 ---

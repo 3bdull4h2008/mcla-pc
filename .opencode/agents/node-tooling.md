@@ -3,7 +3,6 @@ description: >-
   Manifest/database and node tooling side (better-sqlite3, mcla_manifest*.toml).
   Use when editing manifests via tooling, or building SQLite/DB utilities.
 mode: subagent
-model: omniroute/auto/coding
 temperature: 0.2
 color: secondary
 ---

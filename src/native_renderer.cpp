@@ -5,6 +5,7 @@
 #include "capture_hooks.h"
 #include "frame_trace.h"
 #include "d3d12_backend.h"
+#include "patches.h"
 #include <rex/logging.h>
 #include <rex/ui/window.h>
 #include <cmath>
@@ -16,7 +17,11 @@
 #include <rex/graphics/xenos.h>
 
 #include <cassert>
+#include <chrono>
 #include <filesystem>
+#include <thread>
+#include <unordered_set>
+#include <vector>
 
 namespace mcla::native {
 
@@ -47,7 +52,54 @@ static rex::graphics::CommandProcessor* GetCommandProcessor() {
     return gs->command_processor();
 }
 
-// IssueDraw is protected in CommandProcessor.  This shim exposes it as
+// Host-side frame trace driver.  The game renders through the host GPU plugin
+// (rexgpu-xenos.dll) on the command-processor worker thread, not through the
+// guest PPC draw functions we hook, so the only complete record of real draws
+// is the CommandProcessor's built-in TraceWriter (Xenia .xtr stream format).
+//
+// BeginTracing/EndTracing are virtual, dispatched through the vtable to the
+// plugin's D3D12CommandProcessor, so they need no exported symbol on our side.
+// They only set trace state and open/close the backing file; packet bytes are
+// written on the CP worker thread itself while it drains the ring buffer.  A
+// detached host thread waits a warm-up delay for the scene to settle, opens the
+// trace for a capture window, then closes it, leaving <root>/{title:08X}_stream.xtr.
+static constexpr std::chrono::milliseconds kHostTraceWarmup{3000};
+static constexpr std::chrono::milliseconds kHostTraceWindow{1500};
+
+void StartHostFrameTrace() {
+    auto* cp = GetCommandProcessor();
+    if (!cp) {
+        REXLOG_WARN("StartHostFrameTrace: no command processor available");
+        return;
+    }
+
+    auto* runtime = rex::Runtime::instance();
+    std::filesystem::path root =
+        (runtime && !runtime->cache_root().empty()) ? runtime->cache_root()
+                                                    : std::filesystem::current_path();
+
+    REXLOG_INFO("StartHostFrameTrace: scheduling Xenos .xtr capture under '{}'",
+                root.string());
+
+    // Must not block the caller; run the warm-up + Begin/End on a detached host
+    // thread.  These are virtual (vtable dispatch), so they are safe to call
+    // from any thread and require no exported SDK symbol.
+    std::thread([cp, root]() {
+        std::this_thread::sleep_for(kHostTraceWarmup);
+
+        cp->BeginTracing(root);
+        REXLOG_INFO("StartHostFrameTrace: BeginTracing under '{}'", root.string());
+
+        // Let the CP keep draining the ring buffer and writing trace packets
+        // for the capture window before closing the stream.
+        std::this_thread::sleep_for(kHostTraceWindow);
+
+        cp->EndTracing();
+        REXLOG_INFO("StartHostFrameTrace: EndTracing complete");
+    }).detach();
+}
+
+// reIssueDraw is a protected in CommandProcessor.  This shim exposes it as
 // a public static so we can call it from the hook without modifying the SDK.
 
 struct CommandProcessorAccess : rex::graphics::CommandProcessor {
@@ -458,6 +510,66 @@ REX_FUNC(Hooked_Sub8241ABB8) {
 
 static PPCFunc* orig_VdSwap = nullptr;
 
+namespace {
+
+// Cap on a single consumed vertex range. Non-indexed MCLA city geometry is a
+// few KB per stream; anything larger is treated as a bad capture rather than
+// staging a multi-MB upload.
+constexpr uint32_t kMaxConsumeBytes = 1u << 20;
+
+// Attempt to consume the most recently captured DrawPacket as native
+// geometry. Returns true when the packet passes the layout gate AND the draw
+// was submitted; false otherwise (caller falls back to the fixture quad).
+// Refusals are emitted once per reason (deduplicated) so a non-matching
+// capture stays quiet after the first frame.
+bool TryConsumeCapturedGeometry(D3D12Backend* backend, const DrawPacket* packet) {
+    static std::unordered_set<std::string> s_emittedReasons;
+
+    auto refuse = [&](const char* reason) {
+        std::string key(reason);
+        if (s_emittedReasons.insert(key).second) {
+            REXLOG_WARN("Native render: captured draw not consumable ({}) — falling back to fixture quad",
+                        reason);
+        }
+        return false;
+    };
+
+    if (!backend) return false;
+    if (!packet || !packet->isValid) return refuse("packet not valid");
+    if (packet->primType != 0) return refuse("primType != TriList(0)");
+    // The test PSO input layout is non-indexed-only; consuming an indexed draw
+    // would require proving the captured index buffer layout, which no capture
+    // evidence supports yet.
+    if (packet->indexType != 2) return refuse("indexType != non-indexed(2)");
+    if (packet->vertexStreamCount != 1) return refuse("vertexStreamCount != 1");
+    const uint32_t stride = packet->vertexStreams[0].stride;
+    if (stride != 28) return refuse("vertex stride != 28 (test input layout)");
+    if (packet->indexCount == 0) return refuse("indexCount == 0");
+
+    const VertexStreamDesc& vs = packet->vertexStreams[0];
+    const uint64_t bytesNeeded = static_cast<uint64_t>(packet->indexCount) * stride;
+    if (bytesNeeded > kMaxConsumeBytes) return refuse("vertex range exceeds 1 MiB cap");
+    if (bytesNeeded == 0) return refuse("vertex range empty");
+
+    std::vector<uint8_t> vb(static_cast<size_t>(bytesNeeded));
+    if (!GetDrawAccumulator()->ReadGuestRange(vs.guestAddress + vs.offset,
+                                              static_cast<uint32_t>(bytesNeeded),
+                                              vb.data())) {
+        return refuse("guest vertex range not fully mapped");
+    }
+
+    D3D12Backend::DynamicMeshDesc desc = {};
+    desc.vertexBytes = vb.data();
+    desc.vertexBytesSize = static_cast<uint32_t>(bytesNeeded);
+    desc.vertexStride = stride;
+    desc.vertexCount = packet->indexCount;  // non-indexed: indexCount is vertex count
+    desc.indexed = false;
+
+    return backend->DrawDynamicMesh(desc);
+}
+
+} // namespace
+
 REX_FUNC(Hooked_VdSwap) {
     uint32_t obj        = ctx.r3.u32;   // swap chain object + 4
     uint32_t swap_info  = ctx.r4.u32;   // swap info struct
@@ -465,11 +577,23 @@ REX_FUNC(Hooked_VdSwap) {
     static int swapCount = 0;
     swapCount++;
     if (swapCount <= 5) {
-        REXLOG_INFO("VdSwap[%d] obj=0x%08X swap_info=0x%08X mode={}",
+        REXLOG_INFO("VdSwap[{}] obj=0x{:08X} swap_info=0x{:08X} mode={}",
                     swapCount, obj, swap_info,
                     mcla::renderer::RendererModeName(mcla::renderer::GetRendererMode()));
     }
 
+    // Snapshot the last validated packet BEFORE OnFrameEnd clears it; the
+    // accumulator zeroes m_lastPacket at frame end, so reading it afterwards
+    // would always fail and the consumption path would stay dead forever.
+    DrawPacket capturedSnapshot{};
+    bool haveCaptured = false;
+    {
+        const DrawPacket* captured = nullptr;
+        if (GetDrawAccumulator()->LastPacket(captured)) {
+            capturedSnapshot = *captured;
+            haveCaptured = true;
+        }
+    }
     GetDrawAccumulator()->OnFrameEnd();
 
     if (mcla::renderer::GetRendererMode() == mcla::renderer::RendererMode::Native) {
@@ -489,10 +613,23 @@ REX_FUNC(Hooked_VdSwap) {
         if (d3dBackend->IsInitialized()) {
             static uint64_t s_nativeFrameCount = 0;
             s_nativeFrameCount++;
-            // Phase 3: draw a meshed indexed triangle on the native path.
-            // This proves buffer/upload, index, viewport, topology, and RTV
-            // handling end-to-end without the Xenos command processor.
-            d3dBackend->DrawTestMeshedTriangle(static_cast<uint32_t>(s_nativeFrameCount));
+
+            // Try to consume the most recently captured DrawPacket as native
+            // geometry when its layout provably matches the test PSO input
+            // layout. In this session no game draw is reached, so the snapshot
+            // is empty and this falls back to the fixture quad (one diagnostic
+            // per refusal reason).
+            bool consumed = false;
+            if (haveCaptured) {
+                consumed = TryConsumeCapturedGeometry(d3dBackend, &capturedSnapshot);
+            }
+
+            // Phase 3 fallback: draw a meshed indexed triangle on the native
+            // path. This proves buffer/upload, index, viewport, topology, and
+            // RTV handling end-to-end without the Xenos command processor.
+            if (!consumed) {
+                d3dBackend->DrawTestMeshedTriangle(static_cast<uint32_t>(s_nativeFrameCount));
+            }
 
             // Low-noise aggregate: one structured line per 120th frame.
             const auto& stats = d3dBackend->Stats();
@@ -553,6 +690,12 @@ void InstallNativeRenderer(rex::runtime::FunctionDispatcher* dispatcher) {
         REXLOG_INFO("Native renderer: Phase 1 DrawPacket capture ENABLED (trace={}, path={})",
                     mcla::renderer::TraceModeName(mcla::renderer::GetTraceMode()),
                     tracePath.string());
+
+        // Also drive the runtime's own built-in frame trace (.xtr).  The real
+        // draws execute on the host GPU-plugin CP thread, which the guest PPC
+        // hooks never see; this is the only complete record of them.  Runs in
+        // parallel on a detached thread, so the app keeps booting normally.
+        StartHostFrameTrace();
     } else {
         GetDrawAccumulator()->SetCaptureEnabled(false);
         REXLOG_INFO("Native renderer: Phase 1 DrawPacket capture disabled (mode={}, trace={})",
@@ -594,13 +737,21 @@ void InstallNativeRenderer(rex::runtime::FunctionDispatcher* dispatcher) {
         REXLOG_WARN("Native renderer: sub_8241ABB8 not found");
     }
 
-    // Hook VdSwap (swap/flip â€” chains to original SDK implementation)
-    orig_VdSwap = dispatcher->GetFunction(0x827BD6E4);
+    // Hook VdSwap (swap/flip — chains to original SDK implementation).
+    // The generated recompiled code calls __imp__VdSwap via a DIRECT
+    // relative call to the import-library JMP thunk, which bypasses
+    // FunctionDispatcher::SetFunction (indirect/dispatcher calls only).
+    // Detour the thunk itself so ALL call paths (direct, dispatcher, JIT)
+    // hit our hook; keep the dispatcher entry set for indirect routing.
+    dispatcher->SetFunction(0x827BD6E4, Hooked_VdSwap);
+    orig_VdSwap = mcla_DetourImportThunk(
+        reinterpret_cast<uint8_t*>(reinterpret_cast<void*>(&__imp__VdSwap)),
+        Hooked_VdSwap);
     if (orig_VdSwap) {
-        dispatcher->SetFunction(0x827BD6E4, Hooked_VdSwap);
-        REXLOG_INFO("Native renderer: VdSwap hooked (passthrough)");
+        REXLOG_INFO("Native renderer: VdSwap import thunk detoured (passthrough)");
     } else {
-        REXLOG_WARN("Native renderer: VdSwap not found");
+        REXLOG_WARN("Native renderer: VdSwap import thunk detour failed; "
+                    "falling back to dispatcher entry only");
     }
 }
 

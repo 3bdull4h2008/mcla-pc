@@ -34,16 +34,21 @@ struct Stats {
     uint64_t pixel = 0;
     uint64_t hashMismatches = 0;
     uint64_t parseErrors = 0;
+    uint64_t translationErrors = 0;
+    uint64_t emptyHlsl = 0;
+    uint64_t emptyProgram = 0;
+    uint64_t unknownOpcodes = 0;
+    uint64_t unsupportedOpcodes = 0;
 };
 
 static std::vector<uint8_t> ReadFile(const fs::path& path, bool& ok) {
     std::vector<uint8_t> data;
     ok = false;
+    std::error_code ec;
+    const uintmax_t sz = fs::file_size(path, ec);
+    if (ec) return data;
     FILE* f = std::fopen(path.string().c_str(), "rb");
     if (!f) return data;
-    std::fseek(f, 0, SEEK_END);
-    long sz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
     if (sz > 0) {
         data.resize(size_t(sz));
         if (std::fread(data.data(), 1, size_t(sz), f) != size_t(sz)) {
@@ -57,7 +62,10 @@ static std::vector<uint8_t> ReadFile(const fs::path& path, bool& ok) {
     return data;
 }
 
-// Parse + double-hash a single container slice. Returns false on error.
+// Parse + double-hash a single container slice, then run the Phase 5
+// translation gates: the HLSL output must be non-empty and every decoded
+// instruction must have a known opcode and a lowering. Returns false on error
+// (any failed gate flips the global RESULT to ISSUES FOUND).
 static bool ProcessContainer(const uint8_t* data, size_t size, Stats& stats) {
     stats.containers++;
 
@@ -77,7 +85,30 @@ static bool ProcessContainer(const uint8_t* data, size_t size, Stats& stats) {
         stats.hashMismatches++;
         return false;
     }
-    return true;
+
+    // Phase 5 gate: translate to HLSL and require a complete, clean lowering.
+    bool ok = true;
+    if (!TranslateShader(data, size, {}, out)) {
+        stats.translationErrors++;
+        ok = false;
+    }
+    if (out.instructionCount == 0) {
+        stats.emptyProgram++;
+        ok = false;
+    }
+    if (out.hlsl.empty()) {
+        stats.emptyHlsl++;
+        ok = false;
+    }
+    if (out.unknownOpcodeCount != 0) {
+        stats.unknownOpcodes += out.unknownOpcodeCount;
+        ok = false;
+    }
+    if (out.unsupportedOpcodeCount != 0) {
+        stats.unsupportedOpcodes += out.unsupportedOpcodeCount;
+        ok = false;
+    }
+    return ok;
 }
 
 // Exercise the pipeline-key + cache machinery with synthetic data.
@@ -180,6 +211,12 @@ int main(int argc, char** argv) {
                 (unsigned long long)stats.pixel,
                 (unsigned long long)stats.parseErrors,
                 (unsigned long long)stats.hashMismatches);
+    std::printf("phase5_gates: empty_hlsl=%llu empty_program=%llu unknown_opcodes=%llu unsupported_opcodes=%llu translation_errors=%llu\n",
+                (unsigned long long)stats.emptyHlsl,
+                (unsigned long long)stats.emptyProgram,
+                (unsigned long long)stats.unknownOpcodes,
+                (unsigned long long)stats.unsupportedOpcodes,
+                (unsigned long long)stats.translationErrors);
     std::printf("pipeline_key_test=%s\n", keyOk ? "ok" : "FAIL");
     std::printf("RESULT: %s\n", allOk ? "CLEAN" : "ISSUES FOUND");
     return allOk ? 0 : 1;

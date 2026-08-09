@@ -966,6 +966,132 @@ this session**:
   the same "a capture that covers an actual draw" precondition as the
   capture-replay gate.
 
+## Option-1 gate closure: on-window native present S_OK (2026-08-08, gpu-engineer)
+
+The addendum above ("wiring verified, on-window draw not observable") is
+**superseded**. Two back-to-back `renderer_mode=native` runs now close the
+on-window present gate: `build\logs\mcla_008.log` (22:42) and `mcla_009.log`
+(22:46), RTX 3070, D3D12 debug layer enabled:
+
+- `VdSwap[1..5]` fired on the native path in both runs (obj=0xA872C790 …
+  0xA8A11F00), so the guest reaches its present point under native mode.
+- `D3D12Backend: DrawTestMeshedTriangle frame=1..3 present_hr=0x00000000`
+  (S_OK): the flip-model swap chain presents successfully on-window.
+  `present_hr_sok=3`, `swapchain_failed=0`, zero `0x80070005` — the earlier
+  `CreateSwapChainForHwnd failed hr=0x80070005` (22:16 run) is fixed: the
+  backend initializes on the window-owner thread and native mode no longer
+  attaches the rex presenter to the swap chain.
+- `DrawTestMeshedTriangle` logs only the first 3 frames (`frame <= 3` guard);
+  VdSwap[4]/[5] present without a log line.
+- The 4 `[error]` lines are the pre-existing `ExecutePacketType3 overflow /
+  INDIRECT RINGBUFFER: Failed to execute packet` GPU-packet overflow — the
+  Xenos command processor does not run under native mode and this is unrelated
+  to the present path.
+- Residual wedge is unchanged and orthogonal: after VdSwap[5] the guest wedges
+  in the RAGE city-art `.loc` loader (`NtCreateFile
+  t:\mc4\art\city\test_dt_railyard.loc` → pre-mounted stub warnings), so **no
+  real guest draw** reached the draw hooks in either run (VdSwap fires;
+  `sub_82420BA8`/draw-builder does not).
+
+Gate status after this run:
+
+- **Phase 2 "native clear + present on-window" — CLOSED** (D3D12 backend owns
+  the flip-model swap chain; present S_OK; zero debug-layer errors).
+- Phase 3 "replay a captured draw with guest vertex data" — **still gated on a
+  live draw-level capture**, unchanged. The backend now has the dynamic-geometry
+  consumption path to act on one the moment the game reaches a draw (see
+  "Dynamic Geometry & Phase 4 Texture Decoding wiring" below); the capture does
+  not exist yet.
+- `renderer_mode` remains `legacy` by default; native is exercised explicitly
+  with `renderer_mode="native"`.
+
+## Dynamic Geometry & Phase 4 Texture Decoding wiring (2026-08-08, gpu-engineer)
+
+Data-independent plumbing; no guest data invented (Golden Rule 5), no
+`MclaGpuContext` field consumed.
+
+- **`D3D12Backend::DrawDynamicMesh`** — host-side dynamic-geometry entry point:
+  uploads caller vertex bytes (+ optional index bytes) through the per-frame
+  upload arena, binds VB/IB, draws indexed (R16/R32) or non-indexed.
+  `DrawTestMeshedTriangle` now delegates to it (fixture quad → one draw path),
+  preserving the static-IB cache gate. This is the consumption target for a
+  captured `DrawPacket`.
+- **`Hooked_VdSwap` consumption rule** (native mode): a captured packet is drawn
+  dynamically only when the capture layer marked it valid AND it is a single
+  stream, non-indexed, `primType == TriList`, and `stride == 28` (the only input
+  layout the test VS can render — POSITION float3 + COLOR float4). Guest VB
+  bytes are read through the checked `GuestMemoryView`. Any mismatch keeps the
+  deterministic quad + a deduplicated diagnostic.
+- **Unresolved assumption (recorded, not hidden):** the byte layout of a
+  captured stream is still unproven — no live `grcFvf`/fetch-constant snapshot
+  exists (Rev-03 constraint). The stride==28 gate is the conservative stopgap;
+  a real layout needs the guest VS input layout (blocked Phase 3/5 work).
+- **Phase 4 texture decode → SRV path.** Root signature extended with a
+  pixel-visibility SRV descriptor table (t0) + static linear-clamp sampler (s0).
+  `CreateDecodedTexture` uploads host-linear decoded pixels into a DEFAULT-heap
+  texture and creates a shader-visible SRV; `BindDecodedTexture` binds the
+  table. The test VS/PS do not sample t0 yet — content sampling needs a
+  textured shader pair, gated on a captured texture descriptor (the
+  `TextureUntileInfo` capture-layer caller contract is still unwritten).
+  CPU `UntileTexture2D` is oracle-validated headlessly; the backend validator
+  now adds a D3D12-side fixture (untiled bytes → texture upload → SRV →
+  descriptor-table bind → texture readback verify, zero debug-layer messages).
+
+Build/verify: `cmake --build build` clean; `backend_validator.exe` exit 0
+(extended fixture); `texture_decode_test.exe` CLEAN.
+
+### Implementation + verification record (2026-08-08, gpu-engineer)
+
+Implemented exactly the wiring above. Files changed and why:
+
+- `src/d3d12_backend.h` / `src/d3d12_backend.cpp` — added `DynamicMeshDesc` +
+  `DrawDynamicMesh` (single indexed/non-indexed draw body with the 256-byte
+  arena-upload, RTV/viewport/scissor, R16/R32 IB, `present_hr` returned via
+  `m_lastPresentHr`); `DrawTestMeshedTriangle` now delegates, preserving the
+  static-IB cache gate. Added the Phase 4 texture path: `CreateSrvHeap`,
+  `CreateDecodedTexture` (D3D12-footprint row-pitch upload of host-linear
+  decoded pixels into a DEFAULT-heap texture + shader-visible SRV at t0) and
+  `BindDecodedTexture` (SetDescriptorHeaps + SetGraphicsRootDescriptorTable).
+  Root signature extended with the pixel-visible t0 descriptor table + static
+  linear-clamp sampler s0. Shutdown releases the new texture/upload/heap.
+- `src/capture_hooks.h` / `.cpp` — added `LastPacket()` + bounded
+  `ReadGuestRange()` (via checked `GuestMemoryView::ReadBytes`); `OnSubmit`
+  stores the last validated packet, `OnFrameEnd` clears it.
+- `src/native_renderer.cpp` — `Hooked_VdSwap` native branch now calls
+  `TryConsumeCapturedGeometry` (single stream, non-indexed, TriList, stride==28,
+  bounded guest read, 1 MiB cap) before falling back to the fixture quad; each
+  refusal reason logs once (deduplicated).
+
+Build + run results:
+
+- `cmd /c build\_build_mcla.bat` — **clean** (5/5, zero errors).
+- `cmd /c build\_build_backend_val.bat` (wrapper updated to link
+  `texture_decode.cpp`) — **clean**.
+- `build\backend_validator.exe` — **RESULT: CLEAN, exit 0** on the RTX 3070
+  (hardware adapter). All prior fixtures still pass; two new fixtures pass:
+  (8) CPU `UntileTexture2D` round-trip 32x32 8_8_8_8 == `GetTiledOffset2D`
+  reference; (9) D3D12 decoded-texture slice — untiled pixels → texture upload
+  → SRV create → descriptor-table bind + static sampler → texture readback
+  verify, **zero debug-layer messages**.
+- `build\texture_decode_test.exe` — **CLEAN** (oracle cross-check, unchanged).
+- Brief native boot: `build\mcla.exe` (`renderer_mode=native`), log
+  `build\logs\mcla_010.log` — `VdSwap[1..5]`, `DrawTestMeshedTriangle frame=1..3
+  present_hr=0x00000000`, confirming S_OK on the refactored draw path.
+
+Unresolved guest-structure assumptions carried forward (named + evidence gap):
+
+1. **Captured vertex stream byte layout (field `VertexStreamDesc`).** The
+   stride==28 gate is a stopgap; no live `grcFvf`/fetch-constant snapshot exists
+   (Rev-03: no 32-byte slot-95 decoder; layout must come from a live capture).
+   Evidence gap: a real draw capture with a readable `grcFvf`.
+2. **Consumption is inert this session** by design: the game never reaches a
+   draw (`LastPacket()` null → fixture quad + one refusal diagnostic per
+   reason), so `TryConsumeCapturedGeometry` has not executed a real packet.
+3. **Texture content sampling** is blocked on a captured texture descriptor and
+   a textured VS/PS pair (no DXC available to compile new shaders); only
+   upload/SRV/bind/readback is verified. The `TextureUntileInfo` capture-layer
+   caller contract is still unwritten.
+
 **External references identified (2026-08-06, research-scout).** Sibling repos
 that support the native-renderer goal, ranked by applicability:
 
@@ -1140,4 +1266,69 @@ bases `+0x317C`/`+0x3180`, draw count `+0x31DC`, and target/viewport/scissor
 array `+0x3098`-`+0x30A8`). No `MclaGpuContext` field has been added or
 consumed dynamically this session; per Project Rule 4, postpone until live
 capture evidence proves each offset in the guest binary the next phase consumes.
+
+## Phase 3 consumption-gate fixes (2026-08-08, gpu-engineer)
+
+Code review of the Phase 3 consumption path found four defects that would keep
+the "consume a captured draw" path dead or malformed; all fixed and verified:
+
+1. **Packet cleared before read** — `Hooked_VdSwap` called `LastPacket()` only
+   *after* `GetDrawAccumulator()->OnFrameEnd()`, which zeroes `m_lastPacket`
+   and clears `m_lastPacketValid`, so consumption always saw an invalid packet.
+   Fixed: snapshot the packet (value copy of the trivial POD) *before*
+   `OnFrameEnd()` and consume the snapshot. Verified: the only `LastPacket()`
+   call site now precedes `OnFrameEnd()` (`src/native_renderer.cpp:592` vs
+   `:597`).
+2. **`indexType != 2` gate unreachable** — capture inferred only 0/1 from a
+   single flag bit, so the non-indexed gate (the only layout the test PSO
+   supports) could never pass. Recomp evidence (`sub_82420BA8`,
+   `generated/default/mcla_recomp.26.cpp:20301-20345`) shows bits 4-6 of the
+   draw flags are the index-type field, derived from a `u16 & 3` lookup into
+   `0x10`/`0x50`/`0x70`; the consumer distinguishes `&0x10` vs `&0x20`
+   (`mcla_recomp.28.cpp:19287-19297`). `OnDrawBuild` now decodes
+   `(drawFlags >> 4) & 0x7` → `0x1`→0 (16-bit), `0x5`→1 (32-bit), `0x7`→2
+   (non-indexed); unknown encodings (the "already set" branch values 0x20/0x30/
+   0x40/0x60) mark the capture failed rather than defaulting (no invented draw
+   data).
+3. **Cached IB bound with `SizeInBytes=0`** — a cached index buffer was bound
+   with zero size, which D3D12 treats as an *unbound* slot (the rasterizer
+   silently skips the draw; the validator missed it because fixture 7
+   replicates the command sequence offscreen and never calls
+   `DrawDynamicMesh`). Fixed: `DynamicMeshDesc` gains `cachedIndexBytesSize`;
+   the cache-hit branch of `DrawTestMeshedTriangle` records the real byte size
+   and `DrawDynamicMesh` refuses any cached IB whose size is still 0 and binds
+   the nonzero size.
+4. **Upload-region write racing in-flight GPU reads** — `MapUpload` wrote the
+   per-frame upload region before the `BeginFrame()` fence wait for the frame
+   that owns that region, so a still-rendering prior frame could read
+   overwritten bytes. Fixed: extracted `WaitForCurrentFrameGpu()` (waits the
+   fence value recorded when the current back buffer was last rendered) and
+   call it in `DrawDynamicMesh` *before* `MapUpload`; `BeginFrame` keeps its
+   (now-redundant-on-this-path, required-by-`ClearAndPresent`) wait.
+
+Validation evidence (re-run 2026-08-08, RTX 3070, D3D12 debug layer on):
+
+- `cmake --build build` (vcvars64 + Ninja, clang-cl) — **7/7 targets, 0 errors**.
+- `build\backend_validator.exe` — **RESULT: CLEAN**, exit 0, zero debug-layer
+  messages.
+- Re-review (`code-reviewer`) of the four edit sites — **no blockers, no
+  regressions**; indexType decode matches recomp byte-for-byte, IBV never bound
+  with size 0, fence-wait order correct, recursive mutex not deadlocked.
+- Live native boot (`--renderer_mode native`) still cannot reach a real draw:
+  `game_data\mc4` contains only `art\`, no `default.xex`, so no guest present /
+  draw is produced (same precondition as the splash-wedge addendum). The
+  consumption path therefore stays the "snapshot empty → fixture fallback"
+  state in a live run; headless evidence is the gate, not a live draw.
+
+Resolved-now vs open guest-structure assumptions:
+
+- Resolved: index-type field location (bits 4-6 of draw flags) is now
+  recomp-backed, not guessed; consumption gate is reachable.
+- Open: `TryConsumeCapturedGeometry` binds guest vertex data only for the
+  non-indexed 28-byte-stride layout the test PSO supports. The captured index
+  buffer layout (address, element size, offset semantics) is still unproven by
+  capture evidence, so indexed guest draws remain refused by design — do not
+  relax until a live capture demonstrates the IB descriptor.
+- Open: per-frame upload assumes one draw per frame (capture XOR fixture);
+  multi-draw-per-frame staging is future work, out of scope for this gate.
 

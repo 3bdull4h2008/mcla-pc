@@ -40,6 +40,15 @@ uint32_t GetLastDrawFlags();
 // all renderer requirements before the call.
 void IssueNativeDraw(::MclaGpuContext* gpuCtx);
 
+// Drive the runtime's own frame trace (Xenia .xtr stream).  The game renders
+// through the host GPU plugin (rexgpu-xenos.dll) on the "GPU Commands" thread,
+// not through the guest PPC draw functions we hook, so the only complete
+// record of real draws is the CommandProcessor's built-in TraceWriter.
+// StartHostFrameTrace spawns a host thread that, after a warm-up delay,
+// calls CommandProcessor::BeginTracing(root) and then EndTracing() after a
+// capture window, leaving <root>/{title_id:08X}_stream.xtr on disk.
+void StartHostFrameTrace();
+
 }
 
 // GPU context struct from reverse engineering of the game's render-state

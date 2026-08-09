@@ -3,7 +3,6 @@ description: >-
   Crash / assert / D3D12 validation-warning triage. Use to isolate root causes
   of runtime failures, crashes, hangs, or device-lost paths.
 mode: subagent
-model: omniroute/gh/claude-sonnet-4.6
 temperature: 0.2
 color: error
 ---

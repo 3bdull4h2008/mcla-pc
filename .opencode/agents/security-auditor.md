@@ -4,7 +4,6 @@ description: >-
   and guest-pointer handling. Use on any change touching guest memory or
   pointers before claiming done.
 mode: subagent
-model: omniroute/gh/claude-sonnet-4.6
 temperature: 0.1
 color: error
 permission:

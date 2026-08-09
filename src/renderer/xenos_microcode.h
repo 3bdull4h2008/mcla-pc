@@ -117,7 +117,6 @@ const char* AluScalarOpcodeName(AluScalarOpcode opcode);
 
 struct DecodedInstruction {
     InstructionKind kind = InstructionKind::Alu;
-    uint32_t slotAddress = 0;  // byte offset within microcode (filled by walker)
 
     // Fetch operands
     FetchOpcode fetchOpcode = FetchOpcode::VertexFetch;
@@ -160,6 +159,12 @@ struct DecodedInstruction {
     uint32_t src1Swizzle = 0, src2Swizzle = 0, src3Swizzle = 0;
     bool src1Select = false, src2Select = false, src3Select = false;
     bool src1Negate = false, src2Negate = false, src3Negate = false;
+
+    // ALU word0 bit 7 (abs constants) + word1 bits 29-31 (const-relative).
+    bool absConstants = false;
+    bool constAddressRegisterRelative = false;
+    bool const1Relative = false;
+    bool const0Relative = false;
 
     bool unknown = false;
 };

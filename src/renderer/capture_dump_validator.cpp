@@ -50,10 +50,16 @@ static void Diag(bool ok, const char* fmt, ...) {
 }
 
 // Expected dump size a capture would produce for one vertex stream.
+// When layout is resolved (stride != 0) the capture writes stride*count bytes
+// (capped like the capture). When stride == 0 the layout is UNRESOLVED (Rev 03:
+// format/stride live in the captured drawable's grcFvf, not the shader or the
+// fetch-constant descriptor) -- we must NOT guess a default stride (that would
+// be invented draw data per Golden Rule 5). Return 0 to signal "cannot state an
+// expected dump size yet"; the caller reports it as a layout gap.
 static uint32_t ExpectedStreamDumpBytes(const VertexStreamDesc& s, uint32_t indexCount) {
-    const uint32_t stride = s.stride ? s.stride : 32;
+    if (s.stride == 0) return 0;  // layout unresolved -- no invented stride
     const uint32_t elements = indexCount > 0 ? indexCount : 1;
-    const uint32_t maxBytes = stride * elements;
+    const uint32_t maxBytes = s.stride * elements;
     return maxBytes > 0x10000u ? 0x10000u : maxBytes;
 }
 
@@ -80,6 +86,7 @@ struct LayoutEvidence {
     uint64_t packetsNonIndexed = 0;
     uint64_t packetsInvalid = 0;
     uint64_t packetsTotal = 0;
+    uint64_t streamsLayoutUnresolved = 0;
 };
 
 // Analyze one trace file against a guestmem dir (may be empty).
@@ -167,9 +174,14 @@ static void AnalyzeTrace(const fs::path& tracePath, const fs::path& memDir, Layo
                 continue;
             }
             if (vs.stride == 0) {
-                // Capture currently guesses stride; flag once as a diagnostic
-                // so the evidence gate surfaces layout gaps.
-                Diag(false, "packet %zu: stream %u stride==0 (layout unresolved)", i, s);
+                // Layout unresolved (Rev 03: format/stride live in the captured
+                // drawable's grcFvf, not the shader or fetch-constant). One
+                // diagnostic per stream; do NOT guess a stride or claim dump
+                // coverage (Golden Rule 5). Excluded from the coverage ratio.
+                agg.streamsLayoutUnresolved++;
+                Diag(false, "packet %zu: stream %u layout unresolved (stride==0) -- "
+                     "cannot state expected VB dump; needs captured grcFvf layout", i, s);
+                continue;
             }
 
             VertexFormatDesc d = DecodeVertexFetch(vs.format, vs.format);
@@ -183,7 +195,7 @@ static void AnalyzeTrace(const fs::path& tracePath, const fs::path& memDir, Layo
             const uint32_t want = ExpectedStreamDumpBytes(vs, p.indexCount);
             if (dumps.count({ vs.guestAddress, want })) {
                 streamCovered++;
-            } else if (want > 0) {
+            } else {
                 Diag(false, "packet %zu: stream %u missing dump vb_%08X_%06X.bin (expected %u bytes)",
                      i, s, vs.guestAddress, want, want);
             }
@@ -205,6 +217,8 @@ static void PrintEvidence(const LayoutEvidence& agg) {
     std::printf("  invalid packets: %llu\n", static_cast<unsigned long long>(agg.packetsInvalid));
     std::printf("  with index buf:  %llu\n", static_cast<unsigned long long>(agg.packetsWithIndexBuffer));
     std::printf("  non-indexed:     %llu\n", static_cast<unsigned long long>(agg.packetsNonIndexed));
+    std::printf("  streams layout unresolved: %llu\n",
+                static_cast<unsigned long long>(agg.streamsLayoutUnresolved));
     if (!agg.formatCount.empty()) {
         std::printf("  vertex-format codes:\n");
         for (auto& [vf, n] : agg.formatCount) {

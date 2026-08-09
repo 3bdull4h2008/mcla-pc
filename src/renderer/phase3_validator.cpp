@@ -49,6 +49,46 @@ static std::vector<uint8_t> ReadFile(const fs::path& path, bool& ok) {
     return data;
 }
 
+static bool ExerciseVertexFetchConstant() {
+    bool ok = true;
+    // zero entry -> isZero, not valid.
+    {
+        uint8_t p[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        VertexFetchConstant fc = DecodeVertexFetchConstant(p);
+        if (!fc.isZero || fc.valid) { std::printf("  !! zero slot must be isZero\n"); ok = false; }
+    }
+    // w0 address=0x1000 dwords (0x4000 bytes), word1 endian=2, size=0x20 words
+    {
+        uint32_t addrDwords = 0x1000;      // 4096 dwords = 16384 bytes
+        uint8_t p[8];
+        uint32_t w0 = (0u << 30) | (addrDwords & 0x3FFFFFFF);
+        uint32_t w1 = (2u << 30) | (0x20u << 6);   // endian=2, size=32 words
+        p[0] = uint8_t(w0 >> 24); p[1] = uint8_t(w0 >> 16);
+        p[2] = uint8_t(w0 >> 8);  p[3] = uint8_t(w0);
+        p[4] = uint8_t(w1 >> 24); p[5] = uint8_t(w1 >> 16);
+        p[6] = uint8_t(w1 >> 8);  p[7] = uint8_t(w1);
+        VertexFetchConstant fc = DecodeVertexFetchConstant(p);
+        if (!fc.valid) { std::printf("  !! non-zero entry must decode valid\n"); ok = false; }
+        if (fc.addressBytes != 0x4000) { std::printf("  !! addressBytes=%u != 16384\n", fc.addressBytes); ok = false; }
+        if (fc.addressType != 0) { std::printf("  !! addressType=%u != 0\n", fc.addressType); ok = false; }
+        if (fc.endian != 2) { std::printf("  !! endian=%u != 2\n", fc.endian); ok = false; }
+        if (fc.sizeWords != 0x20) { std::printf("  !! sizeWords=%u != 0x20\n", fc.sizeWords); ok = false; }
+    }
+    // size=0 but address set -> not valid (0-size stream).
+    {
+        uint8_t p[8] = {0, 0, 0x10, 0, 0, 0, 0, 0};
+        VertexFetchConstant fc = DecodeVertexFetchConstant(p);
+        if (fc.valid) { std::printf("  !! zero-size stream must not be valid\n"); ok = false; }
+    }
+    // Ensure decoding is big-endian independent of host endianness.
+    {
+        uint8_t p[8] = {0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00}; // addr 0x1000 dwords
+        VertexFetchConstant fc = DecodeVertexFetchConstant(p);
+        if (fc.addressBytes != 0x4000) { std::printf("  !! BE decode host-independent mismatch\n"); ok = false; }
+    }
+    return ok;
+}
+
 static bool ExerciseVertexDecode() {
     bool ok = true;
 
@@ -80,16 +120,23 @@ static bool ExerciseVertexDecode() {
         ok = false;
     }
 
-    // DecodeVertexFetch: vf=0 flags fetch-constant-relative layout.
+    // DecodeVertexFetch: vf=0 flags fetch-constant-relative layout. The
+    // hardware descriptor slot for const_index=31, const_index_select=2 is
+    // 31*3+2 = 95 (fetch-constant block of 96 two-dword entries).
     {
-        VertexFormatDesc d = DecodeVertexFetch(0, 31);
-        if (!d.fromFetchConstant || d.fetchConstantIndex != 31) {
-            std::printf("  !! DecodeVertexFetch should flag fetch-constant (vf=0,const=31)\\n");
+        VertexFormatDesc d = DecodeVertexFetch(0, 31, 2);
+        if (!d.fromFetchConstant || d.fetchConstantIndex != 95 || d.fetchConstantSelect != 2) {
+            std::printf("  !! DecodeVertexFetch should resolve (vf=0,const=31,sel=2) to slot 95\n");
+            ok = false;
+        }
+        VertexFormatDesc d1 = DecodeVertexFetch(0, 31);  // sel unknown => slot 93
+        if (!d1.fromFetchConstant || d1.fetchConstantIndex != 93) {
+            std::printf("  !! DecodeVertexFetch default sel should give slot 93\n");
             ok = false;
         }
         VertexFormatDesc d2 = DecodeVertexFetch(36, 7);
         if (d2.fromFetchConstant || !d2.valid || d2.type != VertexType::Float32) {
-            std::printf("  !! DecodeVertexFetch(36) should decode as float32, not fetch-constant\\n");
+            std::printf("  !! DecodeVertexFetch(36) should decode as float32, not fetch-constant\n");
             ok = false;
         }
     }
@@ -205,14 +252,24 @@ int main(int argc, char** argv) {
     }
 
     bool vdOk = ExerciseVertexDecode();
+    bool fOk = ExerciseVertexFetchConstant();
     bool rcOk = ExerciseResourceCache();
     bool shOk = ExerciseTestShaderBlobs();
 
     // Scan corpus for used vf codes.
     std::map<uint32_t, uint64_t> vfUsage;
     std::map<uint32_t, uint64_t> constIndexUsage;
+    std::map<uint32_t, uint64_t> strideUsage;
+    std::map<bool, uint64_t> miniUsage;
     std::set<uint32_t> unsupported;
     uint64_t containers = 0, fetchInstrs = 0, fetchConstantRel = 0;
+
+    // Stream-binding classification (Rev 03): the offline corpus can only prove
+    // HOW MANY vertex streams and WHICH fetch-constant slot the shaders bind; it
+    // cannot recover format/stride (that lives in the captured drawable grcFvf).
+    // Assert the corpus is single-stream so the capture path knows a VB layout
+    // for every draw must come from the guest declaration, never from here.
+    std::map<uint32_t, uint64_t> fetchConstantSlotUsage;
     for (const auto& entry : fs::recursive_directory_iterator(root)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() == ".list") continue;
@@ -229,23 +286,31 @@ int main(int argc, char** argv) {
                 if (ir.decoded.kind != InstructionKind::VertexFetch) continue;
                 fetchInstrs++;
                 uint32_t vf = ir.decoded.vertexFormat & 0x3F;
-                VertexFormatDesc vfd = DecodeVertexFetch(vf, ir.decoded.constIndex & 0x1F);
+                VertexFormatDesc vfd = DecodeVertexFetch(vf, ir.decoded.constIndex,
+                                                         ir.decoded.constIndexSelect);
                 vfUsage[vf]++;
+                strideUsage[ir.decoded.stride]++;
+                miniUsage[ir.decoded.isMiniFetch]++;
                 if (vfd.valid || vfd.fromFetchConstant) {
                     fetchConstantRel++;
                 } else {
                     unsupported.insert(vf);
                 }
-                // Also record fetch-constant index use (MCLA vertex fetch is
+                // Also record fetch-constant slot use (MCLA vertex fetch is
                 // constant-relative: format/stride live in the fetch-constant
                 // descriptor, not the VFETCH instruction).
-                constIndexUsage[ir.decoded.constIndex & 0x1F]++;
+                constIndexUsage[vfd.fromFetchConstant
+                                    ? vfd.fetchConstantIndex
+                                    : (ir.decoded.constIndex & 0x1F)]++;
+                fetchConstantSlotUsage[vfd.fromFetchConstant
+                                           ? vfd.fetchConstantIndex
+                                           : (ir.decoded.constIndex & 0x1F)]++;
             }
             return true;
         });
     }
-    std::printf("vertex_decode_test=%s  resource_cache_test=%s  test_shader_blobs=%s\n",
-                vdOk ? "ok" : "FAIL", rcOk ? "ok" : "FAIL", shOk ? "ok" : "FAIL");
+    std::printf("vertex_decode_test=%s  fetch_constant_test=%s  resource_cache_test=%s  test_shader_blobs=%s\n",
+                vdOk ? "ok" : "FAIL", fOk ? "ok" : "FAIL", rcOk ? "ok" : "FAIL", shOk ? "ok" : "FAIL");
     std::printf("corpus: containers=%llu vertex_fetches=%llu used_vf_codes=%zu unsupported_codes=%zu\\n",
                 (unsigned long long)containers, (unsigned long long)fetchInstrs,
                 vfUsage.size(), unsupported.size());
@@ -258,12 +323,41 @@ int main(int argc, char** argv) {
         std::printf("  vf=%-3u (%-14s) count=%-8llu %s\n", vf, VertexFormatName(vf),
                     (unsigned long long)count, status);
     }
-    std::printf("fetch_constant_index_histogram (constIndex of each VFETCH):\n");
+    std::printf("fetch_constant_index_histogram (merged descriptor slot const*3+sel of each VFETCH):\n");
     for (auto& [idx, count] : constIndexUsage) {
         std::printf("  const[%u] count=%llu\n", idx, (unsigned long long)count);
     }
+    std::printf("stride_histogram (VFETCH instruction stride field):\n");
+    for (auto& [s, count] : strideUsage) {
+        std::printf("  stride[%u] count=%llu\n", s, (unsigned long long)count);
+    }
+    std::printf("mini_fetch_histogram:\n");
+    for (auto& [mini, count] : miniUsage) {
+        std::printf("  %s count=%llu\n", mini ? "mini" : "full", (unsigned long long)count);
+    }
 
-    bool allOk = vdOk && rcOk && shOk && unsupported.empty();
+    // Rev 03 stream-binding classification: every vertex fetch in the corpus
+    // must resolve to exactly one fetch-constant slot bound to stream input.
+    // If that holds, each captured draw needs a VB layout that can ONLY come
+    // from the guest drawable's run-time vertex declaration (grcFvf); the
+    // shader/descriptor supplies address+size only. Any multi-slot or non-fetch
+    //-constant fetch would mean a different (offline-recoverable) layout and
+    // must be reported, not assumed.
+    uint64_t distinctSlots = fetchConstantSlotUsage.size();
+    bool singleStream = (distinctSlots == 1) &&
+                        (miniUsage.size() == 1) && !miniUsage.begin()->first;
+    // Gating: only slots that are provably fetch-constant-relative count as a
+    // single bound stream. vf=0 => fetchConstantRel==fetchInstrs.
+    bool allFetchConstant = (fetchConstantRel == fetchInstrs);
+    std::printf("stream_binding_classification:\n");
+    std::printf("  distinct_fetch_constant_slots=%llu  vertex_fetches=%llu  fetch_constant_relative=%llu\n",
+                (unsigned long long)distinctSlots, (unsigned long long)fetchInstrs,
+                (unsigned long long)fetchConstantRel);
+    std::printf("  single_stream=%s  (all fetches resolve to one slot, full-rate, layout must come from guest grcFvf)\n",
+                (singleStream && allFetchConstant) ? "TRUE" : "FALSE");
+
+    bool allOk = vdOk && fOk && rcOk && shOk && unsupported.empty() &&
+                 singleStream && allFetchConstant;
     std::printf("RESULT: %s\n", allOk ? "CLEAN" : "ISSUES FOUND");
     return allOk ? 0 : 1;
 }

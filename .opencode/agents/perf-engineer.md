@@ -4,7 +4,6 @@ description: >-
   Use for frame-time analysis, cache-hit improvements, or buffer/descriptor
   churn.
 mode: primary
-model: omniroute/auto/coding:pro
 temperature: 0.2
 color: accent
 ---

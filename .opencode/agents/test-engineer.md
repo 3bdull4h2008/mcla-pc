@@ -4,7 +4,6 @@ description: >-
   verification of decoders, translators, and capture replay without running the
   game.
 mode: subagent
-model: omniroute/auto/coding:cheap
 temperature: 0.2
 color: info
 ---

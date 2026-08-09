@@ -37,6 +37,16 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
 
     REXLOG_INFO("D3D12Backend: Initializing backend for HWND 0x{:X} ({}x{})",
                 reinterpret_cast<uintptr_t>(hwnd), m_width, m_height);
+    DWORD winThread = GetWindowThreadProcessId(hwnd, nullptr);
+    DWORD curThread = GetCurrentThreadId();
+    REXLOG_INFO("D3D12Backend: window owner thread={} calling thread={} {}",
+                winThread, curThread, winThread == curThread ? "(MATCH)" : "(MISMATCH)");
+    {
+        char cls[256] = {};
+        GetClassNameA(hwnd, cls, 256);
+        REXLOG_INFO("D3D12Backend: window class='{}' visible={}",
+                    cls, IsWindowVisible(hwnd) ? 1 : 0);
+    }
 
     if (!CreateDevice()) return false;
     if (!CreateCommandObjects()) return false;
@@ -47,6 +57,7 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     if (!CreateTestRootSignature()) return false;
     if (!CreateTestPipeline()) return false;
     if (!CreateStaticIndexBuffer()) return false;
+    if (!CreateSrvHeap()) return false;
 
     m_initialized = true;
     REXLOG_INFO("D3D12Backend: Successfully initialized D3D12 native renderer skeleton + Phase 3 test pipeline");
@@ -213,8 +224,12 @@ bool D3D12Backend::CreateSyncObjects() {
         return false;
     }
 
-    m_fenceValues[m_frameIndex] = 1;
-    m_currentFenceValue = 1;
+    // The fence is created at value 0. Pre-arm the per-frame wait values to 0
+    // so the FIRST BeginFrame does not wait on a value that was never signaled
+    // (the fence is only advanced by the Signal() after each submit). A slot
+    // only becomes non-zero once its frame has been submitted and fenced.
+    m_fenceValues[m_frameIndex] = 0;
+    m_currentFenceValue = 0;
 
     m_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (!m_fenceEvent) {
@@ -336,14 +351,213 @@ uint8_t* D3D12Backend::MapUpload(size_t size, size_t alignment, D3D12_GPU_VIRTUA
     return dst;
 }
 
+bool D3D12Backend::CreateSrvHeap() {
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.NumDescriptors = 1;
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    HRESULT hr = m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_srvHeap));
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: CreateDescriptorHeap (CBV/SRV/UAV) failed with hr=0x{:08X}",
+                     static_cast<uint32_t>(hr));
+        return false;
+    }
+    m_srvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return true;
+}
+
+// Phase 4 data-independent slice: upload host-linear decoded pixels into a
+// DEFAULT-heap texture and expose them as a shader-visible SRV (t0). The
+// caller produces `linearPixels` via texture_decode (UntileTexture2D); the
+// backend never touches guest memory here. Only scalar (1 block/texel)
+// formats are accepted so the row-pitch copy is exact.
+bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t width,
+                                        uint32_t height, uint32_t dxgiFormat) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized || !m_srvHeap) return false;
+    if (!linearPixels || width == 0 || height == 0) return false;
+
+    const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(dxgiFormat);
+    UINT bytesPerPixel = 0;
+    switch (format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: bytesPerPixel = 4; break;
+        case DXGI_FORMAT_R8_UNORM:       bytesPerPixel = 1; break;
+        default:
+            REXLOG_ERROR("D3D12Backend: CreateDecodedTexture unsupported dxgi format {}", dxgiFormat);
+            return false;
+    }
+
+    D3D12_HEAP_PROPERTIES defProps = {};
+    defProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+    defProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    defProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Format = format;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+    HRESULT hr = m_device->CreateCommittedResource(
+        &defProps, D3D12_HEAP_FLAG_NONE, &texDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr, IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: CreateDecodedTexture CreateCommittedResource failed with hr=0x{:08X}",
+                     static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    // Staging upload with the D3D12 footprint (row pitch aligned, not naive).
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT64 totalBytes = 0;
+    UINT64 rowBytes = 0;
+    {
+        UINT64 tmp = 0;
+        D3D12_RESOURCE_DESC fullDesc = texDesc;
+        m_device->GetCopyableFootprints(&fullDesc, 0, 1, 0, &footprint, nullptr, &tmp, &totalBytes);
+        rowBytes = static_cast<UINT64>(width) * bytesPerPixel;
+    }
+
+    D3D12_HEAP_PROPERTIES upProps = {};
+    upProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    upProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    upProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+    D3D12_RESOURCE_DESC bufDesc = {};
+    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufDesc.Width = totalBytes;
+    bufDesc.Height = 1;
+    bufDesc.DepthOrArraySize = 1;
+    bufDesc.MipLevels = 1;
+    bufDesc.SampleDesc.Count = 1;
+    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+    hr = m_device->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                                           D3D12_RESOURCE_STATE_GENERIC_READ,
+                                           nullptr, IID_PPV_ARGS(&staging));
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: CreateDecodedTexture staging failed with hr=0x{:08X}",
+                     static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    void* mapped = nullptr;
+    hr = staging->Map(0, nullptr, &mapped);
+    if (FAILED(hr) || !mapped) {
+        REXLOG_ERROR("D3D12Backend: CreateDecodedTexture staging Map failed with hr=0x{:08X}",
+                     static_cast<uint32_t>(hr));
+        return false;
+    }
+    {
+        uint8_t* dst = static_cast<uint8_t*>(mapped);
+        const UINT srcPitch = width * bytesPerPixel;
+        const UINT64 dstPitch = footprint.Footprint.RowPitch;
+        for (UINT32 y = 0; y < height; ++y) {
+            std::memcpy(dst + static_cast<size_t>(y) * dstPitch,
+                        linearPixels + static_cast<size_t>(y) * srcPitch, srcPitch);
+        }
+    }
+    staging->Unmap(0, nullptr);
+
+    // The copy is enqueued into the current frame's command list below, so the
+    // staging buffer must outlive the draw; the previous staging is replaced
+    // only after the new one is successfully created.
+    Microsoft::WRL::ComPtr<ID3D12Resource> prevStaging = m_decodedTextureUpload;
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = texture.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = staging.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint = footprint;
+
+    if (!m_inFrame) {
+        if (!BeginFrame()) return false;
+    }
+    m_commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = format;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE srvHandle(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+    m_device->CreateShaderResourceView(texture.Get(), &srvDesc, srvHandle);
+    m_decodedTextureSrvGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+
+    // Commit the new texture/upload only now that everything succeeded.
+    m_decodedTexture = texture;
+    m_decodedTextureUpload = staging;
+    prevStaging.Reset();
+
+    REXLOG_INFO("D3D12Backend: decoded texture created ({}x{}, format {}) + SRV t0",
+                width, height, dxgiFormat);
+    return true;
+}
+
+void D3D12Backend::BindDecodedTexture() {
+    if (!m_srvHeap || !m_decodedTexture) return;
+    m_commandList->SetDescriptorHeaps(1, m_srvHeap.GetAddressOf());
+    m_commandList->SetGraphicsRootDescriptorTable(0, m_decodedTextureSrvGpu);
+}
+
 bool D3D12Backend::CreateTestRootSignature() {
-    // One empty root signature is enough for the deterministic test shaders
-    // (no root constants/descriptors are referenced by the test VS/PS).
+    // Root signature for the deterministic test shaders. The existing test
+    // VS/PS do not sample, but the Phase 4 decoded-texture path needs a
+    // pixel-visible SRV descriptor table at t0 and a static sampler at s0 so a
+    // captured texture can be bound without recompiling the root signature.
+    // Shaders that ignore the table are unaffected by it.
+    D3D12_DESCRIPTOR_RANGE srvRange = {};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 1;
+    srvRange.BaseShaderRegister = 0;  // t0
+    srvRange.RegisterSpace = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER rootParams[1] = {};
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
+    rootParams[0].DescriptorTable.pDescriptorRanges = &srvRange;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC staticSampler = {};
+    staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    staticSampler.MipLODBias = 0.0f;
+    staticSampler.MaxAnisotropy = 1;
+    staticSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    staticSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    staticSampler.MinLOD = 0.0f;
+    staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    staticSampler.ShaderRegister = 0;  // s0
+    staticSampler.RegisterSpace = 0;
+    staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-    rootDesc.NumParameters = 0;
-    rootDesc.NumStaticSamplers = 0;
-    rootDesc.pParameters = nullptr;
-    rootDesc.pStaticSamplers = nullptr;
+    rootDesc.NumParameters = _countof(rootParams);
+    rootDesc.pParameters = rootParams;
+    rootDesc.NumStaticSamplers = 1;
+    rootDesc.pStaticSamplers = &staticSampler;
     rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     Microsoft::WRL::ComPtr<ID3DBlob> signatureBlob;
@@ -409,21 +623,10 @@ bool D3D12Backend::CreateTestPipeline() {
 
 // Phase 3 test draw: an indexed triangle whose colors pulse per frame.
 // Exercises the upload arena, index/vertex buffer binding, viewport, and
-// primitive topology on the native path.
+// primitive topology on the native path. The draw body is shared with the
+// captured-geometry path via DrawDynamicMesh so both go through identical
+// command-list handling.
 bool D3D12Backend::DrawTestMeshedTriangle(uint32_t frame) {
-    // Guard the whole body (including MapUpload / m_frameIndex / m_stats /
-    // m_inFrame mutation) so it cannot race with Resize()/Shutdown() from the
-    // window/app thread. BeginFrame() re-locks the same recursive mutex.
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!m_initialized) return false;
-    m_stats.bytesThisFrame = 0;
-
-    // Per-frame upload cursor: reset within this frame's region so the arena
-    // is reused every frame instead of filling up and dropping draws after
-    // ~a few minutes. BeginFrame() below waits on this back buffer's fence,
-    // which guarantees this region is safe to rewrite.
-    m_uploadOffset = 0;
-
     // Deterministic rotating color so the frame visibly changes.
     const float t = static_cast<float>(frame) * 0.1f;
     const float cr = (std::sin(t) + 1.0f) * 0.5f;
@@ -439,31 +642,93 @@ bool D3D12Backend::DrawTestMeshedTriangle(uint32_t frame) {
         { { -0.8f,  0.8f, 0.0f }, { cr, cb, cg, 1.0f } },
     };
     const uint16_t indices[6] = { 0, 1, 2, 0, 2, 3 };
-    constexpr uint32_t kVertexStride = sizeof(TestVertex);  // 28 bytes
 
-    // Stage the vertex data BEFORE starting any command-list work, so an arena
+    DynamicMeshDesc desc = {};
+    desc.vertexBytes = vertices;
+    desc.vertexBytesSize = sizeof(vertices);
+    desc.vertexStride = sizeof(TestVertex);  // 28 bytes
+    desc.vertexCount = 4;
+    desc.indexed = true;
+    desc.indexFormat = DXGI_FORMAT_R16_UINT;
+    desc.indexCount = 6;
+
+    // Reuse the static cached index buffer (uploaded once at Initialize).
+    const ResourceKey ibKey = { ResourceKind::Buffer, 0 /*synthetic test addr*/,
+                                sizeof(indices), DXGI_FORMAT_R16_UINT, 1 };
+    ResourceEntry ibEntry;
+    if (m_resourceCache.Find(ibKey, ibEntry)) {
+        desc.cachedIndexGpu = ibEntry.handle;
+        desc.cachedIndexBytesSize = sizeof(indices);
+        m_stats.cacheHits++;
+    } else {
+        // Should not happen (initialized before draw), but recover safely by
+        // falling back to a per-frame upload of the same bytes.
+        desc.indexBytes = indices;
+        desc.indexBytesSize = sizeof(indices);
+        m_stats.cacheMisses++;
+    }
+
+    const bool ok = DrawDynamicMesh(desc);
+    if (frame <= 3) {
+        REXLOG_INFO("D3D12Backend: DrawTestMeshedTriangle frame={} present_hr=0x{:08X}",
+                    frame, static_cast<uint32_t>(m_lastPresentHr));
+    }
+    return ok;
+}
+
+// Generic dynamic-geometry draw. Uploads the caller's vertex bytes (and index
+// bytes when the caller has no cached IB) into the per-frame upload arena and
+// issues one indexed/non-indexed draw. The caller is responsible for producing
+// host data from validated captures; the backend never interprets guest
+// layouts. The vertex stride must match the test PSO's input layout
+// (Position:float3 + Color:float4 = 28 bytes) — anything else is refused so we
+// never draw with a mismatched layout.
+bool D3D12Backend::DrawDynamicMesh(const DynamicMeshDesc& desc) {
+    // Guard the whole body (including MapUpload / m_frameIndex / m_stats /
+    // m_inFrame mutation) so it cannot race with Resize()/Shutdown() from the
+    // window/app thread. BeginFrame() re-locks the same recursive mutex.
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized) return false;
+    if (!desc.vertexBytes || desc.vertexBytesSize == 0 || desc.vertexCount == 0) return false;
+
+    // The test PSO input layout is exactly { float3 pos, float4 color } = 28
+    // bytes. Refusing any other stride keeps us honest: a captured stream with
+    // a different layout is not invented into this layout.
+    constexpr uint32_t kLayoutStride = 28;
+    if (desc.vertexStride != kLayoutStride) {
+        REXLOG_WARN("D3D12Backend: DrawDynamicMesh refused vertex stride {} (test layout is {})",
+                    desc.vertexStride, kLayoutStride);
+        return false;
+    }
+    if (desc.indexed && !desc.cachedIndexGpu &&
+        (!desc.indexBytes || desc.indexBytesSize == 0)) {
+        return false;
+    }
+    if (desc.indexed && desc.cachedIndexGpu && desc.cachedIndexBytesSize == 0) {
+        REXLOG_WARN("D3D12Backend: DrawDynamicMesh refused cached IB with size 0");
+        return false;
+    }
+
+    m_stats.bytesThisFrame = 0;
+    m_uploadOffset = 0;
+
+    // Wait for the GPU to finish the previous frame that used this back
+    // buffer's upload region before we write into it again. This must happen
+    // before MapUpload, not at BeginFrame time (which is after staging), or
+    // the CPU can overwrite bytes the GPU is still reading.
+    if (!WaitForCurrentFrameGpu()) return false;
+
+    // Stage vertex data BEFORE starting any command-list work, so an arena
     // exhaustion bails out cleanly with no open list and no stuck m_inFrame.
-    // The index buffer is static and cached; it is NOT re-uploaded here.
-    D3D12_GPU_VIRTUAL_ADDRESS vbGpu = 0, ibGpu = 0;
-    uint8_t* vbDst = MapUpload(sizeof(vertices), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, vbGpu);
+    D3D12_GPU_VIRTUAL_ADDRESS vbGpu = 0, ibGpu = desc.cachedIndexGpu;
+    uint8_t* vbDst = MapUpload(desc.vertexBytesSize, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, vbGpu);
     if (!vbDst) return false;
-    std::memcpy(vbDst, vertices, sizeof(vertices));
+    std::memcpy(vbDst, desc.vertexBytes, desc.vertexBytesSize);
 
-    {
-        // Reuse the static cached index buffer (uploaded once at Initialize).
-        const ResourceKey ibKey = { ResourceKind::Buffer, 0 /*synthetic test addr*/,
-                                    sizeof(indices), DXGI_FORMAT_R16_UINT, 1 };
-        ResourceEntry ibEntry;
-        if (m_resourceCache.Find(ibKey, ibEntry)) {
-            ibGpu = ibEntry.handle;
-            m_stats.cacheHits++;
-        } else {
-            // Should not happen (initialized before draw), but recover safely.
-            uint8_t* ibDst = MapUpload(sizeof(indices), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, ibGpu);
-            if (!ibDst) return false;
-            std::memcpy(ibDst, indices, sizeof(indices));
-            m_stats.cacheMisses++;
-        }
+    if (desc.indexed && !desc.cachedIndexGpu) {
+        uint8_t* ibDst = MapUpload(desc.indexBytesSize, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, ibGpu);
+        if (!ibDst) return false;
+        std::memcpy(ibDst, desc.indexBytes, desc.indexBytesSize);
     }
 
     if (!m_inFrame) {
@@ -496,20 +761,33 @@ bool D3D12Backend::DrawTestMeshedTriangle(uint32_t frame) {
 
     D3D12_VERTEX_BUFFER_VIEW vbView = {};
     vbView.BufferLocation = vbGpu;
-    vbView.StrideInBytes = kVertexStride;
-    vbView.SizeInBytes = sizeof(vertices);
-
-    D3D12_INDEX_BUFFER_VIEW ibView = {};
-    ibView.BufferLocation = ibGpu;
-    ibView.SizeInBytes = sizeof(indices);
-    ibView.Format = DXGI_FORMAT_R16_UINT;  // IndexElementBytes(0) == 2, 16-bit
+    vbView.StrideInBytes = desc.vertexStride;
+    vbView.SizeInBytes = desc.vertexBytesSize;
 
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->IASetVertexBuffers(0, 1, &vbView);
-    m_commandList->IASetIndexBuffer(&ibView);
+
+    D3D12_INDEX_BUFFER_VIEW ibView = {};
+    if (desc.indexed) {
+        ibView.BufferLocation = ibGpu;
+        // A D3D12 IBV with SizeInBytes == 0 is treated as unbound (the runtime
+        // considers the slot null), so the cached IB must carry its real byte
+        // size even though it is never re-uploaded.
+        ibView.SizeInBytes = desc.cachedIndexGpu ? desc.cachedIndexBytesSize
+                                                 : desc.indexBytesSize;
+        ibView.Format = desc.indexFormat;
+        m_commandList->IASetIndexBuffer(&ibView);
+    }
+
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
     m_commandList->SetPipelineState(m_testPipeline.Get());
-    m_commandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
+    BindDecodedTexture();  // no-op unless a decoded texture is active
+
+    if (desc.indexed) {
+        m_commandList->DrawIndexedInstanced(desc.indexCount, 1, 0, 0, 0);
+    } else {
+        m_commandList->DrawInstanced(desc.vertexCount, 1, 0, 0);
+    }
 
     m_stats.drawsIssued++;
 
@@ -528,6 +806,7 @@ bool D3D12Backend::DrawTestMeshedTriangle(uint32_t frame) {
     m_commandQueue->ExecuteCommandLists(1, ppCommandLists);
 
     hr = m_swapChain->Present(1, 0);
+    m_lastPresentHr = hr;
 
     m_currentFenceValue++;
     m_commandQueue->Signal(m_fence.Get(), m_currentFenceValue);
@@ -578,16 +857,26 @@ bool D3D12Backend::Resize(uint32_t width, uint32_t height) {
     return CreateRenderTargets();
 }
 
-bool D3D12Backend::BeginFrame() {
+// Wait until the GPU is done with everything recorded against the current back
+// buffer. Callers that write into the upload arena region for this frame must
+// do so only after this returns, otherwise the CPU can overwrite bytes the GPU
+// is still reading from the previous frame that used the same region.
+bool D3D12Backend::WaitForCurrentFrameGpu() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!m_initialized || m_inFrame) return false;
-
-    // Wait for the buffer's previous frame to finish before resetting command allocator
+    if (!m_initialized) return false;
     uint64_t completedVal = m_fence->GetCompletedValue();
     if (completedVal < m_fenceValues[m_frameIndex]) {
         m_fence->SetEventOnCompletion(m_fenceValues[m_frameIndex], m_fenceEvent);
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
+    return true;
+}
+
+bool D3D12Backend::BeginFrame() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized || m_inFrame) return false;
+
+    if (!WaitForCurrentFrameGpu()) return false;
 
     HRESULT hr = m_commandAllocators[m_frameIndex]->Reset();
     if (FAILED(hr)) return false;
@@ -687,6 +976,10 @@ void D3D12Backend::Shutdown() {
     m_uploadMap = nullptr;
     m_uploadOffset = 0;
     m_staticIndexBuffer.Reset();
+    m_decodedTexture.Reset();
+    m_decodedTextureUpload.Reset();
+    m_srvHeap.Reset();
+    m_decodedTextureSrvGpu = {};
     m_testPipeline.Reset();
     m_rootSignature.Reset();
     m_resourceCache.Clear();

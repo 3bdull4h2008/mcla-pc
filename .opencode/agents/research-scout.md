@@ -3,7 +3,6 @@ description: >-
   External reference research into recomp projects (Xenia, XenosRecomp,
   UnleashedRecomp), shader semantics, and GPU behavior. Read-only.
 mode: subagent
-model: omniroute/auto/best-reasoning
 temperature: 0.3
 color: info
 permission:

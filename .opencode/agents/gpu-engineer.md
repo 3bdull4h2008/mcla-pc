@@ -3,7 +3,6 @@ description: >-
   Native renderer / D3D12 / C++23 implementation. This is the default agent;
   use for writing and refactoring src/renderer and src/ backend code.
 mode: primary
-model: omniroute/auto/coding
 temperature: 0.2
 color: success
 ---

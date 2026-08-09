@@ -48,16 +48,47 @@ struct VertexFormatDesc {
     // descriptor selected by constIndex). Callers must resolve the actual
     // format/stride from that descriptor at capture time.
     bool fromFetchConstant = false;
-    uint32_t fetchConstantIndex = 0;  // VFETCH constIndex when fromFetchConstant
+    uint32_t fetchConstantIndex = 0;  // fetch-constant slot [0-95] when fromFetchConstant
+    uint32_t fetchConstantSelect = 0; // raw 2-bit constIndexSelect (field only, pre-merge)
 };
 
 // Decode a Xenos 6-bit vertex format code.
 VertexFormatDesc DecodeVertexFormat(uint32_t vfCode);
-// Decode a VFETCH with an explicit fetch-constant index. When vfCode is 0
-// (MCLA embeds 0), the descriptor fields (format/stride) must come from the
-// guest fetch-constant table; this returns fromFetchConstant=true and sets
-// fetchConstantIndex. When vfCode is non-zero it behaves like DecodeVertexFormat.
-VertexFormatDesc DecodeVertexFetch(uint32_t vfCode, uint32_t constIndex);
+// Decode a VFETCH with an explicit fetch-constant index/select. When vfCode
+// is 0 (MCLA embeds 0), the descriptor fields (format/stride) must come from
+// the guest fetch-constant table; this returns fromFetchConstant=true and sets
+// fetchConstantIndex to the merged slot `(constIndex & 0x1F) * 3 +
+// (constIndexSelect & 0x3)` (hardware range [0-95]; the 2-bit select selects
+// one of three 32-byte constants per 5-bit const_index). pass 0 for
+// constIndexSelect where only constIndex is known. When vfCode is non-zero it
+// behaves like DecodeVertexFormat and ignores the index fields.
+VertexFormatDesc DecodeVertexFetch(uint32_t vfCode, uint32_t constIndex,
+                                   uint32_t constIndexSelect = 0);
+
+// A single Xenos SHADER_CONSTANT_FETCH stream binding, decoded from the
+// documented 8-byte `xe_gpu_vertex_fetch_t` layout
+// (`_archive/xenia_xenos.h`, `rexglue-sdk/.../xenos.h`):
+//   word0: { address_type: 2, address: 30 }   (address in DWORDs)
+//   word1: { endian: 2,       size: 24 }      (size in WORDs per RX00)
+// It carries ONLY the VB base address, size and endianness for a fetched
+// stream. Per Rev 03 of the plan, format/stride are NOT present here (MCLA
+// VFETCH embeds vf=0, stride=0) and must be recovered offline from the
+// captured RAGE drawable's vertex declaration (grcFvf), never inferred here.
+struct VertexFetchConstant {
+    bool valid = false;
+    bool isZero = false;      // whole 8 bytes zero (unwritten slot)
+    uint16_t addressType = 0; // 2-bit raw
+    uint32_t addressBytes = 0;// address field, converted to bytes = dwords*4
+    uint16_t endian = 0;      // 2-bit raw (0x1C800?? encoding resolved by caller)
+    uint32_t sizeWords = 0;   // 24-bit size field, in 16-bit words
+};
+
+// Decode an 8-byte big-endian fetch-constant entry into VertexFetchConstant.
+// `p8` must point at a checked, in-bounds 8 bytes of guest data already
+// fetched by the caller's GuestMemoryView (this parser never touches guest
+// memory itself, keeping it headlessly testable). Sets valid only for a
+// non-zero entry whose address/size are in range.
+VertexFetchConstant DecodeVertexFetchConstant(const uint8_t* p8);
 
 // Human-readable name (for debug/trace); "unsupported" when !valid.
 const char* VertexFormatName(uint32_t vfCode);

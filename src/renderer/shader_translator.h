@@ -29,6 +29,9 @@ struct TranslatedShader {
     std::vector<uint8_t> dxil;     // compiled DXIL (empty unless compiled)
     bool dxilOk = false;
     std::string error;             // last translation/compile error
+    uint64_t instructionCount = 0; // decoded instructions processed
+    uint64_t unknownOpcodeCount = 0;   // instructions with no decoder table entry
+    uint64_t unsupportedOpcodeCount = 0; // instructions with no lowering (never dropped)
 };
 
 // Parse + hash a shader container. Fills `prog` with the normalized IR and
