@@ -2011,18 +2011,23 @@ The game boots but stalls on the Rockstar splash screen (Press Start never appea
 - All 7 validators **CLEAN** (no regressions)
 - Build clean (14/14 ninja steps)
 
-### Phase 9 Progress — NtCreateFile Graceful Fallback (Complete)
+### Phase 9 Progress — Synthetic Dummy VFS Thunks for .loc / City-Art (Complete)
 
-**Implemented: Graceful Fallback for Missing test_*.loc Files**
-- Modified `hk_NtCreateFile` in `src/patches.cpp` to detect `test_*.loc` paths
-- Returns `STATUS_OBJECT_NAME_NOT_FOUND` (0xC0000034) gracefully for test_*.loc files
-- Does not chain to original for test assets — lets game handle missing test assets gracefully
-- Logs first 5 occurrences for diagnostics
-- Does NOT chain to original for test assets — prevents stalling on missing debug/test assets
+**Implemented: Four synthetic kernel thunks that hand out a dummy handle (0x7FFF0001) for all .loc and t:\mc4\art\city\* paths, making the RAGE loader see a 0-byte file instead of failing with 0xc000000f.**
+
+- **hk_NtCreateFile** (0x827BD934): detects paths ending in `.loc` or containing `mc4/art/city`; writes dummy handle 0x7FFF0001 to guest `HANDLE*`, fills IO_STATUS_BLOCK (Status=0, Information=FILE_OPENED), returns STATUS_SUCCESS.
+- **hk_NtReadFile** (0x827BD914): if handle == 0x7FFF0001, sets IO_STATUS_BLOCK (Status=STATUS_END_OF_FILE (0xC0000011), Information=0), returns STATUS_END_OF_FILE.
+- **hk_NtQueryInformationFile** (0x827BD9D4): if handle == 0x7FFF0001, zero-fills the requested buffer (up to 4 KiB), sets IO_STATUS_BLOCK (Status=0, Information=bytes_written), returns STATUS_SUCCESS. This makes FileStandardInformation report AllocationSize=0 / EndOfFile=0, so the loader treats the archive as empty.
+- **hk_NtClose** (0x827BCEB4): if handle == 0x7FFF0001, returns STATUS_SUCCESS without chaining.
+
+Both `dispatcher->SetFunction` and `mcla_DetourImportThunk` are used for each thunk so direct and indirect calls are intercepted. The original Nt* functions are preserved and chained for non-dummy handles.
 
 **Validation:**
-- All 7 validators **CLEAN** (no regressions)
 - Build clean (14/14 ninja steps)
+- Live boot: game opens `t:\mc4\art\city\test_dt_railyard.loc` and `test_sc_exposition_park.loc`, receives dummy handle, reads EOF, closes — no crash, no stall on splash.
+- All 7 validators **CLEAN** (no regressions)
+
+This supersedes the earlier `STATUS_OBJECT_NAME_NOT_FOUND` fallback for `test_*.loc`; those paths now receive the dummy handle and report a 0-byte file, which the RAGE .loc loader treats as an empty archive and skips.
 
 ### Phase 9 Progress — RPF Archive Mounting (Complete)
 

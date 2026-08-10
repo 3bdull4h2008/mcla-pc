@@ -39,6 +39,12 @@ public:
     bool ReadF32BE(uint32_t guestAddr, float* outVal) const;
     bool ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t size) const;
 
+    // Endian-safe checked writes. Return false if guestAddr range is invalid.
+    bool WriteU8(uint32_t guestAddr, uint8_t val) const;
+    bool WriteU32BE(uint32_t guestAddr, uint32_t val) const;
+    bool WriteU64BE(uint32_t guestAddr, uint64_t val) const;
+    bool WriteBytes(uint32_t guestAddr, const void* src, uint32_t size) const;
+
 private:
     rex::memory::Memory* ResolveMemory() const;
 

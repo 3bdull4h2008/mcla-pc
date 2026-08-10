@@ -118,6 +118,36 @@ bool GuestMemoryView::ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t si
 }
 
 
+bool GuestMemoryView::WriteU8(uint32_t guestAddr, uint8_t val) const {
+    uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint8_t));
+    if (!ptr) return false;
+    *ptr = val;
+    return true;
+}
+
+bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
+    uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint32_t));
+    if (!ptr) return false;
+    uint32_t be = rex::byte_swap(val);
+    std::memcpy(ptr, &be, sizeof(be));
+    return true;
+}
+
+bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
+    uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint64_t));
+    if (!ptr) return false;
+    uint64_t be = rex::byte_swap(val);
+    std::memcpy(ptr, &be, sizeof(be));
+    return true;
+}
+
+bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t size) const {
+    uint8_t* ptr = GetHostPtrMutable(guestAddr, size);
+    if (!ptr || !src) return false;
+    std::memcpy(ptr, src, size);
+    return true;
+}
+
 
 bool VerifyGuestMemoryViewForTests() {
     GuestMemoryView view;

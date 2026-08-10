@@ -152,6 +152,14 @@ static PPCFunc* g_original_KeWait = nullptr;
 static PPCFunc* g_original_XamInputGetState = nullptr;
 static PPCFunc* g_original_NtCreateFile = nullptr;
 
+// Synthetic dummy VFS thunks for .loc / city-art files the host cannot serve.
+// Handed out by hk_NtCreateFile; recognized by hk_NtReadFile,
+// hk_NtQueryInformationFile, and hk_NtClose.  All reads report a 0-byte file.
+static constexpr uint32_t kDummyLocHandle = 0x7FFF0001;
+static PPCFunc* g_original_NtReadFile = nullptr;
+static PPCFunc* g_original_NtQueryInformationFile = nullptr;
+static PPCFunc* g_original_NtClose = nullptr;
+
 // Overwrite an import-library JMP thunk ("jmp [rip+disp]") with a
 // 12-byte "mov rax, imm64; jmp rax" detour and return the target
 // of the original JMP (the real function in the DLL).
@@ -263,6 +271,9 @@ static void TimerHookDispatch(PPCContext& ctx, uint8_t* base,
 void hk_KeWaitForSingleObject(PPCContext& ctx, uint8_t* base);
 void hk_XamInputGetState(PPCContext& ctx, uint8_t* base);
 void hk_NtCreateFile(PPCContext& ctx, uint8_t* base);
+void hk_NtReadFile(PPCContext& ctx, uint8_t* base);
+void hk_NtQueryInformationFile(PPCContext& ctx, uint8_t* base);
+void hk_NtClose(PPCContext& ctx, uint8_t* base);
 void hk_sub_82130690(PPCContext& ctx, uint8_t* base);
 void hk_sub_82130770(PPCContext& ctx, uint8_t* base);
 void hk_sub_82130850(PPCContext& ctx, uint8_t* base);
@@ -303,11 +314,28 @@ static uint32_t g_press_start_shim_thunk = 0;
 void mcla_ApplyPatches(rex::runtime::FunctionDispatcher* dispatcher) {
     g_dispatcher = dispatcher;
 
-    // Initialize VFS for RPF archive mounting (Phase 9)
+    // Initialize VFS for RPF archive mounting (Phase 9).
+    // The RPF archives (xarchive_cache.rpf / xarchive_audio.rpf / ...) were
+    // extracted into root-level xarchive_* folders; try them in order and
+    // use the first that exists.  The old "mcla extracted cache" root is
+    // gone after the re-extraction.
     {
         mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
-        std::string cache_root = "E:/mcla pc/mcla extracted cache";
-        if (!vfs.Initialize(cache_root)) {
+        static const char* kCandidateRoots[] = {
+            "E:/mcla pc/xarchive_cache",
+            "E:/mcla pc/xarchive_audio",
+            "E:/mcla pc/xarchive_music",
+            "E:/mcla pc/xarchive_audlo",
+            "E:/mcla pc/mcla extracted cache",
+        };
+        bool ok = false;
+        for (const char* root : kCandidateRoots) {
+            if (vfs.Initialize(root)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
             REXLOG_ERROR("Failed to initialize VFS for RPF archive mounting");
         } else {
             REXLOG_INFO("VFS initialized for RPF archive mounting");
@@ -354,6 +382,33 @@ void mcla_ApplyPatches(rex::runtime::FunctionDispatcher* dispatcher) {
         hk_NtCreateFile);
     if (!g_original_NtCreateFile) {
         REXLOG_ERROR("Failed to detour __imp__NtCreateFile");
+    }
+    
+    // Hook NtReadFile (0x827BD914) â€” synthetic dummy VFS thunk for .loc files.
+    dispatcher->SetFunction(0x827BD914, hk_NtReadFile);
+    g_original_NtReadFile = mcla_DetourImportThunk(
+        reinterpret_cast<uint8_t*>(reinterpret_cast<void*>(&__imp__NtReadFile)),
+        hk_NtReadFile);
+    if (!g_original_NtReadFile) {
+        REXLOG_ERROR("Failed to detour __imp__NtReadFile");
+    }
+
+    // Hook NtQueryInformationFile (0x827BD9D4) â€” synthetic dummy VFS thunk for .loc files.
+    dispatcher->SetFunction(0x827BD9D4, hk_NtQueryInformationFile);
+    g_original_NtQueryInformationFile = mcla_DetourImportThunk(
+        reinterpret_cast<uint8_t*>(reinterpret_cast<void*>(&__imp__NtQueryInformationFile)),
+        hk_NtQueryInformationFile);
+    if (!g_original_NtQueryInformationFile) {
+        REXLOG_ERROR("Failed to detour __imp__NtQueryInformationFile");
+    }
+
+    // Hook NtClose (0x827BCEB4) â€” synthetic dummy VFS thunk for .loc files.
+    dispatcher->SetFunction(0x827BCEB4, hk_NtClose);
+    g_original_NtClose = mcla_DetourImportThunk(
+        reinterpret_cast<uint8_t*>(reinterpret_cast<void*>(&__imp__NtClose)),
+        hk_NtClose);
+    if (!g_original_NtClose) {
+        REXLOG_ERROR("Failed to detour __imp__NtClose");
     }
     
     // Hook XamInputGetState â€” same approach as KeWait: overwrite the
@@ -739,6 +794,22 @@ static void StubNtCreateFileCityLoc(const std::string& guest_path) {
     }
 }
 
+// Returns true if the normalized guest path should receive the synthetic
+// dummy VFS handle (all .loc files and all t:\mc4\art\city\* paths).
+static bool IsDummyVfsPath(const std::string& guest_path) {
+    std::string norm = guest_path;
+    std::transform(norm.begin(), norm.end(), norm.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::replace(norm.begin(), norm.end(), '\\', '/');
+
+    const std::string kCityMarker = "mc4/art/city";
+    if (norm.find(kCityMarker) != std::string::npos) return true;
+    auto dot = norm.find_last_of('.');
+    if (dot != std::string::npos && norm.compare(dot, 4, ".loc") == 0) return true;
+    return false;
+}
+
 REX_FUNC(hk_NtCreateFile) {
     // r5 = X_OBJECT_ATTRIBUTES* (guest).  Read name_ptr â†' X_ANSI_STRING.
     mcla::native::GuestMemoryView view;
@@ -755,24 +826,60 @@ REX_FUNC(hk_NtCreateFile) {
             std::string guest_path(buf.data(), str_len);
             StubNtCreateFileCityLoc(guest_path);
             
-            // Check for test_*.loc files (optional debug/test assets that don't exist in RPF)
-            // Return STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034) gracefully instead of stalling
-            std::string norm = guest_path;
-            std::transform(norm.begin(), norm.end(), norm.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-            });
-            std::replace(norm.begin(), norm.end(), '\\', '/');
-            
-            // Check for test_*.loc pattern
-            if (norm.find("test_") != std::string::npos && norm.size() >= 5 &&
-                norm.compare(norm.size() - 4, 4, ".loc") == 0) {
-                // Return STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034) gracefully
-                ctx.r3.u64 = 0xC0000034;
-                static int s_testLocLogCount = 0;
-                if (s_testLocLogCount++ < 5) {
-                    REXLOG_INFO("NtCreateFile: test_*.loc not found in RPF, returning NOT_FOUND: {}", guest_path);
+            // Synthetic handling for .loc / city-art paths the host cannot serve.
+            // .loc files are dev-exclusive (absent from retail), so the correct
+            // behavior is STATUS_OBJECT_NAME_NOT_FOUND: the loader then follows
+            // the same "file absent" path retail takes instead of a success
+            // handle that yields an impossible empty-file state and wedges.
+            if (IsDummyVfsPath(guest_path)) {
+                constexpr uint32_t kStatusObjectNameNotFound = 0xC0000034;
+                uint32_t iosb = ctx.r6.u32;  // IO_STATUS_BLOCK* (Status @+0, Information @+4)
+
+                bool is_loc = false;
+                std::string norm = guest_path;
+                std::transform(norm.begin(), norm.end(), norm.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                auto dot = norm.find_last_of('.');
+                if (dot != std::string::npos && norm.compare(dot, 4, ".loc") == 0) {
+                    is_loc = true;
                 }
-                return;  // Don't chain to original - let the game handle missing test assets gracefully
+
+                if (is_loc) {
+                    // Fill IO_STATUS_BLOCK: Status = STATUS_OBJECT_NAME_NOT_FOUND, Information = 0.
+                    if (iosb) {
+                        view.WriteU32BE(iosb + 0, kStatusObjectNameNotFound);
+                        view.WriteU32BE(iosb + 4, 0);
+                    }
+                    static std::unordered_set<std::string> s_seen;
+                    if (s_seen.insert(guest_path).second) {
+                        REXLOG_WARN("NtCreateFile -> STATUS_OBJECT_NAME_NOT_FOUND for dev-exclusive .loc {}",
+                                    guest_path);
+                    }
+                    ctx.r3.u64 = kStatusObjectNameNotFound;
+                    return;
+                }
+
+                // Non-.loc city-art path: synthetic dummy VFS handle.
+                uint32_t handle_out = ctx.r3.u32;  // HANDLE* output pointer
+
+                // Write the dummy handle to the output pointer
+                if (handle_out) {
+                    view.WriteU32BE(handle_out, kDummyLocHandle);
+                }
+                // Fill IO_STATUS_BLOCK: Status = STATUS_SUCCESS (0), Information = FILE_OPENED (1)
+                if (iosb) {
+                    view.WriteU32BE(iosb + 0, 0);
+                    view.WriteU32BE(iosb + 4, 1);
+                }
+
+                static std::unordered_set<std::string> s_seen;
+                if (s_seen.insert(guest_path).second) {
+                    REXLOG_WARN("NtCreateFile -> dummy VFS handle 0x{:08X} for {}",
+                                kDummyLocHandle, guest_path);
+                }
+                ctx.r3.u64 = 0;  // STATUS_SUCCESS
+                return;
             }
             
             // Check for t:\ paths - use VFS
@@ -793,11 +900,17 @@ REX_FUNC(hk_NtCreateFile) {
                 }
                 std::replace(path.begin(), path.end(), '\\', '/');
                 
-                if (vfs.Exists(path)) {
-                    REXLOG_INFO("NtCreateFile: VFS hit for t:\\ path: {}", path);
+                std::string vfs_path = vfs.GuestToVirtualPath(guest_path);
+                if (vfs.Exists(vfs_path)) {
+                    REXLOG_INFO("NtCreateFile: VFS hit for t:\\ path: {} -> {}", guest_path, vfs_path);
                     // File exists in VFS - we should handle this properly
                     // For now, let original handle it (will fail if not in host FS)
                     // TODO: Implement proper VFS file handle creation
+                } else {
+                    static std::unordered_set<std::string> s_vfs_miss;
+                    if (s_vfs_miss.insert(vfs_path).second) {
+                        REXLOG_WARN("NtCreateFile: VFS miss for t:\\ path: {} (virtual: {})", guest_path, vfs_path);
+                    }
                 }
             }
         }
@@ -805,6 +918,84 @@ REX_FUNC(hk_NtCreateFile) {
 
     if (g_original_NtCreateFile) {
         g_original_NtCreateFile(ctx, base);
+    }
+}
+
+// Hook: NtReadFile (0x827BD914).
+// If the handle is our synthetic dummy VFS handle (0x7FFF0001), report
+// STATUS_END_OF_FILE with 0 bytes read so the RAGE .loc loader sees an
+// empty file and continues without stalling.
+REX_FUNC(hk_NtReadFile) {
+    if (ctx.r3.u32 == kDummyLocHandle) {
+        mcla::native::GuestMemoryView view;
+        uint32_t iosb = ctx.r7.u32;
+        if (iosb) {
+            view.WriteU32BE(iosb + 0, 0xC0000011);  // STATUS_END_OF_FILE
+            view.WriteU32BE(iosb + 4, 0);           // 0 bytes read
+        }
+        static int s_readLogCount = 0;
+        if (s_readLogCount++ < 5) {
+            REXLOG_INFO("hk_NtReadFile: dummy handle 0x7FFF0001 -> STATUS_END_OF_FILE (0 bytes)");
+        }
+        ctx.r3.u64 = 0xC0000011;  // STATUS_END_OF_FILE
+        return;
+    }
+    if (g_original_NtReadFile) {
+        g_original_NtReadFile(ctx, base);
+    }
+}
+
+// Hook: NtQueryInformationFile (0x827BD9D4).
+// If the handle is our synthetic dummy VFS handle, fill the buffer with
+// zeros (0-byte file semantics) and return STATUS_SUCCESS.  The RAGE
+// loader primarily queries FileStandardInformation (class 5, 24 bytes)
+// and FileNetworkOpenInformation (class 34, 56 bytes) for file size.
+// Zero-filled AllocationSize/EndOfFile makes the archive appear empty.
+REX_FUNC(hk_NtQueryInformationFile) {
+    if (ctx.r3.u32 == kDummyLocHandle) {
+        mcla::native::GuestMemoryView view;
+        uint32_t iosb = ctx.r4.u32;
+        uint32_t buffer = ctx.r5.u32;
+        uint32_t length = ctx.r6.u32;
+        uint32_t cls = ctx.r7.u32;
+
+        constexpr uint32_t kMaxFill = 4096;
+        uint32_t fill = (length > kMaxFill) ? kMaxFill : length;
+        std::vector<uint8_t> zeros(fill, 0);
+        if (buffer) {
+            view.WriteBytes(buffer, zeros.data(), fill);
+        }
+        if (iosb) {
+            view.WriteU32BE(iosb + 0, 0);      // STATUS_SUCCESS
+            view.WriteU32BE(iosb + 4, fill);   // bytes written
+        }
+        static int s_qifLogCount = 0;
+        if (s_qifLogCount++ < 5) {
+            REXLOG_INFO("hk_NtQueryInformationFile: dummy handle 0x7FFF0001 class={} len={} -> STATUS_SUCCESS ({} bytes zero)",
+                        cls, length, fill);
+        }
+        ctx.r3.u64 = 0;  // STATUS_SUCCESS
+        return;
+    }
+    if (g_original_NtQueryInformationFile) {
+        g_original_NtQueryInformationFile(ctx, base);
+    }
+}
+
+// Hook: NtClose (0x827BCEB4).
+// If the handle is our synthetic dummy VFS handle, just return
+// STATUS_SUCCESS without chaining to the real kernel.
+REX_FUNC(hk_NtClose) {
+    if (ctx.r3.u32 == kDummyLocHandle) {
+        static int s_closeLogCount = 0;
+        if (s_closeLogCount++ < 5) {
+            REXLOG_INFO("hk_NtClose: dummy handle 0x7FFF0001 -> STATUS_SUCCESS");
+        }
+        ctx.r3.u64 = 0;  // STATUS_SUCCESS
+        return;
+    }
+    if (g_original_NtClose) {
+        g_original_NtClose(ctx, base);
     }
 }
 
