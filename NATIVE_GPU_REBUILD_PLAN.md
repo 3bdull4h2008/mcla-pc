@@ -2046,6 +2046,37 @@ The game boots but stalls on the Rockstar splash screen (Press Start never appea
 - Build clean (14/14 ninja steps)
 - VFS initializes and mounts at startup via `mcla_ApplyPatches()`
 
+### Phase 9 Progress — RW-Chunk TXD/DFF Parsers (Complete)
+
+Replaced the `TxdParser`/`DffParser` placeholders in `rage_asset_pipeline.*`
+with bounded, endian-explicit RenderWare-chunk parsers (commit `a6e58ff`):
+
+- RW chunk constants (`RW_STRUCT`..`RW_CLUMP`), `RwChunkHeader`, assumed
+  `TxFormat` enum and `TxdTextureStruct` layout added to the header.
+- `ReadU16LE` / `ReadF32LE` / `ReadRwChunk` helpers: explicit LE reads, no
+  `reinterpret_cast` on asset data; `ReadRwChunk` masks library/flags bits
+  from type/size and every payload/array read is bounds-checked against the
+  entry extent (malformed data cannot OOB).
+- `TxdParser`: dictionary → struct(count) → per-texture struct + native
+  payload; captures name hash, dims, format, mips and raw native bytes.
+  Native-header layout is **assumed**; parser logs a warning rather than
+  guessing field values (validation gap below).
+- `DffParser`: accepts `RW_CLUMP` or `RW_ATOMIC` roots, scans top-level
+  children for `GEOMETRY_LIST`, decodes standard RW3 geometry flags to
+  extract positions/normals/texcoords/indices.
+- `LoadModel` guards against empty mesh lists before indexing `meshes[0]`.
+
+Verified: clean clang-cl build (2/2) and all offline validators CLEAN —
+`phase3` (551 containers / 762 fetches, 0 unsupported), `shader_pipeline`
+(551 parsed, 0 errors), `xenos_decode` (514 shaders, **0 unknown, 0 OOB**),
+`backend`, `capture_dump`, `xtr_dump`.
+
+**Unresolved assumption (named):** TXD texture-struct and native-header
+field layout is inferred from RenderWare conventions, not from a live
+capture. Before wiring real `.txd` textures into the native renderer, the
+layout must be validated against captured guest bytes. `.stream`/`.strm`
+streaming loading remains unimplemented (only needed to reach first draw).
+
 ### Next Steps for Phase 9 (In Progress)
 
 #### 1. Guest File System / RPF Mounting (Complete)
@@ -2055,8 +2086,10 @@ The game boots but stalls on the Rockstar splash screen (Press Start never appea
 
 #### 2. Art Asset Pipeline (In Progress)
 - ✅ RPF virtual filesystem provides file access
+- ✅ RW-chunk `.dff` / `.txd` parsers (bounded, endian-explicit); format
+  layout marked assumed pending capture validation
+- ⬜ Validate `.dff` / `.txd` field layouts against a live capture
 - ⬜ Implement `.stream` / `.strm` streaming texture/mesh loading
-- ⬜ Validate `.dff` (model) / `.txd` (texture) format parsing
 - ⬜ Wire VFS file handles to native renderer texture/geometry loading
 
 #### 3. Boot Progression Verification (Validation Gate)
