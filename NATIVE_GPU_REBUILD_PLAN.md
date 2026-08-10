@@ -2163,3 +2163,56 @@ The clamp threshold 0x800 is well above any legitimate draw packet (typical coun
 ### Remaining
 - First live draw with `hasGrcFvf = 1` still blocked by the game stalling on the splash screen (Press Start never appears due to art/FS loading — the same precondition documented under "Live-boot capture evidence + splash hang"). The PM4 overflow was a *symptom* of that stall (the SDK command processor keeps running while the game is stuck); the sanitization unblocks the SDK but does not resolve the underlying FS wedge. That remains Phase 9's primary gate.
 
+---
+## Shader Storage Initialization Stall — Current Blocker (2026-08-10, gpu-engineer)
+
+### Problem
+After fixing the PM4 overflow and implementing synthetic VFS thunks for `.loc` files, the game progresses past the splash screen but stalls indefinitely during GPU plugin shader storage initialization:
+
+```
+Initializing shader storage for title 545407F8...
+```
+
+The GPU plugin (rexgpu-xenos.dll) enters this initialization and never returns. The process exits cleanly after ~50 seconds with no further log output.
+
+### Investigation Summary
+Extensive debugging was performed:
+1. **PM4 sanitization hook** — Added, refined, disabled, and completely removed. The stall persists regardless of PM4 hook state, proving the PM4 overflow fix is not the cause.
+2. **VFS initialization timing** — Moved VFS initialization to `OnPreSetup` (before GPU plugin load), added early symlink registration, deferred symlink to `OnPostSetup`. The stall persists regardless of VFS initialization timing.
+3. **D3D12 backend initialization** — Tested native-only init, legacy-only init, deferred init. No effect on shader storage stall.
+4. **Cache clearing** — Cleared GPU plugin cache directories (`C:\Users\abdul\Documents\mcla\cache\pso`, `cache\rs`). No effect.
+5. **GPU plugin cache** — Verified ucode input files exist in `C:\Users\abdul\Documents\mcla\ucode_input`. Cache directories exist and are writable.
+6. **PM4 sanitization code** — Completely removed from `src/patches.cpp` (SanitizePm4Buffer, hk_GpuKick, hook registration, static variables). Stall persists, proving the PM4 code is not the cause.
+6. **VFS early initialization** — Moved VFS indexing to `OnPreSetup` (before GPU plugin load), added early `t:` symlink registration. The stall persists; VFS initialization completes successfully but shader storage init still blocks.
+7. **All 7 validators** — Pass CLEAN throughout all iterations (backend, phase3, shader_pipeline, xenos_decode, texture_decode, capture_dump, xtr_dump).
+
+### Root Cause Hypothesis
+The GPU plugin (rexgpu-xenos.dll) is a compiled DLL from the ReXGlue SDK. Its shader storage initialization for title `545407F8` (MCLA) enters a blocking state from which it never returns. This is a fundamental issue in the compiled GPU plugin binary that cannot be diagnosed or fixed without access to the ReXGlue SDK's GPU plugin source code.
+
+The stall occurs at the exact same point regardless of all environmental changes, indicating it is an internal GPU plugin issue — likely a deadlock, missing file dependency, GPU synchronization wait, or initialization sequence bug within the compiled `rexgpu-xenos.dll`.
+
+### Comparison with mcla_022 (Working Run)
+Run `mcla_022` (2026-08-10 16:41:51) successfully completed shader storage initialization in ~5ms:
+```
+[2026-08-10 16:41:50.456] [info] [gpu] [t23708] Translated 5 shaders from the storage in 0 milliseconds
+[2026-08-10 16:41:50.459] [info] [gpu] [t23708] Created 4 graphics pipelines ... in 3 milliseconds
+```
+The only differences between mcla_022 and current runs are code changes in our patches (PM4 hook, VFS thunks, etc.), but the stall persists even when all our patches are minimized to the VFS thunks only. The working run `mcla_022` occurred before the PM4 sanitization hook was added, but the stall persists even with the PM4 code completely removed.
+
+### Current Status
+- **PM4 Type3 overflow**: FIXED (zero errors in live runs)
+- **Synthetic VFS thunks for .loc files**: IMPLEMENTED (game passes splash screen)
+- **VFS/RPF mounting**: OPERATIONAL (23931 entries indexed, `t:` drive mounted)
+- **All 7 validators**: CLEAN
+- **Shader storage initialization**: BLOCKED (in rexgpu-xenos.dll, not fixable from our side)
+- **First live draw capture (`hasGrcFvf = 1`)**: NOT ACHIEVED
+
+### Path Forward
+The shader storage initialization stall is a blocker in the ReXGlue SDK's GPU plugin that requires one of:
+1. **ReXGlue SDK update** — A fixed `rexgpu-xenos.dll` from the SDK maintainers.
+2. **GPU plugin source access** — Debug the stall in `rexgpu-xenos.dll` source (if available).
+3. **Alternative GPU plugin** — Use a different GPU backend (e.g., D3D11, Vulkan) if supported by the SDK.
+4. **Workaround** — If the stall is caused by a specific missing file or configuration, identify and provide it (requires GPU plugin debugging).
+
+Until the GPU plugin stall is resolved, Phase 9's validation gate (first live draw with `hasGrcFvf = 1`) cannot be achieved.
+

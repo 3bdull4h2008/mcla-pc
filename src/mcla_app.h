@@ -10,6 +10,8 @@
 #include "generated/default/mcla_init.h"
 #include "patches.h"
 #include "d3d12_backend.h"
+#include "vfs_rpf.h"
+#include "renderer_mode.h"
 
 // Pre-create empty .loc stubs for t:\mc4\art\city\*.loc BEFORE the runtime
 // mounts the VFS.  The RAGE city-art loader opens these RPF3 archives that
@@ -59,6 +61,33 @@ public:
     }
 
     void OnPreSetup(rex::RuntimeConfig& config) override {
+        // Initialize VFS BEFORE loading GPU plugin, so GPU Commands thread
+        // has access to the VFS during its initialization.  The VFS indexing
+        // takes ~2-3s for 23931 entries; doing it here avoids a race where
+        // the GPU Commands thread starts before the VFS is ready.
+        {
+            mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+            static const char* kCandidateRoots[] = {
+                "E:/mcla pc/xarchive_cache",
+                "E:/mcla pc/xarchive_audio",
+                "E:/mcla pc/xarchive_music",
+                "E:/mcla pc/xarchive_audlo",
+                "E:/mcla pc/mcla extracted cache",
+            };
+            bool ok = false;
+            for (const char* root : kCandidateRoots) {
+                if (vfs.Initialize(root)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                REXLOG_ERROR("Failed to initialize VFS for RPF archive mounting");
+            } else {
+                REXLOG_WARN("VFS initialized for RPF archive mounting (early, before GPU plugin)");
+            }
+        }
+
         config.gpu_plugin = "xenos";
     }
 
@@ -85,6 +114,7 @@ public:
         auto* vfs = runtime()->file_system();
         if (vfs) {
             vfs->RegisterSymbolicLink("t:", "update:");
+            REXLOG_WARN("Registered t: symlink to update:");
         }
 
         // Initialize the native D3D12 backend on the MAIN thread.  D3D12
@@ -92,16 +122,22 @@ public:
         // thread that owns the window (E_ACCESSDENIED otherwise).  The VdSwap
         // hook fires on a guest game thread, so lazy init from there always
         // fails; do it here where the window thread is guaranteed.
-        auto* win = runtime()->display_window();
-        if (win) {
-            HWND hwnd = reinterpret_cast<HWND>(win->GetNativeWindowHandle());
-            if (hwnd) {
-                mcla::native::GetD3D12Backend()->Initialize(
-                    hwnd, win->GetActualPhysicalWidth(), win->GetActualPhysicalHeight());
-            } else {
-                REXLOG_WARN("MCLAApp: display window has no native handle; "
-                            "native backend will init lazily from VdSwap (may fail)");
+        // Only initialize in native renderer mode; in legacy mode the rex GPU
+        // plugin manages the swap chain.
+        if (mcla::renderer::GetRendererMode() == mcla::renderer::RendererMode::Native) {
+            auto* win = runtime()->display_window();
+            if (win) {
+                HWND hwnd = reinterpret_cast<HWND>(win->GetNativeWindowHandle());
+                if (hwnd) {
+                    mcla::native::GetD3D12Backend()->Initialize(
+                        hwnd, win->GetActualPhysicalWidth(), win->GetActualPhysicalHeight());
+                } else {
+                    REXLOG_WARN("MCLAApp: display window has no native handle; "
+                                "native backend will init lazily from VdSwap (may fail)");
+                }
             }
+        } else {
+            REXLOG_INFO("MCLAApp: renderer_mode=legacy/capture; skipping native D3D12 backend init");
         }
     }
 
