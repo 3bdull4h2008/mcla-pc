@@ -30,6 +30,29 @@ static uint32_t ReadU32LE(const uint8_t* data) {
            (static_cast<uint32_t>(data[3]) << 24);
 }
 
+static uint16_t ReadU16LE(const uint8_t* data) {
+    return static_cast<uint16_t>(data[0]) |
+           (static_cast<uint16_t>(data[1]) << 8);
+}
+
+static float ReadF32LE(const uint8_t* data) {
+    uint32_t bits = ReadU32LE(data);
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Reads a 12-byte RW chunk header (LE), masking off library/flags bits.
+// Advances ptr past the header on success.
+static bool ReadRwChunk(const uint8_t*& ptr, const uint8_t* end, RwChunkHeader& out) {
+    if (end - ptr < 12) return false;
+    out.type = ReadU32LE(ptr) & 0xFFFFu;
+    out.size = ReadU32LE(ptr + 4) & 0x00FFFFFFu;
+    out.version = ReadU32LE(ptr + 8);
+    ptr += 12;
+    return true;
+}
+
 // CsrContainer implementation
 bool CsrContainer::Parse(const uint8_t* data, size_t size) {
     if (size < sizeof(CsrHeader)) {
@@ -173,19 +196,250 @@ bool RageAssetManager::ParseCsrEntry(const CsrEntry& entry) {
     return true;
 }
 
+// Parses a single RW geometry into a DffMesh (positions/normals/uvs/indices).
+// Uses standard RW3 flags; exact RAGE layout needs capture validation.
+static bool ParseGeometry(const uint8_t* ptr, const uint8_t* end, DffMesh& out_mesh) {
+    RwChunkHeader struct_hdr;
+    if (!ReadRwChunk(ptr, end, struct_hdr) || struct_hdr.type != RW_STRUCT) return false;
+    const uint8_t* struct_end = ptr + struct_hdr.size;
+    if (struct_end > end) struct_end = end;
+    if (struct_end - ptr < 16) return false;
+
+    const uint32_t flags = ReadU32LE(ptr);
+    const uint32_t num_triangles = ReadU32LE(ptr + 4);
+    const uint32_t num_vertices = ReadU32LE(ptr + 8);
+    const uint32_t num_frames = ReadU32LE(ptr + 12);
+    ptr += 16;
+
+    const bool has_positions = (flags & 0x02u) != 0;
+    const bool has_normals = (flags & 0x10u) != 0;
+    const bool has_colors = (flags & 0x08u) != 0;
+    const uint32_t num_uv_sets = (flags & 0x80u) ? 2u : ((flags & 0x04u) ? 1u : 0u);
+
+    out_mesh.hash = 0;
+    out_mesh.material_hash = 0;
+
+    // Triangles: 3 x u16 index per triangle.
+    if (struct_end - ptr < num_triangles * 6) return false;
+    out_mesh.indices.reserve(num_triangles * 3);
+    for (uint32_t t = 0; t < num_triangles; ++t) {
+        out_mesh.indices.push_back(ReadU16LE(ptr));
+        out_mesh.indices.push_back(ReadU16LE(ptr + 2));
+        out_mesh.indices.push_back(ReadU16LE(ptr + 4));
+        ptr += 6;
+    }
+
+    // Per-frame vertex groups.
+    if (struct_end - ptr < num_frames * 8) return false;
+    ptr += num_frames * 8;
+
+    // Vertices.
+    if (has_positions) {
+        if (struct_end - ptr < num_vertices * 12) return false;
+        out_mesh.positions.reserve(num_vertices * 3);
+        for (uint32_t v = 0; v < num_vertices; ++v) {
+            out_mesh.positions.push_back(ReadF32LE(ptr));
+            out_mesh.positions.push_back(ReadF32LE(ptr + 4));
+            out_mesh.positions.push_back(ReadF32LE(ptr + 8));
+            ptr += 12;
+        }
+    }
+    if (has_normals) {
+        if (struct_end - ptr < num_vertices * 12) return false;
+        out_mesh.normals.reserve(num_vertices * 3);
+        for (uint32_t v = 0; v < num_vertices; ++v) {
+            out_mesh.normals.push_back(ReadF32LE(ptr));
+            out_mesh.normals.push_back(ReadF32LE(ptr + 4));
+            out_mesh.normals.push_back(ReadF32LE(ptr + 8));
+            ptr += 12;
+        }
+    }
+    if (num_uv_sets > 0) {
+        if (struct_end - ptr < num_uv_sets * num_vertices * 8) return false;
+        out_mesh.texcoords.reserve(num_uv_sets * num_vertices * 2);
+        for (uint32_t s = 0; s < num_uv_sets; ++s) {
+            for (uint32_t v = 0; v < num_vertices; ++v) {
+                out_mesh.texcoords.push_back(ReadF32LE(ptr));
+                out_mesh.texcoords.push_back(ReadF32LE(ptr + 4));
+                ptr += 8;
+            }
+        }
+    }
+    if (has_colors) {
+        if (struct_end - ptr < num_vertices * 4) return false;
+        ptr += num_vertices * 4;
+    }
+
+    REXLOG_INFO("DFF: geometry flags=0x%X vtx=%u tri=%u uv_sets=%u",
+                flags, num_vertices, num_triangles, num_uv_sets);
+    return true;
+}
+
+// Walks the GEOMETRY_LIST chunk body.
+static bool ParseGeometryList(const uint8_t* ptr, const uint8_t* end, DffModel& out_model) {
+    RwChunkHeader struct_hdr;
+    if (!ReadRwChunk(ptr, end, struct_hdr) || struct_hdr.type != RW_STRUCT) return false;
+    if (end - ptr < 4) return false;
+    const uint32_t num_geoms = ReadU32LE(ptr);
+    ptr += 4;
+
+    for (uint32_t g = 0; g < num_geoms && ptr < end; ++g) {
+        RwChunkHeader geom_hdr;
+        if (!ReadRwChunk(ptr, end, geom_hdr) || geom_hdr.type != RW_GEOMETRY) {
+            REXLOG_WARN("DFF: Expected geometry chunk %u", g);
+            return false;
+        }
+        const uint8_t* geom_end = ptr + geom_hdr.size;
+        if (geom_end > end) geom_end = end;
+
+        DffMesh mesh = {};
+        if (!ParseGeometry(ptr, geom_end, mesh)) {
+            REXLOG_ERROR("DFF: Geometry %u parse failed", g);
+            return false;
+        }
+        out_model.meshes.push_back(std::move(mesh));
+        ptr = geom_end;
+    }
+    return true;
+}
+
 // TxdParser implementation
 bool TxdParser::Parse(const uint8_t* data, size_t size, TxdDictionary& out_dict) {
-    // TXD format parsing - simplified for now
-    // Real implementation would parse TXD chunks
-    REXLOG_WARN("TXD parsing not fully implemented");
-    return false;
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
+
+    RwChunkHeader txd_hdr;
+    if (!ReadRwChunk(ptr, end, txd_hdr)) {
+        REXLOG_ERROR("TXD: Failed to read dictionary chunk header");
+        return false;
+    }
+    if (txd_hdr.type != RW_TEXTURE_DICTIONARY) {
+        REXLOG_ERROR("TXD: Not a texture dictionary (type=0x%X)", txd_hdr.type);
+        return false;
+    }
+    const uint8_t* txd_end = ptr + txd_hdr.size;
+    if (txd_end > end) txd_end = end;
+
+    RwChunkHeader struct_hdr;
+    if (!ReadRwChunk(ptr, txd_end, struct_hdr) || struct_hdr.type != RW_STRUCT) {
+        REXLOG_ERROR("TXD: Expected struct chunk");
+        return false;
+    }
+    const uint8_t* struct_end = ptr + struct_hdr.size;
+    if (struct_end > txd_end) struct_end = txd_end;
+    if (struct_end - ptr < 4) return false;
+
+    const uint32_t tex_count = ReadU16LE(ptr);
+    ptr += 4; // u16 count + u16 padding
+
+    REXLOG_INFO("TXD: %u textures", tex_count);
+    out_dict.textures.clear();
+    out_dict.textures.reserve(tex_count);
+
+    for (uint32_t i = 0; i < tex_count && ptr < txd_end; ++i) {
+        RwChunkHeader tex_hdr;
+        if (!ReadRwChunk(ptr, txd_end, tex_hdr) || tex_hdr.type != RW_TEXTURE) {
+            REXLOG_ERROR("TXD: Expected texture chunk %u", i);
+            return false;
+        }
+        const uint8_t* tex_end = ptr + tex_hdr.size;
+        if (tex_end > txd_end) tex_end = txd_end;
+
+        TxdTexture texture = {};
+        texture.hash = 0;
+        texture.width = 0;
+        texture.height = 0;
+        texture.format = 0;
+        texture.mip_levels = 1;
+
+        // Texture struct (assumed layout; validate against capture).
+        RwChunkHeader ts_hdr;
+        if (ReadRwChunk(ptr, tex_end, ts_hdr) && ts_hdr.type == RW_STRUCT) {
+            const size_t ts_len = std::min<uint32_t>(ts_hdr.size, static_cast<uint32_t>(tex_end - ptr));
+            if (ts_len >= 8) {
+                TxdTextureStruct s = {};
+                s.name_hash = ReadU32LE(ptr);
+                s.width = ReadU16LE(ptr + 4);
+                s.height = ReadU16LE(ptr + 6);
+                s.mipmaps = (ts_len >= 10) ? ptr[8] : 0;
+                s.format = (ts_len >= 11) ? ptr[9] : 0;
+                texture.hash = s.name_hash;
+                texture.width = s.width;
+                texture.height = s.height;
+                texture.format = s.format;
+                if (s.mipmaps) texture.mip_levels = s.mipmaps;
+            }
+            ptr += ts_len;
+        }
+
+        // Walk sub-chunks: name string, then native texture payload.
+        while (ptr < tex_end) {
+            RwChunkHeader sub;
+            const uint8_t* sub_start = ptr;
+            if (!ReadRwChunk(ptr, tex_end, sub)) break;
+            if (sub.type == RW_TEXTURE_NATIVE) {
+                const size_t avail = static_cast<size_t>(tex_end - ptr);
+                const size_t nlen = std::min<uint32_t>(sub.size, static_cast<uint32_t>(avail));
+                if (nlen > 0) {
+                    texture.data.assign(ptr, ptr + nlen);
+                    REXLOG_WARN("TXD[%u]: native payload %zu bytes; header layout unvalidated",
+                                i, nlen);
+                }
+                ptr += nlen;
+                break;
+            }
+            ptr = sub_start + 12;
+            ptr += std::min<uint32_t>(sub.size, static_cast<uint32_t>(tex_end - ptr));
+        }
+
+        out_dict.textures.push_back(std::move(texture));
+        REXLOG_INFO("TXD[%u]: %ux%u fmt=%u mips=%u bytes=%zu", i,
+                    texture.width, texture.height, texture.format,
+                    texture.mip_levels, texture.data.size());
+    }
+    return true;
 }
 
 // DffParser implementation
 bool DffParser::Parse(const uint8_t* data, size_t size, DffModel& out_model) {
-    // DFF format parsing - simplified for now
-    REXLOG_WARN("DFF parsing not fully implemented");
-    return false;
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
+
+    RwChunkHeader root;
+    if (!ReadRwChunk(ptr, end, root)) {
+        REXLOG_ERROR("DFF: Failed to read root chunk");
+        return false;
+    }
+    if (root.type != RW_CLUMP && root.type != RW_ATOMIC) {
+        REXLOG_ERROR("DFF: Not a clump/atomic (type=0x%X)", root.type);
+        return false;
+    }
+
+    out_model.meshes.clear();
+
+    // Walk top-level children looking for GEOMETRY_LIST.
+    const uint8_t* cur = data + 12;
+    while (cur + 12 <= end) {
+        RwChunkHeader hdr;
+        const uint8_t* chunk_start = cur;
+        if (!ReadRwChunk(cur, end, hdr)) break;
+        const uint8_t* chunk_end = cur + hdr.size;
+        if (chunk_end > end) chunk_end = end;
+
+        if (hdr.type == RW_GEOMETRY_LIST) {
+            if (!ParseGeometryList(cur, chunk_end, out_model)) {
+                REXLOG_ERROR("DFF: Geometry list parse failed");
+                return false;
+            }
+        }
+        cur = chunk_start + 12 + hdr.size;
+    }
+
+    if (out_model.meshes.empty()) {
+        REXLOG_WARN("DFF: No geometry found (chunk layout may differ)");
+        return false;
+    }
+    return true;
 }
 // RageAssetManager implementation
 
@@ -228,7 +482,7 @@ bool RageAssetManager::LoadModel(uint32_t hash) {
             const uint8_t* data = container.GetEntryData(entry);
             if (data) {
                 DffModel model;
-                if (DffParser::Parse(data, entry.size, model)) {
+                if (DffParser::Parse(data, entry.size, model) && !model.meshes.empty()) {
                     // Store model geometry
                     m_model_positions[hash] = model.meshes[0].positions; // Simplified
                     m_model_normals[hash] = model.meshes[0].normals;

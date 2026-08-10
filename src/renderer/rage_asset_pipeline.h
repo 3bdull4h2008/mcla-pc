@@ -16,6 +16,55 @@
 
 namespace mcla::rage {
 
+// RW (RenderWare) chunk ids used by .dff/.txd assets.
+// Stored little-endian in file; type/size carry optional library/flags bits
+// that ReadRwChunk masks off.
+enum RwChunkType : uint32_t {
+    RW_STRUCT = 0x0001,
+    RW_STRING = 0x0002,
+    RW_EXTENSION = 0x0003,
+    RW_CAMERA = 0x0004,
+    RW_TEXTURE = 0x0005,
+    RW_MATERIAL = 0x0006,
+    RW_MATERIAL_LIST = 0x0007,
+    RW_FRAME_LIST = 0x0008,
+    RW_GEOMETRY = 0x0009,
+    RW_GEOMETRY_LIST = 0x000A,
+    RW_ATOMIC = 0x000B,
+    RW_TEXTURE_NATIVE = 0x000C,
+    RW_TEXTURE_DICTIONARY = 0x000D,
+    RW_CLUMP = 0x0010,
+};
+
+// 12-byte chunk header: type, payload size, version (all LE on disk).
+struct RwChunkHeader {
+    uint32_t type;
+    uint32_t size;
+    uint32_t version;
+};
+
+// Assumed RAGE texture pixel formats (needs capture validation).
+enum TxFormat : uint32_t {
+    TEX_FMT_DXT1 = 0,
+    TEX_FMT_DXT3 = 1,
+    TEX_FMT_DXT5 = 2,
+    TEX_FMT_RGBA8888 = 4,
+    TEX_FMT_RGB888 = 5,
+    TEX_FMT_RGB565 = 6,
+    TEX_FMT_ARGB8888 = 7,
+};
+
+// Assumed texture struct layout inside a TXD (needs capture validation).
+struct TxdTextureStruct {
+    uint32_t name_hash;
+    uint16_t width;
+    uint16_t height;
+    uint8_t mipmaps;
+    uint8_t format;
+    uint16_t flags;
+    uint32_t data_size;
+};
+
 // RAGE CSR Container Header
 struct CsrHeader {
     uint8_t version;          // 0x05
