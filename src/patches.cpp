@@ -800,12 +800,13 @@ REX_FUNC(hk_NtCreateFile) {
             StubNtCreateFileCityLoc(guest_path);
             
             // Synthetic handling for .loc / city-art paths the host cannot serve.
-            // .loc files are dev-exclusive (absent from retail), so the correct
-            // behavior is STATUS_OBJECT_NAME_NOT_FOUND: the loader then follows
-            // the same "file absent" path retail takes instead of a success
-            // handle that yields an impossible empty-file state and wedges.
+            // .loc files are dev-exclusive (absent from retail).  Pre-mounted
+            // 0-byte host stubs exist under update_data_root\mc4\art\city, so we
+            // chain .loc opens to the real NtCreateFile (empty stream -> EOF)
+            // rather than returning STATUS_OBJECT_NAME_NOT_FOUND, which wedged
+            // the RAGE loader at frame ~6.  Non-.loc city-art gets the synthetic
+            // dummy VFS handle.
             if (IsDummyVfsPath(guest_path)) {
-                constexpr uint32_t kStatusObjectNameNotFound = 0xC0000034;
                 uint32_t iosb = ctx.r6.u32;  // IO_STATUS_BLOCK* (Status @+0, Information @+4)
 
                 bool is_loc = false;
@@ -819,40 +820,40 @@ REX_FUNC(hk_NtCreateFile) {
                 }
 
                 if (is_loc) {
-                    // Fill IO_STATUS_BLOCK: Status = STATUS_OBJECT_NAME_NOT_FOUND, Information = 0.
-                    if (iosb) {
-                        view.WriteU32BE(iosb + 0, kStatusObjectNameNotFound);
-                        view.WriteU32BE(iosb + 4, 0);
-                    }
+                    // .loc files are dev-exclusive test maps absent from the
+                    // host game_data tree, but pre-mounted 0-byte stubs exist
+                    // under update_data_root\mc4\art\city (MclaPrecreateArtCityStubs
+                    // runs before the runtime mounts the VFS).  Chain to the real
+                    // NtCreateFile so it serves the real empty stream (NtReadFile
+                    // -> EOF) instead of returning STATUS_OBJECT_NAME_NOT_FOUND,
+                    // which wedges the RAGE loader at frame ~6.
                     static std::unordered_set<std::string> s_seen;
                     if (s_seen.insert(guest_path).second) {
-                        REXLOG_WARN("NtCreateFile -> STATUS_OBJECT_NAME_NOT_FOUND for dev-exclusive .loc {}",
-                                    guest_path);
+                        REXLOG_WARN("NtCreateFile .loc {} -> host stub pass-through "
+                                    "(chaining to real NtCreateFile)", guest_path);
                     }
-                    ctx.r3.u64 = kStatusObjectNameNotFound;
+                } else {
+                    // Non-.loc city-art path: synthetic dummy VFS handle.
+                    uint32_t handle_out = ctx.r3.u32;  // HANDLE* output pointer
+
+                    // Write the dummy handle to the output pointer
+                    if (handle_out) {
+                        view.WriteU32BE(handle_out, kDummyLocHandle);
+                    }
+                    // Fill IO_STATUS_BLOCK: Status = STATUS_SUCCESS (0), Information = FILE_OPENED (1)
+                    if (iosb) {
+                        view.WriteU32BE(iosb + 0, 0);
+                        view.WriteU32BE(iosb + 4, 1);
+                    }
+
+                    static std::unordered_set<std::string> s_seen;
+                    if (s_seen.insert(guest_path).second) {
+                        REXLOG_WARN("NtCreateFile -> dummy VFS handle 0x{:08X} for {}",
+                                    kDummyLocHandle, guest_path);
+                    }
+                    ctx.r3.u64 = 0;  // STATUS_SUCCESS
                     return;
                 }
-
-                // Non-.loc city-art path: synthetic dummy VFS handle.
-                uint32_t handle_out = ctx.r3.u32;  // HANDLE* output pointer
-
-                // Write the dummy handle to the output pointer
-                if (handle_out) {
-                    view.WriteU32BE(handle_out, kDummyLocHandle);
-                }
-                // Fill IO_STATUS_BLOCK: Status = STATUS_SUCCESS (0), Information = FILE_OPENED (1)
-                if (iosb) {
-                    view.WriteU32BE(iosb + 0, 0);
-                    view.WriteU32BE(iosb + 4, 1);
-                }
-
-                static std::unordered_set<std::string> s_seen;
-                if (s_seen.insert(guest_path).second) {
-                    REXLOG_WARN("NtCreateFile -> dummy VFS handle 0x{:08X} for {}",
-                                kDummyLocHandle, guest_path);
-                }
-                ctx.r3.u64 = 0;  // STATUS_SUCCESS
-                return;
             }
             
             // Check for t:\ paths - use VFS

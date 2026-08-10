@@ -2216,3 +2216,66 @@ The shader storage initialization stall is a blocker in the ReXGlue SDK's GPU pl
 
 Until the GPU plugin stall is resolved, Phase 9's validation gate (first live draw with `hasGrcFvf = 1`) cannot be achieved.
 
+---
+## `.loc` Error Handling Revert + Frame-6 Overflow Isolation (2026-08-11, gpu-engineer)
+
+### Change
+Reverted `hk_NtCreateFile`'s `.loc` handling from `STATUS_OBJECT_NAME_NOT_FOUND`
+(0xC0000034, introduced by fb017bb) back to **host pass-through (Path B)**:
+
+- `.loc` opens (`t:\mc4\art\city\*.loc`) now chain to the real `NtCreateFile`,
+  which serves the pre-mounted 0-byte stubs created by
+  `MclaPrecreateArtCityStubs` under `update_data_root\mc4\art\city`. The RAGE
+  loader reads the empty stream to EOF, matching the behavior of the only
+  known-working run (`mcla_003`).
+- Non-`.loc` city-art keeps the synthetic dummy VFS handle (`0x7FFF0001`).
+
+### Validation evidence
+- Rebuild clean (ninja `[2/2] Linking mcla.exe`).
+- `mcla_044.log`: `.loc` opens log `-> host stub pass-through (chaining to real
+  NtCreateFile)`; the `STATUS_OBJECT_NAME_NOT_FOUND` path no longer fires.
+- VdSwap still presents test-triangle frames 1-5 (`present_hr=0x00000000`), then
+  stops — the frame-6 wedge persists.
+
+### Outcome
+The `.loc` revert is correct and necessary (it restores the working run's
+behavior) but is **not sufficient**: it does not unblock frame progression. The
+actual wedge is the `ExecutePacketType3 overflow (read count 00000144, packet
+count 00010000)` on the SDK GPU command thread (thid 3), which fires **before**
+the `.loc` opens:
+
+```
+mcla_044: 15.944  ExecutePacketType3 overflow (gpu thread t25760)
+          15.969  NtCreateFile .loc ... -> host stub pass-through (core thread t2276)
+```
+
+### Overflow correlation (new evidence)
+The overflow only appears once VFS is active — it is a Phase 9 regression, not a
+`.loc` issue:
+
+| Run | VFS | Shader storage | Overflow | Outcome |
+| --- | --- | --- | --- | --- |
+| mcla_003 (08-08) | no (pre-Phase 9) | OK (709 shaders) | none | reached Press Start (`sub_82554E20[1..4]`) |
+| mcla_022 (08-10) | yes (23931 entries) | OK (5 shaders) | 51.370 / 51.405 | wedged at frame ~6 |
+| mcla_044 (08-11) | yes (23931 entries) | skipped (rex_app.cpp:471) | 15.944 / 15.978 | wedged at frame ~6 |
+
+Both game_data roots are byte-identical (default.xex MD5
+`062233A2DB24808D429FD0B539C1D4B4`, RPF sizes match), so the `E:\MCLA-Standalone`
+vs `E:\mcla pc\build\game_data` path change is not the cause.
+
+### Hypothesis
+With VFS serving real RPF content, the game loads real art and submits real draw
+work through the ring buffer for the first time. The SDK command processor
+misparses a RAGE-internal packet header (`((count-1)<<16)|base_reg`, count
+field = 0x3FFF) as Xenos PM4 Type3 claiming 0x10000 bytes. mcla_003 never
+submitted real draws (nothing loaded), so it never hit this.
+
+### Remaining blocker + planned fix
+The `sub_82412710` GPU-kick sanitizer hook (patches.cpp:493) never fires —
+recompiled code calls it via direct relative calls that bypass the dispatcher;
+only import-thunk detours (VdSwap, NtCreateFile, KeWait) fire. The planned fix is
+a **runtime in-memory patch of the loaded `rexgpu-xenos.dll`**: scan for
+`ExecutePacketType3 overflow`, walk back to the function start, and clamp the
+misparsed count field before the SDK aborts the indirect ring buffer.
+
+
