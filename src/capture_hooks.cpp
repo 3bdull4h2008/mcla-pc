@@ -137,6 +137,86 @@ void DrawPacketAccumulator::OnDrawBuild(::MclaGpuContext* gpuCtx, ::PPCContext& 
             m_lastCaptureFailed = true;
         }
     }
+
+    // Attempt to capture the RAGE grcFvf vertex declaration from the live
+    // drawable. The drawable pointer is observed at gpuCtx+10896 (0x2A90) in
+    // the recompiled draw-builder path. From the drawable we follow the
+    // shader-group -> vertex-declaration chain to reach the 16-byte m_Fvf block.
+    // Offsets are reverse-engineered from the MCLA recompilation; if any read
+    // fails we leave hasGrcFvf=0 and the native renderer falls back to the
+    // fixture stopgap (no invented data per Golden Rule 5).
+    {
+        constexpr uint32_t kDrawableOffset = 10896;  // gpuCtx+10896 -> grmDrawable*
+        uint32_t drawablePtr = 0;
+        if (m_memoryView.IsValidRange(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, 4)) {
+            m_memoryView.ReadU32BE(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, &drawablePtr);
+        }
+
+        // Common offset chain in RAGE (MCLA era): drawable+0x28 -> grmShaderGroup*,
+        // shaderGroup+0x10 -> Rsc5VertexDeclaration*, vdecl+0x10 -> 16-byte m_Fvf.
+        // We try a small set of plausible offsets; first valid fvfMask wins.
+        constexpr uint32_t kDrawableShaderGroupOff[] = { 0x28, 0x30, 0x38, 0x20 };
+        constexpr uint32_t kShaderGroupVDeclOff[]  = { 0x10, 0x18, 0x20, 0x08 };
+        constexpr uint32_t kVDeclFvfOff[]          = { 0x10, 0x20, 0x30, 0x08, 0x40 };
+
+        uint32_t fvfMask = 0;
+        uint8_t fvfSize = 0, flags = 0, dynamicOrder = 0, channelCount = 0;
+        uint64_t types = 0;
+        bool gotFvf = false;
+
+        for (uint32_t dsg : kDrawableShaderGroupOff) {
+            if (!drawablePtr) break;
+            uint32_t shaderGroupPtr = 0;
+            if (!m_memoryView.IsValidRange(drawablePtr + dsg, 4)) continue;
+            if (!m_memoryView.ReadU32BE(drawablePtr + dsg, &shaderGroupPtr) || !shaderGroupPtr) continue;
+
+            for (uint32_t sgv : kShaderGroupVDeclOff) {
+                if (!shaderGroupPtr) break;
+                uint32_t vdeclPtr = 0;
+                if (!m_memoryView.IsValidRange(shaderGroupPtr + sgv, 4)) continue;
+                if (!m_memoryView.ReadU32BE(shaderGroupPtr + sgv, &vdeclPtr) || !vdeclPtr) continue;
+
+                for (uint32_t vfo : kVDeclFvfOff) {
+                    if (!vdeclPtr) break;
+                    if (!m_memoryView.IsValidRange(vdeclPtr + vfo, 16)) continue;
+                    uint32_t mask = 0;
+                    uint8_t size = 0, fl = 0, dyn = 0, chcnt = 0;
+                    uint64_t ty = 0;
+                    // Read the 16-byte grcFvf block: u32 mask, u8 size, u8 flags, u8 dyn, u8 chcnt, u64 types
+                    if (m_memoryView.ReadU32BE(vdeclPtr + vfo + 0, &mask) &&
+                        m_memoryView.ReadU8(vdeclPtr + vfo + 4, &size) &&
+                        m_memoryView.ReadU8(vdeclPtr + vfo + 5, &fl) &&
+                        m_memoryView.ReadU8(vdeclPtr + vfo + 6, &dyn) &&
+                        m_memoryView.ReadU8(vdeclPtr + vfo + 7, &chcnt) &&
+                        m_memoryView.ReadU64BE(vdeclPtr + vfo + 8, &ty)) {
+                        // Basic plausibility: mask non-zero, size reasonable (<= 255 for u8), types non-zero
+                        if (mask != 0 && size != 0 && ty != 0) {
+                            fvfMask = mask;
+                            fvfSize = size;
+                            flags = fl;
+                            dynamicOrder = dyn;
+                            channelCount = chcnt;
+                            types = ty;
+                            gotFvf = true;
+                            break;
+                        }
+                    }
+                }
+                if (gotFvf) break;
+            }
+            if (gotFvf) break;
+        }
+
+        if (gotFvf) {
+            m_currentPacket.grcFvf.fvfMask = fvfMask;
+            m_currentPacket.grcFvf.fvfSize = fvfSize;
+            m_currentPacket.grcFvf.flags = flags;
+            m_currentPacket.grcFvf.dynamicOrder = dynamicOrder;
+            m_currentPacket.grcFvf.channelCount = channelCount;
+            m_currentPacket.grcFvf.types = types;
+            m_currentPacket.hasGrcFvf = 1;
+        }
+    }
 }
 
 void DrawPacketAccumulator::OnSubmit(::MclaGpuContext* gpuCtx, uint32_t) {

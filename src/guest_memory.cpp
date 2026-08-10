@@ -91,6 +91,15 @@ bool GuestMemoryView::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const {
     return true;
 }
 
+bool GuestMemoryView::ReadU64BE(uint32_t guestAddr, uint64_t* outVal) const {
+    const uint8_t* ptr = GetHostPtr(guestAddr, sizeof(uint64_t));
+    if (!ptr || !outVal) return false;
+    uint64_t val;
+    std::memcpy(&val, ptr, sizeof(val));
+    *outVal = rex::byte_swap(val);
+    return true;
+}
+
 bool GuestMemoryView::ReadF32BE(uint32_t guestAddr, float* outVal) const {
     const uint8_t* ptr = GetHostPtr(guestAddr, sizeof(float));
     if (!ptr || !outVal) return false;

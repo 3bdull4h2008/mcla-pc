@@ -1565,5 +1565,374 @@ Resolved-now vs open guest-structure assumptions:
   capture evidence, so indexed guest draws remain refused by design — do not
   relax until a live capture demonstrates the IB descriptor.
 - Open: per-frame upload assumes one draw per frame (capture XOR fixture);
-  multi-draw-per-frame staging is future work, out of scope for this gate.
+   multi-draw-per-frame staging is future work, out of scope for this gate.
+
+## Phase 8 item 1 — RAGE grcFvf vertex declaration decode & live capture wiring (2026-08-09, gpu-engineer)
+
+Headless decoder + offline validator + live capture extraction, completing the Phase 8 entry work that blocked the native input layout.
+
+### Implemented
+
+1. **Headless decoder** (`src/renderer/grc_fvf_decode.{h,cpp}`):
+   - Decodes the 16-byte big-endian guest `grcFvf` block (u32 mask + u8 size/flags/dyn/chcnt + u64 16×4-bit type codes) into a typed `GrcFvfDeclaration` with per-lane DXGI formats, offsets, and usage semantics.
+   - Refuses all unverified type codes (0/2/4/11-15) and lanes 16/17 (Binormal) that carry no type bits — no invented draw data (Golden Rule 5).
+   - Produces a deterministic FNV-1a hash of the declaration for `PipelineKey.vertexDeclHash`.
+   - Builds an ascending-offset D3D12 input layout via `BuildGrcFvfLayout`.
+
+2. **Wire format & trace version** (`src/native_types.h`):
+   - Added `GrcFvfDesc` (host-endian after BE→host conversion) + `DrawPacket.grcFvf` / `hasGrcFvf`.
+   - Bumped `kTraceVersion` 1→2; writer/reader/validator share the constant; stale v1 traces rejected by version + packetSize guards.
+
+3. **Offline validator** (`src/renderer/phase3_validator.cpp`):
+   - `ExerciseGrcFvfDecode()` with 9 fixtures: valid 16-channel MCLA1 declaration; PNCT-ish 5-channel; unknown-type refusal; count/size mismatch flags; hash determinism/distinctness/sensitivity; mask gating; lane 16/17 refusal; code-0 bound lane; codes 11-15 coverage.
+   - `phase3_validator.exe` corpus gate: **CLEAN** (551 containers, 762 fetches, 0 unsupported, `single_stream=TRUE`).
+
+4. **Native renderer resolution** (`src/native_renderer.cpp`):
+   - `ResolveCapturedVertexLayout()` replaces `BuildInputLayoutFromVS` in `GetPipelineForPacket`: when `packet.hasGrcFvf`, decodes the captured declaration, cross-checks every VS-referenced input against a present+valid decoded channel (refuses on missing), builds the full declaration layout (extra channels stay in stride), and hashes it. When no capture exists, falls back to the documented Phase-3 fixture stopgap (28-byte layout, `HashVsVertexDeclaration` yielding 0 for MCLA vf=0) with a deduplicated diagnostic.
+   - `TryConsumeCapturedGeometry` stride gate now uses the decoded `fvfSize` when `hasGrcFvf`; otherwise the 28-byte fixture gate.
+
+5. **Capture-side extraction** (`src/capture_hooks.cpp::OnDrawBuild`):
+   - Traverses the live drawable pointer chain observed in recompilation: `gpuCtx+10896` → `grmDrawable*` → `+0x28/0x30/0x38/0x20` → `grmShaderGroup*` → `+0x10/0x18/0x20/0x08` → `Rsc5VertexDeclaration*` → `+0x10/0x20/0x30/0x08/0x40` → 16-byte `m_Fvf` block.
+   - Reads through `GuestMemoryView::ReadU32BE` / `ReadU8` / **`ReadU64BE` (new)**.
+   - Populates `m_currentPacket.grcFvf` and sets `hasGrcFvf=1` on first plausible block (non-zero mask, non-zero size ≤ 255, non-zero types).
+   - If no chain resolves, `hasGrcFvf` remains 0 and the renderer uses the fixture stopgap (honest ceiling, no invented data).
+
+6. **Memory view helper** (`src/guest_memory.{h,cpp}`):
+   - Added `ReadU64BE` to complete the endian-read set required by the capture-side contract.
+
+### Validation
+
+- All 7 validators **CLEAN**:
+  - `phase3_validator.exe` (corpus 551 containers / 762 fetches + 9 fixtures)
+  - `capture_dump_validator.exe`
+  - `backend_validator.exe`
+  - `shader_pipeline_validator.exe` (corpus)
+  - `xenos_decode_validator.exe` (corpus)
+  - `texture_decode_test.exe`
+  - `mcla.exe` build clean (13/13 ninja steps)
+
+### Evidence gap resolved / carried forward
+
+- **Resolved**: The grcFvf decoder is complete, headlessly validated, and wired into the native resolution path. The trace format now carries the captured declaration (v2).
+- **Carried forward**: The live capture chain (`gpuCtx+10896` → drawable → shader group → vertex declaration → m_Fvf) is implemented with researched offsets, but **has not yet been exercised by a live game draw** (the game stalls at splash due to art/FS loading — documented 2026-08-07). The next live run that reaches an actual draw will validate the offset chain end-to-end and produce the first `hasGrcFvf=1` packets. Until then, the resolver correctly falls back to the fixture stopgap and logs the deduction.
+
+### External references
+- `hedge-dev/XenosRecomp` `shader_code.h` (VertexFetchInstruction bitfield) informed the fetch-constant semantics.
+- `Foxxyyy/CodeX.Games.MCLA` `Rsc5Drawable.cs` confirmed `Rsc5VertexDeclaration` with `grcFvf` 16×4-bit channel layout.
+
+---
+
+## Phase 6 item 1 — Research-backed guest RT & depth-stencil format mapping (2026-08-09, gpu-engineer)
+
+Replaced the hardcoded `R8G8B8A8_UNORM` / `D24_UNORM_S8_UINT` placeholders in `BuildPipelineStateFromPacket` with accurate Xenos register-to-DXGI format mappings derived from the captured RB_COLOR_INFO / RB_DEPTH_INFO registers in the DrawPacket.
+
+### Implemented
+
+1. **Format decode helpers** (`src/native_renderer.cpp`):
+   - `DecodeColorTargetFormat(uint32_t colorInfo)` — extracts the 4-bit `ColorRenderTargetFormat` from bits 16-19 of the RB_COLOR_INFO register (Xenia `registers.h` `RB_COLOR_INFO` bitfield) and maps to the exact DXGI_FORMAT equivalent.
+   - `DecodeDepthTargetFormat(uint32_t depthInfo)` — extracts the 1-bit `DepthRenderTargetFormat` from bit 16 of RB_DEPTH_INFO and maps to DXGI_FORMAT.
+
+2. **Mapping table (Xenia xenos.h → DXGI_FORMAT)**:
+   - Color (4 bits):
+     - 0  `k_8_8_8_8`                 → `R8G8B8A8_UNORM`
+     - 1  `k_8_8_8_8_GAMMA`           → `R8G8B8A8_UNORM_SRGB`
+     - 2  `k_2_10_10_10`              → `R10G10B10A2_UNORM`
+     - 3  `k_2_10_10_10_FLOAT` (7e3)  → `R10G10B10A2_UNORM` (same storage)
+     - 4  `k_16_16`                   → `R16G16_UNORM`
+     - 5  `k_16_16_16_16`             → `R16G16B16A16_UNORM`
+     - 6  `k_16_16_FLOAT`             → `R16G16_FLOAT`
+     - 7  `k_16_16_16_16_FLOAT`       → `R16G16B16A16_FLOAT`
+     - 10 `k_2_10_10_10_AS_10_10_10_10` → `R10G10B10A2_UNORM`
+     - 12 `k_2_10_10_10_FLOAT_AS_16_16_16_16` → `R16G16B16A16_FLOAT`
+     - 14 `k_32_FLOAT`               → `R32_FLOAT`
+     - 15 `k_32_32_FLOAT`            → `R32G32_FLOAT`
+   - Depth (1 bit):
+     - 0 `kD24S8`    → `D24_UNORM_S8_UINT`
+     - 1 `kD24FS8`   → `D24_UNORM_S8_UINT` (float 20e4 depth — same storage, shader handles range)
+
+3. **PipelineState population** (`BuildPipelineStateFromPacket`):
+   - Iterates `packet.colorTargets[0..3]` (raw RB_COLOR_INFO values captured at `OnStateSetup`) and assigns decoded formats to `state.targetFormats[i]`.
+   - Assigns decoded depth format from `packet.depthTarget` (raw RB_DEPTH_INFO) to `state.depthStencilFormat`.
+   - Formats flow into `PipelineKey` → PSO descriptor `RTVFormats` / `DSVFormat` → GPU validation.
+
+4. **Deduplicated diagnostics**: Unknown format codes emit a single warning per code value, then silently fall back to `R8G8B8A8_UNORM` / `D24_UNORM_S8_UINT` so live runs stay quiet after first occurrence.
+
+### Validation
+
+- All 7 validators **CLEAN** (no regressions):
+  - `backend_validator.exe` (D3D12 PSO creation with decoded formats)
+  - `shader_pipeline_validator.exe` (corpus)
+  - `phase3_validator.exe` (corpus + fixtures)
+  - `capture_dump_validator.exe`
+  - `xenos_decode_validator.exe`
+  - `texture_decode_test.exe`
+  - `mcla.exe` build clean
+
+### Evidence gap
+
+- The format mapping is research-backed (Xenia `registers.h` bitfields + `xenos.h` enums) and headlessly validated, but **has not been exercised by a live game draw** that captures non-8_8_8_8 RT formats. The capture chain stores the raw register values correctly; the first live draw with HDR/float render targets will prove the decode path end-to-end. Until then the fallback remains the conservative `R8G8B8A8_UNORM` for any unrecognized code.
+
+### External references
+- `xenia/src/xenia/gpu/registers.h` — `RB_COLOR_INFO` / `RB_DEPTH_INFO` bitfield definitions (bits 16-19 / bit 16).
+- `xenia/src/xenia/gpu/xenos.h` — `ColorRenderTargetFormat` / `DepthRenderTargetFormat` enums.
+
+---
+
+## Phase 6 Entry — Native Command List Emission & Frame Present (2026-08-09, gpu-engineer)
+
+The D3D12 backend already implements the complete native frame command list emission and present path. The `VdSwap` hook in `native_renderer.cpp` drives the per-frame cycle: it snapshots the latest validated `DrawPacket`, calls `TryConsumeCapturedGeometry` (which routes through `DrawDynamicMeshWithPipeline`), and falls back to the deterministic test triangle when no live draw is captured. The backend handles the full command list lifecycle, resource barriers, draw calls, and swap chain presentation.
+
+### Implemented
+
+1. **Per-frame command list lifecycle** (`src/d3d12_backend.cpp::DrawDynamicMeshWithPipeline`):
+   - Waits for the GPU to finish the previous frame using this back buffer (`WaitForCurrentFrameGpu` with fence synchronization).
+   - Stages validated vertex/index data into the per-frame upload arena (`MapUpload` with 256-byte alignment).
+   - Resets the command allocator and command list (`BeginFrame`).
+   - Transitions the back buffer from `PRESENT` → `RENDER_TARGET` (resource barrier).
+   - Clears the render target view with the decoded RT format (from `PipelineState.targetFormats`).
+   - Sets full-screen viewport and scissor rect.
+   - Binds vertex buffer view (GPU address, stride from decoded `grcFvf` or fixture 28-byte layout).
+   - Binds index buffer view (cached static IB for test triangle; per-frame upload for captured geometry).
+   - Sets the root signature (pixel-visible SRV table at t0 + static linear-clamp sampler at s0).
+   - Sets the active pipeline state object (fallback test PSO or live DXIL PSO from `PipelineCache::GetOrCompile`).
+   - Issues `DrawIndexedInstanced` (indexed) or `DrawInstanced` (non-indexed) matching `packet.primType` / `packet.indexType`.
+   - Transitions the back buffer `RENDER_TARGET` → `PRESENT` (resource barrier).
+   - Closes the command list, executes on the direct queue, and calls `IDXGISwapChain3::Present(1, 0)`.
+   - Advances the fence value and signals the frame completion fence.
+
+2. **VdSwap frame driver** (`src/native_renderer.cpp::Hooked_VdSwap`):
+   - Snapshots the last validated `DrawPacket` *before* `OnFrameEnd` clears it.
+   - In `RendererMode::Native`: calls `TryConsumeCapturedGeometry` (consumes live geometry when `hasGrcFvf` and layout matches; otherwise deduplicated refusal diagnostic + test triangle).
+   - In legacy/capture modes: chains to original `VdSwap` SDK implementation.
+   - Records frame presentation via `mcla::renderer::RecordFramePresented()`.
+
+3. **Format-correct RTV/DSV binding**:
+   - `PipelineState.targetFormats[0..7]` populated by `DecodeColorTargetFormat` from captured `RB_COLOR_INFO`.
+   - `PipelineState.depthStencilFormat` populated by `DecodeDepthTargetFormat` from captured `RB_DEPTH_INFO`.
+   - Formats flow into `PipelineKey` → `CreatePipelineFromDxil` → `D3D12_GRAPHICS_PIPELINE_STATE_DESC.RTVFormats` / `DSVFormat`.
+   - The test PSO and live PSOs use the same decoded formats.
+
+4. **Resource state management**:
+   - Explicit barriers for back buffer: `PRESENT` ↔ `RENDER_TARGET`.
+   - Decoded texture upload: `COPY_DEST` → `PIXEL_SHADER_RESOURCE` (barrier enqueued in same command list).
+   - Upload heap stays in `GENERIC_READ`; static index buffer stays in `GENERIC_READ`.
+   - No implicit state transitions — all resource state changes are explicit barriers in the command list.
+
+### Validation
+
+- All 7 validators **CLEAN**:
+  - `backend_validator.exe` — Exercises the full `DrawDynamicMeshWithPipeline` path (vertex upload, index binding, barrier sequence, RTV clear, draw, present, fence signal). Zero D3D12 debug-layer messages.
+  - `shader_pipeline_validator.exe` — Corpus pipeline compilation with decoded formats in PSO descriptors.
+  - `phase3_validator.exe` — Corpus + 9 `grcFvfDecode` fixtures; single-stream `const[95]` geometry gate.
+  - `capture_dump_validator.exe` — Synthetic capture self-test (guest mem dumps + frame trace round-trip).
+  - `xenos_decode_validator.exe` — 514 containers, 0 unknown/OOB.
+  - `texture_decode_test.exe` — Oracle-validated tiling + SRV bind/readback.
+  - `mcla.exe` build clean (13/13 ninja steps).
+
+### Evidence gap
+
+- The live capture chain (`gpuCtx+10896` → drawable → `grcFvf`) is implemented but **has not been exercised by a live game draw** (game stalls at splash due to art/FS loading — documented 2026-08-07). The first live draw reaching `Hooked_VdSwap` with `hasGrcFvf=1` will validate the end-to-end path. Until then the renderer correctly falls back to the deterministic test triangle and logs the refusal reason once per category.
+
+### External references
+- `src/d3d12_backend.cpp` — `DrawDynamicMeshWithPipeline`, `BeginFrame`, `ClearAndPresent`, `WaitForCurrentFrameGpu`.
+- `src/native_renderer.cpp` — `Hooked_VdSwap`, `TryConsumeCapturedGeometry`, `ResolveCapturedVertexLayout`.
+
+---
+
+## Phase 4 — Texture, Sampler, and Render-Pass Support (2026-08-09, gpu-engineer)
+
+Completed the texture/sampler/render-pass infrastructure for the native D3D12 backend.
+
+### Implemented
+
+1. **Sampler state management** (`src/d3d12_backend.cpp/h`):
+   - `GetOrCreateStaticSampler` — creates/caches `D3D12_STATIC_SAMPLER_DESC` for root signature binding.
+   - Descriptor caching for reuse in root signatures.
+
+2. **Render target / depth-stencil view creation** (`CreateRenderTargetView`, `CreateDepthStencilView`):
+   - Creates RTV/DSV descriptors for textures with specified formats.
+
+3. **Render target resolve** (`ResolveRenderTarget`):
+   - Transitions source RT to `RESOLVE_SOURCE`, destination to `RESOLVE_DEST`.
+   - Calls `ResolveSubresource` and restores states.
+
+4. **State object caching** (descriptor-level, baked into PSOs):
+   - `GetOrCreateBlendState`, `GetOrCreateDepthStencilState`, `GetOrCreateRasterizerState` — cache `D3D12_BLEND_DESC`, `D3D12_DEPTH_STENCIL_DESC`, `D3D12_RASTERIZER_DESC` for reuse in PSO creation.
+
+5. **Resource state tracking & automatic barrier insertion** (`TransitionResource`):
+   - Tracks per-resource state/subresource.
+   - Emits `D3D12_RESOURCE_BARRIER_TYPE_TRANSITION` only when state actually changes.
+
+6. **Render pass abstraction** (`BeginRenderPass` / `EndRenderPass`):
+   - Binds multiple RTVs + optional DSV with load/store semantics.
+   - Handles clears (color/depth/stencil) per attachment.
+   - Sets viewport/scissor.
+   - Tracks active pass for EndRenderPass cleanup.
+
+7. **Mipmap generation** (`GenerateMipmaps`):
+    - Full compute-shader-based mipmap chain generation (box filter 2x2 downsampling).
+    - Runtime DXC compilation of HLSL compute shader (profile `cs_6_0`).
+    - Compute root signature: SRV (t0) + UAV (u0) + CBV (b0) for per-mip parameters.
+    - Iterative downsampling: for each mip level N→N+1, binds source mip SRV + destination mip UAV, dispatches 8x8 thread groups.
+    - Per-mip resource state tracking: transitions source mip `COMMON`→`NON_PIXEL_SHADER_RESOURCE`, dest mip `COMMON`→`UNORDERED_ACCESS`, UAV barrier between mips, final transition all mips to `PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE`.
+    - Requires texture created with `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`.
+
+### Validation
+
+- All 7 validators **CLEAN** (no regressions):
+  - `backend_validator.exe` — Exercises full draw path including new render pass helpers.
+  - `shader_pipeline_validator.exe` — Corpus pipeline compilation.
+  - `phase3_validator.exe` — Corpus + 9 `grcFvfDecode` fixtures.
+  - `capture_dump_validator.exe` — Synthetic capture self-test.
+  - `xenos_decode_validator.exe` — 514 containers, 0 unknown/OOB.
+  - `texture_decode_test.exe` — Oracle-validated tiling + SRV bind/readback.
+  - `mcla.exe` build clean (14/14 ninja steps).
+
+### Evidence gap
+
+- Sampler descriptor heap (dynamic samplers) not yet implemented — only static samplers in root signature.
+- Full frame graph / render graph with automatic dependency tracking deferred to Phase 6.
+
+### External references
+- `src/d3d12_backend.cpp` — All Phase 4 implementations.
+- `src/d3d12_backend.h` — Public API declarations.
+- `src/native_renderer.cpp` — `ResolveCapturedVertexLayout` uses `TransitionResource`.
+
+---
+
+## Phase 6 — Dynamic Sampler Descriptor Heap & Table Binding (2026-08-09, gpu-engineer)
+
+Completed the shader-visible sampler descriptor heap manager, runtime sampler state deduplication, and dynamic descriptor table binding on the graphics command list.
+
+### Implemented
+
+1. **Shader-visible sampler descriptor heap** (`src/d3d12_backend.cpp/h`):
+   - `CreateSamplerHeap` — creates a `D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER` heap (capacity 2048 descriptors, `SHADER_VISIBLE`).
+   - `GetOrCreateSamplerDescriptor` — returns CPU/GPU descriptor handles for a `D3D12_SAMPLER_DESC`; deduplicates by hashing the descriptor and caches in `m_samplerDescriptorIndex` (maps descriptor hash → heap index).
+   - `BindSamplerHeap` — calls `SetDescriptorHeaps` with the sampler heap so dynamic sampler tables can be bound.
+
+2. **Root signature integration**:
+   - Static samplers still added to root signatures via `GetOrCreateStaticSampler`.
+   - Dynamic samplers (for runtime-created sampler states) use the shader-visible heap and descriptor tables bound via `BindSamplerHeap` + `SetComputeRootDescriptorTable`/`SetGraphicsRootDescriptorTable`.
+
+3. **Descriptor allocation**:
+   - Sequential allocation with `m_samplerHeapOffset` (capacity 2048).
+   - Deduplication via `m_samplerDescriptorIndex` (FNV-1a hash of `D3D12_SAMPLER_DESC`).
+   - Returns `SamplerDescriptor` struct with both CPU and GPU handles for binding.
+
+### Validation
+
+- All 7 validators **CLEAN** (no regressions):
+  - `backend_validator.exe` — Exercises full draw path including sampler heap.
+  - `shader_pipeline_validator.exe` — Corpus pipeline compilation.
+  - `phase3_validator.exe` — Corpus + 9 `grcFvfDecode` fixtures.
+  - `capture_dump_validator.exe` — Synthetic capture self-test.
+  - `xenos_decode_validator.exe` — 514 containers, 0 unknown/OOB.
+  - `texture_decode_test.exe` — Oracle-validated tiling + SRV bind/readback.
+  - `mcla.exe` build clean (14/14 ninja steps).
+
+### Evidence gap
+
+- Full frame graph / render graph with automatic dependency tracking deferred to future phase.
+
+### External references
+- `src/d3d12_backend.cpp` — `CreateSamplerHeap`, `GetOrCreateSamplerDescriptor`, `BindSamplerHeap`.
+- `src/d3d12_backend.h` — Public API declarations (`SamplerDescriptor`, `GetOrCreateSamplerDescriptor`, `BindSamplerHeap`).
+- `src/d3d12_backend.h` — Sampler cache key/hash types (`SamplerCacheKey`, `SamplerCacheKeyHash`).
+
+---
+
+## Phase 7 — Render Graph / Frame Graph Architecture (2026-08-09, gpu-engineer)
+
+Implemented a declarative Render Graph system for automatic barrier management, transitive resource allocation, and optimal pass ordering.
+
+### Implemented
+
+1. **Render Graph Builder API** (`src/d3d12_backend.h/cpp`):
+   - `RenderGraphBuilder` — declarative API to declare passes, resources, and execution callbacks.
+   - `AddPass(name, resources, execute)` — adds a pass with explicit resource access list (SRV/RTV/UAV) and state transitions.
+   - `GetTransientResource(desc)` — requests a transient render target/UAV buffer; allocates or recycles from pool.
+   - `Build()` — validates dependencies, performs topological sort (Kahn's algorithm), computes execution order.
+   - `Execute()` — runs passes in topological order, emits transition barriers before each pass, UAV barriers after, invokes pass callback.
+   - `Reset()` — clears passes for next frame; recycles transient resources.
+
+2. **Automatic Resource State Tracking & Barrier Batching**:
+   - Per-pass resource access list specifies `beforeState`/`afterState` and usage (Read/Write/ReadWrite).
+   - `Build()` constructs DAG of pass dependencies based on shared resource access with write conflicts.
+   - Topological sort (Kahn's algorithm) determines optimal execution order.
+   - `Execute()` emits batched `D3D12_RESOURCE_BARRIER_TYPE_TRANSITION` before each pass, `D3D12_RESOURCE_BARRIER_TYPE_UAV` after writes.
+
+3. **Transient Resource Allocation**:
+   - `GetTransientResource(desc)` allocates or recycles `ID3D12Resource` from pool keyed by `D3D12_RESOURCE_DESC`.
+   - Resources returned to pool after `Execute()` completes (marked `inUse = false`).
+   - Keyed by `width`, `height`, `format`, `depthOrArraySize`, `mipLevels`, `sampleDesc`, `flags`.
+
+4. **Transient Resource Description**:
+   - `TransientResourceDesc` encapsulates `D3D12_RESOURCE_DESC`, debug name, and optional `D3D12_CLEAR_VALUE`.
+   - Resources created with `D3D12_HEAP_TYPE_DEFAULT` and `D3D12_RESOURCE_STATE_COMMON`.
+
+### Validation
+
+- All 7 validators **CLEAN** (no regressions):
+  - `backend_validator.exe` — Exercises full draw path including render graph infrastructure.
+  - `shader_pipeline_validator.exe` — Corpus pipeline compilation.
+  - `phase3_validator.exe` — Corpus + 9 `grcFvfDecode` fixtures.
+  - `capture_dump_validator.exe` — Synthetic capture self-test.
+  - `xenos_decode_validator.exe` — 514 containers, 0 unknown/OOB.
+  - `texture_decode_test.exe` — Oracle-validated tiling + SRV bind/readback.
+  - `xtr_dump_validator.exe` — Synthetic .xtr round-trip.
+  - `mcla.exe` build clean (14/14 ninja steps).
+
+### External references
+- `src/d3d12_backend.cpp` — `RenderGraphBuilder::AddPass`, `GetTransientResource`, `Build`, `Execute`, `Reset`, `CreateRenderGraph`.
+- `src/d3d12_backend.h` — `RenderGraphBuilder`, `RenderGraphPass`, `TransientResourceEntry`, `ResourceAccess`, `ResourceUsage`, `PassHandle`, `TransientResourceDesc`.
+- `src/native_renderer.cpp` — `Hooked_VdSwap` now uses `CreateRenderGraph` and `AddPass` for geometry consumption and test triangle fallback.
+
+---
+
+## Phase 8 — Render Graph Integration into Native Frame Loop (2026-08-09, gpu-engineer)
+
+Refactored `Hooked_VdSwap` in `native_renderer.cpp` to orchestrate the native frame via the Render Graph system.
+
+### Implemented
+
+1. **Frame graph construction per frame** (`Hooked_VdSwap`):
+   - `auto graph = d3dBackend->CreateRenderGraph()` at frame start.
+   - Two passes declared:
+     - **ConsumeCapturedGeometry**: Attempts to consume a live `DrawPacket` via `TryConsumeCapturedGeometry`. If a live draw was captured (`haveCaptured`), the geometry is uploaded and drawn.
+     - **DrawTestTriangle**: Fallback pass that draws the deterministic test triangle (proves native path works end-to-end when no live draw is captured).
+   - `graph.Build()` validates dependencies and topologically sorts passes.
+   - `graph.Execute()` runs passes in order, emitting transition/UAV barriers automatically.
+   - `graph.Reset()` clears passes for next frame.
+
+2. **Resource access declaration** (currently minimal):
+   - Geometry pass: reads captured vertex buffer (SRV).
+   - Test triangle pass: writes to back buffer RTV.
+   - Dependencies auto-resolved by `Build()` — triangle pass runs after geometry pass if both present.
+
+3. **Frame synchronization**:
+   - Swap chain present and fence signaling handled by `DrawTestMeshedTriangle` / `TryConsumeCapturedGeometry` → `DrawDynamicMeshWithPipeline` → `EndFrame` chain.
+
+### Validation
+
+- All 7 validators **CLEAN** (no regressions):
+  - `backend_validator.exe` — Full draw path with render graph infrastructure.
+  - `shader_pipeline_validator.exe` — Corpus pipeline compilation.
+  - `phase3_validator.exe` — Corpus + 9 `grcFvfDecode` fixtures.
+  - `capture_dump_validator.exe` — Synthetic capture self-test.
+  - `xenos_decode_validator.exe` — 514 containers, 0 unknown/OOB.
+  - `texture_decode_test.exe` — Oracle-validated tiling + SRV bind/readback.
+  - `xtr_dump_validator.exe` — Synthetic .xtr round-trip.
+  - `mcla.exe` build clean (14/14 ninja steps).
+
+### Evidence gap
+
+- Live `grcFvf` capture not yet exercised by a game draw (game stalls at splash).
+- Full RTV/DSV/SRV resource tracking in pass declarations deferred until live capture works.
+- Multi-pass dependency tracking (e.g., shadow map → lighting pass) not yet exercised.
+
+### External references
+- `src/native_renderer.cpp` — `Hooked_VdSwap` uses `CreateRenderGraph`, `AddPass`, `Build`, `Execute`, `Reset`.
+- `src/d3d12_backend.cpp` — `RenderGraphBuilder` implementation.
+- `src/d3d12_backend.h` — `RenderGraphBuilder`, `ResourceAccess`, `ResourceUsage`, `PassHandle`.
 

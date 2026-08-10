@@ -2,6 +2,8 @@
 #include "renderer/test_shaders.h"
 #include "renderer/vertex_decode.h"
 #include "renderer/pipeline_cache.h"
+#include "renderer/resource_cache.h"
+#include "renderer/texture_decode.h"
 #include <rex/logging.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -59,6 +61,7 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     if (!CreateTestPipeline()) return false;
     if (!CreateStaticIndexBuffer()) return false;
     if (!CreateSrvHeap()) return false;
+    if (!CreateSamplerHeap()) return false;
 
     // Initialize pipeline cache worker thread and set fallback PSO (test pipeline)
     m_pipelineCache.StartWorker(m_device, m_rootSignature);
@@ -372,7 +375,263 @@ bool D3D12Backend::CreateSrvHeap() {
     return true;
 }
 
-// Phase 4 data-independent slice: upload host-linear decoded pixels into a
+// Phase 6: Create shader-visible sampler descriptor heap
+bool D3D12Backend::CreateSamplerHeap() {
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.NumDescriptors = kSamplerHeapSize;
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    HRESULT hr = m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_samplerHeap));
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: CreateDescriptorHeap (Sampler) failed with hr=0x{:08X}",
+                     static_cast<uint32_t>(hr));
+        return false;
+    }
+    m_samplerDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    m_samplerHeapOffset = 0;
+    REXLOG_INFO("D3D12Backend: Created sampler descriptor heap ({} descriptors)", kSamplerHeapSize);
+    return true;
+}
+
+// Phase 6: Get or create sampler descriptor in the shader-visible heap
+D3D12Backend::SamplerDescriptor D3D12Backend::GetOrCreateSamplerDescriptor(const D3D12_SAMPLER_DESC& desc) {
+    SamplerCacheKey key{ desc };
+    auto it = m_samplerDescriptorIndex.find(key);
+    if (it != m_samplerDescriptorIndex.end()) {
+        uint32_t index = it->second;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
+        cpuHandle.ptr += static_cast<SIZE_T>(index) * m_samplerDescriptorSize;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+        gpuHandle.ptr += static_cast<SIZE_T>(index) * m_samplerDescriptorSize;
+        return { cpuHandle, gpuHandle };
+    }
+
+    // Allocate new descriptor
+    if (m_samplerHeapOffset >= kSamplerHeapSize) {
+        REXLOG_ERROR("D3D12Backend: Sampler descriptor heap exhausted ({} slots)", kSamplerHeapSize);
+        return { {}, {} };
+    }
+
+    uint32_t index = m_samplerHeapOffset++;
+    m_samplerDescriptorIndex.emplace(key, index);
+
+    // Create the sampler in the heap
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
+    cpuHandle.ptr += static_cast<SIZE_T>(index) * m_samplerDescriptorSize;
+    m_device->CreateSampler(&desc, cpuHandle);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+    gpuHandle.ptr += static_cast<SIZE_T>(index) * m_samplerDescriptorSize;
+
+    return { cpuHandle, gpuHandle };
+}
+
+// Bind the shader-visible sampler descriptor heap to the command list
+void D3D12Backend::BindSamplerHeap() {
+    if (!m_samplerHeap) return;
+    ID3D12DescriptorHeap* heaps[] = { m_samplerHeap.Get() };
+    m_commandList->SetDescriptorHeaps(1, heaps);
+}
+
+// Phase 7: Render Graph implementation
+D3D12Backend::RenderGraphBuilder D3D12Backend::CreateRenderGraph() {
+    return RenderGraphBuilder(this);
+}
+
+D3D12Backend::RenderGraphBuilder::PassHandle D3D12Backend::RenderGraphBuilder::AddPass(
+    std::wstring name,
+    std::vector<ResourceAccess> resources,
+    std::function<void(ID3D12GraphicsCommandList*)> execute) {
+    RenderGraphPass pass;
+    pass.name = std::move(name);
+    pass.resources = std::move(resources);
+    pass.execute = std::move(execute);
+    PassHandle handle{ static_cast<uint32_t>(m_backend->m_renderGraphPasses.size()) };
+    m_backend->m_renderGraphPasses.push_back(std::move(pass));
+    return handle;
+}
+
+ID3D12Resource* D3D12Backend::RenderGraphBuilder::GetTransientResource(const TransientResourceDesc& desc) {
+    // Search for existing reusable resource
+    for (auto& entry : m_backend->m_transientResources) {
+        if (!entry.inUse && entry.desc.Width == desc.desc.Width &&
+            entry.desc.Height == desc.desc.Height &&
+            entry.desc.Format == desc.desc.Format &&
+            entry.desc.DepthOrArraySize == desc.desc.DepthOrArraySize &&
+            entry.desc.MipLevels == desc.desc.MipLevels &&
+            entry.desc.SampleDesc.Count == desc.desc.SampleDesc.Count &&
+            entry.desc.Flags == desc.desc.Flags) {
+            entry.inUse = true;
+            entry.lastUsedFrame = m_backend->m_frameIndex;
+            return entry.resource.Get();
+        }
+    }
+
+    // Create new resource
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    HRESULT hr = m_backend->m_device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc.desc,
+        D3D12_RESOURCE_STATE_COMMON,
+        &desc.clearValue, IID_PPV_ARGS(&resource));
+
+    if (FAILED(hr)) {
+        REXLOG_ERROR("RenderGraph: Failed to create transient resource '{}', hr=0x{:08X}",
+                     std::string(desc.name.begin(), desc.name.end()).c_str(),
+                     static_cast<uint32_t>(hr));
+        return nullptr;
+    }
+
+    TransientResourceEntry entry;
+    entry.name = desc.name;
+    entry.desc = desc.desc;
+    entry.clearValue = desc.clearValue;
+    entry.resource = resource;
+    entry.lastUsedFrame = m_backend->m_frameIndex;
+    entry.inUse = true;
+
+    m_backend->m_transientResources.push_back(std::move(entry));
+    return m_backend->m_transientResources.back().resource.Get();
+}
+
+bool D3D12Backend::RenderGraphBuilder::Build() {
+    auto& passes = m_backend->m_renderGraphPasses;
+    auto& resources = m_backend->m_transientResources;
+    auto& executionOrder = m_backend->m_renderGraphExecutionOrder;
+
+    // Build dependency graph based on resource access patterns
+    for (uint32_t i = 0; i < passes.size(); ++i) {
+        for (uint32_t j = i + 1; j < passes.size(); ++j) {
+            const auto& passA = passes[i];
+            const auto& passB = passes[j];
+
+            // Check for resource dependencies
+            bool hasDependency = false;
+            for (const auto& resA : passA.resources) {
+                for (const auto& resB : passB.resources) {
+                    if (resA.resource == resB.resource) {
+                        // Same resource accessed - check for write dependency
+                        if (resA.usage == ResourceUsage::Write || resB.usage == ResourceUsage::Write ||
+                            resA.usage == ResourceUsage::ReadWrite || resB.usage == ResourceUsage::ReadWrite) {
+                            hasDependency = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasDependency) break;
+            }
+            if (hasDependency) {
+                passes[i].dependents.push_back(j);
+                passes[j].dependencies.push_back(i);
+            }
+        }
+    }
+
+    // Topological sort (Kahn's algorithm)
+    std::vector<uint32_t> inDegree(passes.size(), 0);
+    for (const auto& pass : passes) {
+        for (uint32_t dep : pass.dependencies) {
+            inDegree[dep]++;
+        }
+    }
+
+    std::queue<uint32_t> q;
+    for (uint32_t i = 0; i < passes.size(); ++i) {
+        if (inDegree[i] == 0) q.push(i);
+    }
+
+    executionOrder.clear();
+    while (!q.empty()) {
+        uint32_t u = q.front();
+        q.pop();
+        executionOrder.push_back(u);
+        for (uint32_t v : passes[u].dependents) {
+            if (--inDegree[v] == 0) {
+                q.push(v);
+            }
+        }
+    }
+
+    if (executionOrder.size() != passes.size()) {
+        REXLOG_ERROR("RenderGraph: Cycle detected in pass dependencies");
+        return false;
+    }
+
+    // Allocate transient resources
+    for (auto& res : resources) {
+        if (!res.inUse) {
+            // Already allocated or will be allocated on first use
+        }
+    }
+
+    m_backend->m_renderGraphBuilt = true;
+    return true;
+}
+
+void D3D12Backend::RenderGraphBuilder::Execute() {
+    if (!m_backend->m_renderGraphBuilt) return;
+
+    auto& passes = m_backend->m_renderGraphPasses;
+    auto& executionOrder = m_backend->m_renderGraphExecutionOrder;
+
+    for (uint32_t idx : executionOrder) {
+        const auto& pass = passes[idx];
+
+        // Emit barriers for resource state transitions
+        std::vector<D3D12_RESOURCE_BARRIER> barriers;
+        for (const auto& res : pass.resources) {
+            if (res.resource) {
+                D3D12_RESOURCE_BARRIER barrier = {};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = res.resource;
+                barrier.Transition.StateBefore = res.beforeState;
+                barrier.Transition.StateAfter = res.afterState;
+                barrier.Transition.Subresource = res.subresource;
+                barriers.push_back(barrier);
+            }
+        }
+        if (!barriers.empty()) {
+            m_backend->m_commandList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+        }
+
+        // Execute the pass
+        if (pass.execute) {
+            pass.execute(m_backend->m_commandList.Get());
+        }
+
+        // Emit UAV barriers for resources written
+        std::vector<D3D12_RESOURCE_BARRIER> uavBarriers;
+        for (const auto& res : pass.resources) {
+            if (res.resource && (res.usage == ResourceUsage::Write || res.usage == ResourceUsage::ReadWrite)) {
+                D3D12_RESOURCE_BARRIER uavBarrier = {};
+                uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uavBarrier.UAV.pResource = res.resource;
+                uavBarriers.push_back(uavBarrier);
+            }
+        }
+        if (!uavBarriers.empty()) {
+            m_backend->m_commandList->ResourceBarrier(static_cast<UINT>(uavBarriers.size()), uavBarriers.data());
+        }
+    }
+
+    // Mark transient resources as no longer in use
+    for (auto& res : m_backend->m_transientResources) {
+        res.inUse = false;
+    }
+}
+
+void D3D12Backend::RenderGraphBuilder::Reset() {
+    m_backend->m_renderGraphPasses.clear();
+    m_backend->m_renderGraphExecutionOrder.clear();
+    m_backend->m_renderGraphBuilt = false;
+    // Note: transient resources are kept for reuse, only marked as not in use
+    for (auto& res : m_backend->m_transientResources) {
+        res.inUse = false;
+    }
+}
 // DEFAULT-heap texture and expose them as a shader-visible SRV (t0). The
 // caller produces `linearPixels` via texture_decode (UntileTexture2D); the
 // backend never touches guest memory here. Only scalar (1 block/texel)
@@ -623,6 +882,280 @@ bool D3D12Backend::CreateTestPipeline() {
     }
     REXLOG_INFO("D3D12Backend: Phase 3 test pipeline created (DXIL {} vs / {} ps bytes)",
                 GetTestVsBlobSize(), GetTestPsBlobSize());
+    return true;
+}
+
+// Create mipmap generation compute pipeline (root signature + PSO)
+bool D3D12Backend::CreateMipGenPipeline() {
+    // Root signature: SRV (t0) + UAV (u0) + CBV (b0) for params
+    D3D12_DESCRIPTOR_RANGE srvRange = {};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 1;
+    srvRange.BaseShaderRegister = 0;  // t0
+    srvRange.RegisterSpace = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_DESCRIPTOR_RANGE uavRange = {};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 1;
+    uavRange.BaseShaderRegister = 0;  // u0
+    uavRange.RegisterSpace = 0;
+    uavRange.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER rootParams[2] = {};
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
+    rootParams[0].DescriptorTable.pDescriptorRanges = &srvRange;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[1].Descriptor.ShaderRegister = 0;  // b0
+    rootParams[1].Descriptor.RegisterSpace = 0;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+    rootDesc.NumParameters = _countof(rootParams);
+    rootDesc.pParameters = rootParams;
+    rootDesc.NumStaticSamplers = 0;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    Microsoft::WRL::ComPtr<ID3DBlob> signatureBlob, errorBlob;
+    HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                             &signatureBlob, &errorBlob);
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: MipGen SerializeRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    hr = m_device->CreateRootSignature(0, signatureBlob->GetBufferPointer(),
+                                       signatureBlob->GetBufferSize(),
+                                       IID_PPV_ARGS(&m_mipGenRootSignature));
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: MipGen CreateRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    REXLOG_INFO("D3D12Backend: MipGen root signature created");
+    return true;
+}
+
+// Generate mipmaps using compute shader downsampling
+bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) {
+    if (!texture || mipLevels <= 1) {
+        REXLOG_WARN("D3D12Backend: GenerateMipmaps invalid args (texture={}, mipLevels={})",
+                    texture != nullptr, mipLevels);
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+        REXLOG_ERROR("D3D12Backend: GenerateMipmaps texture lacks ALLOW_UNORDERED_ACCESS flag");
+        return false;
+    }
+    if (desc.MipLevels < mipLevels) {
+        REXLOG_ERROR("D3D12Backend: GenerateMipmaps texture has {} mips, requested {}",
+                     desc.MipLevels, mipLevels);
+        return false;
+    }
+
+    // Lazy-create mip generation pipeline on first use
+    if (!m_mipGenRootSignature) {
+        if (!CreateMipGenPipeline()) return false;
+    }
+
+    // Lazy-create compute PSO on first use
+    if (!m_mipGenPipeline) {
+        const char* csHlsl = GetMipGenCsHlsl();
+        if (!csHlsl || !*csHlsl) {
+            REXLOG_ERROR("D3D12Backend: GenerateMipmaps missing CS HLSL source");
+            return false;
+        }
+
+        // Compile CS with DXC runtime
+        mcla::renderer::DxcRuntime dxc;
+        std::string usedDir, error;
+        if (!dxc.Load("", usedDir, error)) {
+            REXLOG_ERROR("D3D12Backend: GenerateMipmaps failed to load DXC runtime: {}", error);
+            return false;
+        }
+
+        std::vector<uint8_t> csBlob;
+        if (!dxc.Compile(csHlsl, "main", "cs_6_0", csBlob, error)) {
+            REXLOG_ERROR("D3D12Backend: GenerateMipmaps CS compilation failed: {}", error);
+            return false;
+        }
+
+        // Create compute PSO
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = m_mipGenRootSignature.Get();
+        psoDesc.CS = { csBlob.data(), csBlob.size() };
+        psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+        HRESULT hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_mipGenPipeline));
+        if (FAILED(hr)) {
+            REXLOG_ERROR("D3D12Backend: GenerateMipmaps CreateComputePipelineState failed hr=0x{:08X}",
+                         static_cast<uint32_t>(hr));
+            return false;
+        }
+        REXLOG_INFO("D3D12Backend: MipGen compute pipeline created (CS blob {} bytes)", csBlob.size());
+    }
+
+    // Create SRV heap for source mips (read) and UAV heap for destination mips (write)
+    // We'll use the existing SRV heap for source and create UAVs for each mip level
+    // For simplicity, we'll use the same descriptor heap with different offsets
+
+    D3D12_DESCRIPTOR_HEAP_DESC srvUavHeapDesc = {};
+    srvUavHeapDesc.NumDescriptors = mipLevels * 2;  // SRV + UAV per mip
+    srvUavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvUavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srvUavHeap;
+    HRESULT hr = m_device->CreateDescriptorHeap(&srvUavHeapDesc, IID_PPV_ARGS(&srvUavHeap));
+    if (FAILED(hr)) {
+        REXLOG_ERROR("D3D12Backend: GenerateMipmaps CreateDescriptorHeap failed hr=0x{:08X}",
+                     static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    uint32_t descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // Create SRVs and UAVs for each mip level
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> srvHandles(mipLevels);
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> uavHandles(mipLevels);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE srvStart = srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE uavStart;
+    uavStart.ptr = srvStart.ptr + static_cast<SIZE_T>(mipLevels) * descriptorSize;
+
+    for (uint32_t i = 0; i < mipLevels; ++i) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = desc.Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MostDetailedMip = i;
+        srvDesc.Texture2D.MipLevels = 1;
+        srvDesc.Texture2D.PlaneSlice = 0;
+        srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = srvStart;
+        srvHandle.ptr += static_cast<SIZE_T>(i) * descriptorSize;
+        m_device->CreateShaderResourceView(texture, &srvDesc, srvHandle);
+        srvHandles[i] = srvHandle;
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.Format = desc.Format;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        uavDesc.Texture2D.MipSlice = i;
+        uavDesc.Texture2D.PlaneSlice = 0;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE uavHandle = uavStart;
+        uavHandle.ptr += static_cast<SIZE_T>(i) * descriptorSize;
+        m_device->CreateUnorderedAccessView(texture, nullptr, &uavDesc, uavHandle);
+        uavHandles[i] = uavHandle;
+    }
+
+    // Constant buffer for mip generation params
+    struct MipGenParams {
+        uint32_t srcWidth;
+        uint32_t srcHeight;
+        uint32_t dstWidth;
+        uint32_t dstHeight;
+        uint32_t srcMipLevel;
+        uint32_t padding[3];
+    };
+
+    // Wait for GPU to be ready for this frame's upload region
+    if (!WaitForCurrentFrameGpu()) return false;
+
+    // Begin frame if not already in frame
+    if (!m_inFrame) {
+        if (!BeginFrame()) return false;
+    }
+
+    // Transition all mips to appropriate states and generate each level
+    for (uint32_t i = 1; i < mipLevels; ++i) {
+        uint32_t srcMip = i - 1;
+        uint32_t dstMip = i;
+
+        // Calculate dimensions
+        uint32_t srcWidth = std::max<uint32_t>(1, desc.Width >> srcMip);
+        uint32_t srcHeight = std::max<uint32_t>(1, desc.Height >> srcMip);
+        uint32_t dstWidth = std::max<uint32_t>(1, desc.Width >> dstMip);
+        uint32_t dstHeight = std::max<uint32_t>(1, desc.Height >> dstMip);
+
+        // Transition src mip: current state -> NON_PIXEL_SHADER_RESOURCE (SRV)
+        if (!TransitionResource(texture,
+                                D3D12_RESOURCE_STATE_COMMON,  // tracked state
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                srcMip)) {
+            // If transition failed, continue anyway
+        }
+
+        // Transition dst mip: current state -> UNORDERED_ACCESS (UAV)
+        if (!TransitionResource(texture,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                dstMip)) {
+        }
+
+        // Begin frame if needed
+        if (!m_inFrame) {
+            if (!BeginFrame()) return false;
+        }
+
+        // Bind pipeline and descriptors
+        m_commandList->SetPipelineState(m_mipGenPipeline.Get());
+        m_commandList->SetComputeRootSignature(m_mipGenRootSignature.Get());
+
+        // Bind SRV table (src mip)
+        D3D12_GPU_DESCRIPTOR_HANDLE srvGpuHandle = srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+        srvGpuHandle.ptr += static_cast<SIZE_T>(srcMip) * descriptorSize;
+        m_commandList->SetComputeRootDescriptorTable(0, srvGpuHandle);
+
+        // Bind UAV table (dst mip)
+        D3D12_GPU_DESCRIPTOR_HANDLE uavGpuHandle = srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+        uavGpuHandle.ptr += static_cast<SIZE_T>(mipLevels + dstMip) * descriptorSize;
+        m_commandList->SetComputeRootDescriptorTable(1, uavGpuHandle);
+
+        // Bind constants via CBV (root param 1)
+        struct MipGenParams {
+            uint32_t srcWidth;
+            uint32_t srcHeight;
+            uint32_t dstWidth;
+            uint32_t dstHeight;
+            uint32_t srcMipLevel;
+            uint32_t padding[3];
+        } params = { srcWidth, srcHeight, dstWidth, dstHeight, srcMip, {0,0,0} };
+
+        m_commandList->SetComputeRoot32BitConstants(1, sizeof(MipGenParams) / 4, &params, 0);
+
+        // Dispatch
+        uint32_t dispatchX = (dstWidth + 7) / 8;
+        uint32_t dispatchY = (dstHeight + 7) / 8;
+        m_commandList->Dispatch(dispatchX, dispatchY, 1);
+
+        // UAV barrier for this mip
+        D3D12_RESOURCE_BARRIER uavBarrier = {};
+        uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavBarrier.UAV.pResource = texture;
+        m_commandList->ResourceBarrier(1, &uavBarrier);
+
+        // Transition dst mip back to SRV state for next iteration
+        TransitionResource(texture,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          dstMip);
+    }
+
+    // Final transition: all mips to PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE
+    for (uint32_t i = 0; i < mipLevels; ++i) {
+        TransitionResource(texture,
+                          D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          i);
+    }
+
+    REXLOG_INFO("D3D12Backend: Generated {} mip levels for texture", mipLevels);
     return true;
 }
 
@@ -1058,6 +1591,179 @@ void D3D12Backend::Shutdown() {
 
     m_initialized = false;
     REXLOG_INFO("D3D12Backend: Shutdown complete");
+}
+
+// Phase 4: Sampler state management (static samplers for root signature)
+uint32_t D3D12Backend::GetOrCreateStaticSampler(const D3D12_SAMPLER_DESC& desc) {
+    SamplerCacheKey key{ desc };
+    auto it = m_samplerCache.find(key);
+    if (it != m_samplerCache.end()) {
+        for (uint32_t i = 0; i < m_staticSamplerArray.size(); ++i) {
+            if (memcmp(&m_staticSamplerArray[i].Filter, &desc.Filter, sizeof(D3D12_SAMPLER_DESC)) == 0) return i;
+        }
+    }
+    D3D12_STATIC_SAMPLER_DESC staticDesc = {};
+    staticDesc.Filter = desc.Filter;
+    staticDesc.AddressU = desc.AddressU;
+    staticDesc.AddressV = desc.AddressV;
+    staticDesc.AddressW = desc.AddressW;
+    staticDesc.MipLODBias = desc.MipLODBias;
+    staticDesc.MaxAnisotropy = desc.MaxAnisotropy;
+    staticDesc.ComparisonFunc = desc.ComparisonFunc;
+    staticDesc.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    staticDesc.MinLOD = desc.MinLOD;
+    staticDesc.MaxLOD = desc.MaxLOD;
+    staticDesc.ShaderRegister = 0;
+    staticDesc.RegisterSpace = 0;
+    staticDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    uint32_t index = static_cast<uint32_t>(m_staticSamplerArray.size());
+    m_staticSamplerArray.push_back(staticDesc);
+    m_samplerCache.emplace(SamplerCacheKey{ desc }, desc);
+    return index;
+}
+
+bool D3D12Backend::CreateRenderTargetView(ID3D12Resource* texture, DXGI_FORMAT format,
+                                          D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle) {
+    if (!texture || !m_device) return false;
+    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format = format;
+    rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtvDesc.Texture2D.MipSlice = 0;
+    rtvDesc.Texture2D.PlaneSlice = 0;
+    m_device->CreateRenderTargetView(texture, &rtvDesc, rtvHandle);
+    return true;
+}
+
+bool D3D12Backend::CreateDepthStencilView(ID3D12Resource* texture, DXGI_FORMAT format,
+                                          D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle) {
+    if (!texture || !m_device) return false;
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = format;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+    dsvDesc.Texture2D.MipSlice = 0;
+    m_device->CreateDepthStencilView(texture, &dsvDesc, dsvHandle);
+    return true;
+}
+
+bool D3D12Backend::ResolveRenderTarget(ID3D12Resource* srcRt, ID3D12Resource* dstTexture,
+                                       DXGI_FORMAT format) {
+    if (!srcRt || !dstTexture || !m_commandList) return false;
+    D3D12_RESOURCE_BARRIER barriers[2] = {};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = srcRt;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = dstTexture;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(2, barriers);
+    m_commandList->ResolveSubresource(dstTexture, 0, srcRt, 0, format);
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(2, barriers);
+    return true;
+}
+
+const D3D12_BLEND_DESC* D3D12Backend::GetOrCreateBlendState(const D3D12_BLEND_DESC& desc) {
+    BlendStateCacheKey key{ desc };
+    auto it = m_blendStateCache.find(key);
+    if (it != m_blendStateCache.end()) return &it->second;
+    auto [it2, inserted] = m_blendStateCache.emplace(BlendStateCacheKey{ desc }, desc);
+    return &it2->second;
+}
+
+const D3D12_DEPTH_STENCIL_DESC* D3D12Backend::GetOrCreateDepthStencilState(const D3D12_DEPTH_STENCIL_DESC& desc) {
+    DepthStencilStateCacheKey key{ desc };
+    auto it = m_depthStencilStateCache.find(key);
+    if (it != m_depthStencilStateCache.end()) return &it->second;
+    auto [it2, inserted] = m_depthStencilStateCache.emplace(DepthStencilStateCacheKey{ desc }, desc);
+    return &it2->second;
+}
+
+const D3D12_RASTERIZER_DESC* D3D12Backend::GetOrCreateRasterizerState(const D3D12_RASTERIZER_DESC& desc) {
+    RasterizerStateCacheKey key{ desc };
+    auto it = m_rasterizerStateCache.find(key);
+    if (it != m_rasterizerStateCache.end()) return &it->second;
+    auto [it2, inserted] = m_rasterizerStateCache.emplace(RasterizerStateCacheKey{ desc }, desc);
+    return &it2->second;
+}
+
+bool D3D12Backend::TransitionResource(ID3D12Resource* resource,
+                                      D3D12_RESOURCE_STATES stateBefore,
+                                      D3D12_RESOURCE_STATES stateAfter,
+                                      UINT subresource) {
+    if (!resource || !m_commandList) return false;
+    if (stateBefore == stateAfter) return false;
+    auto it = m_resourceStates.find(resource);
+    D3D12_RESOURCE_STATES trackedBefore = (it != m_resourceStates.end()) ? it->second.state : D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES trackedSub = (it != m_resourceStates.end()) ? D3D12_RESOURCE_STATES(it->second.subresource) : D3D12_RESOURCE_STATES(D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    if (trackedBefore == stateBefore && trackedSub == subresource) {
+        if (it != m_resourceStates.end()) {
+            it->second.state = stateAfter;
+            it->second.subresource = subresource;
+        } else {
+            m_resourceStates.emplace(resource, ResourceStateEntry{ stateAfter, subresource });
+        }
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.StateBefore = trackedBefore;
+    barrier.Transition.StateAfter = stateAfter;
+    barrier.Transition.Subresource = trackedSub;
+    m_commandList->ResourceBarrier(1, &barrier);
+    if (it != m_resourceStates.end()) {
+        it->second.state = stateAfter;
+        it->second.subresource = subresource;
+    } else {
+        m_resourceStates.emplace(resource, ResourceStateEntry{ stateAfter, subresource });
+    }
+    return true;
+}
+
+bool D3D12Backend::BeginRenderPass(const D3D12Backend::RenderPassDesc& desc) {
+    if (!m_commandList || desc.rtvs.empty()) return false;
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvHandles;
+    for (const auto& rtv : desc.rtvs) rtvHandles.push_back(rtv.cpuHandle);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = {};
+    bool hasDsv = desc.dsv.has_value();
+    if (hasDsv) dsvHandle = desc.dsv->cpuHandle;
+    m_commandList->OMSetRenderTargets(static_cast<UINT>(rtvHandles.size()),
+                                      rtvHandles.data(), FALSE,
+                                      hasDsv ? &dsvHandle : nullptr);
+    for (const auto& rtv : desc.rtvs) {
+        if (rtv.clear) {
+            m_commandList->ClearRenderTargetView(rtv.cpuHandle, rtv.clearColor, 0, nullptr);
+        }
+    }
+    if (hasDsv && (desc.dsv->clearDepth || desc.dsv->clearStencil)) {
+        D3D12_CLEAR_FLAGS flags = static_cast<D3D12_CLEAR_FLAGS>(0);
+        if (desc.dsv->clearDepth) flags |= D3D12_CLEAR_FLAG_DEPTH;
+        if (desc.dsv->clearStencil) flags |= D3D12_CLEAR_FLAG_STENCIL;
+        m_commandList->ClearDepthStencilView(dsvHandle, flags,
+                                             desc.dsv->depthClear, desc.dsv->stencilClear,
+                                             0, nullptr);
+    }
+    if (desc.viewport.Width > 0 && desc.viewport.Height > 0) {
+        m_commandList->RSSetViewports(1, &desc.viewport);
+    }
+    if (desc.scissor.right > desc.scissor.left && desc.scissor.bottom > desc.scissor.top) {
+        m_commandList->RSSetScissorRects(1, &desc.scissor);
+    }
+    m_activeRenderPass = desc;
+    return true;
+}
+
+void D3D12Backend::EndRenderPass() {
+    if (!m_activeRenderPass.has_value() || !m_commandList) return;
+    m_activeRenderPass.reset();
 }
 
 } // namespace mcla::native

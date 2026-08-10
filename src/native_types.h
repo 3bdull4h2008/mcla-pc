@@ -8,7 +8,9 @@ namespace mcla::native {
 
 // Magic identifier for MCLA trace streams ('MCLA' in ASCII / 0x414C434D)
 constexpr uint32_t kTraceMagic = 0x414C434D;
-constexpr uint32_t kTraceVersion = 1;
+// v2 adds the captured grcFvf vertex declaration to DrawPacket (packetSize
+// guard). v1 traces are rejected by the reader (version mismatch).
+constexpr uint32_t kTraceVersion = 2;
 
 #pragma pack(push, 1)
 
@@ -29,6 +31,35 @@ struct VertexStreamDesc {
     uint32_t stride;           // Element stride in bytes
     uint32_t offset;           // Offset within stream
     uint32_t format;           // Format/type descriptor
+};
+
+// Captured RAGE drawable vertex declaration (grcFvf), 16 bytes from the guest
+// drawable descriptor:
+//   +0 u32 fvfMask       bit i set = semantic lane i is bound
+//   +4 u8  fvfSize       declared vertex stride in bytes
+//   +5 u8  flags
+//   +6 u8  dynamicOrder
+//   +7 u8  channelCount   count of set mask bits (informational)
+//   +8 u64 channelTypes   16 x 4-bit type codes, lane i at bits [i*4..i*4+3]
+//
+// ENDIANNESS: the guest block is big-endian; the capture site must convert
+// with ReadU32BE (fvfMask) and ReadU64BE (channelTypes) BEFORE storing, so
+// the fields here are plain host-endian numeric values. The decoder assumes
+// exactly that layout (lane i at bits [i*4..i*4+3] of `types`). Lanes 16/17
+// (Binormal0/1) have no type bits in the u64 and decode as unknown.
+//
+// Zero-valued when no live drawable capture provided the descriptor
+// (DrawPacket.hasGrcFvf == 0). Decoded by grc_fvf_decode.
+// No default member initializers: the struct must stay a trivial POD so
+// DrawPacket remains trivially copyable (trace file I/O, value-init {} zeros
+// any unwritten fields).
+struct GrcFvfDesc {
+    uint32_t fvfMask;
+    uint8_t fvfSize;
+    uint8_t flags;
+    uint8_t dynamicOrder;
+    uint8_t channelCount;
+    uint64_t types;
 };
 
 // POD DrawPacket representing a complete, self-contained draw call
@@ -80,6 +111,10 @@ struct DrawPacket {
     uint64_t stateHash;        // Deterministic hash of draw state
     uint32_t isValid;          // 1 if all guest memory references are valid, 0 if error
     uint32_t validationFlags;  // Bitfield describing validation status
+
+    // ── Vertex Declaration (grcFvf) ─────────────────────────────────────────
+    GrcFvfDesc grcFvf;         // Captured RAGE drawable vertex declaration
+    uint32_t hasGrcFvf;        // 1 when grcFvf was decoded from a live guest drawable
 };
 
 #pragma pack(pop)

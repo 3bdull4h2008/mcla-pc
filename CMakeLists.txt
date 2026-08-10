@@ -88,6 +88,7 @@ add_executable(mcla WIN32
       src/renderer/dxc_runtime.cpp src/renderer/dxc_runtime.h
       src/renderer/pipeline_cache.cpp src/renderer/pipeline_cache.h
       src/renderer/vertex_decode.cpp src/renderer/vertex_decode.h
+      src/renderer/grc_fvf_decode.cpp src/renderer/grc_fvf_decode.h
       src/renderer/resource_cache.cpp src/renderer/resource_cache.h
       src/renderer/texture_decode.cpp src/renderer/texture_decode.h
       src/renderer/test_shaders.h
@@ -134,7 +135,7 @@ target_compile_definitions(xenos_decode_validator PRIVATE ${VALIDATOR_COMPILE_DE
 # phase3_validator: vertex fetch + resource/texture decode unit checks.
 add_executable(phase3_validator
     src/renderer/phase3_validator.cpp ${RENDERER_IR_TUS}
-    src/renderer/vertex_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
+    src/renderer/vertex_decode.cpp src/renderer/grc_fvf_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
 target_include_directories(phase3_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(phase3_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 

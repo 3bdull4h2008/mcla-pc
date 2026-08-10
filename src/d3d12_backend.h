@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 
 #include "renderer/resource_cache.h"
 #include "renderer/pipeline_cache.h"
@@ -115,6 +116,153 @@ public:
                                 const renderer::PipelineState& state,
                                 Microsoft::WRL::ComPtr<ID3D12PipelineState>& outPso);
 
+    // Phase 4: Sampler state management
+    // Creates or retrieves a cached sampler state from the provided descriptor.
+    // Returns the D3D12_STATIC_SAMPLER_DESC index for root signature binding,
+    // or UINT32_MAX on failure.
+    uint32_t GetOrCreateStaticSampler(const D3D12_SAMPLER_DESC& desc);
+
+    // Phase 4: Render target view for a texture (allows texture to be used as RT)
+    // Creates an RTV for the given texture resource with the specified format.
+    // Returns false on failure.
+    bool CreateRenderTargetView(ID3D12Resource* texture, DXGI_FORMAT format,
+                                D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle);
+
+    // Phase 4: Depth-stencil view for a texture
+    bool CreateDepthStencilView(ID3D12Resource* texture, DXGI_FORMAT format,
+                                D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle);
+
+    // Phase 4: Generate mipmaps for a texture (requires SRV + UAV)
+    // Source texture must have D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.
+    bool GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels);
+
+    // Phase 5: Create mipmap generation compute pipeline (root signature + PSO)
+    bool CreateMipGenPipeline();
+
+    // Phase 6: Create shader-visible sampler descriptor heap
+    bool CreateSamplerHeap();
+
+    // Phase 6: Dynamic sampler descriptor heap management
+    // Returns CPU/GPU descriptor handles for a sampler state; creates and caches if new.
+    // The GPU handle is valid for binding to a root signature descriptor table slot.
+    struct SamplerDescriptor {
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;
+    };
+    SamplerDescriptor GetOrCreateSamplerDescriptor(const D3D12_SAMPLER_DESC& desc);
+
+    // Binds the shader-visible sampler descriptor heap to the command list.
+    // Call after BeginRenderPass or before drawing when sampler tables are needed.
+    void BindSamplerHeap();
+
+    // Phase 4: Resolve a render target to a texture (for MSAA or format conversion)
+    bool ResolveRenderTarget(ID3D12Resource* srcRt, ID3D12Resource* dstTexture,
+                             DXGI_FORMAT format);
+
+    // Phase 4: Full render state objects (cached by descriptor)
+    // Blend state
+    const D3D12_BLEND_DESC* GetOrCreateBlendState(const D3D12_BLEND_DESC& desc);
+    // Depth-stencil state
+    const D3D12_DEPTH_STENCIL_DESC* GetOrCreateDepthStencilState(const D3D12_DEPTH_STENCIL_DESC& desc);
+    // Rasterizer state
+    const D3D12_RASTERIZER_DESC* GetOrCreateRasterizerState(const D3D12_RASTERIZER_DESC& desc);
+
+    // Phase 4: Resource state tracking and automatic barrier insertion
+    // Call before accessing a resource to ensure correct state transition.
+    // Returns true if a barrier was emitted.
+    bool TransitionResource(ID3D12Resource* resource,
+                            D3D12_RESOURCE_STATES stateBefore,
+                            D3D12_RESOURCE_STATES stateAfter,
+                            UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+
+    // Phase 4: Frame graph / render pass support
+    // Begin a render pass: sets RTs/DSV, emits necessary barriers, clears if requested.
+    // Passes an array of render target descriptors (format, clear color, load/store ops).
+    struct RenderPassDesc {
+        struct RTV {
+            D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+            DXGI_FORMAT format;
+            float clearColor[4] = {0, 0, 0, 0};
+            bool clear = false;
+            D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            D3D12_RESOURCE_STATES finalState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        };
+        struct DSV {
+            D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+            DXGI_FORMAT format;
+            float depthClear = 1.0f;
+            UINT8 stencilClear = 0;
+            bool clearDepth = false;
+            bool clearStencil = false;
+            D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            D3D12_RESOURCE_STATES finalState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        };
+        std::vector<RTV> rtvs;
+        std::optional<DSV> dsv;
+        D3D12_VIEWPORT viewport = {};
+        D3D12_RECT scissor = {};
+    };
+    bool BeginRenderPass(const RenderPassDesc& desc);
+    void EndRenderPass();
+
+    // Phase 7: Render Graph / Frame Graph Architecture
+    // Declarative render graph builder for automatic barrier management and transient resource allocation.
+    struct RenderGraphPass;
+    class RenderGraphBuilder {
+    public:
+        // Opaque handle to a pass in the graph
+        struct PassHandle { uint32_t index; };
+        // Resource usage in a pass
+        enum class ResourceUsage {
+            Read,       // SRV
+            Write,      // RTV/DSV/UAV
+            ReadWrite   // UAV read+write
+        };
+        // Resource access info for a pass
+        struct ResourceAccess {
+            ID3D12Resource* resource = nullptr;
+            ResourceUsage usage = ResourceUsage::Read;
+            D3D12_RESOURCE_STATES beforeState = D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES afterState = D3D12_RESOURCE_STATE_COMMON;
+            UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        };
+        // Transient resource description for allocation
+        struct TransientResourceDesc {
+            std::wstring name;
+            D3D12_RESOURCE_DESC desc;
+            D3D12_CLEAR_VALUE clearValue = {};
+        };
+
+        RenderGraphBuilder() = default;
+        explicit RenderGraphBuilder(D3D12Backend* backend) : m_backend(backend) {}
+
+        // Add a pass to the graph. `execute` is called during graph execution.
+        // `resources` lists all resources accessed by this pass with their usage and state transitions.
+        // Returns a handle to the pass for later reference.
+        PassHandle AddPass(std::wstring name,
+                           std::vector<ResourceAccess> resources,
+                           std::function<void(ID3D12GraphicsCommandList*)> execute);
+
+        // Request a transient resource. The graph will allocate/recycle based on lifetime.
+        ID3D12Resource* GetTransientResource(const TransientResourceDesc& desc);
+
+        // Build the graph: validates dependencies, performs topological sort, allocates transients.
+        bool Build();
+
+        // Execute the built graph on the current command list.
+        void Execute();
+
+        // Clear the graph for the next frame.
+        void Reset();
+
+    private:
+        D3D12Backend* m_backend = nullptr;
+        friend class D3D12Backend;
+    };
+
+    // Create a RenderGraphBuilder for the current frame.
+    RenderGraphBuilder CreateRenderGraph();
+
     void EndFrame();
 
     // Accessors
@@ -132,7 +280,7 @@ public:
     // Must precede writes into this frame's upload arena region.
     bool WaitForCurrentFrameGpu();
 
-    // Phase 3 draw-path resources
+// Phase 3 draw-path resources
     bool CreateUploadHeap();
     bool CreateTestRootSignature();
     bool CreateTestPipeline();
@@ -151,6 +299,10 @@ public:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_testPipeline;
 
+    // Phase 5: Mipmap generation compute pipeline
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_mipGenRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_mipGenPipeline;
+
     // Static index buffer for the deterministic triangle, uploaded once and
     // cached by ResourceCache so later frames do not re-upload it.
     bool CreateStaticIndexBuffer();
@@ -161,12 +313,129 @@ public:
     bool CreateSrvHeap();
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_srvHeap;
     uint32_t m_srvDescriptorSize = 0;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_samplerHeap;
+    uint32_t m_samplerDescriptorSize = 0;
+    uint32_t m_samplerHeapOffset = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_decodedTexture;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_decodedTextureUpload;
     D3D12_GPU_DESCRIPTOR_HANDLE m_decodedTextureSrvGpu = {};
     HRESULT m_lastPresentHr = S_OK;
 
-    DrawStats m_stats;
+DrawStats m_stats;
+
+    // Phase 6: Dynamic sampler descriptor heap
+    static constexpr uint32_t kSamplerHeapSize = 2048;
+    // SamplerCacheKey and hash must be defined before the map that uses them
+    struct SamplerCacheKey {
+        D3D12_SAMPLER_DESC desc;
+        bool operator==(const SamplerCacheKey& other) const {
+            return memcmp(&desc, &other.desc, sizeof(D3D12_SAMPLER_DESC)) == 0;
+        }
+    };
+    struct SamplerCacheKeyHash {
+        size_t operator()(const SamplerCacheKey& k) const noexcept {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(&k.desc);
+            size_t h = 14695981039346656037ULL;
+            for (size_t i = 0; i < sizeof(D3D12_SAMPLER_DESC); ++i) {
+                h ^= p[i]; h *= 1099511628211ULL;
+            }
+            return h;
+        }
+    };
+std::unordered_map<SamplerCacheKey, D3D12_SAMPLER_DESC, SamplerCacheKeyHash> m_samplerCache;
+    std::vector<D3D12_STATIC_SAMPLER_DESC> m_staticSamplerArray;  // for root signature
+    std::unordered_map<SamplerCacheKey, uint32_t, SamplerCacheKeyHash> m_samplerDescriptorIndex;  // desc -> heap index
+
+    // Phase 4: Cached state objects
+    // Samplers in D3D12 are either static (root signature) or descriptor heap entries.
+    // We cache the descriptor descriptors for reuse.
+
+    // For Blend/DepthStencil/Rasterizer states, D3D12 bakes them into PSOs.
+    // We cache the descriptors for reuse when creating PSOs.
+    struct BlendStateCacheKey {
+        D3D12_BLEND_DESC desc;
+        bool operator==(const BlendStateCacheKey& other) const {
+            return memcmp(&desc, &other.desc, sizeof(D3D12_BLEND_DESC)) == 0;
+        }
+    };
+    struct BlendStateCacheKeyHash {
+        size_t operator()(const BlendStateCacheKey& k) const noexcept {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(&k.desc);
+            size_t h = 14695981039346656037ULL;
+            for (size_t i = 0; i < sizeof(D3D12_BLEND_DESC); ++i) {
+                h ^= p[i]; h *= 1099511628211ULL;
+            }
+            return h;
+        }
+    };
+    std::unordered_map<BlendStateCacheKey, D3D12_BLEND_DESC, BlendStateCacheKeyHash> m_blendStateCache;
+
+    struct DepthStencilStateCacheKey {
+        D3D12_DEPTH_STENCIL_DESC desc;
+        bool operator==(const DepthStencilStateCacheKey& other) const {
+            return memcmp(&desc, &other.desc, sizeof(D3D12_DEPTH_STENCIL_DESC)) == 0;
+        }
+    };
+    struct DepthStencilStateCacheKeyHash {
+        size_t operator()(const DepthStencilStateCacheKey& k) const noexcept {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(&k.desc);
+            size_t h = 14695981039346656037ULL;
+            for (size_t i = 0; i < sizeof(D3D12_DEPTH_STENCIL_DESC); ++i) {
+                h ^= p[i]; h *= 1099511628211ULL;
+            }
+            return h;
+        }
+    };
+    std::unordered_map<DepthStencilStateCacheKey, D3D12_DEPTH_STENCIL_DESC, DepthStencilStateCacheKeyHash> m_depthStencilStateCache;
+
+    struct RasterizerStateCacheKey {
+        D3D12_RASTERIZER_DESC desc;
+        bool operator==(const RasterizerStateCacheKey& other) const {
+            return memcmp(&desc, &other.desc, sizeof(D3D12_RASTERIZER_DESC)) == 0;
+        }
+    };
+    struct RasterizerStateCacheKeyHash {
+        size_t operator()(const RasterizerStateCacheKey& k) const noexcept {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(&k.desc);
+            size_t h = 14695981039346656037ULL;
+            for (size_t i = 0; i < sizeof(D3D12_RASTERIZER_DESC); ++i) {
+                h ^= p[i]; h *= 1099511628211ULL;
+            }
+            return h;
+        }
+    };
+    std::unordered_map<RasterizerStateCacheKey, D3D12_RASTERIZER_DESC, RasterizerStateCacheKeyHash> m_rasterizerStateCache;
+
+    // Resource state tracking for automatic barrier insertion
+    struct ResourceStateEntry {
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+        UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    };
+    std::unordered_map<ID3D12Resource*, ResourceStateEntry> m_resourceStates;
+
+    // Current render pass state
+    std::optional<RenderPassDesc> m_activeRenderPass;
+
+    // Phase 7: Render Graph state
+    struct RenderGraphPass {
+        std::wstring name;
+        std::vector<RenderGraphBuilder::ResourceAccess> resources;
+        std::function<void(ID3D12GraphicsCommandList*)> execute;
+        std::vector<uint32_t> dependencies;  // indices of passes this depends on
+        std::vector<uint32_t> dependents;    // indices of passes that depend on this
+    };
+    struct TransientResourceEntry {
+        std::wstring name;
+        D3D12_RESOURCE_DESC desc;
+        D3D12_CLEAR_VALUE clearValue;
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+        uint64_t lastUsedFrame = 0;
+        bool inUse = false;
+    };
+    std::vector<RenderGraphPass> m_renderGraphPasses;
+    std::vector<TransientResourceEntry> m_transientResources;
+    std::vector<uint32_t> m_renderGraphExecutionOrder;
+    bool m_renderGraphBuilt = false;
 
 private:
     bool CreateDevice();

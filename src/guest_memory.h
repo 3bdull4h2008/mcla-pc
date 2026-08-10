@@ -31,10 +31,11 @@ public:
     const uint8_t* GetHostPtr(uint32_t guestAddr, uint32_t size) const;
     uint8_t* GetHostPtrMutable(uint32_t guestAddr, uint32_t size) const;
 
-    // Endian-safe checked reads. Return false if guestAddr range is invalid.
+// Endian-safe checked reads. Return false if guestAddr range is invalid.
     bool ReadU8(uint32_t guestAddr, uint8_t* outVal) const;
     bool ReadU16BE(uint32_t guestAddr, uint16_t* outVal) const;
     bool ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const;
+    bool ReadU64BE(uint32_t guestAddr, uint64_t* outVal) const;
     bool ReadF32BE(uint32_t guestAddr, float* outVal) const;
     bool ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t size) const;
 

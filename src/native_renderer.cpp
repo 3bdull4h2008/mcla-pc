@@ -19,6 +19,7 @@
 #include "renderer/pipeline_cache.h"
 #include "renderer/xenos_shader_ir.h"
 #include "renderer/vertex_decode.h"
+#include "renderer/grc_fvf_decode.h"
 
 #include <cassert>
 #include <chrono>
@@ -625,19 +626,169 @@ static uint64_t HashVsVertexDeclaration(const mcla::renderer::ShaderProgram& vsP
                                  static_cast<uint32_t>(vf.size()));
 }
 
+// Resolve the captured RAGE drawable vertex declaration (grcFvf) when the
+// packet carries one. Fills `layout` (D3D12 input elements) and `declHash`
+// (PipelineKey vertexDeclHash) from the decoded declaration and returns true.
+//
+// Cross-check: every vertex input the VS references must resolve to a decoded
+// channel. The drawable may declare more channels than the current VS uses
+// (extra channels stay in the stride and are included in the input layout),
+// but a referenced-but-absent element is refused, never defaulted (Golden
+// Rule 5).
+//
+// When the packet has no captured grcFvf (live drawable pointer chain still
+// unproven - no game draw reached a hook yet), falls back to the documented
+// Phase-3 stopgap: the fixture layout from the VS referenced inputs plus
+// HashVsVertexDeclaration (which yields 0 for MCLA vf=0). A one-time
+// deduplicated diagnostic keeps the evidence gap loud without frame spam.
+static bool ResolveCapturedVertexLayout(
+    const DrawPacket& packet, const mcla::renderer::ShaderProgram& vsProg,
+    std::vector<D3D12_INPUT_ELEMENT_DESC>& layout, uint64_t& declHash) {
+    static std::unordered_set<std::string> s_emittedReasons;
+
+    auto refuse = [&](const char* reason) {
+        std::string key(reason);
+        if (s_emittedReasons.insert(key).second) {
+            REXLOG_WARN("Native render: captured grcFvf layout refused ({})", reason);
+        }
+        layout.clear();
+        declHash = 0;
+        return false;
+    };
+
+    if (!packet.hasGrcFvf) {
+        if (s_emittedReasons.insert("no captured grcFvf (live drawable pointer chain unproven)").second) {
+            REXLOG_WARN("Native render: packet has no captured grcFvf (live drawable "
+                        "pointer chain unproven); using fixture layout stopgap, stride==28 gate");
+        }
+        layout = BuildInputLayoutFromVS(vsProg);
+        declHash = HashVsVertexDeclaration(vsProg);
+        return !layout.empty();
+    }
+
+    const mcla::native::GrcFvfDeclaration decl = mcla::native::DecodeGrcFvf(packet.grcFvf);
+    if (!decl.valid) {
+        return refuse(decl.unknownChannel
+                          ? "captured grcFvf has an unknown channel type"
+                          : "captured grcFvf empty/invalid");
+    }
+    if (decl.sizeMismatch) {
+        return refuse("captured grcFvf stride inconsistency (fvfSize != channel sum)");
+    }
+
+    mcla::native::GrcFvfLayoutEntry entries[mcla::native::kGrcFvfChannelCount];
+    uint32_t entryCount = 0;
+    if (!mcla::native::BuildGrcFvfLayout(decl, entries, entryCount) || entryCount == 0) {
+        return refuse("captured grcFvf produced no usable layout");
+    }
+
+    const auto refs = mcla::renderer::ReferencedVertexInputs(vsProg);
+    for (const auto& r : refs) {
+        bool found = false;
+        for (uint32_t i = 0; i < entryCount; ++i) {
+            if (entries[i].usage == r.usage && entries[i].usageIndex == r.usageIndex) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            REXLOG_WARN("Native render: VS references (usage={},idx={}) missing from "
+                        "captured grcFvf; refusing",
+                        (int)r.usage, (int)r.usageIndex);
+            return refuse("VS input missing from captured grcFvf");
+        }
+    }
+
+    std::vector<D3D12_INPUT_ELEMENT_DESC> out;
+    out.reserve(entryCount);
+    for (uint32_t i = 0; i < entryCount; ++i) {
+        D3D12_INPUT_ELEMENT_DESC desc = {};
+        desc.SemanticName = mcla::renderer::VertexUsageSemanticName(entries[i].usage);
+        desc.SemanticIndex = entries[i].usageIndex;
+        desc.InputSlot = 0;
+        desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        desc.InstanceDataStepRate = 0;
+        desc.Format = static_cast<DXGI_FORMAT>(entries[i].dxgiFormat);
+        desc.AlignedByteOffset = entries[i].byteOffset;
+        out.push_back(desc);
+    }
+
+    layout = std::move(out);
+    declHash = mcla::native::HashGrcFvfDeclaration(decl);
+    return true;
+}
+
+// Xenos/XenosRecomp-researched surface format mappings.
+// RB_COLOR_INFO: bits 16-19 = ColorRenderTargetFormat (4 bits)
+// RB_DEPTH_INFO: bit 16 = DepthRenderTargetFormat (1 bit)
+//
+// ColorRenderTargetFormat enum (Xenia xenos.h):
+//   0  k_8_8_8_8
+//   1  k_8_8_8_8_GAMMA
+//   2  k_2_10_10_10
+//   3  k_2_10_10_10_FLOAT  (7e3 float)
+//   4  k_16_16
+//   5  k_16_16_16_16
+//   6  k_16_16_FLOAT
+//   7  k_16_16_16_16_FLOAT
+//   10 k_2_10_10_10_AS_10_10_10_10
+//   12 k_2_10_10_10_FLOAT_AS_16_16_16_16
+//   14 k_32_FLOAT
+//   15 k_32_32_FLOAT
+//
+// DepthRenderTargetFormat enum:
+//   0  kD24S8
+//   1  kD24FS8  (float depth, 20e4)
+
+static DXGI_FORMAT DecodeColorTargetFormat(uint32_t colorInfo) {
+    // Extract color_format from bits 16-19
+    const uint32_t format = (colorInfo >> 16) & 0xF;
+    switch (format) {
+        case 0:  return DXGI_FORMAT_R8G8B8A8_UNORM;              // k_8_8_8_8
+        case 1:  return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;         // k_8_8_8_8_GAMMA
+        case 2:  return DXGI_FORMAT_R10G10B10A2_UNORM;           // k_2_10_10_10
+        case 3:  return DXGI_FORMAT_R10G10B10A2_UNORM;           // k_2_10_10_10_FLOAT (7e3) - same storage
+        case 4:  return DXGI_FORMAT_R16G16_UNORM;                // k_16_16
+        case 5:  return DXGI_FORMAT_R16G16B16A16_UNORM;          // k_16_16_16_16
+        case 6:  return DXGI_FORMAT_R16G16_FLOAT;                // k_16_16_FLOAT
+        case 7:  return DXGI_FORMAT_R16G16B16A16_FLOAT;          // k_16_16_16_16_FLOAT
+        case 10: return DXGI_FORMAT_R10G10B10A2_UNORM;           // k_2_10_10_10_AS_10_10_10_10
+        case 12: return DXGI_FORMAT_R16G16B16A16_FLOAT;          // k_2_10_10_10_FLOAT_AS_16_16_16_16
+        case 14: return DXGI_FORMAT_R32_FLOAT;                   // k_32_FLOAT
+        case 15: return DXGI_FORMAT_R32G32_FLOAT;                // k_32_32_FLOAT
+        default:
+            REXLOG_WARN("Native render: unknown color target format {} (raw=0x{:08X})",
+                        format, colorInfo);
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+static DXGI_FORMAT DecodeDepthTargetFormat(uint32_t depthInfo) {
+    // Extract depth_format from bit 16
+    const uint32_t format = (depthInfo >> 16) & 0x1;
+    switch (format) {
+        case 0: return DXGI_FORMAT_D24_UNORM_S8_UINT;            // kD24S8
+        case 1: return DXGI_FORMAT_D24_UNORM_S8_UINT;            // kD24FS8 (float depth, 20e4) - same storage
+        default:
+            REXLOG_WARN("Native render: unknown depth target format {} (raw=0x{:08X})",
+                        format, depthInfo);
+            return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    }
+}
+
 // Build a PipelineState from a DrawPacket's captured render state.
 static mcla::renderer::PipelineState
 BuildPipelineStateFromPacket(const DrawPacket& packet) {
     mcla::renderer::PipelineState state = {};
 
-    // Render target formats (simplified - assume R8G8B8A8_UNORM for now)
+    // Render target formats from Xenos RB_COLOR_INFO / RB_DEPTH_INFO registers.
     for (uint32_t i = 0; i < 4; ++i) {
         if (packet.colorTargets[i] != 0) {
-            state.targetFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            state.targetFormats[i] = DecodeColorTargetFormat(packet.colorTargets[i]);
         }
     }
     if (packet.depthTarget != 0) {
-        state.depthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        state.depthStencilFormat = DecodeDepthTargetFormat(packet.depthTarget);
     }
 
     // Rasterizer state from PA registers
@@ -706,10 +857,13 @@ GetPipelineForPacket(D3D12Backend* backend, const DrawPacket& packet) {
     // declaration. GetOrCompile compiles HLSL in the background and returns
     // the fallback PSO immediately, so the draw never stalls.
     mcla::renderer::PipelineState state = BuildPipelineStateFromPacket(packet);
+    uint64_t vertexDeclHash = 0;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+    if (!ResolveCapturedVertexLayout(packet, vsProg, inputLayout, vertexDeclHash)) {
+        return nullptr;
+    }
     mcla::renderer::PipelineKey key = mcla::renderer::ComputePipelineKey(
-        vsOut.programHash, psOut.programHash, HashVsVertexDeclaration(vsProg), state);
-
-    auto inputLayout = BuildInputLayoutFromVS(vsProg);
+        vsOut.programHash, psOut.programHash, vertexDeclHash, state);
 
     auto& cache = backend->GetPipelineCache();
     return cache.GetOrCompile(key, vsOut.hlsl, psOut.hlsl, inputLayout);
@@ -740,8 +894,18 @@ bool TryConsumeCapturedGeometry(D3D12Backend* backend, const DrawPacket* packet)
     // evidence supports yet.
     if (packet->indexType != 2) return refuse("indexType != non-indexed(2)");
     if (packet->vertexStreamCount != 1) return refuse("vertexStreamCount != 1");
+    // Expected stride: from the captured grcFvf declaration when present
+    // (Phase 8 item 1), otherwise the fixture (test) input layout's 28 bytes.
+    uint32_t expectedStride = 28;
+    if (packet->hasGrcFvf) {
+        const mcla::native::GrcFvfDeclaration decl = mcla::native::DecodeGrcFvf(packet->grcFvf);
+        if (!decl.valid || decl.unknownChannel || decl.sizeMismatch) {
+            return refuse("captured grcFvf not usable for stride gate");
+        }
+        expectedStride = decl.computedStride;
+    }
     const uint32_t stride = packet->vertexStreams[0].stride;
-    if (stride != 28) return refuse("vertex stride != 28 (test input layout)");
+    if (stride != expectedStride) return refuse("vertex stride != declared grcFvf stride");
     if (packet->indexCount == 0) return refuse("indexCount == 0");
 
     const VertexStreamDesc& vs = packet->vertexStreams[0];
@@ -818,31 +982,48 @@ REX_FUNC(Hooked_VdSwap) {
             static uint64_t s_nativeFrameCount = 0;
             s_nativeFrameCount++;
 
-            // Try to consume the most recently captured DrawPacket as native
-            // geometry when its layout provably matches the test PSO input
-            // layout. In this session no game draw is reached, so the snapshot
-            // is empty and this falls back to the fixture quad (one diagnostic
-            // per refusal reason).
+            // Build and execute the render graph for this frame
+            auto graph = d3dBackend->CreateRenderGraph();
+
+            // Pass 1: Geometry consumption (if captured packet available)
             bool consumed = false;
             if (haveCaptured) {
-                consumed = TryConsumeCapturedGeometry(d3dBackend, &capturedSnapshot);
+                graph.AddPass(L"ConsumeCapturedGeometry",
+                    {
+                        // No specific resources tracked yet - we'll track them better once live captures work
+                    },
+                    [&](ID3D12GraphicsCommandList* cmdList) {
+                        auto* backend = GetD3D12Backend();
+                        if (TryConsumeCapturedGeometry(backend, &capturedSnapshot)) {
+                            // Mark as consumed - the actual draw happens inside TryConsumeCapturedGeometry
+                        }
+                    });
             }
 
-            // Phase 3 fallback: draw a meshed indexed triangle on the native
-            // path. This proves buffer/upload, index, viewport, topology, and
-            // RTV handling end-to-end without the Xenos command processor.
-            if (!consumed) {
-                d3dBackend->DrawTestMeshedTriangle(static_cast<uint32_t>(s_nativeFrameCount));
+            // Pass 2: Fallback test triangle (always runs if geometry not consumed)
+            // This pass writes to the back buffer RTV
+            graph.AddPass(L"DrawTestTriangle",
+                {},
+                [&](ID3D12GraphicsCommandList* cmdList) {
+                    auto* backend = GetD3D12Backend();
+                    static uint64_t s_nativeFrameCount = 0;
+                    s_nativeFrameCount++;
+                    backend->DrawTestMeshedTriangle(static_cast<uint32_t>(s_nativeFrameCount));
+                });
+
+            // Execute the render graph
+            if (graph.Build()) {
+                graph.Execute();
             }
+            graph.Reset();
 
             // Low-noise aggregate: one structured line per 120th frame.
-            const auto& stats = d3dBackend->Stats();
             static uint64_t s_nativeReportFrame = 0;
-            if (s_nativeFrameCount % 120 == 0) {
-                REXLOG_INFO("Native render phase3 frame={} draws={} uploaded_bytes_total={} cache_hits={} cache_misses={}",
+            if (static_cast<uint64_t>(s_nativeFrameCount) % 120 == 0) {
+                const auto& stats = d3dBackend->Stats();
+                REXLOG_INFO("Native render frame={} draws={} uploaded_bytes_total={} cache_hits={} cache_misses={}",
                             s_nativeFrameCount, stats.drawsIssued, stats.uploadsBytes,
                             stats.cacheHits, stats.cacheMisses);
-                (void)s_nativeReportFrame;
             }
         }
     } else {

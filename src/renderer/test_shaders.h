@@ -549,3 +549,48 @@ float4 main(PSIn input) : SV_Target {
 }
 )HLSL";
 }
+
+// Mipmap generation compute shader (box filter downsampling)
+inline const char* GetMipGenCsHlsl() {
+    return R"HLSL(
+// Mipmap generation compute shader - box filter 2x2 downsample
+// Reads from src mip (SRV), writes to dst mip (UAV)
+
+cbuffer MipGenParams : register(b0) {
+    uint2 srcDim;     // source mip dimensions (width, height)
+    uint2 dstDim;     // destination mip dimensions (width, height)
+    uint  srcMipLevel; // source mip level being read
+};
+
+Texture2D<float4> srcTexture : register(t0);
+RWTexture2D<float4> dstTexture : register(u0);
+
+[numthreads(8, 8, 1)]
+void main(uint3 DTid : SV_DispatchThreadID) {
+    if (DTid.x >= dstDim.x || DTid.y >= dstDim.y) return;
+
+    // Source coordinates for 2x2 box filter
+    uint2 srcCoord0 = DTid.xy * 2;
+    uint2 srcCoord1 = srcCoord0 + uint2(1, 0);
+    uint2 srcCoord2 = srcCoord0 + uint2(0, 1);
+    uint2 srcCoord3 = srcCoord0 + uint2(1, 1);
+
+    // Clamp to source dimensions
+    srcCoord1 = min(srcCoord1, srcDim - 1);
+    srcCoord2 = min(srcCoord2, srcDim - 1);
+    srcCoord3 = min(srcCoord3, srcDim - 1);
+
+    // Box filter: average of 4 texels
+    float4 sum = srcTexture[srcCoord0];
+    sum += srcTexture[srcCoord1];
+    sum += srcTexture[srcCoord2];
+    sum += srcTexture[srcCoord3];
+
+    dstTexture[DTid.xy] = sum * 0.25;
+}
+)HLSL";
+}
+
+// Compiled mipmap generation compute shader DXIL blob (placeholder - compiled at runtime)
+inline const char* GetMipGenCsBlob() { return nullptr; }
+inline uint32_t GetMipGenCsBlobSize() { return 0; }

@@ -14,6 +14,7 @@
 #include "vertex_decode.h"
 #include "resource_cache.h"
 #include "test_shaders.h"
+#include "grc_fvf_decode.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -160,6 +161,218 @@ static bool ExerciseVertexDecode() {
     return ok;
 }
 
+static bool ExerciseGrcFvfDecode() {
+    bool ok = true;
+    auto fail = [&ok](const char* what) {
+        std::printf("  !! %s\n", what);
+        ok = false;
+    };
+
+    // ---- Fixture 1: MCLA1-style 16-channel declaration.
+    // types = 0xAA1111111199A996 stored big-endian (bytes AA 11 11 11 11 99
+    // A9 96); lanes 0-15 bound. Type codes (4-bit, LSB-first over the BE
+    // u64): ch0 Float3(6), ch1/2/4/5 Colour(9), ch3/14/15 Dec3N(A),
+    // ch6..13 Half2(1). Sizes 12+4+4+4+4+4 + 8*4 + 4 + 4 = 72 -> fvfSize 72.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x0000FFFF;
+        desc.fvfSize = 72;
+        desc.flags = 0;
+        desc.dynamicOrder = 0;
+        desc.channelCount = 16;
+        const uint8_t t[8] = {0xAA, 0x11, 0x11, 0x11, 0x11, 0x99, 0xA9, 0x96};
+        desc.types = 0;
+        for (int i = 0; i < 8; ++i) desc.types |= uint64_t(t[i]) << (56 - 8 * i);
+
+        GrcFvfDeclaration d = DecodeGrcFvf(desc);
+        if (!d.valid || d.unknownChannel) fail("fixture1 must decode valid");
+        if (d.computedStride != 72 || d.sizeMismatch) fail("fixture1 stride mismatch");
+        if (d.countMismatch || d.channelCount != 16) fail("fixture1 count mismatch");
+
+        // Semantic/type/offset per lane (offsets: ch0@0, ch1@12, ch2@16,
+        // ch3@20, ch4@24, ch5@28, ch6..13@32..60, ch14@64, ch15@68).
+        if (d.channels[0].type != 6 || d.channels[0].dxgiFormat != 6 /*R32G32B32_FLOAT*/
+            || d.channels[0].byteOffset != 0 || d.channels[0].usage != 0 || d.channels[0].usageIndex != 0)
+            fail("fixture1 ch0 Position/Float3");
+        if (d.channels[3].type != 10 /*Dec3N*/ || d.channels[3].dxgiFormat != 24
+            || d.channels[3].byteOffset != 20 || d.channels[3].usage != 3)
+            fail("fixture1 ch3 Normal/Dec3N");
+        if (d.channels[4].usage != 10 || d.channels[4].usageIndex != 0
+            || d.channels[4].dxgiFormat != 28 || d.channels[4].byteOffset != 24)
+            fail("fixture1 ch4 Colour0");
+        if (d.channels[5].usageIndex != 1) fail("fixture1 ch5 Colour1");
+        if (d.channels[6].usage != 5 || d.channels[6].usageIndex != 0
+            || d.channels[6].dxgiFormat != 34 || d.channels[6].byteOffset != 32)
+            fail("fixture1 ch6 TexCoord0/Half2");
+        if (d.channels[14].usage != 6 || d.channels[14].usageIndex != 0
+            || d.channels[14].dxgiFormat != 24 || d.channels[14].byteOffset != 64)
+            fail("fixture1 ch14 Tangent0/Dec3N");
+        if (d.channels[15].usageIndex != 1 || d.channels[15].byteOffset != 68)
+            fail("fixture1 ch15 Tangent1");
+        if (d.channels[17].present) fail("fixture1 lane17 must not be present");
+
+        GrcFvfLayoutEntry layout[18];
+        uint32_t n = 0;
+        if (!BuildGrcFvfLayout(d, layout, n) || n != 16) fail("fixture1 layout count");
+        if (layout[0].usage != 0 || layout[0].byteOffset != 0 || layout[0].dxgiFormat != 6)
+            fail("fixture1 layout[0]");
+        if (layout[15].usage != 6 || layout[15].usageIndex != 1 || layout[15].byteOffset != 68)
+            fail("fixture1 layout[15]");
+        // Layout must be ascending by byte offset.
+        for (uint32_t i = 1; i < n; ++i)
+            if (layout[i].byteOffset <= layout[i - 1].byteOffset) fail("fixture1 layout not ascending");
+    }
+
+    // ---- Fixture 2: PNCT-ish declaration, mask 0x40C9 (lanes 0,3,6,7,14):
+    // ch0 Float3(6), ch3 Dec3N(A), ch6/7 Half2(1), ch14 Float4(7).
+    // t[0]=0x07 -> lane14 Float4 (low nibble), t[4]=0x11 -> lanes 6/7 Half2,
+    // t[6]=0xA0 -> lane3 Dec3N (high nibble), t[7]=0x06 -> lane0 Float3.
+    // Sizes 12+4+4+4+16 = 40 -> fvfSize 40.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x40C9;  // bits 0,3,6,7,14
+        desc.fvfSize = 40;
+        desc.channelCount = 5;
+        const uint8_t t[8] = {0x07, 0x00, 0x00, 0x00, 0x11, 0x00, 0xA0, 0x06};
+        desc.types = 0;
+        for (int i = 0; i < 8; ++i) desc.types |= uint64_t(t[i]) << (56 - 8 * i);
+
+        GrcFvfDeclaration d = DecodeGrcFvf(desc);
+        if (!d.valid || d.unknownChannel || d.countMismatch) fail("fixture2 must decode valid");
+        if (d.channelCount != 5 || d.computedStride != 40 || d.sizeMismatch)
+            fail("fixture2 count/stride mismatch");
+        if (d.channels[0].byteOffset != 0 || d.channels[3].byteOffset != 12)
+            fail("fixture2 offsets");
+        if (d.channels[14].type != 7 || d.channels[14].dxgiFormat != 2 /*R32G32B32A32_FLOAT*/
+            || d.channels[14].byteOffset != 24 || d.channels[14].usage != 6)
+            fail("fixture2 ch14 Tangent/Float4");
+    }
+
+    // ---- Fixture 3: bound lane with an unverified type code (4 FloatUnk)
+    // must decode unknown and be refused for layout building.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x1;
+        desc.fvfSize = 4;
+        desc.channelCount = 1;
+        desc.types = 0x4;  // nibble0 = FloatUnk
+        GrcFvfDeclaration d = DecodeGrcFvf(desc);
+        if (d.valid || !d.unknownChannel) fail("fixture3 unknown type must be refused");
+        GrcFvfLayoutEntry layout[18];
+        uint32_t n = 99;
+        if (BuildGrcFvfLayout(d, layout, n)) fail("fixture3 layout must not build");
+        if (n != 0) fail("fixture3 layout count must stay 0");
+    }
+
+    // ---- Fixture 4: stored channelCount inconsistent with the mask is an
+    // informational mismatch, not a validity failure.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x1;
+        desc.fvfSize = 12;
+        desc.channelCount = 3;  // wrong; popcount is 1
+        desc.types = 0x6;       // nibble0 = Float3
+        GrcFvfDeclaration d = DecodeGrcFvf(desc);
+        if (!d.valid || !d.countMismatch) fail("fixture4 count mismatch must be informational");
+        if (d.channelCount != 1) fail("fixture4 canonical count must be popcount");
+    }
+
+    // ---- Fixture 5: hash determinism, distinctness, sensitivity.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x0000FFFF;
+        desc.fvfSize = 72;
+        desc.channelCount = 16;
+        const uint8_t t[8] = {0xAA, 0x11, 0x11, 0x11, 0x11, 0x99, 0xA9, 0x96};
+        desc.types = 0;
+        for (int i = 0; i < 8; ++i) desc.types |= uint64_t(t[i]) << (56 - 8 * i);
+
+        GrcFvfDeclaration a = DecodeGrcFvf(desc);
+        GrcFvfDeclaration b = DecodeGrcFvf(desc);
+        uint64_t h1 = HashGrcFvfDeclaration(a);
+        if (h1 == 0 || h1 != HashGrcFvfDeclaration(b)) fail("fixture5 hash nondeterministic/zero");
+        GrcFvfDesc desc2 = desc;
+        desc2.types ^= 0x1;  // flip ch0's LSB type bit
+        GrcFvfDeclaration c = DecodeGrcFvf(desc2);
+        if (HashGrcFvfDeclaration(c) == h1) fail("fixture5 hash insensitive to types");
+        if (c.channels[0].type == a.channels[0].type) fail("fixture5 types bit not decoded");
+    }
+
+    // ---- Fixture 6: presence is mask-gated; a type code on an unbound lane
+    // is ignored. mask 0x11 (lanes 0,4), ch3 type 6 but lane 3 not bound.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x11;
+        desc.fvfSize = 16;
+        desc.channelCount = 2;
+        desc.types = 0x96006;  // nibble0=6, nibble3=6, nibble4=9
+        GrcFvfDeclaration d = DecodeGrcFvf(desc);
+        if (!d.valid || d.unknownChannel || d.countMismatch) fail("fixture6 must decode valid");
+        if (!d.channels[0].present || d.channels[0].type != 6) fail("fixture6 ch0 present");
+        if (d.channels[3].present) fail("fixture6 unbound lane3 must be absent");
+        if (!d.channels[4].present || d.channels[4].type != 9
+            || d.channels[4].byteOffset != 12 || d.channels[4].usage != 10)
+            fail("fixture6 ch4 Colour@12");
+        if (d.computedStride != 16 || d.sizeMismatch) fail("fixture6 stride");
+    }
+
+    // ---- Fixture 7: bound Binormal lane (16) has no type bits in the u64
+    // and must be refused (no UB, no invented format). mask 0x10000, lane 16.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x10000;  // bit 16
+        desc.fvfSize = 4;
+        desc.channelCount = 1;
+        desc.types = 0;
+        GrcFvfDeclaration d = DecodeGrcFvf(desc);
+        if (d.valid || !d.unknownChannel) fail("fixture7 lane16 must refuse");
+        if (!d.channels[16].present) fail("fixture7 lane16 marked present");
+        if (d.channels[16].usage != 7 || d.channels[16].usageIndex != 0)
+            fail("fixture7 lane16 Binormal0 semantic");
+        if (d.sizeMismatch) fail("fixture7 lane16 must not size-mismatch (0 bytes)");
+        GrcFvfLayoutEntry layout[18];
+        uint32_t n = 99;
+        if (BuildGrcFvfLayout(d, layout, n)) fail("fixture7 layout must not build");
+        if (n != 0) fail("fixture7 layout count must stay 0");
+    }
+
+    // ---- Fixture 8: bound lane with type Nothing (code 0) is refused: the
+    // u64 nibble exists but the type corroborates no size/format, so an
+    // invented layout would violate Golden Rule 5.
+    {
+        GrcFvfDesc desc{};
+        desc.fvfMask = 0x1;     // lane 0
+        desc.fvfSize = 12;
+        desc.channelCount = 1;
+        desc.types = 0x0;       // nibble0 = 0 (Nothing)
+        GrcFvfDeclaration d = DecodeGrcFvf(desc);
+        if (d.valid || !d.unknownChannel) fail("fixture8 code-0 lane must refuse");
+        if (!d.channels[0].present) fail("fixture8 lane0 present");
+        if (d.sizeMismatch || d.countMismatch) fail("fixture8 must not flag size/count");
+        if (d.channelCount != 1) fail("fixture8 canonical count must be popcount");
+    }
+
+    // ---- Fixture 9: bound lane with each unverified code (2, 4, 11-15) is
+    // refused. Coverage uses one mask bit (lane 0) and toggles the nibble
+    // across all six codes.
+    {
+        const uint8_t unkCodes[] = {2, 4, 11, 12, 13, 14, 15};
+        for (uint8_t code : unkCodes) {
+            GrcFvfDesc desc{};
+            desc.fvfMask = 0x1;
+            desc.fvfSize = 4;
+            desc.channelCount = 1;
+            desc.types = static_cast<uint64_t>(code);
+            GrcFvfDeclaration d = DecodeGrcFvf(desc);
+            if (d.valid || !d.unknownChannel)
+                fail("fixture9 unverified code must refuse");
+            if (d.channels[0].type != code) fail("fixture9 type bit echoed");
+        }
+    }
+
+    return ok;
+}
+
 static bool ExerciseTestShaderBlobs() {
     bool ok = true;
 
@@ -255,6 +468,7 @@ int main(int argc, char** argv) {
     bool fOk = ExerciseVertexFetchConstant();
     bool rcOk = ExerciseResourceCache();
     bool shOk = ExerciseTestShaderBlobs();
+    bool gfOk = ExerciseGrcFvfDecode();
 
     // Scan corpus for used vf codes.
     std::map<uint32_t, uint64_t> vfUsage;
@@ -309,8 +523,8 @@ int main(int argc, char** argv) {
             return true;
         });
     }
-    std::printf("vertex_decode_test=%s  fetch_constant_test=%s  resource_cache_test=%s  test_shader_blobs=%s\n",
-                vdOk ? "ok" : "FAIL", fOk ? "ok" : "FAIL", rcOk ? "ok" : "FAIL", shOk ? "ok" : "FAIL");
+    std::printf("vertex_decode_test=%s  fetch_constant_test=%s  resource_cache_test=%s  test_shader_blobs=%s  grc_fvf_decode_test=%s\n",
+                vdOk ? "ok" : "FAIL", fOk ? "ok" : "FAIL", rcOk ? "ok" : "FAIL", shOk ? "ok" : "FAIL", gfOk ? "ok" : "FAIL");
     std::printf("corpus: containers=%llu vertex_fetches=%llu used_vf_codes=%zu unsupported_codes=%zu\\n",
                 (unsigned long long)containers, (unsigned long long)fetchInstrs,
                 vfUsage.size(), unsupported.size());
@@ -356,7 +570,7 @@ int main(int argc, char** argv) {
     std::printf("  single_stream=%s  (all fetches resolve to one slot, full-rate, layout must come from guest grcFvf)\n",
                 (singleStream && allFetchConstant) ? "TRUE" : "FALSE");
 
-    bool allOk = vdOk && fOk && rcOk && shOk && unsupported.empty() &&
+    bool allOk = vdOk && fOk && rcOk && shOk && gfOk && unsupported.empty() &&
                  singleStream && allFetchConstant;
     std::printf("RESULT: %s\n", allOk ? "CLEAN" : "ISSUES FOUND");
     return allOk ? 0 : 1;
