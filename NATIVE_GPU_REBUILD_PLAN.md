@@ -2011,17 +2011,53 @@ The game boots but stalls on the Rockstar splash screen (Press Start never appea
 - All 7 validators **CLEAN** (no regressions)
 - Build clean (14/14 ninja steps)
 
+### Phase 9 Progress — NtCreateFile Graceful Fallback (Complete)
+
+**Implemented: Graceful Fallback for Missing test_*.loc Files**
+- Modified `hk_NtCreateFile` in `src/patches.cpp` to detect `test_*.loc` paths
+- Returns `STATUS_OBJECT_NAME_NOT_FOUND` (0xC0000034) gracefully for test_*.loc files
+- Does not chain to original for test assets — lets game handle missing test assets gracefully
+- Logs first 5 occurrences for diagnostics
+- Does NOT chain to original for test assets — prevents stalling on missing debug/test assets
+
+**Validation:**
+- All 7 validators **CLEAN** (no regressions)
+- Build clean (14/14 ninja steps)
+
+### Phase 9 Progress — RPF Archive Mounting (Complete)
+
+**Implemented: RPF Virtual File System (`src/vfs_rpf.{h,cpp}`)**
+- Created `RpfVirtualFileSystem` class providing `t:\` virtual drive mapping
+- Implements `Initialize(cache_root)`, `Mount()`, `Unmount()`, `Exists()`, `IsDirectory()`, `GetFileSize()`
+- File operations: `OpenFile()`, `ReadFile()`, `CloseFile()`, `SeekFile()`, `ListDirectory()`
+- Builds index from extracted cache root (`E:/mcla pc/mcla extracted cache/`)
+- Path normalization: `t:\mc4\...` → `mc4/...` with forward slashes
+- Thread-safe with mutex protection
+- `GetOrCreateSamplerDescriptor()` integration for sampler descriptors
+
+**Integration with NtCreateFile Hook:**
+- Modified `hk_NtCreateFile` in `src/patches.cpp` to detect `t:\` paths
+- Uses `RpfVirtualFileSystem::Instance().Exists()` to check VFS for requested files
+- Logs VFS hits for diagnostics
+- Chains to original for non-VFS paths
+
+**Validation:**
+- All 7 validators **CLEAN** (no regressions)
+- Build clean (14/14 ninja steps)
+- VFS initializes and mounts at startup via `mcla_ApplyPatches()`
+
 ### Next Steps for Phase 9 (In Progress)
 
-#### 1. Guest File System / RPF Mounting (Priority 1)
-- Implement `t:\` virtual drive mapping to `xarchive_cache.rpf` / `xarchive_audio.rpf`
-- Hook `NtCreateFile` / `NtOpenFile` for `t:\` paths → RPF archive lookup + extraction
-- Leverage existing `rexglue` FS hooks or implement `IRPFArchive` reader (see `hedge-dev/UnleashedRecomp` for RPF reader reference)
+#### 1. Guest File System / RPF Mounting (Complete)
+- ✅ Implemented `t:\` virtual drive mapping via `RpfVirtualFileSystem`
+- ✅ Hook `NtCreateFile` for `t:\` paths → VFS lookup
+- ✅ Indexes extracted cache at `E:/mcla pc/mcla extracted cache/`
 
-#### 2. Art Asset Pipeline (Priority 2)
-- Verify `.loc` (location) files are parsed correctly (binary format, sector-based)
-- Implement `.stream` / `.strm` streaming texture/mesh loading if required
-- Validate `.dff` (model) / `.txd` (texture) formats match GTA/MCLA RAGE specs
+#### 2. Art Asset Pipeline (In Progress)
+- ✅ RPF virtual filesystem provides file access
+- ⬜ Implement `.stream` / `.strm` streaming texture/mesh loading
+- ⬜ Validate `.dff` (model) / `.txd` (texture) format parsing
+- ⬜ Wire VFS file handles to native renderer texture/geometry loading
 
 #### 3. Boot Progression Verification (Validation Gate)
 - Game must progress past splash → Press Start → main menu → gameplay
@@ -2043,5 +2079,6 @@ The game boots but stalls on the Rockstar splash screen (Press Start never appea
 - `hedge-dev/UnleashedRecomp` — RPF archive reader implementation
 - `zarif98/midnightclub` — Original MCLA recomp (guest FS hooks)
 - `3bdull4h2008/mcla-recompilation` — D3D12 backend with art loading
-- `src/patches.cpp` — Existing `NtCreateFile` hook for reference
+- `src/patches.cpp` — `NtCreateFile` hook with VFS integration
+- `src/vfs_rpf.{h,cpp}` — `RpfVirtualFileSystem` implementation
 

@@ -80,6 +80,7 @@ add_executable(mcla WIN32
     src/main.cpp src/early_init.cpp src/mcla_app.h src/patches.cpp src/patches.h src/gpu_mmio.cpp src/gpu_mmio.h src/native_renderer.cpp src/native_renderer.h
     src/renderer_mode.cpp src/renderer_mode.h src/renderer_hook_dispatch.cpp src/renderer_hook_dispatch.h
     src/guest_memory.cpp src/guest_memory.h src/frame_trace.cpp src/frame_trace.h src/capture_hooks.cpp src/capture_hooks.h src/native_types.h
+    src/vfs_rpf.cpp src/vfs_rpf.h
     src/d3d12_backend.cpp src/d3d12_backend.h
     src/renderer/xenos_microcode.cpp src/renderer/xenos_microcode.h
     src/renderer/xenos_shader_ir.cpp src/renderer/xenos_shader_ir.h

@@ -2,6 +2,7 @@
 #include "gpu_mmio.h"
 #include "native_renderer.h"
 #include "guest_memory.h"
+#include "vfs_rpf.h"
 #include "generated/default/mcla_init.h"
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -301,6 +302,17 @@ static uint32_t g_press_start_shim_thunk = 0;
 
 void mcla_ApplyPatches(rex::runtime::FunctionDispatcher* dispatcher) {
     g_dispatcher = dispatcher;
+
+    // Initialize VFS for RPF archive mounting (Phase 9)
+    {
+        mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+        std::string cache_root = "E:/mcla pc/mcla extracted cache";
+        if (!vfs.Initialize(cache_root)) {
+            REXLOG_ERROR("Failed to initialize VFS for RPF archive mounting");
+        } else {
+            REXLOG_INFO("VFS initialized for RPF archive mounting");
+        }
+    }
 
     // Register function table entry for 0x82554080 (start button handler).
     // This address is not in the auto-generated function table, so it must
@@ -728,7 +740,7 @@ static void StubNtCreateFileCityLoc(const std::string& guest_path) {
 }
 
 REX_FUNC(hk_NtCreateFile) {
-    // r5 = X_OBJECT_ATTRIBUTES* (guest).  Read name_ptr â†’ X_ANSI_STRING.
+    // r5 = X_OBJECT_ATTRIBUTES* (guest).  Read name_ptr â†' X_ANSI_STRING.
     mcla::native::GuestMemoryView view;
     uint32_t oa = ctx.r5.u32;
     uint32_t ansi_str = 0;
@@ -761,6 +773,32 @@ REX_FUNC(hk_NtCreateFile) {
                     REXLOG_INFO("NtCreateFile: test_*.loc not found in RPF, returning NOT_FOUND: {}", guest_path);
                 }
                 return;  // Don't chain to original - let the game handle missing test assets gracefully
+            }
+            
+            // Check for t:\ paths - use VFS
+            std::string path = guest_path;
+            std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            std::replace(path.begin(), path.end(), '\\', '/');
+            
+            if (path.rfind("t:/mc4/", 0) == 0 || path.rfind("t:/mc4", 0) == 0 ||
+                path.rfind("t:/", 0) == 0) {
+                // This is a request for our virtual t:\ drive
+                mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+                std::string vpath = guest_path;
+                std::string path = guest_path;
+                if (path.rfind("t:/", 0) == 0 || path.rfind("t:\\", 0) == 0) {
+                    path = path.substr(3);
+                }
+                std::replace(path.begin(), path.end(), '\\', '/');
+                
+                if (vfs.Exists(path)) {
+                    REXLOG_INFO("NtCreateFile: VFS hit for t:\\ path: {}", path);
+                    // File exists in VFS - we should handle this properly
+                    // For now, let original handle it (will fail if not in host FS)
+                    // TODO: Implement proper VFS file handle creation
+                }
             }
         }
     }
