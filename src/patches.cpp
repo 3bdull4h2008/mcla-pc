@@ -159,6 +159,7 @@ static constexpr uint32_t kDummyLocHandle = 0x7FFF0001;
 static PPCFunc* g_original_NtReadFile = nullptr;
 static PPCFunc* g_original_NtQueryInformationFile = nullptr;
 static PPCFunc* g_original_NtClose = nullptr;
+static PPCFunc* g_original_GpuKick = nullptr;
 
 // Overwrite an import-library JMP thunk ("jmp [rip+disp]") with a
 // 12-byte "mov rax, imm64; jmp rax" detour and return the target
@@ -281,6 +282,8 @@ void hk_sub_82130930(PPCContext& ctx, uint8_t* base);
 void hk_sub_82130A18(PPCContext& ctx, uint8_t* base);
 void hk_sub_822A3998(PPCContext& ctx, uint8_t* base);
 void hk_sub_82554E20(PPCContext& ctx, uint8_t* base);
+void hk_sub_82554590(PPCContext& ctx, uint8_t* base);
+void hk_GpuKick(PPCContext& ctx, uint8_t* base);
 static PPCFunc* g_orig_sub_82554E20 = nullptr;
 
 // â”€â”€ Kernel Timer DPC hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -515,6 +518,16 @@ void mcla_ApplyPatches(rex::runtime::FunctionDispatcher* dispatcher) {
     // Install GPU MMIO hooks with passthrough to originals
     mcla::gpu::InstallGpuHooks(dispatcher);
     
+    // Install PM4 ring buffer sanitization hook on GPU Kick (sub_82412710)
+    // to clamp excessive Type3 packet counts that cause ExecutePacketType3 overflow.
+    g_original_GpuKick = dispatcher->GetFunction(0x82412710);
+    if (g_original_GpuKick) {
+        dispatcher->SetFunction(0x82412710, hk_GpuKick);
+        REXLOG_INFO("GPU Kick (sub_82412710) hooked for PM4 sanitization");
+    } else {
+        REXLOG_WARN("GPU Kick (sub_82412710) not found in dispatcher");
+    }
+    
     // Install native renderer (wraps GfxCmdBufSubmit to capture state)
     if (dispatcher) {
         mcla::native::InstallNativeRenderer(dispatcher);
@@ -655,6 +668,90 @@ static void ReinitGpuBackend(PPCContext& ctx, uint8_t* base) {
             REX_STORE_U32(ctrl_struct + 16, 0);
         }
     }
+}
+
+// â”€â”€ PM4 Ring Buffer Sanitization (defensive clamp for Type3 overflow) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// The SDK command processor hits "ExecutePacketType3 overflow (read count 0x144, packet count 0x10000)"
+// when processing an INDIRECT_BUFFER whose internal Type3 packet claims 65536 dwords but only 324 are
+// available.  This is likely a byte-swap or bitfield mismatch on the count field.  We sanitize at
+// GPU kick time (sub_82412710) by scanning the primary ring buffer for INDIRECT_BUFFER packets,
+// then scanning their target buffers for Type3 packets with excessive count and clamping to 0x800.
+static constexpr uint32_t kMaxPm4Count = 0x800;  // 2048 dwords max per packet
+static constexpr uint32_t kPm4Type3Mask     = 0xC0000000;
+static constexpr uint32_t kPm4Type3Value    = 0xC0000000;
+static constexpr uint32_t kPm4OpcodeMask    = 0x00007F00;
+static constexpr uint32_t kPm4CountMask     = 0x3FFF0000;
+static constexpr uint32_t kPm4IndirectBufOpcode = 0x3F;
+
+static void SanitizePm4Buffer(mcla::native::GuestMemoryView& view, uint32_t base, uint32_t limit) {
+    if (!base || base >= limit) return;
+    uint32_t offset = 0;
+    while (base + offset + 4 <= limit) {
+        uint32_t header = 0;
+        if (!view.ReadU32BE(base + offset, &header)) break;
+        // Check for Type3 packet
+        if ((header & kPm4Type3Mask) != kPm4Type3Value) {
+            offset += 4;  // Not a PM4 header, advance by 1 dword (conservative)
+            continue;
+        }
+        uint32_t count = (header & kPm4CountMask) >> 16;
+        uint32_t opcode = (header & kPm4OpcodeMask) >> 8;
+        uint32_t packet_dwords = 1 + count;  // header + body
+        
+        // Clamp excessive count in place
+        if (count > kMaxPm4Count) {
+            uint32_t new_header = (header & ~kPm4CountMask) | (kMaxPm4Count << 16);
+            view.WriteU32BE(base + offset, new_header);
+            count = kMaxPm4Count;
+            packet_dwords = 1 + count;
+        }
+        
+        // If INDIRECT_BUFFER (opcode 0x3F), sanitize its target buffer
+        if (opcode == kPm4IndirectBufOpcode && count == 2) {
+            uint32_t ib_base = 0, ib_dwords = 0;
+            if (view.ReadU32BE(base + offset + 4, &ib_base) &&
+                view.ReadU32BE(base + offset + 8, &ib_dwords)) {
+                // Clamp IB dword count to reasonable max
+                if (ib_dwords > kMaxPm4Count) {
+                    ib_dwords = kMaxPm4Count;
+                    view.WriteU32BE(base + offset + 8, ib_dwords);
+                }
+                // Recursively sanitize the indirect buffer
+                if (ib_base && ib_dwords > 0) {
+                    SanitizePm4Buffer(view, ib_base, ib_base + ib_dwords * 4);
+                }
+            }
+        }
+        
+        offset += packet_dwords * 4;
+        if (offset > (limit - base)) break;  // Prevent runaway
+    }
+}
+
+// Hook: sub_82412710 (GPU Kick) â€” sanitize PM4 ring buffer before SDK processes it.
+
+REX_FUNC(hk_GpuKick) {
+    // r3 = ring buffer manager object
+    uint32_t mgr = ctx.r3.u32;
+    if (mgr) {
+        mcla::native::GuestMemoryView view;
+        // Ring buffer manager layout (from sub_824238E0 / GfxCmdBufSubmit):
+        // +48 = write pointer, +52 = limit, +56 = base (GfxCmdBufSubmit uses +56 for limit)
+        uint32_t write_ptr = 0, limit = 0, base = 0;
+        if (view.ReadU32BE(mgr + 48, &write_ptr) &&
+            view.ReadU32BE(mgr + 52, &limit)) {
+            // Try +56 for base (GfxCmdBufSubmit), else compute from limit - size
+            if (!view.ReadU32BE(mgr + 56, &base) || !base) {
+                // Fallback: assume ring size is power of 2, base = limit - size
+                // Common size is 0x10000 (64KB) or 0x20000
+                base = limit - 0x10000;
+            }
+            if (base && write_ptr && write_ptr >= base && write_ptr <= limit) {
+                SanitizePm4Buffer(view, base, write_ptr);
+            }
+        }
+    }
+    if (g_original_GpuKick) g_original_GpuKick(ctx, base);
 }
 
 // Hook: KeWaitForSingleObject â€” skip the display-sync semaphore wait.

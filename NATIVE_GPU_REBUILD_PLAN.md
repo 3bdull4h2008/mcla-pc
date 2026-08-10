@@ -2120,3 +2120,46 @@ streaming loading remains unimplemented (only needed to reach first draw).
 - `src/patches.cpp` — `NtCreateFile` hook with VFS integration
 - `src/vfs_rpf.{h,cpp}` — `RpfVirtualFileSystem` implementation
 
+---
+## PM4 Type3 Ring Buffer Overflow Fix (2026-08-10, gpu-engineer)
+
+### Problem
+The SDK command processor (rexgpu-xenos.dll) repeatedly emitted:
+```
+ExecutePacketType3 overflow (read count 0x144, packet count 0x10000)
+**** INDIRECT RINGBUFFER: Failed to execute packet.
+```
+This occurred when the SDK processed an INDIRECT_BUFFER packet whose internal Type3 packet claimed 65536 dwords (0x10000) while only 324 dwords (0x144) were available in the indirect buffer.
+
+### Root Cause Analysis
+Traced the PM4 packet construction through the recompiled PPC:
+- `sub_824238E0` (Main MMIO Packet Writer) writes RAGE-internal packets with header format `((count-1)<<16) | base_reg`, where count is 16× the number of contiguous dirty registers.
+- On GPU kick (`sub_82412710`), the game converts these into standard Xenos PM4 Type3 packets (0xC0000000 | (opcode<<8) | (count<<16)) and writes them to the GPU ring buffer.
+- The INDIRECT_BUFFER packet (opcode 0x3F) points the SDK command processor at a secondary buffer containing further PM4 commands.
+- The SDK's `ExecutePacketType3` reads `count = (packet >> 16) & 0x3FFF` (14-bit field, max 16383). The observed `packet count 0x10000` implies the SDK read a Type3 header where the count field was corrupted — likely a byte-swap mismatch or bitfield shift error on the indirect buffer's header word.
+- The exact corruption path was not fully isolated (the SDK implementation is in a compiled DLL), but the symptom is reproducible: a Type3 packet inside an INDIRECT_BUFFER claims 65536 dwords against 324 available.
+
+### Fix: Defensive Ring Buffer Sanitization at GPU Kick
+Added a sanitization hook on `sub_82412710` (GPU Kick) in `src/patches.cpp`:
+1. `SanitizePm4Buffer()` scans the primary ring buffer from base to write pointer.
+2. Identifies PM4 Type3 headers (top bits 0xC0000000), extracts opcode and count.
+3. Clamps any `count > 0x800` (2048 dwords) to `0x800` in-place via checked guest memory writes.
+4. For INDIRECT_BUFFER packets (opcode 0x3F, count=2), also sanitizes the target indirect buffer recursively, clamping its dword count and internal Type3 packets.
+
+The clamp threshold 0x800 is well above any legitimate draw packet (typical counts < 100 dwords) but far below the observed 0x10000 corruption.
+
+### Validation
+- **All 7 validators CLEAN** (no regressions):
+  - `backend_validator.exe` — D3D12 draw path + render graph
+  - `phase3_validator.exe` — 551 containers, 762 fetches, grcFvf decode
+  - `shader_pipeline_validator.exe` — 551 containers, 317 VS / 234 PS
+  - `xenos_decode_validator.exe` — 514 shaders, 0 unknown / 0 OOB
+  - `texture_decode_test.exe` — oracle-validated tiling + SRV bind/readback
+  - `capture_dump_validator.exe` — synthetic capture self-test
+  - `xtr_dump_validator.exe` — .xtr stream round-trip
+- **Live run (mcla_023.log)**: Zero `ExecutePacketType3 overflow` errors. Previous runs (mcla_020–022) showed 4 errors per run; mcla_023 shows none.
+- Game progresses to native renderer initialization without PM4 overflow stalls.
+
+### Remaining
+- First live draw with `hasGrcFvf = 1` still blocked by the game stalling on the splash screen (Press Start never appears due to art/FS loading — the same precondition documented under "Live-boot capture evidence + splash hang"). The PM4 overflow was a *symptom* of that stall (the SDK command processor keeps running while the game is stuck); the sanitization unblocks the SDK but does not resolve the underlying FS wedge. That remains Phase 9's primary gate.
+
