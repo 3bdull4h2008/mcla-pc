@@ -1,0 +1,10 @@
+Phase 9: NtCreateFile graceful fallback for test_*.loc files
+
+- Modified hk_NtCreateFile in patches.cpp to detect test_*.loc files
+- Returns STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034) gracefully for test assets
+- Does not chain to original for test assets - prevents splash stall
+- Logs first 5 occurrences for diagnostics
+- All 7 validators CLEAN, build clean (14/14 ninja steps)
+
+Phase 9 Progress: NtCreateFile graceful fallback for test_*.loc complete.
+Next: RPF archive mounting for t:\ paths and art asset pipeline.

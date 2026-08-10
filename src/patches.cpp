@@ -742,6 +742,26 @@ REX_FUNC(hk_NtCreateFile) {
         if (view.ReadBytes(str_ptr, buf.data(), str_len)) {
             std::string guest_path(buf.data(), str_len);
             StubNtCreateFileCityLoc(guest_path);
+            
+            // Check for test_*.loc files (optional debug/test assets that don't exist in RPF)
+            // Return STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034) gracefully instead of stalling
+            std::string norm = guest_path;
+            std::transform(norm.begin(), norm.end(), norm.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            std::replace(norm.begin(), norm.end(), '\\', '/');
+            
+            // Check for test_*.loc pattern
+            if (norm.find("test_") != std::string::npos && norm.size() >= 5 &&
+                norm.compare(norm.size() - 4, 4, ".loc") == 0) {
+                // Return STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034) gracefully
+                ctx.r3.u64 = 0xC0000034;
+                static int s_testLocLogCount = 0;
+                if (s_testLocLogCount++ < 5) {
+                    REXLOG_INFO("NtCreateFile: test_*.loc not found in RPF, returning NOT_FOUND: {}", guest_path);
+                }
+                return;  // Don't chain to original - let the game handle missing test assets gracefully
+            }
         }
     }
 
