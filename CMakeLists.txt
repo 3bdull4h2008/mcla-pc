@@ -77,7 +77,7 @@ add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
 add_compile_definitions("$<$<CXX_COMPILER_ID:MSVC>:__builtin_isnan=_isnan>")
 
 add_executable(mcla WIN32
-    src/main.cpp src/early_init.cpp src/mcla_app.h src/patches.cpp src/patches.h src/gpu_mmio.cpp src/gpu_mmio.h src/native_renderer.cpp src/native_renderer.h
+src/main.cpp src/early_init.cpp src/mcla_app.h src/patches.cpp src/patches.h src/gpu_mmio.cpp src/gpu_mmio.h src/native_renderer.cpp src/native_renderer.h
     src/renderer_mode.cpp src/renderer_mode.h src/renderer_hook_dispatch.cpp src/renderer_hook_dispatch.h
     src/guest_memory.cpp src/guest_memory.h src/frame_trace.cpp src/frame_trace.h src/capture_hooks.cpp src/capture_hooks.h src/native_types.h
     src/vfs_rpf.cpp src/vfs_rpf.h
@@ -90,6 +90,7 @@ add_executable(mcla WIN32
       src/renderer/pipeline_cache.cpp src/renderer/pipeline_cache.h
       src/renderer/vertex_decode.cpp src/renderer/vertex_decode.h
       src/renderer/grc_fvf_decode.cpp src/renderer/grc_fvf_decode.h
+      src/renderer/rage_asset_pipeline.cpp src/renderer/rage_asset_pipeline.h
       src/renderer/resource_cache.cpp src/renderer/resource_cache.h
       src/renderer/texture_decode.cpp src/renderer/texture_decode.h
       src/renderer/test_shaders.h

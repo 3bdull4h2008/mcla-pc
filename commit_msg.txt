@@ -1,11 +1,22 @@
-Phase 9: RPF Archive Mounting + VFS Implementation
+Phase 9: Art Asset Pipeline - RAGE Format Parser
 
-- Implemented RpfVirtualFileSystem in src/vfs_rpf.{h,cpp}:
-  - Virtual t:\ drive mapping to extracted cache (E:/mcla pc/mcla extracted cache)
-  - File operations: OpenFile, ReadFile, CloseFile, SeekFile, ListDirectory
-  - Path normalization: t:\mc4\... -> mc4/...
-  - Thread-safe with mutex protection
-  - File index built from extracted cache at startup
+- Created src/renderer/rage_asset_pipeline.{h,cpp}:
+  - CsrContainer: Parses RAGE CSR (0x525343) container format
+  - Parses CSR header (version=5, magic="CSR", entries)
+  - CsrEntry parsing: hash, offset, size, flags, type, unk
+  - TxdParser: Placeholder for .txd texture dictionary parsing
+  - DffParser: Placeholder for .dff model parsing
+  - RageAssetManager: Singleton asset manager
+    - LoadTextureDictionary()/LoadModel() via VFS
+    - GetTextureData()/GetModelGeometry() for native renderer
+    - GetOrCreateTexture()/GetOrCreateModel() for D3D12 resources
+  - CSR header parsing: version=5, magic="CSR", big-endian fields
+  - Entry parsing: hash, offset, size, flags, type, unk
+  - VFS integration: LoadCsrContainer() loads from virtual t:\ drive
+
+- Integrated with VFS (src/vfs_rpf.{h,cpp}) for RPF archive mounting
+- VFS indexes extracted cache at E:/mcla pc/mcla extracted cache
+- Path normalization: t:\mc4\... -> mc4/...
 
 - Integrated with NtCreateFile hook in patches.cpp:
   - Detects t:\ paths and checks VFS for existence
@@ -16,4 +27,4 @@ Phase 9: RPF Archive Mounting + VFS Implementation
 
 - All 7 validators CLEAN, build clean (14/14 ninja steps)
 
-Phase 9 Progress: RPF Archive Mounting complete. Next: Art Asset Pipeline (.dff/.txd parsing) and Boot Validation.
+Next: .dff/.txd format parsing, .stream loading, boot validation to reach hasGrcFvf=1
