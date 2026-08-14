@@ -1,16 +1,13 @@
 #pragma once
-#include <rex/ppc/context.h>
-#include <rex/system/function_dispatcher.h>
 
-void mcla_ApplyPatches(rex::runtime::FunctionDispatcher* dispatcher);
+#include "app.h"
+#include <string_view>
 
-// Overwrite an import-library JMP thunk ("jmp [rip+disp]") with a
-// 12-byte "mov rax, imm64; jmp rax" detour and return the target of the
-// original JMP (the real function in the DLL).  Generated recompiled code
-// calls __imp__* imports via a DIRECT relative call to the thunk, which
-// bypasses FunctionDispatcher::SetFunction; this detour intercepts all
-// call paths.  Returns nullptr on failure.
-PPCFunc* mcla_DetourImportThunk(uint8_t* thunk, PPCFunc* hook);
+void mcla_ApplyPatches(mcla::App::FunctionDispatcher* dispatcher);
 
-REX_FUNC(sub_82554080_stub);
-REX_FUNC(hk_press_start_shim);
+bool BisectGroupEnabled(std::string_view group);
+
+mcla::App::FunctionDispatcher::PPCFunc* mcla_DetourImportThunk(uint8_t* thunk, mcla::App::FunctionDispatcher::PPCFunc* hook);
+
+void sub_82554080_stub(mcla::PPCContext& ctx, uint8_t* base);
+void hk_press_start_shim(mcla::PPCContext& ctx, uint8_t* base);

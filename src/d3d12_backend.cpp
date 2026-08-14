@@ -4,7 +4,7 @@
 #include "renderer/pipeline_cache.h"
 #include "renderer/resource_cache.h"
 #include "renderer/texture_decode.h"
-#include <rex/logging.h>
+#include "logging.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")

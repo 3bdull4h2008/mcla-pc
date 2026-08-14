@@ -1,3 +1,17 @@
-#include "mcla_app.h"
+#include "app.h"
+#include "logging.h"
 
-REX_DEFINE_APP(mcla, MCLAApp::Create)
+int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+
+    mcla::App app("MCLA Native");
+
+    if (!app.Initialize()) {
+        return 1;
+    }
+
+    app.Run();
+
+    return 0;
+}

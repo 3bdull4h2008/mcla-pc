@@ -1,9 +1,8 @@
 #include "renderer_hook_dispatch.h"
+#include "logging.h"
 
 #include <array>
 #include <mutex>
-
-#include <rex/logging.h>
 
 namespace mcla::renderer::hooks {
 namespace {
@@ -14,7 +13,7 @@ size_t g_submitObserverCount = 0;
 std::mutex g_submitObserverMutex;
 
 void RunObservers(const SubmitObserver* observers, size_t count,
-                  ::PPCContext& ctx, uint8_t* base) {
+                  mcla::native::PPCContext& ctx, uint8_t* base) {
     for (size_t i = 0; i < count; ++i) {
         observers[i](ctx, base);
     }
@@ -22,11 +21,11 @@ void RunObservers(const SubmitObserver* observers, size_t count,
 
 uint32_t g_testOrder = 0;
 
-void TestObserverOne(::PPCContext&, uint8_t*) {
+void TestObserverOne(mcla::native::PPCContext&, uint8_t*) {
     g_testOrder = g_testOrder * 10 + 1;
 }
 
-void TestObserverTwo(::PPCContext&, uint8_t*) {
+void TestObserverTwo(mcla::native::PPCContext&, uint8_t*) {
     g_testOrder = g_testOrder * 10 + 2;
 }
 
@@ -49,7 +48,7 @@ bool AddBeforeSubmitObserver(SubmitObserver observer) {
     return true;
 }
 
-void DispatchBeforeSubmit(::PPCContext& ctx, uint8_t* base) {
+void DispatchBeforeSubmit(mcla::native::PPCContext& ctx, uint8_t* base) {
     std::array<SubmitObserver, kMaxSubmitObservers> observers{};
     size_t count = 0;
     {
@@ -67,7 +66,7 @@ size_t BeforeSubmitObserverCount() {
 
 bool VerifySubmitObserverOrderingForTests() {
     const std::array<SubmitObserver, 2> observers{TestObserverOne, TestObserverTwo};
-    ::PPCContext context{};
+    mcla::native::PPCContext context{};
     uint8_t dummyBase = 0;
     g_testOrder = 0;
     RunObservers(observers.data(), observers.size(), context, &dummyBase);

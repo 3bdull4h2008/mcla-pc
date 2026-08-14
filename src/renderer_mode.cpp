@@ -1,15 +1,8 @@
 ﻿#include "renderer_mode.h"
+#include "cvar.h"
 
 #include <atomic>
 #include <string_view>
-
-#include <rex/cvar.h>
-#include <rex/logging.h>
-
-REXCVAR_DEFINE_STRING(renderer_mode, "legacy", "MCLA Renderer",
-                      "Renderer mode: legacy, capture, or native.");
-REXCVAR_DEFINE_STRING(native_renderer_trace, "off", "MCLA Renderer",
-                      "Capture trace level: off, frames, or all.");
 
 namespace mcla::renderer {
 namespace {
@@ -24,7 +17,7 @@ std::atomic<uint64_t> g_invalidModeSelections = 0;
 }  // namespace
 
 RendererMode GetRendererMode() {
-    const std::string_view mode = REXCVAR_GET(renderer_mode);
+    const std::string_view mode = MCLA_CVAR_GET_STRING(renderer_mode);
     if (mode == "legacy") return RendererMode::Legacy;
     if (mode == "capture") return RendererMode::Capture;
     if (mode == "native") return RendererMode::Native;
@@ -43,7 +36,7 @@ const char* RendererModeName(RendererMode mode) {
 }
 
 TraceMode GetTraceMode() {
-    const std::string_view mode = REXCVAR_GET(native_renderer_trace);
+    const std::string_view mode = MCLA_CVAR_GET_STRING(native_renderer_trace);
     if (mode == "frames") return TraceMode::Frames;
     if (mode == "all") return TraceMode::All;
     return TraceMode::Off;
@@ -85,8 +78,6 @@ void RecordFramePresented() {
     const uint64_t frame = g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
     g_swaps.fetch_add(1, std::memory_order_relaxed);
 
-    // Keep normal runtime logs low-noise while still exposing a useful capture
-    // baseline for the first native-renderer milestone.
     if (frame % 120 != 0) return;
 
     const FrameCounters counters = GetFrameCounters();
@@ -97,4 +88,3 @@ void RecordFramePresented() {
 }
 
 }  // namespace mcla::renderer
-

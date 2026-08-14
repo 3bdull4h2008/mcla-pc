@@ -1,0 +1,27 @@
+[main]
+file_path = "build/game_data/default.xex"
+out_directory_path = "generated/ppc_xenon"
+switch_table_file_path = ".research/XenonRecomp/XenonAnalyse/jump_tables.toml"
+
+# Save/restore ABI functions (from ReXGlue manifest / disassembly).
+savegprlr_14_address = 0x823D91C0
+restgprlr_14_address = 0x823D9210
+savefpr_14_address = 0x823DB9A0
+restfpr_14_address = 0x823DB9EC
+savevmx_14_address = 0x823DD2C0
+restvmx_14_address = 0x823DD558
+savevmx_64_address = 0x823DD354
+restvmx_64_address = 0x823DD5EC
+
+# setjmp/longjmp addresses. Correct values TBD (not yet located in MCLA).
+# longjmp_address = 0x
+# setjmp_address = 0x
+
+# Register locality flags (optimizations). Matches ReXGlue ppc_config.h.
+# NOTE: skip_lr / skip_msr are intentionally left OFF until exceptions are researched.
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = true
+non_volatile_as_local = true

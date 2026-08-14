@@ -1,9 +1,9 @@
 #include "frame_trace.h"
+#include "logging.h"
 
 #include <chrono>
 #include <cstring>
 #include <fmt/format.h>
-#include <rex/logging.h>
 
 namespace mcla::native {
 
@@ -35,7 +35,6 @@ bool FrameTraceWriter::Open(const std::filesystem::path& tracePath, uint64_t bui
     m_header.buildHash = buildHash;
     m_header.startTimestamp = timestamp;
 
-    // Write initial header placeholder
     m_file.write(reinterpret_cast<const char*>(&m_header), sizeof(m_header));
     m_file.flush();
 
@@ -54,12 +53,10 @@ bool FrameTraceWriter::WritePacket(const DrawPacket& packet) {
 void FrameTraceWriter::Close() {
     if (!m_file.is_open()) return;
 
-    // Seek back and overwrite header with final packet count
     m_file.seekp(0, std::ios::beg);
     m_file.write(reinterpret_cast<const char*>(&m_header), sizeof(m_header));
     m_file.close();
 
-    // Write JSON manifest alongside binary trace
     std::filesystem::path manifestPath = m_tracePath;
     manifestPath.replace_filename("trace_manifest.json");
 

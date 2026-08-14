@@ -48,8 +48,16 @@ public:
     }
 
     void OnConfigurePaths(rex::PathConfig& paths) override {
-        if (paths.game_data_root.empty())
-            paths.game_data_root = "game_data";
+        // Resolve game_data relative to the executable directory, so the build
+        // works regardless of the process working directory (the config toml
+        // cvar override is loaded too late to affect these paths).
+        if (paths.game_data_root.empty()) {
+            auto exe_dir = rex::filesystem::GetExecutableFolder();
+            std::filesystem::path fallback = exe_dir / "game_data";
+            paths.game_data_root = std::filesystem::exists(fallback)
+                                       ? fallback.string()
+                                       : "game_data";
+        }
         if (paths.update_data_root.empty())
             paths.update_data_root = paths.game_data_root;
 
@@ -61,32 +69,32 @@ public:
     }
 
     void OnPreSetup(rex::RuntimeConfig& config) override {
-        // Initialize VFS BEFORE loading GPU plugin, so GPU Commands thread
-        // has access to the VFS during its initialization.  The VFS indexing
-        // takes ~2-3s for 23931 entries; doing it here avoids a race where
-        // the GPU Commands thread starts before the VFS is ready.
-        {
-            mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
-            static const char* kCandidateRoots[] = {
-                "E:/mcla pc/xarchive_cache",
-                "E:/mcla pc/xarchive_audio",
-                "E:/mcla pc/xarchive_music",
-                "E:/mcla pc/xarchive_audlo",
-                "E:/mcla pc/mcla extracted cache",
-            };
-            bool ok = false;
-            for (const char* root : kCandidateRoots) {
-                if (vfs.Initialize(root)) {
-                    ok = true;
-                    break;
-                }
-            }
-            if (!ok) {
-                REXLOG_ERROR("Failed to initialize VFS for RPF archive mounting");
-            } else {
-                REXLOG_WARN("VFS initialized for RPF archive mounting (early, before GPU plugin)");
-            }
-        }
+        // VFS (t:\ RPF virtual drive) disabled to match mcla_003 (known-working
+        // run reached Press Start with no VFS; the 23931-entry index adds ~3s
+        // boot cost and a broken t:\ mount that wedges the RAGE loader).
+        // Re-enable for later RPF-art serving phases once boot is unblocked.
+        // {
+        //     mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+        //     static const char* kCandidateRoots[] = {
+        //         "E:/mcla pc/xarchive_cache",
+        //         "E:/mcla pc/xarchive_audio",
+        //         "E:/mcla pc/xarchive_music",
+        //         "E:/mcla pc/xarchive_audlo",
+        //         "E:/mcla pc/mcla extracted cache",
+        //     };
+        //     bool ok = false;
+        //     for (const char* root : kCandidateRoots) {
+        //         if (vfs.Initialize(root)) {
+        //             ok = true;
+        //             break;
+        //         }
+        //     }
+        //     if (!ok) {
+        //         REXLOG_ERROR("Failed to initialize VFS for RPF archive mounting");
+        //     } else {
+        //         REXLOG_WARN("VFS initialized for RPF archive mounting (early, before GPU plugin)");
+        //     }
+        // }
 
         config.gpu_plugin = "xenos";
     }
@@ -110,7 +118,11 @@ public:
         rex::cvar::SetFlagByName("texture_cache_memory_limit_render_to_texture", "256");
         rex::cvar::SetFlagByName("guide_button", "true");
 
-        // Register VFS symlink so t:\ resolves to the update: device
+        // Register VFS symlink so t:\ resolves to the update: device.
+        // Re-enabled 2026-08-11: mcla_061 proved the t:\ mount is required --
+        // without it ResolvePath(t:\mc4\art\city) fails "device not found" and
+        // the pre-mounted .loc stubs never resolve (mcla_003, the working run,
+        // had this symlink active and reached Press Start).
         auto* vfs = runtime()->file_system();
         if (vfs) {
             vfs->RegisterSymbolicLink("t:", "update:");

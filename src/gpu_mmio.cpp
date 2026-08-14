@@ -1,6 +1,6 @@
 #include "gpu_mmio.h"
 #include "native_renderer.h"
-#include <rex/logging.h>
+#include "logging.h"
 #include <unordered_map>
 
 namespace mcla::gpu {
@@ -8,7 +8,6 @@ namespace mcla::gpu {
 static std::unordered_map<uint32_t, uint64_t> g_mmioWriteCounts;
 static GpuHooks g_hooks;
 
-// Saved original function pointers
 static PPCFunc* orig_sub_824238E0 = nullptr;
 static PPCFunc* orig_sub_82422EF8 = nullptr;
 static PPCFunc* orig_sub_82411180 = nullptr;
@@ -41,23 +40,6 @@ void LogMmioWrite(uint32_t offset, uint32_t value) {
     }
 }
 
-// ── Ring-buffer bitstream writer (sub_824238E0) ──────────────────────────
-//
-// The game calls this function to encode register-offset+value pairs into
-// the command ring buffer as PM4 packets.  The parameters are:
-//   r3 = ring-buffer manager object
-//   r4 = write pointer (destination offset into ring)
-//   r5 = source bitstream (packed (offset,value) pairs)
-//   r6 = bitstream size in bytes
-//
-// We DO NOT attempt to decode the bitstream here — that would duplicate
-// the PM4 encoder logic.  Instead we just track the call rate and chain
-// to the original, which populates the ring buffer normally.
-//
-// NOTE: the earlier hook interpreted ctx.r6/r7 as (offset,value), which is
-// incorrect — r6 is the bitstream byte size, r7 is a local variable set
-// inside the callee.  That interpretation is removed.
-
 static int g_bitstreamWriteCount = 0;
 
 REX_FUNC(gpu_MmioWriteHook) {
@@ -79,13 +61,11 @@ REX_FUNC(gpu_MmioWriteHook) {
     if (orig_sub_824238E0) orig_sub_824238E0(ctx, base);
 }
 
-// Hook: sub_82422EF8 - Ring buffer flush helper
 REX_FUNC(gpu_MmioWriteHelperHook) {
     if (g_hooks.onGpuKick) g_hooks.onGpuKick(ctx);
     if (orig_sub_82422EF8) orig_sub_82422EF8(ctx, base);
 }
 
-// Hook: sub_82411180 - Ring buffer alignment/sync
 REX_FUNC(gpu_Sub82411180Hook) {
     if (g_hooks.onDrawCall) g_hooks.onDrawCall(ctx);
     if (orig_sub_82411180) orig_sub_82411180(ctx, base);
@@ -95,7 +75,6 @@ void NotifyGpuSubmit(PPCContext& ctx, uint8_t*) {
     if (g_hooks.onDrawCall) g_hooks.onDrawCall(ctx);
 }
 
-// Hook: sub_82411618 - Vertex fetch setup
 REX_FUNC(gpu_Sub82411618Hook) {
     if (g_hooks.onSetupVertexFetch) g_hooks.onSetupVertexFetch(ctx);
     if (orig_sub_82411618) orig_sub_82411618(ctx, base);
@@ -113,7 +92,7 @@ void DefaultDrawCallHook(PPCContext& ctx) {
     REXLOG_INFO("GPU DRAW CALL");
 }
 
-void InstallGpuHooks(rex::runtime::FunctionDispatcher* dispatcher, const GpuHooks& hooks) {
+void InstallGpuHooks(mcla::App::FunctionDispatcher* dispatcher, const GpuHooks& hooks) {
     g_hooks = hooks;
 
     orig_sub_824238E0 = dispatcher->GetFunction(0x824238E0);

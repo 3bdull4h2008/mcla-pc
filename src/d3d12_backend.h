@@ -20,13 +20,6 @@
 #include "renderer/resource_cache.h"
 #include "renderer/pipeline_cache.h"
 
-namespace rex {
-class Runtime;
-namespace ui {
-class Presenter;
-}
-} // namespace rex
-
 namespace mcla::native {
 
 class D3D12Backend {

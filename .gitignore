@@ -1,5 +1,14 @@
 # ── Build output ─────────────────────────────────────────────
 /build/
+/build_pathb/
+/pathb/
+/build-smoke/
+/build-standalone/
+# Unreferenced XenonRecomp vendor copy (see BOOT_REBUILD_PLAN.md cleanup candidate)
+/tools/XenonRecomp/
+# Large local dumps / personal config
+/disasm.txt
+/config.json
 
 # ── Derived / regenerable ───────────────────────────────────
 # Recompilation output (never editable; regenerated from game)

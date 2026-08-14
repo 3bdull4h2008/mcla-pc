@@ -1,37 +1,24 @@
 ﻿#pragma once
 
 #include <cstdint>
-
-namespace rex::memory {
-class Memory;
-}
+#include <cstddef>
 
 namespace mcla::native {
 
-// Endian-aware, checked view over Xbox 360 guest memory address space.
-//
-// Validation is performed against the live ReXGlue memory heaps rather than a
-// raw base pointer. Every read is range-checked against the mapped guest image
-// and translated through the heap's host offset so heaps with a nonzero
-// host_address_offset are handled correctly.
 class GuestMemoryView {
 public:
     GuestMemoryView();
 
-    // Bind to a specific memory object. If null (or never called), the view
-    // lazily resolves rex::Runtime::instance()->memory().
-    void SetMemory(rex::memory::Memory* memory);
-    rex::memory::Memory* GetMemory() const { return m_memory; }
+    void SetMemoryBase(uint8_t* base, uint32_t size);
 
-    // Check if the guest address range [guestAddr, guestAddr + size) is safe
-    // to read: nonzero, no 32-bit wrap, and fully inside one mapped guest heap.
+    uint8_t* GetMemoryBase() const { return m_base; }
+    uint32_t GetMemorySize() const { return m_size; }
+
     bool IsValidRange(uint32_t guestAddr, uint32_t size) const;
 
-    // Checked pointer accessor. Returns nullptr if the range is invalid.
     const uint8_t* GetHostPtr(uint32_t guestAddr, uint32_t size) const;
     uint8_t* GetHostPtrMutable(uint32_t guestAddr, uint32_t size) const;
 
-// Endian-safe checked reads. Return false if guestAddr range is invalid.
     bool ReadU8(uint32_t guestAddr, uint8_t* outVal) const;
     bool ReadU16BE(uint32_t guestAddr, uint16_t* outVal) const;
     bool ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const;
@@ -39,22 +26,23 @@ public:
     bool ReadF32BE(uint32_t guestAddr, float* outVal) const;
     bool ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t size) const;
 
-    // Endian-safe checked writes. Return false if guestAddr range is invalid.
     bool WriteU8(uint32_t guestAddr, uint8_t val) const;
     bool WriteU32BE(uint32_t guestAddr, uint32_t val) const;
     bool WriteU64BE(uint32_t guestAddr, uint64_t val) const;
     bool WriteBytes(uint32_t guestAddr, const void* src, uint32_t size) const;
 
 private:
-    rex::memory::Memory* ResolveMemory() const;
+    uint8_t* m_base = nullptr;
+    uint32_t m_size = 0;
 
-    rex::memory::Memory* m_memory = nullptr;
+    uint16_t Swap16(uint16_t val) const { return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }
+    uint32_t Swap32(uint32_t val) const { return ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | ((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }
+    uint64_t Swap64(uint64_t val) const {
+        return ((val & 0xFFULL) << 56) | ((val & 0xFF00ULL) << 40) | ((val & 0xFF0000ULL) << 24) | ((val & 0xFF000000ULL) << 8) |
+               ((val >> 8) & 0xFF000000ULL) | ((val >> 24) & 0xFF0000ULL) | ((val >> 40) & 0xFF00ULL) | ((val >> 56) & 0xFFULL);
+    }
 };
 
-// Unit self-test for the checked range logic. Safe to call before the
-// memory system is fully initialized; it exercises the memory-independent
-// rejection paths plus the lazy-resolution path.
 bool VerifyGuestMemoryViewForTests();
 
 } // namespace mcla::native
-

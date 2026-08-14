@@ -1,37 +1,29 @@
 ﻿#pragma once
 
-namespace rex::memory { class Memory; }
-
 #include "guest_memory.h"
 #include "frame_trace.h"
 #include "native_types.h"
 #include "native_renderer.h"
 
-#include <rex/ppc/context.h>
 #include <filesystem>
 #include <unordered_set>
 #include <memory>
 
 namespace mcla::native {
 
+struct PPCContext;
+
 class DrawPacketAccumulator {
 public:
     DrawPacketAccumulator();
     ~DrawPacketAccumulator();
 
-    void Initialize(rex::memory::Memory* memory = nullptr);
+    void Initialize(uint8_t* memoryBase = nullptr, uint32_t memorySize = 0);
     void SetCaptureEnabled(bool enabled, const std::filesystem::path& tracePath = {});
 
-    // Called from sub_8241ABB8 hook (viewport / render target capture)
     void OnStateSetup(::MclaGpuContext* gpuCtx, uint32_t srcStateAddr);
-
-    // Called from sub_82420BA8 hook (draw call builder capture)
-    void OnDrawBuild(::MclaGpuContext* gpuCtx, ::PPCContext& ctx);
-
-    // Called from sub_8241BD08 hook (GfxCmdBufSubmit kick)
+    void OnDrawBuild(::MclaGpuContext* gpuCtx, PPCContext& ctx);
     void OnSubmit(::MclaGpuContext* gpuCtx, uint32_t r4Param);
-
-    // Called from VdSwap (end of frame)
     void OnFrameEnd();
 
     uint64_t GetCapturedDrawCount() const { return m_totalCapturedDraws; }
@@ -39,25 +31,16 @@ public:
     uint64_t GetInvalidPacketCount() const { return m_invalidPackets; }
     uint64_t GetDroppedPacketCount() const { return m_droppedPackets; }
 
-    // Last validated packet captured by OnDrawBuild (i.e. the packet for the
-    // most recent submit), plus a bounded guest-range read helper. The native
-    // renderer uses these to consume a captured draw's geometry when the
-    // captured layout provably matches the native PSO input layout. Returns
-    // false when no valid packet has been captured yet.
     bool LastPacket(const DrawPacket*& outPacket) const {
         if (!m_lastPacketValid) return false;
         outPacket = &m_lastPacket;
         return true;
     }
 
-// Bounded read of `size` bytes at guest `address` into `dst`. Fails (and
-    // does not touch `dst`) when the range is not fully mapped. Endianness of
-    // the caller's own concern \u2014 this only copies raw bytes.
     bool ReadGuestRange(uint32_t address, uint32_t size, void* dst) const {
         return m_memoryView.ReadBytes(address, dst, size);
     }
 
-    // Access the guest memory view for shader container parsing.
     GuestMemoryView& GetMemoryView() { return m_memoryView; }
 
 private:
@@ -77,29 +60,17 @@ private:
     uint64_t m_validPackets = 0;
     uint64_t m_invalidPackets = 0;
 
-    // Transient context state captured between setup and draw
     DrawPacket m_currentPacket{};
     bool m_lastCaptureFailed = false;
 
-    // Most recently validated packet, kept alive for the native-renderer
-    // consumption path (DrawDynamicMesh). Set by OnSubmit when a valid packet
-    // is present; cleared on OnFrameEnd.
     DrawPacket m_lastPacket{};
     bool m_lastPacketValid = false;
 
-    // Runtime shader-microcode dumping (Phase 1 / Phase 5 research aid).
-    // Each unique VS/PS program guest address is dumped once, so captured
-    // draws can be re-parsed offline with D3DRePro-style container structs.
     void DumpShaderIfNew(uint32_t guestAddr, bool isVertex, const std::filesystem::path& dir);
     std::unordered_set<uint32_t> m_dumpedVs;
     std::unordered_set<uint32_t> m_dumpedPs;
     std::filesystem::path m_shaderDumpDir;
 
-    // Guest-memory evidence dumping (Phase 3 research aid). Writes the raw
-    // vertex/index bytes from each captured draw's referenced guest memory so
-    // the DrawPacket layout (vertex stride, per-stream format, index buffer
-    // address/size) can be validated against the live guest struct rather than
-    // guessed. Deduplicated: same (address, len) is written once per session.
     struct GuestDumpKey {
         uint32_t address;
         uint32_t size;
@@ -118,8 +89,3 @@ private:
 DrawPacketAccumulator* GetDrawAccumulator();
 
 } // namespace mcla::native
-
-
-
-
-

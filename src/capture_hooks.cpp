@@ -1,5 +1,6 @@
 ﻿#include "capture_hooks.h"
 #include "renderer_mode.h"
+#include "logging.h"
 
 #include <chrono>
 #include <algorithm>
@@ -7,15 +8,13 @@
 #include <fstream>
 #include <cstdio>
 #include <cstring>
-#include <rex/logging.h>
-#include <rex/ppc/context.h>
+#include <filesystem>
 
 namespace mcla::native {
 
 namespace {
 static DrawPacketAccumulator g_accumulator;
 
-// FNV-1a 64-bit hash helper
 uint64_t Fnv1a64(const void* data, size_t size, uint64_t hash = 14695981039346656037ULL) {
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < size; ++i) {
@@ -24,6 +23,14 @@ uint64_t Fnv1a64(const void* data, size_t size, uint64_t hash = 1469598103934665
     }
     return hash;
 }
+
+uint32_t AssembleBE32(const uint8_t* bytes) {
+    return (static_cast<uint32_t>(bytes[0]) << 24) |
+           (static_cast<uint32_t>(bytes[1]) << 16) |
+           (static_cast<uint32_t>(bytes[2]) << 8) |
+           static_cast<uint32_t>(bytes[3]);
+}
+
 } // namespace
 
 DrawPacketAccumulator* GetDrawAccumulator() {
@@ -34,7 +41,8 @@ DrawPacketAccumulator::DrawPacketAccumulator() = default;
 DrawPacketAccumulator::~DrawPacketAccumulator() = default;
 
 void DrawPacketAccumulator::Initialize(rex::memory::Memory* memory) {
-    m_memoryView.SetMemory(memory);
+    (void)memory;
+    m_memoryView.SetMemoryBase(nullptr, 0);
 }
 
 void DrawPacketAccumulator::SetCaptureEnabled(bool enabled, const std::filesystem::path& tracePath) {
@@ -59,7 +67,6 @@ void DrawPacketAccumulator::OnStateSetup(::MclaGpuContext* gpuCtx, uint32_t srcS
         return;
     }
 
-    // Capture the 5 surface info source descriptors from the setup struct.
     bool ok = true;
     ok &= m_memoryView.ReadU32BE(srcStateAddr + 108, &m_currentPacket.colorTargets[0]);
     ok &= m_memoryView.ReadU32BE(srcStateAddr + 112, &m_currentPacket.colorTargets[1]);
@@ -81,42 +88,31 @@ void DrawPacketAccumulator::OnDrawBuild(::MclaGpuContext* gpuCtx, ::PPCContext& 
     m_currentPacket.indexCount = gpuCtx->drawVertexCount;
     m_currentPacket.baseVertex = 0;
 
-    // Index type is encoded in drawFlags bits 4-6. sub_82420BA8
-    // (generated/default/mcla_recomp.26.cpp:20301-20345) sets these from a
-    // struct u16&3 indexed by primitive type: 0 -> flags|0x10, 1 -> flags|0x50,
-    // else -> flags|0x70. Map to the DrawPacket contract (0=16-bit, 1=32-bit,
-    // 2=non-indexed). Unknown encodings are NOT defaulted: the packet is
-    // marked invalid so nothing is consumed from unproven index semantics.
     const uint32_t indexField = (drawFlags >> 4) & 0x7;
     switch (indexField) {
-        case 0x1: m_currentPacket.indexType = 0; break;  // 16-bit indexed
-        case 0x5: m_currentPacket.indexType = 1; break;  // 32-bit indexed
-        case 0x7: m_currentPacket.indexType = 2; break;  // non-indexed
+        case 0x1: m_currentPacket.indexType = 0; break;
+        case 0x5: m_currentPacket.indexType = 1; break;
+        case 0x7: m_currentPacket.indexType = 2; break;
         default:
             m_currentPacket.indexType = 0;
             m_lastCaptureFailed = true;
             break;
     }
 
-    // Rasterizer state
     m_currentPacket.paClipCntl = gpuCtx->paClipCntl;
     m_currentPacket.paSuScModeCntl = gpuCtx->paSuScModeCntl;
     m_currentPacket.paClVteCntl = gpuCtx->paClVteCntl;
 
-    // Shader program guest addresses
     m_currentPacket.sqVsProgram = gpuCtx->sqVsProgram;
     m_currentPacket.sqVsConst = gpuCtx->sqVsConst;
     m_currentPacket.sqPsProgram = gpuCtx->sqPsProgram;
     m_currentPacket.sqPsConst = gpuCtx->sqPsConst;
 
-    // Viewport / Scissor mirrors
     m_currentPacket.viewportTL = gpuCtx->rbSurfaceInfoP2;
     m_currentPacket.viewportBR = gpuCtx->rbSurfaceInfoP3;
     m_currentPacket.scissorTL = gpuCtx->rbSurfaceInfoP4;
     m_currentPacket.scissorBR = gpuCtx->rbSurfaceInfoP4;
 
-    // Capture vertex buffer descriptor from r7 parameter if available.
-    // Never invent a stream when the descriptor is absent or unreadable.
     uint32_t vbPtr = ctx.r7.u32;
     m_currentPacket.vertexStreamCount = 0;
     if (vbPtr) {
@@ -138,84 +134,70 @@ void DrawPacketAccumulator::OnDrawBuild(::MclaGpuContext* gpuCtx, ::PPCContext& 
         }
     }
 
-    // Attempt to capture the RAGE grcFvf vertex declaration from the live
-    // drawable. The drawable pointer is observed at gpuCtx+10896 (0x2A90) in
-    // the recompiled draw-builder path. From the drawable we follow the
-    // shader-group -> vertex-declaration chain to reach the 16-byte m_Fvf block.
-    // Offsets are reverse-engineered from the MCLA recompilation; if any read
-    // fails we leave hasGrcFvf=0 and the native renderer falls back to the
-    // fixture stopgap (no invented data per Golden Rule 5).
-    {
-        constexpr uint32_t kDrawableOffset = 10896;  // gpuCtx+10896 -> grmDrawable*
-        uint32_t drawablePtr = 0;
-        if (m_memoryView.IsValidRange(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, 4)) {
-            m_memoryView.ReadU32BE(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, &drawablePtr);
-        }
+    constexpr uint32_t kDrawableOffset = 10896;
+    uint32_t drawablePtr = 0;
+    if (m_memoryView.IsValidRange(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, 4)) {
+        m_memoryView.ReadU32BE(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, &drawablePtr);
+    }
 
-        // Common offset chain in RAGE (MCLA era): drawable+0x28 -> grmShaderGroup*,
-        // shaderGroup+0x10 -> Rsc5VertexDeclaration*, vdecl+0x10 -> 16-byte m_Fvf.
-        // We try a small set of plausible offsets; first valid fvfMask wins.
-        constexpr uint32_t kDrawableShaderGroupOff[] = { 0x28, 0x30, 0x38, 0x20 };
-        constexpr uint32_t kShaderGroupVDeclOff[]  = { 0x10, 0x18, 0x20, 0x08 };
-        constexpr uint32_t kVDeclFvfOff[]          = { 0x10, 0x20, 0x30, 0x08, 0x40 };
+    constexpr uint32_t kDrawableShaderGroupOff[] = { 0x28, 0x30, 0x38, 0x20 };
+    constexpr uint32_t kShaderGroupVDeclOff[]  = { 0x10, 0x18, 0x20, 0x08 };
+    constexpr uint32_t kVDeclFvfOff[]          = { 0x10, 0x20, 0x30, 0x08, 0x40 };
 
-        uint32_t fvfMask = 0;
-        uint8_t fvfSize = 0, flags = 0, dynamicOrder = 0, channelCount = 0;
-        uint64_t types = 0;
-        bool gotFvf = false;
+    uint32_t fvfMask = 0;
+    uint8_t fvfSize = 0, flags = 0, dynamicOrder = 0, channelCount = 0;
+    uint64_t types = 0;
+    bool gotFvf = false;
 
-        for (uint32_t dsg : kDrawableShaderGroupOff) {
-            if (!drawablePtr) break;
-            uint32_t shaderGroupPtr = 0;
-            if (!m_memoryView.IsValidRange(drawablePtr + dsg, 4)) continue;
-            if (!m_memoryView.ReadU32BE(drawablePtr + dsg, &shaderGroupPtr) || !shaderGroupPtr) continue;
+    for (uint32_t dsg : kDrawableShaderGroupOff) {
+        if (!drawablePtr) break;
+        uint32_t shaderGroupPtr = 0;
+        if (!m_memoryView.IsValidRange(drawablePtr + dsg, 4)) continue;
+        if (!m_memoryView.ReadU32BE(drawablePtr + dsg, &shaderGroupPtr) || !shaderGroupPtr) continue;
 
-            for (uint32_t sgv : kShaderGroupVDeclOff) {
-                if (!shaderGroupPtr) break;
-                uint32_t vdeclPtr = 0;
-                if (!m_memoryView.IsValidRange(shaderGroupPtr + sgv, 4)) continue;
-                if (!m_memoryView.ReadU32BE(shaderGroupPtr + sgv, &vdeclPtr) || !vdeclPtr) continue;
+        for (uint32_t sgv : kShaderGroupVDeclOff) {
+            if (!shaderGroupPtr) break;
+            uint32_t vdeclPtr = 0;
+            if (!m_memoryView.IsValidRange(shaderGroupPtr + sgv, 4)) continue;
+            if (!m_memoryView.ReadU32BE(shaderGroupPtr + sgv, &vdeclPtr) || !vdeclPtr) continue;
 
-                for (uint32_t vfo : kVDeclFvfOff) {
-                    if (!vdeclPtr) break;
-                    if (!m_memoryView.IsValidRange(vdeclPtr + vfo, 16)) continue;
-                    uint32_t mask = 0;
-                    uint8_t size = 0, fl = 0, dyn = 0, chcnt = 0;
-                    uint64_t ty = 0;
-                    // Read the 16-byte grcFvf block: u32 mask, u8 size, u8 flags, u8 dyn, u8 chcnt, u64 types
-                    if (m_memoryView.ReadU32BE(vdeclPtr + vfo + 0, &mask) &&
-                        m_memoryView.ReadU8(vdeclPtr + vfo + 4, &size) &&
-                        m_memoryView.ReadU8(vdeclPtr + vfo + 5, &fl) &&
-                        m_memoryView.ReadU8(vdeclPtr + vfo + 6, &dyn) &&
-                        m_memoryView.ReadU8(vdeclPtr + vfo + 7, &chcnt) &&
-                        m_memoryView.ReadU64BE(vdeclPtr + vfo + 8, &ty)) {
-                        // Basic plausibility: mask non-zero, size reasonable (<= 255 for u8), types non-zero
-                        if (mask != 0 && size != 0 && ty != 0) {
-                            fvfMask = mask;
-                            fvfSize = size;
-                            flags = fl;
-                            dynamicOrder = dyn;
-                            channelCount = chcnt;
-                            types = ty;
-                            gotFvf = true;
-                            break;
-                        }
+            for (uint32_t vfo : kVDeclFvfOff) {
+                if (!vdeclPtr) break;
+                if (!m_memoryView.IsValidRange(vdeclPtr + vfo, 16)) continue;
+                uint32_t mask = 0;
+                uint8_t size = 0, fl = 0, dyn = 0, chcnt = 0;
+                uint64_t ty = 0;
+                if (m_memoryView.ReadU32BE(vdeclPtr + vfo + 0, &mask) &&
+                    m_memoryView.ReadU8(vdeclPtr + vfo + 4, &size) &&
+                    m_memoryView.ReadU8(vdeclPtr + vfo + 5, &fl) &&
+                    m_memoryView.ReadU8(vdeclPtr + vfo + 6, &dyn) &&
+                    m_memoryView.ReadU8(vdeclPtr + vfo + 7, &chcnt) &&
+                    m_memoryView.ReadU64BE(vdeclPtr + vfo + 8, &ty)) {
+                    if (mask != 0 && size != 0 && ty != 0) {
+                        fvfMask = mask;
+                        fvfSize = size;
+                        flags = fl;
+                        dynamicOrder = dyn;
+                        channelCount = chcnt;
+                        types = ty;
+                        gotFvf = true;
+                        break;
                     }
                 }
-                if (gotFvf) break;
             }
             if (gotFvf) break;
         }
+        if (gotFvf) break;
+    }
 
-        if (gotFvf) {
-            m_currentPacket.grcFvf.fvfMask = fvfMask;
-            m_currentPacket.grcFvf.fvfSize = fvfSize;
-            m_currentPacket.grcFvf.flags = flags;
-            m_currentPacket.grcFvf.dynamicOrder = dynamicOrder;
-            m_currentPacket.grcFvf.channelCount = channelCount;
-            m_currentPacket.grcFvf.types = types;
-            m_currentPacket.hasGrcFvf = 1;
-        }
+    if (gotFvf) {
+        m_currentPacket.grcFvf.fvfMask = fvfMask;
+        m_currentPacket.grcFvf.fvfSize = fvfSize;
+        m_currentPacket.grcFvf.flags = flags;
+        m_currentPacket.grcFvf.dynamicOrder = dynamicOrder;
+        m_currentPacket.grcFvf.channelCount = channelCount;
+        m_currentPacket.grcFvf.types = types;
+        m_currentPacket.hasGrcFvf = 1;
     }
 }
 
@@ -234,8 +216,6 @@ void DrawPacketAccumulator::OnSubmit(::MclaGpuContext* gpuCtx, uint32_t) {
     packet.stateHash = ComputeStateHash(packet);
     packet.isValid = ValidatePacket(packet) ? 1 : 0;
 
-    // A failed guest read during capture invalidates the packet and its data
-    // must not be trusted by a replay tool.
     if (m_lastCaptureFailed) {
         packet.isValid = 0;
         packet.validationFlags |= (1u << 18);
@@ -245,9 +225,6 @@ void DrawPacketAccumulator::OnSubmit(::MclaGpuContext* gpuCtx, uint32_t) {
     m_totalCapturedDraws++;
     if (packet.isValid) {
         m_validPackets++;
-        // Keep the most recent valid packet for the native-renderer
-        // consumption path. It is cleared at OnFrameEnd so it never carries
-        // into the next frame.
         m_lastPacket = packet;
         m_lastPacketValid = true;
     } else {
@@ -288,8 +265,6 @@ void DrawPacketAccumulator::DumpShaderIfNew(uint32_t guestAddr, bool isVertex,
     if (guestAddr == 0 || seen.count(guestAddr) != 0) return;
     seen.insert(guestAddr);
 
-    // Dump a bounded, page-aligned prefix of the program microcode. Xenos
-    // shaders are typically a few KB; 32KB covers all observed sizes.
     constexpr uint32_t kMaxBytes = 0x8000;
     constexpr uint32_t kChunk = 0x1000;
 
@@ -317,9 +292,6 @@ void DrawPacketAccumulator::DumpShaderIfNew(uint32_t guestAddr, bool isVertex,
 
 void DrawPacketAccumulator::DumpPacketGuestMemory(const DrawPacket& packet,
                                                   const std::filesystem::path& dir) {
-    // Phase 3 evidence capture: write raw guest bytes referenced by the draw
-    // so the vertex/index layout can be proven from live data instead of
-    // guessed offsets. Each unique (address, size) range is written once.
     auto dumpRange = [&](uint32_t guestAddr, uint32_t size, const char* tag) {
         if (!guestAddr || size == 0) return;
         GuestDumpKey key{ guestAddr, size };
@@ -350,9 +322,6 @@ void DrawPacketAccumulator::DumpPacketGuestMemory(const DrawPacket& packet,
 
     for (uint32_t i = 0; i < packet.vertexStreamCount; ++i) {
         const auto& s = packet.vertexStreams[i];
-        // Capture a bounded prefix; a full indexCount*stride range could be
-        // huge for instanced/streamed geometry, but a few pages is enough to
-        // identify the real vertex layout offline.
         const uint32_t stride = s.stride ? s.stride : 32;
         const uint32_t maxBytes = stride * (packet.indexCount > 0 ? packet.indexCount : 1);
         const uint32_t dumpBytes = std::min(maxBytes, 0x10000u);
@@ -378,7 +347,6 @@ bool DrawPacketAccumulator::ValidatePacket(DrawPacket& packet) const {
     uint32_t flags = 0;
     bool valid = true;
 
-    // Validate shader program addresses if non-zero
     if (packet.sqVsProgram && !m_memoryView.IsValidRange(packet.sqVsProgram, 4)) {
         flags |= (1 << 0);
         valid = false;
@@ -388,7 +356,6 @@ bool DrawPacketAccumulator::ValidatePacket(DrawPacket& packet) const {
         valid = false;
     }
 
-    // Validate vertex stream pointers
     for (uint32_t i = 0; i < packet.vertexStreamCount; ++i) {
         if (packet.vertexStreams[i].guestAddress &&
             !m_memoryView.IsValidRange(packet.vertexStreams[i].guestAddress, 4)) {
