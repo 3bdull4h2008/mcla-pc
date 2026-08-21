@@ -55,3 +55,34 @@ ninja_err.txt
 /PHASE2_IMPLEMENTATION_PLAN.md
 /MCLA_RPF3_Technical_Reference.txt
 /flowchart.drawio
+
+# ai tooling n local-only stuff, not part of the repo
+.opencode/
+/opencode.json
+/AGENTS.md
+/start_ghidra_mcp.bat
+/mcla_manifest.toml
+/mcla_vanilla_test.toml
+
+# old debug/duplicate wrapper scripts (configure.bat + ninja_build.bat r the real ones)
+/cmake_config.bat
+/cmake_config_debug.bat
+/cmake_debug.bat
+/cmake_debug2.bat
+/cmake_debug_final.bat
+/cmake_final.bat
+/reconfig.bat
+/build_main.bat
+/build_mcla.bat
+/build_mcla_test.bat
+/build_boot.bat
+/build_env.bat
+/build_env_vs2022.bat
+/build_env_vs2026.bat
+/build_phase0.bat
+/build_phase0_release.bat
+/build_phase0_test.bat
+/rebuild.bat
+/check_lib_vs2022.bat
+/run_silent.bat
+/run_test.bat
