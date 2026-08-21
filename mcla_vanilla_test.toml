@@ -1,0 +1,20 @@
+[main]
+file_path = "build/game_data/default.xex"
+out_directory_path = "build/codegen_vanilla_test"
+switch_table_file_path = ".research/XenonRecomp/XenonAnalyse/jump_tables.toml"
+
+savegprlr_14_address = 0x823D91C0
+restgprlr_14_address = 0x823D9210
+savefpr_14_address = 0x823DB9A0
+restfpr_14_address = 0x823DB9EC
+savevmx_14_address = 0x823DD2C0
+restvmx_14_address = 0x823DD558
+savevmx_64_address = 0x823DD354
+restvmx_64_address = 0x823DD5EC
+
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = true
+non_volatile_as_local = true

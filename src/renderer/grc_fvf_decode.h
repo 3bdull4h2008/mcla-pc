@@ -23,7 +23,7 @@
 // one decodes with unknownChannel=true and is refused for layout building
 // (Golden Rule 5 - never invent draw data).
 //
-// The decoder is standalone (no D3D12, no rexglue, no GuestMemoryView - callers
+// The decoder is standalone (no D3D12, no GuestMemoryView - callers
 // fetch the checked 16 guest bytes), so it is headlessly testable.
 //
 // It is intentionally separate from vertex_decode.{h,cpp}: vertex_decode maps

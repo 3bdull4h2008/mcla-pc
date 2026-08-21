@@ -11,8 +11,6 @@
 
 namespace mcla::native {
 
-struct PPCContext;
-
 class DrawPacketAccumulator {
 public:
     DrawPacketAccumulator();

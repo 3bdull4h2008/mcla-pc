@@ -10,38 +10,21 @@
 
 #include "d3d12_backend.h"
 #include "renderer_mode.h"
-#include "native_renderer.h"
 #include "guest_memory.h"
 #include "cvar.h"
+#include "ppc_config.h"
+#include "generated/ppc_xenon/ppc_context.h"
 
 namespace mcla {
 
-// PPC Context structure matching ReXGlue's PPCContext
-struct PPCContext {
-    // General purpose registers r0-r31
-    union { uint32_t u32; uint64_t u64; float f32; double f64; } r[32];
-    // Floating point registers f0-f31 (aliased with r)
-    union { uint32_t u32; uint64_t u64; float f32; double f64; } f[32];
-
-    // Special registers
-    uint64_t lr;      // Link register
-    uint64_t ctr;     // Count register
-    uint64_t xer;     // Fixed-point exception register
-    uint64_t cr;      // Condition register
-    uint32_t pc;      // Program counter (guest address)
-
-    // FPSCR
-    uint32_t fpscr;
-
-    // Vector/scalar registers (VSX) - 128-bit each
-    struct VSXReg { uint64_t lo, hi; } vsr[64];
-
-    // Default constructor
-    PPCContext() = default;
-};
+// XenonRecomp-compatible PPCContext (see generated/ppc_xenon/ppc_context.h).
+// The recompiled ABI defines the global ::PPCContext; these aliases keep the
+// existing hook consumers (mcla::PPCContext / mcla::native::PPCContext)
+// compiling unchanged.
+using PPCContext = ::PPCContext;
 
 namespace native {
-using PPCContext = mcla::PPCContext;
+using PPCContext = ::PPCContext;
 }
 
 class App {
@@ -84,7 +67,7 @@ public:
 private:
     bool InitSDL();
     bool InitPaths();
-    bool CreateWindow();
+    bool CreateSDLWindow();
     bool InitD3D12();
     void MainLoop();
     void HandleEvents();
@@ -103,6 +86,7 @@ private:
     native::GuestMemoryView m_guestMemoryView;
     std::unique_ptr<FunctionDispatcher> m_dispatcher;
     uint8_t* m_ppcBase = nullptr;
+    uint32_t m_bootEntry = 0;
 
     FrameCallback m_frameCallback;
 };
@@ -134,3 +118,5 @@ private:
 App* GetApp();
 
 } // namespace mcla
+
+#include "native_renderer.h"

@@ -1,9 +1,7 @@
 ﻿#pragma once
 
 #include <cstdint>
-#include <rex/cvar.h>
-
-REXCVAR_DECLARE(std::string, renderer_mode);
+#include "cvar.h"
 
 namespace mcla::renderer {
 

@@ -1,7 +1,7 @@
 # Local fmt package config - provides header-only fmt
 # This overrides the broken SDK fmt package
 
-get_filename_component(PACKAGE_PREFIX_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../" ABSOLUTE)
+get_filename_component(PACKAGE_PREFIX_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
 macro(set_and_check _var _file)
   set(${_var} "${_file}")
@@ -21,8 +21,8 @@ macro(check_required_components _NAME)
 endmacro()
 
 # Create header-only fmt targets
-# The fmt headers are in the SDK's include directory
-set(FMT_INCLUDE_DIR "${PACKAGE_PREFIX_DIR}/rexglue-sdk/win-amd64/include")
+# The fmt headers are vendored in third_party
+set(FMT_INCLUDE_DIR "${PACKAGE_PREFIX_DIR}/third_party/fmt")
 
 if(NOT TARGET fmt::fmt-header-only)
   add_library(fmt::fmt-header-only INTERFACE IMPORTED)

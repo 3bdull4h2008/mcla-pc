@@ -3,7 +3,7 @@ file_path = "build/game_data/default.xex"
 out_directory_path = "generated/ppc_xenon"
 switch_table_file_path = ".research/XenonRecomp/XenonAnalyse/jump_tables.toml"
 
-# Save/restore ABI functions (from ReXGlue manifest / disassembly).
+# Save/restore ABI functions (from disassembly / XenonAnalyse).
 savegprlr_14_address = 0x823D91C0
 restgprlr_14_address = 0x823D9210
 savefpr_14_address = 0x823DB9A0
@@ -13,11 +13,15 @@ restvmx_14_address = 0x823DD558
 savevmx_64_address = 0x823DD354
 restvmx_64_address = 0x823DD5EC
 
-# setjmp/longjmp addresses. Correct values TBD (not yet located in MCLA).
+# setjmp/longjmp addresses. VERIFIED ABSENT (2026-08-20): scanned decompressed
+# PE (find_abi_addrs.py + manual .text pattern scan) - no __imp__setjmp/
+# __imp__longjmp imports, no Microsoft-CRT setjmp/longjmp code pattern in .text,
+# no _setjmp/_longjmp symbols in the function map. MCLA uses SEH exception
+# handling (__C_specific_handler import). Leaving these unset (0) is correct.
 # longjmp_address = 0x
 # setjmp_address = 0x
 
-# Register locality flags (optimizations). Matches ReXGlue ppc_config.h.
+# Register locality flags (optimizations). Matches the generated ppc_config.h.
 # NOTE: skip_lr / skip_msr are intentionally left OFF until exceptions are researched.
 ctr_as_local = true
 xer_as_local = true
@@ -25,3 +29,9 @@ reserved_as_local = true
 cr_as_local = true
 non_argument_as_local = true
 non_volatile_as_local = true
+
+# Authoritative config: FULL recompile (no `functions` list) so the output is
+# the 179-TU set wired into CMakeLists.txt (ppc_recomp.0..178.cpp). A
+# boot-critical 111-function subset was evaluated and dropped; see
+# XENONRECOMP_REBUILD_PLAN.md Phase 5 reconciliation.
+

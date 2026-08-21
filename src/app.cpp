@@ -1,10 +1,14 @@
-#include "app.h"
+﻿#include "app.h"
 #include "logging.h"
 #include "patches.h"
+#include "boot_host.h"
 #include "native_renderer.h"
 #include "renderer_mode.h"
-#include "generated/default/mcla_init.h"
+#include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "vfs_rpf.h"
+
+// Forward declaration for GPU context poller (Phase 4)
+void StartGpuContextPoller();
 
 #include <fmt/format.h>
 #include <algorithm>
@@ -31,9 +35,12 @@ App* GetApp() {
 bool App::Initialize() {
     MCLA_LOG_INFO("Initializing {}...", m_name);
 
+    // The PPC ABI load/store macros route through the checked guest-memory view.
+    SetActiveGuestMemoryView(&m_guestMemoryView);
+
     if (!InitSDL()) return false;
     if (!InitPaths()) return false;
-    if (!CreateWindow()) return false;
+    if (!CreateSDLWindow()) return false;
     if (!InitD3D12()) return false;
 
     // Initialize logging first so patches can log
@@ -41,8 +48,19 @@ bool App::Initialize() {
     mcla::log::Initialize(m_name.c_str(), mcla::log::Level::Info,
                           (m_cacheRoot / "mcla.log").string().c_str());
 
-    MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
+MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
     MCLA_LOG_INFO("Cache root: {}", m_cacheRoot.string());
+
+    // Phase 5 (BOOT_REBUILD_PLAN): load the game image into the 4 GiB guest
+    // window and prepare the boot context. Must run after logging + paths (boot
+    // diagnostics need a sink) and before mcla_ApplyPatches (guest-memory hooks
+    // need a live window).
+    const std::filesystem::path xexPath = m_gameDataRoot / "default.xex";
+    if (std::filesystem::exists(xexPath) && boot::LoadAndPrepare(xexPath.string(), m_bootEntry)) {
+        MCLA_LOG_INFO("Guest image loaded; entry @0x{:08X}", m_bootEntry);
+    } else {
+        MCLA_LOG_WARN("Boot host not started: {} missing or load failed", xexPath.string());
+    }
 
     // Apply patches (installs PPC hooks)
     if (m_dispatcher) {
@@ -59,7 +77,18 @@ bool App::Initialize() {
         }
     }
 
-    m_running = true;
+m_running = true;
+
+    // Start GPU context poller (Phase 4) - waits for game to allocate GPU context
+    StartGpuContextPoller();
+
+    // Start the guest boot worker once the host services it will touch (VFS,
+    // kernel stubs, logging) are up. The worker parks in the game main loop;
+    // its outcome is reported in mcla.log by the boot watchdog.
+    if (m_bootEntry != 0) {
+        boot::Start(m_bootEntry);
+    }
+
     return true;
 }
 
@@ -112,7 +141,7 @@ bool App::InitPaths() {
     std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
 
     // Game data root: check cvar, then fallback to exe_dir/game_data
-    std::string gameDataCvar = MCLA_CVAR_GET_STRING(game_data_root);
+    std::string gameDataCvar(MCLA_CVAR_GET_STRING(game_data_root));
     if (!gameDataCvar.empty()) {
         m_gameDataRoot = gameDataCvar;
     } else {
@@ -123,7 +152,7 @@ bool App::InitPaths() {
     }
 
     // Cache root: check cvar, then fallback to exe_dir/cache
-    std::string cacheCvar = MCLA_CVAR_GET_STRING(cache_root);
+    std::string cacheCvar(MCLA_CVAR_GET_STRING(cache_root));
     if (!cacheCvar.empty()) {
         m_cacheRoot = cacheCvar;
     } else {
@@ -136,7 +165,7 @@ bool App::InitPaths() {
     return true;
 }
 
-bool App::CreateWindow() {
+bool App::CreateSDLWindow() {
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 
     // Check for fullscreen cvar
@@ -263,3 +292,4 @@ uint32_t App::FunctionDispatcher::AllocateThunk(PPCFunc func, uint32_t originalA
 }
 
 } // namespace mcla
+

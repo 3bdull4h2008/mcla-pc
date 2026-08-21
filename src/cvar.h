@@ -184,15 +184,4 @@ private:
 #define MCLA_CVAR_GET_BOOL(name) mcla::cvar::CVarSystem::Instance().GetBool(#name)
 #define MCLA_CVAR_GET_FLOAT(name) mcla::cvar::CVarSystem::Instance().GetFloat(#name)
 
-// Compatibility macros for existing REXCVAR_* usage
-#define REXCVAR_DEFINE_STRING(name, default_val, category, desc) MCLA_CVAR_STRING(name, default_val, category, desc)
-#define REXCVAR_DEFINE_INT(name, default_val, category, desc) MCLA_CVAR_INT(name, default_val, category, desc)
-#define REXCVAR_DEFINE_BOOL(name, default_val, category, desc) MCLA_CVAR_BOOL(name, default_val, category, desc)
-#define REXCVAR_DEFINE_FLOAT(name, default_val, category, desc) MCLA_CVAR_FLOAT(name, default_val, category, desc)
-
-#define REXCVAR_GET(name) MCLA_CVAR_GET_STRING(name)
-#define REXCVAR_GET_INT(name) MCLA_CVAR_GET_INT(name)
-#define REXCVAR_GET_BOOL(name) MCLA_CVAR_GET_BOOL(name)
-#define REXCVAR_GET_FLOAT(name) MCLA_CVAR_GET_FLOAT(name)
-
-#define REXCVAR_DECLARE(type, name) extern type REXCVAR_GET_##name()
+} // namespace mcla::cvar

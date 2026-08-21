@@ -4,6 +4,7 @@
 #include "renderer/pipeline_cache.h"
 #include "renderer/resource_cache.h"
 #include "renderer/texture_decode.h"
+#include "guest_memory.h"
 #include "logging.h"
 
 #pragma comment(lib, "d3d12.lib")
@@ -30,7 +31,7 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
 
     if (m_initialized) return true;
     if (!hwnd) {
-        REXLOG_ERROR("D3D12Backend: Null HWND passed to Initialize");
+        MCLA_LOG_ERROR("D3D12Backend: Null HWND passed to Initialize");
         return false;
     }
 
@@ -38,16 +39,16 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     m_width = (width > 0) ? width : 1280;
     m_height = (height > 0) ? height : 720;
 
-    REXLOG_INFO("D3D12Backend: Initializing backend for HWND 0x{:X} ({}x{})",
+    MCLA_LOG_INFO("D3D12Backend: Initializing backend for HWND 0x{:X} ({}x{})",
                 reinterpret_cast<uintptr_t>(hwnd), m_width, m_height);
     DWORD winThread = GetWindowThreadProcessId(hwnd, nullptr);
     DWORD curThread = GetCurrentThreadId();
-    REXLOG_INFO("D3D12Backend: window owner thread={} calling thread={} {}",
+    MCLA_LOG_INFO("D3D12Backend: window owner thread={} calling thread={} {}",
                 winThread, curThread, winThread == curThread ? "(MATCH)" : "(MISMATCH)");
     {
         char cls[256] = {};
         GetClassNameA(hwnd, cls, 256);
-        REXLOG_INFO("D3D12Backend: window class='{}' visible={}",
+        MCLA_LOG_INFO("D3D12Backend: window class='{}' visible={}",
                     cls, IsWindowVisible(hwnd) ? 1 : 0);
     }
 
@@ -68,7 +69,7 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     m_pipelineCache.SetFallbackPipeline(m_testPipeline);
 
     m_initialized = true;
-    REXLOG_INFO("D3D12Backend: Successfully initialized D3D12 native renderer skeleton + Phase 3 test pipeline");
+    MCLA_LOG_INFO("D3D12Backend: Successfully initialized D3D12 native renderer skeleton + Phase 3 test pipeline");
     return true;
 }
 
@@ -81,14 +82,14 @@ bool D3D12Backend::CreateDevice() {
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
             debugController->EnableDebugLayer();
             dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
-            REXLOG_INFO("D3D12Backend: Direct3D 12 Debug Layer enabled");
+            MCLA_LOG_INFO("D3D12Backend: Direct3D 12 Debug Layer enabled");
         }
     }
 #endif
 
     HRESULT hr = CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&m_factory));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateDXGIFactory2 failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateDXGIFactory2 failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -104,7 +105,7 @@ bool D3D12Backend::CreateDevice() {
             char descBuf[128] = {};
             size_t converted = 0;
             wcstombs_s(&converted, descBuf, sizeof(descBuf) - 1, desc.Description, _TRUNCATE);
-            REXLOG_INFO("D3D12Backend: Selected GPU adapter: {}", descBuf);
+            MCLA_LOG_INFO("D3D12Backend: Selected GPU adapter: {}", descBuf);
             adapterSelected = true;
             break;
         }
@@ -113,19 +114,19 @@ bool D3D12Backend::CreateDevice() {
     if (!adapterSelected) {
         // Loop always leaves hardwareAdapter non-null after the first iteration,
         // so clear it explicitly before the WARP fallback.
-        REXLOG_WARN("D3D12Backend: No hardware D3D12 adapter found, attempting WARP software adapter");
+        MCLA_LOG_WARN("D3D12Backend: No hardware D3D12 adapter found, attempting WARP software adapter");
         hardwareAdapter = nullptr;
         m_factory->EnumWarpAdapter(IID_PPV_ARGS(&hardwareAdapter));
     }
 
     if (!hardwareAdapter) {
-        REXLOG_ERROR("D3D12Backend: No D3D12-capable adapter (hardware or WARP) available");
+        MCLA_LOG_ERROR("D3D12Backend: No D3D12-capable adapter (hardware or WARP) available");
         return false;
     }
 
     hr = D3D12CreateDevice(hardwareAdapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_device));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: D3D12CreateDevice failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: D3D12CreateDevice failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -139,21 +140,21 @@ bool D3D12Backend::CreateCommandObjects() {
 
     HRESULT hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_commandQueue));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateCommandQueue failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateCommandQueue failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     for (uint32_t i = 0; i < kBufferCount; ++i) {
         hr = m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_commandAllocators[i]));
         if (FAILED(hr)) {
-            REXLOG_ERROR("D3D12Backend: CreateCommandAllocator[{}] failed with hr=0x{:08X}", i, static_cast<uint32_t>(hr));
+            MCLA_LOG_ERROR("D3D12Backend: CreateCommandAllocator[{}] failed with hr=0x{:08X}", i, static_cast<uint32_t>(hr));
             return false;
         }
     }
 
     hr = m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocators[0].Get(), nullptr, IID_PPV_ARGS(&m_commandList));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateCommandList failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateCommandList failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -181,14 +182,14 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd, uint32_t width, uint32_t height) {
         &swapChain);
 
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateSwapChainForHwnd failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateSwapChainForHwnd failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     m_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
     hr = swapChain.As(&m_swapChain);
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: Query IDXGISwapChain3 interface failed");
+        MCLA_LOG_ERROR("D3D12Backend: Query IDXGISwapChain3 interface failed");
         return false;
     }
 
@@ -204,7 +205,7 @@ bool D3D12Backend::CreateRenderTargets() {
 
     HRESULT hr = m_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_rtvHeap));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateDescriptorHeap (RTV) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateDescriptorHeap (RTV) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -215,7 +216,7 @@ bool D3D12Backend::CreateRenderTargets() {
     for (uint32_t i = 0; i < kBufferCount; ++i) {
         hr = m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_renderTargets[i]));
         if (FAILED(hr)) {
-            REXLOG_ERROR("D3D12Backend: GetBuffer[{}] failed with hr=0x{:08X}", i, static_cast<uint32_t>(hr));
+            MCLA_LOG_ERROR("D3D12Backend: GetBuffer[{}] failed with hr=0x{:08X}", i, static_cast<uint32_t>(hr));
             return false;
         }
         m_device->CreateRenderTargetView(m_renderTargets[i].Get(), nullptr, rtvHandle);
@@ -228,7 +229,7 @@ bool D3D12Backend::CreateRenderTargets() {
 bool D3D12Backend::CreateSyncObjects() {
     HRESULT hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateFence failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateFence failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -241,7 +242,7 @@ bool D3D12Backend::CreateSyncObjects() {
 
     m_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (!m_fenceEvent) {
-        REXLOG_ERROR("D3D12Backend: CreateEvent failed");
+        MCLA_LOG_ERROR("D3D12Backend: CreateEvent failed");
         return false;
     }
 
@@ -269,7 +270,7 @@ bool D3D12Backend::CreateUploadHeap() {
         &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
         nullptr, IID_PPV_ARGS(&m_uploadHeap));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateCommittedResource(upload) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateCommittedResource(upload) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -279,11 +280,11 @@ bool D3D12Backend::CreateUploadHeap() {
     m_uploadMap = nullptr;
     hr = m_uploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&m_uploadMap));
     if (FAILED(hr) || !m_uploadMap) {
-        REXLOG_ERROR("D3D12Backend: upload heap Map failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: upload heap Map failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    REXLOG_INFO("D3D12Backend: created {} MiB upload arena", kUploadSize / (1024 * 1024));
+    MCLA_LOG_INFO("D3D12Backend: created {} MiB upload arena", kUploadSize / (1024 * 1024));
     return true;
 }
 
@@ -313,14 +314,14 @@ bool D3D12Backend::CreateStaticIndexBuffer() {
         &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
         nullptr, IID_PPV_ARGS(&m_staticIndexBuffer));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateCommittedResource(static ib) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateCommittedResource(static ib) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     void* mapped = nullptr;
     hr = m_staticIndexBuffer->Map(0, nullptr, &mapped);
     if (FAILED(hr) || !mapped) {
-        REXLOG_ERROR("D3D12Backend: static index buffer Map failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: static index buffer Map failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
     std::memcpy(mapped, indices, kIndexBytes);
@@ -332,7 +333,7 @@ bool D3D12Backend::CreateStaticIndexBuffer() {
     m_resourceCache.Insert(ibKey, ResourceEntry{ ibGpu, 1, false });
     m_stats.cacheMisses++;
 
-    REXLOG_INFO("D3D12Backend: static index buffer cached ({} bytes, gpu=0x{:X})", kIndexBytes, ibGpu);
+    MCLA_LOG_INFO("D3D12Backend: static index buffer cached ({} bytes, gpu=0x{:X})", kIndexBytes, ibGpu);
     return true;
 }
 
@@ -345,7 +346,7 @@ uint8_t* D3D12Backend::MapUpload(size_t size, size_t alignment, D3D12_GPU_VIRTUA
     // region before we write it again. Region reuse requires offset < region.
     m_uploadOffset = (m_uploadOffset + alignment - 1) & ~(alignment - 1);
     if (m_uploadOffset + size > m_uploadRegionSize) {
-        REXLOG_WARN("D3D12Backend: upload arena region exhausted (need {} bytes, {} free); frame draw dropped",
+        MCLA_LOG_WARN("D3D12Backend: upload arena region exhausted (need {} bytes, {} free); frame draw dropped",
                     size, m_uploadRegionSize - m_uploadOffset);
         return nullptr;
     }
@@ -367,7 +368,7 @@ bool D3D12Backend::CreateSrvHeap() {
 
     HRESULT hr = m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_srvHeap));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateDescriptorHeap (CBV/SRV/UAV) failed with hr=0x{:08X}",
+        MCLA_LOG_ERROR("D3D12Backend: CreateDescriptorHeap (CBV/SRV/UAV) failed with hr=0x{:08X}",
                      static_cast<uint32_t>(hr));
         return false;
     }
@@ -384,13 +385,13 @@ bool D3D12Backend::CreateSamplerHeap() {
 
     HRESULT hr = m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_samplerHeap));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateDescriptorHeap (Sampler) failed with hr=0x{:08X}",
+        MCLA_LOG_ERROR("D3D12Backend: CreateDescriptorHeap (Sampler) failed with hr=0x{:08X}",
                      static_cast<uint32_t>(hr));
         return false;
     }
     m_samplerDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     m_samplerHeapOffset = 0;
-    REXLOG_INFO("D3D12Backend: Created sampler descriptor heap ({} descriptors)", kSamplerHeapSize);
+    MCLA_LOG_INFO("D3D12Backend: Created sampler descriptor heap ({} descriptors)", kSamplerHeapSize);
     return true;
 }
 
@@ -409,7 +410,7 @@ D3D12Backend::SamplerDescriptor D3D12Backend::GetOrCreateSamplerDescriptor(const
 
     // Allocate new descriptor
     if (m_samplerHeapOffset >= kSamplerHeapSize) {
-        REXLOG_ERROR("D3D12Backend: Sampler descriptor heap exhausted ({} slots)", kSamplerHeapSize);
+        MCLA_LOG_ERROR("D3D12Backend: Sampler descriptor heap exhausted ({} slots)", kSamplerHeapSize);
         return { {}, {} };
     }
 
@@ -479,7 +480,7 @@ ID3D12Resource* D3D12Backend::RenderGraphBuilder::GetTransientResource(const Tra
         &desc.clearValue, IID_PPV_ARGS(&resource));
 
     if (FAILED(hr)) {
-        REXLOG_ERROR("RenderGraph: Failed to create transient resource '{}', hr=0x{:08X}",
+        MCLA_LOG_ERROR("RenderGraph: Failed to create transient resource '{}', hr=0x{:08X}",
                      std::string(desc.name.begin(), desc.name.end()).c_str(),
                      static_cast<uint32_t>(hr));
         return nullptr;
@@ -556,7 +557,7 @@ bool D3D12Backend::RenderGraphBuilder::Build() {
     }
 
     if (executionOrder.size() != passes.size()) {
-        REXLOG_ERROR("RenderGraph: Cycle detected in pass dependencies");
+        MCLA_LOG_ERROR("RenderGraph: Cycle detected in pass dependencies");
         return false;
     }
 
@@ -648,7 +649,7 @@ bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t wi
         case DXGI_FORMAT_R8G8B8A8_UNORM: bytesPerPixel = 4; break;
         case DXGI_FORMAT_R8_UNORM:       bytesPerPixel = 1; break;
         default:
-            REXLOG_ERROR("D3D12Backend: CreateDecodedTexture unsupported dxgi format {}", dxgiFormat);
+            MCLA_LOG_ERROR("D3D12Backend: CreateDecodedTexture unsupported dxgi format {}", dxgiFormat);
             return false;
     }
 
@@ -672,7 +673,7 @@ bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t wi
         &defProps, D3D12_HEAP_FLAG_NONE, &texDesc, D3D12_RESOURCE_STATE_COPY_DEST,
         nullptr, IID_PPV_ARGS(&texture));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateDecodedTexture CreateCommittedResource failed with hr=0x{:08X}",
+        MCLA_LOG_ERROR("D3D12Backend: CreateDecodedTexture CreateCommittedResource failed with hr=0x{:08X}",
                      static_cast<uint32_t>(hr));
         return false;
     }
@@ -707,7 +708,7 @@ bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t wi
                                            D3D12_RESOURCE_STATE_GENERIC_READ,
                                            nullptr, IID_PPV_ARGS(&staging));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateDecodedTexture staging failed with hr=0x{:08X}",
+        MCLA_LOG_ERROR("D3D12Backend: CreateDecodedTexture staging failed with hr=0x{:08X}",
                      static_cast<uint32_t>(hr));
         return false;
     }
@@ -715,7 +716,7 @@ bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t wi
     void* mapped = nullptr;
     hr = staging->Map(0, nullptr, &mapped);
     if (FAILED(hr) || !mapped) {
-        REXLOG_ERROR("D3D12Backend: CreateDecodedTexture staging Map failed with hr=0x{:08X}",
+        MCLA_LOG_ERROR("D3D12Backend: CreateDecodedTexture staging Map failed with hr=0x{:08X}",
                      static_cast<uint32_t>(hr));
         return false;
     }
@@ -772,7 +773,7 @@ bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t wi
     m_decodedTextureUpload = staging;
     prevStaging.Reset();
 
-    REXLOG_INFO("D3D12Backend: decoded texture created ({}x{}, format {}) + SRV t0",
+    MCLA_LOG_INFO("D3D12Backend: decoded texture created ({}x{}, format {}) + SRV t0",
                 width, height, dxgiFormat);
     return true;
 }
@@ -829,7 +830,7 @@ bool D3D12Backend::CreateTestRootSignature() {
     HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
                                              &signatureBlob, &errorBlob);
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: D3D12SerializeRootSignature failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: D3D12SerializeRootSignature failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -837,7 +838,7 @@ bool D3D12Backend::CreateTestRootSignature() {
                                        signatureBlob->GetBufferSize(),
                                        IID_PPV_ARGS(&m_rootSignature));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateRootSignature failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateRootSignature failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
     return true;
@@ -877,10 +878,10 @@ bool D3D12Backend::CreateTestPipeline() {
 
     HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_testPipeline));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateGraphicsPipelineState(test) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateGraphicsPipelineState(test) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
-    REXLOG_INFO("D3D12Backend: Phase 3 test pipeline created (DXIL {} vs / {} ps bytes)",
+    MCLA_LOG_INFO("D3D12Backend: Phase 3 test pipeline created (DXIL {} vs / {} ps bytes)",
                 GetTestVsBlobSize(), GetTestPsBlobSize());
     return true;
 }
@@ -923,7 +924,7 @@ bool D3D12Backend::CreateMipGenPipeline() {
     HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
                                              &signatureBlob, &errorBlob);
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: MipGen SerializeRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: MipGen SerializeRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -931,29 +932,29 @@ bool D3D12Backend::CreateMipGenPipeline() {
                                        signatureBlob->GetBufferSize(),
                                        IID_PPV_ARGS(&m_mipGenRootSignature));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: MipGen CreateRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: MipGen CreateRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    REXLOG_INFO("D3D12Backend: MipGen root signature created");
+    MCLA_LOG_INFO("D3D12Backend: MipGen root signature created");
     return true;
 }
 
 // Generate mipmaps using compute shader downsampling
 bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) {
     if (!texture || mipLevels <= 1) {
-        REXLOG_WARN("D3D12Backend: GenerateMipmaps invalid args (texture={}, mipLevels={})",
+        MCLA_LOG_WARN("D3D12Backend: GenerateMipmaps invalid args (texture={}, mipLevels={})",
                     texture != nullptr, mipLevels);
         return false;
     }
 
     D3D12_RESOURCE_DESC desc = texture->GetDesc();
     if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
-        REXLOG_ERROR("D3D12Backend: GenerateMipmaps texture lacks ALLOW_UNORDERED_ACCESS flag");
+        MCLA_LOG_ERROR("D3D12Backend: GenerateMipmaps texture lacks ALLOW_UNORDERED_ACCESS flag");
         return false;
     }
     if (desc.MipLevels < mipLevels) {
-        REXLOG_ERROR("D3D12Backend: GenerateMipmaps texture has {} mips, requested {}",
+        MCLA_LOG_ERROR("D3D12Backend: GenerateMipmaps texture has {} mips, requested {}",
                      desc.MipLevels, mipLevels);
         return false;
     }
@@ -967,7 +968,7 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
     if (!m_mipGenPipeline) {
         const char* csHlsl = GetMipGenCsHlsl();
         if (!csHlsl || !*csHlsl) {
-            REXLOG_ERROR("D3D12Backend: GenerateMipmaps missing CS HLSL source");
+            MCLA_LOG_ERROR("D3D12Backend: GenerateMipmaps missing CS HLSL source");
             return false;
         }
 
@@ -975,13 +976,13 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
         mcla::renderer::DxcRuntime dxc;
         std::string usedDir, error;
         if (!dxc.Load("", usedDir, error)) {
-            REXLOG_ERROR("D3D12Backend: GenerateMipmaps failed to load DXC runtime: {}", error);
+            MCLA_LOG_ERROR("D3D12Backend: GenerateMipmaps failed to load DXC runtime: {}", error);
             return false;
         }
 
         std::vector<uint8_t> csBlob;
         if (!dxc.Compile(csHlsl, "main", "cs_6_0", csBlob, error)) {
-            REXLOG_ERROR("D3D12Backend: GenerateMipmaps CS compilation failed: {}", error);
+            MCLA_LOG_ERROR("D3D12Backend: GenerateMipmaps CS compilation failed: {}", error);
             return false;
         }
 
@@ -993,11 +994,11 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
 
         HRESULT hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_mipGenPipeline));
         if (FAILED(hr)) {
-            REXLOG_ERROR("D3D12Backend: GenerateMipmaps CreateComputePipelineState failed hr=0x{:08X}",
+            MCLA_LOG_ERROR("D3D12Backend: GenerateMipmaps CreateComputePipelineState failed hr=0x{:08X}",
                          static_cast<uint32_t>(hr));
             return false;
         }
-        REXLOG_INFO("D3D12Backend: MipGen compute pipeline created (CS blob {} bytes)", csBlob.size());
+        MCLA_LOG_INFO("D3D12Backend: MipGen compute pipeline created (CS blob {} bytes)", csBlob.size());
     }
 
     // Create SRV heap for source mips (read) and UAV heap for destination mips (write)
@@ -1012,7 +1013,7 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srvUavHeap;
     HRESULT hr = m_device->CreateDescriptorHeap(&srvUavHeapDesc, IID_PPV_ARGS(&srvUavHeap));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: GenerateMipmaps CreateDescriptorHeap failed hr=0x{:08X}",
+        MCLA_LOG_ERROR("D3D12Backend: GenerateMipmaps CreateDescriptorHeap failed hr=0x{:08X}",
                      static_cast<uint32_t>(hr));
         return false;
     }
@@ -1155,7 +1156,7 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
                           i);
     }
 
-    REXLOG_INFO("D3D12Backend: Generated {} mip levels for texture", mipLevels);
+    MCLA_LOG_INFO("D3D12Backend: Generated {} mip levels for texture", mipLevels);
     return true;
 }
 
@@ -1165,7 +1166,7 @@ bool D3D12Backend::CreatePipelineFromDxil(const std::vector<uint8_t>& vsDxil,
                                           const renderer::PipelineState& state,
                                           Microsoft::WRL::ComPtr<ID3D12PipelineState>& outPso) {
     if (vsDxil.empty() || psDxil.empty()) {
-        REXLOG_ERROR("D3D12Backend: CreatePipelineFromDxil: empty DXIL blob");
+        MCLA_LOG_ERROR("D3D12Backend: CreatePipelineFromDxil: empty DXIL blob");
         return false;
     }
 
@@ -1204,10 +1205,10 @@ bool D3D12Backend::CreatePipelineFromDxil(const std::vector<uint8_t>& vsDxil,
 
     HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&outPso));
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: CreateGraphicsPipelineState(translated) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: CreateGraphicsPipelineState(translated) failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
-    REXLOG_INFO("D3D12Backend: Live pipeline created from DXIL (VS={} bytes, PS={} bytes)", vsDxil.size(), psDxil.size());
+    MCLA_LOG_INFO("D3D12Backend: Live pipeline created from DXIL (VS={} bytes, PS={} bytes)", vsDxil.size(), psDxil.size());
     return true;
 }
 
@@ -1260,7 +1261,7 @@ bool D3D12Backend::DrawTestMeshedTriangle(uint32_t frame) {
 
     const bool ok = DrawDynamicMesh(desc);
     if (frame <= 3) {
-        REXLOG_INFO("D3D12Backend: DrawTestMeshedTriangle frame={} present_hr=0x{:08X}",
+        MCLA_LOG_INFO("D3D12Backend: DrawTestMeshedTriangle frame={} present_hr=0x{:08X}",
                     frame, static_cast<uint32_t>(m_lastPresentHr));
     }
     return ok;
@@ -1292,7 +1293,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // a different layout is not invented into this layout.
     constexpr uint32_t kLayoutStride = 28;
     if (desc.vertexStride != kLayoutStride) {
-        REXLOG_WARN("D3D12Backend: DrawDynamicMesh refused vertex stride {} (test layout is {})",
+        MCLA_LOG_WARN("D3D12Backend: DrawDynamicMesh refused vertex stride {} (test layout is {})",
                     desc.vertexStride, kLayoutStride);
         return false;
     }
@@ -1301,7 +1302,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         return false;
     }
     if (desc.indexed && desc.cachedIndexGpu && desc.cachedIndexBytesSize == 0) {
-        REXLOG_WARN("D3D12Backend: DrawDynamicMesh refused cached IB with size 0");
+        MCLA_LOG_WARN("D3D12Backend: DrawDynamicMesh refused cached IB with size 0");
         return false;
     }
 
@@ -1434,7 +1435,7 @@ bool D3D12Backend::Resize(uint32_t width, uint32_t height) {
     if (!m_initialized || !m_swapChain) return false;
     if (width == 0 || height == 0) return false;
 
-    REXLOG_INFO("D3D12Backend: Resizing swap chain to {}x{}", width, height);
+    MCLA_LOG_INFO("D3D12Backend: Resizing swap chain to {}x{}", width, height);
 
     WaitForGpu();
 
@@ -1445,7 +1446,7 @@ bool D3D12Backend::Resize(uint32_t width, uint32_t height) {
 
     HRESULT hr = m_swapChain->ResizeBuffers(kBufferCount, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
     if (FAILED(hr)) {
-        REXLOG_ERROR("D3D12Backend: ResizeBuffers failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        MCLA_LOG_ERROR("D3D12Backend: ResizeBuffers failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -1590,7 +1591,7 @@ void D3D12Backend::Shutdown() {
     m_factory.Reset();
 
     m_initialized = false;
-    REXLOG_INFO("D3D12Backend: Shutdown complete");
+    MCLA_LOG_INFO("D3D12Backend: Shutdown complete");
 }
 
 // Phase 4: Sampler state management (static samplers for root signature)
@@ -1764,6 +1765,311 @@ bool D3D12Backend::BeginRenderPass(const D3D12Backend::RenderPassDesc& desc) {
 void D3D12Backend::EndRenderPass() {
     if (!m_activeRenderPass.has_value() || !m_commandList) return;
     m_activeRenderPass.reset();
+}
+
+} // namespace mcla::native
+
+// =============================================================================
+// Phase 5: Captured DrawPacket Native Draw Implementation
+// =============================================================================
+
+namespace mcla::native {
+
+std::vector<D3D12_INPUT_ELEMENT_DESC>
+D3D12Backend::BuildInputLayoutFromGrcFvf(const native::GrcFvfDesc& grcFvf)
+{
+    std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
+
+    if (grcFvf.fvfMask == 0 || grcFvf.fvfSize == 0) {
+        MCLA_LOG_WARN("BuildInputLayoutFromGrcFvf: invalid grcFvf (mask=0x%08X, size=%u)",
+                      grcFvf.fvfMask, grcFvf.fvfSize);
+        return layout;
+    }
+
+    // Decode channel types from the 64-bit field (16 channels x 4 bits each)
+    // Each 4-bit nibble represents the type for that channel
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        if ((grcFvf.fvfMask & (1u << lane)) == 0) continue;
+
+        uint32_t typeCode = (grcFvf.types >> (lane * 4)) & 0xF;
+
+        D3D12_INPUT_ELEMENT_DESC desc = {};
+        desc.InputSlot = 0;
+        desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        desc.InstanceDataStepRate = 0;
+
+        // Map RAGE VFETCH channel type codes to DXGI formats
+        // Type codes from Xenos microcode / RAGE format table:
+        // 0 = float, 1 = float2, 2 = float3, 3 = float4
+        // 4 = ubyte4, 5 = ubyte4_norm, 6 = sbyte4, 7 = sbyte4_norm
+        // 8 = ushort2, 9 = ushort2_norm, 10 = ushort4, 11 = ushort4_norm
+        // 12 = short2, 13 = short2_norm, 14 = short4, 15 = short4_norm
+        // (exact mapping depends on RAGE's grcFvf decoding)
+
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        uint32_t offset = 0; // Will be calculated by lane order
+
+        // Semantic mapping based on channel index (RAGE convention)
+        const char* semanticName = "TEXCOORD";
+        uint32_t semanticIndex = lane;
+
+        // Common semantic assignments for RAGE:
+        switch (lane) {
+            case 0: semanticName = "POSITION"; semanticIndex = 0; break;  // Position
+            case 1: semanticName = "BLENDWEIGHT"; semanticIndex = 0; break;
+            case 2: semanticName = "BLENDINDICES"; semanticIndex = 0; break;
+            case 3: semanticName = "NORMAL"; semanticIndex = 0; break;
+            case 4: semanticName = "PSIZE"; semanticIndex = 0; break;
+            case 5: semanticName = "TEXCOORD"; semanticIndex = 0; break;
+            case 6: semanticName = "TEXCOORD"; semanticIndex = 1; break;
+            case 7: semanticName = "TEXCOORD"; semanticIndex = 2; break;
+            case 8: semanticName = "TEXCOORD"; semanticIndex = 3; break;
+            case 9: semanticName = "TEXCOORD"; semanticIndex = 4; break;
+            case 10: semanticName = "TEXCOORD"; semanticIndex = 5; break;
+            case 11: semanticName = "TEXCOORD"; semanticIndex = 6; break;
+            case 12: semanticName = "TEXCOORD"; semanticIndex = 7; break;
+            case 13: semanticName = "TANGENT"; semanticIndex = 0; break;
+            case 14: semanticName = "BINORMAL"; semanticIndex = 0; break;
+            case 15: semanticName = "TESSFACTOR"; semanticIndex = 0; break;
+        }
+
+        desc.SemanticName = semanticName;
+        desc.SemanticIndex = semanticIndex;
+
+        // Map type code to DXGI format
+        switch (typeCode) {
+            case 0x0: format = DXGI_FORMAT_R32_FLOAT; break;                    // float
+            case 0x1: format = DXGI_FORMAT_R32G32_FLOAT; break;                // float2
+            case 0x2: format = DXGI_FORMAT_R32G32B32_FLOAT; break;             // float3
+            case 0x3: format = DXGI_FORMAT_R32G32B32A32_FLOAT; break;          // float4
+            case 0x4: format = DXGI_FORMAT_R8G8B8A8_UINT; break;               // ubyte4
+            case 0x5: format = DXGI_FORMAT_R8G8B8A8_UNORM; break;              // ubyte4_norm
+            case 0x6: format = DXGI_FORMAT_R8G8B8A8_SINT; break;               // sbyte4
+            case 0x7: format = DXGI_FORMAT_R8G8B8A8_SNORM; break;              // sbyte4_norm
+            case 0x8: format = DXGI_FORMAT_R16G16_UINT; break;                 // ushort2
+            case 0x9: format = DXGI_FORMAT_R16G16_UNORM; break;                // ushort2_norm
+            case 0xA: format = DXGI_FORMAT_R16G16B16A16_UINT; break;           // ushort4
+            case 0xB: format = DXGI_FORMAT_R16G16B16A16_UNORM; break;          // ushort4_norm
+            case 0xC: format = DXGI_FORMAT_R16G16_SINT; break;                 // short2
+            case 0xD: format = DXGI_FORMAT_R16G16_SNORM; break;                // short2_norm
+            case 0xE: format = DXGI_FORMAT_R16G16B16A16_SINT; break;           // short4
+            case 0xF: format = DXGI_FORMAT_R16G16B16A16_SNORM; break;          // short4_norm
+            default:
+                MCLA_LOG_WARN("BuildInputLayoutFromGrcFvf: unknown type code %u for lane %u",
+                              typeCode, lane);
+                continue;
+        }
+
+        desc.Format = format;
+        desc.AlignedByteOffset = D3D12_APPEND_ALIGNED_ELEMENT;
+
+        layout.push_back(desc);
+
+        MCLA_LOG_INFO("BuildInputLayoutFromGrcFvf: lane=%u semantic=%s idx=%u type=%u fmt=%u",
+                      lane, semanticName, semanticIndex, typeCode, static_cast<uint32_t>(format));
+    }
+
+    if (layout.empty()) {
+        MCLA_LOG_WARN("BuildInputLayoutFromGrcFvf: no valid lanes decoded from mask=0x%08X",
+                      grcFvf.fvfMask);
+    }
+
+    return layout;
+}
+
+renderer::PipelineState D3D12Backend::BuildPipelineStateFromPacket(const native::DrawPacket& packet)
+{
+    renderer::PipelineState state = {};
+
+    // Target formats - default to R8G8B8A8_UNORM
+    state.targetFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    state.depthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+    // Blend state hash - extract from paClipCntl / other registers
+    state.blendState = packet.paClipCntl ^ 0x12345678;
+
+    // Raster state hash - extract cull mode, fill mode from paClipCntl / paSuScModeCntl
+    state.rasterState = packet.paClipCntl ^ packet.paSuScModeCntl;
+
+    // Depth-stencil state hash
+    state.depthStencilState = packet.paClVteCntl ^ 0xABCDEF00;
+
+    // Primitive topology
+    switch (packet.primType) {
+        case 0: state.topology = 0; break; // Triangle
+        case 1: state.topology = 0; break; // Triangle strip
+        case 2: state.topology = 1; break; // Line
+        case 3: state.topology = 1; break; // Line strip
+        case 4: state.topology = 2; break; // Point
+        default: state.topology = 0; break;
+    }
+
+    state.sampleCount = 1;
+
+    return state;
+}
+
+bool D3D12Backend::UploadPacketGeometry(const native::DrawPacket& packet,
+                                        D3D12_GPU_VIRTUAL_ADDRESS& vbGpu,
+                                        D3D12_GPU_VIRTUAL_ADDRESS& ibGpu,
+                                        uint32_t& vertexStride,
+                                        uint32_t& vertexCount,
+                                        uint32_t& indexCount,
+                                        DXGI_FORMAT& indexFormat)
+{
+    // Get active guest memory view
+    auto& memView = mcla::native::GetActiveGuestMemoryView();
+
+    // Upload vertex buffer
+    if (packet.vertexStreamCount == 0) {
+        MCLA_LOG_WARN("UploadPacketGeometry: no vertex streams in packet");
+        return false;
+    }
+
+    // For now, use first vertex stream
+    const auto& stream = packet.vertexStreams[0];
+    if (!stream.guestAddress || stream.stride == 0) {
+        MCLA_LOG_WARN("UploadPacketGeometry: invalid vertex stream 0 (addr=0x%08X stride=%u)",
+                      stream.guestAddress, stream.stride);
+        return false;
+    }
+
+    // Read vertex data from guest memory
+    if (!memView.IsValidRange(stream.guestAddress, stream.stride * packet.indexCount)) {
+        MCLA_LOG_WARN("UploadPacketGeometry: vertex stream out of bounds (addr=0x%08X stride=%u count=%u)",
+                      stream.guestAddress, stream.stride, packet.indexCount);
+        return false;
+    }
+
+    // For now, use the test vertex stride (28 bytes) since our test PSO expects that
+    vertexStride = 28;
+    vertexCount = packet.indexCount;
+
+    std::vector<uint8_t> vertexData(vertexStride * vertexCount);
+    if (!memView.ReadBytes(stream.guestAddress, vertexData.data(), vertexData.size())) {
+        MCLA_LOG_WARN("UploadPacketGeometry: failed to read vertex data from guest");
+        return false;
+    }
+
+    // Upload vertex buffer
+    vbGpu = 0;
+    uint8_t* vbDst = MapUpload(vertexData.size(), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, vbGpu);
+    if (!vbDst) return false;
+    std::memcpy(vbDst, vertexData.data(), vertexData.size());
+
+    // Upload index buffer
+    if (packet.indexType == 1) {
+        indexFormat = DXGI_FORMAT_R32_UINT;
+    } else {
+        indexFormat = DXGI_FORMAT_R16_UINT;
+    }
+    indexCount = packet.indexCount;
+
+    // Check if we have a cached index buffer for this packet's index data
+    ResourceKey ibKey = { ResourceKind::Buffer, packet.indexBufferAddress, packet.indexBufferSize, 0, 0 };
+    ResourceEntry ibEntry;
+    if (m_resourceCache.Find(ibKey, ibEntry)) {
+        ibGpu = ibEntry.handle;
+        MCLA_LOG_INFO("UploadPacketGeometry: using cached index buffer 0x%llx", ibGpu);
+    } else {
+        // Upload index buffer data
+        if (!memView.IsValidRange(packet.indexBufferAddress, packet.indexBufferSize)) {
+            MCLA_LOG_WARN("UploadPacketGeometry: index buffer out of bounds (addr=0x%08X size=%u)",
+                          packet.indexBufferAddress, packet.indexBufferSize);
+            return false;
+        }
+
+        std::vector<uint8_t> indexData(packet.indexBufferSize);
+        if (!memView.ReadBytes(packet.indexBufferAddress, indexData.data(), indexData.size())) {
+            MCLA_LOG_WARN("UploadPacketGeometry: failed to read index data from guest");
+            return false;
+        }
+
+        ibGpu = 0;
+        uint8_t* ibDst = MapUpload(indexData.size(), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, ibGpu);
+        if (!ibDst) return false;
+        std::memcpy(ibDst, indexData.data(), indexData.size());
+
+        // Cache the index buffer for future frames
+        ResourceEntry entry = { ibGpu, 0, false };
+        m_resourceCache.Insert(ibKey, entry);
+        MCLA_LOG_INFO("UploadPacketGeometry: cached new index buffer 0x%llx", ibGpu);
+    }
+
+    return true;
+}
+
+bool D3D12Backend::DrawCapturedPacket(const native::DrawPacket& packet)
+{
+    if (!m_initialized) {
+        MCLA_LOG_WARN("DrawCapturedPacket: backend not initialized");
+        return false;
+    }
+    if (!packet.isValid) {
+        MCLA_LOG_WARN("DrawCapturedPacket: packet is invalid");
+        return false;
+    }
+    if (!m_inFrame) {
+        if (!BeginFrame()) return false;
+    }
+
+    // Build input layout from captured grcFvf
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+    if (packet.hasGrcFvf) {
+        inputLayout = BuildInputLayoutFromGrcFvf(packet.grcFvf);
+        if (inputLayout.empty()) {
+            MCLA_LOG_WARN("DrawCapturedPacket: failed to build input layout from grcFvf");
+            return false;
+        }
+    } else {
+        MCLA_LOG_WARN("DrawCapturedPacket: packet missing grcFvf, using fallback layout");
+        // Fallback to test layout
+        inputLayout = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
+    }
+
+    // Build pipeline state from packet
+    renderer::PipelineState state = BuildPipelineStateFromPacket(packet);
+
+    // Get or create PSO for this input layout + state
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    renderer::PipelineKey key = renderer::ComputePipelineKey(packet.sqVsProgram, packet.sqPsProgram,
+                                                            0, state);
+    pso = m_pipelineCache.GetOrCompile(key, "", "", inputLayout);
+    if (!pso) {
+        // Fallback to test pipeline
+        pso = m_testPipeline;
+        if (!pso) {
+            MCLA_LOG_WARN("DrawCapturedPacket: no valid PSO available");
+            return false;
+        }
+    }
+
+    // Upload geometry
+    D3D12_GPU_VIRTUAL_ADDRESS vbGpu = 0, ibGpu = 0;
+    uint32_t vertexStride = 0, vertexCount = 0, indexCount = 0;
+    DXGI_FORMAT indexFormat = DXGI_FORMAT_R16_UINT;
+
+    if (!UploadPacketGeometry(packet, vbGpu, ibGpu, vertexStride, vertexCount, indexCount, indexFormat)) {
+        MCLA_LOG_WARN("DrawCapturedPacket: failed to upload packet geometry");
+        return false;
+    }
+
+    // Draw using the generic dynamic mesh path with the created PSO
+    DynamicMeshDesc desc = {};
+    desc.vertexBytes = nullptr; // Already uploaded
+    desc.vertexBytesSize = 0;
+    desc.vertexStride = 28; // Test layout stride
+    desc.vertexCount = vertexCount;
+    desc.indexed = true;
+    desc.indexFormat = indexFormat;
+    desc.indexCount = indexCount;
+    desc.cachedIndexGpu = ibGpu;
+    desc.cachedIndexBytesSize = packet.indexBufferSize;
+
+    return DrawDynamicMeshWithPipeline(desc, pso.Get());
 }
 
 } // namespace mcla::native

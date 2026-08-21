@@ -1,56 +1,49 @@
-# MCLA Workflow & Phase Discipline
+# Workflow — MCLA Native PC GPU
 
-Follow this before, during, and after any change to the renderer. The phase
-plan is `NATIVE_GPU_REBUILD_PLAN.md`; the designated skill is
-`mcla-phase-gate`.
+## Phase Discipline
+All work follows `MCLA_REBUILD_PLAN.md` phase gates. Never advance a phase until its gate criteria pass.
 
-## Before editing
+## Before Starting Any Task
+1. **Search First** — grep/glob the codebase, check `.research/`, query the knowledge graph (`memory-steward` / `second-brain`)
+2. **List Strategies** — Write down your thinking/acting strategies (first-principles, hypothesis-driven, adversarial self-critique, search strategy)
+3. **Step-by-Step Plan** — Define precise implementation steps and validation gates
+4. **Get Review** — For implementation tasks, route through `code-reviewer`; for guest-memory changes, also `security-auditor`
 
-1. Read `NATIVE_GPU_REBUILD_PLAN.md` and the immediately preceding phase.
-2. `rg` the target guest function address; confirm it has exactly **one hook
-   owner** (see Golden Rule 1).
-3. Confirm the change is authorized by the current phase. Do not skip ahead:
-   no D3D12-native work in Phase 0, no PM4 bypass before Phase 2, etc.
+## Development Loop
+```
+configure:  cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=RelWithDebInfo
+build:      cmake --build build
+run:        build/mcla.exe
+validate:   build/mcla.exe --validate-shaders --headless
+```
+**Build after every focused change. Never leave the tree in a non-building state.**
 
-## During work
+## Hook Development
+1. Discover guest address/struct via `reverser` (Ghidra, recomp output)
+2. Add hook to `src/hooks/registry.cpp` using composable dispatcher
+3. Hook captures **only** state — no D3D12, no side effects
+4. Verify with `security-auditor` (bounds, endianness, OOB)
+5. Register in dispatcher; one owner per address
 
-- Keep **generated/** unchanged. Validate before trusting any struct field.
-- One vertical slice at a time. Leave the existing renderer mode functional so
-  the tree always builds and boots.
-- Guest reads go through the checked memory helper with explicit endian reads.
-- Build after every focused change; never leave the tree non-building.
+## Shader Translation
+1. Extract Xenos microcode → IR via `shader-translator` subagent
+2. Validate IR dumps under `build/`
+3. Generate HLSL/DXIL via offline tooling
+4. Corpus regression check via `test-engineer`
 
-## Validation evidence
+## Perf Work
+- Profile with Tracy + PIX/RenderDoc
+- Use `perf-engineer` for upload/cache tuning, frame pacing
+- Document findings in handoff notes
 
-Record, per change:
+## Documentation & Handoffs
+- Update `.opencode/docs/architecture.md` after phase lands
+- Write lossless handoff via `memory-steward` / `docs-writer` before long sessions end
+- Record decisions, assumptions, open questions in durable memory (`second-brain`)
 
-- files changed and why;
-- build command + result (expect zero errors);
-- the validation gate you targeted and its outcome;
-- any unresolved guest-structure assumptions (name the field + the evidence
-  gap).
-- `renderer_mode` stays `legacy` by default until the gate says otherwise.
-
-## Offline / headless verification
-
-- Shader corpus validators and IR dumps live under `build/`
-  (`shader_ir`, `shader_ir_v2`, `shader_recompiled`).
-- Run the shader decoder/validator over the corpus and confirm
-  `0 unknown, 0 OOB` before claiming a decoder fix.
-- `test-engineer` owns the smoke gates; do not hand-wave them.
-
-## Handoff checklist (every continuation)
-
-- [ ] Single hook owner per address confirmed
-- [ ] Generated code untouched
-- [ ] `legacy` still the default; prior mode still functional
-- [ ] Built cleanly; build command + result recorded
-- [ ] Validation evidence and assumptions written down
-- [ ] Never claimed "native" while calling the Xenos command processor / PM4 /
-  guessed draw data
-
-## Phase-gate skill
-
-Invoke the `mcla-phase-gate` skill (`.opencode/skills/mcla-phase-gate`) before
-starting any task named in `NATIVE_GPU_REBUILD_PLAN.md`. It enforces the
-ordering above.
+## Context Discipline
+- Auto-compaction **disabled** — manage context manually
+- Delegate broad reads/search to subagents
+- Query `codebase_memory_*` graph and `@architecture` before grep-spamming
+- Read targeted slices (`Read` with `offset`/`limit`)
+- Externalize exact state to handoff files before context pressure

@@ -89,18 +89,9 @@ inline void Critical(fmt::format_string<Args...> fmt, Args&&... args) {
 
 } // namespace mcla::log
 
-// Macro compatibility layer for existing REXLOG_* usage
 #define MCLA_LOG_TRACE(...)  mcla::log::Trace(__VA_ARGS__)
 #define MCLA_LOG_DEBUG(...)  mcla::log::Debug(__VA_ARGS__)
 #define MCLA_LOG_INFO(...)   mcla::log::Info(__VA_ARGS__)
 #define MCLA_LOG_WARN(...)   mcla::log::Warn(__VA_ARGS__)
 #define MCLA_LOG_ERROR(...)  mcla::log::Error(__VA_ARGS__)
 #define MCLA_LOG_CRITICAL(...) mcla::log::Critical(__VA_ARGS__)
-
-// For backward compatibility with REXLOG_* macros used in the codebase
-#define REXLOG_TRACE(...)  MCLA_LOG_TRACE(__VA_ARGS__)
-#define REXLOG_DEBUG(...)  MCLA_LOG_DEBUG(__VA_ARGS__)
-#define REXLOG_INFO(...)   MCLA_LOG_INFO(__VA_ARGS__)
-#define REXLOG_WARN(...)   MCLA_LOG_WARN(__VA_ARGS__)
-#define REXLOG_ERROR(...)  MCLA_LOG_ERROR(__VA_ARGS__)
-#define REXLOG_CRITICAL(...) MCLA_LOG_CRITICAL(__VA_ARGS__)

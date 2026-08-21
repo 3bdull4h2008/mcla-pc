@@ -39,7 +39,7 @@ bool AddBeforeSubmitObserver(SubmitObserver observer) {
         if (g_submitObservers[i] == observer) return true;
     }
     if (g_submitObserverCount == g_submitObservers.size()) {
-        REXLOG_ERROR("Renderer submit observer capacity ({}) exhausted",
+        MCLA_LOG_ERROR("Renderer submit observer capacity ({}) exhausted",
                      g_submitObservers.size());
         return false;
     }

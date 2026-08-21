@@ -49,7 +49,7 @@ enum {
     kDxgiD24UnormS8Uint       = 45,
 };
 
-// Xenos texture format table. Values mirror the ReXGlue SDK's compiled
+// Xenos texture format table. Values mirror the compiled legacy
 // FormatInfo table verbatim — generated and cross-checked against the
 // `FormatInfo::Get` export of rexruntime.dll (the FormatInfo oracle; see
 // build/oracle_format_dump.cpp). Per the SDK formula
@@ -229,7 +229,7 @@ int32_t GetTiledAddressUpperBound2D(uint32_t right, uint32_t bottom, uint32_t pi
 
 int32_t GetTiledAddressLowerBound3D(uint32_t left, uint32_t top, uint32_t front,
                                     uint32_t pitch, uint32_t height, uint32_t bpbLog2) {
-    // Mirrors ReXGlue texture_util::GetTiledAddressLowerBound3D exactly:
+    // Mirrors the legacy GetTiledAddressLowerBound3D exactly:
     // x & ~kTextureTileWidthHeight (2D) / front & ~kTextureTileDepth (3D,
     // kTextureTileDepth = 4).
     return GetTiledOffset3D(int32_t(left & ~31u), int32_t(top & ~31u),

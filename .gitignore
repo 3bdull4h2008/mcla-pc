@@ -15,6 +15,7 @@
 /generated/
 # Node tooling install + lock-backed deps
 /node_modules/
+/.opencode/node_modules/
 npm-debug.log*
 
 # ── Large / copyrighted third-party data (do not version) ────
@@ -42,3 +43,9 @@ npm-debug.log*
 crash_log_early.txt
 Thumbs.db
 .DS_Store
+# root build artifacts n junk
+*.obj
+*.d
+ninja_out.txt
+ninja_err.txt
+.second-brain.lock

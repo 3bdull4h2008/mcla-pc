@@ -1,4 +1,4 @@
-#include "gpu_mmio.h"
+﻿#include "gpu_mmio.h"
 #include "native_renderer.h"
 #include "logging.h"
 #include <unordered_map>
@@ -35,14 +35,14 @@ void LogMmioWrite(uint32_t offset, uint32_t value) {
             case XenosRegister::SQ_PGM_RESOURCES_VS: regName = "SQ_PGM_RESOURCES_VS"; break;
             case XenosRegister::SQ_PGM_RESOURCES_PS: regName = "SQ_PGM_RESOURCES_PS"; break;
         }
-        REXLOG_INFO("GPU MMIO: 0x7FC8%04X (%s) = 0x%08X [%llu]",
+        MCLA_LOG_INFO("GPU MMIO: 0x7FC8%04X (%s) = 0x%08X [%llu]",
             offset, regName, value, count);
     }
 }
 
 static int g_bitstreamWriteCount = 0;
 
-REX_FUNC(gpu_MmioWriteHook) {
+PPC_FUNC_IMPL(gpu_MmioWriteHook) {
     g_bitstreamWriteCount++;
 
     if (g_bitstreamWriteCount <= 5 || (g_bitstreamWriteCount % 1000 == 0)) {
@@ -51,7 +51,7 @@ REX_FUNC(gpu_MmioWriteHook) {
         uint32_t bitstream = ctx.r5.u32;
         uint32_t bsSize    = ctx.r6.u32;
 
-        REXLOG_INFO("sub_824238E0[%d] mgr=0x%08X wptr=0x%08X bs=0x%08X sz=%u",
+        MCLA_LOG_INFO("sub_824238E0[%d] mgr=0x%08X wptr=0x%08X bs=0x%08X sz=%u",
                     g_bitstreamWriteCount, mgr, writePtr, bitstream, bsSize);
     }
 
@@ -61,12 +61,12 @@ REX_FUNC(gpu_MmioWriteHook) {
     if (orig_sub_824238E0) orig_sub_824238E0(ctx, base);
 }
 
-REX_FUNC(gpu_MmioWriteHelperHook) {
+PPC_FUNC_IMPL(gpu_MmioWriteHelperHook) {
     if (g_hooks.onGpuKick) g_hooks.onGpuKick(ctx);
     if (orig_sub_82422EF8) orig_sub_82422EF8(ctx, base);
 }
 
-REX_FUNC(gpu_Sub82411180Hook) {
+PPC_FUNC_IMPL(gpu_Sub82411180Hook) {
     if (g_hooks.onDrawCall) g_hooks.onDrawCall(ctx);
     if (orig_sub_82411180) orig_sub_82411180(ctx, base);
 }
@@ -75,21 +75,21 @@ void NotifyGpuSubmit(PPCContext& ctx, uint8_t*) {
     if (g_hooks.onDrawCall) g_hooks.onDrawCall(ctx);
 }
 
-REX_FUNC(gpu_Sub82411618Hook) {
+PPC_FUNC_IMPL(gpu_Sub82411618Hook) {
     if (g_hooks.onSetupVertexFetch) g_hooks.onSetupVertexFetch(ctx);
     if (orig_sub_82411618) orig_sub_82411618(ctx, base);
 }
 
 void DefaultGpuKickHook(PPCContext& ctx) {
-    REXLOG_INFO("GPU KICK: CP_RB_WPTR signal");
+    MCLA_LOG_INFO("GPU KICK: CP_RB_WPTR signal");
 }
 
 void DefaultSetupVertexFetchHook(PPCContext& ctx) {
-    REXLOG_INFO("GPU VERTEX FETCH SETUP");
+    MCLA_LOG_INFO("GPU VERTEX FETCH SETUP");
 }
 
 void DefaultDrawCallHook(PPCContext& ctx) {
-    REXLOG_INFO("GPU DRAW CALL");
+    MCLA_LOG_INFO("GPU DRAW CALL");
 }
 
 void InstallGpuHooks(mcla::App::FunctionDispatcher* dispatcher, const GpuHooks& hooks) {
@@ -105,7 +105,8 @@ void InstallGpuHooks(mcla::App::FunctionDispatcher* dispatcher, const GpuHooks& 
     dispatcher->SetFunction(0x82411180, gpu_Sub82411180Hook);
     dispatcher->SetFunction(0x82411618, gpu_Sub82411618Hook);
 
-    REXLOG_INFO("GPU hooks installed: 4 intercept+passthrough; submit is renderer-owned");
+    MCLA_LOG_INFO("GPU hooks installed: 4 intercept+passthrough; submit is renderer-owned");
 }
 
 } // namespace mcla::gpu
+

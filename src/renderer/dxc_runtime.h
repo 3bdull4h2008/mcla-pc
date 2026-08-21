@@ -7,7 +7,7 @@
 // at pipeline-key time without a compile-time dependency on the shader
 // compiler. The DLL pair is resolved from, in priority order: an explicit
 // directory, the MCLA_DXC_DIR environment variable, the vendored
-// `.research/XenosRecomp/thirdparty/dxc-bin/bin/x64` tree, then the
+// `third_party/dxc/bin/x64` tree, then the
 // executable's directory.
 //
 // Threading: DXC COM compiler objects are not thread-safe. Create one

@@ -67,7 +67,7 @@ VertexFormatDesc DecodeVertexFetch(uint32_t vfCode, uint32_t constIndex,
 
 // A single Xenos SHADER_CONSTANT_FETCH stream binding, decoded from the
 // documented 8-byte `xe_gpu_vertex_fetch_t` layout
-// (`_archive/xenia_xenos.h`, `rexglue-sdk/.../xenos.h`):
+// (`_archive/xenia_xenos.h`, `the xenos header`):
 //   word0: { address_type: 2, address: 30 }   (address in DWORDs)
 //   word1: { endian: 2,       size: 24 }      (size in WORDs per RX00)
 // It carries ONLY the VB base address, size and endianness for a fetched

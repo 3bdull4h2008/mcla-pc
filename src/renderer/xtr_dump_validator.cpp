@@ -2,7 +2,7 @@
 //
 // The built-in host frame trace (written by the GPU plugin's TraceWriter on
 // the command-processor thread) produces a .xtr file with the header layout
-// in rex::graphics::trace_protocol.h.  This tool parses that stream directly
+// in the trace protocol.  This tool parses that stream directly
 // (no runtime dependency) and reports:
 //
 //   1. Header integrity (format version, title_id).
@@ -32,7 +32,7 @@
 #include <vector>
 
 namespace proto {
-// Mirrors rex::graphics::trace_protocol.h (kept local so this tool has no SDK
+// Mirrors the trace protocol (kept local so this tool has no SDK
 // dependency).  This is the Xenia .xtr on-disk format, version 1.
 static const uint32_t kTraceFormatVersion = 1;
 

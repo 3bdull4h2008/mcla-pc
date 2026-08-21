@@ -12,7 +12,7 @@ enum XenosRegister : uint32_t {
     CP_RB_CNTL            = 0x01CC,
     VGT_PRIMITIVE_TYPE    = 0x21F8,
     VGT_NUM_INDICES       = 0x21FC,
-    VGT_DRAW_INITIATOR    = 0x21FC,
+    VGT_DRAW_INITIATOR    = 0x21F0,
     SQ_ALU_CONST_CACHE    = 0x2440,
     CB_COLOR0_BASE        = 0x2000,
     CB_DEPTH_BASE         = 0x2002,

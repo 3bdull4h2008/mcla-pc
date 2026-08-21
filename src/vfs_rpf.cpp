@@ -43,7 +43,7 @@ bool RpfVirtualFileSystem::Initialize(const std::string& extracted_cache_root) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     if (m_mounted) {
-        REXLOG_WARN("VFS: Already initialized");
+        MCLA_LOG_WARN("VFS: Already initialized");
         return true;
     }
 
@@ -51,15 +51,15 @@ bool RpfVirtualFileSystem::Initialize(const std::string& extracted_cache_root) {
 
     std::filesystem::path root_path(extracted_cache_root);
     if (!std::filesystem::exists(root_path)) {
-        REXLOG_ERROR("VFS: Extracted cache root does not exist: {}", extracted_cache_root);
+        MCLA_LOG_ERROR("VFS: Extracted cache root does not exist: {}", extracted_cache_root);
         return false;
     }
 
-    REXLOG_INFO("VFS: Initializing with extracted cache root: {}", extracted_cache_root);
+    MCLA_LOG_INFO("VFS: Initializing with extracted cache root: {}", extracted_cache_root);
 
     BuildIndex(extracted_cache_root);
 
-    REXLOG_INFO("VFS: Indexed {} files/directories", m_file_index.size());
+    MCLA_LOG_INFO("VFS: Indexed {} files/directories", m_file_index.size());
 
     Mount();
     return true;
@@ -67,7 +67,7 @@ bool RpfVirtualFileSystem::Initialize(const std::string& extracted_cache_root) {
 
 void RpfVirtualFileSystem::Mount() {
     m_mounted = true;
-    REXLOG_INFO("VFS: Mounted virtual t:\\ drive");
+    MCLA_LOG_INFO("VFS: Mounted virtual t:\\ drive");
 }
 
 void RpfVirtualFileSystem::Unmount() {
@@ -79,7 +79,7 @@ void RpfVirtualFileSystem::Unmount() {
     m_open_files.clear();
     m_file_index.clear();
     m_mounted = false;
-    REXLOG_INFO("VFS: Unmounted virtual t:\\ drive");
+    MCLA_LOG_INFO("VFS: Unmounted virtual t:\\ drive");
 }
 
 bool RpfVirtualFileSystem::IsVirtualPath(const std::string& path) const {
@@ -207,7 +207,7 @@ bool RpfVirtualFileSystem::ReadFile(OpenFileHandle& file, void* buffer, uint64_t
     }
 
     DWORD read = 0;
-    BOOL result = ReadFile(static_cast<HANDLE>(file.handle), buffer, static_cast<DWORD>(size), &read, nullptr);
+    BOOL result = ::ReadFile(static_cast<HANDLE>(file.handle), buffer, static_cast<DWORD>(size), &read, nullptr);
     bytes_read = read;
     file.position += read;
     return result != FALSE;

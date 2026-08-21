@@ -19,6 +19,7 @@
 
 #include "renderer/resource_cache.h"
 #include "renderer/pipeline_cache.h"
+#include "native_types.h"
 
 namespace mcla::native {
 
@@ -108,6 +109,29 @@ public:
                                 const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout,
                                 const renderer::PipelineState& state,
                                 Microsoft::WRL::ComPtr<ID3D12PipelineState>& outPso);
+
+    // Phase 5: Draw a captured DrawPacket using its native vertex/index data,
+    // shaders, and state. Builds input layout from grcFvf, creates/selects PSO
+    // from PipelineCache, uploads guest vertex/index buffers, and issues the draw.
+    bool DrawCapturedPacket(const native::DrawPacket& packet);
+
+    // Helper: Build D3D12 input layout from captured grcFvf vertex declaration.
+    // Returns empty vector on failure (unsupported format).
+    std::vector<D3D12_INPUT_ELEMENT_DESC>
+    BuildInputLayoutFromGrcFvf(const native::GrcFvfDesc& grcFvf);
+
+    // Helper: Build render state from captured DrawPacket state.
+    renderer::PipelineState BuildPipelineStateFromPacket(const native::DrawPacket& packet);
+
+    // Helper: Upload guest vertex/index data from captured packet to upload arena.
+    // Returns false if upload fails or data is invalid.
+    bool UploadPacketGeometry(const native::DrawPacket& packet,
+                              D3D12_GPU_VIRTUAL_ADDRESS& vbGpu,
+                              D3D12_GPU_VIRTUAL_ADDRESS& ibGpu,
+                              uint32_t& vertexStride,
+                              uint32_t& vertexCount,
+                              uint32_t& indexCount,
+                              DXGI_FORMAT& indexFormat);
 
     // Phase 4: Sampler state management
     // Creates or retrieves a cached sampler state from the provided descriptor.

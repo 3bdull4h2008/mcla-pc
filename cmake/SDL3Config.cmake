@@ -1,23 +1,25 @@
-# Minimal SDL3 config - provides header-only target to avoid missing DLL issue
-# This is found first due to CMAKE_PREFIX_PATH ordering
+# SDL3 config - links against vendored SDL3.lib
 
 set(SDL3_FOUND TRUE)
-set(SDL3_VERSION "3.2.0")
-set(SDL3_VERSION_STRING "3.2.0")
+set(SDL3_VERSION "3.2.6")
+set(SDL3_VERSION_STRING "3.2.6")
 
-# Headers target (provided by SDK)
+get_filename_component(PACKAGE_PREFIX_DIR "${CMAKE_CURRENT_LIST_DIR}/../" ABSOLUTE)
+
+# Headers target (vendored in third_party)
 if(NOT TARGET SDL3::Headers)
   add_library(SDL3::Headers INTERFACE IMPORTED)
   set_target_properties(SDL3::Headers PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${_IMPORT_PREFIX}/include"
+    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/third_party/SDL3/include"
   )
 endif()
 
-# Provide a header-only SDL3::SDL3 target that doesn't need DLL
+# Main SDL3 target linking against vendored SDL3.lib
 if(NOT TARGET SDL3::SDL3)
-  add_library(SDL3::SDL3 INTERFACE IMPORTED)
+  add_library(SDL3::SDL3 UNKNOWN IMPORTED)
   set_target_properties(SDL3::SDL3 PROPERTIES
-    INTERFACE_LINK_LIBRARIES "SDL3::Headers"
+    IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/third_party/SDL3/lib/SDL3.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/third_party/SDL3/include"
     INTERFACE_COMPILE_DEFINITIONS "SDL_STATIC=1"
   )
 endif()
@@ -34,10 +36,3 @@ if(NOT TARGET SDL3::SDL3_test)
     INTERFACE_LINK_LIBRARIES "SDL3::SDL3"
   )
 endif()
-
-# Variables
-set(SDL3_LIBRARIES SDL3::SDL3)
-set(SDL3_STATIC_LIBRARIES SDL3::SDL3-static)
-set(SDL3_STATIC_PRIVATE_LIBS "")
-
-message(STATUS "Using minimal header-only SDL3 config")

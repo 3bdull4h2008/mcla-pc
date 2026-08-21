@@ -1,8 +1,11 @@
 ﻿#include "renderer_mode.h"
 #include "cvar.h"
+#include "logging.h"
 
 #include <atomic>
 #include <string_view>
+
+MCLA_CVAR_STRING(renderer_mode, "legacy", "Renderer", "Renderer mode: legacy | native | capture");
 
 namespace mcla::renderer {
 namespace {
@@ -81,7 +84,7 @@ void RecordFramePresented() {
     if (frame % 120 != 0) return;
 
     const FrameCounters counters = GetFrameCounters();
-    REXLOG_INFO("Renderer frame {} mode={} state={} draws={} submits={} swaps={} invalid_modes={}",
+    MCLA_LOG_INFO("Renderer frame {} mode={} state={} draws={} submits={} swaps={} invalid_modes={}",
                 counters.frames, RendererModeName(GetRendererMode()),
                 counters.stateSetups, counters.drawBuilds, counters.submits,
                 counters.swaps, counters.invalidModeSelections);

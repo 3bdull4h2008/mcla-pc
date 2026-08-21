@@ -1,11 +1,11 @@
-#include "rage_asset_pipeline.h"
+﻿#include "rage_asset_pipeline.h"
 
 #include <cstring>
 #include <algorithm>
 #include <fstream>
 #include <sstream>
 
-#include <rex/logging.h>
+#include "logging.h"
 
 #include "vfs_rpf.h"
 
@@ -56,7 +56,7 @@ static bool ReadRwChunk(const uint8_t*& ptr, const uint8_t* end, RwChunkHeader& 
 // CsrContainer implementation
 bool CsrContainer::Parse(const uint8_t* data, size_t size) {
     if (size < sizeof(CsrHeader)) {
-        REXLOG_ERROR("CSR: Data too small for header");
+        MCLA_LOG_ERROR("CSR: Data too small for header");
         return false;
     }
     
@@ -73,16 +73,16 @@ bool CsrContainer::Parse(const uint8_t* data, size_t size) {
     
     // Verify magic "CSR"
     if (m_header.magic[0] != 'C' || m_header.magic[1] != 'S' || m_header.magic[2] != 'R') {
-        REXLOG_ERROR("CSR: Invalid magic: %c%c%c", m_header.magic[0], m_header.magic[1], m_header.magic[2]);
+        MCLA_LOG_ERROR("CSR: Invalid magic: %c%c%c", m_header.magic[0], m_header.magic[1], m_header.magic[2]);
         return false;
     }
     
     if (m_header.version != 5) {
-        REXLOG_WARN("CSR: Unexpected version %d", m_header.version);
+        MCLA_LOG_WARN("CSR: Unexpected version %d", m_header.version);
     }
     
     if (m_header.num_entries == 0) {
-        REXLOG_WARN("CSR: No entries in container");
+        MCLA_LOG_WARN("CSR: No entries in container");
         return true;
     }
     
@@ -92,7 +92,7 @@ bool CsrContainer::Parse(const uint8_t* data, size_t size) {
     
     for (uint32_t i = 0; i < m_header.num_entries; ++i) {
         if (reinterpret_cast<const uint8_t*>(ptr + sizeof(CsrEntry)) > data + size) {
-            REXLOG_ERROR("CSR: Entry %d out of bounds", i);
+            MCLA_LOG_ERROR("CSR: Entry %d out of bounds", i);
             return false;
         }
         
@@ -110,7 +110,7 @@ bool CsrContainer::Parse(const uint8_t* data, size_t size) {
     
     // Verify total size
     if (m_header.size != size) {
-        REXLOG_WARN("CSR: Size mismatch: header=%u, actual=%zu", m_header.size, size);
+        MCLA_LOG_WARN("CSR: Size mismatch: header=%u, actual=%zu", m_header.size, size);
     }
     
     m_data = data;
@@ -178,7 +178,7 @@ bool RageAssetManager::LoadCsrContainer(uint32_t hash, CsrContainer& out_contain
     }
     
     if (!m_vfs->CloseFile(handle)) {
-        REXLOG_WARN("Failed to close file handle");
+        MCLA_LOG_WARN("Failed to close file handle");
     }
     
     // Parse the container
@@ -192,7 +192,7 @@ bool RageAssetManager::LoadCsrContainer(uint32_t hash, CsrContainer& out_contain
 bool RageAssetManager::ParseCsrEntry(const CsrEntry& entry) {
     // TODO: Parse based on entry.type
     // For now, just log
-    REXLOG_INFO("RAGE: Parsing entry hash=0x%08X type=%u size=%u", entry.hash, entry.type, entry.size);
+    MCLA_LOG_INFO("RAGE: Parsing entry hash=0x%08X type=%u size=%u", entry.hash, entry.type, entry.size);
     return true;
 }
 
@@ -270,7 +270,7 @@ static bool ParseGeometry(const uint8_t* ptr, const uint8_t* end, DffMesh& out_m
         ptr += num_vertices * 4;
     }
 
-    REXLOG_INFO("DFF: geometry flags=0x%X vtx=%u tri=%u uv_sets=%u",
+    MCLA_LOG_INFO("DFF: geometry flags=0x%X vtx=%u tri=%u uv_sets=%u",
                 flags, num_vertices, num_triangles, num_uv_sets);
     return true;
 }
@@ -286,7 +286,7 @@ static bool ParseGeometryList(const uint8_t* ptr, const uint8_t* end, DffModel& 
     for (uint32_t g = 0; g < num_geoms && ptr < end; ++g) {
         RwChunkHeader geom_hdr;
         if (!ReadRwChunk(ptr, end, geom_hdr) || geom_hdr.type != RW_GEOMETRY) {
-            REXLOG_WARN("DFF: Expected geometry chunk %u", g);
+            MCLA_LOG_WARN("DFF: Expected geometry chunk %u", g);
             return false;
         }
         const uint8_t* geom_end = ptr + geom_hdr.size;
@@ -294,7 +294,7 @@ static bool ParseGeometryList(const uint8_t* ptr, const uint8_t* end, DffModel& 
 
         DffMesh mesh = {};
         if (!ParseGeometry(ptr, geom_end, mesh)) {
-            REXLOG_ERROR("DFF: Geometry %u parse failed", g);
+            MCLA_LOG_ERROR("DFF: Geometry %u parse failed", g);
             return false;
         }
         out_model.meshes.push_back(std::move(mesh));
@@ -310,11 +310,11 @@ bool TxdParser::Parse(const uint8_t* data, size_t size, TxdDictionary& out_dict)
 
     RwChunkHeader txd_hdr;
     if (!ReadRwChunk(ptr, end, txd_hdr)) {
-        REXLOG_ERROR("TXD: Failed to read dictionary chunk header");
+        MCLA_LOG_ERROR("TXD: Failed to read dictionary chunk header");
         return false;
     }
     if (txd_hdr.type != RW_TEXTURE_DICTIONARY) {
-        REXLOG_ERROR("TXD: Not a texture dictionary (type=0x%X)", txd_hdr.type);
+        MCLA_LOG_ERROR("TXD: Not a texture dictionary (type=0x%X)", txd_hdr.type);
         return false;
     }
     const uint8_t* txd_end = ptr + txd_hdr.size;
@@ -322,7 +322,7 @@ bool TxdParser::Parse(const uint8_t* data, size_t size, TxdDictionary& out_dict)
 
     RwChunkHeader struct_hdr;
     if (!ReadRwChunk(ptr, txd_end, struct_hdr) || struct_hdr.type != RW_STRUCT) {
-        REXLOG_ERROR("TXD: Expected struct chunk");
+        MCLA_LOG_ERROR("TXD: Expected struct chunk");
         return false;
     }
     const uint8_t* struct_end = ptr + struct_hdr.size;
@@ -332,14 +332,14 @@ bool TxdParser::Parse(const uint8_t* data, size_t size, TxdDictionary& out_dict)
     const uint32_t tex_count = ReadU16LE(ptr);
     ptr += 4; // u16 count + u16 padding
 
-    REXLOG_INFO("TXD: %u textures", tex_count);
+    MCLA_LOG_INFO("TXD: %u textures", tex_count);
     out_dict.textures.clear();
     out_dict.textures.reserve(tex_count);
 
     for (uint32_t i = 0; i < tex_count && ptr < txd_end; ++i) {
         RwChunkHeader tex_hdr;
         if (!ReadRwChunk(ptr, txd_end, tex_hdr) || tex_hdr.type != RW_TEXTURE) {
-            REXLOG_ERROR("TXD: Expected texture chunk %u", i);
+            MCLA_LOG_ERROR("TXD: Expected texture chunk %u", i);
             return false;
         }
         const uint8_t* tex_end = ptr + tex_hdr.size;
@@ -382,7 +382,7 @@ bool TxdParser::Parse(const uint8_t* data, size_t size, TxdDictionary& out_dict)
                 const size_t nlen = std::min<uint32_t>(sub.size, static_cast<uint32_t>(avail));
                 if (nlen > 0) {
                     texture.data.assign(ptr, ptr + nlen);
-                    REXLOG_WARN("TXD[%u]: native payload %zu bytes; header layout unvalidated",
+                    MCLA_LOG_WARN("TXD[%u]: native payload %zu bytes; header layout unvalidated",
                                 i, nlen);
                 }
                 ptr += nlen;
@@ -393,7 +393,7 @@ bool TxdParser::Parse(const uint8_t* data, size_t size, TxdDictionary& out_dict)
         }
 
         out_dict.textures.push_back(std::move(texture));
-        REXLOG_INFO("TXD[%u]: %ux%u fmt=%u mips=%u bytes=%zu", i,
+        MCLA_LOG_INFO("TXD[%u]: %ux%u fmt=%u mips=%u bytes=%zu", i,
                     texture.width, texture.height, texture.format,
                     texture.mip_levels, texture.data.size());
     }
@@ -407,11 +407,11 @@ bool DffParser::Parse(const uint8_t* data, size_t size, DffModel& out_model) {
 
     RwChunkHeader root;
     if (!ReadRwChunk(ptr, end, root)) {
-        REXLOG_ERROR("DFF: Failed to read root chunk");
+        MCLA_LOG_ERROR("DFF: Failed to read root chunk");
         return false;
     }
     if (root.type != RW_CLUMP && root.type != RW_ATOMIC) {
-        REXLOG_ERROR("DFF: Not a clump/atomic (type=0x%X)", root.type);
+        MCLA_LOG_ERROR("DFF: Not a clump/atomic (type=0x%X)", root.type);
         return false;
     }
 
@@ -428,7 +428,7 @@ bool DffParser::Parse(const uint8_t* data, size_t size, DffModel& out_model) {
 
         if (hdr.type == RW_GEOMETRY_LIST) {
             if (!ParseGeometryList(cur, chunk_end, out_model)) {
-                REXLOG_ERROR("DFF: Geometry list parse failed");
+                MCLA_LOG_ERROR("DFF: Geometry list parse failed");
                 return false;
             }
         }
@@ -436,7 +436,7 @@ bool DffParser::Parse(const uint8_t* data, size_t size, DffModel& out_model) {
     }
 
     if (out_model.meshes.empty()) {
-        REXLOG_WARN("DFF: No geometry found (chunk layout may differ)");
+        MCLA_LOG_WARN("DFF: No geometry found (chunk layout may differ)");
         return false;
     }
     return true;

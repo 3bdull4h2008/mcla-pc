@@ -40,9 +40,8 @@ DrawPacketAccumulator* GetDrawAccumulator() {
 DrawPacketAccumulator::DrawPacketAccumulator() = default;
 DrawPacketAccumulator::~DrawPacketAccumulator() = default;
 
-void DrawPacketAccumulator::Initialize(rex::memory::Memory* memory) {
-    (void)memory;
-    m_memoryView.SetMemoryBase(nullptr, 0);
+void DrawPacketAccumulator::Initialize(uint8_t* base, uint32_t size) {
+    m_memoryView.SetMemoryBase(base, size);
 }
 
 void DrawPacketAccumulator::SetCaptureEnabled(bool enabled, const std::filesystem::path& tracePath) {
@@ -286,7 +285,7 @@ void DrawPacketAccumulator::DumpShaderIfNew(uint32_t guestAddr, bool isVertex,
     }
     out.close();
 
-    REXLOG_INFO("ShaderDump: {} ({}) -> {} ({} bytes)", name,
+    MCLA_LOG_INFO("ShaderDump: {} ({}) -> {} ({} bytes)", name,
                 isVertex ? "VS" : "PS", outPath.string(), written);
 }
 
@@ -298,7 +297,7 @@ void DrawPacketAccumulator::DumpPacketGuestMemory(const DrawPacket& packet,
         if (!m_dumpedRanges.insert(key).second) return;
 
         if (!m_memoryView.IsValidRange(guestAddr, size)) {
-            REXLOG_WARN("GuestMemDump: range invalid addr=0x{:08X} size={}", guestAddr, size);
+            MCLA_LOG_WARN("GuestMemDump: range invalid addr=0x{:08X} size={}", guestAddr, size);
             return;
         }
 
@@ -316,7 +315,7 @@ void DrawPacketAccumulator::DumpPacketGuestMemory(const DrawPacket& packet,
             written += want;
         }
         out.close();
-        REXLOG_INFO("GuestMemDump: {} addr=0x{:08X} size={} -> {} ({} bytes)",
+        MCLA_LOG_INFO("GuestMemDump: {} addr=0x{:08X} size={} -> {} ({} bytes)",
                     tag, guestAddr, size, (dir / name).string(), written);
     };
 

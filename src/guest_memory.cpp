@@ -1,4 +1,4 @@
-﻿#include "guest_memory.h"
+#include "guest_memory.h"
 #include "logging.h"
 #include <cstring>
 
@@ -6,15 +6,17 @@ namespace mcla::native {
 
 GuestMemoryView::GuestMemoryView() = default;
 
-void GuestMemoryView::SetMemoryBase(uint8_t* base, uint32_t size) {
+void GuestMemoryView::SetMemoryBase(uint8_t* base, uint64_t size) {
     m_base = base;
     m_size = size;
-    REXLOG_INFO("GuestMemoryView: memory base=0x{:p} size=0x{:X} ({} MB)",
+    MCLA_LOG_INFO("GuestMemoryView: memory base=0x{:p} size=0x{:X} ({} MB)",
                 (void*)base, size, size / (1024 * 1024));
 }
 
 bool GuestMemoryView::IsValidRange(uint32_t guestAddr, uint32_t size) const {
-    if (guestAddr == 0 || size == 0) return false;
+    // Reject the NOACCESS guard page (first 4 KiB) so zero-base reads
+    // (e.g. uninitialized r2/TOC) log as invalid instead of AV-ing.
+    if (guestAddr < 0x1000 || size == 0) return false;
 
     const uint64_t end = static_cast<uint64_t>(guestAddr) + size;
     if (end > 0x100000000ULL) return false;
@@ -94,6 +96,14 @@ bool GuestMemoryView::WriteU8(uint32_t guestAddr, uint8_t val) const {
     return true;
 }
 
+bool GuestMemoryView::WriteU16BE(uint32_t guestAddr, uint16_t val) const {
+    uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint16_t));
+    if (!ptr) return false;
+    uint16_t be = Swap16(val);
+    std::memcpy(ptr, &be, sizeof(be));
+    return true;
+}
+
 bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint32_t));
     if (!ptr) return false;
@@ -115,6 +125,19 @@ bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t s
     if (!ptr || !src) return false;
     std::memcpy(ptr, src, size);
     return true;
+}
+
+namespace {
+mcla::native::GuestMemoryView* g_activeGuestMemoryView = nullptr;
+}
+
+mcla::native::GuestMemoryView& mcla::native::GetActiveGuestMemoryView() {
+    static mcla::native::GuestMemoryView fallback;
+    return g_activeGuestMemoryView ? *g_activeGuestMemoryView : fallback;
+}
+
+void mcla::native::SetActiveGuestMemoryView(mcla::native::GuestMemoryView* view) {
+    g_activeGuestMemoryView = view;
 }
 
 bool VerifyGuestMemoryViewForTests() {
@@ -146,7 +169,20 @@ bool VerifyGuestMemoryViewForTests() {
     if (!view.ReadU16BE(0x100, &val16)) return false;
     if (val16 != 0x1234) return false;
 
+    if (!view.WriteU16BE(0x200, 0xAABB)) return false;
+    if (testMem[0x200] != 0xAA || testMem[0x201] != 0xBB) return false;
+
     return true;
+}
+
+uint64_t mcla::native::QueryGuestTimebase() {
+    LARGE_INTEGER freq;
+    LARGE_INTEGER counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    // Scale to ~800 MHz (Xenon timebase = CPU/4, 3.2 GHz / 4 = 800 MHz)
+    // freq is in Hz, so multiply by 800e6 / freq.QuadPart
+    return (counter.QuadPart * 800000000ULL) / freq.QuadPart;
 }
 
 } // namespace mcla::native

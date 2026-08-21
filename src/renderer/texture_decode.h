@@ -3,14 +3,14 @@
 // Phase 4 texture format/layout decoding for the MCLA native renderer.
 //
 // Xenos preserves a small set of "canonical" texture format codes (see
-// rexglue-sdk/.../rex/graphics/xenos.h TextureFormat) plus block-based tiled
+// the Xenos texture format TextureFormat) plus block-based tiled
 // memory layouts. This module maps a Xenos texture format to the information a
 // native D3D12 backend needs (host DXGI format, block size, bytes/block,
 // compressed-ness), computes the Xenos tiled byte offset for 2D/3D block
 // coordinates, and untiles guest textures into a linear host layout.
 //
 // It is intentionally standalone (no D3D12/SDK headers) so it is testable
-// headlessly against the shader/capture corpus and against the ReXGlue SDK's
+// headlessly against the shader/capture corpus and against the legacy
 // own implementations, which are exported by rexruntime.dll and used as the
 // validation oracle.
 
@@ -19,7 +19,7 @@
 namespace mcla::native {
 
 // Layout metadata for one Xenos texture format, mirroring the SDK's FormatInfo
-// (rexglue-sdk/.../texture/info.h) semantics. Kept as plain data with numeric
+// (the texture format info) semantics. Kept as plain data with numeric
 // host-format codes so the module stays D3D12-free.
 struct TextureFormatInfo {
     uint32_t xenosFormat = 0;   // xenos::TextureFormat numeric value
@@ -56,7 +56,7 @@ uint32_t GetTextureBlockSpan(uint32_t xenosFormat, uint32_t width, uint32_t heig
 // Xenos textures in EDRAM/guest memory are stored in a 32x32-block macro tile
 // layout when tiled. The two functions below reproduce the canonical
 // XGAddress tiled offset math (Xenia texture_util.cc + architected 3D case)
-// which ReXGlue's texture_util also implements; the validator cross-checks
+// which the legacy texture utility also implements; the validator cross-checks
 // your implementation against rexruntime.dll's exported versions.
 // ---------------------------------------------------------------------------
 
@@ -72,7 +72,7 @@ int32_t GetTiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch,
                          uint32_t height, uint32_t bpbLog2);
 
 // Bounds in bytes that a region may touch in a tiled surface, for cache-range
-// estimation. Mirror the ReXGlue texture_util helpers:
+// estimation. Mirror the legacy texture utility helpers:
 //   - lower bound: tiled offset at the macro-tile-aligned (left, top)
 //     block corner (32x32-block tiles).
 //   - upper bound: maximum tiled offset reachable within the region, allowing

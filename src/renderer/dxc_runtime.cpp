@@ -77,7 +77,7 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
     if (!dllDir.empty()) dirs.push_back(std::string(dllDir));
     if (const char* env = std::getenv("MCLA_DXC_DIR"); env && *env)
         dirs.push_back(env);
-    dirs.push_back(".research/XenosRecomp/thirdparty/dxc-bin/bin/x64");
+    dirs.push_back("third_party/dxc/bin/x64");
     {
         char exe[1024] = {};
         const DWORD n = GetModuleFileNameA(nullptr, exe, sizeof(exe));
@@ -101,7 +101,7 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
     }
     if (dir.empty()) {
         error = "DXC DLLs not found (tried explicit dir, MCLA_DXC_DIR, "
-                ".research/XenosRecomp/thirdparty/dxc-bin/bin/x64, exe dir)";
+                "third_party/dxc/bin/x64, exe dir)";
         return false;
     }
 

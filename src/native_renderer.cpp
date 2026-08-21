@@ -1,4 +1,4 @@
-﻿#include "native_renderer.h"
+#include "native_renderer.h"
 #include "renderer_hook_dispatch.h"
 #include "renderer_mode.h"
 #include "capture_hooks.h"
@@ -8,7 +8,8 @@
 #include "app.h"
 #include "logging.h"
 #include "guest_memory.h"
-#include "generated/default/mcla_init.h"
+#include "gpu_mmio.h"
+#include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "renderer/shader_translator.h"
 #include "renderer/pipeline_cache.h"
 #include "renderer/xenos_shader_ir.h"
@@ -31,12 +32,12 @@ static PPCFunc* orig_Sub8241ABB8     = nullptr;
 static PPCFunc* orig_VdSwap          = nullptr;
 static DrawCaptureCallback g_drawCaptureCb = nullptr;
 
-// Host-side frame trace driver (stubbed - no ReXGlue command processor)
+// Host-side frame trace driver (stubbed - no legacy command processor)
 static constexpr std::chrono::milliseconds kHostTraceWarmup{3000};
 static constexpr std::chrono::milliseconds kHostTraceWindow{1500};
 
 void StartHostFrameTrace() {
-    REXLOG_WARN("StartHostFrameTrace: not available in standalone mode (no ReXGlue command processor)");
+    MCLA_LOG_WARN("StartHostFrameTrace: not available in standalone mode (no legacy command processor)");
 }
 
 // Draw-capture callback
@@ -51,10 +52,10 @@ static uint32_t s_lastDrawFlags = 0;
 uint32_t GetLastDrawType()  { return s_lastDrawType; }
 uint32_t GetLastDrawFlags() { return s_lastDrawFlags; }
 
-// Register file sync - stubbed (no ReXGlue register file in standalone mode)
+// Register file sync - stubbed (no legacy register file in standalone mode)
 void WriteGpuContextToRegisterFile(::MclaGpuContext* gpuCtx) {
     (void)gpuCtx;
-    // In standalone mode, we don't have a ReXGlue register file.
+    // In standalone mode, we don't have a legacy register file.
     // Draw state is captured directly from guest context via hooks.
 }
 
@@ -70,7 +71,7 @@ void ForwardRegisterToBackend(uint32_t regIndex, uint32_t value) {
 }
 
 // Hook: sub_8241BD08 - GfxCmdBufSubmit
-REX_FUNC(Hooked_GfxCmdBufSubmit) {
+PPC_FUNC_IMPL(Hooked_GfxCmdBufSubmit) {
     mcla::renderer::RecordSubmit();
     mcla::renderer::hooks::DispatchBeforeSubmit(ctx, base);
 
@@ -82,7 +83,7 @@ REX_FUNC(Hooked_GfxCmdBufSubmit) {
         static int drawCount = 0;
         drawCount++;
         if (drawCount <= 5 || (drawCount % 100 == 0)) {
-            REXLOG_INFO("GfxCmdBufSubmit[{}] ctx=0x%08X r4=0x%08X "
+            MCLA_LOG_INFO("GfxCmdBufSubmit[{}] ctx=0x%08X r4=0x%08X "
                         "surf0=0x%08X surf1=0x%08X "
                         "vsProg=0x%08X psProg=0x%08X",
                         drawCount, ctx_guest, ctx.r4.u32,
@@ -107,7 +108,7 @@ REX_FUNC(Hooked_GfxCmdBufSubmit) {
 }
 
 // Hook: sub_82420BA8 - Draw-call builder
-REX_FUNC(Hooked_Sub82420BA8) {
+PPC_FUNC_IMPL(Hooked_Sub82420BA8) {
     mcla::renderer::RecordDrawBuild();
     uint32_t drawFlags = ctx.r4.u32;
     uint32_t drawType  = drawFlags & 7;
@@ -124,7 +125,7 @@ REX_FUNC(Hooked_Sub82420BA8) {
     static int ba8Count = 0;
     ba8Count++;
     if (ba8Count <= 5 || (ba8Count % 100 == 0)) {
-        REXLOG_INFO("Sub82420BA8[{}] ctx=0x%08X flags=0x%08X type=%u "
+        MCLA_LOG_INFO("Sub82420BA8[{}] ctx=0x%08X flags=0x%08X type=%u "
                     "r6=0x%08X r7=0x%08X f1=%f  [{}]",
                     ba8Count, ctx.r3.u32, drawFlags, drawType,
                     ctx.r6.u32, ctx.r7.u32,
@@ -141,7 +142,7 @@ REX_FUNC(Hooked_Sub82420BA8) {
 }
 
 // Hook: sub_8241ABB8 - SetViewport / SetRenderTargets state setup
-REX_FUNC(Hooked_Sub8241ABB8) {
+PPC_FUNC_IMPL(Hooked_Sub8241ABB8) {
     mcla::renderer::RecordStateSetup();
     uint32_t ctx_guest   = ctx.r3.u32;
     uint32_t src_state   = ctx.r4.u32;
@@ -149,11 +150,11 @@ REX_FUNC(Hooked_Sub8241ABB8) {
     if (ctx_guest && src_state) {
         ::MclaGpuContext* gpuCtx = reinterpret_cast<::MclaGpuContext*>(base + ctx_guest);
 
-        gpuCtx->rbSurfaceInfoP0 = REX_LOAD_U32(src_state + 108);
-        gpuCtx->rbSurfaceInfoP1 = REX_LOAD_U32(src_state + 112);
-        gpuCtx->rbSurfaceInfoP2 = REX_LOAD_U32(src_state + 116);
-        gpuCtx->rbSurfaceInfoP3 = REX_LOAD_U32(src_state + 120);
-        gpuCtx->rbSurfaceInfoP4 = REX_LOAD_U32(src_state + 124);
+        gpuCtx->rbSurfaceInfoP0 = PPC_LOAD_U32(src_state + 108);
+        gpuCtx->rbSurfaceInfoP1 = PPC_LOAD_U32(src_state + 112);
+        gpuCtx->rbSurfaceInfoP2 = PPC_LOAD_U32(src_state + 116);
+        gpuCtx->rbSurfaceInfoP3 = PPC_LOAD_U32(src_state + 120);
+        gpuCtx->rbSurfaceInfoP4 = PPC_LOAD_U32(src_state + 124);
 
         GetDrawAccumulator()->OnStateSetup(gpuCtx, src_state);
     }
@@ -166,7 +167,7 @@ REX_FUNC(Hooked_Sub8241ABB8) {
 // Native draw dispatch - now uses D3D12Backend directly
 void IssueNativeDraw(::MclaGpuContext* gpuCtx) {
     (void)gpuCtx;
-    REXLOG_WARN("IssueNativeDraw: legacy ReXGlue command processor path not available in standalone mode");
+    MCLA_LOG_WARN("IssueNativeDraw: legacy command processor path not available in standalone mode");
     // Native draws are now issued through the VdSwap hook -> D3D12Backend render graph
 }
 
@@ -263,7 +264,7 @@ static bool ResolveCapturedVertexLayout(
     auto refuse = [&](const char* reason) {
         std::string key(reason);
         if (s_emittedReasons.insert(key).second) {
-            REXLOG_WARN("Native render: captured grcFvf layout refused ({})", reason);
+            MCLA_LOG_WARN("Native render: captured grcFvf layout refused ({})", reason);
         }
         layout.clear();
         declHash = 0;
@@ -272,7 +273,7 @@ static bool ResolveCapturedVertexLayout(
 
     if (!packet.hasGrcFvf) {
         if (s_emittedReasons.insert("no captured grcFvf (live drawable pointer chain unproven)").second) {
-            REXLOG_WARN("Native render: packet has no captured grcFvf (live drawable "
+            MCLA_LOG_WARN("Native render: packet has no captured grcFvf (live drawable "
                         "pointer chain unproven); using fixture layout stopgap, stride==28 gate");
         }
         layout = BuildInputLayoutFromVS(vsProg);
@@ -306,7 +307,7 @@ static bool ResolveCapturedVertexLayout(
             }
         }
         if (!found) {
-            REXLOG_WARN("Native render: VS references (usage={},idx={}) missing from "
+            MCLA_LOG_WARN("Native render: VS references (usage={},idx={}) missing from "
                         "captured grcFvf; refusing",
                         (int)r.usage, (int)r.usageIndex);
             return refuse("VS input missing from captured grcFvf");
@@ -348,7 +349,7 @@ static DXGI_FORMAT DecodeColorTargetFormat(uint32_t colorInfo) {
         case 14: return DXGI_FORMAT_R32_FLOAT;
         case 15: return DXGI_FORMAT_R32G32_FLOAT;
         default:
-            REXLOG_WARN("Native render: unknown color target format {} (raw=0x{:08X})",
+            MCLA_LOG_WARN("Native render: unknown color target format {} (raw=0x{:08X})",
                         format, colorInfo);
             return DXGI_FORMAT_R8G8B8A8_UNORM;
     }
@@ -360,7 +361,7 @@ static DXGI_FORMAT DecodeDepthTargetFormat(uint32_t depthInfo) {
         case 0: return DXGI_FORMAT_D24_UNORM_S8_UINT;
         case 1: return DXGI_FORMAT_D24_UNORM_S8_UINT;
         default:
-            REXLOG_WARN("Native render: unknown depth target format {} (raw=0x{:08X})",
+            MCLA_LOG_WARN("Native render: unknown depth target format {} (raw=0x{:08X})",
                         format, depthInfo);
             return DXGI_FORMAT_D24_UNORM_S8_UINT;
     }
@@ -404,29 +405,29 @@ GetPipelineForPacket(D3D12Backend* backend, const DrawPacket& packet) {
 
     std::vector<uint8_t> vsContainer, psContainer;
     if (!ReadShaderContainerFromGuest(memView, packet.sqVsProgram, vsContainer)) {
-        REXLOG_WARN("Failed to read VS container at 0x{:08X}", packet.sqVsProgram);
+        MCLA_LOG_WARN("Failed to read VS container at 0x{:08X}", packet.sqVsProgram);
         return nullptr;
     }
     if (!ReadShaderContainerFromGuest(memView, packet.sqPsProgram, psContainer)) {
-        REXLOG_WARN("Failed to read PS container at 0x{:08X}", packet.sqPsProgram);
+        MCLA_LOG_WARN("Failed to read PS container at 0x{:08X}", packet.sqPsProgram);
         return nullptr;
     }
 
     mcla::renderer::TranslatedShader vsOut, psOut;
     if (!mcla::renderer::TranslateShader(vsContainer.data(), vsContainer.size(), {}, vsOut) ||
         vsOut.hlsl.empty()) {
-        REXLOG_WARN("Failed to translate VS at 0x{:08X}: {}", packet.sqVsProgram, vsOut.error);
+        MCLA_LOG_WARN("Failed to translate VS at 0x{:08X}: {}", packet.sqVsProgram, vsOut.error);
         return nullptr;
     }
     if (!mcla::renderer::TranslateShader(psContainer.data(), psContainer.size(), {}, psOut) ||
         psOut.hlsl.empty()) {
-        REXLOG_WARN("Failed to translate PS at 0x{:08X}: {}", packet.sqPsProgram, psOut.error);
+        MCLA_LOG_WARN("Failed to translate PS at 0x{:08X}: {}", packet.sqPsProgram, psOut.error);
         return nullptr;
     }
 
     mcla::renderer::ShaderProgram vsProg;
     if (!ParseShaderProgram(vsContainer.data(), vsContainer.size(), vsProg)) {
-        REXLOG_WARN("Failed to parse VS IR at 0x{:08X}", packet.sqVsProgram);
+        MCLA_LOG_WARN("Failed to parse VS IR at 0x{:08X}", packet.sqVsProgram);
         return nullptr;
     }
 
@@ -449,7 +450,7 @@ bool TryConsumeCapturedGeometry(D3D12Backend* backend, const DrawPacket* packet)
     auto refuse = [&](const char* reason) {
         std::string key(reason);
         if (s_emittedReasons.insert(key).second) {
-            REXLOG_WARN("Native render: captured draw not consumable ({}) \u2014 falling back to fixture quad",
+            MCLA_LOG_WARN("Native render: captured draw not consumable ({}) \u2014 falling back to fixture quad",
                         reason);
         }
         return false;
@@ -502,14 +503,14 @@ bool TryConsumeCapturedGeometry(D3D12Backend* backend, const DrawPacket* packet)
 
 } // namespace
 
-REX_FUNC(Hooked_VdSwap) {
+PPC_FUNC_IMPL(Hooked_VdSwap) {
     uint32_t obj        = ctx.r3.u32;
     uint32_t swap_info  = ctx.r4.u32;
 
     static int swapCount = 0;
     swapCount++;
     if (swapCount <= 5) {
-        REXLOG_INFO("VdSwap[{}] obj=0x{:08X} swap_info=0x{:08X} mode={}",
+        MCLA_LOG_INFO("VdSwap[{}] obj=0x{:08X} swap_info=0x{:08X} mode={}",
                     swapCount, obj, swap_info,
                     mcla::renderer::RendererModeName(mcla::renderer::GetRendererMode()));
     }
@@ -568,7 +569,7 @@ REX_FUNC(Hooked_VdSwap) {
             static uint64_t s_nativeReportFrame = 0;
             if (static_cast<uint64_t>(s_nativeFrameCount) % 120 == 0) {
                 const auto& stats = d3dBackend->Stats();
-                REXLOG_INFO("Native render frame={} draws={} uploaded_bytes_total={} cache_hits={} cache_misses={}",
+                MCLA_LOG_INFO("Native render frame={} draws={} uploaded_bytes_total={} cache_hits={} cache_misses={}",
                             s_nativeFrameCount, stats.drawsIssued, stats.uploadsBytes,
                             stats.cacheHits, stats.cacheMisses);
             }
@@ -584,33 +585,33 @@ REX_FUNC(Hooked_VdSwap) {
 
 void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher) {
     if (!dispatcher) {
-        REXLOG_WARN("Native renderer: null dispatcher, skipping install");
+        MCLA_LOG_WARN("Native renderer: null dispatcher, skipping install");
         return;
     }
 
-    const std::string_view mode = REXCVAR_GET(renderer_mode);
+    const std::string_view mode = MCLA_CVAR_GET_STRING(renderer_mode);
     if (mode == "compat") {
-        REXLOG_WARN("Native renderer: COMPAT mode - no hooks installed "
+        MCLA_LOG_WARN("Native renderer: COMPAT mode - no hooks installed "
                     "(backup 2026-07-16 parity)");
         return;
     }
 
     if (!BisectGroupEnabled("native")) {
-        REXLOG_WARN("Native renderer: mcla_patch_groups excludes 'native' - "
+        MCLA_LOG_WARN("Native renderer: mcla_patch_groups excludes 'native' - "
                     "no hooks installed");
         return;
     }
 
     if (!VerifyTraceFileForTests()) {
-        REXLOG_ERROR("Native renderer: Phase 1 trace validation self-test FAILED");
+        MCLA_LOG_ERROR("Native renderer: Phase 1 trace validation self-test FAILED");
     } else {
-        REXLOG_INFO("Native renderer: Phase 1 trace validation self-test PASSED");
+        MCLA_LOG_INFO("Native renderer: Phase 1 trace validation self-test PASSED");
     }
 
     if (!VerifyGuestMemoryViewForTests()) {
-        REXLOG_ERROR("Native renderer: guest memory view self-test FAILED");
+        MCLA_LOG_ERROR("Native renderer: guest memory view self-test FAILED");
     } else {
-        REXLOG_INFO("Native renderer: guest memory view self-test PASSED");
+        MCLA_LOG_INFO("Native renderer: guest memory view self-test PASSED");
     }
 
     GetDrawAccumulator()->Initialize(nullptr);
@@ -623,12 +624,12 @@ void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher) {
             tracePath = app->GetCacheRoot() / "mcla_capture.mclatrace";
         }
         GetDrawAccumulator()->SetCaptureEnabled(true, tracePath);
-        REXLOG_INFO("Native renderer: Phase 1 DrawPacket capture ENABLED (trace={}, path={})",
+        MCLA_LOG_INFO("Native renderer: Phase 1 DrawPacket capture ENABLED (trace={}, path={})",
                     mcla::renderer::TraceModeName(mcla::renderer::GetTraceMode()),
                     tracePath.string());
     } else {
         GetDrawAccumulator()->SetCaptureEnabled(false);
-        REXLOG_INFO("Native renderer: Phase 1 DrawPacket capture disabled (mode={}, trace={})",
+        MCLA_LOG_INFO("Native renderer: Phase 1 DrawPacket capture disabled (mode={}, trace={})",
                     mcla::renderer::RendererModeName(mcla::renderer::GetRendererMode()),
                     mcla::renderer::TraceModeName(mcla::renderer::GetTraceMode()));
     }
@@ -637,35 +638,36 @@ void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher) {
     if (orig_GfxCmdBufSubmit) {
         dispatcher->SetFunction(0x8241BD08, Hooked_GfxCmdBufSubmit);
         if (!mcla::renderer::hooks::AddBeforeSubmitObserver(mcla::gpu::NotifyGpuSubmit)) {
-            REXLOG_ERROR("Native renderer: failed to register GPU submit observer");
+            MCLA_LOG_ERROR("Native renderer: failed to register GPU submit observer");
         }
 #ifndef NDEBUG
         assert(mcla::renderer::hooks::VerifySubmitObserverOrderingForTests());
 #endif
-        REXLOG_INFO("Native renderer: GfxCmdBufSubmit hooked (single owner, {} observer(s))",
+        MCLA_LOG_INFO("Native renderer: GfxCmdBufSubmit hooked (single owner, {} observer(s))",
                     mcla::renderer::hooks::BeforeSubmitObserverCount());
     } else {
-        REXLOG_WARN("Native renderer: GfxCmdBufSubmit not found");
+        MCLA_LOG_WARN("Native renderer: GfxCmdBufSubmit not found");
     }
 
     orig_Sub82420BA8 = dispatcher->GetFunction(0x82420BA8);
     if (orig_Sub82420BA8) {
         dispatcher->SetFunction(0x82420BA8, Hooked_Sub82420BA8);
-        REXLOG_INFO("Native renderer: sub_82420BA8 (draw builder) hooked - passthrough");
+        MCLA_LOG_INFO("Native renderer: sub_82420BA8 (draw builder) hooked - passthrough");
     } else {
-        REXLOG_WARN("Native renderer: sub_82420BA8 not found");
+        MCLA_LOG_WARN("Native renderer: sub_82420BA8 not found");
     }
 
     orig_Sub8241ABB8 = dispatcher->GetFunction(0x8241ABB8);
     if (orig_Sub8241ABB8) {
         dispatcher->SetFunction(0x8241ABB8, Hooked_Sub8241ABB8);
-        REXLOG_INFO("Native renderer: sub_8241ABB8 (state setup) hooked");
+        MCLA_LOG_INFO("Native renderer: sub_8241ABB8 (state setup) hooked");
     } else {
-        REXLOG_WARN("Native renderer: sub_8241ABB8 not found");
+        MCLA_LOG_WARN("Native renderer: sub_8241ABB8 not found");
     }
 
     dispatcher->SetFunction(0x827BD6E4, Hooked_VdSwap);
-    REXLOG_INFO("Native renderer: VdSwap hooked");
+    MCLA_LOG_INFO("Native renderer: VdSwap hooked");
 }
 
 } // namespace mcla::native
+

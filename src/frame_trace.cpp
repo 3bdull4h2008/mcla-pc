@@ -19,7 +19,7 @@ bool FrameTraceWriter::Open(const std::filesystem::path& tracePath, uint64_t bui
     m_tracePath = tracePath;
     m_file.open(m_tracePath, std::ios::binary | std::ios::trunc);
     if (!m_file.is_open()) {
-        REXLOG_ERROR("FrameTraceWriter: Failed to open output trace file: {}", tracePath.string());
+        MCLA_LOG_ERROR("FrameTraceWriter: Failed to open output trace file: {}", tracePath.string());
         return false;
     }
 
@@ -38,7 +38,7 @@ bool FrameTraceWriter::Open(const std::filesystem::path& tracePath, uint64_t bui
     m_file.write(reinterpret_cast<const char*>(&m_header), sizeof(m_header));
     m_file.flush();
 
-    REXLOG_INFO("FrameTraceWriter: Created trace file {}", tracePath.string());
+    MCLA_LOG_INFO("FrameTraceWriter: Created trace file {}", tracePath.string());
     return true;
 }
 
@@ -76,7 +76,7 @@ void FrameTraceWriter::Close() {
         manifest.close();
     }
 
-    REXLOG_INFO("FrameTraceWriter: Closed trace file {}, wrote {} packets",
+    MCLA_LOG_INFO("FrameTraceWriter: Closed trace file {}, wrote {} packets",
                 m_tracePath.string(), m_header.packetCount);
 }
 
@@ -91,30 +91,30 @@ bool FrameTraceReader::Open(const std::filesystem::path& tracePath) {
 
     std::ifstream file(tracePath, std::ios::binary);
     if (!file.is_open()) {
-        REXLOG_ERROR("FrameTraceReader: Failed to open trace file: {}", tracePath.string());
+        MCLA_LOG_ERROR("FrameTraceReader: Failed to open trace file: {}", tracePath.string());
         return false;
     }
 
     file.read(reinterpret_cast<char*>(&m_header), sizeof(TraceHeader));
     if (!file.good()) {
-        REXLOG_ERROR("FrameTraceReader: Truncated header in {}", tracePath.string());
+        MCLA_LOG_ERROR("FrameTraceReader: Truncated header in {}", tracePath.string());
         return false;
     }
 
     if (m_header.magic != kTraceMagic) {
-        REXLOG_ERROR("FrameTraceReader: Invalid magic 0x{:08X} (expected 0x{:08X})",
+        MCLA_LOG_ERROR("FrameTraceReader: Invalid magic 0x{:08X} (expected 0x{:08X})",
                      m_header.magic, kTraceMagic);
         return false;
     }
 
     if (m_header.version != kTraceVersion) {
-        REXLOG_ERROR("FrameTraceReader: Unsupported version {} (expected {})",
+        MCLA_LOG_ERROR("FrameTraceReader: Unsupported version {} (expected {})",
                      m_header.version, kTraceVersion);
         return false;
     }
 
     if (m_header.packetSize != sizeof(DrawPacket)) {
-        REXLOG_ERROR("FrameTraceReader: Packet size mismatch {} (expected {})",
+        MCLA_LOG_ERROR("FrameTraceReader: Packet size mismatch {} (expected {})",
                      m_header.packetSize, sizeof(DrawPacket));
         return false;
     }
@@ -123,13 +123,13 @@ bool FrameTraceReader::Open(const std::filesystem::path& tracePath) {
     if (m_header.packetCount > 0) {
         file.read(reinterpret_cast<char*>(m_packets.data()), m_header.packetCount * sizeof(DrawPacket));
         if (!file.good()) {
-            REXLOG_ERROR("FrameTraceReader: Truncated packets stream in {}", tracePath.string());
+            MCLA_LOG_ERROR("FrameTraceReader: Truncated packets stream in {}", tracePath.string());
             return false;
         }
     }
 
     m_isOpen = true;
-    REXLOG_INFO("FrameTraceReader: Successfully loaded trace {} ({} packets)",
+    MCLA_LOG_INFO("FrameTraceReader: Successfully loaded trace {} ({} packets)",
                 tracePath.string(), m_packets.size());
     return true;
 }
@@ -146,7 +146,7 @@ bool VerifyTraceFileForTests() {
     {
         FrameTraceWriter writer;
         if (!writer.Open(testPath, 0x123456789ABCDEF0ULL)) {
-            REXLOG_ERROR("VerifyTraceFileForTests: Writer open failed");
+            MCLA_LOG_ERROR("VerifyTraceFileForTests: Writer open failed");
             return false;
         }
 
@@ -174,22 +174,22 @@ bool VerifyTraceFileForTests() {
     {
         FrameTraceReader reader;
         if (!reader.Open(testPath)) {
-            REXLOG_ERROR("VerifyTraceFileForTests: Reader open failed");
+            MCLA_LOG_ERROR("VerifyTraceFileForTests: Reader open failed");
             return false;
         }
 
         if (reader.GetHeader().packetCount != 2) {
-            REXLOG_ERROR("VerifyTraceFileForTests: Expected 2 packets, got {}", reader.GetHeader().packetCount);
+            MCLA_LOG_ERROR("VerifyTraceFileForTests: Expected 2 packets, got {}", reader.GetHeader().packetCount);
             return false;
         }
 
         const auto& packets = reader.GetPackets();
         if (packets[0].indexCount != 36 || packets[1].indexCount != 120) {
-            REXLOG_ERROR("VerifyTraceFileForTests: Packet content mismatch");
+            MCLA_LOG_ERROR("VerifyTraceFileForTests: Packet content mismatch");
             return false;
         }
         if (packets[0].stateHash != 0xDEADBEEFCAFEBABEULL) {
-            REXLOG_ERROR("VerifyTraceFileForTests: State hash mismatch");
+            MCLA_LOG_ERROR("VerifyTraceFileForTests: State hash mismatch");
             return false;
         }
     }
@@ -198,7 +198,7 @@ bool VerifyTraceFileForTests() {
     std::filesystem::remove(testPath, ec);
     std::filesystem::remove(testPath.parent_path() / "trace_manifest.json", ec);
 
-    REXLOG_INFO("VerifyTraceFileForTests: Phase 1 trace validation PASSED");
+    MCLA_LOG_INFO("VerifyTraceFileForTests: Phase 1 trace validation PASSED");
     return true;
 }
 
