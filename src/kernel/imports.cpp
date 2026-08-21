@@ -391,16 +391,34 @@ uint32_t NtCreateFile
     mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fileHandle;
     if (!vfs.OpenFile(virtualPath, fileHandle))
     {
-        MCLA_LOG_WARN("NtCreateFile: FAILED '{}' (guest '{}') -> STATUS_OBJECT_NAME_NOT_FOUND",
-                      virtualPath, guestPath);
-        IoStatusBlock->Status.set(0xC0000034); // STATUS_OBJECT_NAME_NOT_FOUND
-        return 0xC0000034;
+        // Raw device opens (\Device\Harddisk0\partition0 etc) have no VFS
+        // backing. The boot validation loop treats a failed open as fatal, so
+        // hand back an empty pseudo-file instead.
+        constexpr auto startsWithDevice = [](const char* p) {
+            return std::strncmp(p, "\\Device\\", 8) == 0 || std::strncmp(p, "/Device/", 8) == 0;
+        };
+        const bool isRawDevice = startsWithDevice(guestPath);
+        if (!isRawDevice)
+        {
+            MCLA_LOG_WARN("NtCreateFile: FAILED '{}' (guest '{}') -> STATUS_OBJECT_NAME_NOT_FOUND",
+                          virtualPath, guestPath);
+            IoStatusBlock->Status.set(0xC0000034); // STATUS_OBJECT_NAME_NOT_FOUND
+            return 0xC0000034;
+        }
+        MCLA_LOG_INFO("NtCreateFile: raw device '{}' -> empty pseudo-file", guestPath);
+        fileHandle = mcla::vfs::RpfVirtualFileSystem::OpenFileHandle{};
+        fileHandle.virtual_path = virtualPath;
+        fileHandle.size = 0;
+        fileHandle.position = 0;
     }
 
-    // Create kernel file object
-    auto* fileObj = new FileObject(std::move(fileHandle));
-    uint32_t kernelHandle = GetKernelHandle(fileObj);
+    // Create kernel file object - MUST live in the guest physical heap so the
+    // identity handle (its guest VA) round-trips through Translate(). Plain
+    // `new` yields host pointers that MapVirtual cannot represent.
+    auto* fileObj2 = CreateKernelObject<FileObject>(std::move(fileHandle));
+    uint32_t kernelHandle = GetKernelHandle(fileObj2);
     FileHandle->set(kernelHandle);
+    MCLA_LOG_INFO("NtCreateFile: '{}' opened, handle={:08X}", virtualPath, kernelHandle);
 
     IoStatusBlock->Status.set(STATUS_SUCCESS);
     IoStatusBlock->Information.set(1); // FILE_OPENED
@@ -415,9 +433,9 @@ uint32_t NtClose(uint32_t handle)
 
     if (IsKernelObject(handle))
     {
-        // Check if it's a file object first
         KernelObject* obj = GetKernelObject(handle);
-        if (obj)
+        MCLA_LOG_INFO("NtClose: handle={:08X} valid={}", handle, obj ? obj->IsValid() : false);
+        if (obj && obj->IsValid())
         {
             // Try to close VFS file if it's a FileObject
             FileObject* fileObj = dynamic_cast<FileObject*>(obj);
@@ -425,25 +443,48 @@ uint32_t NtClose(uint32_t handle)
             {
                 mcla::vfs::RpfVirtualFileSystem::Instance().CloseFile(fileObj->fileHandle);
             }
+            DestroyKernelObject(obj);
         }
-        
-        DestroyKernelObject(handle);
+        // Handles we don't recognize as host wrappers (raw guest structs the
+        // game treats as handles) are simply ignored - closing them must not
+        // fault or tear down guest memory.
         return 0;
     }
     else
     {
-        assert(false && "Unrecognized kernel object.");
-        return 0xFFFFFFFF;
+        return 0;
     }
 }
 
 uint32_t NtQueryInformationFile(uint32_t handle, uint32_t ioStatus, uint32_t buffer, uint32_t length, uint32_t infoClass)
 {
-    (void)handle;
-    (void)ioStatus;
-    (void)buffer;
-    (void)length;
-    (void)infoClass;
+    // X_FILE_STANDARD_INFORMATION (5): AllocationSize(8) EndOfFile(8)
+    // NumberOfLinks(4) DeletePending(1) Directory(1). The packfile loader
+    // queries this right after opening an archive; leaving the buffer empty
+    // made the game read garbage sizes and fatal on every .rpf.
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+    KernelObject* obj = nullptr;
+    if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle))
+    {
+        obj = GetKernelObject(handle);
+    }
+    FileObject* fileObj = (obj && obj->IsValid()) ? dynamic_cast<FileObject*>(obj) : nullptr;
+
+    if (infoClass == 5 && buffer != 0 && length >= 24 && fileObj)
+    {
+        const uint64_t fileSize = fileObj->fileHandle.size;
+        mem.WriteU64BE(buffer + 0, fileSize);          // AllocationSize
+        mem.WriteU64BE(buffer + 8, fileSize);          // EndOfFile
+        mem.WriteU32BE(buffer + 16, 1);                // NumberOfLinks
+        mem.WriteU16BE(buffer + 20, 0);                // DeletePending=0, Directory=0
+        if (ioStatus != 0) mem.WriteU32BE(ioStatus + 0, STATUS_SUCCESS), mem.WriteU32BE(ioStatus + 4, 24);
+        return STATUS_SUCCESS;
+    }
+
+    MCLA_LOG_WARN("NtQueryInformationFile: class={} len={} handleValid={} -> stub",
+                  infoClass, length, fileObj != nullptr);
+    if (ioStatus != 0) mem.WriteU32BE(ioStatus + 0, STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
 
@@ -743,13 +784,51 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32
         return 0xC0000005;
     }
 
-    memset(hostPtr, 0, length);
+    // Resolve the kernel file object and serve real bytes from the VFS.
+    FileObject* fileObj = nullptr;
+    if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle))
+    {
+        KernelObject* obj = GetKernelObject(handle);
+        if (obj && obj->IsValid()) fileObj = dynamic_cast<FileObject*>(obj);
+    }
+
+    uint64_t bytesRead = 0;
+    bool ok = false;
+    if (fileObj)
+    {
+        auto& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+        uint64_t offset = 0;
+        if (byteOffset)
+        {
+            offset = byteOffset->get();
+            vfs.SeekFile(fileObj->fileHandle, static_cast<int64_t>(offset), 0 /* FILE_BEGIN */);
+        }
+        else
+        {
+            offset = fileObj->fileHandle.position;
+        }
+        ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
+        MCLA_LOG_INFO("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes, head {:02X} {:02X} {:02X} {:02X}",
+                      handle, offset, length, bytesRead,
+                      bytesRead >= 1 ? reinterpret_cast<uint8_t*>(hostPtr)[0] : 0,
+                      bytesRead >= 2 ? reinterpret_cast<uint8_t*>(hostPtr)[1] : 0,
+                      bytesRead >= 3 ? reinterpret_cast<uint8_t*>(hostPtr)[2] : 0,
+                      bytesRead >= 4 ? reinterpret_cast<uint8_t*>(hostPtr)[3] : 0);
+    }
+    else
+    {
+        // Non-VFS handles (device opens etc): zero-fill keeps legacy behavior.
+        std::memset(hostPtr, 0, length);
+        bytesRead = length;
+        ok = true;
+    }
+
     if (ioStatus)
     {
-        ioStatus->Status.set(STATUS_SUCCESS);
-        ioStatus->Information.set(length);
+        ioStatus->Status.set(ok ? STATUS_SUCCESS : 0xC000000D);
+        ioStatus->Information.set(static_cast<uint64_t>(bytesRead));
     }
-    return STATUS_SUCCESS;
+    return ok ? STATUS_SUCCESS : 0xC000000D;
 }
 
 uint32_t NtReadFileScatter()
@@ -1517,11 +1596,37 @@ void XamUserReadProfileSettings
     }
 }
 
-uint32_t NetDll_WSAStartup(uint16_t version, void* wsaData)
+// NOTE: NetDll_* exports take a leading selector arg (generated wrappers pass
+// r3=1 before the real WinSock args — see sub_8244A258 in generated code).
+uint32_t NetDll_WSAStartup(uint32_t dllSelector, uint16_t versionRequested, void* wsaData)
 {
-    (void)version;
-    (void)wsaData;
-    return 0; // Success
+    // WinSock 1.1-style WSADATA on 360 (Xenia xboxkrnl_net.cc semantics):
+    // wVersion@0, wHighVersion@2, szDescription@4, szSystemStatus@261,
+    // iMaxSockets@390, iMaxUdpDg@392, lpVendorInfo@396.
+    // Evidence (generated sub_821E44A0): the game re-reads wVersion and only
+    // accepts the exact word the caller passed (0x0002 here) — store it
+    // verbatim, big-endian, no MAKEWORD reshuffling.
+    const uint16_t reportedVersion = static_cast<uint16_t>(versionRequested);
+    constexpr uint16_t kHighVersion = 0x0202;
+    (void)dllSelector;
+
+    if (wsaData)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        const uint32_t base = reinterpret_cast<uint32_t>(wsaData);
+        mem.WriteU16BE(base + 0, reportedVersion);   // wVersion = echoed request
+        mem.WriteU16BE(base + 2, kHighVersion);      // wHighVersion
+
+        const char description[] = "MCLA native recomp winsock 2.2";
+        mem.WriteBytes(base + 4, description, sizeof(description));
+        const char systemStatus[] = "Running";
+        mem.WriteBytes(base + 261, systemStatus, sizeof(systemStatus));
+
+        mem.WriteU16BE(base + 390, 1024);            // iMaxSockets
+        mem.WriteU16BE(base + 392, 64);              // iMaxUdpDg
+        mem.WriteU32BE(base + 396, 0);               // lpVendorInfo = NULL
+    }
+    return 0; // SUCCESS
 }
 
 uint32_t NetDll_WSACleanup()
@@ -1936,11 +2041,36 @@ void StfsCreateDevice()
 // We provide a strong definition that terminates the game instead of infinite-looping.
 void sub_821BD618(PPCContext& ctx, uint8_t* base)
 {
-    (void)ctx; (void)base;
+    (void)base;
     // Original dispatcher: reads handler from slot 0x8285FEA0, calls it if non-zero,
     // then infinite loops. The callers expect this to NEVER return.
-    // We terminate the process cleanly instead of infinite-looping.
+    // We dump state first so we know who routed us here, then terminate.
     MCLA_LOG_ERROR("Fatal error dispatcher invoked - terminating game");
+    MCLA_LOG_ERROR("  fatal-dispatch regs: lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X}",
+                   static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t slotValue = 0;
+    if (mem.ReadU32BE(0x8285FEA0, &slotValue))
+        MCLA_LOG_ERROR("  slot 0x8285FEA0 = 0x{:08X}", slotValue);
+
+    // EABI frames: back chain at [sp], saved LR at [sp+4].
+    uint64_t lr = ctx.lr;
+    uint32_t sp = ctx.r1.u32;
+    for (int depth = 0; depth < 16; ++depth)
+    {
+        MCLA_LOG_ERROR("  fatal chain[{}]: lr=0x{:08X} sp=0x{:08X}", depth,
+                       static_cast<uint32_t>(lr), sp);
+        uint32_t nextSp = 0;
+        uint32_t nextLr = 0;
+        if (sp == 0 || !mem.ReadU32BE(sp, &nextSp) || !mem.ReadU32BE(sp + 4, &nextLr))
+            break;
+        if (nextSp <= sp || (nextSp & 3) != 0)
+            break;
+        lr = nextLr;
+        sp = nextSp;
+    }
+    spdlog::default_logger()->flush();
     ExitProcess(0x80000003); // STATUS_BREAKPOINT
 }
 
@@ -2666,7 +2796,7 @@ GUEST_FUNCTION_STUB(__imp__XamShowAchievementsUI);
 GUEST_FUNCTION_STUB(__imp__XamShowPlayerReviewUI);
 GUEST_FUNCTION_STUB(__imp__XamShowMarketplaceUI);
 GUEST_FUNCTION_STUB(__imp__KeSetDisableBoostThread);
-GUEST_FUNCTION_STUB(__imp__MmAllocatePhysicalMemoryEx);
+GUEST_FUNCTION_HOOK(__imp__MmAllocatePhysicalMemoryEx, MmAllocatePhysicalMemoryEx);
 GUEST_FUNCTION_STUB(__imp__XamLoaderSetLaunchData);
 GUEST_FUNCTION_STUB(__imp__XamLoaderGetLaunchData);
 GUEST_FUNCTION_STUB(__imp__XamLoaderGetLaunchDataSize);

@@ -21,6 +21,9 @@
 Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 
 #include <windows.h>
+#include <dbghelp.h>
+
+#pragma comment(lib, "dbghelp.lib")
 
 #include <atomic>
 #include <chrono>
@@ -547,6 +550,31 @@ void BootWorker(uint32_t entryGuest)
                            "r7={:08X} r8={:08X} r9={:08X} r10={:08X} r13={:08X}",
                            fc->r1.u32, (uint32_t)fc->lr, fc->r3.u32, fc->r4.u32, fc->r5.u32,
                            fc->r6.u32, fc->r7.u32, fc->r8.u32, fc->r9.u32, fc->r10.u32, fc->r13.u32);
+        }
+
+        // resolve host symbols from the PDB so crashes name themselves
+        if (code == 0xC0000005 || code == 0x80000003 || code == 0xE06D7363)
+        {
+            static std::once_flag symOnce;
+            std::call_once(symOnce, [] {
+                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+            });
+            void* frames[24] = {};
+            const USHORT nFrames = CaptureStackBackTrace(0, 24, frames, nullptr);
+            char symBuf[sizeof(SYMBOL_INFO) + 160] = {};
+            auto* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 159;
+            MCLA_LOG_ERROR("  host stack (deepest first):");
+            for (USHORT i = 0; i < nFrames && i < 14; ++i) {
+                DWORD64 disp = 0;
+                if (SymFromAddr(GetCurrentProcess(), reinterpret_cast<DWORD64>(frames[i]), &disp, sym)) {
+                    MCLA_LOG_ERROR("   [{:2}] {} +0x{:X}", i, sym->Name, disp);
+                } else {
+                    MCLA_LOG_ERROR("   [{:2}] ??? 0x{:p}", i, frames[i]);
+                }
+            }
         }
         spdlog::default_logger()->flush();
         return EXCEPTION_CONTINUE_SEARCH;

@@ -9,6 +9,11 @@
 
 struct KernelObject
 {
+    // Identity check: handles are guest VAs, so any guest address can be
+    // handed to GetKernelObject. The magic lets us tell real host wrappers
+    // from random guest memory before touching the vtable.
+    const uint32_t magic = OBJECT_SIGNATURE;
+
     virtual ~KernelObject() 
     {
     }
@@ -18,6 +23,8 @@ struct KernelObject
         assert(false && "Wait not implemented for this kernel object.");
         return STATUS_TIMEOUT;
     }
+
+    bool IsValid() const { return magic == OBJECT_SIGNATURE; }
 };
 
 template<typename T, typename... Args>

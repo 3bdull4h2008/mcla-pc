@@ -86,3 +86,5 @@ ninja_err.txt
 /check_lib_vs2022.bat
 /run_silent.bat
 /run_test.bat
+
+/BOOT_HANDOFF.md
