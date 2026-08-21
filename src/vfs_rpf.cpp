@@ -427,6 +427,30 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
 
     // synthesized .rpf opens: serve an RPF3 image built over the extracted dir
     if (norm.size() > 4 && norm.compare(norm.size() - 4, 4, ".rpf") == 0) {
+        // PREFER the real packfile from the dump root (game_data\<name>.rpf) -
+        // genuine TOC/data beats any reconstruction, exactly like Xenia's
+        // HostPathDevice serving the mounted volume.
+        std::error_code size_ec;
+        const auto real_path = std::filesystem::path(m_extracted_root).parent_path() / norm;
+        const uint64_t real_size = std::filesystem::file_size(real_path, size_ec);
+        if (!size_ec) {
+            HANDLE h = CreateFileA(real_path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                const uint64_t handle_id = m_next_handle++;
+                out_file.virtual_path = norm;
+                out_file.physical_path = real_path.generic_string();
+                out_file.size = real_size;
+                out_file.position = 0;
+                out_file.handle = h;
+                out_file.virtual_rpf.reset();
+                m_open_files[handle_id] = std::make_unique<OpenFileHandle>(out_file);
+                MCLA_LOG_INFO("VFS: opened REAL packfile '{}' ({} MB)", norm,
+                              static_cast<int>(real_size >> 20));
+                return true;
+            }
+        }
+
         const std::string dir_key = norm.substr(0, norm.size() - 4);
         auto idx_it = m_file_index.find(dir_key);
         MCLA_LOG_INFO("VFS: rpf open '{}' dir_key='{}' indexed={} is_dir={}",
@@ -556,6 +580,15 @@ bool RpfVirtualFileSystem::ReadFile(OpenFileHandle& file, void* buffer, uint64_t
 
         file.position += done;
         bytes_read = done;
+        return true;
+    }
+
+    if (!file.handle && !file.virtual_rpf) {
+        // Pseudo-file (raw device like \Device\Harddisk0\partition0): behave
+        // like an empty volume - reads succeed and return zeroed sectors.
+        std::memset(buffer, 0, static_cast<size_t>(size));
+        file.position += size;
+        bytes_read = size;
         return true;
     }
 

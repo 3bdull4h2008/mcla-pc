@@ -9,22 +9,29 @@
 
 struct KernelObject
 {
-    // Identity check: handles are guest VAs, so any guest address can be
-    // handed to GetKernelObject. The magic lets us tell real host wrappers
-    // from random guest memory before touching the vtable.
-    const uint32_t magic = OBJECT_SIGNATURE;
+    // Guest-visible dispatcher header, MUST be first: handles are guest VAs,
+    // and guest-side thunks validate them by checking
+    // WaitListHead.Flink == 'XBOX' before touching the object.
+    XDISPATCHER_HEADER header{};
 
-    virtual ~KernelObject() 
+    KernelObject()
     {
+        header.WaitListHead.Flink = OBJECT_SIGNATURE;
+        header.WaitListHead.Blink = 0;
     }
 
-    virtual uint32_t Wait(uint32_t timeout) 
+    virtual ~KernelObject()
+    {
+        header.WaitListHead.Flink = 0; // invalidate on destruction
+    }
+
+    virtual uint32_t Wait(uint32_t timeout)
     {
         assert(false && "Wait not implemented for this kernel object.");
         return STATUS_TIMEOUT;
     }
 
-    bool IsValid() const { return magic == OBJECT_SIGNATURE; }
+    bool IsValid() const { return header.WaitListHead.Flink == OBJECT_SIGNATURE; }
 };
 
 template<typename T, typename... Args>

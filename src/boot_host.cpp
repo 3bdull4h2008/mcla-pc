@@ -700,73 +700,11 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
 
     SeedPreBootSlots();
 
-    // Patch fatal-error dispatcher (sub_821BD618) to return instead of infinite loop.
-    // The dispatcher's host code has a `goto loc_821BD640` infinite loop.
-    // Find the `jmp` instruction and replace with `ret` (0xC3).
-    {
-        PPCFunc* fn = PPC_LOOKUP_FUNC(g_base, 0x821BD618);
-        if (fn)
-        {
-            uint8_t* code = reinterpret_cast<uint8_t*>(fn);
-            // Scan first 256 bytes for the short jmp (0xEB) or near jmp (0xE9) 
-            // that targets the infinite loop location.
-            for (size_t off = 0; off < 256; ++off)
-            {
-                if (code[off] == 0xEB || code[off] == 0xE9)
-                {
-                    // Check if this jumps to the loop location (within function body)
-                    int32_t rel = code[off] == 0xEB ? static_cast<int8_t>(code[off + 1])
-                                                    : *reinterpret_cast<int32_t*>(code + off + 1);
-                    intptr_t target = reinterpret_cast<intptr_t>(code + off + (code[off] == 0xEB ? 2 : 5)) + rel;
-                    // If target is within the function body (loop), patch with ret
-                    if (target > reinterpret_cast<intptr_t>(code) && 
-                        target < reinterpret_cast<intptr_t>(code) + 512)
-                    {
-                        code[off] = 0xC3; // ret
-                        if (code[off] == 0xEB) code[off + 1] = 0x90; // nop padding for short jmp
-                        char lbuf[192];
-                        std::snprintf(lbuf, sizeof(lbuf), "[boot] patched sub_821BD618 at offset %zu: jmp->ret", off);
-                        BootReportInfo(lbuf);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Patch sub_821305B8 to NOP the call to fatal dispatcher (sub_821BD618).
-    // The CRT init function unconditionally calls the fatal dispatcher,
-    // which spins forever since we left the handler slot zero.
-    // Find the 'bl 0x821BD618' in sub_821305B8 and NOP it (replace with 'b .+4' / 0x48000000).
-    {
-        PPCFunc* fn = PPC_LOOKUP_FUNC(g_base, 0x821305B8);
-        if (fn)
-        {
-            // The call to dispatcher is typically a 'bl' (branch with link) at a known offset.
-            // Pattern: 0x48xxxxxx (bl) at a fixed offset from function start.
-            // We'll scan the first 64 bytes for the 'bl' to 0x821BD618.
-            uint8_t* code = reinterpret_cast<uint8_t*>(fn);
-            for (size_t off = 0; off < 64; off += 4)
-            {
-                uint32_t instr = *reinterpret_cast<uint32_t*>(code + off);
-                // Check if this is a 'bl' to ~0x821BD618 relative to g_base
-                if ((instr & 0xFC000000) == 0x48000000) // bl opcode
-                {
-                    // Compute target: PC-relative, target = (pc & ~3) + (instr & 0x03FFFFFC) << 2
-                    uint32_t target = (reinterpret_cast<uintptr_t>(code + off) & ~3u) + (static_cast<int32_t>(instr << 2) >> 2);
-                    if (target == reinterpret_cast<uintptr_t>(g_base) + 0x821BD618)
-                    {
-                        // NOP it: replace with 'b .+4' (branch to next instruction)
-                        *reinterpret_cast<uint32_t*>(code + off) = 0x48000000;
-                        char lbuf[192];
-                        std::snprintf(lbuf, sizeof(lbuf), "[boot] patched sub_821305B8 at offset %zu: NOP'd bl to fatal dispatcher", off);
-                        BootReportInfo(lbuf);
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // NOTE: the old self-patching blocks here (jmp->ret on the fatal dispatcher
+    // and NOP'ing a "bl" in sub_821305B8) scanned HOST x86 code as if it were
+    // PPC and wrote into .text. After any relayout they false-positive and
+    // corrupt live functions - the kernel-side override of sub_821BD618 in
+    // imports.cpp handles the dispatcher correctly now. Do not reintroduce.
 
     entryGuest = (uint32_t)image.entry_point;
     return true;
