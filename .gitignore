@@ -49,3 +49,9 @@ Thumbs.db
 ninja_out.txt
 ninja_err.txt
 .second-brain.lock
+
+# re / planning docs stay local only
+/MCLA_REBUILD_PLAN.md
+/PHASE2_IMPLEMENTATION_PLAN.md
+/MCLA_RPF3_Technical_Reference.txt
+/flowchart.drawio
