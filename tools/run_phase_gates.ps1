@@ -1,4 +1,4 @@
-# G0 Phase-Gate Runner (B2S discipline adopted 2026-08-22)
+﻿# G0 Phase-Gate Runner (B2S discipline adopted 2026-08-22)
 # One command: build -> validators -> boot soak -> log assertions -> JSON report.
 # Exit 0 only when every ENFORCED gate passes. Tracked gates are recorded but do
 # not fail the run until their phase activates them (see MCLA_REBUILD_PLAN.md).
@@ -142,6 +142,7 @@ if (-not $SkipBoot) {
         $createdMatch = @($slice | Select-String -Pattern 'DEVICE: created @ .*match\)').Count
         $selfTestOk = @($slice | Select-String -Pattern 'redirected \d+/101 default RS slots.*readback=ok.*thunkResolved=true').Count
         $rsThunkHits = @($slice | Select-String -Pattern 'RS-default-thunk hit').Count
+        $rsRealHits = @($slice | Select-String -Pattern 'RS-real-thunk hit').Count
 
         Add-Gate -Id 'G-BOOT-SOAK' -Status 'enforced' -Pass ($stillAlive -and $fatalHits -eq 0) -Metrics @{
             soakSeconds = $SoakSeconds; stillAlive = [bool]$stillAlive; exitCode = $exitCode; fatalPatterns = $fatalHits
@@ -155,8 +156,8 @@ if (-not $SkipBoot) {
             }
 
         # Tracked: real-handler passthrough proof (activates when a real slot is thumbed)
-        Add-Gate -Id 'G-P4-RS-THUNK-HITS' -Status 'tracked' -Pass ($rsThunkHits -ge 1) `
-            -Metrics @{ thunkHits = $rsThunkHits }
+        Add-Gate -Id 'G-P4-RS-THUNK-HITS' -Status 'tracked' -Pass ($rsRealHits -ge 1) `
+            -Metrics @{ realThunkHits = $rsRealHits; defaultThunkHits = $rsThunkHits }
 
         # Tracked: PM4-free frames (activates at P6'; currently the legacy ring is alive by design)
         $putVals = @($slice | Select-String -Pattern 'RING: ctx\+30=([0-9A-F]{8})' |
@@ -208,3 +209,4 @@ Write-Host ''
 Write-Host ("OVERALL: {0}  (report: {1})" -f $(if ($report.overallPass) { 'PASS' } else { 'FAIL' }), $outFile) `
     -ForegroundColor $(if ($report.overallPass) { 'Green' } else { 'Red' })
 exit $(if ($report.overallPass) { 0 } else { 1 })
+

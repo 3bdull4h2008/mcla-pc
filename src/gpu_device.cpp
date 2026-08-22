@@ -1,10 +1,16 @@
-#include "gpu_device.h"
+﻿#include "gpu_device.h"
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "logging.h"
 #include "kernel/memory.h"
 
 #include <atomic>
+
+static std::atomic<uint32_t> s_rsRealThunkHits{0};
+static std::atomic<uint32_t> s_rsLogOnlyThunkHits{0};
+void HostRsRealPassthrough(PPCContext& __restrict ctx, uint8_t* base);
+void HostRsRealPassthroughLogOnly(PPCContext& __restrict ctx, uint8_t* base);
+
 
 namespace mcla::gpu {
 
@@ -138,6 +144,65 @@ void RedirectDefaultRenderStateSlots(uint32_t dev)
                   tableOk ? "ok" : "FAIL", readBack, resolved != nullptr);
 }
 
+// P4' step 2: passthrough-thunk ONE real handler slot so a runtime call proves
+// dispatch through our synthetic VA end-to-end. Slot +0x68 (table index 10)
+// held 0x82414078 in both dumped devices. The original stays reachable via its
+// own guest address (FindFunction), so redirection loses nothing.
+constexpr uint32_t kRealSlotOffset = 0x68;
+constexpr uint32_t kRealSlotOriginal = 0x82414078;
+
+void RedirectFirstRealRenderStateSlot(uint32_t dev)
+{
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+    const uint32_t slotAddr = dev + kRealSlotOffset;
+    uint32_t cur = 0;
+    if (!mem.ReadU32BE(slotAddr, &cur))
+    {
+        MCLA_LOG_WARN("DEVICE: real-slot redirect read failed @ {:08X}", slotAddr);
+        return;
+    }
+    if (cur != kRealSlotOriginal)
+    {
+        MCLA_LOG_WARN("DEVICE: real-slot @ {:08X} holds {:08X} (expected {:08X}) - skipping",
+                      slotAddr, cur, kRealSlotOriginal);
+        return;
+    }
+
+    // Synthetic VA right after the default-slots thunk.
+    const auto fnOffset = static_cast<uint32_t>(PPC_CODE_BASE + PPC_CODE_SIZE) + 4u;
+    mcla::kernel::g_memory.InsertFunction(fnOffset, &HostRsRealPassthrough);
+    (void)mem.WriteU32BE(slotAddr, fnOffset);
+
+    uint32_t readBack = 0;
+    const bool ok = mem.ReadU32BE(slotAddr, &readBack) && readBack == fnOffset &&
+                    mcla::kernel::g_memory.FindFunction(fnOffset) != nullptr;
+    MCLA_LOG_INFO("DEVICE: real RS slot +{:X} -> {:08X} | selftest={}",
+                  kRealSlotOffset, fnOffset, ok ? "ok" : "FAIL");
+
+    // Probe widening: EVERY other real slot gets a log-only thunk (no
+    // passthrough - originals stay reachable by address if needed later).
+    // Purpose: discover which states are actually hot during boot/menu.
+    constexpr uint32_t kSlots = 0x65;
+    uint32_t probed = 0;
+    auto nextFn = fnOffset;
+    for (uint32_t slot = 0; slot < kSlots; ++slot)
+    {
+        const uint32_t sAddr = dev + 0x40u + slot * 4u;
+        uint32_t v = 0;
+        if (!mem.ReadU32BE(sAddr, &v)) break;
+        if (v == static_cast<uint32_t>(PPC_CODE_BASE)) continue;   // default stub
+        if (sAddr == slotAddr) continue;                           // faithful one above
+        if (v < static_cast<uint32_t>(PPC_CODE_BASE) ||
+            v >= static_cast<uint32_t>(PPC_CODE_BASE + PPC_CODE_SIZE)) continue; // not guest code
+        ++nextFn;
+        mcla::kernel::g_memory.InsertFunction(nextFn, &HostRsRealPassthroughLogOnly);
+        (void)mem.WriteU32BE(sAddr, nextFn);
+        ++probed;
+    }
+    MCLA_LOG_INFO("DEVICE: probe widened - {} additional real slots log-only", probed);
+}
+
 } // namespace
 } // namespace mcla::gpu
 
@@ -171,6 +236,7 @@ PPC_FUNC(sub_82413588)
         {
             mcla::gpu::OnDeviceCreated(dev);
             mcla::gpu::RedirectDefaultRenderStateSlots(dev);
+            mcla::gpu::RedirectFirstRealRenderStateSlot(dev);
         }
         else
         {
@@ -182,3 +248,27 @@ PPC_FUNC(sub_82413588)
         }
     }
 }
+
+
+
+
+// P4' step 2 runtime thunk: proves guest -> synthetic VA -> host dispatch.
+void HostRsRealPassthrough(PPCContext& __restrict ctx, uint8_t* base)
+{
+    const uint32_t n = s_rsRealThunkHits.fetch_add(1) + 1;
+    if (n <= 12 || (n % 500) == 0)
+        MCLA_LOG_INFO("DEVICE: RS-real-thunk hit #{} r3={:08X} r4={:08X}", n, ctx.r3.u32, ctx.r4.u32);
+    if (PPCFunc* orig = mcla::kernel::g_memory.FindFunction(mcla::gpu::kRealSlotOriginal))
+        orig(ctx, base);
+}
+
+
+// Log-only probe thunk: records the hit, does NOT call the original - used to
+// discover hot render-state slots; originals remain at their guest addresses.
+void HostRsRealPassthroughLogOnly(PPCContext& __restrict ctx, uint8_t* base)
+{
+    const uint32_t n = s_rsLogOnlyThunkHits.fetch_add(1) + 1;
+    if (n <= 20 || (n % 1000) == 0)
+        MCLA_LOG_INFO("DEVICE: RS-logonly-thunk hit #{} r3={:08X} r4={:08X}", n, ctx.r3.u32, ctx.r4.u32);
+}
+
