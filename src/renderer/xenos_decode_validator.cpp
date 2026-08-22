@@ -267,8 +267,12 @@ static bool ScanDirectory(const fs::path& dir, Stats& total) {
     size_t count = 0;
     for (const auto& entry : fs::recursive_directory_iterator(dir)) {
         if (!entry.is_regular_file()) continue;
+        // Accept .fxc containers AND raw microcode dumps (*.ucode.*) - the
+        // Xenia-dump corpus is raw microcode and translates through the same
+        // decoder (dual path below mirrors main()'s single-file logic).
         auto ext = entry.path().extension().string();
-        if (ext != ".fxc") continue;
+        const bool isUcode = entry.path().string().find(".ucode.") != std::string::npos;
+        if (ext != ".fxc" && !isUcode) continue;
         FILE* f = std::fopen(entry.path().string().c_str(), "rb");
         if (!f) continue;
         std::fseek(f, 0, SEEK_END);
@@ -281,7 +285,16 @@ static bool ScanDirectory(const fs::path& dir, Stats& total) {
         }
         std::fclose(f);
         Stats stats;
-        bool clean = ParseFxc(data.data(), data.size(), stats, false);
+        bool clean;
+        bool foundContainer = false;
+        for (size_t i = 0; i + sizeof(ContainerHeader) <= data.size(); i += 4) {
+            if ((ReadBE32(data.data() + i) & 0xFFFFFF00) == 0x102A1100) { foundContainer = true; break; }
+        }
+        if (foundContainer) {
+            clean = ParseFxc(data.data(), data.size(), stats, false);
+        } else {
+            clean = DecodeMicrocode(data.data(), data.size(), stats, false);
+        }
         total.containers += stats.containers;
         total.shaders += stats.shaders;
         total.cleanShaders += stats.cleanShaders;

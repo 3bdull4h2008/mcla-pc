@@ -55,10 +55,10 @@ $validators = @(
 )
 $validatorResults = @{}
 $validatorOutputs = @{}
-# Corpus-dependent validators: they scan for Rockstar .fxc containers, which do
-# not exist in the Xenia-dump corpus yet -> recorded as tracked until real
-# captures land (files=0 is their CORRECT answer for foreign input).
-$corpusValidators = @('shader_pipeline_validator', 'phase3_validator', 'xenos_decode_validator')
+# xenos_decode scans the RAW-UCODE corpus (translatable via XenosRecomp pipeline).
+$validatorArgs = @{ 'xenos_decode_validator' = '.research\findings\xenia\shader_dumps' }
+# These two still require Rockstar .fxc containers (input format TBD - tracked).
+$corpusValidators = @('shader_pipeline_validator', 'phase3_validator')
 Invoke-Step 'G-VALIDATORS' {
     foreach ($v in $validators) {
         $exe = Join-Path $build "$v.exe"
@@ -68,23 +68,47 @@ Invoke-Step 'G-VALIDATORS' {
         $psi.WorkingDirectory = $repo
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
+        if ($validatorArgs[$v]) { $psi.Arguments = $validatorArgs[$v] }
         $p = [System.Diagnostics.Process]::Start($psi)
         $validatorOutputs[$v] = $p.StandardOutput.ReadToEnd()
         if (-not $p.WaitForExit(180000)) { $p.Kill(); $validatorResults[$v] = -998; continue }
         $p.WaitForExit()
         $validatorResults[$v] = $p.ExitCode
     }
+    # xenos_decode exit 1 = decoder found unknown/opcodes+oob on real shaders -
+    # a TRACKED decoder-quality finding, not a harness failure.
     $failed = @($validatorResults.GetEnumerator() | Where-Object {
-        $_.Value -ne 0 -and -not ($corpusValidators -contains $_.Key -and $_.Value -eq 2)
+        $_.Value -ne 0 -and -not (
+            ($corpusValidators -contains $_.Key -and $_.Value -in 1,2) -or
+            ($_.Key -eq 'xenos_decode_validator' -and $_.Value -eq 1)
+        )
     } | ForEach-Object { $_.Key })
     Add-Gate -Id 'G-VALIDATORS' -Status 'enforced' -Pass ($failed.Count -eq 0) `
         -Metrics @{ exits = $validatorResults; failed = $failed }
 
-    # Corpus gates: tracked until real MCLA .fxc captures exist.
+    # Corpus gates: xenos_decode ENFORCED on coverage over the ucode corpus;
+    # fxc-container validators stay tracked until their input format lands.
+    $xdFiles = -1
+    $xdMetrics = @{}
+    $m = [regex]::Match($validatorOutputs['xenos_decode_validator'], '(?m)^files=(\d+)')
+    if ($m.Success) { $xdFiles = [int]$m.Groups[1].Value }
+    $m2 = [regex]::Match($validatorOutputs['xenos_decode_validator'], 'unknown_instrs=(\d+) oob=(\d+)')
+    if ($m2.Success) {
+        $xdMetrics.unknownInstrs = [int]$m2.Groups[1].Value
+        $xdMetrics.oobExecs = [int]$m2.Groups[2].Value
+    }
+    $xdMetrics.filesScanned = $xdFiles
+    Add-Gate -Id 'G-CORPUS-XENOS-DECODE' -Status 'enforced' -Pass ($xdFiles -ge 1000) `
+        -Metrics $xdMetrics
+    # Decoder cleanliness on the corpus: tracked until unknown-opcode/oob gaps
+    # in DecodeMicrocode are fixed (real findings, see metrics above).
+    Add-Gate -Id 'G-XENOS-DECODE-CLEAN' -Status 'tracked' `
+        -Pass ($validatorResults['xenos_decode_validator'] -eq 0) `
+        -Metrics @{ exitCode = $validatorResults['xenos_decode_validator'] }
     foreach ($v in $corpusValidators) {
         Add-Gate -Id "G-CORPUS-$v" -Status 'tracked' `
             -Pass ($validatorResults[$v] -eq 0) `
-            -Metrics @{ exitCode = $validatorResults[$v]; note = 'needs real .fxc corpus' }
+            -Metrics @{ exitCode = $validatorResults[$v]; note = 'needs .fxc container input format' }
     }
 
     $m = [regex]::Match($validatorOutputs['phase0_validator'], '(\d+) passed, (\d+) failed')
