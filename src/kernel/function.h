@@ -2,6 +2,8 @@
 
 #include <cpu/ppc_context.h>
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include "xbox.h"
 #include "memory.h"
 
@@ -276,6 +278,16 @@ PPC_FUNC(HostToGuestFunction)
 
     auto args = function_args(Func);
     _translate_args_to_host<Func>(ctx, base, args);
+
+    // TEMPORARY boot probe: name every import the guest touches + caller LR.
+    {
+        static std::atomic<uint32_t> s_probeCount{0};
+        if (s_probeCount.fetch_add(1) < 4000)
+        {
+            fprintf(stderr, "[import-trace] lr=%08X fn=%s\n",
+                    static_cast<uint32_t>(ctx.lr), __PRETTY_FUNCTION__);
+        }
+    }
 
     if constexpr (std::is_same_v<ret_t, void>)
     {

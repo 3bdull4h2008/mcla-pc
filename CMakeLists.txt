@@ -49,13 +49,21 @@ set(MSVC_INCLUDE_PATH "${MSVC_TOOLSET_PATH}/include")
 set(MSVC_LIB_PATH "${MSVC_TOOLSET_PATH}/lib/x64")
 
 # Windows SDK library paths
-set(WINDOWS_SDK_UM_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64")
-set(WINDOWS_SDK_UCRT_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64")
+set(WINDOWS_SDK_PATH "C:/Program Files (x86)/Windows Kits/10")
+set(WINDOWS_SDK_VERSION "10.0.26100.0")
+set(WINDOWS_SDK_UM_LIB_PATH "${WINDOWS_SDK_PATH}/Lib/${WINDOWS_SDK_VERSION}/um/x64")
+set(WINDOWS_SDK_UCRT_LIB_PATH "${WINDOWS_SDK_PATH}/Lib/${WINDOWS_SDK_VERSION}/ucrt/x64")
 
-# Override the default MSVC include path to use VS 2022 toolset
-set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -imsvc${MSVC_INCLUDE_PATH}")
-set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -imsvc${MSVC_INCLUDE_PATH}")
-
+# Override the default MSVC include path to use VS 2022 toolset.
+# NOTE: _INIT variables are only consumed by project(); writing them afterwards
+# is dead code. SYSTEM directory includes are emitted as quoted -imsvc args,
+# so they survive paths containing spaces (unlike raw compiler-flag strings).
+include_directories(AFTER SYSTEM
+    "${MSVC_INCLUDE_PATH}"
+    "${WINDOWS_SDK_PATH}/Include/${WINDOWS_SDK_VERSION}/ucrt"
+    "${WINDOWS_SDK_PATH}/Include/${WINDOWS_SDK_VERSION}/shared"
+    "${WINDOWS_SDK_PATH}/Include/${WINDOWS_SDK_VERSION}/um"
+)
 link_directories(${MSVC_LIB_PATH} ${WINDOWS_SDK_UM_LIB_PATH} ${WINDOWS_SDK_UCRT_LIB_PATH})
 
 add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
