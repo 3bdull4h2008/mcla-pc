@@ -272,3 +272,28 @@ void HostRsRealPassthroughLogOnly(PPCContext& __restrict ctx, uint8_t* base)
         MCLA_LOG_INFO("DEVICE: RS-logonly-thunk hit #{} r3={:08X} r4={:08X}", n, ctx.r3.u32, ctx.r4.u32);
 }
 
+
+// ---------------------------------------------------------------------------
+// P4' PIVOT: MCLA never dispatches via device FP tables (see PIVOT FINDING).
+// State/draw intent flows DIRECTLY through these helpers. Global-scope strong
+// overrides intercept every caller; passthrough preserves behavior.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82411180);
+static std::atomic<uint32_t> s_h11180{0};
+PPC_FUNC(sub_82411180)
+{
+    const uint32_t n = s_h11180.fetch_add(1) + 1;
+    if (n <= 12 || (n % 2000) == 0)
+        MCLA_LOG_INFO("HELPER-thunk sub_82411180 hit #{} r3={:08X} r4={:08X}", n, ctx.r3.u32, ctx.r4.u32);
+    __imp__sub_82411180(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82411618);
+static std::atomic<uint32_t> s_h11618{0};
+PPC_FUNC(sub_82411618)
+{
+    const uint32_t n = s_h11618.fetch_add(1) + 1;
+    if (n <= 12 || (n % 2000) == 0)
+        MCLA_LOG_INFO("HELPER-thunk sub_82411618 hit #{} r3={:08X}", n, ctx.r3.u32);
+    __imp__sub_82411618(ctx, base);
+}

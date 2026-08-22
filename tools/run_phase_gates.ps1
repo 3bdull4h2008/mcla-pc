@@ -143,6 +143,7 @@ if (-not $SkipBoot) {
         $selfTestOk = @($slice | Select-String -Pattern 'redirected \d+/101 default RS slots.*readback=ok.*thunkResolved=true').Count
         $rsThunkHits = @($slice | Select-String -Pattern 'RS-default-thunk hit').Count
         $rsRealHits = @($slice | Select-String -Pattern 'RS-real-thunk hit').Count
+        $helperHits = @($slice | Select-String -Pattern 'HELPER-thunk').Count
 
         Add-Gate -Id 'G-BOOT-SOAK' -Status 'enforced' -Pass ($stillAlive -and $fatalHits -eq 0) -Metrics @{
             soakSeconds = $SoakSeconds; stillAlive = [bool]$stillAlive; exitCode = $exitCode; fatalPatterns = $fatalHits
@@ -156,8 +157,8 @@ if (-not $SkipBoot) {
             }
 
         # Tracked: real-handler passthrough proof (activates when a real slot is thumbed)
-        Add-Gate -Id 'G-P4-RS-THUNK-HITS' -Status 'tracked' -Pass ($rsRealHits -ge 1) `
-            -Metrics @{ realThunkHits = $rsRealHits; defaultThunkHits = $rsThunkHits }
+        Add-Gate -Id 'G-P4-RS-THUNK-HITS' -Status 'tracked' -Pass (($rsRealHits + $helperHits) -ge 1) `
+            -Metrics @{ realThunkHits = $rsRealHits; helperHits = $helperHits }
 
         # Tracked: PM4-free frames (activates at P6'; currently the legacy ring is alive by design)
         $putVals = @($slice | Select-String -Pattern 'RING: ctx\+30=([0-9A-F]{8})' |
@@ -209,4 +210,5 @@ Write-Host ''
 Write-Host ("OVERALL: {0}  (report: {1})" -f $(if ($report.overallPass) { 'PASS' } else { 'FAIL' }), $outFile) `
     -ForegroundColor $(if ($report.overallPass) { 'Green' } else { 'Red' })
 exit $(if ($report.overallPass) { 0 } else { 1 })
+
 
