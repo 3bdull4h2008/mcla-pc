@@ -1336,6 +1336,28 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
 
                         MCLA_LOG_INFO("VSync: calling callback 0x{:08X} with userData=0x{:08X} (frame={})",
                                       currentCallback, currentUserData, s_frameCounter++);
+
+                        // Ring-buffer submission probe: sample the head of the
+                        // primary ring every ~2s (120 frames) to see whether
+                        // the game ever writes PM4 packets for us to consume.
+                        if ((s_frameCounter % 120) == 0)
+                        {
+                            auto& memProbe = mcla::kernel::GuestMemoryHeap::Instance();
+                            uint32_t ctxPtr = 0;
+                            if (memProbe.ReadU32BE(0x82839254, &ctxPtr) && ctxPtr != 0)
+                            {
+                                uint32_t p0 = 0, p1 = 0;
+                                memProbe.ReadU32BE(ctxPtr + 0x30, &p0);
+                                memProbe.ReadU32BE(ctxPtr + 0x38, &p1);
+                                uint8_t head[8] = {};
+                                for (int bi = 0; bi < 8; ++bi)
+                                    memProbe.ReadU8(0xC6224480 + static_cast<uint32_t>(bi), &head[bi]);
+                                MCLA_LOG_INFO("RING: ctx+30={:08X} ctx+38={:08X} head={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
+                                              p0, p1, head[0], head[1], head[2], head[3],
+                                              head[4], head[5], head[6], head[7]);
+                            }
+                        }
+
                         fn(cbCtx, base);
                         MCLA_LOG_INFO("VSync: callback returned");
                     }
