@@ -88,3 +88,6 @@ ninja_err.txt
 /run_test.bat
 
 /BOOT_HANDOFF.md
+
+flutter_windows_*
+*_b.cmd
