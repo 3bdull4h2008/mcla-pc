@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <thread>
 
 struct Event final : KernelObject, HostObject<XKEVENT>
 {
@@ -62,30 +63,16 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         }
         else
         {
-            // Finite timeout: block on the atomic until signaled or deadline.
-            // (Previously fell through an assert - release builds returned
-            // SUCCESS immediately, turning every finite wait into a hot spin.)
+            // Finite timeout: bounded poll. std::atomic::wait has NO timed
+            // form - blocking on it here skipped the deadline check whenever
+            // no thread signaled inside the window (infinite park). Polling
+            // honors the deadline; 1ms quantum is well under one frame.
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
-            if (manualReset)
+            while (!signaled.load(std::memory_order_acquire))
             {
-                while (!signaled.load(std::memory_order_acquire))
-                {
-                    if (std::chrono::steady_clock::now() >= deadline)
-                        return STATUS_TIMEOUT;
-                    signaled.wait(false, std::memory_order_relaxed);
-                }
-            }
-            else
-            {
-                while (true)
-                {
-                    bool expected = true;
-                    if (signaled.compare_exchange_strong(expected, false))
-                        break;
-                    if (std::chrono::steady_clock::now() >= deadline)
-                        return STATUS_TIMEOUT;
-                    signaled.wait(expected, std::memory_order_relaxed);
-                }
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return STATUS_TIMEOUT;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
 
@@ -161,7 +148,8 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         }
         else
         {
-            // Finite timeout: real timed acquire (see Event::Wait note).
+            // Finite timeout: bounded poll (see Event::Wait note - atomic::wait
+            // is untimed and skipped the deadline when nobody signaled).
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
             while (true)
             {
@@ -175,11 +163,9 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
                 {
                     if (std::chrono::steady_clock::now() >= deadline)
                         return STATUS_TIMEOUT;
-                    count.wait(0);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
-
-            return STATUS_SUCCESS;
         }
     }
 

@@ -1,4 +1,4 @@
-#include <stdafx.h>
+﻿#include <stdafx.h>
 #include <cpu/ppc_context.h>
 #include <cpu/guest_thread.h>
 #include <apu/audio.h>
@@ -104,64 +104,36 @@ static uint32_t NtQueryInformationFileImpl(uint32_t handle, uint32_t ioStatusAdd
         return STATUS_SUCCESS;
     }
 
-    MCLA_LOG_WARN("NtQueryInformationFile: class={} len={} handleValid={} -> zero-info",
+    // Xenia semantics: never fake-success with zeros - the game branches on
+    // the returned data, so unsupported classes must fail loudly.
+    if (infoClass != 5 && infoClass != 34)
+    {
+        MCLA_LOG_WARN("NtQueryInformationFile: class={} -> STATUS_INVALID_INFO_CLASS", infoClass);
+        if (ioStatusAddr)
+        {
+            (void)mem.WriteU32BE(ioStatusAddr, STATUS_INVALID_INFO_CLASS);
+            (void)mem.WriteU32BE(ioStatusAddr + 4, 0);
+        }
+        return STATUS_INVALID_INFO_CLASS;
+    }
+
+    MCLA_LOG_WARN("NtQueryInformationFile: class={} len={} handleValid={} -> INFO_LENGTH_MISMATCH",
                   infoClass, length, fileObj != nullptr);
-    if (bufferAddr && length)
-    {
-        const uint32_t n = std::min<uint32_t>(length, 64);
-        for (uint32_t off = 0; off < n; off += 4) (void)mem.WriteU32BE(bufferAddr + off, 0);
-    }
     if (ioStatusAddr)
     {
-        (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-        (void)mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
+        (void)mem.WriteU32BE(ioStatusAddr, STATUS_INFO_LENGTH_MISMATCH);
+        (void)mem.WriteU32BE(ioStatusAddr + 4, 0);
     }
-    return STATUS_SUCCESS;
+    return STATUS_INFO_LENGTH_MISMATCH;
 }
 
-static uint32_t NtQueryVolumeInformationFileImpl(uint32_t handle, uint32_t ioStatusAddr, uint32_t bufferAddr, uint32_t length, uint32_t infoClass)
-{
-    (void)handle;
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    MCLA_LOG_INFO("NtQueryVolumeInformationFile: class={} len={}", infoClass, length);
-    if (bufferAddr && length)
-    {
-        const uint32_t n = std::min<uint32_t>(length, 64);
-        for (uint32_t off = 0; off < n; off += 4) (void)mem.WriteU32BE(bufferAddr + off, 0);
-    }
-    if (ioStatusAddr)
-    {
-        (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-        (void)mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
-    }
-    return STATUS_SUCCESS;
-}
-
-static uint32_t NtQueryDirectoryFileImpl(uint32_t handle, uint32_t ioStatusAddr)
-{
-    (void)handle;
-    MCLA_LOG_INFO("NtQueryDirectoryFile -> NO_MORE_FILES");
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    if (ioStatusAddr) (void)mem.WriteU32BE(ioStatusAddr, 0x80000006);
-    return 0x80000006; // STATUS_NO_MORE_FILES
-}
+// NtQueryVolumeInformationFile / NtQueryDirectoryFile: typed impls live below
+// (near NtReadFile) and are GUEST_FUNCTION_HOOKed at the bottom of this file.
 
 PPC_FUNC(__imp__NtQueryInformationFile)
 {
     // r3=handle, r4=ioStatus, r5=buffer, r6=length, r7=infoClass
     ctx.r3.u32 = NtQueryInformationFileImpl(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
-}
-
-PPC_FUNC(__imp__NtQueryVolumeInformationFile)
-{
-    // r3=handle, r4=ioStatus, r5=buffer, r6=length, r7=infoClass
-    ctx.r3.u32 = NtQueryVolumeInformationFileImpl(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
-}
-
-PPC_FUNC(__imp__NtQueryDirectoryFile)
-{
-    // r3=handle, r4=event, r5=apcRoutine, r6=apcContext, r7=ioStatus
-    ctx.r3.u32 = NtQueryDirectoryFileImpl(ctx.r3.u32, ctx.r7.u32);
 }
 
 void VdHSIOCalibrationLock()
@@ -1741,14 +1713,14 @@ void XamUserReadProfileSettings
 }
 
 // NOTE: NetDll_* exports take a leading selector arg (generated wrappers pass
-// r3=1 before the real WinSock args — see sub_8244A258 in generated code).
+// r3=1 before the real WinSock args â€” see sub_8244A258 in generated code).
 uint32_t NetDll_WSAStartup(uint32_t dllSelector, uint16_t versionRequested, void* wsaData)
 {
     // WinSock 1.1-style WSADATA on 360 (Xenia xboxkrnl_net.cc semantics):
     // wVersion@0, wHighVersion@2, szDescription@4, szSystemStatus@261,
     // iMaxSockets@390, iMaxUdpDg@392, lpVendorInfo@396.
     // Evidence (generated sub_821E44A0): the game re-reads wVersion and only
-    // accepts the exact word the caller passed (0x0002 here) — store it
+    // accepts the exact word the caller passed (0x0002 here) â€” store it
     // verbatim, big-endian, no MAKEWORD reshuffling.
     const uint16_t reportedVersion = static_cast<uint16_t>(versionRequested);
     constexpr uint16_t kHighVersion = 0x0202;
@@ -2608,7 +2580,10 @@ GUEST_FUNCTION_HOOK(__imp__XexGetModuleSection, XexGetModuleSection);
 GUEST_FUNCTION_HOOK(__imp__RtlUnicodeToMultiByteN, RtlUnicodeToMultiByteN);
 GUEST_FUNCTION_HOOK(__imp__KeDelayExecutionThread, KeDelayExecutionThread);
 GUEST_FUNCTION_HOOK(__imp__ExFreePool, ExFreePool);
-// NtQueryInformationFile, NtQueryVolumeInformationFile, NtQueryDirectoryFile - implemented as PPC_FUNC
+// NtQueryInformationFile stays on its PPC_FUNC wrapper (no typed impl yet);
+// Volume/Directory queries use the typed impls above.
+GUEST_FUNCTION_HOOK(__imp__NtQueryVolumeInformationFile, NtQueryVolumeInformationFile);
+GUEST_FUNCTION_HOOK(__imp__NtQueryDirectoryFile, NtQueryDirectoryFile);
 GUEST_FUNCTION_HOOK(__imp__NtReadFileScatter, NtReadFileScatter);
 GUEST_FUNCTION_HOOK(__imp__NtReadFile, NtReadFile);
 GUEST_FUNCTION_HOOK(__imp__NtDuplicateObject, NtDuplicateObject);
