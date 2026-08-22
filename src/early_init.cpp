@@ -7,8 +7,8 @@ static LONG WINAPI EarlyVeh(EXCEPTION_POINTERS* ep) {
     FILE* f = nullptr;
     fopen_s(&f, "crash_log_early.txt", "w");
     if (f) {
-        fprintf(f, "VEH exception: code=0x%08X addr=0x%p\n",
-                ep->ExceptionRecord->ExceptionCode,
+        fprintf(f, "VEH exception: code=0x%08lX addr=0x%p\n",
+                static_cast<unsigned long>(ep->ExceptionRecord->ExceptionCode),
                 ep->ExceptionRecord->ExceptionAddress);
         for (ULONG i = 0; i < ep->ExceptionRecord->NumberParameters && i < 15; i++) {
             fprintf(f, "  param[%lu] = 0x%llX\n", i, ep->ExceptionRecord->ExceptionInformation[i]);

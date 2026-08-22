@@ -13,6 +13,10 @@
 #include <user/config.h>
 #include <os/logger.h>
 
+// Host thread id of the guest main thread (see xdm.h). Defined here; set by
+// boot_host.cpp when the boot worker starts.
+std::atomic<uint32_t> g_mainGuestThreadId{0};
+
 static std::atomic<uint32_t> g_keSetEventGeneration;
 
 // Forward declarations
@@ -69,17 +73,17 @@ static uint32_t NtQueryInformationFileImpl(uint32_t handle, uint32_t ioStatusAdd
         // EndOfFile(8), FileAttributes(4). The packfile loader gates on
         // EndOfFile being the REAL archive size.
         const uint64_t fileSize = fileObj->fileHandle.size;
-        mem.WriteU64BE(bufferAddr + 0, 0);            // CreationTime
-        mem.WriteU64BE(bufferAddr + 8, 0);            // LastAccessTime
-        mem.WriteU64BE(bufferAddr + 16, 0);           // LastWriteTime
-        mem.WriteU64BE(bufferAddr + 24, 0);           // ChangeTime
-        mem.WriteU64BE(bufferAddr + 32, fileSize);    // AllocationSize
-        mem.WriteU64BE(bufferAddr + 40, fileSize);    // EndOfFile
-        mem.WriteU32BE(bufferAddr + 48, 0x20);        // FILE_ATTRIBUTE_ARCHIVE
+        (void)mem.WriteU64BE(bufferAddr + 0, 0);            // CreationTime
+        (void)mem.WriteU64BE(bufferAddr + 8, 0);            // LastAccessTime
+        (void)mem.WriteU64BE(bufferAddr + 16, 0);           // LastWriteTime
+        (void)mem.WriteU64BE(bufferAddr + 24, 0);           // ChangeTime
+        (void)mem.WriteU64BE(bufferAddr + 32, fileSize);    // AllocationSize
+        (void)mem.WriteU64BE(bufferAddr + 40, fileSize);    // EndOfFile
+        (void)mem.WriteU32BE(bufferAddr + 48, 0x20);        // FILE_ATTRIBUTE_ARCHIVE
         if (ioStatusAddr)
         {
-            mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-            mem.WriteU32BE(ioStatusAddr + 4, 52);
+            (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+            (void)mem.WriteU32BE(ioStatusAddr + 4, 52);
         }
         MCLA_LOG_INFO("NtQueryInformationFile: NETWORK_OPEN_INFO size={}", fileSize);
         return STATUS_SUCCESS;
@@ -88,14 +92,14 @@ static uint32_t NtQueryInformationFileImpl(uint32_t handle, uint32_t ioStatusAdd
     if (infoClass == 5 && bufferAddr != 0 && length >= 24 && fileObj)
     {
         const uint64_t fileSize = fileObj->fileHandle.size;
-        mem.WriteU64BE(bufferAddr + 0, fileSize);
-        mem.WriteU64BE(bufferAddr + 8, fileSize);
-        mem.WriteU32BE(bufferAddr + 16, 1);
-        mem.WriteU16BE(bufferAddr + 20, 0);
+        (void)mem.WriteU64BE(bufferAddr + 0, fileSize);
+        (void)mem.WriteU64BE(bufferAddr + 8, fileSize);
+        (void)mem.WriteU32BE(bufferAddr + 16, 1);
+        (void)mem.WriteU16BE(bufferAddr + 20, 0);
         if (ioStatusAddr)
         {
-            mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-            mem.WriteU32BE(ioStatusAddr + 4, 24);
+            (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+            (void)mem.WriteU32BE(ioStatusAddr + 4, 24);
         }
         return STATUS_SUCCESS;
     }
@@ -105,12 +109,12 @@ static uint32_t NtQueryInformationFileImpl(uint32_t handle, uint32_t ioStatusAdd
     if (bufferAddr && length)
     {
         const uint32_t n = std::min<uint32_t>(length, 64);
-        for (uint32_t off = 0; off < n; off += 4) mem.WriteU32BE(bufferAddr + off, 0);
+        for (uint32_t off = 0; off < n; off += 4) (void)mem.WriteU32BE(bufferAddr + off, 0);
     }
     if (ioStatusAddr)
     {
-        mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-        mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
+        (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+        (void)mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
     }
     return STATUS_SUCCESS;
 }
@@ -123,12 +127,12 @@ static uint32_t NtQueryVolumeInformationFileImpl(uint32_t handle, uint32_t ioSta
     if (bufferAddr && length)
     {
         const uint32_t n = std::min<uint32_t>(length, 64);
-        for (uint32_t off = 0; off < n; off += 4) mem.WriteU32BE(bufferAddr + off, 0);
+        for (uint32_t off = 0; off < n; off += 4) (void)mem.WriteU32BE(bufferAddr + off, 0);
     }
     if (ioStatusAddr)
     {
-        mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-        mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
+        (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+        (void)mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
     }
     return STATUS_SUCCESS;
 }
@@ -138,7 +142,7 @@ static uint32_t NtQueryDirectoryFileImpl(uint32_t handle, uint32_t ioStatusAddr)
     (void)handle;
     MCLA_LOG_INFO("NtQueryDirectoryFile -> NO_MORE_FILES");
     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    if (ioStatusAddr) mem.WriteU32BE(ioStatusAddr, 0x80000006);
+    if (ioStatusAddr) (void)mem.WriteU32BE(ioStatusAddr, 0x80000006);
     return 0x80000006; // STATUS_NO_MORE_FILES
 }
 
@@ -392,7 +396,7 @@ uint32_t XamLoaderMediaGetInfo(uint32_t mediaId, void* infoBuffer)
         *reinterpret_cast<uint32_t*>(&info[4]) = __builtin_bswap32(0x0);  // MediaFlags
         *reinterpret_cast<uint32_t*>(&info[8]) = __builtin_bswap32(0x0);  // MediaId
         *reinterpret_cast<uint32_t*>(&info[12]) = __builtin_bswap32(0x0); // SessionId
-        mem.WriteBytes(g_ppcContext->r4.u32, info, 16);
+        (void)mem.WriteBytes(g_ppcContext->r4.u32, info, 16);
     }
     return 0; // ERROR_SUCCESS
 }
@@ -467,7 +471,7 @@ uint32_t NtCreateFile
     uint16_t length = name->Length.get();
     if (length >= sizeof(guestPath)) length = sizeof(guestPath) - 1;
     
-    void* srcPtr = mcla::kernel::GuestMemoryHeap::Instance().Translate(reinterpret_cast<uint32_t>(name->Buffer.get()));
+    void* srcPtr = mcla::kernel::GuestMemoryHeap::Instance().Translate(name->Buffer.ptr);
     if (!srcPtr)
     {
         IoStatusBlock->Status.set(0xC0000005); // STATUS_ACCESS_VIOLATION
@@ -572,6 +576,16 @@ uint32_t FscSetCacheElementCount()
 
 uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
+    // MAIN-THREAD PARK PROBE
+    {
+        static std::atomic<uint32_t> s_parkLogs2{0};
+        uint32_t mainId = g_mainGuestThreadId.load();
+        if (mainId != 0 && GetCurrentThreadId() == mainId && s_parkLogs2.fetch_add(1) < 200)
+        {
+            MCLA_LOG_INFO("[main-park] NtWaitForSingleObjectEx handle={:08X} alertable={} lr={:08X}",
+                          Handle, Alertable, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
     assert(timeout == 0 || timeout == INFINITE);
 
@@ -602,7 +616,9 @@ uint32_t NtWriteFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint3
         return STATUS_SUCCESS;
     }
 
-    void* hostPtr = mcla::kernel::GuestMemoryHeap::Instance().Translate(reinterpret_cast<uint32_t>(buffer));
+    auto& guestMem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t bufferAddr = guestMem.MapVirtual(buffer);
+    void* hostPtr = (bufferAddr != 0) ? guestMem.Translate(bufferAddr) : nullptr;
     if (!hostPtr)
     {
         if (ioStatus) ioStatus->Status.set(0xC0000005);
@@ -769,6 +785,18 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
 
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
+    // MAIN-THREAD PARK PROBE: name where the guest main loop sleeps.
+    {
+        static std::atomic<uint32_t> s_parkLogs{0};
+        uint32_t mainId = g_mainGuestThreadId.load();
+        if (mainId != 0 && GetCurrentThreadId() == mainId && timeout >= 8 &&
+            s_parkLogs.fetch_add(1) < 200)
+        {
+            MCLA_LOG_INFO("[main-park] KeDelayExecutionThread timeout={}ms lr={:08X}",
+                          timeout, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
+
 #ifdef _WIN32
     Sleep(timeout);
 #else
@@ -803,9 +831,9 @@ uint32_t NtQueryVolumeInformationFile(uint32_t handle, XIO_STATUS_BLOCK* ioStatu
     {
         // zero-filled volume info = "empty fixed volume"; refine per class when
         // boot proves it matters
-        const uint32_t addr = reinterpret_cast<uint32_t>(fsInfo);
+        const uint32_t addr = mem.MapVirtual(fsInfo);
         const uint32_t n = std::min<uint32_t>(length, 64);
-        for (uint32_t off = 0; off < n; off += 4) mem.WriteU32BE(addr + off, 0);
+        for (uint32_t off = 0; addr != 0 && off < n; off += 4) (void)mem.WriteU32BE(addr + off, 0);
     }
     if (ioStatus)
     {
@@ -837,7 +865,9 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32
         return STATUS_SUCCESS;
     }
 
-    void* hostPtr = mcla::kernel::GuestMemoryHeap::Instance().Translate(reinterpret_cast<uint32_t>(buffer));
+    auto& guestMem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t bufferAddr = guestMem.MapVirtual(buffer);
+    void* hostPtr = (bufferAddr != 0) ? guestMem.Translate(bufferAddr) : nullptr;
     if (!hostPtr)
     {
         if (ioStatus) ioStatus->Status.set(0xC0000005);
@@ -850,7 +880,7 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32
     {
         auto& heapForBounds = mcla::kernel::GuestMemoryHeap::Instance();
         const uint64_t winSize = heapForBounds.Size();
-        const uint64_t bufOff = reinterpret_cast<uint32_t>(buffer);
+        const uint64_t bufOff = bufferAddr;
         if (bufOff < winSize && length > winSize - bufOff)
         {
             length = static_cast<uint32_t>(winSize - bufOff);
@@ -1141,12 +1171,12 @@ void VdGetSystemCommandBuffer(uint32_t p0, uint32_t p1)
     if (p0)
     {
         static const uint8_t zeroBuf[0x94] = {0};
-        mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(p0, zeroBuf, 0x94);
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p0, 0xBEEF0000);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(p0, zeroBuf, 0x94);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p0, 0xBEEF0000);
     }
     if (p1)
     {
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p1, 0xBEEF0001);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p1, 0xBEEF0001);
     }
 }
 
@@ -1194,7 +1224,7 @@ void VdEnableRingBufferRPtrWriteBack(uint32_t ringBuffer, uint32_t blockSizeLog2
         // Write the write-back address (host will update this)
         // In real hardware, GPU writes the read pointer here
         // We write a placeholder value
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(addr, 0);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(addr, 0);
     }
 }
 
@@ -1206,7 +1236,7 @@ void VdInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2)
     if (physAddr)
     {
         std::vector<uint8_t> zeroBuf(ringSize, 0);
-        mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(physAddr, zeroBuf.data(), ringSize);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(physAddr, zeroBuf.data(), ringSize);
     }
 }
 
@@ -1328,25 +1358,25 @@ uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg, uint32_t p
     // Based on Xenia and MCLA analysis, the GPU context pointer is at 0x82839254.
     constexpr uint32_t gpuCtxPtrAddr = 0x82839254;
     uint32_t gpuCtxPtr = 0;
-    mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr, &gpuCtxPtr);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr, &gpuCtxPtr);
 
     if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000)
     {
         // Initialize spinlocks at +0x4148 and +0x4158
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4148, 0);
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4158, 0);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4148, 0);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4158, 0);
 
         // Initialize command buffer pointers at +0x30 and +0x38
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x30, 0);
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x38, 0);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x30, 0);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x38, 0);
 
         // Present callback at +0x40A0 - will be set by VdSetGraphicsInterruptCallback chain
         // The game sets this up; we don't manually seed it here.
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x40A0, 0);
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x40A4, 0);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x40A0, 0);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x40A4, 0);
 
         // State field at +0xD0 (checked by Function_824E37E0)
-        mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0xD0, 1);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0xD0, 1);
 
         MCLA_LOG_INFO("VdInitializeEngines: initialized GPU context at 0x{:08X}", gpuCtxPtr);
     }
@@ -1373,7 +1403,7 @@ void InitGpuBackendManual(uint32_t gpuCtxPtr)
 
     // Initialize ring buffer
     uint32_t ring_buf = 0;
-    mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtr + 14836, &ring_buf);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtr + 14836, &ring_buf);
     if (ring_buf != 0)
     {
         MCLA_LOG_INFO("InitGpuBackendManual: Initializing ring buffer 0x{:08X}", ring_buf);
@@ -1383,7 +1413,7 @@ void InitGpuBackendManual(uint32_t gpuCtxPtr)
 
     // Initialize sub context
     uint32_t sub_ctx = 0;
-    mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtr + 10896, &sub_ctx);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtr + 10896, &sub_ctx);
     if (sub_ctx != 0)
     {
         MCLA_LOG_INFO("InitGpuBackendManual: Initializing sub context 0x{:08X}", sub_ctx);
@@ -1411,7 +1441,7 @@ void StartGpuContextPoller()
             
             constexpr uint32_t gpuCtxPtrAddr = 0x82839254;
             uint32_t gpuCtxPtr = 0;
-            mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr, &gpuCtxPtr);
+            (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr, &gpuCtxPtr);
             
             if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000 && !s_gpuInitDone.load())
             {
@@ -1554,6 +1584,17 @@ bool KeResetEvent(XKEVENT* pEvent)
 
 uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
+    // MAIN-THREAD PARK PROBE
+    {
+        static std::atomic<uint32_t> s_parkLogs3{0};
+        uint32_t mainId = g_mainGuestThreadId.load();
+        if (mainId != 0 && GetCurrentThreadId() == mainId && s_parkLogs3.fetch_add(1) < 200)
+        {
+            MCLA_LOG_INFO("[main-park] KeWaitForSingleObject obj={:08X} reason={} lr={:08X}",
+                          reinterpret_cast<uint32_t>(Object), WaitReason,
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
     const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
     assert(timeout == 0 || timeout == INFINITE);
 
@@ -1686,18 +1727,21 @@ uint32_t NetDll_WSAStartup(uint32_t dllSelector, uint16_t versionRequested, void
     if (wsaData)
     {
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        const uint32_t base = reinterpret_cast<uint32_t>(wsaData);
-        mem.WriteU16BE(base + 0, reportedVersion);   // wVersion = echoed request
-        mem.WriteU16BE(base + 2, kHighVersion);      // wHighVersion
+        const uint32_t base = mem.MapVirtual(wsaData);
+        if (base != 0)
+        {
+            (void)mem.WriteU16BE(base + 0, reportedVersion);   // wVersion = echoed request
+            (void)mem.WriteU16BE(base + 2, kHighVersion);      // wHighVersion
 
-        const char description[] = "MCLA native recomp winsock 2.2";
-        mem.WriteBytes(base + 4, description, sizeof(description));
-        const char systemStatus[] = "Running";
-        mem.WriteBytes(base + 261, systemStatus, sizeof(systemStatus));
+            const char description[] = "MCLA native recomp winsock 2.2";
+            (void)mem.WriteBytes(base + 4, description, sizeof(description));
+            const char systemStatus[] = "Running";
+            (void)mem.WriteBytes(base + 261, systemStatus, sizeof(systemStatus));
 
-        mem.WriteU16BE(base + 390, 1024);            // iMaxSockets
-        mem.WriteU16BE(base + 392, 64);              // iMaxUdpDg
-        mem.WriteU32BE(base + 396, 0);               // lpVendorInfo = NULL
+            (void)mem.WriteU16BE(base + 390, 1024);            // iMaxSockets
+            (void)mem.WriteU16BE(base + 392, 64);              // iMaxUdpDg
+            (void)mem.WriteU32BE(base + 396, 0);               // lpVendorInfo = NULL
+        }
     }
     return 0; // SUCCESS
 }
@@ -1895,7 +1939,7 @@ void XeKeysGetKey()
             // Exponent at offset 8 (standard 65537)
             *reinterpret_cast<uint32_t*>(&cert[8]) = __builtin_bswap32(0x10001);
             // Remaining bytes are modulus (zero = signature verify "passes" with zero modulus)
-            mem.WriteBytes(output, cert, outputSize);
+            (void)mem.WriteBytes(output, cert, outputSize);
         }
     }
 }
@@ -1931,7 +1975,7 @@ void XeCryptSha()
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
         // Write 20-byte SHA-1 zero hash (placeholder)
         uint8_t hash[20] = {};
-        mem.WriteBytes(outputPtr, hash, 20);
+        (void)mem.WriteBytes(outputPtr, hash, 20);
     }
 }
 
@@ -1953,7 +1997,7 @@ void XeCryptRotSumSha()
     {
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
         uint8_t hash[20] = {};
-        mem.WriteBytes(outputPtr, hash, 20);
+        (void)mem.WriteBytes(outputPtr, hash, 20);
     }
 }
 
@@ -2318,6 +2362,19 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 {
     const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
     assert(timeout == INFINITE || timeout == 0);
+
+    // MAIN-THREAD PARK PROBE
+    {
+        static std::atomic<uint32_t> s_parkLogs4{0};
+        uint32_t mainId = g_mainGuestThreadId.load();
+        if (mainId != 0 && GetCurrentThreadId() == mainId && s_parkLogs4.fetch_add(1) < 200)
+        {
+            MCLA_LOG_INFO("[main-park] KeWaitForMultipleObjects count={} waitType={} obj0={:08X} lr={:08X}",
+                          Count, WaitType,
+                          Objects ? reinterpret_cast<uint32_t>(Objects[0].get()) : 0,
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
 
     if (WaitType == 0) // Wait all
     {
@@ -2834,7 +2891,7 @@ void XexLoadImage()
     {
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
         uint32_t handle = 0x82000000; // Dummy handle
-        mem.WriteU32BE(moduleHandleOut, handle);
+        (void)mem.WriteU32BE(moduleHandleOut, handle);
     }
 }
 
@@ -2859,7 +2916,7 @@ void XexLoadImageHeaders()
         *reinterpret_cast<uint32_t*>(&header[0]) = __builtin_bswap32(0x58455832); // 'XEX2' magic
         *reinterpret_cast<uint32_t*>(&header[4]) = __builtin_bswap32(0x0); // ModuleFlags
         *reinterpret_cast<uint32_t*>(&header[8]) = __builtin_bswap32(0x1000); // HeaderSize
-        mem.WriteBytes(bufferOut, header, bufferSize);
+        (void)mem.WriteBytes(bufferOut, header, bufferSize);
     }
 }
 void XexUnloadImage()

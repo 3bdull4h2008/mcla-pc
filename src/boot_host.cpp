@@ -25,6 +25,9 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 
 #pragma comment(lib, "dbghelp.lib")
 
+// Guest main-thread id (defined in kernel imports.cpp, declared in xdm.h).
+extern std::atomic<uint32_t> g_mainGuestThreadId;
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -509,6 +512,9 @@ static LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info)
 
 void BootWorker(uint32_t entryGuest)
 {
+    // Publish this host thread as the guest "main thread" for park probes.
+    g_mainGuestThreadId.store(GetCurrentThreadId());
+
     PPCFunc* entryFunc = PPC_LOOKUP_FUNC(g_base, entryGuest);
     if (entryFunc == nullptr)
     {

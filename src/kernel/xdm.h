@@ -1,8 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include "heap.h"
 #include "memory.h"
 #include "xbox.h"
+
+// Host thread id of the boot worker (the guest's main thread). Set by
+// boot_host once the worker starts; imports use it to attribute waits.
+extern std::atomic<uint32_t> g_mainGuestThreadId;
 
 #define OBJECT_SIGNATURE           (uint32_t)'XBOX'
 #define GUEST_INVALID_HANDLE_VALUE 0xFFFFFFFF

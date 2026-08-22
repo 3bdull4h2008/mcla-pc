@@ -131,12 +131,12 @@ namespace {
 mcla::native::GuestMemoryView* g_activeGuestMemoryView = nullptr;
 }
 
-mcla::native::GuestMemoryView& mcla::native::GetActiveGuestMemoryView() {
+mcla::native::GuestMemoryView& GetActiveGuestMemoryView() {
     static mcla::native::GuestMemoryView fallback;
     return g_activeGuestMemoryView ? *g_activeGuestMemoryView : fallback;
 }
 
-void mcla::native::SetActiveGuestMemoryView(mcla::native::GuestMemoryView* view) {
+void SetActiveGuestMemoryView(mcla::native::GuestMemoryView* view) {
     g_activeGuestMemoryView = view;
 }
 
@@ -175,7 +175,7 @@ bool VerifyGuestMemoryViewForTests() {
     return true;
 }
 
-uint64_t mcla::native::QueryGuestTimebase() {
+uint64_t QueryGuestTimebase() {
     LARGE_INTEGER freq;
     LARGE_INTEGER counter;
     QueryPerformanceFrequency(&freq);

@@ -38,19 +38,15 @@ static int g_failCount = 0;
 
 static std::atomic<uint32_t> g_keSetEventGeneration;
 
-// Minimal PPC function table for validator tests
-extern PPCFuncMapping PPCFuncMappings[] = {
+// Minimal PPC function table for validator tests (non-static definition: the
+// declaration in ppc_context.h has external linkage and memory.cpp iterates it;
+// the main build links the real table from generated/ppc_xenon instead)
+PPCFuncMapping PPCFuncMappings[] = {
     { 0, nullptr }
 };
 
 #define TEST(name) \
     do { printf("  [TEST] %-50s ", name); } while(0)
-
-#define PASS() \
-    do { printf("PASS\n"); g_passCount++; } while(0)
-
-#define FAIL(msg) \
-    do { printf("FAIL: %s\n", msg); g_failCount++; } while(0)
 
 #define CHECK(cond, msg) \
     do { if (!(cond)) { FAIL(msg); return; } } while(0)

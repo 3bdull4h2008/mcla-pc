@@ -5,6 +5,7 @@
 #include "vfs_rpf.h"
 #include <atomic>
 #include <cassert>
+#include <chrono>
 
 struct Event final : KernelObject, HostObject<XKEVENT>
 {
@@ -61,7 +62,31 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         }
         else
         {
-            assert(false && "Unhandled timeout value.");
+            // Finite timeout: block on the atomic until signaled or deadline.
+            // (Previously fell through an assert - release builds returned
+            // SUCCESS immediately, turning every finite wait into a hot spin.)
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+            if (manualReset)
+            {
+                while (!signaled.load(std::memory_order_acquire))
+                {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        return STATUS_TIMEOUT;
+                    signaled.wait(false, std::memory_order_relaxed);
+                }
+            }
+            else
+            {
+                while (true)
+                {
+                    bool expected = true;
+                    if (signaled.compare_exchange_strong(expected, false))
+                        break;
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        return STATUS_TIMEOUT;
+                    signaled.wait(expected, std::memory_order_relaxed);
+                }
+            }
         }
 
         return STATUS_SUCCESS;
@@ -136,8 +161,25 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         }
         else
         {
-            assert(false && "Unhandled timeout value.");
-            return STATUS_TIMEOUT;
+            // Finite timeout: real timed acquire (see Event::Wait note).
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+            while (true)
+            {
+                uint32_t currentCount = count.load();
+                if (currentCount != 0)
+                {
+                    if (count.compare_exchange_weak(currentCount, currentCount - 1))
+                        return STATUS_SUCCESS;
+                }
+                else
+                {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        return STATUS_TIMEOUT;
+                    count.wait(0);
+                }
+            }
+
+            return STATUS_SUCCESS;
         }
     }
 
