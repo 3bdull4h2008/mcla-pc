@@ -2054,6 +2054,30 @@ void sub_821BD618(PPCContext& ctx, uint8_t* base)
     if (mem.ReadU32BE(0x8285FEA0, &slotValue))
         MCLA_LOG_ERROR("  slot 0x8285FEA0 = 0x{:08X}", slotValue);
 
+    // r3 usually points at the fatal message string - read it straight out
+    if (ctx.r3.u32 >= 0x82000000u && ctx.r3.u32 < 0x83000000u)
+    {
+        if (const void* p = mem.Translate(ctx.r3.u32))
+            MCLA_LOG_ERROR("  fatal message: '{}'", static_cast<const char*>(p));
+        if (ctx.r4.u32 >= 0x82000000u && ctx.r4.u32 < 0x83000000u)
+        {
+            if (const void* p4 = mem.Translate(ctx.r4.u32))
+                MCLA_LOG_ERROR("  fatal aux r4: '{}'", static_cast<const char*>(p4));
+        }
+        else if (ctx.r4.u32 >= 0x8E000000u && ctx.r4.u32 < 0x90000000u)
+        {
+            // varargs: %s value passed directly - r4 IS the char* (stack copy)
+            if (const void* ps = mem.Translate(ctx.r4.u32))
+                MCLA_LOG_ERROR("  fatal %%s arg: '{}'", static_cast<const char*>(ps));
+            uint32_t strPtr = 0;
+            if (mem.ReadU32BE(ctx.r4.u32, &strPtr) && strPtr >= 0x82000000u && strPtr < 0x83000000u)
+            {
+                if (const void* ps2 = mem.Translate(strPtr))
+                    MCLA_LOG_ERROR("  fatal %s indirection -> '{}'", static_cast<const char*>(ps2));
+            }
+        }
+    }
+
     // EABI frames: back chain at [sp], saved LR at [sp+4].
     uint64_t lr = ctx.lr;
     uint32_t sp = ctx.r1.u32;
