@@ -55,6 +55,10 @@ bool GuestMemoryView::ReadU16BE(uint32_t guestAddr, uint16_t* outVal) const {
 }
 
 bool GuestMemoryView::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const {
+    if ((guestAddr & 0xFFFF0000u) == 0x7FC80000u) {
+        GpuMmioReadFn handler = GetGpuMmioReadHandler();
+        if (handler && outVal && handler(guestAddr, outVal)) return true;
+    }
     const uint8_t* ptr = GetHostPtr(guestAddr, sizeof(uint32_t));
     if (!ptr || !outVal) return false;
     uint32_t val;
@@ -105,6 +109,10 @@ bool GuestMemoryView::WriteU16BE(uint32_t guestAddr, uint16_t val) const {
 }
 
 bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
+    if ((guestAddr & 0xFFFF0000u) == 0x7FC80000u) {
+        GpuMmioWriteFn handler = GetGpuMmioWriteHandler();
+        if (handler && handler(guestAddr, val)) return true;
+    }
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint32_t));
     if (!ptr) return false;
     uint32_t be = Swap32(val);
@@ -139,6 +147,19 @@ mcla::native::GuestMemoryView& GetActiveGuestMemoryView() {
 void SetActiveGuestMemoryView(mcla::native::GuestMemoryView* view) {
     g_activeGuestMemoryView = view;
 }
+
+namespace {
+GpuMmioWriteFn g_gpuMmioWriteHandler = nullptr;
+GpuMmioReadFn g_gpuMmioReadHandler = nullptr;
+} // namespace
+
+void SetGpuMmioHandlers(GpuMmioWriteFn writeFn, GpuMmioReadFn readFn) {
+    g_gpuMmioWriteHandler = writeFn;
+    g_gpuMmioReadHandler = readFn;
+}
+
+GpuMmioWriteFn GetGpuMmioWriteHandler() { return g_gpuMmioWriteHandler; }
+GpuMmioReadFn GetGpuMmioReadHandler() { return g_gpuMmioReadHandler; }
 
 bool VerifyGuestMemoryViewForTests() {
     GuestMemoryView view;

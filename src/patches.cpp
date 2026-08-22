@@ -1,5 +1,6 @@
 ﻿#include "patches.h"
 #include "gpu_mmio.h"
+#include "gpu_cp.h"
 #include "native_renderer.h"
 #include "guest_memory.h"
 #include "vfs_rpf.h"
@@ -488,6 +489,7 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher* dispatcher) {
     }
 
 if (BisectGroupEnabled("gp")) {
+        mcla::gpu::CpInstallMmioRouting();
         mcla::gpu::InstallGpuHooks(dispatcher, mcla::gpu::GpuHooks{});
 
         g_original_GpuKick = dispatcher->GetFunction(0x82412710);

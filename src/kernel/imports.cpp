@@ -10,6 +10,7 @@
 #include "xdm.h"
 #include "kernel_objects.h"
 #include "logging.h"
+#include <gpu_cp.h>
 #include <user/config.h>
 #include <os/logger.h>
 
@@ -1185,19 +1186,10 @@ uint32_t KiApcNormalRoutineNop()
 
 void VdEnableRingBufferRPtrWriteBack(uint32_t ringBuffer, uint32_t blockSizeLog2)
 {
-    // Xenia: sets CP_RB_RPTR_ADDR (0x70C), freq=1<<blockSizeLog2>>2
-    MCLA_LOG_INFO("VdEnableRingBufferRPtrWriteBack: ring=0x{:08X} blockLog2={}", ringBuffer, blockSizeLog2);
-    if (ringBuffer)
-    {
-        // CP_RB_RPTR_ADDR is at 0x70C in the ring buffer
-        // Frequency = 1 << (blockSizeLog2 - 2) [since 0x70C is in dwords]
-        // For now, just log and ensure ring buffer is valid
-        uint32_t addr = ringBuffer + 0x70C;
-        // Write the write-back address (host will update this)
-        // In real hardware, GPU writes the read pointer here
-        // We write a placeholder value
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(addr, 0);
-    }
+    // Xenia: r3 IS the read-pointer writeback address (CP_RB_RPTR_ADDR),
+    // not a ring base. The host CP publishes the advanced dword index there.
+    MCLA_LOG_INFO("VdEnableRingBufferRPtrWriteBack: writeback=0x{:08X} blockLog2={}", ringBuffer, blockSizeLog2);
+    mcla::gpu::CpEnableRPtrWriteBack(ringBuffer, blockSizeLog2);
 }
 
 void VdInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2)
@@ -1209,6 +1201,7 @@ void VdInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2)
     {
         std::vector<uint8_t> zeroBuf(ringSize, 0);
         (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(physAddr, zeroBuf.data(), ringSize);
+        mcla::gpu::CpInitializeRingBuffer(physAddr, sizeLog2);
     }
 }
 
@@ -1319,14 +1312,18 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                             if (memProbe.ReadU32BE(0x82839254, &ctxPtr) && ctxPtr != 0)
                             {
                                 uint32_t p0 = 0, p1 = 0;
-                                memProbe.ReadU32BE(ctxPtr + 0x30, &p0);
-                                memProbe.ReadU32BE(ctxPtr + 0x38, &p1);
+                                const bool p0Ok = memProbe.ReadU32BE(ctxPtr + 0x30, &p0);
+                                const bool p1Ok = memProbe.ReadU32BE(ctxPtr + 0x38, &p1);
                                 uint8_t head[8] = {};
+                                bool headOk = true;
                                 for (int bi = 0; bi < 8; ++bi)
-                                    memProbe.ReadU8(0xC6224480 + static_cast<uint32_t>(bi), &head[bi]);
-                                MCLA_LOG_INFO("RING: ctx+30={:08X} ctx+38={:08X} head={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
-                                              p0, p1, head[0], head[1], head[2], head[3],
-                                              head[4], head[5], head[6], head[7]);
+                                    headOk &= memProbe.ReadU8(0xC6224480 + static_cast<uint32_t>(bi), &head[bi]);
+                                if (p0Ok && p1Ok && headOk)
+                                {
+                                    MCLA_LOG_INFO("RING: ctx+30={:08X} ctx+38={:08X} head={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
+                                                  p0, p1, head[0], head[1], head[2], head[3],
+                                                  head[4], head[5], head[6], head[7]);
+                                }
                             }
                         }
 
@@ -1593,7 +1590,7 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, 
         if (mainId != 0 && GetCurrentThreadId() == mainId && s_parkLogs3.fetch_add(1) < 200)
         {
             MCLA_LOG_INFO("[main-park] KeWaitForSingleObject obj={:08X} reason={} lr={:08X}",
-                          reinterpret_cast<uint32_t>(Object), WaitReason,
+                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)), WaitReason,
                           static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
         }
     }
@@ -2373,7 +2370,7 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
         {
             MCLA_LOG_INFO("[main-park] KeWaitForMultipleObjects count={} waitType={} obj0={:08X} lr={:08X}",
                           Count, WaitType,
-                          Objects ? reinterpret_cast<uint32_t>(Objects[0].get()) : 0,
+                          Objects ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Objects[0].get())) : 0,
                           static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
         }
     }

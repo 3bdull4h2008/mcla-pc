@@ -13,6 +13,7 @@ project(mcla VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Local cmake dir for our own configs
@@ -80,6 +81,10 @@ add_executable(mcla
     src/patches.h
     src/gpu_mmio.cpp
     src/gpu_mmio.h
+    src/gpu_cp.cpp
+    src/gpu_cp.h
+    src/gpu_device.cpp
+    src/gpu_device.h
     src/native_renderer.cpp
     src/native_renderer.h
     src/renderer_mode.cpp

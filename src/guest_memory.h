@@ -52,6 +52,15 @@ bool VerifyGuestMemoryViewForTests();
 GuestMemoryView& GetActiveGuestMemoryView();
 void SetActiveGuestMemoryView(GuestMemoryView* view);
 
+// GPU MMIO interception: guest stores/loads landing inside the XGPU register
+// window are routed to these handlers instead of RAM. Installed once during
+// boot patching by mcla::gpu::CpInstallMmioRouting.
+using GpuMmioWriteFn = bool (*)(uint32_t guestAddr, uint32_t value);
+using GpuMmioReadFn = bool (*)(uint32_t guestAddr, uint32_t* outValue);
+void SetGpuMmioHandlers(GpuMmioWriteFn writeFn, GpuMmioReadFn readFn);
+GpuMmioWriteFn GetGpuMmioWriteHandler();
+GpuMmioReadFn GetGpuMmioReadHandler();
+
 // Routed, checked, endian-explicit accessors for the PPC ABI macros.
 inline uint8_t ReadGuestU8(uint32_t guestAddr) {
     uint8_t val = 0;
