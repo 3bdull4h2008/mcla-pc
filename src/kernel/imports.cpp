@@ -44,26 +44,120 @@ PPC_FUNC(__xtl_free)
     ctx.r3.u32 = 1;
 }
 
+// ---- File metadata queries (shared impls, called from the PPC_FUNC wrappers
+// below; these were silent fake-success stubs which made packfile loading fail
+// with "Cannot load archive" before a single byte was ever read) ----
+
+static uint32_t NtQueryInformationFileImpl(uint32_t handle, uint32_t ioStatusAddr, uint32_t bufferAddr, uint32_t length, uint32_t infoClass)
+{
+    // X_FILE_STANDARD_INFORMATION (5): AllocationSize(8) EndOfFile(8)
+    // NumberOfLinks(4) DeletePending(1) Directory(1)
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+    KernelObject* obj = nullptr;
+    if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle))
+    {
+        KernelObject* o = GetKernelObject(handle);
+        if (o && o->IsValid()) obj = o;
+    }
+    FileObject* fileObj = (obj && obj->IsValid()) ? dynamic_cast<FileObject*>(obj) : nullptr;
+
+    if (infoClass == 34 && bufferAddr != 0 && length >= 52 && fileObj)
+    {
+        // X_FILE_NETWORK_OPEN_INFORMATION (NT NETWORK_OPEN_INFORMATION):
+        // Creation/LastAccess/LastWrite/ChangeTime (8 each), AllocationSize(8),
+        // EndOfFile(8), FileAttributes(4). The packfile loader gates on
+        // EndOfFile being the REAL archive size.
+        const uint64_t fileSize = fileObj->fileHandle.size;
+        mem.WriteU64BE(bufferAddr + 0, 0);            // CreationTime
+        mem.WriteU64BE(bufferAddr + 8, 0);            // LastAccessTime
+        mem.WriteU64BE(bufferAddr + 16, 0);           // LastWriteTime
+        mem.WriteU64BE(bufferAddr + 24, 0);           // ChangeTime
+        mem.WriteU64BE(bufferAddr + 32, fileSize);    // AllocationSize
+        mem.WriteU64BE(bufferAddr + 40, fileSize);    // EndOfFile
+        mem.WriteU32BE(bufferAddr + 48, 0x20);        // FILE_ATTRIBUTE_ARCHIVE
+        if (ioStatusAddr)
+        {
+            mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+            mem.WriteU32BE(ioStatusAddr + 4, 52);
+        }
+        MCLA_LOG_INFO("NtQueryInformationFile: NETWORK_OPEN_INFO size={}", fileSize);
+        return STATUS_SUCCESS;
+    }
+
+    if (infoClass == 5 && bufferAddr != 0 && length >= 24 && fileObj)
+    {
+        const uint64_t fileSize = fileObj->fileHandle.size;
+        mem.WriteU64BE(bufferAddr + 0, fileSize);
+        mem.WriteU64BE(bufferAddr + 8, fileSize);
+        mem.WriteU32BE(bufferAddr + 16, 1);
+        mem.WriteU16BE(bufferAddr + 20, 0);
+        if (ioStatusAddr)
+        {
+            mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+            mem.WriteU32BE(ioStatusAddr + 4, 24);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    MCLA_LOG_WARN("NtQueryInformationFile: class={} len={} handleValid={} -> zero-info",
+                  infoClass, length, fileObj != nullptr);
+    if (bufferAddr && length)
+    {
+        const uint32_t n = std::min<uint32_t>(length, 64);
+        for (uint32_t off = 0; off < n; off += 4) mem.WriteU32BE(bufferAddr + off, 0);
+    }
+    if (ioStatusAddr)
+    {
+        mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+        mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
+    }
+    return STATUS_SUCCESS;
+}
+
+static uint32_t NtQueryVolumeInformationFileImpl(uint32_t handle, uint32_t ioStatusAddr, uint32_t bufferAddr, uint32_t length, uint32_t infoClass)
+{
+    (void)handle;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    MCLA_LOG_INFO("NtQueryVolumeInformationFile: class={} len={}", infoClass, length);
+    if (bufferAddr && length)
+    {
+        const uint32_t n = std::min<uint32_t>(length, 64);
+        for (uint32_t off = 0; off < n; off += 4) mem.WriteU32BE(bufferAddr + off, 0);
+    }
+    if (ioStatusAddr)
+    {
+        mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+        mem.WriteU32BE(ioStatusAddr + 4, bufferAddr ? std::min<uint32_t>(length, 64) : 0);
+    }
+    return STATUS_SUCCESS;
+}
+
+static uint32_t NtQueryDirectoryFileImpl(uint32_t handle, uint32_t ioStatusAddr)
+{
+    (void)handle;
+    MCLA_LOG_INFO("NtQueryDirectoryFile -> NO_MORE_FILES");
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    if (ioStatusAddr) mem.WriteU32BE(ioStatusAddr, 0x80000006);
+    return 0x80000006; // STATUS_NO_MORE_FILES
+}
+
 PPC_FUNC(__imp__NtQueryInformationFile)
 {
     // r3=handle, r4=ioStatus, r5=buffer, r6=length, r7=infoClass
-    // Return STATUS_SUCCESS in r3
-    ctx.r3.u32 = 0; // STATUS_SUCCESS
+    ctx.r3.u32 = NtQueryInformationFileImpl(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
 }
 
 PPC_FUNC(__imp__NtQueryVolumeInformationFile)
 {
     // r3=handle, r4=ioStatus, r5=buffer, r6=length, r7=infoClass
-    // Return STATUS_SUCCESS in r3
-    ctx.r3.u32 = 0; // STATUS_SUCCESS
+    ctx.r3.u32 = NtQueryVolumeInformationFileImpl(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
 }
 
 PPC_FUNC(__imp__NtQueryDirectoryFile)
 {
     // r3=handle, r4=event, r5=apcRoutine, r6=apcContext, r7=ioStatus
-    // r8=buffer, r9=length, r10=infoClass, stack=returnSingleEntry, fileIndex, restartScan
-    // Return STATUS_NO_MORE_FILES (0x80000006)
-    ctx.r3.u32 = 0x80000006;
+    ctx.r3.u32 = NtQueryDirectoryFileImpl(ctx.r3.u32, ctx.r7.u32);
 }
 
 void VdHSIOCalibrationLock()
@@ -456,63 +550,6 @@ uint32_t NtClose(uint32_t handle)
     }
 }
 
-uint32_t NtQueryInformationFile(uint32_t handle, uint32_t ioStatus, uint32_t buffer, uint32_t length, uint32_t infoClass)
-{
-    // X_FILE_STANDARD_INFORMATION (5): AllocationSize(8) EndOfFile(8)
-    // NumberOfLinks(4) DeletePending(1) Directory(1). The packfile loader
-    // queries this right after opening an archive; leaving the buffer empty
-    // made the game read garbage sizes and fatal on every .rpf.
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-
-    KernelObject* obj = nullptr;
-    if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle))
-    {
-        obj = GetKernelObject(handle);
-    }
-    FileObject* fileObj = (obj && obj->IsValid()) ? dynamic_cast<FileObject*>(obj) : nullptr;
-
-    if (infoClass == 5 && buffer != 0 && length >= 24 && fileObj)
-    {
-        const uint64_t fileSize = fileObj->fileHandle.size;
-        mem.WriteU64BE(buffer + 0, fileSize);          // AllocationSize
-        mem.WriteU64BE(buffer + 8, fileSize);          // EndOfFile
-        mem.WriteU32BE(buffer + 16, 1);                // NumberOfLinks
-        mem.WriteU16BE(buffer + 20, 0);                // DeletePending=0, Directory=0
-        if (ioStatus != 0) mem.WriteU32BE(ioStatus + 0, STATUS_SUCCESS), mem.WriteU32BE(ioStatus + 4, 24);
-        return STATUS_SUCCESS;
-    }
-
-    MCLA_LOG_WARN("NtQueryInformationFile: class={} len={} handleValid={} -> stub",
-                  infoClass, length, fileObj != nullptr);
-    if (ioStatus != 0) mem.WriteU32BE(ioStatus + 0, STATUS_SUCCESS);
-    return STATUS_SUCCESS;
-}
-
-uint32_t NtQueryDirectoryFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, uint32_t ioStatus, uint32_t buffer, uint32_t length, uint32_t infoClass, uint32_t returnSingleEntry, uint32_t fileIndex, uint32_t restartScan)
-{
-    (void)handle;
-    (void)event;
-    (void)apcRoutine;
-    (void)apcContext;
-    (void)ioStatus;
-    (void)buffer;
-    (void)length;
-    (void)infoClass;
-    (void)returnSingleEntry;
-    (void)fileIndex;
-    (void)restartScan;
-    return 0x80000006; // STATUS_NO_MORE_FILES
-}
-
-uint32_t NtQueryVolumeInformationFile(uint32_t handle, uint32_t ioStatus, uint32_t buffer, uint32_t length, uint32_t infoClass)
-{
-    (void)handle;
-    (void)ioStatus;
-    (void)buffer;
-    (void)length;
-    (void)infoClass;
-    return STATUS_SUCCESS;
-}
 
 uint32_t NtSetInformationFile(uint32_t handle, XIO_STATUS_BLOCK* ioStatus, void* buffer, uint32_t length, uint32_t infoClass)
 {
@@ -749,19 +786,42 @@ void ExFreePool()
     LOG_UTILITY("!!! STUB !!!");
 }
 
-void NtQueryInformationFile()
+// NtQueryInformationFile: real typed implementation lives above (near
+// NtCreateFile) - it answers X_FILE_STANDARD_INFORMATION with true sizes.
+
+// NOTE: no-arg stubs for these three used to sit here UNWIRED - the game's
+// metadata queries fell through to generated weak defaults returning garbage,
+// which is exactly why packfile loading reported "Cannot load archive" without
+// a single read. All three are typed + hooked now.
+
+uint32_t NtQueryVolumeInformationFile(uint32_t handle, XIO_STATUS_BLOCK* ioStatus, void* fsInfo, uint32_t length, uint32_t infoClass)
 {
-    LOG_UTILITY("!!! STUB !!!");
+    (void)handle;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    MCLA_LOG_INFO("NtQueryVolumeInformationFile: class={} len={}", infoClass, length);
+    if (fsInfo)
+    {
+        // zero-filled volume info = "empty fixed volume"; refine per class when
+        // boot proves it matters
+        const uint32_t addr = reinterpret_cast<uint32_t>(fsInfo);
+        const uint32_t n = std::min<uint32_t>(length, 64);
+        for (uint32_t off = 0; off < n; off += 4) mem.WriteU32BE(addr + off, 0);
+    }
+    if (ioStatus)
+    {
+        ioStatus->Status.set(STATUS_SUCCESS);
+        ioStatus->Information.set(fsInfo ? std::min<uint32_t>(length, 64) : 0);
+    }
+    return STATUS_SUCCESS;
 }
 
-void NtQueryVolumeInformationFile()
+uint32_t NtQueryDirectoryFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, XIO_STATUS_BLOCK* ioStatus, void* fileInformation, uint32_t length, uint32_t infoClass, uint32_t singleEntry, uint32_t dirIndex, uint32_t restartScan)
 {
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void NtQueryDirectoryFile()
-{
-    LOG_UTILITY("!!! STUB !!!");
+    (void)handle; (void)event; (void)apcRoutine; (void)apcContext;
+    (void)fileInformation; (void)length; (void)infoClass; (void)singleEntry; (void)dirIndex; (void)restartScan;
+    MCLA_LOG_INFO("NtQueryDirectoryFile: class={}", infoClass);
+    if (ioStatus) ioStatus->Status.set(0x80000006); // STATUS_NO_MORE_FILES
+    return 0x80000006;
 }
 
 uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, XIO_STATUS_BLOCK* ioStatus, void* buffer, uint32_t length, be<uint64_t>* byteOffset, uint32_t* key)
@@ -782,6 +842,19 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32
     {
         if (ioStatus) ioStatus->Status.set(0xC0000005);
         return 0xC0000005;
+    }
+
+    // SECURITY: clamp length so the write stays inside the guest window -
+    // Translate() only validates the buffer START, a huge length would
+    // otherwise write out-of-bounds host memory past the window end.
+    {
+        auto& heapForBounds = mcla::kernel::GuestMemoryHeap::Instance();
+        const uint64_t winSize = heapForBounds.Size();
+        const uint64_t bufOff = reinterpret_cast<uint32_t>(buffer);
+        if (bufOff < winSize && length > winSize - bufOff)
+        {
+            length = static_cast<uint32_t>(winSize - bufOff);
+        }
     }
 
     // Resolve the kernel file object and serve real bytes from the VFS.
@@ -808,12 +881,7 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32
             offset = fileObj->fileHandle.position;
         }
         ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
-        MCLA_LOG_INFO("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes, head {:02X} {:02X} {:02X} {:02X}",
-                      handle, offset, length, bytesRead,
-                      bytesRead >= 1 ? reinterpret_cast<uint8_t*>(hostPtr)[0] : 0,
-                      bytesRead >= 2 ? reinterpret_cast<uint8_t*>(hostPtr)[1] : 0,
-                      bytesRead >= 3 ? reinterpret_cast<uint8_t*>(hostPtr)[2] : 0,
-                      bytesRead >= 4 ? reinterpret_cast<uint8_t*>(hostPtr)[3] : 0);
+        MCLA_LOG_DEBUG("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes", handle, offset, length, bytesRead);
     }
     else
     {
