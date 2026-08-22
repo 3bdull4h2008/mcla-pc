@@ -1288,8 +1288,13 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                     if (fn)
                     {
                         PPCContext cbCtx{};
-                        cbCtx.r3.u32 = currentUserData; // r3 = userData (GPU context pointer)
-                        cbCtx.r4.u32 = 0; // frame counter
+                        // r3 = INTERRUPT TYPE, not userData (decoded from
+                        // generated sub_82411478): 0 = graphics interrupt ->
+                        // runs the command-buffer processor Function_82419718,
+                        // 1 = vsync event -> releases the frame semaphore.
+                        // r4 carries the userData (GPU context pointer).
+                        cbCtx.r3.u32 = 0;
+                        cbCtx.r4.u32 = currentUserData; // GPU context pointer
                         cbCtx.r5.u32 = 0; // field counter
                         cbCtx.r13.u32 = 0x8F200000; // thread block pointer (from boot_host.cpp)
                         cbCtx.r1.u32 = 0x8F000000; // stack top (from boot_host.cpp)
