@@ -297,3 +297,17 @@ PPC_FUNC(sub_82411618)
         MCLA_LOG_INFO("HELPER-thunk sub_82411618 hit #{} r3={:08X}", n, ctx.r3.u32);
     __imp__sub_82411618(ctx, base);
 }
+
+// PRIMARY CHOKE POINT (reverser-verified): every PM4 ring append tail flows
+// through sub_82411640 (prim-math + clamp + fence). Args captured for draw
+// reconstruction: dev=r3, plus descriptor/size regs.
+PPC_FUNC_IMPL(__imp__sub_82411640);
+static std::atomic<uint32_t> s_h11640{0};
+PPC_FUNC(sub_82411640)
+{
+    const uint32_t n = s_h11640.fetch_add(1) + 1;
+    if (n <= 16 || (n % 5000) == 0)
+        MCLA_LOG_INFO("HELPER-thunk sub_82411640 hit #{} dev={:08X} r4={:08X} r5={:08X} r6={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+    __imp__sub_82411640(ctx, base);
+}
