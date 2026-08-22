@@ -1521,6 +1521,14 @@ uint32_t MmAllocatePhysicalMemoryEx
 {
     LOGF_UTILITY("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}", flags, size, protect, minAddress, maxAddress, alignment);
     void* ptr = g_userHeap.AllocPhysical(size, alignment);
+    if (!ptr)
+    {
+        static std::atomic<uint32_t> s_allocFails{0};
+        if (s_allocFails.fetch_add(1) < 50)
+            MCLA_LOG_WARN("MmAllocatePhysicalMemoryEx: FAILED size={:#x} align={:#x} (count={})",
+                          size, alignment, s_allocFails.load());
+        return 0;
+    }
     uint32_t guestAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
     MmTrackAllocationSize(guestAddr, size);
     return guestAddr;
