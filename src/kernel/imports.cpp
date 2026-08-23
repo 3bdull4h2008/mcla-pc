@@ -1329,16 +1329,15 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                     {
                         PPCContext cbCtx{};
                         // r3 = INTERRUPT TYPE, not userData (decoded from
-                        // generated sub_82411478): 0 = graphics interrupt ->
-                        // runs the command-buffer processor Function_82419718,
-                        // 1 = vsync event -> releases the frame semaphore /
-                        // swap callback (77.cpp:19460-19526).
-                        // 2026-08-23 park-sampler evidence: main thread spins
-                        // in the VBlank/present state machine waiting for a
-                        // swap release that never comes when only type-0 is
-                        // delivered. Our timer IS the vertical blank -> send
-                        // type 1.
-                        cbCtx.r3.u32 = 1;
+                        // generated sub_82411478). Xenia ground truth: vblank
+                        // delivers r3=0 (graphics/vblank branch — MarkVblank,
+                        // graphics_system.cc:97-118); r3=1 fires ONLY when the
+                        // CP drains a PM4_INTERRUPT packet
+                        // (command_processor.cc:900-913), which we never
+                        // synthesize. 2026-08-23 session-5 correction of the
+                        // earlier r3=1 flip: our timer is the vertical blank,
+                        // so deliver type 0.
+                        cbCtx.r3.u32 = 0;
                         cbCtx.r4.u32 = currentUserData; // GPU context pointer
                         cbCtx.r5.u32 = 0; // field counter
                         cbCtx.r13.u32 = 0x8F200000; // thread block pointer (from boot_host.cpp)
