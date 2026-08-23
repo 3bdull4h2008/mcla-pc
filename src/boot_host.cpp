@@ -317,49 +317,6 @@ namespace
         return buf;
     }
 
-    // Exact owner resolution: PPCFuncMappings host pointers are true function
-    // starts. Binary-search the greatest start <= pc and list EVERY guest VA
-    // folded onto it (ICF clones share one body). Returns owners as
-    // "82429570+82429988" style; delta appended separately.
-    const char* ExactOwners(uint64_t hostAddr, uint64_t* deltaOut)
-    {
-        static thread_local char buf[256];
-        static std::vector<std::pair<uintptr_t, uint32_t>> s_map;
-        static std::once_flag s_once;
-        std::call_once(s_once, []() {
-            for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
-                s_map.emplace_back((uintptr_t)PPCFuncMappings[i].host, PPCFuncMappings[i].guest);
-            std::sort(s_map.begin(), s_map.end());
-        });
-        if (s_map.empty())
-        {
-            *deltaOut = 0;
-            return "?";
-        }
-        size_t lo = 0;
-        size_t hi = s_map.size();
-        while (lo + 1 < hi)
-        {
-            const size_t mid = (lo + hi) / 2;
-            if (s_map[mid].first <= (uintptr_t)hostAddr)
-                lo = mid;
-            else
-                hi = mid;
-        }
-        const uintptr_t start = s_map[lo].first;
-        *deltaOut = (uintptr_t)hostAddr - start;
-        size_t n = 0;
-        buf[0] = '\0';
-        for (size_t i = lo; i < s_map.size() && s_map[i].first == start && n < 6; ++i, ++n)
-        {
-            const int written = std::snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
-                                              "%s%08x", n ? "+" : "", s_map[i].second);
-            if (written < 0 || (size_t)written >= sizeof(buf) - strlen(buf))
-                break;
-        }
-        return buf;
-    }
-
     int FilterCapture(EXCEPTION_POINTERS* info)
     {
         {
@@ -798,34 +755,43 @@ void Start(uint32_t entryGuest)
                 BootReportInfo(lbuf);
             }
             uint64_t lastRip = 0;
+            // Per-PC dwell histogram over 0x10-byte host-RVA buckets
+            // (session-5: sampled PCs were our own guest_memory accessors —
+            // the histogram quantifies which accessor dominates).
+            std::unordered_map<uint32_t, uint32_t> hist;
+            uint32_t samples = 0;
             for (int i = 0; i < 120 && !g_bootDone.load(); ++i)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 CONTEXT tc;
                 std::memset(&tc, 0, sizeof(tc));
-                tc.ContextFlags = CONTEXT_CONTROL;
+                tc.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
                 if (SuspendThread(workerHandle) == (DWORD)-1)
                     break;
                 const bool ok = GetThreadContext(workerHandle, &tc) != 0;
-                uint64_t rets[5] = {0, 0, 0, 0, 0};
+                uint64_t rets[3] = {0, 0, 0};
                 if (ok)
                 {
-                    for (size_t k = 0; k < 5; ++k)
+                    for (size_t k = 0; k < 3; ++k)
                     {
                         const void* sp = (const void*)(tc.Rsp + 8 * (k + 1));
                         if (!IsBadReadPtr(sp, sizeof(uint64_t)))
                             rets[k] = *(const uint64_t*)sp;
                     }
+                    ++samples;
+                    if (g_moduleBase != 0 && tc.Rip >= g_moduleBase)
+                        ++hist[uint32_t((tc.Rip - g_moduleBase) >> 4)];
                 }
                 ResumeThread(workerHandle);
                 if (!ok || tc.Rip == lastRip)
                     continue;
                 lastRip = tc.Rip;
-                // Exact owner via PPCFuncMappings binary search + guest driver
-                // state. Publish chain: **(u32*)0x82000864 = device VA.
-                uint64_t ripDelta = 0;
-                const char* owners = ExactOwners(tc.Rip, &ripDelta);
-                uint32_t dev = 0, slot = 0, cursor = 0, vbl = 0, flg = 0, pollerCtx = 0, stD0 = 0, ud = 0, ud1 = 0;
+                // Guest driver state via the pinned device chain
+                // **(u32**)0x82000864 (gpu_device.cpp overrides use it), plus
+                // VdSetGraphicsInterruptCallback userData object. The old
+                // pollerCtx/D0 probe (0x82839254) read a DIFFERENT object —
+                // retired per session-5.
+                uint32_t dev = 0, slot = 0, cursor = 0, vbl = 0, flg = 0, ud = 0, ud1 = 0;
                 {
                     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
                     if (mem.ReadU32BE(0x82000864, &slot) && slot != 0)
@@ -836,23 +802,61 @@ void Start(uint32_t entryGuest)
                         (void)mem.ReadU32BE(dev + 21648, &vbl);
                         (void)mem.ReadU32BE(dev + 10942, &flg);
                     }
-                    if (mem.ReadU32BE(0x82839254, &pollerCtx) && pollerCtx != 0)
-                        (void)mem.ReadU32BE(pollerCtx + 0xD0, &stD0);
-                    // VdSetGraphicsInterruptCallback userData object (guest-chosen).
                     if (mem.ReadU32BE(0xA0003080, &ud) && ud != 0)
                         (void)mem.ReadU32BE(ud, &ud1);
                 }
+                // Live guest state of the parked main thread: g_faultCtx points
+                // at BootWorker's PPCContext while it runs guest code. Context
+                // carries arg/TLS regs only (PPC_CONFIG_NON_VOLATILE_AS_LOCAL);
+                // callee-saved r30/r31 + lr sit in the guest frame per the
+                // generated prologue convention (stw lr,-8(r1); std
+                // r30,-24(r1); std r31,-16(r1)) — read as raw slots.
+                uint32_t gr3 = 0, gr4 = 0, gr13 = 0, glr = 0;
+                uint32_t swM8 = 0, swM16 = 0, swM24 = 0, tls0 = 0;
+                if (g_faultCtx != nullptr)
+                {
+                    gr3 = g_faultCtx->r3.u32;
+                    gr4 = g_faultCtx->r4.u32;
+                    gr13 = g_faultCtx->r13.u32; // TLS/PCR base
+                    glr = (uint32_t)g_faultCtx->lr;
+                    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+                    if (gr13 != 0)
+                        (void)mem.ReadU32BE(gr13 + 0x0, &tls0);
+                    const uint32_t sp = g_faultCtx->r1.u32;
+                    if (sp != 0)
+                    {
+                        (void)mem.ReadU32BE(sp - 8, &swM8);   // saved lr slot
+                        (void)mem.ReadU32BE(sp - 16, &swM16); // saved r31 slot
+                        (void)mem.ReadU32BE(sp - 24, &swM24); // saved r30 slot
+                    }
+                }
                 char rbuf[3][64];
                 char lbuf[1024];
-                std::snprintf(lbuf, sizeof(lbuf), "PARK-SAMPLE rawrip=%llx nf=%s own=%s d=+0x%llx s0=%s s1=%s s2=%s dev=%08X cur=%08X vbl=%u flg=%u pctx=%08X D0=%u ud=%08X ud1=%08X",
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "PARK-SAMPLE rawrip=%llx nf=%s s0=%s s1=%s s2=%s dev=%08X cur=%08X vbl=%u flg=%u ud=%08X ud1=%08X"
+                              " | r3=%08X r4=%08X lr=%08X r13=%08X tls0=%08X [r1-8]=%08X [r1-16]=%08X [r1-24]=%08X",
                               (unsigned long long)tc.Rip,
                               NearestFunctionName(tc.Rip),
-                              owners,
-                              (unsigned long long)ripDelta,
                               (std::snprintf(rbuf[0], sizeof(rbuf[0]), "%s", NearestFunctionName(rets[0])), rbuf[0]),
                               (std::snprintf(rbuf[1], sizeof(rbuf[1]), "%s", NearestFunctionName(rets[1])), rbuf[1]),
                               (std::snprintf(rbuf[2], sizeof(rbuf[2]), "%s", NearestFunctionName(rets[2])), rbuf[2]),
-                              dev, cursor, vbl, flg, pollerCtx, stD0, ud, ud1);
+                              dev, cursor, vbl, flg, ud, ud1,
+                              gr3, gr4, glr, gr13, tls0, swM8, swM16, swM24);
+                BootReportInfo(lbuf);
+            }
+            {
+                char lbuf[2048];
+                size_t off = (size_t)std::snprintf(lbuf, sizeof(lbuf), "PARK-HIST samples=%u buckets=%zu top:", samples, hist.size());
+                std::vector<std::pair<uint32_t, uint32_t>> top(hist.begin(), hist.end());
+                std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
+                for (size_t k = 0; k < top.size() && k < 16 && off < sizeof(lbuf); ++k)
+                {
+                    const int w = std::snprintf(lbuf + off, sizeof(lbuf) - off, " %06x=%u",
+                                                (unsigned)(top[k].first * 16), top[k].second);
+                    if (w < 0)
+                        break;
+                    off += (size_t)w;
+                }
                 BootReportInfo(lbuf);
             }
         }).detach();
