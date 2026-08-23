@@ -904,6 +904,56 @@ PPC_FUNC(sub_8244EE00)
     __imp__sub_8244EE00(ctx, base);
 }
 
+// ENQUEUE-CHOOSER census: Function_821BCB10 decides inline-execute vs
+// ring-A vs ring-B push vs reject (Ghidra: [obj+4]!=0 -> inline ret -1;
+// ring full -> ret 0 = silent dead-end; else slot id). MINIMAL form:
+// registers only - a prior version that read guest memory here crashed the
+// first invocation (fault sub_821BCB10+0x7B, the vtable-dispatch region).
+PPC_FUNC_IMPL(__imp__sub_821BCB10);
+static std::atomic<uint32_t> s_hBCB10{0};
+PPC_FUNC(sub_821BCB10)
+{
+    const uint32_t n = s_hBCB10.fetch_add(1) + 1;
+    const uint32_t a0 = ctx.r3.u32;
+    const uint32_t a6 = ctx.r7.u32;
+    __imp__sub_821BCB10(ctx, base);
+    if (n <= 16 || (n % 500) == 0)
+        MCLA_LOG_INFO("ENQ sub_821BCB10 #{} a0={:08X} cb={:08X} -> r3={:08X}",
+                      n, a0, a6, ctx.r3.u32);
+}
+
+// INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
+// (the [obj+4]!=0 path). If this fires for op tag=4, the task ran inline and
+// its own completion step is what silently failed.
+PPC_FUNC_IMPL(__imp__sub_821BC140);
+static std::atomic<uint32_t> s_hBC140{0};
+PPC_FUNC(sub_821BC140)
+{
+    const uint32_t n = s_hBC140.fetch_add(1) + 1;
+    if (n <= 16 || (n % 2000) == 0)
+        MCLA_LOG_INFO("INLINE-EXEC sub_821BC140 #{} a0={:08X} a1={:08X} lr={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32, ctx.lr);
+    __imp__sub_821BC140(ctx, base);
+}
+
+// RING-B CONSUMER census: threads #14/#15 run Function_821BC910(arg=0/1).
+// Entry = thread start; RETURN = one full wait->pop->maybe-execute cycle
+// completed. If returns happen but INLINE-EXEC stays 0, the consumer woke,
+// popped, and SKIPPED (slot[0x60C]==0 or empty slot). If no return after the
+// wake release, our host semaphore wake is broken for this handle.
+PPC_FUNC_IMPL(__imp__sub_821BC910);
+static std::atomic<uint32_t> s_hBC910in{0};
+static std::atomic<uint32_t> s_hBC910out{0};
+PPC_FUNC(sub_821BC910)
+{
+    const uint32_t n = s_hBC910in.fetch_add(1) + 1;
+    if (n <= 8)
+        MCLA_LOG_INFO("RINGB-CONSUMER sub_821BC910 ENTER #{} arg={:08X}", n, ctx.r3.u32);
+    __imp__sub_821BC910(ctx, base);
+    const uint32_t d = s_hBC910out.fetch_add(1) + 1;
+    MCLA_LOG_INFO("RINGB-CONSUMER CYCLE #{} r3={:08X}", d, ctx.r3.u32);
+}
+
 // ---------------------------------------------------------------------------
 // TU83 DRIVER-WORKER census: sub_824569C8 is the worker loop the main guest
 // thread parks inside (sibling 824569C4 = empty padding stub). Its global
