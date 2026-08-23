@@ -719,3 +719,117 @@ PPC_FUNC(sub_82411928)
     if (d <= 12 || (d % 2000) == 0)
         MCLA_LOG_INFO("DOORBELL sub_82411928 RETURNED #{}", d);
 }
+
+// ---------------------------------------------------------------------------
+// E98 census (2026-08-23 session 9): sub_82411E94 is an EMPTY padding stub;
+// the real wait body is sibling sub_82411E98 (77.cpp:21047-21170), decoded:
+//   r4=needed, dev=r3; put=dev[+10908]; pub=*(*(dev+10896)+0)
+//   early-exit r4==0 | free>=used | special (r7&0xFF)==0 && needed==put &&
+//   dev[+13232]==0 -> sub_82412710; else wait loop: init ctx via
+//   sub_82412EA0, poll sub_82412F98 (busy r3=1 keeps looping), recheck
+//   needed > pub, destroy ctx via sub_82412ED0.
+// Persistent stall shape: needed > published at every recheck. Census pins
+// WHICH device spins, the exact predicate words, and THIS thread's progress
+// counter (F98's gate input) - discriminates wrong-device mirrors vs frozen
+// per-thread progress. Also registers every waiting device so mirror
+// maintenance covers it.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82411E98);
+static std::atomic<uint32_t> s_h11E98{0};
+static std::atomic<uint32_t> s_h11E98done{0};
+PPC_FUNC(sub_82411E98)
+{
+    const uint32_t n = s_h11E98.fetch_add(1) + 1;
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t needed = ctx.r4.u32;
+    const uint32_t arg5 = ctx.r5.u32;
+    const uint32_t flags = ctx.r7.u32 & 0xFF;
+    if (dev != 0)
+    {
+        mcla::gpu::CpAttachDriverCtx(dev);
+    }
+    uint32_t put = 0, subctx = 0, pub0 = 0, flag13232 = 0, pcBlk = 0, pcVal = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(dev + 10908, &put);
+        if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0)
+        {
+            (void)mem.ReadU32BE(subctx + 0, &pub0);
+        }
+        (void)mem.ReadU32BE(dev + 13232, &flag13232);
+        if (PPCContext* pctx = GetPPCContext())
+        {
+            const uint32_t tls = pctx->r13.u32;
+            if (tls != 0 && mem.ReadU32BE(tls + 256, &pcBlk) && pcBlk != 0)
+            {
+                (void)mem.ReadU32BE(pcBlk + 88, &pcVal);
+            }
+        }
+    }
+    // Same expression as the generated compare (u32 wraparound semantics).
+    const bool waitsAtEntry = needed != 0 &&
+                              ((put - needed) < (put - pub0));
+    if (n <= 16 || (n % 500) == 0)
+    {
+        MCLA_LOG_INFO("E98 #{:04X} dev={:08X} need={:08X} put={:08X} pub={:08X} "
+                      "f13232={} flg={} wait={} a5={:08X} pc={}:{}",
+                      n, dev, needed, put, pub0, flag13232 != 0, flags,
+                      waitsAtEntry ? 1 : 0, arg5, pcBlk, pcVal);
+    }
+    __imp__sub_82411E98(ctx, base);
+    const uint32_t d = s_h11E98done.fetch_add(1) + 1;
+    if (d <= 16 || (d % 500) == 0)
+        MCLA_LOG_INFO("E98 RETURNED #{}", d);
+}
+
+// ---------------------------------------------------------------------------
+// FLIP-PROCESSOR census: sub_82419718 runs from the vsync ISR type-0 branch
+// once gate [0x7FC86544]&1 is set (77.cpp:19534-19547). Per session-5 RE:
+// drains flip-request entries at dev[+16572+i*8], MMIO store 0x7FCE6110 per
+// entry, callback dev[+16544]. Census proves the gate path executes and dumps
+// queue head + present-callback slot.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82419718);
+static std::atomic<uint32_t> s_h19718{0};
+PPC_FUNC(sub_82419718)
+{
+    const uint32_t n = s_h19718.fetch_add(1) + 1;
+    const uint32_t dev = ctx.r3.u32;
+    uint32_t cb = 0, q0 = 0, q1 = 0, q2 = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(dev + 16544, &cb);
+        (void)mem.ReadU32BE(dev + 16572, &q0);
+        (void)mem.ReadU32BE(dev + 16580, &q1);
+        (void)mem.ReadU32BE(dev + 16588, &q2);
+    }
+    if (n <= 12 || (n % 2000) == 0)
+        MCLA_LOG_INFO("FLIP sub_82419718 #{} dev={:08X} cb={:08X} q[0..2]={:08X}/{:08X}/{:08X}",
+                      n, dev, cb, q0, q1, q2);
+    __imp__sub_82419718(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// WAIT-HELPER census: sub_82135DC0(handle=r3, timeoutMs=r4, alertable=r5)
+// wraps NtWaitForSingleObjectEx in a retry-on-timeout loop
+// (ppc_recomp.0.cpp:18590-18654). PARK-SAMPLE caught the main thread parked
+// inside it on handle C9ADB800 with ~unit timeout - this pins handle,
+// timeout, alertability, and result distribution (257=STATUS_TIMEOUT spin).
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82135DC0);
+static std::atomic<uint32_t> s_h135DC0{0};
+static std::atomic<uint32_t> s_h135DC0done{0};
+PPC_FUNC(sub_82135DC0)
+{
+    const uint32_t n = s_h135DC0.fetch_add(1) + 1;
+    const uint32_t handle = ctx.r3.u32;
+    const uint32_t timeoutArg = ctx.r4.u32;
+    const uint32_t alertable = ctx.r5.u32 & 0xFF;
+    if (n <= 12 || (n % 1000) == 0)
+        MCLA_LOG_INFO("WAITHELP sub_82135DC0 #{} h={:08X} t={} al={}",
+                      n, handle, timeoutArg, alertable);
+    __imp__sub_82135DC0(ctx, base);
+    const uint32_t d = s_h135DC0done.fetch_add(1) + 1;
+    if (d <= 12 || (d % 1000) == 0)
+        MCLA_LOG_INFO("WAITHELP RETURNED #{} r3={:08X} (257=timeout)", d, ctx.r3.u32);
+}

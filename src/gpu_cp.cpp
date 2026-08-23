@@ -25,6 +25,11 @@ constexpr uint32_t kWptrByteOffset = 0x01C5u * 4u; // 0x714
 // Xenia treats this value as "no doorbell rung yet".
 constexpr uint32_t kWptrSentinel = 0xBAADF00Du;
 
+// Register-file shadow over the 64 KB MMIO window (xenia persists writes and
+// serves unhandled reads from it, graphics_system.cc:207-223).
+constexpr size_t kMmioRegCount = kMmioSize / 4u;
+std::atomic<uint32_t> g_regShadow[kMmioRegCount]{};
+
 // Type-3 opcodes we give special treatment (values per xenia gpu/xenos.h).
 constexpr uint32_t kPm4XeSwap = 0x64; // Xenia-invented swap packet
 
@@ -32,9 +37,28 @@ std::atomic<uint32_t> g_ringBase{0};        // guest phys addr of primary ring
 std::atomic<uint32_t> g_ringCapDwords{0};   // ring size in dwords
 std::atomic<uint32_t> g_rptrIndex{0};       // read pointer, dword index
 std::atomic<uint32_t> g_writebackAddr{0};   // where rptr is published (BE)
-std::atomic<uint32_t> g_driverDevCtx{0};    // GuestDevice VA (see CpAttachDriverCtx)
 std::atomic<uint32_t> g_pushWatermark{0};   // consumed-through VA (driver space)
 std::atomic<uint32_t> g_progressBlk{0};     // submitting thread's *(r13+256) block
+
+// All GuestDevices seen driving the ring (create hook + reserver/waiter
+// censuses attach). MCLA binds a SECOND GuestDevice (A0009100) of the same
+// class at create (sub_82413588); waiters poll THEIR OWN dev[+10896] ctx, so
+// mirror maintenance must cover every device, not just the last attacher.
+constexpr size_t kMaxDevices = 4;
+std::atomic<uint32_t> g_devices[kMaxDevices]{};
+static std::atomic<uint32_t> s_attachedCount{0};
+
+template <typename Fn>
+void ForEachDevice(Fn&& fn)
+{
+    for (auto& slot : g_devices)
+    {
+        if (const uint32_t dev = slot.load(std::memory_order_relaxed); dev != 0)
+        {
+            fn(dev);
+        }
+    }
+}
 
 std::atomic<uint64_t> g_drainCount{0};
 std::atomic<uint64_t> g_swapCount{0};
@@ -57,22 +81,25 @@ void PublishRptr()
     {
         (void)mem.WriteU32BE(wb, rptr);
     }
-    // Keep the driver's local ring-context mirrors in sync. The ctx[+0]/[+4]
-    // mirrors live in the DRIVER push-buffer address space (guest waiters
-    // sub_82411E94/barriers compare them against dev[+10908]-derived put
-    // cursors), so they track our consumption watermark — not the kernel-ring
-    // dword index (that is the phys write-back word above, sub_82411218's
-    // view). On HW the write-back + interrupt handler maintain all of these.
-    const uint32_t dev = g_driverDevCtx.load(std::memory_order_relaxed);
+    // Keep every known driver's local ring-context mirrors in sync. The
+    // ctx[+0]/[+4] mirrors live in the DRIVER push-buffer address space
+    // (guest waiters sub_82411E98/barriers compare them against
+    // dev[+10908]-derived put cursors), so they track our consumption
+    // watermark — not the kernel-ring dword index (that is the phys
+    // write-back word above, sub_82411218's view). On HW the write-back +
+    // interrupt handler maintain all of these.
     const uint32_t mark = g_pushWatermark.load(std::memory_order_relaxed);
-    if (dev != 0 && mark != 0)
+    if (mark != 0)
     {
-        uint32_t subctx = 0;
-        if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0)
-        {
-            (void)mem.WriteU32BE(subctx + 0, mark);
-            (void)mem.WriteU32BE(subctx + 4, mark);
-        }
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        ForEachDevice([&mem, mark](uint32_t dev) {
+            uint32_t subctx = 0;
+            if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0)
+            {
+                (void)mem.WriteU32BE(subctx + 0, mark);
+                (void)mem.WriteU32BE(subctx + 4, mark);
+            }
+        });
     }
 }
 
@@ -227,7 +254,31 @@ void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2)
 
 void CpAttachDriverCtx(uint32_t devVA)
 {
-    g_driverDevCtx.store(devVA, std::memory_order_relaxed);
+    if (devVA == 0)
+    {
+        return;
+    }
+    for (auto& slot : g_devices)
+    {
+        if (slot.load(std::memory_order_relaxed) == devVA)
+        {
+            return; // already registered
+        }
+    }
+    for (auto& slot : g_devices)
+    {
+        uint32_t expected = 0;
+        if (slot.compare_exchange_strong(expected, devVA, std::memory_order_relaxed))
+        {
+            const uint32_t n = s_attachedCount.fetch_add(1) + 1;
+            MCLA_LOG_INFO("CP: attached GuestDevice {:08X} ({}/{})", devVA, n, kMaxDevices);
+            if (n == kMaxDevices)
+            {
+                MCLA_LOG_WARN("CP: device registry full - further devices untracked");
+            }
+            return;
+        }
+    }
 }
 
 void CpConsumePushWindow(uint32_t endVA, uint32_t dwords)
@@ -263,12 +314,11 @@ void CpVblankBump(uint32_t amount)
 
     // Mirror maintenance: on HW the CP fetches everything the driver writes
     // almost immediately, so the consumer cursor chases the producer cursor.
-    // Guest waiters (sub_82411E94 etc.) compare ctx[+0]/[+4] against
+    // Guest waiters (sub_82411E98 etc.) compare ctx[+0]/[+4] against
     // dev[+10908]-derived put values; feeding them our stale capture
-    // watermark deadlocks once writes bypass the reserver seam.
-    const uint32_t dev = g_driverDevCtx.load(std::memory_order_relaxed);
-    if (dev != 0)
-    {
+    // watermark deadlocks once writes bypass the reserver seam. Maintain
+    // EVERY attached device - each waiter polls its own dev[+10896] ctx.
+    ForEachDevice([&mem](uint32_t dev) {
         uint32_t subctx = 0;
         uint32_t put = 0;
         if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0 &&
@@ -277,7 +327,7 @@ void CpVblankBump(uint32_t amount)
             (void)mem.WriteU32BE(subctx + 0, put);
             (void)mem.WriteU32BE(subctx + 4, put);
         }
-    }
+    });
 
     if (blk == 0 || amount == 0)
         return;
@@ -313,14 +363,27 @@ bool CpMmioWrite(uint32_t guestAddr, uint32_t value)
         return true;
     }
 
-    // Other registers the driver pokes (observed in generated code:
-    // reg 0x1844 kick, reg 0x0C94 = 7). Log first touches only.
-    static std::atomic<uint32_t> regSeenMask{0};
+    // Xenia persists every register write in its register file and serves
+    // later reads from it (GraphicsSystem::WriteRegister,
+    // graphics_system.cc:207-223). Mirroring that: store into the shadow so
+    // guest read-back sees what it wrote (interrupt-enable bits included).
     const uint32_t regIndex = offset >> 2;
+    if (regIndex < kMmioRegCount)
+    {
+        g_regShadow[regIndex].store(value, std::memory_order_relaxed);
+    }
+
+    // First-touch-per-register logging (low regs tracked by bitmask; high
+    // regs are rare enough to log every store, matching prior behavior).
+    static std::atomic<uint32_t> regSeenMask{0};
     const uint32_t bit = regIndex < 32 ? (1u << regIndex) : 0;
     if (!bit || !(regSeenMask.fetch_or(bit) & bit))
     {
-        MCLA_LOG_INFO("CP: MMIO write reg={:04X} offset={:04X} value={:08X}", regIndex, offset, value);
+        static std::atomic<uint32_t> highRegLogCount{0};
+        if (bit || (highRegLogCount.fetch_add(1) % 200) == 0)
+        {
+            MCLA_LOG_INFO("CP: MMIO write reg={:04X} offset={:04X} value={:08X}", regIndex, offset, value);
+        }
     }
     return true;
 }
@@ -331,13 +394,95 @@ bool CpMmioRead(uint32_t guestAddr, uint32_t* outValue)
     {
         return false;
     }
-    static std::atomic<bool> warnedRead{false};
-    if (!warnedRead.exchange(true))
+
+    const uint32_t offset = guestAddr - kMmioBase;
+    const uint32_t regIndex = offset >> 2;
+
+    // Per-register first-read logging for EVERY read (hardcoded + shadow):
+    // the old warn-once-global flag hid all poll addresses after the first.
     {
-        MCLA_LOG_WARN("CP: MMIO read @ {:08X} returning 0 (status registers unimplemented)",
-                      guestAddr);
+        static std::atomic<uint32_t> slotReg[16]{};
+        static std::atomic<uint32_t> slotBusy[16]{};
+        const uint32_t slot = regIndex % 16;
+        uint32_t expected = 0;
+        bool wasEmpty = slotBusy[slot].load(std::memory_order_relaxed) == 0;
+        if (wasEmpty &&
+            slotBusy[slot].compare_exchange_strong(expected, 1u, std::memory_order_relaxed))
+        {
+            slotReg[slot].store(regIndex, std::memory_order_relaxed);
+            MCLA_LOG_WARN("CP: MMIO read reg={:04X} offset={:04X} (first touch)", regIndex, offset);
+        }
+        else if (!wasEmpty && slotReg[slot].load(std::memory_order_relaxed) != regIndex)
+        {
+            // Slot occupied by another reg: rotate once per 500 distinct-ish
+            // events so rare regs still surface without spamming hot polls.
+            static std::atomic<uint32_t> rotateCounter{0};
+            if ((rotateCounter.fetch_add(1, std::memory_order_relaxed) % 500) == 0)
+            {
+                slotReg[slot].store(regIndex, std::memory_order_relaxed);
+                MCLA_LOG_WARN("CP: MMIO read reg={:04X} offset={:04X} (rotate)", regIndex, offset);
+            }
+        }
     }
-    *outValue = 0;
+
+    // Hardcoded status reads, mirroring xenia GraphicsSystem::ReadRegister
+    // (graphics_system.cc:184-201). Reg 0x1951 bit0 = vblank pending - the
+    // game's own vsync ISR gates its flip-request processor on exactly this
+    // word ([0x7FC80000+0x6544]&1, ppc_recomp.77.cpp:19534-19542); answering
+    // 0 starves the present path.
+    switch (regIndex)
+    {
+    case 0x0F00: // RB_EDRAM_TIMING
+        *outValue = 0x08100748u;
+        return true;
+    case 0x0F01: // RB_BC_CONTROL
+        *outValue = 0x0000200Eu;
+        return true;
+    case 0x194C: // R500_D1MODE_V_COUNTER (720 visible lines)
+        *outValue = 0x000002D0u;
+        return true;
+    case 0x1951: // interrupt status: vblank pending
+        *outValue = 1u;
+        return true;
+    case 0x1961: // AVIVO_D1MODE_VIEWPORT_SIZE 1280x720
+        *outValue = 0x050002D0u;
+        return true;
+    default:
+        break;
+    }
+
+    // Everything else: last written value (xenia register-file fallback),
+    // 0 when never written. Per-register first-read logging replaces the
+    // old warn-once-global flag (which hid every subsequent poll address).
+    if (regIndex < kMmioRegCount)
+    {
+        *outValue = g_regShadow[regIndex].load(std::memory_order_relaxed);
+    }
+    else
+    {
+        *outValue = 0;
+    }
+    {
+        static std::atomic<uint32_t> seenRegs{0};
+        uint32_t slot = regIndex % 16;
+        uint32_t maskBit = 1u << slot;
+        // Same reg logged once; distinct regs evict via round-robin slot.
+        static std::atomic<uint32_t> slotReg[16]{};
+        uint32_t expected = slotReg[slot].load(std::memory_order_relaxed);
+        if (expected != regIndex &&
+            slotReg[slot].compare_exchange_strong(expected, regIndex, std::memory_order_relaxed))
+        {
+            MCLA_LOG_WARN("CP: MMIO read reg={:04X} offset={:04X} -> {:08X} (shadow/hardcoded)",
+                          regIndex, offset, *outValue);
+            seenRegs.fetch_add(1, std::memory_order_relaxed);
+        }
+        else if (expected != regIndex && (seenRegs.load(std::memory_order_relaxed) % 500) == 0)
+        {
+            slotReg[slot].store(regIndex, std::memory_order_relaxed);
+            MCLA_LOG_WARN("CP: MMIO read reg={:04X} offset={:04X} -> {:08X} (shadow/hardcoded)",
+                          regIndex, offset, *outValue);
+        }
+    }
     return true;
 }
 

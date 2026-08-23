@@ -1640,6 +1640,19 @@ void KeUnlockL2()
 
 bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
 {
+    // SIGNAL CENSUS (2026-08-23 session 9): who signals what. Caller LR
+    // attributes the producer site statically afterwards.
+    {
+        static std::atomic<uint32_t> s_signalLogs{0};
+        const uint32_t n = s_signalLogs.fetch_add(1) + 1;
+        if (n <= 40 || (n % 2000) == 0)
+        {
+            MCLA_LOG_INFO("SIGNAL KeSetEvent obj={:08X} inc={} wait={} lr={:08X}",
+                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pEvent)), Increment,
+                          Wait ? 1 : 0, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
+
     bool result = QueryKernelObject<Event>(*pEvent)->Set();
 
     ++g_keSetEventGeneration;
@@ -2528,6 +2541,18 @@ void KfLowerIrql() { }
 
 uint32_t KeReleaseSemaphore(XKSEMAPHORE* semaphore, uint32_t increment, uint32_t adjustment, uint32_t wait)
 {
+    // SIGNAL CENSUS (2026-08-23 session 9): same attribution as KeSetEvent.
+    {
+        static std::atomic<uint32_t> s_signalLogs2{0};
+        const uint32_t n = s_signalLogs2.fetch_add(1) + 1;
+        if (n <= 40 || (n % 2000) == 0)
+        {
+            MCLA_LOG_INFO("SIGNAL KeReleaseSemaphore obj={:08X} inc={} adj={} lr={:08X}",
+                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(semaphore)), increment,
+                          adjustment, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
+
     auto* object = QueryKernelObject<Semaphore>(semaphore->Header);
     object->Release(adjustment, nullptr);
 
