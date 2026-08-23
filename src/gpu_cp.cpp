@@ -426,34 +426,35 @@ bool CpMmioRead(uint32_t guestAddr, uint32_t* outValue)
     }
 
     // Hardcoded status reads, mirroring xenia GraphicsSystem::ReadRegister
-    // (graphics_system.cc:184-201). Reg 0x1951 bit0 = vblank pending - the
-    // game's own vsync ISR gates its flip-request processor on exactly this
-    // word ([0x7FC80000+0x6544]&1, ppc_recomp.77.cpp:19534-19542); answering
-    // 0 starves the present path.
+    // (graphics_system.cc:184-201) - values verbatim from that switch.
+    // Reg 0x1951 bit0 = vblank pending - the game's own vsync ISR gates its
+    // flip-request processor on exactly this word
+    // ([0x7FC80000+0x6544]&1, ppc_recomp.77.cpp:19534-19542); answering 0
+    // starves the present path.
     switch (regIndex)
     {
-    case 0x0F00: // RB_EDRAM_TIMING
+    case 0x0F00: // RB_EDRAM_TIMING (graphics_system.cc:186)
         *outValue = 0x08100748u;
         return true;
-    case 0x0F01: // RB_BC_CONTROL
+    case 0x0F01: // RB_BC_CONTROL (graphics_system.cc:188)
         *outValue = 0x0000200Eu;
         return true;
-    case 0x194C: // R500_D1MODE_V_COUNTER (720 visible lines)
+    case 0x194C: // R500_D1MODE_V_COUNTER (graphics_system.cc:189-190)
         *outValue = 0x000002D0u;
         return true;
-    case 0x1951: // interrupt status: vblank pending
+    case 0x1951: // interrupt status: vblank pending (graphics_system.cc:191-192)
         *outValue = 1u;
         return true;
-    case 0x1961: // AVIVO_D1MODE_VIEWPORT_SIZE 1280x720
+    case 0x1961: // AVIVO_D1MODE_VIEWPORT_SIZE 1280x720 (graphics_system.cc:193-196)
         *outValue = 0x050002D0u;
         return true;
     default:
         break;
     }
 
-    // Everything else: last written value (xenia register-file fallback),
-    // 0 when never written. Per-register first-read logging replaces the
-    // old warn-once-global flag (which hid every subsequent poll address).
+    // Everything else: last written value (xenia register-file fallback,
+    // graphics_system.cc:204 register_file_.values[r] return), 0 when never
+    // written.
     if (regIndex < kMmioRegCount)
     {
         *outValue = g_regShadow[regIndex].load(std::memory_order_relaxed);
@@ -461,27 +462,6 @@ bool CpMmioRead(uint32_t guestAddr, uint32_t* outValue)
     else
     {
         *outValue = 0;
-    }
-    {
-        static std::atomic<uint32_t> seenRegs{0};
-        uint32_t slot = regIndex % 16;
-        uint32_t maskBit = 1u << slot;
-        // Same reg logged once; distinct regs evict via round-robin slot.
-        static std::atomic<uint32_t> slotReg[16]{};
-        uint32_t expected = slotReg[slot].load(std::memory_order_relaxed);
-        if (expected != regIndex &&
-            slotReg[slot].compare_exchange_strong(expected, regIndex, std::memory_order_relaxed))
-        {
-            MCLA_LOG_WARN("CP: MMIO read reg={:04X} offset={:04X} -> {:08X} (shadow/hardcoded)",
-                          regIndex, offset, *outValue);
-            seenRegs.fetch_add(1, std::memory_order_relaxed);
-        }
-        else if (expected != regIndex && (seenRegs.load(std::memory_order_relaxed) % 500) == 0)
-        {
-            slotReg[slot].store(regIndex, std::memory_order_relaxed);
-            MCLA_LOG_WARN("CP: MMIO read reg={:04X} offset={:04X} -> {:08X} (shadow/hardcoded)",
-                          regIndex, offset, *outValue);
-        }
     }
     return true;
 }
