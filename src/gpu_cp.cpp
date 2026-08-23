@@ -33,6 +33,7 @@ std::atomic<uint32_t> g_ringCapDwords{0};   // ring size in dwords
 std::atomic<uint32_t> g_rptrIndex{0};       // read pointer, dword index
 std::atomic<uint32_t> g_writebackAddr{0};   // where rptr is published (BE)
 std::atomic<uint32_t> g_driverDevCtx{0};    // GuestDevice VA (see CpAttachDriverCtx)
+std::atomic<uint32_t> g_pushWatermark{0};   // consumed-through VA (driver space)
 
 std::atomic<uint64_t> g_drainCount{0};
 std::atomic<uint64_t> g_swapCount{0};
@@ -55,18 +56,21 @@ void PublishRptr()
     {
         (void)mem.WriteU32BE(wb, rptr);
     }
-    // Keep the driver's local ring-context mirrors in sync: guest waiters
-    // poll ctx[+0] (sub_82411E94 free-space), [+4] (barriers), and the
-    // write-back word at phys(ctx[+10896]->+60) (sub_82411218). On HW the
-    // write-back + interrupt handler maintain these; we own both roles.
+    // Keep the driver's local ring-context mirrors in sync. The ctx[+0]/[+4]
+    // mirrors live in the DRIVER push-buffer address space (guest waiters
+    // sub_82411E94/barriers compare them against dev[+10908]-derived put
+    // cursors), so they track our consumption watermark — not the kernel-ring
+    // dword index (that is the phys write-back word above, sub_82411218's
+    // view). On HW the write-back + interrupt handler maintain all of these.
     const uint32_t dev = g_driverDevCtx.load(std::memory_order_relaxed);
-    if (dev != 0)
+    const uint32_t mark = g_pushWatermark.load(std::memory_order_relaxed);
+    if (dev != 0 && mark != 0)
     {
         uint32_t subctx = 0;
         if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0)
         {
-            (void)mem.WriteU32BE(subctx + 0, rptr);
-            (void)mem.WriteU32BE(subctx + 4, rptr);
+            (void)mem.WriteU32BE(subctx + 0, mark);
+            (void)mem.WriteU32BE(subctx + 4, mark);
         }
     }
 }
@@ -222,6 +226,32 @@ void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2)
 void CpAttachDriverCtx(uint32_t devVA)
 {
     g_driverDevCtx.store(devVA, std::memory_order_relaxed);
+}
+
+void CpConsumePushWindow(uint32_t endVA, uint32_t dwords)
+{
+    // Monotonic: windows may be captured slightly out of order.
+    uint32_t prev = g_pushWatermark.load(std::memory_order_relaxed);
+    while (endVA > prev && !g_pushWatermark.compare_exchange_weak(prev, endVA, std::memory_order_relaxed))
+    {
+    }
+
+    if (dwords == 0)
+        return;
+    if (PPCContext* ctx = GetPPCContext())
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        const uint32_t tls = ctx->r13.u32;
+        uint32_t blk = 0;
+        if (tls != 0 && mem.ReadU32BE(tls + 256, &blk) && blk != 0)
+        {
+            uint32_t cur = 0;
+            if (mem.ReadU32BE(blk + 88, &cur))
+            {
+                (void)mem.WriteU32BE(blk + 88, cur + dwords);
+            }
+        }
+    }
 }
 
 bool CpMmioWrite(uint32_t guestAddr, uint32_t value)

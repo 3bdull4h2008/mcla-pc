@@ -26,6 +26,14 @@ void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2);
 // kernel CP on HW keeps them in sync via the write-back + interrupt handler.
 void CpAttachDriverCtx(uint32_t devVA);
 
+// Account a driver push-buffer window whose bytes are now resident (capture
+// v2 deferred-drain). Advances the consumption watermark that feeds the
+// ctx[+0]/[+4] mirrors (guest free-space/progress predicates operate in
+// this VA space) and bumps the submitting thread's progress counter by
+// dwords. Call from the thread running guest code (counter chain uses its
+// live PPC context).
+void CpConsumePushWindow(uint32_t endVA, uint32_t dwords);
+
 // Returns true when guestAddr lies inside the XGPU MMIO window and was
 // consumed (never written through to RAM).
 bool CpMmioWrite(uint32_t guestAddr, uint32_t value);

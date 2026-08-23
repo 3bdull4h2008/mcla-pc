@@ -484,6 +484,12 @@ void CaptureWindow(uint32_t n, uint32_t dev, const PendingWindow& pw)
 
     ++g_pktCap.descriptors;
     g_pktCap.dwords.fetch_add(wordCount, std::memory_order_relaxed);
+
+    // Consumption accounting: these bytes are resident ⇒ kernel CP may fetch
+    // through them. Advances the ctx[+0]/[+4] watermark + progress counter
+    // by the FULL reserved size (not the clamped read).
+    mcla::gpu::CpConsumePushWindow(pw.addr + pw.dwords * 4u, pw.dwords);
+
     if ((pw.flags & 1u) != 0)
     {
         if (pw.alignBytes >= 32)
