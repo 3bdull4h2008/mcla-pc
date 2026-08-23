@@ -4,6 +4,7 @@
 #include "guest_memory.h"
 #include "logging.h"
 #include "kernel/memory.h"
+#include <cpu/ppc_context.h>
 
 #include <atomic>
 
@@ -99,6 +100,7 @@ void DrainRing(uint32_t wptr)
     }
 
     uint32_t rptr = g_rptrIndex.load(std::memory_order_relaxed);
+    const uint32_t startRptr = rptr;
     uint32_t guard = cap * 2u + 16u; // hard stop against runaway streams
 
     while (rptr != wptr && guard--)
@@ -169,6 +171,30 @@ void DrainRing(uint32_t wptr)
     g_rptrIndex.store(rptr, std::memory_order_relaxed);
     PublishRptr();
     g_drainCount.fetch_add(1);
+
+    // Kernel-side role: the real kernel CP consumer bumps the submitting
+    // thread's GPU progress counter (*(r13+256)+88) as ring data is consumed;
+    // sub_82412F98 busy-returns until it advanced >=5000 past the snapshot
+    // (77.cpp:23832-23953). We run synchronously ON the submitter thread
+    // (doorbell store), so its own PPC context is live here. Increment is
+    // exactly the dwords consumed this drain - derived, not invented.
+    if (const uint32_t advanced = (rptr - startRptr + cap) % cap; advanced != 0)
+    {
+        if (PPCContext* ctx = GetPPCContext())
+        {
+            auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+            const uint32_t tls = ctx->r13.u32;
+            uint32_t blk = 0;
+            if (tls != 0 && mem.ReadU32BE(tls + 256, &blk) && blk != 0)
+            {
+                uint32_t cur = 0;
+                if (mem.ReadU32BE(blk + 88, &cur))
+                {
+                    (void)mem.WriteU32BE(blk + 88, cur + advanced);
+                }
+            }
+        }
+    }
 }
 
 } // namespace
