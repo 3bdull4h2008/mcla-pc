@@ -240,22 +240,16 @@ void mcla::kernel::GuestMemoryHeap::Shutdown()
 
 void* mcla::kernel::GuestMemoryHeap::Translate(uint32_t guestAddr)
 {
-    if (!m_initialized)
+    if (!m_initialized || guestAddr >= m_size)
         return nullptr;
-    const uint64_t off = TranslateHostOffset(guestAddr);
-    if (off >= m_size)
-        return nullptr;
-    return m_base + off;
+    return m_base + guestAddr;
 }
 
 const void* mcla::kernel::GuestMemoryHeap::Translate(uint32_t guestAddr) const
 {
-    if (!m_initialized)
+    if (!m_initialized || guestAddr >= m_size)
         return nullptr;
-    const uint64_t off = TranslateHostOffset(guestAddr);
-    if (off >= m_size)
-        return nullptr;
-    return m_base + off;
+    return m_base + guestAddr;
 }
 
 uint32_t mcla::kernel::GuestMemoryHeap::MapVirtual(const void* hostPtr) const
@@ -275,11 +269,10 @@ bool mcla::kernel::GuestMemoryHeap::IsValid(uint32_t guestAddr, size_t size) con
     if (!m_initialized || guestAddr == 0 || size == 0)
         return false;
 
-    const uint64_t off = TranslateHostOffset(guestAddr);
-    if (off >= m_size)
+    if (guestAddr >= m_size)
         return false;
 
-    const uint64_t end = off + size;
+    uint64_t end = static_cast<uint64_t>(guestAddr) + size;
     if (end > m_size)
         return false;
 
