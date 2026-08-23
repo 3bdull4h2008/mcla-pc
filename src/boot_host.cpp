@@ -28,6 +28,7 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 // Guest main-thread id (defined in kernel imports.cpp, declared in xdm.h).
 extern std::atomic<uint32_t> g_mainGuestThreadId;
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -313,6 +314,49 @@ namespace
         }
 
         std::snprintf(buf, sizeof(buf), "host 0x%llx", (unsigned long long)hostAddr);
+        return buf;
+    }
+
+    // Exact owner resolution: PPCFuncMappings host pointers are true function
+    // starts. Binary-search the greatest start <= pc and list EVERY guest VA
+    // folded onto it (ICF clones share one body). Returns owners as
+    // "82429570+82429988" style; delta appended separately.
+    const char* ExactOwners(uint64_t hostAddr, uint64_t* deltaOut)
+    {
+        static thread_local char buf[256];
+        static std::vector<std::pair<uintptr_t, uint32_t>> s_map;
+        static std::once_flag s_once;
+        std::call_once(s_once, []() {
+            for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
+                s_map.emplace_back((uintptr_t)PPCFuncMappings[i].host, PPCFuncMappings[i].guest);
+            std::sort(s_map.begin(), s_map.end());
+        });
+        if (s_map.empty())
+        {
+            *deltaOut = 0;
+            return "?";
+        }
+        size_t lo = 0;
+        size_t hi = s_map.size();
+        while (lo + 1 < hi)
+        {
+            const size_t mid = (lo + hi) / 2;
+            if (s_map[mid].first <= (uintptr_t)hostAddr)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        const uintptr_t start = s_map[lo].first;
+        *deltaOut = (uintptr_t)hostAddr - start;
+        size_t n = 0;
+        buf[0] = '\0';
+        for (size_t i = lo; i < s_map.size() && s_map[i].first == start && n < 6; ++i, ++n)
+        {
+            const int written = std::snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
+                                              "%s%08x", n ? "+" : "", s_map[i].second);
+            if (written < 0 || (size_t)written >= sizeof(buf) - strlen(buf))
+                break;
+        }
         return buf;
     }
 
@@ -777,30 +821,38 @@ void Start(uint32_t entryGuest)
                 if (!ok || tc.Rip == lastRip)
                     continue;
                 lastRip = tc.Rip;
-                // Guest driver state the VBlank/present machine polls
-                // (reverser-pinned offsets): gpuCtx+0xD0 task state,
-                // dev+21648 vblank state, dev+10942 flags.
-                uint32_t stD0 = 0, stVbl = 0, stFlg = 0;
+                // Exact owner via PPCFuncMappings binary search + guest driver
+                // state. Publish chain: **(u32*)0x82000864 = device VA.
+                uint64_t ripDelta = 0;
+                const char* owners = ExactOwners(tc.Rip, &ripDelta);
+                uint32_t dev = 0, slot = 0, cursor = 0, vbl = 0, flg = 0, pollerCtx = 0, stD0 = 0, ud = 0, ud1 = 0;
                 {
-                    uint32_t ctxPtr = 0;
                     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-                    if (mem.ReadU32BE(0x82839254, &ctxPtr) && ctxPtr != 0)
+                    if (mem.ReadU32BE(0x82000864, &slot) && slot != 0)
+                        (void)mem.ReadU32BE(slot, &dev);
+                    if (dev != 0)
                     {
-                        (void)mem.ReadU32BE(ctxPtr + 0xD0, &stD0);
-                        (void)mem.ReadU32BE(ctxPtr + 21648, &stVbl);
-                        (void)mem.ReadU32BE(ctxPtr + 10942, &stFlg);
+                        (void)mem.ReadU32BE(dev + 0x30, &cursor);
+                        (void)mem.ReadU32BE(dev + 21648, &vbl);
+                        (void)mem.ReadU32BE(dev + 10942, &flg);
                     }
+                    if (mem.ReadU32BE(0x82839254, &pollerCtx) && pollerCtx != 0)
+                        (void)mem.ReadU32BE(pollerCtx + 0xD0, &stD0);
+                    // VdSetGraphicsInterruptCallback userData object (guest-chosen).
+                    if (mem.ReadU32BE(0xA0003080, &ud) && ud != 0)
+                        (void)mem.ReadU32BE(ud, &ud1);
                 }
-                char rbuf[5][64];
-                char lbuf[896];
-                std::snprintf(lbuf, sizeof(lbuf), "PARK-SAMPLE rawrip=%llx rip=%s s0=%s s1=%s s2=%s s3=%s s4=%s st[D0=%u vbl=%u flg=%u]",
+                char rbuf[3][64];
+                char lbuf[1024];
+                std::snprintf(lbuf, sizeof(lbuf), "PARK-SAMPLE rawrip=%llx nf=%s own=%s d=+0x%llx s0=%s s1=%s s2=%s dev=%08X cur=%08X vbl=%u flg=%u pctx=%08X D0=%u ud=%08X ud1=%08X",
                               (unsigned long long)tc.Rip,
                               NearestFunctionName(tc.Rip),
+                              owners,
+                              (unsigned long long)ripDelta,
                               (std::snprintf(rbuf[0], sizeof(rbuf[0]), "%s", NearestFunctionName(rets[0])), rbuf[0]),
                               (std::snprintf(rbuf[1], sizeof(rbuf[1]), "%s", NearestFunctionName(rets[1])), rbuf[1]),
                               (std::snprintf(rbuf[2], sizeof(rbuf[2]), "%s", NearestFunctionName(rets[2])), rbuf[2]),
-                              (std::snprintf(rbuf[3], sizeof(rbuf[3]), "%s", NearestFunctionName(rets[3])), rbuf[3]),
-                              (std::snprintf(rbuf[4], sizeof(rbuf[4]), "%s", NearestFunctionName(rets[4])), rbuf[4]));
+                              dev, cursor, vbl, flg, pollerCtx, stD0, ud, ud1);
                 BootReportInfo(lbuf);
             }
         }).detach();
