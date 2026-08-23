@@ -78,9 +78,9 @@ private:
     // Xenos VA segments 0x8 (cached), 0xA (uncached), 0xC (extended) alias the
     // same physical RAM. Converge A/C onto their 0x8-segment slot — MUST match
     // mcla::native::GuestMemoryView::TranslateHostOffset so both access paths
-    // see the same bytes. MapVirtual keeps returning raw offsets, which stay
-    // valid because heap placements are 0x8-segment or low addresses. Segments
-    // 0xE/0xF are NOT RAM aliases — left identity so they fail bounds.
+    // see the same bytes. Segments 0xE/0xF stay identity: 0xE legitimately
+    // hosts the physical arena (heap.cpp) so raw-offset VAs round-trip, and
+    // wild 0xF VAs remain bounded only by the u64 end>m_size check.
     static uint64_t TranslateHostOffset(uint32_t guestAddr) {
         const uint32_t seg = guestAddr >> 29;
         if (seg == 4 || seg == 5 || seg == 6)
