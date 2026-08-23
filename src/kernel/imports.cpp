@@ -2379,6 +2379,20 @@ void ExTerminateThread()
 
 uint32_t ExCreateThread(be<uint32_t>* handle, uint32_t stackSize, be<uint32_t>* threadId, uint32_t xApiThreadStartup, uint32_t startAddress, uint32_t startContext, uint32_t creationFlags)
 {
+    // THREAD-CREATE CENSUS (session 10): completer threads must be visible.
+    // The async-op drainer Function_823EC990 family never ran - verify
+    // whether its spawn ever happens (LOGF_UTILITY is compiled out).
+    {
+        static std::atomic<uint32_t> s_threadCreates{0};
+        const uint32_t n = s_threadCreates.fetch_add(1) + 1;
+        if (n <= 60)
+        {
+            MCLA_LOG_INFO("THREAD-CREATE #{} start={:08X} ctx={:08X} flags={:08X} lr={:08X}",
+                          n, startAddress, startContext, creationFlags,
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
+
     LOGF_UTILITY("0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}",
         handle ? handle->get() : 0, stackSize, threadId ? threadId->get() : 0, xApiThreadStartup, startAddress, startContext, creationFlags);
 
