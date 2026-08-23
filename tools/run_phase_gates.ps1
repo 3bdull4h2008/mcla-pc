@@ -188,6 +188,17 @@ if (-not $SkipBoot) {
                 drawPacketsSeen = $pktDraws
             }
 
+        # Tracked: submit-family census (reverser-ranked per-frame seam probes).
+        $censusLines = @($slice | Select-String -Pattern 'SUBMIT-census').Count
+        $censusByFn = @{}
+        foreach ($m in @($slice | Select-String -Pattern 'SUBMIT-census (sub_[0-9A-Fa-f]+)')) {
+            $fn = $m.Matches[0].Groups[1].Value
+            if (-not $censusByFn.ContainsKey($fn)) { $censusByFn[$fn] = 0 }
+            $censusByFn[$fn] += 1
+        }
+        Add-Gate -Id 'G-P4-SUBMIT-FAMILY-HITS' -Status 'tracked' -Pass ($censusLines -ge 1) `
+            -Metrics @{ censusLines = $censusLines; functions = ($censusByFn.Keys -join ',') }
+
         # Tracked: PM4-free frames (activates at P6'; currently the legacy ring is alive by design)
         $putVals = @($slice | Select-String -Pattern 'RING: ctx\+30=([0-9A-F]{8})' |
             ForEach-Object { $_.Matches[0].Groups[1].Value })

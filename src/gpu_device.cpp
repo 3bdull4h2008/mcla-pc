@@ -573,3 +573,67 @@ PPC_FUNC(sub_82411640)
         LogSummary(n);
     }
 }
+
+// ---------------------------------------------------------------------------
+// P4' submit-family census (reverser-ranked per-frame seam candidates).
+// Log-only passthrough overrides; each size-class helper embeds its OWN
+// reserver clone (dev+14908/14916 accessed directly in 11840 at
+// ppc_recomp.77.cpp:20129), which is why 640 stays cold while frames flow.
+// Ranked targets: sub_82420BA8 (per-batch draw submit), sub_82413660 (draw-
+// packet builder), sub_8241BD08 (flush/kick), sub_82429570/sub_824294E0
+// (present kickers, DEBCBEEF marker).
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82420BA8);
+static std::atomic<uint32_t> s_h20BA8{0};
+PPC_FUNC(sub_82420BA8)
+{
+    const uint32_t n = s_h20BA8.fetch_add(1) + 1;
+    if (n <= 12 || (n % 1000) == 0)
+        MCLA_LOG_INFO("SUBMIT-census sub_82420BA8 #{} dev={:08X} flags={:X} blk={:08X} desc={:08X}/{:08X} r10={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r10.u32);
+    __imp__sub_82420BA8(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82413660);
+static std::atomic<uint32_t> s_h13660{0};
+PPC_FUNC(sub_82413660)
+{
+    const uint32_t n = s_h13660.fetch_add(1) + 1;
+    if (n <= 12 || (n % 5000) == 0)
+        MCLA_LOG_INFO("SUBMIT-census sub_82413660 #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+    __imp__sub_82413660(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82411840);
+static std::atomic<uint32_t> s_h11840{0};
+PPC_FUNC(sub_82411840)
+{
+    const uint32_t n = s_h11840.fetch_add(1) + 1;
+    if (n <= 12 || (n % 5000) == 0)
+        MCLA_LOG_INFO("SUBMIT-census sub_82411840 #{} dev={:08X} cls={} a={}",
+                      n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+    __imp__sub_82411840(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8241BD08);
+static std::atomic<uint32_t> s_h1BD08{0};
+PPC_FUNC(sub_8241BD08)
+{
+    const uint32_t n = s_h1BD08.fetch_add(1) + 1;
+    if (n <= 12 || (n % 1000) == 0)
+        MCLA_LOG_INFO("SUBMIT-census sub_8241BD08(flush) #{} dev={:08X} r4={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32);
+    __imp__sub_8241BD08(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82429570);
+static std::atomic<uint32_t> s_h29570{0};
+PPC_FUNC(sub_82429570)
+{
+    const uint32_t n = s_h29570.fetch_add(1) + 1;
+    if (n <= 12 || (n % 1000) == 0)
+        MCLA_LOG_INFO("SUBMIT-census sub_82429570(present) #{} r3={:08X} r4={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32);
+    __imp__sub_82429570(ctx, base);
+}
