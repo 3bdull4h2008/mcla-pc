@@ -2227,6 +2227,20 @@ uint32_t NtCreateSemaphore(be<uint32_t>* Handle, XOBJECT_ATTRIBUTES* ObjectAttri
 
 uint32_t NtReleaseSemaphore(XKSEMAPHORE* Handle, uint32_t ReleaseCount, int32_t* PreviousCount)
 {
+    // SIGNAL CENSUS (session 12): Ghidra proved completers use
+    // NtReleaseSemaphore (NOT KeReleaseSemaphore) - prior census watched
+    // the wrong twin and reported zero signals.
+    {
+        static std::atomic<uint32_t> s_ntRelLogs{0};
+        const uint32_t n = s_ntRelLogs.fetch_add(1) + 1;
+        if (n <= 40 || (n % 2000) == 0)
+        {
+            MCLA_LOG_INFO("SIGNAL NtReleaseSemaphore obj={:08X} count={} lr={:08X}",
+                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Handle)), ReleaseCount,
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
+
     uint32_t previousCount;
     QueryKernelObject<Semaphore>(Handle->Header)->Release(ReleaseCount, &previousCount);
 
@@ -2390,6 +2404,21 @@ uint32_t ExCreateThread(be<uint32_t>* handle, uint32_t stackSize, be<uint32_t>* 
             MCLA_LOG_INFO("THREAD-CREATE #{} start={:08X} ctx={:08X} flags={:08X} lr={:08X}",
                           n, startAddress, startContext, creationFlags,
                           static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+            // Trampoline 0x821C91C8 copies {proc,arg} (44 bytes) from the ctx
+            // node onto its stack then bctrls - dump the node so the REAL
+            // thread procedures become visible.
+            if (startAddress == 0x821C91C8u && startContext != 0)
+            {
+                auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+                std::string words;
+                for (uint32_t off = 0; off < 48; off += 4)
+                {
+                    uint32_t w = 0;
+                    (void)mem.ReadU32BE(startContext + off, &w);
+                    words += fmt::format(" {:08X}", w);
+                }
+                MCLA_LOG_INFO("THREAD-NODE #{} @ {:08X}:{}", n, startContext, words);
+            }
         }
     }
 

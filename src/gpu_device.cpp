@@ -891,6 +891,19 @@ PPC_FUNC(sub_821E5640)
     __imp__sub_821E5640(ctx, base);
 }
 
+// TASK-COMPLETE census: sub_8244EE00 runs after every pool-worker task
+// execution (TU16:15473, sysTaskExecutor pool proc 821C4528). If tasks ever
+// execute, this fires - and its release chain should wake the parked fence.
+PPC_FUNC_IMPL(__imp__sub_8244EE00);
+static std::atomic<uint32_t> s_h4EE00{0};
+PPC_FUNC(sub_8244EE00)
+{
+    const uint32_t n = s_h4EE00.fetch_add(1) + 1;
+    if (n <= 24 || (n % 2000) == 0)
+        MCLA_LOG_INFO("TASK-DONE sub_8244EE00 #{} arg={:08X}", n, ctx.r3.u32);
+    __imp__sub_8244EE00(ctx, base);
+}
+
 // ---------------------------------------------------------------------------
 // TU83 DRIVER-WORKER census: sub_824569C8 is the worker loop the main guest
 // thread parks inside (sibling 824569C4 = empty padding stub). Its global
