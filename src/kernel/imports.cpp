@@ -190,24 +190,69 @@ uint32_t XGetGameRegion()
     return 0x03FF;
 }
 
+// MCLA task dispatcher posts XAM msg 251 through a strict
+// create-handle -> ref-by-handle -> start-IO sequence; BOTH calls must
+// return 0 or the post is skipped and the main thread parks forever in
+// Function_824E5350 (ppc_recomp.158.cpp:27368-27420, 159.cpp:1015+,
+// soak evidence 2026-08-23: ring put cursor frozen).
+uint32_t XamSessionCreateHandle(be<uint32_t>* handleOut)
+{
+    if (!handleOut)
+        return STATUS_INVALID_PARAMETER;
+
+    // Identity-handle model: handle = guest VA of a small session object.
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t obj = mem.Alloc(16, 8);
+    if (obj == 0)
+        return STATUS_NO_MEMORY;
+
+    (void)mem.WriteU32BE(obj, 0);
+    (void)mem.WriteU32BE(obj + 4, 0);
+    handleOut->set(obj);
+    return STATUS_SUCCESS;
+}
+
+uint32_t XamSessionRefObjByHandle(uint32_t handle, be<uint32_t>* objectOut)
+{
+    if (!objectOut)
+        return STATUS_INVALID_PARAMETER;
+    if (handle == 0 || handle == 0xFFFFFFFF)
+        return STATUS_INVALID_HANDLE;
+
+    // Identity handles: the referenced object IS the handle's guest VA.
+    // Validate readability before handing it back as a pointer.
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t probe = 0;
+    if (!mem.ReadU32BE(handle, &probe))
+        return STATUS_INVALID_HANDLE;
+
+    objectOut->set(handle);
+    return STATUS_SUCCESS;
+}
+
 uint32_t XMsgStartIORequest(uint32_t App, uint32_t Message, XXOVERLAPPED* lpOverlapped, void* Buffer, uint32_t szBuffer)
 {
     (void)App;
     (void)Message;
     (void)Buffer;
-    (void)szBuffer;
 
     if (lpOverlapped)
     {
-        // Queue the overlapped I/O request for completion
-        // Signal the event when done
+        // Complete synchronously and UNCONDITIONALLY: MCLA's app-task
+        // dispatcher (sub_824E37E0 case 9) posts event-less overlappeds
+        // (hEvent=0, pCompletionRoutine=0 - ppc_recomp.159.cpp:1100-1116)
+        // then hot-polls Error for != STATUS_IO_INCOMPLETE (997). A no-op
+        // here parks the main thread in Function_824E5350 forever with the
+        // ring put cursor frozen (2026-08-23 soak evidence).
+        lpOverlapped->Error.set(STATUS_SUCCESS);
+        lpOverlapped->Length.set(szBuffer);
+
+        // pCompletionRoutine: MCLA's known consumers poll Error instead of
+        // using callbacks; guest-dispatch callback wiring deferred until a
+        // consumer demands it (no invented behavior).
+
         if (lpOverlapped->hEvent)
         {
-            // Store the overlapped for later completion
-            lpOverlapped->Error.set(STATUS_SUCCESS);
-            lpOverlapped->Length.set(szBuffer);
-            
-            // Signal the event immediately (synchronous completion for now)
             XKEVENT* event = (XKEVENT*)mcla::kernel::GuestMemoryHeap::Instance().Translate(lpOverlapped->hEvent);
             if (event)
             {
@@ -1286,9 +1331,14 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                         // r3 = INTERRUPT TYPE, not userData (decoded from
                         // generated sub_82411478): 0 = graphics interrupt ->
                         // runs the command-buffer processor Function_82419718,
-                        // 1 = vsync event -> releases the frame semaphore.
-                        // r4 carries the userData (GPU context pointer).
-                        cbCtx.r3.u32 = 0;
+                        // 1 = vsync event -> releases the frame semaphore /
+                        // swap callback (77.cpp:19460-19526).
+                        // 2026-08-23 park-sampler evidence: main thread spins
+                        // in the VBlank/present state machine waiting for a
+                        // swap release that never comes when only type-0 is
+                        // delivered. Our timer IS the vertical blank -> send
+                        // type 1.
+                        cbCtx.r3.u32 = 1;
                         cbCtx.r4.u32 = currentUserData; // GPU context pointer
                         cbCtx.r5.u32 = 0; // field counter
                         cbCtx.r13.u32 = 0x8F200000; // thread block pointer (from boot_host.cpp)
@@ -2860,8 +2910,6 @@ uint32_t XMsgCancelIORequest(uint32_t App, XXOVERLAPPED* lpOverlapped)
 void XamInputGetKeystrokeEx() { LOG_UTILITY("!!! STUB !!!"); }
 void XamParseGamerTileKey() { LOG_UTILITY("!!! STUB !!!"); }
 void XamReadTileToTexture() { LOG_UTILITY("!!! STUB !!!"); }
-void XamSessionCreateHandle() { LOG_UTILITY("!!! STUB !!!"); }
-void XamSessionRefObjByHandle() { LOG_UTILITY("!!! STUB !!!"); }
 void XamUserAreUsersFriends() { LOG_UTILITY("!!! STUB !!!"); }
 void XamUserCheckPrivilege() { LOG_UTILITY("!!! STUB !!!"); }
 void XamUserCreateAchievementEnumerator() { LOG_UTILITY("!!! STUB !!!"); }
@@ -2997,8 +3045,8 @@ GUEST_FUNCTION_STUB(__imp__XMsgCancelIORequest);
 GUEST_FUNCTION_STUB(__imp__XamInputGetKeystrokeEx);
 GUEST_FUNCTION_STUB(__imp__XamParseGamerTileKey);
 GUEST_FUNCTION_STUB(__imp__XamReadTileToTexture);
-GUEST_FUNCTION_STUB(__imp__XamSessionCreateHandle);
-GUEST_FUNCTION_STUB(__imp__XamSessionRefObjByHandle);
+GUEST_FUNCTION_HOOK(__imp__XamSessionCreateHandle, XamSessionCreateHandle);
+GUEST_FUNCTION_HOOK(__imp__XamSessionRefObjByHandle, XamSessionRefObjByHandle);
 GUEST_FUNCTION_STUB(__imp__XamUserAreUsersFriends);
 GUEST_FUNCTION_STUB(__imp__XamUserCheckPrivilege);
 GUEST_FUNCTION_STUB(__imp__XamUserCreateAchievementEnumerator);

@@ -424,6 +424,15 @@ typedef struct _XAMINPUT_STATE
 #ifndef STATUS_FAIL_CHECK
 #define STATUS_FAIL_CHECK                ((uint32_t)0xC0000229L)
 #endif
+#ifndef STATUS_INVALID_PARAMETER
+#define STATUS_INVALID_PARAMETER         ((uint32_t)0xC000000DL)
+#endif
+#ifndef STATUS_INVALID_HANDLE
+#define STATUS_INVALID_HANDLE            ((uint32_t)0xC0000008L)
+#endif
+#ifndef STATUS_NO_MEMORY
+#define STATUS_NO_MEMORY                 ((uint32_t)0xC0000017L)
+#endif
 #ifndef STATUS_INVALID_INFO_CLASS
 #define STATUS_INVALID_INFO_CLASS        ((uint32_t)0xC0000003L)
 #endif

@@ -740,6 +740,72 @@ void Start(uint32_t entryGuest)
     constexpr size_t WorkerStackSize = 8 * 1024 * 1024; // 8MB
     const HANDLE workerHandle = CreateThread(nullptr, WorkerStackSize, BootThreadProc, (LPVOID)(uintptr_t)entryGuest, 0, nullptr);
 
+    // Park sampler (diagnostic): periodically suspend the guest worker, log
+    // its host RIP + top stack return addresses resolved to guest VAs.
+    // Evidence for boot-progression blockers (ring put frozen post-init,
+    // 2026-08-23). Capture-only; stops after ~60s or when boot completes.
+    if (workerHandle != nullptr)
+    {
+        std::thread([workerHandle]() {
+            {
+                char lbuf[128];
+                std::snprintf(lbuf, sizeof(lbuf), "PARK-SAMPLE base=%llx",
+                              (unsigned long long)(uintptr_t)GetModuleHandle(nullptr));
+                BootReportInfo(lbuf);
+            }
+            uint64_t lastRip = 0;
+            for (int i = 0; i < 120 && !g_bootDone.load(); ++i)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                CONTEXT tc;
+                std::memset(&tc, 0, sizeof(tc));
+                tc.ContextFlags = CONTEXT_CONTROL;
+                if (SuspendThread(workerHandle) == (DWORD)-1)
+                    break;
+                const bool ok = GetThreadContext(workerHandle, &tc) != 0;
+                uint64_t rets[5] = {0, 0, 0, 0, 0};
+                if (ok)
+                {
+                    for (size_t k = 0; k < 5; ++k)
+                    {
+                        const void* sp = (const void*)(tc.Rsp + 8 * (k + 1));
+                        if (!IsBadReadPtr(sp, sizeof(uint64_t)))
+                            rets[k] = *(const uint64_t*)sp;
+                    }
+                }
+                ResumeThread(workerHandle);
+                if (!ok || tc.Rip == lastRip)
+                    continue;
+                lastRip = tc.Rip;
+                // Guest driver state the VBlank/present machine polls
+                // (reverser-pinned offsets): gpuCtx+0xD0 task state,
+                // dev+21648 vblank state, dev+10942 flags.
+                uint32_t stD0 = 0, stVbl = 0, stFlg = 0;
+                {
+                    uint32_t ctxPtr = 0;
+                    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+                    if (mem.ReadU32BE(0x82839254, &ctxPtr) && ctxPtr != 0)
+                    {
+                        (void)mem.ReadU32BE(ctxPtr + 0xD0, &stD0);
+                        (void)mem.ReadU32BE(ctxPtr + 21648, &stVbl);
+                        (void)mem.ReadU32BE(ctxPtr + 10942, &stFlg);
+                    }
+                }
+                char rbuf[5][64];
+                char lbuf[896];
+                std::snprintf(lbuf, sizeof(lbuf), "PARK-SAMPLE rawrip=%llx rip=%s s0=%s s1=%s s2=%s s3=%s s4=%s st[D0=%u vbl=%u flg=%u]",
+                              (unsigned long long)tc.Rip,
+                              NearestFunctionName(tc.Rip),
+                              (std::snprintf(rbuf[0], sizeof(rbuf[0]), "%s", NearestFunctionName(rets[0])), rbuf[0]),
+                              (std::snprintf(rbuf[1], sizeof(rbuf[1]), "%s", NearestFunctionName(rets[1])), rbuf[1]),
+                              (std::snprintf(rbuf[2], sizeof(rbuf[2]), "%s", NearestFunctionName(rets[2])), rbuf[2]),
+                              (std::snprintf(rbuf[3], sizeof(rbuf[3]), "%s", NearestFunctionName(rets[3])), rbuf[3]),
+                              (std::snprintf(rbuf[4], sizeof(rbuf[4]), "%s", NearestFunctionName(rets[4])), rbuf[4]));
+                BootReportInfo(lbuf);
+            }
+        }).detach();
+    }
+
     constexpr int WatchdogMs = 300000; // 5 minutes
     for (int i = 0; i < WatchdogMs && !g_bootDone.load(); i += 100)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
