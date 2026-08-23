@@ -42,8 +42,8 @@ private:
     // A/C accesses converge onto their 0x8-segment slot to keep every alias
     // viewing the same bytes. 0x8 and low addresses stay identity-mapped
     // (existing heap placement / boot seeds rely on it). Segments 0xE/0xF
-    // stay identity too: 0xE hosts the physical arena (kernel heap.cpp), so
-    // its raw-offset VAs round-trip; bounds are enforced by u64 end>m_size.
+    // are NOT RAM aliases (xenia rejects them) — left identity so they fail
+    // bounds instead of folding into valid slots.
     static uint64_t TranslateHostOffset(uint32_t guestAddr) {
         const uint32_t seg = guestAddr >> 29;
         if (seg == 4 || seg == 5 || seg == 6)

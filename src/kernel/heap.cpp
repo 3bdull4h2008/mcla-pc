@@ -28,18 +28,8 @@ void Heap::Init()
     heapArenaSize = RESERVED_BEGIN - 0x20000;
     heap = o1heapInit(heapArenaBase, heapArenaSize);
 
-    // Physical arena: RAW host offsets in segment E [0xE0000000, 4 GiB).
-    // Storage must not live where alias convergence folds (segments
-    // A/C → 0x8-slot): chunks handed out from [0xA0000000,0xE0000000) get
-    // guest VAs whose converged reads/writes land ~1.5 GiB away from their
-    // storage (security-audit F2/F3 class on 83d9b58; note g_memory itself
-    // is the raw-identity Memory struct — the fold lives in
-    // GuestMemoryHeap/GuestMemoryView). Segment E is identity under every
-    // translator, so MapVirtual(raw offset) round-trips exactly.
-    // Capacity 1.5 GiB -> 512 MiB: above retail Xenon RAM; o1heap exhaustion
-    // surfaces as null XAllocMem rather than silent corruption.
-    physArenaBase = mcla::kernel::g_memory.base + 0xE0000000;
-    physArenaSize = 0x100000000ull - 0xE0000000;
+    physArenaBase = (uint8_t*)mcla::kernel::g_memory.Translate(RESERVED_END);
+    physArenaSize = 0x100000000 - RESERVED_END;
     physicalHeap = o1heapInit(physArenaBase, physArenaSize);
 }
 
