@@ -259,9 +259,28 @@ void CpConsumePushWindow(uint32_t endVA, uint32_t dwords)
 void CpVblankBump(uint32_t amount)
 {
     const uint32_t blk = g_progressBlk.load(std::memory_order_relaxed);
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+    // Mirror maintenance: on HW the CP fetches everything the driver writes
+    // almost immediately, so the consumer cursor chases the producer cursor.
+    // Guest waiters (sub_82411E94 etc.) compare ctx[+0]/[+4] against
+    // dev[+10908]-derived put values; feeding them our stale capture
+    // watermark deadlocks once writes bypass the reserver seam.
+    const uint32_t dev = g_driverDevCtx.load(std::memory_order_relaxed);
+    if (dev != 0)
+    {
+        uint32_t subctx = 0;
+        uint32_t put = 0;
+        if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0 &&
+            mem.ReadU32BE(dev + 10908, &put) && put != 0)
+        {
+            (void)mem.WriteU32BE(subctx + 0, put);
+            (void)mem.WriteU32BE(subctx + 4, put);
+        }
+    }
+
     if (blk == 0 || amount == 0)
         return;
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t cur = 0;
     if (mem.ReadU32BE(blk + 88, &cur))
     {

@@ -278,7 +278,7 @@ namespace
 
     const char* NearestFunctionName(uint64_t hostAddr)
     {
-        static thread_local char buf[128];
+        static thread_local char buf[160];
         const uintptr_t pc = (uintptr_t)hostAddr;
 
         // Walk unwind metadata to get the real containing host function start.
@@ -291,6 +291,28 @@ namespace
             if (it != g_hostToGuest.end())
             {
                 std::snprintf(buf, sizeof(buf), "0x%08x", it->second);
+                return buf;
+            }
+        }
+
+        // Host-only code (kernel imports, our C++): ask the PDB via dbghelp.
+        {
+            static std::once_flag symOnce;
+            std::call_once(symOnce, []() {
+                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+            });
+            SYMBOL_INFO* si = (SYMBOL_INFO*)buf;
+            // Use a scratch buffer: SYMBOL_INFO must precede the name.
+            alignas(8) char scratch[sizeof(SYMBOL_INFO) + 96];
+            si = (SYMBOL_INFO*)scratch;
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 95;
+            DWORD64 disp = 0;
+            if (SymFromAddr(GetCurrentProcess(), pc, &disp, si))
+            {
+                std::snprintf(buf, sizeof(buf), "%s+0x%llx", si->Name,
+                              (unsigned long long)disp);
                 return buf;
             }
         }
