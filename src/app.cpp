@@ -62,7 +62,11 @@ MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
         MCLA_LOG_WARN("Boot host not started: {} missing or load failed", xexPath.string());
     }
 
-    // Apply patches (installs PPC hooks)
+    // Apply patches (installs PPC hooks). The dispatcher was never
+    // instantiated before 2026-08-23 - mcla_ApplyPatches silently no-op'd on
+    // every boot, leaving CP MMIO routing (doorbell consumer) and the whole
+    // patch layer dead. Found via doorbell-never-drains trace.
+    m_dispatcher = std::make_unique<FunctionDispatcher>();
     if (m_dispatcher) {
         mcla_ApplyPatches(m_dispatcher.get());
     }

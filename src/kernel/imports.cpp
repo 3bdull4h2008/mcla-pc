@@ -1348,13 +1348,26 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                         // Publish this thread's context so guest imports can read TLS/TEB/r13
                         SetPPCContext(cbCtx);
 
-                        MCLA_LOG_INFO("VSync: calling callback 0x{:08X} with userData=0x{:08X} (frame={})",
-                                      currentCallback, currentUserData, s_frameCounter++);
+                        // Per-frame spam demoted (ship-blocker #2): first 3
+                        // frames + every 500th only. Counter increments every
+                        // frame regardless.
+                        const uint32_t frame = s_frameCounter++;
+                        if (frame <= 3 || (frame % 500) == 0)
+                        {
+                            MCLA_LOG_INFO("VSync: calling callback 0x{:08X} with userData=0x{:08X} (frame={})",
+                                          currentCallback, currentUserData, frame);
+                            fn(cbCtx, base);
+                            MCLA_LOG_INFO("VSync: callback returned");
+                        }
+                        else
+                        {
+                            fn(cbCtx, base);
+                        }
 
                         // Ring-buffer submission probe: sample the head of the
                         // primary ring every ~2s (120 frames) to see whether
                         // the game ever writes PM4 packets for us to consume.
-                        if ((s_frameCounter % 120) == 0)
+                        if ((frame % 120) == 0)
                         {
                             auto& memProbe = mcla::kernel::GuestMemoryHeap::Instance();
                             uint32_t ctxPtr = 0;
@@ -1367,17 +1380,20 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                                 bool headOk = true;
                                 for (int bi = 0; bi < 8; ++bi)
                                     headOk &= memProbe.ReadU8(0xC6224480 + static_cast<uint32_t>(bi), &head[bi]);
-                                if (p0Ok && p1Ok && headOk)
+                                // Drain-chain truth: published RPTR word (the one
+                                // sub_82411218 polls) + host CP drain/swap counters.
+                                uint32_t wbVal = 0;
+                                const bool wbOk = memProbe.ReadU32BE(0x072344BC, &wbVal);
+                                if (p0Ok && p1Ok && headOk && wbOk)
                                 {
-                                    MCLA_LOG_INFO("RING: ctx+30={:08X} ctx+38={:08X} head={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
+                                    MCLA_LOG_INFO("RING: ctx+30={:08X} ctx+38={:08X} head={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}"
+                                                  " rptrWB={:08X} drains={} swaps={}",
                                                   p0, p1, head[0], head[1], head[2], head[3],
-                                                  head[4], head[5], head[6], head[7]);
+                                                  head[4], head[5], head[6], head[7],
+                                                  wbVal, mcla::gpu::CpDrainCount(), mcla::gpu::CpSwapCount());
                                 }
                             }
                         }
-
-                        fn(cbCtx, base);
-                        MCLA_LOG_INFO("VSync: callback returned");
                     }
                 }
             }

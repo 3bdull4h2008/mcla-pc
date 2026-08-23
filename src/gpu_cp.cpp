@@ -31,9 +31,11 @@ std::atomic<uint32_t> g_ringBase{0};        // guest phys addr of primary ring
 std::atomic<uint32_t> g_ringCapDwords{0};   // ring size in dwords
 std::atomic<uint32_t> g_rptrIndex{0};       // read pointer, dword index
 std::atomic<uint32_t> g_writebackAddr{0};   // where rptr is published (BE)
+std::atomic<uint32_t> g_driverDevCtx{0};    // GuestDevice VA (see CpAttachDriverCtx)
 
 std::atomic<uint64_t> g_drainCount{0};
 std::atomic<uint64_t> g_swapCount{0};
+std::atomic<uint64_t> g_doorbellCount{0};
 
 uint32_t ReadRingU32(uint32_t dwordIndex)
 {
@@ -45,11 +47,26 @@ uint32_t ReadRingU32(uint32_t dwordIndex)
 
 void PublishRptr()
 {
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t rptr = g_rptrIndex.load(std::memory_order_relaxed);
     const uint32_t wb = g_writebackAddr.load(std::memory_order_relaxed);
     if (wb != 0)
     {
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(
-            wb, g_rptrIndex.load(std::memory_order_relaxed));
+        (void)mem.WriteU32BE(wb, rptr);
+    }
+    // Keep the driver's local ring-context mirrors in sync: guest waiters
+    // poll ctx[+0] (sub_82411E94 free-space), [+4] (barriers), and the
+    // write-back word at phys(ctx[+10896]->+60) (sub_82411218). On HW the
+    // write-back + interrupt handler maintain these; we own both roles.
+    const uint32_t dev = g_driverDevCtx.load(std::memory_order_relaxed);
+    if (dev != 0)
+    {
+        uint32_t subctx = 0;
+        if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0)
+        {
+            (void)mem.WriteU32BE(subctx + 0, rptr);
+            (void)mem.WriteU32BE(subctx + 4, rptr);
+        }
     }
 }
 
@@ -176,6 +193,11 @@ void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2)
     MCLA_LOG_INFO("CP: rptr writeback @ {:08X}", rptrWritebackAddr);
 }
 
+void CpAttachDriverCtx(uint32_t devVA)
+{
+    g_driverDevCtx.store(devVA, std::memory_order_relaxed);
+}
+
 bool CpMmioWrite(uint32_t guestAddr, uint32_t value)
 {
     if ((guestAddr & kMmioMask) != kMmioBase)
@@ -186,6 +208,14 @@ bool CpMmioWrite(uint32_t guestAddr, uint32_t value)
     const uint32_t offset = guestAddr - kMmioBase;
     if (offset == kWptrByteOffset)
     {
+        // Log every doorbell including the sentinel: a silent sentinel store
+        // vs a missing store are different failure modes.
+        const uint64_t n = g_doorbellCount.fetch_add(1) + 1;
+        if (n <= 16 || (n % 500) == 0)
+        {
+            MCLA_LOG_INFO("CP: doorbell wptr={:08X} (rptr={})", value,
+                          g_rptrIndex.load(std::memory_order_relaxed));
+        }
         if (value != kWptrSentinel)
         {
             DrainRing(value);

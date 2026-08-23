@@ -1,4 +1,5 @@
 ﻿#include "gpu_device.h"
+#include "gpu_cp.h"
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "logging.h"
@@ -281,12 +282,25 @@ void HostRsRealPassthroughLogOnly(PPCContext& __restrict ctx, uint8_t* base)
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_82411180);
 static std::atomic<uint32_t> s_h11180{0};
+static std::atomic<uint32_t> s_h11180done{0};
 PPC_FUNC(sub_82411180)
 {
     const uint32_t n = s_h11180.fetch_add(1) + 1;
-    if (n <= 12 || (n % 2000) == 0)
-        MCLA_LOG_INFO("HELPER-thunk sub_82411180 hit #{} r3={:08X} r4={:08X}", n, ctx.r3.u32, ctx.r4.u32);
+    const uint32_t dev = ctx.r3.u32;
+    uint32_t mask = 0, subctx = 0, published4 = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(dev + 14900, &mask);
+        if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0)
+            (void)mem.ReadU32BE(subctx + 4, &published4);
+    }
+    if (n <= 16 || (n % 2000) == 0)
+        MCLA_LOG_INFO("HELPER-thunk sub_82411180 hit #{} r3={:08X} r4={:08X} r5={:08X} msk={:X} sc={:X} wb4={:X}",
+                      n, dev, ctx.r4.u32, ctx.r5.u32, mask, subctx, published4);
     __imp__sub_82411180(ctx, base);
+    const uint32_t d = s_h11180done.fetch_add(1) + 1;
+    if (n <= 16 || (n % 2000) == 0)
+        MCLA_LOG_INFO("HELPER-thunk sub_82411180 RETURNED #{} (r3={:08X})", d, ctx.r3.u32);
 }
 
 PPC_FUNC_IMPL(__imp__sub_82411618);
@@ -636,4 +650,52 @@ PPC_FUNC(sub_82429570)
         MCLA_LOG_INFO("SUBMIT-census sub_82429570(present) #{} r3={:08X} r4={:08X}",
                       n, ctx.r3.u32, ctx.r4.u32);
     __imp__sub_82429570(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// RING-WAIT census (2026-08-23): sub_82411928 is the SOLE doorbell-ringer
+// module-wide (PPC_MM_STORE_U32(0x7FC80000+1812), 77.cpp:20398). Earlier run:
+// 5 reserve passes then silence — thread parked between 11218-return and the
+// doorbell store. Log predicate inputs + whether the tail is ever reached.
+// Units: dword indices, mask=dev[+14900]; published rptr = subctx[+60].
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82411218);
+static std::atomic<uint32_t> s_h11218{0};
+PPC_FUNC(sub_82411218)
+{
+    const uint32_t n = s_h11218.fetch_add(1) + 1;
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t target = ctx.r4.u32;
+    const uint32_t bytes = ctx.r5.u32;
+    if (dev != 0)
+    {
+        mcla::gpu::CpAttachDriverCtx(dev);
+    }
+    uint32_t mask = 0, subctx = 0, published = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(dev + 14900, &mask);
+        if (mem.ReadU32BE(dev + 10896, &subctx) && subctx != 0)
+            (void)mem.ReadU32BE(subctx + 60, &published);
+    }
+    const bool wraps = ((target + bytes) & ~mask) != (target & ~mask);
+    if (n <= 16 || (n % 2000) == 0)
+        MCLA_LOG_INFO("RW #{:04X} tgt={:05X} b={:X} msk={:X} sc={:X} wb={:X} wrap={}",
+                      n, target, bytes, mask, subctx, published, wraps ? 1 : 0);
+    __imp__sub_82411218(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82411928);
+static std::atomic<uint32_t> s_h11928{0};
+static std::atomic<uint32_t> s_h11928done{0};
+PPC_FUNC(sub_82411928)
+{
+    const uint32_t n = s_h11928.fetch_add(1) + 1;
+    if (n <= 12 || (n % 2000) == 0)
+        MCLA_LOG_INFO("DOORBELL sub_82411928 #{} r3={:08X} r4={:08X} r5={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+    __imp__sub_82411928(ctx, base);
+    const uint32_t d = s_h11928done.fetch_add(1) + 1;
+    if (d <= 12 || (d % 2000) == 0)
+        MCLA_LOG_INFO("DOORBELL sub_82411928 RETURNED #{}", d);
 }

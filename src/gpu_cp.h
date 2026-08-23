@@ -19,6 +19,13 @@ namespace mcla::gpu {
 void CpInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2);
 void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2);
 
+// Capture the guest driver-extension object (GuestDevice VA whose [+10896]
+// holds the ring context). Its ctx[+0]/[+4]/[+60] are three views of the
+// ring read pointer polled by different guest waiters (sub_82411218 polls
+// +60, sub_82411E94 polls +0, sub_82411180-style barriers poll +4); the
+// kernel CP on HW keeps them in sync via the write-back + interrupt handler.
+void CpAttachDriverCtx(uint32_t devVA);
+
 // Returns true when guestAddr lies inside the XGPU MMIO window and was
 // consumed (never written through to RAM).
 bool CpMmioWrite(uint32_t guestAddr, uint32_t value);
