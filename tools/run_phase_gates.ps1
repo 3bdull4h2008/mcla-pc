@@ -55,10 +55,14 @@ $validators = @(
 )
 $validatorResults = @{}
 $validatorOutputs = @{}
-# xenos_decode scans the RAW-UCODE corpus (translatable via XenosRecomp pipeline).
-$validatorArgs = @{ 'xenos_decode_validator' = '.research\findings\xenia\shader_dumps' }
-# These two still require Rockstar .fxc containers (input format TBD - tracked).
-$corpusValidators = @('shader_pipeline_validator', 'phase3_validator')
+# All three shader validators scan the RAW-UCODE corpus
+# (.research/findings/xenia/shader_dumps): dual-path classification handles
+# raw microcode dumps (endian-restored) AND Rockstar .fxc containers.
+$validatorArgs = @{
+    'xenos_decode_validator'    = '.research\findings\xenia\shader_dumps'
+    'shader_pipeline_validator' = '.research\findings\xenia\shader_dumps'
+    'phase3_validator'          = '.research\findings\xenia\shader_dumps'
+}
 Invoke-Step 'G-VALIDATORS' {
     foreach ($v in $validators) {
         $exe = Join-Path $build "$v.exe"
@@ -76,12 +80,10 @@ Invoke-Step 'G-VALIDATORS' {
         $validatorResults[$v] = $p.ExitCode
     }
     # xenos_decode exit 1 = decoder found unknown/opcodes+oob on real shaders -
-    # a TRACKED decoder-quality finding, not a harness failure.
+    # a TRACKED decoder-quality finding, not a harness failure (G-XENOS-DECODE-CLEAN
+    # below still enforces exit 0).
     $failed = @($validatorResults.GetEnumerator() | Where-Object {
-        $_.Value -ne 0 -and -not (
-            ($corpusValidators -contains $_.Key -and $_.Value -in 1,2) -or
-            ($_.Key -eq 'xenos_decode_validator' -and $_.Value -eq 1)
-        )
+        $_.Value -ne 0 -and -not ($_.Key -eq 'xenos_decode_validator' -and $_.Value -eq 1)
     } | ForEach-Object { $_.Key })
     Add-Gate -Id 'G-VALIDATORS' -Status 'enforced' -Pass ($failed.Count -eq 0) `
         -Metrics @{ exits = $validatorResults; failed = $failed }
@@ -100,15 +102,19 @@ Invoke-Step 'G-VALIDATORS' {
     $xdMetrics.filesScanned = $xdFiles
     Add-Gate -Id 'G-CORPUS-XENOS-DECODE' -Status 'enforced' -Pass ($xdFiles -ge 1000) `
         -Metrics $xdMetrics
-    # Decoder cleanliness on the corpus: tracked until unknown-opcode/oob gaps
-    # in DecodeMicrocode are fixed (real findings, see metrics above).
-    Add-Gate -Id 'G-XENOS-DECODE-CLEAN' -Status 'tracked' `
+    # Decoder cleanliness on the corpus: ENFORCED since 2026-08-23 - binary
+    # microcode decodes 806/806 clean after endian/classification fixes
+    # (LE-stored .ucode.bin.* byte-reversed; text disasms skipped).
+    Add-Gate -Id 'G-XENOS-DECODE-CLEAN' -Status 'enforced' `
         -Pass ($validatorResults['xenos_decode_validator'] -eq 0) `
         -Metrics @{ exitCode = $validatorResults['xenos_decode_validator'] }
-    foreach ($v in $corpusValidators) {
-        Add-Gate -Id "G-CORPUS-$v" -Status 'tracked' `
+    # Pipeline-key + phase3 corpus gates: ENFORCED since 2026-08-23 - both
+    # validators accept the raw-ucode corpus via dual-path input classification
+    # and must process it cleanly (exit 0).
+    foreach ($v in @('shader_pipeline_validator', 'phase3_validator')) {
+        Add-Gate -Id "G-CORPUS-$v" -Status 'enforced' `
             -Pass ($validatorResults[$v] -eq 0) `
-            -Metrics @{ exitCode = $validatorResults[$v]; note = 'needs .fxc container input format' }
+            -Metrics @{ exitCode = $validatorResults[$v] }
     }
 
     $m = [regex]::Match($validatorOutputs['phase0_validator'], '(\d+) passed, (\d+) failed')
@@ -159,6 +165,28 @@ if (-not $SkipBoot) {
         # Tracked: real-handler passthrough proof (activates when a real slot is thumbed)
         Add-Gate -Id 'G-P4-RS-THUNK-HITS' -Status 'tracked' -Pass (($rsRealHits + $helperHits) -ge 1) `
             -Metrics @{ realThunkHits = $rsRealHits; helperHits = $helperHits }
+
+        # Tracked: P4' packet capture at sub_82411640. REVERSER-PINNED SCOPE:
+        # 640 is the init/state-batch seam (~handful hits/boot), NOT per-frame
+        # draws - so Pass = windows captured with real PM4 content. A draw-seam
+        # gate joins when the per-frame path (VSync worker / submit family) is
+        # instrumented.
+        $pktSummaries = @($slice | Select-String -Pattern 'PKT-CAP summary:').Count
+        # -AllMatches: summary line contains BOTH draw_indx= and draw_indx2=.
+        $pktDraws = 0
+        foreach ($m in @($slice | Select-String -AllMatches -Pattern 'draw_indx2?=(\d+)')) {
+            foreach ($mm in $m.Matches) { $pktDraws += [int]$mm.Groups[1].Value }
+        }
+        # desc is cumulative-monotonic across summaries -> Maximum == latest.
+        $pktDescs = @($slice | Select-String -Pattern 'desc=(\d+) dw=' |
+            ForEach-Object { [int]$_.Matches[0].Groups[1].Value } |
+            Measure-Object -Maximum).Maximum
+        if ($null -eq $pktDescs) { $pktDescs = 0 }
+        Add-Gate -Id 'G-P4-PACKET-CAPTURE' -Status 'tracked' `
+            -Pass ($pktSummaries -ge 1 -and $pktDescs -ge 1) -Metrics @{
+                pktSummaries = $pktSummaries; pktWindowsCaptured = $pktDescs
+                drawPacketsSeen = $pktDraws
+            }
 
         # Tracked: PM4-free frames (activates at P6'; currently the legacy ring is alive by design)
         $putVals = @($slice | Select-String -Pattern 'RING: ctx\+30=([0-9A-F]{8})' |
