@@ -686,19 +686,22 @@ PPC_FUNC(sub_82411218)
             (void)mem.ReadU32BE(subctx + 60, &published);
     }
     // Progress-counter visibility: *(r13+256)+88 of THIS thread (sub_82412F98
-    // exits when it advances >=5000 past snapshot).
-    uint32_t pcBlk = 0, pcVal = 0;
+    // exits when it advances >=5000 past snapshot). Pump preconditions per
+    // gate-cracker E3: dev[+13432]!=0 && blocker [0x827CDA3C]==0.
+    uint32_t pcBlk = 0, pcVal = 0, pumpObj = 0, blocker = 0;
     if (PPCContext* pctx = GetPPCContext())
     {
         const uint32_t tls = pctx->r13.u32;
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
         if (tls != 0 && mem.ReadU32BE(tls + 256, &pcBlk) && pcBlk != 0)
             (void)mem.ReadU32BE(pcBlk + 88, &pcVal);
+        (void)mem.ReadU32BE(dev + 13432, &pumpObj);
+        (void)mem.ReadU32BE(0x827CDA3C, &blocker);
     }
     const bool wraps = ((target + bytes) & ~mask) != (target & ~mask);
     if (n <= 16 || (n % 2000) == 0)
-        MCLA_LOG_INFO("RW #{:04X} tgt={:05X} b={:X} msk={:X} sc={:X} wb={:X} pc={}:{} wrap={}",
-                      n, target, bytes, mask, subctx, published, pcBlk, pcVal, wraps ? 1 : 0);
+        MCLA_LOG_INFO("RW #{:04X} tgt={:05X} b={:X} msk={:X} sc={:X} wb={:X} pc={}:{} pump={:08X} blk={:08X} wrap={}",
+                      n, target, bytes, mask, subctx, published, pcBlk, pcVal, pumpObj, blocker, wraps ? 1 : 0);
     __imp__sub_82411218(ctx, base);
 }
 
