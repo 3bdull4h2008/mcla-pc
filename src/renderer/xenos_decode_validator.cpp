@@ -1,8 +1,14 @@
 ﻿// Standalone MCLA Xenos shader-microcode validator.
-// Usage: xenos_decode_validator.exe <path-to-fxc-or-microcode>
+// Usage: xenos_decode_validator.exe <path-to-fxc-or-microcode> [--print]
+//        xenos_decode_validator.exe <dir> [--histogram <out.txt>]
 //  - Parses Rockstar .fxc containers (flags 0x102A1100), decodes every VS/PS
 //    microcode blob, and reports unknown instructions / OOB exec targets.
-//  - If given a raw microcode file, decodes it directly.
+//  - Decodes raw microcode files directly. Xenia ucode binary dumps
+//    (shader_<HASH>.ucode.bin.<vert|frag>, host-endian dwords written by
+//    Shader::DumpUcode) are restored to guest big-endian first.
+//  - Xenia text disassembly companions (*.ucode.<vert|frag>) are classified
+//    as non-microcode input and skipped (count printed); the --histogram
+//    artifact breaks failures down by opcode family.
 // Exit code 0 = clean, 1 = errors found.
 
 #include "xenos_microcode.h"
@@ -11,11 +17,89 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 using namespace mcla::renderer;
+
+// Survey instrumentation: classifies failing decodes by opcode/family without
+// altering any of the tracked counters below (G-XENOS-DECODE-CLEAN baseline).
+// Written to build/xenos_decode_histogram.txt via --histogram <path>.
+struct Buckets {
+    std::map<uint32_t, uint64_t> fetchOpcode;   // raw fetch opcode value
+    std::map<uint32_t, uint64_t> aluVector;     // raw vector opcode value
+    std::map<uint32_t, uint64_t> aluScalar;     // raw scalar opcode value
+    uint64_t oobExecTarget = 0;                 // exec beyond buffer end
+    std::map<uint32_t, uint64_t> oobExecCf;     // cf opcode of failing exec
+};
+
+struct Histogram {
+    uint64_t textFiles = 0;
+    uint64_t binaryFiles = 0;
+    // Failures attributed to text (non-microcode) inputs vs binary microcode.
+    Buckets binary, text;
+
+    static bool LooksLikeText(const uint8_t* data, size_t size) {
+        const size_t n = size < 64 ? size : 64;
+        if (n == 0) return false;
+        size_t printable = 0;
+        for (size_t i = 0; i < n; ++i) {
+            uint8_t c = data[i];
+            if ((c >= 0x20 && c < 0x7F) || c == '\r' || c == '\n' || c == '\t') {
+                ++printable;
+            }
+        }
+        return printable * 100 >= n * 90;
+    }
+
+    void Report(FILE* out) const;
+};
+
+static void Bump(std::map<uint32_t, uint64_t>& m, uint32_t key) { ++m[key]; }
+
+// Xenia's Shader::DumpUcode writes the host-endian ucode dword array verbatim
+// (.research/xenia/src/xenia/gpu/shader.cc:142-145; the array itself is
+// produced host-side via xe::copy_and_swap at shader.cc:34), so its
+// shader_<HASH>.ucode.bin.<ext> dumps store what this project assembles as
+// big-endian guest dwords in little-endian byte order. Recover the guest-BE
+// stream in place so the single BE decode pipeline below sees valid words.
+// Explicit per-dword byte reversal - no reinterpret_cast on file data.
+static void RestoreGuestEndianDwords(std::vector<uint8_t>& data) {
+    for (size_t i = 0; i + 4 <= data.size(); i += 4) {
+        uint8_t t = data[i];
+        data[i] = data[i + 3];
+        data[i + 3] = t;
+        t = data[i + 1];
+        data[i + 1] = data[i + 2];
+        data[i + 2] = t;
+    }
+}
+
+static void ReportBuckets(const char* label, const Buckets& b, FILE* out) {
+    std::fprintf(out, "[%s] oob_exec_target=%llu\n", label,
+                 (unsigned long long)b.oobExecTarget);
+    auto dumpMap = [&](const char* name, const std::map<uint32_t, uint64_t>& m) {
+        std::fprintf(out, "  %s:", name);
+        for (const auto& [key, count] : m) {
+            std::fprintf(out, " %u=%llu", key, (unsigned long long)count);
+        }
+        std::fprintf(out, "\n");
+    };
+    dumpMap("unknown_fetch_opcode", b.fetchOpcode);
+    dumpMap("unknown_alu_vector_opcode", b.aluVector);
+    dumpMap("unknown_alu_scalar_opcode", b.aluScalar);
+    dumpMap("oob_exec_cf_opcode", b.oobExecCf);
+}
+
+void Histogram::Report(FILE* out) const {
+    std::fprintf(out, "files: text=%llu binary=%llu\n",
+                 (unsigned long long)textFiles,
+                 (unsigned long long)binaryFiles);
+    ReportBuckets("binary microcode", binary, out);
+    ReportBuckets("text (non-microcode input)", text, out);
+}
 
 struct ContainerHeader {
     uint32_t flags, virtualSize, physicalSize, fieldC;
@@ -85,7 +169,7 @@ static void PrintMicrocode(const uint8_t* code, size_t size) {
 }
 
 static bool DecodeMicrocode(const uint8_t* code, size_t size, Stats& stats,
-                            bool print) {
+                            bool print, Buckets* survey) {
     bool clean = true;
     const size_t cf_bound = ComputeControlFlowByteBound(code, size);
     size_t n = cf_bound / 12;
@@ -104,6 +188,11 @@ static bool DecodeMicrocode(const uint8_t* code, size_t size, Stats& stats,
                 if (cf.count > 0 && base + size_t(cf.count) * 12 > size) {
                     ++stats.oobExecs;
                     clean = false;
+                    if (survey) {
+                        ++survey->oobExecTarget;
+                        Bump(survey->oobExecCf,
+                             static_cast<uint32_t>(cf.opcode));
+                    }
                     continue;
                 }
                 for (uint32_t i = 0; i < cf.count; ++i) {
@@ -116,6 +205,22 @@ static bool DecodeMicrocode(const uint8_t* code, size_t size, Stats& stats,
                     if (ins.unknown) {
                         ++stats.unknownInstructions;
                         clean = false;
+                        if (survey) {
+                            if (ins.kind == InstructionKind::Alu) {
+                                if (static_cast<uint32_t>(ins.vectorOpcode) > 29) {
+                                    Bump(survey->aluVector,
+                                         static_cast<uint32_t>(ins.vectorOpcode));
+                                }
+                                const uint32_t so =
+                                    static_cast<uint32_t>(ins.scalarOpcode);
+                                if (!(so <= 40 || (so >= 42 && so <= 50))) {
+                                    Bump(survey->aluScalar, so);
+                                }
+                            } else {
+                                Bump(survey->fetchOpcode,
+                                     static_cast<uint32_t>(ins.fetchOpcode));
+                            }
+                        }
                         if (print) {
                             std::printf("  !! unknown instr at +%04zu kind=%d\n",
                                         base + i * 12, int(ins.kind));
@@ -179,7 +284,8 @@ static bool ParseFxc(const uint8_t* data, size_t size, Stats& stats, bool print)
                             i, h.flags, isVs ? "VS" : "PS", h.virtualSize,
                             h.physicalSize, sh.size);
             }
-            if (DecodeMicrocode(data + codeStart, sh.size, stats, print)) {
+            if (DecodeMicrocode(data + codeStart, sh.size, stats, print,
+                                nullptr)) {
                 ++stats.cleanShaders;
             } else {
                 allClean = false;
@@ -262,9 +368,13 @@ static void DumpShaderIr(const uint8_t* code, size_t size, FILE* out) {
     }
 }
 
-static bool ScanDirectory(const fs::path& dir, Stats& total) {
+static bool ScanDirectory(const fs::path& dir, Stats& total, Histogram* hist) {
     bool allClean = true;
     size_t count = 0;
+    Stats binaryTotal;
+    uint64_t binaryFilesScanned = 0;
+    uint64_t binaryCleanFiles = 0;
+    uint64_t skippedTextDisasm = 0;
     for (const auto& entry : fs::recursive_directory_iterator(dir)) {
         if (!entry.is_regular_file()) continue;
         // Accept .fxc containers AND raw microcode dumps (*.ucode.*) - the
@@ -284,16 +394,46 @@ static bool ScanDirectory(const fs::path& dir, Stats& total) {
             continue;
         }
         std::fclose(f);
+        // Xenia ucode binary dumps (shader_<HASH>.ucode.bin.<vert|frag>) hold
+        // host-endian dwords (Shader::DumpUcode writes the host-endian array
+        // verbatim); restore guest-BE before decoding.
+        const bool isXeniaUcodeBin =
+            entry.path().string().find(".ucode.bin.") != std::string::npos;
+        if (isXeniaUcodeBin) RestoreGuestEndianDwords(data);
         Stats stats;
-        bool clean;
+        Buckets survey;
+        Buckets* surveyPtr = nullptr;
+        const bool textLike = Histogram::LooksLikeText(data.data(), data.size());
+        if (hist) {
+            if (textLike) {
+                ++hist->textFiles;
+                surveyPtr = &hist->text;
+            } else {
+                ++hist->binaryFiles;
+                surveyPtr = &hist->binary;
+            }
+        }
+        // Xenia text disassembly companions (shader_<HASH>.ucode.<ext>, no
+        // ".bin." - see .research/findings/xenia/FINDINGS.md) are not
+        // microcode. Feeding them to the decoder measures ASCII, not decoder
+        // gaps, so they are skipped from decoding and reported explicitly.
+        // The skip is printed; per-file counters below are unchanged.
         bool foundContainer = false;
         for (size_t i = 0; i + sizeof(ContainerHeader) <= data.size(); i += 4) {
             if ((ReadBE32(data.data() + i) & 0xFFFFFF00) == 0x102A1100) { foundContainer = true; break; }
         }
+        if (!foundContainer && textLike &&
+            entry.path().string().find(".ucode.") != std::string::npos) {
+            ++skippedTextDisasm;
+            count++;
+            continue;
+        }
+        bool clean;
         if (foundContainer) {
             clean = ParseFxc(data.data(), data.size(), stats, false);
         } else {
-            clean = DecodeMicrocode(data.data(), data.size(), stats, false);
+            clean = DecodeMicrocode(data.data(), data.size(), stats, false,
+                                    surveyPtr);
         }
         total.containers += stats.containers;
         total.shaders += stats.shaders;
@@ -301,10 +441,28 @@ static bool ScanDirectory(const fs::path& dir, Stats& total) {
         total.unknownInstructions += stats.unknownInstructions;
         total.oobExecs += stats.oobExecs;
         total.returns += stats.returns;
+        if (!textLike) {
+            ++binaryFilesScanned;
+            binaryTotal.unknownInstructions += stats.unknownInstructions;
+            binaryTotal.oobExecs += stats.oobExecs;
+            binaryTotal.returns += stats.returns;
+            if (clean) ++binaryCleanFiles;
+        }
         if (!clean) allClean = false;
         count++;
     }
     std::printf("files=%zu\n", count);
+    std::printf(
+        "skipped text disassembly (non-microcode): %llu\n",
+        (unsigned long long)skippedTextDisasm);
+    std::printf(
+        "binary microcode only: files=%llu clean=%llu "
+        "unknown_instrs=%llu oob=%llu returns=%llu\n",
+        (unsigned long long)binaryFilesScanned,
+        (unsigned long long)binaryCleanFiles,
+        (unsigned long long)binaryTotal.unknownInstructions,
+        (unsigned long long)binaryTotal.oobExecs,
+        (unsigned long long)binaryTotal.returns);
     return allClean;
 }
 
@@ -392,7 +550,8 @@ int main(int argc, char** argv) {
     }
     if (fs::is_directory(path)) {
         Stats total;
-        bool clean = ScanDirectory(path, total);
+        Histogram hist;
+        bool clean = ScanDirectory(path, total, &hist);
         std::printf("dir scan: containers=%llu shaders=%llu clean=%llu unknown_instrs=%llu oob=%llu returns=%llu\n",
                     (unsigned long long)total.containers,
                     (unsigned long long)total.shaders,
@@ -400,6 +559,19 @@ int main(int argc, char** argv) {
                     (unsigned long long)total.unknownInstructions,
                     (unsigned long long)total.oobExecs,
                     (unsigned long long)total.returns);
+        // Survey artifact (durable, under build/): failure families by input
+        // class. Does not affect the tracked counters above.
+        fs::path histPath;
+        for (int i = 2; i + 1 < argc; ++i) {
+            if (std::strcmp(argv[i], "--histogram") == 0) histPath = argv[i + 1];
+        }
+        if (!histPath.empty()) {
+            if (FILE* hf = std::fopen(histPath.string().c_str(), "w")) {
+                hist.Report(hf);
+                std::fclose(hf);
+                std::printf("histogram written: %s\n", histPath.string().c_str());
+            }
+        }
         std::printf(clean ? "RESULT: CLEAN\n" : "RESULT: ISSUES FOUND\n");
         return clean ? 0 : 1;
     }
@@ -418,6 +590,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::fclose(f);
+    }
+    // Same provenance rule as ScanDirectory: Xenia ucode binary dumps are
+    // host-endian dword arrays; restore guest-BE before decoding.
+    if (path.string().find(".ucode.bin.") != std::string::npos) {
+        RestoreGuestEndianDwords(data);
     }
 
     Stats stats;
@@ -443,7 +620,7 @@ int main(int argc, char** argv) {
                     (unsigned long long)stats.returns);
     } else {
         if (print) PrintMicrocode(data.data(), data.size());
-        clean = DecodeMicrocode(data.data(), data.size(), stats, print);
+        clean = DecodeMicrocode(data.data(), data.size(), stats, print, nullptr);
         std::printf("raw microcode: %zu bytes, unknown_instrs=%llu oob=%llu returns=%llu\n",
                     data.size(),
                     (unsigned long long)stats.unknownInstructions,

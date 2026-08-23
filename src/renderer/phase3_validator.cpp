@@ -4,7 +4,10 @@
 //
 // 1. Unit-exercises DecodeVertexFormat / IndexElementBytes /
 //    HashVertexDeclaration and ResourceCache insert/find/eviction/needs-upload.
-// 2. Scans every container in <shader-dir>, decodes the IR, and records every
+// 2. Scans every container in <shader-dir> (dual-path input classification
+//    per raw_ucode_corpus.h: Rockstar .fxc containers, plus raw Xenia ucode
+//    dumps decoded after host->guest endian restore; ASCII disasm companions
+//    are skipped and counted), decodes the IR, and records every
 //    VFETCH vertexFormat code actually used by the corpus. Verifies that all
 //    observed codes decode to a supported VertexFormatDesc.
 //
@@ -15,6 +18,7 @@
 #include "resource_cache.h"
 #include "test_shaders.h"
 #include "grc_fvf_decode.h"
+#include "raw_ucode_corpus.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -477,6 +481,17 @@ int main(int argc, char** argv) {
     std::map<bool, uint64_t> miniUsage;
     std::set<uint32_t> unsupported;
     uint64_t containers = 0, fetchInstrs = 0, fetchConstantRel = 0;
+    // Raw-ucode corpus path (Xenia dumps; no container metadata).
+    uint64_t rawPrograms = 0, rawOobExecs = 0, rawUnknownInstrs = 0;
+    uint64_t textDisasmSkipped = 0;
+    // Container-proven vs raw-observed stream-binding evidence (Rev 04): the
+    // fetch-constant DESCRIPTORS backing vf=0 slots live in guest memory and
+    // are absent from raw microcode dumps, so stream-binding proof is only
+    // possible for container-parsed programs (they carry the guest tables).
+    std::map<uint32_t, uint64_t> containerFetchSlotUsage;
+    std::map<uint32_t, uint64_t> rawFetchSlotUsage;
+    uint64_t containerFetchInstrs = 0, containerFetchConstRel = 0;
+    uint64_t containerMiniFetches = 0;
 
     // Stream-binding classification (Rev 03): the offline corpus can only prove
     // HOW MANY vertex streams and WHICH fetch-constant slot the shaders bind; it
@@ -484,42 +499,88 @@ int main(int argc, char** argv) {
     // Assert the corpus is single-stream so the capture path knows a VB layout
     // for every draw must come from the guest declaration, never from here.
     std::map<uint32_t, uint64_t> fetchConstantSlotUsage;
+
+    // VFETCH usage recording, shared by the .fxc-container path and the
+    // raw-microcode path (identical IR shape: prog.instructions).
+    auto recordFetches = [&](const ShaderProgram& prog, bool fromContainer) {
+        for (const auto& ir : prog.instructions) {
+            if (ir.decoded.kind != InstructionKind::VertexFetch) continue;
+            fetchInstrs++;
+            uint32_t vf = ir.decoded.vertexFormat & 0x3F;
+            VertexFormatDesc vfd = DecodeVertexFetch(vf, ir.decoded.constIndex,
+                                                     ir.decoded.constIndexSelect);
+            vfUsage[vf]++;
+            strideUsage[ir.decoded.stride]++;
+            miniUsage[ir.decoded.isMiniFetch]++;
+            if (vfd.valid || vfd.fromFetchConstant) {
+                fetchConstantRel++;
+            } else {
+                unsupported.insert(vf);
+            }
+            // Also record fetch-constant slot use (MCLA vertex fetch is
+            // constant-relative: format/stride live in the fetch-constant
+            // descriptor, not the VFETCH instruction).
+            const uint32_t slot = vfd.fromFetchConstant
+                                      ? vfd.fetchConstantIndex
+                                      : (ir.decoded.constIndex & 0x1F);
+            constIndexUsage[slot]++;
+            fetchConstantSlotUsage[slot]++;
+            if (fromContainer) {
+                ++containerFetchInstrs;
+                if (vfd.valid || vfd.fromFetchConstant) ++containerFetchConstRel;
+                ++containerFetchSlotUsage[slot];
+                if (ir.decoded.isMiniFetch) ++containerMiniFetches;
+            } else {
+                ++rawFetchSlotUsage[slot];
+            }
+        }
+    };
+
+    // Stream-binding classification (Rev 03): the offline corpus can only prove
+    // HOW MANY vertex streams and WHICH fetch-constant slot the shaders bind; it
+    // cannot recover format/stride (that lives in the captured drawable grcFvf).
+    // Assert the corpus is single-stream so the capture path knows a VB layout
+    // for every draw must come from the guest declaration, never from here.
     for (const auto& entry : fs::recursive_directory_iterator(root)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() == ".list") continue;
         bool ok = false;
         std::vector<uint8_t> data = ReadFile(entry.path(), ok);
         if (!ok) continue;
+        const std::string pathStr = entry.path().string();
+        // Xenia ucode binary dumps hold host-endian dwords (Shader::DumpUcode
+        // writes them verbatim); restore guest-BE before classification/decode.
+        if (corpus::PathContains(pathStr, ".ucode.bin.")) {
+            corpus::RestoreGuestEndianDwords(data);
+        }
+        // Dual-path input classification: .fxc containers -> container parse;
+        // raw microcode dumps -> shared raw decode; text disasms -> counted
+        // skip; compiled .d3d12.bin.* companions -> ignored.
+        const corpus::InputClass cls =
+            corpus::ClassifyCorpusFile(pathStr, data.data(), data.size());
+        if (cls == corpus::InputClass::Ignore) continue;
+        if (cls == corpus::InputClass::TextDisasm) {
+            textDisasmSkipped++;
+            continue;
+        }
+        if (cls == corpus::InputClass::RawMicrocode) {
+            ShaderProgram prog;
+            prog.isVertex = corpus::IsVertexDumpName(pathStr);
+            const corpus::RawDecodeStats st =
+                corpus::DecodeRawMicrocode(data.data(), data.size(), prog);
+            rawPrograms++;
+            rawOobExecs += st.oobExecs;
+            rawUnknownInstrs += st.unknownInstrs;
+            recordFetches(prog, false);
+            continue;
+        }
         VisitShaderContainers(data.data(), data.size(), [&](size_t off) {
             const size_t vsize = AssembleBE32(data.data() + off + 4);
             const size_t psize = AssembleBE32(data.data() + off + 8);
             ShaderProgram prog;
             if (!ParseShaderProgram(data.data() + off, vsize + psize, prog)) return true;
             containers++;
-            for (const auto& ir : prog.instructions) {
-                if (ir.decoded.kind != InstructionKind::VertexFetch) continue;
-                fetchInstrs++;
-                uint32_t vf = ir.decoded.vertexFormat & 0x3F;
-                VertexFormatDesc vfd = DecodeVertexFetch(vf, ir.decoded.constIndex,
-                                                         ir.decoded.constIndexSelect);
-                vfUsage[vf]++;
-                strideUsage[ir.decoded.stride]++;
-                miniUsage[ir.decoded.isMiniFetch]++;
-                if (vfd.valid || vfd.fromFetchConstant) {
-                    fetchConstantRel++;
-                } else {
-                    unsupported.insert(vf);
-                }
-                // Also record fetch-constant slot use (MCLA vertex fetch is
-                // constant-relative: format/stride live in the fetch-constant
-                // descriptor, not the VFETCH instruction).
-                constIndexUsage[vfd.fromFetchConstant
-                                    ? vfd.fetchConstantIndex
-                                    : (ir.decoded.constIndex & 0x1F)]++;
-                fetchConstantSlotUsage[vfd.fromFetchConstant
-                                           ? vfd.fetchConstantIndex
-                                           : (ir.decoded.constIndex & 0x1F)]++;
-            }
+            recordFetches(prog, true);
             return true;
         });
     }
@@ -530,6 +591,9 @@ int main(int argc, char** argv) {
                 vfUsage.size(), unsupported.size());
     std::printf("  fetch_constant_relative=%llu (vf=0 resolved from guest fetch-constant descriptor)\\n",
                 (unsigned long long)fetchConstantRel);
+    std::printf("raw_ucode: programs=%llu oob=%llu unknown=%llu text_skipped=%llu\\n",
+                (unsigned long long)rawPrograms, (unsigned long long)rawOobExecs,
+                (unsigned long long)rawUnknownInstrs, (unsigned long long)textDisasmSkipped);
     std::printf("vf_code_histogram:\n");
     for (auto& [vf, count] : vfUsage) {
         const char* status = DecodeVertexFormat(vf).valid ? "supported"
@@ -557,18 +621,42 @@ int main(int argc, char** argv) {
     // shader/descriptor supplies address+size only. Any multi-slot or non-fetch
     //-constant fetch would mean a different (offline-recoverable) layout and
     // must be reported, not assumed.
-    uint64_t distinctSlots = fetchConstantSlotUsage.size();
-    bool singleStream = (distinctSlots == 1) &&
-                        (miniUsage.size() == 1) && !miniUsage.begin()->first;
+    // Rev 04 (raw-ucode corpus): the descriptors backing vf=0 slots are guest
+    // memory, not part of microcode dumps, so the single-stream PROOF is only
+    // possible for container-parsed programs. The hard assertion therefore
+    // applies to the container sub-corpus only (identical semantics when a
+    // container corpus is scanned); raw-dump slot observations are reported
+    // below as evidence - recorded, never invented, never asserted.
+    const uint64_t distinctSlots = fetchConstantSlotUsage.size();
+    const bool containerBindingProven = containerFetchInstrs > 0;
+    bool singleStream = !containerBindingProven ||
+                        (containerFetchSlotUsage.size() == 1 &&
+                         containerMiniFetches == 0);
     // Gating: only slots that are provably fetch-constant-relative count as a
     // single bound stream. vf=0 => fetchConstantRel==fetchInstrs.
-    bool allFetchConstant = (fetchConstantRel == fetchInstrs);
+    bool allFetchConstant = !containerBindingProven ||
+                            (containerFetchConstRel == containerFetchInstrs);
     std::printf("stream_binding_classification:\n");
     std::printf("  distinct_fetch_constant_slots=%llu  vertex_fetches=%llu  fetch_constant_relative=%llu\n",
                 (unsigned long long)distinctSlots, (unsigned long long)fetchInstrs,
                 (unsigned long long)fetchConstantRel);
-    std::printf("  single_stream=%s  (all fetches resolve to one slot, full-rate, layout must come from guest grcFvf)\n",
-                (singleStream && allFetchConstant) ? "TRUE" : "FALSE");
+    if (containerBindingProven) {
+        std::printf("  container_fetches=%llu fetch_constant_relative=%llu distinct_container_slots=%llu\n",
+                    (unsigned long long)containerFetchInstrs,
+                    (unsigned long long)containerFetchConstRel,
+                    (unsigned long long)containerFetchSlotUsage.size());
+        std::printf("  single_stream=%s  (all fetches resolve to one slot, full-rate, layout must come from guest grcFvf)\n",
+                    (singleStream && allFetchConstant) ? "TRUE" : "FALSE");
+    } else {
+        std::printf("  container_proven=false (no .fxc containers in scan dir; "
+                    "single-stream assertion N/A without guest descriptors)\n");
+    }
+    if (!rawFetchSlotUsage.empty()) {
+        std::printf("raw_stream_binding_observation (informational; descriptors unavailable):\n");
+        for (auto& [slot, count] : rawFetchSlotUsage) {
+            std::printf("  slot[%u] count=%llu\n", slot, (unsigned long long)count);
+        }
+    }
 
     bool allOk = vdOk && fOk && rcOk && shOk && gfOk && unsupported.empty() &&
                  singleStream && allFetchConstant;

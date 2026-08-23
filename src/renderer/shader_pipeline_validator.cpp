@@ -2,8 +2,12 @@
 //
 // Usage: shader_pipeline_validator.exe <shader-dir> [--dump <out-dir>]
 //
-// Scans every regular file in <shader-dir>, walks Rockstar .fxc containers via
-// VisitShaderContainers, and for each container:
+// Scans every regular file in <shader-dir>. Input classification is dual-path
+// (raw_ucode_corpus.h): files with the Rockstar .fxc container magic go through
+// VisitShaderContainers; raw Xenia microcode dumps (*.ucode.bin.*, host-endian,
+// byte-reversed back to guest-BE) decode through the shared raw path; ASCII
+// text disasm companions (*.ucode.<vert|frag>) and compiled *.d3d12.bin.*
+// companions are skipped/counted, not decoded. For each .fxc container:
 //   - parses it through ParseShaderContainer into the normalized IR;
 //   - verifies hash determinism (HashShaderContainer returns the same
 //     programHash on two independent parses of the same bytes);
@@ -18,6 +22,7 @@
 
 #include "shader_translator.h"
 #include "pipeline_cache.h"
+#include "raw_ucode_corpus.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -91,6 +96,12 @@ struct Stats {
     uint64_t emptyProgram = 0;
     uint64_t unknownOpcodes = 0;
     uint64_t unsupportedOpcodes = 0;
+    // Raw-ucode corpus path (Xenia dumps; no Rockstar container metadata).
+    uint64_t rawShaders = 0;
+    uint64_t rawOobExecs = 0;
+    uint64_t textDisasmSkipped = 0;
+    // Container-metadata-only stages (HLSL translation) skipped for raw input.
+    uint64_t translationSkippedRaw = 0;
 };
 
 static std::vector<uint8_t> ReadFile(const fs::path& path, bool& ok) {
@@ -182,9 +193,38 @@ static bool ProcessContainer(const uint8_t* data, size_t size, Stats& stats,
     return ok;
 }
 
+// Raw-ucode corpus path (Xenia dumps, no Rockstar container metadata): decode
+// the guest-BE microcode into IR, verify hash determinism across an
+// independent second decode, and count decoder-quality findings (unknown
+// opcodes / OOB exec targets). Stages that require container metadata
+// (constants table -> HLSL translation) are genuinely N/A here: they are
+// counted as skipped, not errors.
+static bool ProcessRawMicrocode(const std::vector<uint8_t>& data, bool isVertex,
+                                Stats& stats) {
+    stats.rawShaders++;
+    if (isVertex) stats.vertex++; else stats.pixel++;
+
+    ShaderProgram prog;
+    prog.isVertex = isVertex;
+    const corpus::RawDecodeStats st =
+        corpus::DecodeRawMicrocode(data.data(), data.size(), prog);
+    stats.rawOobExecs += st.oobExecs;
+    stats.unknownOpcodes += st.unknownInstrs;
+
+    ShaderProgram prog2;
+    prog2.isVertex = isVertex;
+    corpus::DecodeRawMicrocode(data.data(), data.size(), prog2);
+    if (ComputeShaderProgramHash(prog) != ComputeShaderProgramHash(prog2)) {
+        stats.hashMismatches++;
+        return false;
+    }
+
+    stats.translationSkippedRaw++;
+    return st.unknownInstrs == 0 && st.oobExecs == 0;
+}
+
 // Exercise the pipeline-key + cache machinery with synthetic data.
-static bool ExercisePipelineKeys() {
-    bool ok = true;
+static bool ExercisePipelineKeys() {    bool ok = true;
 
     PipelineState s1;
     s1.targetFormats[0] = 0x00162; // R8G8B8A8_UNORM
@@ -266,7 +306,28 @@ int main(int argc, char** argv) {
         bool ok = false;
         std::vector<uint8_t> data = ReadFile(entry.path(), ok);
         if (!ok) continue;
+        const std::string pathStr = entry.path().string();
+        // Xenia ucode binary dumps hold host-endian dwords (Shader::DumpUcode
+        // writes them verbatim); restore guest-BE before classification/decode.
+        if (corpus::PathContains(pathStr, ".ucode.bin.")) {
+            corpus::RestoreGuestEndianDwords(data);
+        }
+        // Dual-path input classification: .fxc containers -> container pipeline;
+        // raw microcode dumps -> raw decode; text disasms -> counted skip.
+        const corpus::InputClass cls =
+            corpus::ClassifyCorpusFile(pathStr, data.data(), data.size());
+        if (cls == corpus::InputClass::Ignore) continue;
         stats.files++;
+        if (cls == corpus::InputClass::TextDisasm) {
+            stats.textDisasmSkipped++;
+            continue;
+        }
+        if (cls == corpus::InputClass::RawMicrocode) {
+            if (!ProcessRawMicrocode(data, corpus::IsVertexDumpName(pathStr), stats)) {
+                allOk = false;
+            }
+            continue;
+        }
 
         // Walk containers at variable offsets (XenosRecomp-style scan).
         bool fileClean = true;
@@ -307,6 +368,11 @@ int main(int argc, char** argv) {
                 (unsigned long long)stats.unsupportedOpcodes,
                 (unsigned long long)stats.translationErrors);
     std::printf("pipeline_key_test=%s\n", keyOk ? "ok" : "FAIL");
+    std::printf("raw_ucode: shaders=%llu oob=%llu text_skipped=%llu translation_skipped_container_only=%llu\n",
+                (unsigned long long)stats.rawShaders,
+                (unsigned long long)stats.rawOobExecs,
+                (unsigned long long)stats.textDisasmSkipped,
+                (unsigned long long)stats.translationSkippedRaw);
     std::printf("RESULT: %s\n", allOk ? "CLEAN" : "ISSUES FOUND");
     return allOk ? 0 : 1;
 }
