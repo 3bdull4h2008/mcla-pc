@@ -791,7 +791,7 @@ void Start(uint32_t entryGuest)
                 // VdSetGraphicsInterruptCallback userData object. The old
                 // pollerCtx/D0 probe (0x82839254) read a DIFFERENT object —
                 // retired per session-5.
-                uint32_t dev = 0, slot = 0, cursor = 0, vbl = 0, flg = 0, ud = 0, ud1 = 0;
+                uint32_t dev = 0, slot = 0, cursor = 0, vbl = 0, flg = 0, ud = 0, ud1 = 0, ud8 = 0;
                 {
                     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
                     if (mem.ReadU32BE(0x82000864, &slot) && slot != 0)
@@ -802,8 +802,17 @@ void Start(uint32_t entryGuest)
                         (void)mem.ReadU32BE(dev + 21648, &vbl);
                         (void)mem.ReadU32BE(dev + 10942, &flg);
                     }
-                    if (mem.ReadU32BE(0xA0003080, &ud) && ud != 0)
+                    // VdSetGraphicsInterruptCallback userData: probe BOTH the
+                    // uncached alias (guest-chosen 0xA0003080) and its
+                    // would-be cached slot (0x80003080). System-wide A/C
+                    // convergence was reverted (e9c9445: title needs >512 MB
+                    // physical; identity-safe capacity insufficient), so
+                    // alias resolution stays per-probe until evidence
+                    // justifies more.
+                    (void)mem.ReadU32BE(0xA0003080, &ud);
+                    if (ud != 0)
                         (void)mem.ReadU32BE(ud, &ud1);
+                    (void)mem.ReadU32BE(0x80003080, &ud8);
                 }
                 // Live guest state of the parked main thread: g_faultCtx points
                 // at BootWorker's PPCContext while it runs guest code. Context
@@ -833,14 +842,14 @@ void Start(uint32_t entryGuest)
                 char rbuf[3][64];
                 char lbuf[1024];
                 std::snprintf(lbuf, sizeof(lbuf),
-                              "PARK-SAMPLE rawrip=%llx nf=%s s0=%s s1=%s s2=%s dev=%08X cur=%08X vbl=%u flg=%u ud=%08X ud1=%08X"
+                              "PARK-SAMPLE rawrip=%llx nf=%s s0=%s s1=%s s2=%s dev=%08X cur=%08X vbl=%u flg=%u ud=%08X ud1=%08X ud8=%08X"
                               " | r3=%08X r4=%08X lr=%08X r13=%08X tls0=%08X [r1-8]=%08X [r1-16]=%08X [r1-24]=%08X",
                               (unsigned long long)tc.Rip,
                               NearestFunctionName(tc.Rip),
                               (std::snprintf(rbuf[0], sizeof(rbuf[0]), "%s", NearestFunctionName(rets[0])), rbuf[0]),
                               (std::snprintf(rbuf[1], sizeof(rbuf[1]), "%s", NearestFunctionName(rets[1])), rbuf[1]),
                               (std::snprintf(rbuf[2], sizeof(rbuf[2]), "%s", NearestFunctionName(rets[2])), rbuf[2]),
-                              dev, cursor, vbl, flg, ud, ud1,
+                              dev, cursor, vbl, flg, ud, ud1, ud8,
                               gr3, gr4, glr, gr13, tls0, swM8, swM16, swM24);
                 BootReportInfo(lbuf);
             }
