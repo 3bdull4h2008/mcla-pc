@@ -1363,6 +1363,13 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                         {
                             fn(cbCtx, base);
                         }
+                        // EXPERIMENT (gate-cracker + xenia-scout 2026-08-23):
+                        // KTHREAD+0x58 progress must reach snapshot+5000 for
+                        // sub_82412F98 to exit; no writer exists in the guest
+                        // module and xenia never synthesizes it (MCLA freezes
+                        // there too). Bump per vblank from our pump; revert if
+                        // disproven. Rate chosen to cross threshold ~1.3s.
+                        mcla::gpu::CpVblankBump(64);
 
                         // Ring-buffer submission probe: sample the head of the
                         // primary ring every ~2s (120 frames) to see whether

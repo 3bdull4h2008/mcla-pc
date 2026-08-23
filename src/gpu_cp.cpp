@@ -34,6 +34,7 @@ std::atomic<uint32_t> g_rptrIndex{0};       // read pointer, dword index
 std::atomic<uint32_t> g_writebackAddr{0};   // where rptr is published (BE)
 std::atomic<uint32_t> g_driverDevCtx{0};    // GuestDevice VA (see CpAttachDriverCtx)
 std::atomic<uint32_t> g_pushWatermark{0};   // consumed-through VA (driver space)
+std::atomic<uint32_t> g_progressBlk{0};     // submitting thread's *(r13+256) block
 
 std::atomic<uint64_t> g_drainCount{0};
 std::atomic<uint64_t> g_swapCount{0};
@@ -191,6 +192,7 @@ void DrainRing(uint32_t wptr)
             uint32_t blk = 0;
             if (tls != 0 && mem.ReadU32BE(tls + 256, &blk) && blk != 0)
             {
+                g_progressBlk.store(blk, std::memory_order_relaxed);
                 uint32_t cur = 0;
                 if (mem.ReadU32BE(blk + 88, &cur))
                 {
@@ -251,6 +253,19 @@ void CpConsumePushWindow(uint32_t endVA, uint32_t dwords)
                 (void)mem.WriteU32BE(blk + 88, cur + dwords);
             }
         }
+    }
+}
+
+void CpVblankBump(uint32_t amount)
+{
+    const uint32_t blk = g_progressBlk.load(std::memory_order_relaxed);
+    if (blk == 0 || amount == 0)
+        return;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t cur = 0;
+    if (mem.ReadU32BE(blk + 88, &cur))
+    {
+        (void)mem.WriteU32BE(blk + 88, cur + amount);
     }
 }
 

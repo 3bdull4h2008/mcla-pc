@@ -34,6 +34,12 @@ void CpAttachDriverCtx(uint32_t devVA);
 // live PPC context).
 void CpConsumePushWindow(uint32_t endVA, uint32_t dwords);
 
+// EXPERIMENT (2026-08-23, falsifiable): xenia never maintains KTHREAD+0x58
+// (MCLA freezes there too), yet sub_82412F98 requires delta>=5000. We bump
+// the submitting thread's progress block by `amount` per vblank tick from
+// the vsync pump - mirroring MarkVblink placement. Revert if disproven.
+void CpVblankBump(uint32_t amount);
+
 // Returns true when guestAddr lies inside the XGPU MMIO window and was
 // consumed (never written through to RAM).
 bool CpMmioWrite(uint32_t guestAddr, uint32_t value);
