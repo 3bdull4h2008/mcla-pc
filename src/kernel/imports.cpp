@@ -736,6 +736,21 @@ void MmQueryStatistics()
 uint32_t NtCreateEvent(be<uint32_t>* handle, void* objAttributes, uint32_t eventType, uint32_t initialState)
 {
     *handle = GetKernelHandle(CreateKernelObject<Event>(!eventType, !!initialState));
+
+    // EVENT-CREATE CENSUS (2026-08-23 session 10): handle -> creation-LR map.
+    // The TU83 driver worker waits on event [0x827D3738+52]=C9ADB800; matching
+    // that handle against this census identifies the creation site statically.
+    {
+        static std::atomic<uint32_t> s_evtCreates{0};
+        const uint32_t n = s_evtCreates.fetch_add(1) + 1;
+        if (n <= 500)
+        {
+            MCLA_LOG_INFO("EVENT-CREATE #{} h={:08X} type={} init={} lr={:08X}",
+                          n, static_cast<uint32_t>(*handle), eventType, initialState,
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
+
     return 0;
 }
 
@@ -2194,6 +2209,19 @@ uint32_t NtSetEvent(Event* handle, uint32_t* previousState)
 uint32_t NtCreateSemaphore(be<uint32_t>* Handle, XOBJECT_ATTRIBUTES* ObjectAttributes, uint32_t InitialCount, uint32_t MaximumCount)
 {
     Handle->set(GetKernelHandle(CreateKernelObject<Semaphore>(InitialCount, MaximumCount)));
+
+    // SEMA-CREATE CENSUS (session 10): the main-thread park waits on handle
+    // C9ADB800 (NOT an NtCreateEvent product) - identify its creator.
+    {
+        static std::atomic<uint32_t> s_semaCreates{0};
+        const uint32_t n = s_semaCreates.fetch_add(1) + 1;
+        if (n <= 100)
+        {
+            MCLA_LOG_INFO("SEMA-CREATE #{} h={:08X} init={} max={} lr={:08X}",
+                          n, static_cast<uint32_t>(*Handle), InitialCount, MaximumCount,
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
     return STATUS_SUCCESS;
 }
 

@@ -825,11 +825,111 @@ PPC_FUNC(sub_82135DC0)
     const uint32_t handle = ctx.r3.u32;
     const uint32_t timeoutArg = ctx.r4.u32;
     const uint32_t alertable = ctx.r5.u32 & 0xFF;
-    if (n <= 12 || (n % 1000) == 0)
-        MCLA_LOG_INFO("WAITHELP sub_82135DC0 #{} h={:08X} t={} al={}",
-                      n, handle, timeoutArg, alertable);
+    // Finite timeouts are the poll patterns (frame pacing etc.) - always
+    // surface those up to a cap; infinite worker parks stay throttled.
+    const bool finite = timeoutArg != 0xFFFFFFFFu;
+    if ((finite && n <= 400) || n <= 12 || (n % 1000) == 0)
+        MCLA_LOG_INFO("WAITHELP sub_82135DC0 #{} h={:08X} t={} al={} lr={:08X}",
+                      n, handle, timeoutArg, alertable, ctx.lr);
     __imp__sub_82135DC0(ctx, base);
     const uint32_t d = s_h135DC0done.fetch_add(1) + 1;
     if (d <= 12 || (d % 1000) == 0)
         MCLA_LOG_INFO("WAITHELP RETURNED #{} r3={:08X} (257=timeout)", d, ctx.r3.u32);
+}
+
+// Non-alertable wrapper (li r5,0 -> DC0, TU0:18580-18587): the MAIN thread's
+// park goes through here (PARK-SAMPLE lr=82135DF8 is inside DC0's own
+// NtWaitForSingleObjectEx call). Census names each caller site + handle.
+PPC_FUNC_IMPL(__imp__sub_82135DB8);
+static std::atomic<uint32_t> s_h135DB8{0};
+PPC_FUNC(sub_82135DB8)
+{
+    const uint32_t n = s_h135DB8.fetch_add(1) + 1;
+    if (n <= 24 || (n % 1000) == 0)
+        MCLA_LOG_INFO("WAITB8 sub_82135DB8 #{} h={:08X} t={} lr={:08X}",
+                      n, ctx.r3.u32, ctx.r4.u32, ctx.lr);
+    __imp__sub_82135DB8(ctx, base);
+}
+
+// Sync-wait utility (TU17:10837): wait INFINITE non-alertable on r3, return
+// r3==0. The main thread's park handle C9ADB800 arrives HERE - capture the
+// caller one level up to name the waiting subsystem.
+PPC_FUNC_IMPL(__imp__sub_821C90C0);
+static std::atomic<uint32_t> s_h90C0{0};
+PPC_FUNC(sub_821C90C0)
+{
+    const uint32_t n = s_h90C0.fetch_add(1) + 1;
+    const uint32_t handle = ctx.r3.u32;
+    const uint32_t caller = ctx.lr;
+    if (n <= 24 || (n % 1000) == 0)
+        MCLA_LOG_INFO("WAITSYNC sub_821C90C0 #{} h={:08X} caller={:08X}",
+                      n, handle, caller);
+    __imp__sub_821C90C0(ctx, base);
+}
+
+// FENCE-WAIT (TU21:4085): sub_821E5640(obj=r3, blocking=r4, release=r5)
+// waits INFINITE on the embedded completion event [obj+8]. Dump the object
+// tag/state so the pending async-job TYPE becomes visible; caller LR names
+// the submitter (async wrapper sub_821E5FD0 family).
+PPC_FUNC_IMPL(__imp__sub_821E5640);
+static std::atomic<uint32_t> s_h5640{0};
+PPC_FUNC(sub_821E5640)
+{
+    const uint32_t n = s_h5640.fetch_add(1) + 1;
+    const uint32_t obj = ctx.r3.u32;
+    const uint32_t blocking = ctx.r4.u32 & 0xFF;
+    uint32_t tag = 0, state = 0, evt = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(obj + 0, &tag);
+        (void)mem.ReadU32BE(obj + 4, &state);
+        (void)mem.ReadU32BE(obj + 8, &evt);
+    }
+    if (n <= 24 || (n % 500) == 0)
+        MCLA_LOG_INFO("FENCE sub_821E5640 #{} obj={:08X} tag={:08X} st={} ev={:08X} blk={} lr={:08X}",
+                      n, obj, tag, state, evt, blocking, ctx.lr);
+    __imp__sub_821E5640(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// TU83 DRIVER-WORKER census: sub_824569C8 is the worker loop the main guest
+// thread parks inside (sibling 824569C4 = empty padding stub). Its global
+// block 0x827D3738: event-handle@+52 (PARK-SAMPLE saw C9ADB800),
+// deadline@+128/+132, lazy-init@+184, wake flags@+188/+196/+200/+208/+212.
+// Census dumps all wake-relevant fields + caller LR at entry so we can pin
+// which field transition must lift the park. No direct callers exist
+// module-wide => invoked as a thread entry / function pointer.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_824569C8);
+static std::atomic<uint32_t> s_h569C8{0};
+PPC_FUNC(sub_824569C8)
+{
+    const uint32_t n = s_h569C8.fetch_add(1) + 1;
+    constexpr uint32_t kBlk = 0x827D3738u;
+    const uint32_t lr = ctx.lr;
+    uint32_t ev52 = 0, dl128 = 0, dl132 = 0, f184 = 0, f188 = 0, f196 = 0;
+    uint32_t f200 = 0, f208 = 0, f212 = 0, cbTarget = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(kBlk + 52, &ev52);
+        (void)mem.ReadU32BE(kBlk + 128, &dl128);
+        (void)mem.ReadU32BE(kBlk + 132, &dl132);
+        (void)mem.ReadU32BE(kBlk + 184, &f184);
+        (void)mem.ReadU32BE(kBlk + 188, &f188);
+        (void)mem.ReadU32BE(kBlk + 196, &f196);
+        (void)mem.ReadU32BE(kBlk + 200, &f200);
+        (void)mem.ReadU32BE(kBlk + 208, &f208);
+        (void)mem.ReadU32BE(kBlk + 212, &f212);
+        uint32_t cbStruct = 0;
+        if (mem.ReadU32BE(0x82945A80u + 16, &cbStruct) && cbStruct != 0)
+        {
+            // r26 = 0x82945A80; head bctrl target lives at [r26+16] with arg [+20]
+            (void)mem.ReadU32BE(cbStruct, &cbTarget);
+        }
+    }
+    if (n <= 12 || (n % 1000) == 0)
+        MCLA_LOG_INFO("WORKER sub_824569C8 #{} lr={:08X} ev={:08X} dl={:08X}/{:08X} "
+                      "f184={} f188={:08X} f196={:08X} f200={:08X} f208={:08X} f212={:08X} cbt={:08X}",
+                      n, lr, ev52, dl128, dl132, f184 != 0, f188, f196, f200, f208, f212, cbTarget);
+    __imp__sub_824569C8(ctx, base);
 }
