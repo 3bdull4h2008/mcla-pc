@@ -18,11 +18,10 @@ bool GuestMemoryView::IsValidRange(uint32_t guestAddr, uint32_t size) const {
     // (e.g. uninitialized r2/TOC) log as invalid instead of AV-ing.
     if (guestAddr < 0x1000 || size == 0) return false;
 
-    const uint64_t end = static_cast<uint64_t>(guestAddr) + size;
-    if (end > 0x100000000ULL) return false;
-
     if (!m_base) return false;
-    if (guestAddr >= m_size) return false;
+    const uint64_t off = TranslateHostOffset(guestAddr);
+    if (off >= m_size) return false;
+    const uint64_t end = off + size;
     if (end > m_size) return false;
 
     return true;
@@ -30,12 +29,12 @@ bool GuestMemoryView::IsValidRange(uint32_t guestAddr, uint32_t size) const {
 
 const uint8_t* GuestMemoryView::GetHostPtr(uint32_t guestAddr, uint32_t size) const {
     if (!IsValidRange(guestAddr, size)) return nullptr;
-    return m_base + guestAddr;
+    return m_base + TranslateHostOffset(guestAddr);
 }
 
 uint8_t* GuestMemoryView::GetHostPtrMutable(uint32_t guestAddr, uint32_t size) const {
     if (!IsValidRange(guestAddr, size)) return nullptr;
-    return m_base + guestAddr;
+    return m_base + TranslateHostOffset(guestAddr);
 }
 
 bool GuestMemoryView::ReadU8(uint32_t guestAddr, uint8_t* outVal) const {

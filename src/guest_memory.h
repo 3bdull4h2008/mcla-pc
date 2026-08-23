@@ -36,6 +36,21 @@ private:
     uint8_t* m_base = nullptr;
     uint64_t m_size = 0;
 
+    // Xenos VA segments 0x8 (cached), 0xA (uncached), 0xC (extended) all
+    // alias the same physical RAM (phys = va & 0x1FFFFFFF, xenia memory.cc).
+    // The guest heap lives at identity host offsets in the 0x8 segment, so
+    // A/C accesses converge onto their 0x8-segment slot to keep every alias
+    // viewing the same bytes. 0x8 and low addresses stay identity-mapped
+    // (existing heap placement / boot seeds rely on it). Segments 0xE/0xF
+    // are NOT RAM aliases (xenia rejects them) — left identity so they fail
+    // bounds instead of folding into valid slots.
+    static uint64_t TranslateHostOffset(uint32_t guestAddr) {
+        const uint32_t seg = guestAddr >> 29;
+        if (seg == 4 || seg == 5 || seg == 6)
+            return 0x80000000ull | (guestAddr & 0x1FFFFFFFull);
+        return guestAddr;
+    }
+
     uint16_t Swap16(uint16_t val) const { return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }
     uint32_t Swap32(uint32_t val) const { return ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | ((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }
     uint64_t Swap64(uint64_t val) const {
