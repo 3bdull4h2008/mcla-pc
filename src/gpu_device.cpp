@@ -974,7 +974,19 @@ PPC_FUNC(sub_821BC910)
         MCLA_LOG_INFO("RINGB-CONSUMER sub_821BC910 ENTER #{} arg={:08X}", n, ctx.r3.u32);
     __imp__sub_821BC910(ctx, base);
     const uint32_t d = s_hBC910out.fetch_add(1) + 1;
-    MCLA_LOG_INFO("RINGB-CONSUMER CYCLE #{} r3={:08X}", d, ctx.r3.u32);
+    // Counters for BOTH consumer queues (arg 0 -> base+0, arg 1 -> +0x6174).
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t w0 = 0, p0 = 0, c0 = 0, w1 = 0, p1 = 0, c1 = 0;
+        (void)mem.ReadU32BE(0x82849518u + 0x6160, &w0);
+        (void)mem.ReadU32BE(0x82849518u + 0x6164, &p0);
+        (void)mem.ReadU32BE(0x82849518u + 0x6168, &c0);
+        (void)mem.ReadU32BE(0x82849518u + 0x6174 + 0x6160, &w1);
+        (void)mem.ReadU32BE(0x82849518u + 0x6174 + 0x6164, &p1);
+        (void)mem.ReadU32BE(0x82849518u + 0x6174 + 0x6168, &c1);
+        MCLA_LOG_INFO("RINGB-CONSUMER CYCLE #{} r3={:08X} q0 w/p/c={}/{}/{} q1 w/p/c={}/{}/{}",
+                      d, ctx.r3.u32, w0, p0, c0, w1, p1, c1);
+    }
 }
 
 // PRODUCER-PUSH census (session 16): Function_821BC868 pushes a task slot
@@ -987,10 +999,23 @@ static std::atomic<uint32_t> s_hBC868{0};
 PPC_FUNC(sub_821BC868)
 {
     const uint32_t n = s_hBC868.fetch_add(1) + 1;
-    if (n <= 16 || (n % 2000) == 0)
-        MCLA_LOG_INFO("PUSH sub_821BC868 #{} q={:08X} lr={:08X}",
-                      n, ctx.r3.u32, ctx.lr);
+    const uint32_t q = ctx.r3.u32;
     __imp__sub_821BC868(ctx, base);
+    // Queue-counter dump (session 20): write idx [+0x6160], pop idx
+    // [+0x6164], count [+0x6168]. Prove/disprove stale-pop: if pop idx or
+    // count was non-zero BEFORE our first real push, the consumer woke on a
+    // leaked increment and executed a stale zeroed slot.
+    if (n <= 16 || (n % 2000) == 0)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t wIdx = 0, pIdx = 0, cnt = 0;
+        const bool okW = mem.ReadU32BE(q + 0x6160, &wIdx);
+        const bool okP = mem.ReadU32BE(q + 0x6164, &pIdx);
+        const bool okC = mem.ReadU32BE(q + 0x6168, &cnt);
+        MCLA_LOG_INFO("PUSH sub_821BC868 #{} q={:08X} wIdx={}{} pIdx={}{} cnt={}{} lr={:08X}",
+                      n, q, wIdx, okW ? "" : "?", pIdx, okP ? "" : "?",
+                      cnt, okC ? "" : "?", ctx.lr);
+    }
 }
 
 // ---------------------------------------------------------------------------
