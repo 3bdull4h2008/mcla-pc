@@ -3,10 +3,22 @@
 #include "xdm.h"
 #include "xbox.h"
 #include "vfs_rpf.h"
+#include <spdlog/spdlog.h>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <thread>
+
+// WAKE-LOSS PROBE (session 14): wrapper identity between semaphore wait and
+// release paths. Inline + spdlog direct - including logging.h here breaks
+// mutex.h's windows.h include-order assumption.
+inline void SemaphoreProbeLog(const void* self, const char* site, uint32_t count)
+{
+    static std::atomic<uint32_t> s_semaProbeLogs{0};
+    const uint32_t n = s_semaProbeLogs.fetch_add(1) + 1;
+    if (n <= 60 || (n % 2000) == 0)
+        spdlog::info("SEMA-{} this={} count={}", site, self, count);
+}
 
 struct Event final : KernelObject, HostObject<XKEVENT>
 {
@@ -116,6 +128,15 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
     uint32_t Wait(uint32_t timeout) override
     {
+        // WAKE-LOSS PROBE (session 14): consumers park on C5218280 but never
+        // cycle despite NtReleaseSemaphore firing on it. Compare wrapper
+        // identity between wait and release paths.
+        {
+            static std::atomic<uint32_t> s_semaWaitLogs{0};
+            const uint32_t n = s_semaWaitLogs.fetch_add(1) + 1;
+            if (timeout == INFINITE && (n <= 24 || (n % 2000) == 0))
+                SemaphoreProbeLog(this, "wait", count.load());
+        }
         if (timeout == 0)
         {
             uint32_t currentCount = count.load();
@@ -171,6 +192,8 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
     void Release(uint32_t releaseCount, uint32_t* previousCount)
     {
+        SemaphoreProbeLog(this, "release", count.load());
+
         if (previousCount != nullptr)
             *previousCount = count;
 
