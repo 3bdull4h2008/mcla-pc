@@ -1,4 +1,4 @@
-﻿#include "gpu_device.h"
+#include "gpu_device.h"
 #include "gpu_cp.h"
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
@@ -485,7 +485,7 @@ void CaptureWindow(uint32_t n, uint32_t dev, const PendingWindow& pw)
     ++g_pktCap.descriptors;
     g_pktCap.dwords.fetch_add(wordCount, std::memory_order_relaxed);
 
-    // Consumption accounting: these bytes are resident ⇒ kernel CP may fetch
+    // Consumption accounting: these bytes are resident ? kernel CP may fetch
     // through them. Advances the ctx[+0]/[+4] watermark + progress counter
     // by the FULL reserved size (not the clamped read).
     mcla::gpu::CpConsumePushWindow(pw.addr + pw.dwords * 4u, pw.dwords);
@@ -604,15 +604,103 @@ PPC_FUNC(sub_82411640)
 // packet builder), sub_8241BD08 (flush/kick), sub_82429570/sub_824294E0
 // (present kickers, DEBCBEEF marker).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// P4' CAPTURE (session 24): SubmitBatch = per-batch geometry submit
+// (DrawIndexedPrimitive-equivalent, Ghidra-verified). Capture geometry args
+// + device state snapshot BEFORE passthrough; legacy rendering unchanged.
+// State lives in device shadow blocks - no per-RS-handler overrides needed.
+// ---------------------------------------------------------------------------
+struct CapturedDrawV1
+{
+    uint32_t primTypeFlags;
+    uint32_t vbDesc[2][4];        // r5/r7 raw {base,stride,size,size}
+    uint32_t ibDesc[4];           // r6 raw
+    uint32_t ibBase;              // [+0x20] page-aligned | fmt bits0-5
+    uint32_t ibCounts;            // [+0x24] 11/13-bit halves split by tiling
+    uint32_t indexWidthBits;      // [+0x28] bits31-30
+    uint32_t dirtyMask[6];        // dev+0x10/+0x18/+0x20 (3x u64)
+    static constexpr uint32_t kShadowDwords = 437; // 0x28CC..0x2FA0
+    uint32_t shadow[kShadowDwords];
+    uint32_t seq;
+};
+
+static CapturedDrawV1 g_lastDraw{};
+static std::atomic<uint32_t> g_capturedDrawCount{0};
+
+const CapturedDrawV1* mcla_gpu_GetLastCapturedDraw(uint32_t* outTotal);
+
+const CapturedDrawV1* mcla_gpu_GetLastCapturedDraw(uint32_t* outTotal)
+{
+    if (outTotal)
+    {
+        *outTotal = g_capturedDrawCount.load(std::memory_order_relaxed);
+    }
+    return &g_lastDraw;
+}
+
 PPC_FUNC_IMPL(__imp__sub_82420BA8);
 static std::atomic<uint32_t> s_h20BA8{0};
 PPC_FUNC(sub_82420BA8)
 {
     const uint32_t n = s_h20BA8.fetch_add(1) + 1;
+    const uint32_t dev = ctx.r3.u32;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    if (dev != 0 && mem.IsValid(dev + 0x2FA0, 4))
+    {
+        CapturedDrawV1 cap{};
+        cap.primTypeFlags = ctx.r4.u32;
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            (void)mem.ReadU32BE(ctx.r5.u32 + i * 4, &cap.vbDesc[0][i]);
+            (void)mem.ReadU32BE(ctx.r7.u32 + i * 4, &cap.vbDesc[1][i]);
+            (void)mem.ReadU32BE(ctx.r6.u32 + i * 4, &cap.ibDesc[i]);
+        }
+        (void)mem.ReadU32BE(ctx.r6.u32 + 0x20, &cap.ibBase);
+        (void)mem.ReadU32BE(ctx.r6.u32 + 0x24, &cap.ibCounts);
+        (void)mem.ReadU32BE(ctx.r6.u32 + 0x28, &cap.indexWidthBits);
+        for (uint32_t w = 0; w < 6; ++w)
+        {
+            (void)mem.ReadU32BE(dev + 0x10 + w * 4, &cap.dirtyMask[w]);
+        }
+        for (uint32_t d = 0; d < CapturedDrawV1::kShadowDwords; ++d)
+        {
+            (void)mem.ReadU32BE(dev + 0x28CC + d * 4, &cap.shadow[d]);
+        }
+        cap.seq = n;
+
+        g_lastDraw = cap;
+        const uint32_t total = g_capturedDrawCount.fetch_add(1) + 1;
+        if (total == 1 || (total % 500) == 0)
+        {
+            MCLA_LOG_INFO("P4'-CAPTURE draw #{} prim={:08X} ibBase={:08X} ibCnt={:08X} "
+                          "dirty={:08X}{:08X}",
+                          total, cap.primTypeFlags, cap.ibBase, cap.ibCounts,
+                          cap.dirtyMask[1], cap.dirtyMask[0]);
+        }
+    }
     if (n <= 12 || (n % 1000) == 0)
         MCLA_LOG_INFO("SUBMIT-census sub_82420BA8 #{} dev={:08X} flags={:X} blk={:08X} desc={:08X}/{:08X} r10={:08X}",
                       n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r10.u32);
     __imp__sub_82420BA8(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// P4' CAPTURE: PresentKick frame boundary. sub_824294E0 = raw kick
+// (r3=dev, r4=fbAddr); sub_82429570 = vsync-aware flip picker (backbuffer
+// idx dev[+0x5498], count [+0x5494], base [+0x548c]). Both emit PM4 flip +
+// 0xDEADBEEF fence consumed by ISR 0x82411478.
+// ---------------------------------------------------------------------------
+static std::atomic<uint32_t> s_presentKickCount{0};
+static std::atomic<uint32_t> s_lastFbAddr{0};
+
+PPC_FUNC_IMPL(__imp__sub_824294E0);
+PPC_FUNC(sub_824294E0)
+{
+    const uint32_t n = s_presentKickCount.fetch_add(1) + 1;
+    s_lastFbAddr.store(ctx.r4.u32, std::memory_order_relaxed);
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_INFO("P4'-PRESENT kick #{} dev={:08X} fb={:08X}", n, ctx.r3.u32, ctx.r4.u32);
+    __imp__sub_824294E0(ctx, base);
 }
 
 PPC_FUNC_IMPL(__imp__sub_82413660);
@@ -653,16 +741,26 @@ static std::atomic<uint32_t> s_h29570{0};
 PPC_FUNC(sub_82429570)
 {
     const uint32_t n = s_h29570.fetch_add(1) + 1;
-    if (n <= 12 || (n % 1000) == 0)
-        MCLA_LOG_INFO("SUBMIT-census sub_82429570(present) #{} r3={:08X} r4={:08X}",
-                      n, ctx.r3.u32, ctx.r4.u32);
+    const uint32_t dev = ctx.r3.u32;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    if (dev != 0 && mem.IsValid(dev + 0x5498, 4))
+    {
+        uint32_t bbIdx = 0, bbCount = 0, bbBase = 0;
+        (void)mem.ReadU32BE(dev + 0x5498, &bbIdx);
+        (void)mem.ReadU32BE(dev + 0x5494, &bbCount);
+        (void)mem.ReadU32BE(dev + 0x548c, &bbBase);
+        if (n <= 12 || (n % 1000) == 0)
+            MCLA_LOG_INFO("P4'-PRESENT picker #{} dev={:08X} bb idx={} count={} base={:08X}",
+                          n, dev, bbIdx, bbCount, bbBase);
+    }
+    s_presentKickCount.fetch_add(1, std::memory_order_relaxed);
     __imp__sub_82429570(ctx, base);
 }
 
 // ---------------------------------------------------------------------------
 // RING-WAIT census (2026-08-23): sub_82411928 is the SOLE doorbell-ringer
 // module-wide (PPC_MM_STORE_U32(0x7FC80000+1812), 77.cpp:20398). Earlier run:
-// 5 reserve passes then silence — thread parked between 11218-return and the
+// 5 reserve passes then silence � thread parked between 11218-return and the
 // doorbell store. Log predicate inputs + whether the tail is ever reached.
 // Units: dword indices, mask=dev[+14900]; published rptr = subctx[+60].
 // ---------------------------------------------------------------------------
