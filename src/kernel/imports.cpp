@@ -2235,14 +2235,50 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE* Handle, uint32_t ReleaseCount, int32_t*
         const uint32_t n = s_ntRelLogs.fetch_add(1) + 1;
         if (n <= 40 || (n % 2000) == 0)
         {
-            MCLA_LOG_INFO("SIGNAL NtReleaseSemaphore obj={:08X} count={} lr={:08X}",
-                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Handle)), ReleaseCount,
+            // Guest VA of the caller's XKSEMAPHORE* + the address our typed
+            // Header field resolves to - session 15 showed census/probe
+            // disagreeing across runs; measure both in one place.
+            const uint32_t guestHandle =
+                static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(Handle) -
+                                      mcla::kernel::g_memory.base);
+            MCLA_LOG_INFO("SIGNAL NtReleaseSemaphore guest={:08X} hdrOff={} count={} lr={:08X}",
+                          guestHandle,
+                          reinterpret_cast<uintptr_t>(&Handle->Header) - reinterpret_cast<uintptr_t>(Handle),
+                          ReleaseCount,
                           static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
         }
     }
 
+    // IDENTITY RESOLUTION (session 16 fix): the game's driver re-initializes
+    // dispatcher headers after NtCreateSemaphore (it owns these structs),
+    // wiping our OBJECT_SIGNATURE - QueryKernelObject's lazy-wrap then built
+    // a PHANTOM wrapper over raw bytes (probe: release landed on guest
+    // C9ADB880 with garbage count while consumers waited wrapper C5218280).
+    // Resolve identically to the wait path (NtWaitForSingleObjectEx ->
+    // GetKernelObject = pure identity translation) and only fall back to
+    // lazy-wrap for addresses we never created.
+    Semaphore* sem = nullptr;
+    {
+        const uint32_t guestHandle =
+            static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(Handle) -
+                                  mcla::kernel::g_memory.base);
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        if (mem.IsValid(guestHandle, sizeof(XKSEMAPHORE)))
+        {
+            auto* direct = reinterpret_cast<Semaphore*>(mem.Translate(guestHandle));
+            if (direct->IsValid())
+            {
+                sem = direct;
+            }
+        }
+        if (!sem)
+        {
+            sem = QueryKernelObject<Semaphore>(Handle->Header);
+        }
+    }
+
     uint32_t previousCount;
-    QueryKernelObject<Semaphore>(Handle->Header)->Release(ReleaseCount, &previousCount);
+    sem->Release(ReleaseCount, &previousCount);
 
     if (PreviousCount != nullptr)
         *PreviousCount = previousCount;
