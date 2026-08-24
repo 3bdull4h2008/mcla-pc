@@ -581,6 +581,18 @@ void BootWorker(uint32_t entryGuest)
                            fc->r6.u32, fc->r7.u32, fc->r8.u32, fc->r9.u32, fc->r10.u32, fc->r13.u32);
         }
 
+        // Host GP registers - session 17: pin which pointer is the bad raw
+        // host address (e.g. 0x7E780000) at indirect-dispatch fault sites.
+        if (code == 0xC0000005 && ExceptionInfo->ContextRecord)
+        {
+            const CONTEXT* c = ExceptionInfo->ContextRecord;
+            MCLA_LOG_ERROR("  host regs rip={:p} rax={:p} rbx={:p} rcx={:p} rdx={:p} rsi={:p} rdi={:p} "
+                           "r8={:p} r9={:p} r10={:p} r11={:p} rsp={:p}",
+                           (PVOID)c->Rip, (PVOID)c->Rax, (PVOID)c->Rbx, (PVOID)c->Rcx, (PVOID)c->Rdx,
+                           (PVOID)c->Rsi, (PVOID)c->Rdi, (PVOID)c->R8, (PVOID)c->R9,
+                           (PVOID)c->R10, (PVOID)c->R11, (PVOID)c->Rsp);
+        }
+
         // resolve host symbols from the PDB so crashes name themselves
         if (code == 0xC0000005 || code == 0x80000003 || code == 0xE06D7363)
         {
