@@ -648,6 +648,34 @@ bool CpMmioRead(uint32_t guestAddr, uint32_t* outValue)
 uint64_t CpSwapCount() { return g_swapCount.load(std::memory_order_relaxed); }
 uint64_t CpDrainCount() { return g_drainCount.load(std::memory_order_relaxed); }
 
+// PAGE-WATCH (session 24): attribution probes for the async-task work buffer
+// at guest 0x50000000 - called from GuestMemoryView checked accessors.
+void PageWatchOnWrite(uint32_t guestAddr, uint32_t value)
+{
+    static std::atomic<uint32_t> s_watchWrites{0};
+    const uint32_t n = s_watchWrites.fetch_add(1) + 1;
+    if (n <= 16)
+    {
+        uint32_t lr = 0;
+        if (const PPCContext* c = GetPPCContext())
+            lr = static_cast<uint32_t>(c->lr);
+        MCLA_LOG_WARN("PAGEWATCH W #{:02} @ {:08X} = {:08X} lr={:08X}", n, guestAddr, value, lr);
+    }
+}
+
+void PageWatchOnRead(uint32_t guestAddr, uint32_t value)
+{
+    static std::atomic<uint32_t> s_watchReads{0};
+    const uint32_t n = s_watchReads.fetch_add(1) + 1;
+    if (n <= 8)
+    {
+        uint32_t lr = 0;
+        if (const PPCContext* c = GetPPCContext())
+            lr = static_cast<uint32_t>(c->lr);
+        MCLA_LOG_WARN("PAGEWATCH R #{:02} @ {:08X} -> {:08X} lr={:08X}", n, guestAddr, value, lr);
+    }
+}
+
 void CpInstallMmioRouting()
 {
     mcla::native::SetGpuMmioHandlers(&CpMmioWrite, &CpMmioRead);

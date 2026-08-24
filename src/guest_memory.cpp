@@ -1,6 +1,21 @@
 #include "guest_memory.h"
 #include "logging.h"
+#include <atomic>
 #include <cstring>
+
+// PAGE-WATCH hooks (session 24): defined in gpu_cp.cpp which owns the full
+// PPCContext includes - keeps this hot-path TU free of ABI header chains.
+namespace mcla::gpu {
+void PageWatchOnWrite(uint32_t guestAddr, uint32_t value);
+void PageWatchOnRead(uint32_t guestAddr, uint32_t value);
+} // namespace mcla::gpu
+
+static constexpr uint32_t kWatchPage = 0x50000000u;
+
+inline bool PageWatchHit(uint32_t guestAddr)
+{
+    return (guestAddr & 0xFFFFF000u) == kWatchPage;
+}
 
 namespace mcla::native {
 
@@ -64,6 +79,8 @@ bool GuestMemoryView::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const {
     uint32_t val;
     std::memcpy(&val, ptr, sizeof(val));
     *outVal = Swap32(val);
+    if (PageWatchHit(guestAddr))
+        mcla::gpu::PageWatchOnRead(guestAddr, *outVal);
     return true;
 }
 
@@ -117,6 +134,8 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
     if (!ptr) return false;
     uint32_t be = Swap32(val);
     std::memcpy(ptr, &be, sizeof(be));
+    if (PageWatchHit(guestAddr))
+        mcla::gpu::PageWatchOnWrite(guestAddr, val);
     return true;
 }
 
