@@ -1653,6 +1653,32 @@ void KeUnlockL2()
     LOG_UTILITY("!!! STUB !!!");
 }
 
+// IDENTITY-FIRST RESOLUTION (session 16 audit, systemic fix): kernel-created
+// wrappers can have their guest dispatcher-header signature WIPED by the
+// game's own driver (it owns these structs and re-inits them post-create),
+// after which QueryKernelObject's lazy-wrap builds PHANTOM wrappers over raw
+// bytes - the wake-loss bug class proven on NtReleaseSemaphore. Resolve by
+// pure identity translation (same as the wait path) whenever the addressed
+// memory still hosts a valid wrapper; fall back to lazy-wrap only for
+// genuinely embedded/never-created objects.
+template <typename T>
+static T* ResolveCreatedObject(void* guestPtr, size_t guestSize)
+{
+    const uint32_t guestAddr =
+        static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(guestPtr) -
+                              mcla::kernel::g_memory.base);
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    if (mem.IsValid(guestAddr, guestSize))
+    {
+        auto* direct = reinterpret_cast<T*>(mem.Translate(guestAddr));
+        if (direct->IsValid())
+        {
+            return direct;
+        }
+    }
+    return nullptr;
+}
+
 bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
 {
     // SIGNAL CENSUS (2026-08-23 session 9): who signals what. Caller LR
@@ -1668,7 +1694,8 @@ bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
         }
     }
 
-    bool result = QueryKernelObject<Event>(*pEvent)->Set();
+    Event* ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
+    bool result = ev ? ev->Set() : QueryKernelObject<Event>(*pEvent)->Set();
 
     ++g_keSetEventGeneration;
     g_keSetEventGeneration.notify_all();
@@ -1678,7 +1705,8 @@ bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
 
 bool KeResetEvent(XKEVENT* pEvent)
 {
-    return QueryKernelObject<Event>(*pEvent)->Reset();
+    Event* ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
+    return ev ? ev->Reset() : QueryKernelObject<Event>(*pEvent)->Reset();
 }
 
 uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
@@ -1703,12 +1731,22 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, 
     {
         case 0:
         case 1:
-            QueryKernelObject<Event>(*Object)->Wait(timeout);
+        {
+            Event* ev = ResolveCreatedObject<Event>(Object, sizeof(XKEVENT));
+            if (!ev)
+                ev = QueryKernelObject<Event>(*Object);
+            ev->Wait(timeout);
             break;
+        }
 
         case 5:
-            QueryKernelObject<Semaphore>(*Object)->Wait(timeout);
+        {
+            Semaphore* sem = ResolveCreatedObject<Semaphore>(Object, sizeof(XKSEMAPHORE));
+            if (!sem)
+                sem = QueryKernelObject<Semaphore>(*Object);
+            sem->Wait(timeout);
             break;
+        }
 
         default:
             assert(false && "Unrecognized kernel object type.");
@@ -2257,24 +2295,10 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE* Handle, uint32_t ReleaseCount, int32_t*
     // Resolve identically to the wait path (NtWaitForSingleObjectEx ->
     // GetKernelObject = pure identity translation) and only fall back to
     // lazy-wrap for addresses we never created.
-    Semaphore* sem = nullptr;
+    Semaphore* sem = ResolveCreatedObject<Semaphore>(Handle, sizeof(XKSEMAPHORE));
+    if (!sem)
     {
-        const uint32_t guestHandle =
-            static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(Handle) -
-                                  mcla::kernel::g_memory.base);
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        if (mem.IsValid(guestHandle, sizeof(XKSEMAPHORE)))
-        {
-            auto* direct = reinterpret_cast<Semaphore*>(mem.Translate(guestHandle));
-            if (direct->IsValid())
-            {
-                sem = direct;
-            }
-        }
-        if (!sem)
-        {
-            sem = QueryKernelObject<Semaphore>(Handle->Header);
-        }
+        sem = QueryKernelObject<Semaphore>(Handle->Header);
     }
 
     uint32_t previousCount;
@@ -2660,8 +2684,12 @@ uint32_t KeReleaseSemaphore(XKSEMAPHORE* semaphore, uint32_t increment, uint32_t
         }
     }
 
-    auto* object = QueryKernelObject<Semaphore>(semaphore->Header);
-    object->Release(adjustment, nullptr);
+    Semaphore* sem = ResolveCreatedObject<Semaphore>(semaphore, sizeof(XKSEMAPHORE));
+    if (!sem)
+    {
+        sem = QueryKernelObject<Semaphore>(semaphore->Header);
+    }
+    sem->Release(adjustment, nullptr);
 
     ++g_keSetEventGeneration;
     g_keSetEventGeneration.notify_all();
