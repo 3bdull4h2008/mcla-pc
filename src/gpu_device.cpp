@@ -954,6 +954,22 @@ PPC_FUNC(sub_821BC910)
     MCLA_LOG_INFO("RINGB-CONSUMER CYCLE #{} r3={:08X}", d, ctx.r3.u32);
 }
 
+// PRODUCER-PUSH census (session 16): Function_821BC868 pushes a task slot
+// and releases [q+0x616C]. Queue base family = 0x82849518 + idx*0x6174 (ring
+// B) / 0x8283D218 family (ring A) - both sides agree statically, so log the
+// ACTUAL q pointer to see which index/instance the parked submit used.
+// Register-only entry logging (crash lesson from BCB10+0x7B).
+PPC_FUNC_IMPL(__imp__sub_821BC868);
+static std::atomic<uint32_t> s_hBC868{0};
+PPC_FUNC(sub_821BC868)
+{
+    const uint32_t n = s_hBC868.fetch_add(1) + 1;
+    if (n <= 16 || (n % 2000) == 0)
+        MCLA_LOG_INFO("PUSH sub_821BC868 #{} q={:08X} lr={:08X}",
+                      n, ctx.r3.u32, ctx.lr);
+    __imp__sub_821BC868(ctx, base);
+}
+
 // ---------------------------------------------------------------------------
 // TU83 DRIVER-WORKER census: sub_824569C8 is the worker loop the main guest
 // thread parks inside (sibling 824569C4 = empty padding stub). Its global
