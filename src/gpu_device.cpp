@@ -933,6 +933,29 @@ PPC_FUNC(sub_821BC140)
     if (n <= 16 || (n % 2000) == 0)
         MCLA_LOG_INFO("INLINE-EXEC sub_821BC140 #{} a0={:08X} a1={:08X} lr={:08X}",
                       n, ctx.r3.u32, ctx.r4.u32, ctx.lr);
+    // NODE-CHAIN DUMP (session 19): the dispatched fnptr was ZERO. Walk the
+    // list head a0 -> [a0+4]=node {node[0] ?, node[4]=fnptr, node[12]=next}
+    // up to 3 nodes with checked reads (body starts with plain guest loads,
+    // no early vtable dispatch - safe to pre-read).
+    if (n <= 8)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t node = 0;
+        if (mem.ReadU32BE(ctx.r3.u32 + 4, &node))
+        {
+            for (int i = 0; i < 3 && node != 0; ++i)
+            {
+                uint32_t w0 = 0, fn = 0, nx = 0;
+                const bool ok0 = mem.ReadU32BE(node + 0, &w0);
+                const bool okf = mem.ReadU32BE(node + 4, &fn);
+                const bool okn = mem.ReadU32BE(node + 12, &nx);
+                MCLA_LOG_INFO("NODE[{}] @ {:08X} w0={:08X}{} fn={:08X}{} next={:08X}{}",
+                              i, node, w0, ok0 ? "" : "?", fn, okf ? "" : "?",
+                              nx, okn ? "" : "?");
+                node = nx;
+            }
+        }
+    }
     __imp__sub_821BC140(ctx, base);
 }
 
