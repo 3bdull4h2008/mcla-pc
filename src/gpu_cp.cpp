@@ -115,6 +115,161 @@ void LogUnknownOpcode(uint32_t opcode, uint32_t count)
     MCLA_LOG_WARN("CP: skipping TYPE3 opcode=0x{:02X} count={} (unimplemented)", opcode, count);
 }
 
+// PM4 TYPE3 opcode values (xenia gpu/xenos.h PM4 enum).
+constexpr uint32_t kPm4MeInit = 0x48;           // initialize CP micro-engine
+constexpr uint32_t kPm4IndirectBuffer = 0x3F;   // indirect buffer dispatch
+constexpr uint32_t kPm4MemWrite = 0x3D;         // write N dwords to memory
+
+// GpuSwap mirror (xenia command_processor.cc:1038-1064): endianness encoded
+// in the low bits of PM4 memory addresses.
+inline uint32_t GpuSwap32(uint32_t value, uint32_t endianBits)
+{
+    switch (endianBits & 0x3)
+    {
+    case 1: // k8in16: swap bytes in half words
+        return ((value << 8) & 0xFF00FF00u) | ((value >> 8) & 0x00FF00FFu);
+    case 2: // k8in32: swap all bytes
+        return ((value >> 24) & 0xFFu) | ((value >> 8) & 0xFF00u) |
+               ((value << 8) & 0xFF0000u) | ((value << 24) & 0xFF000000u);
+    default: // kNone / unhandled: no swap
+        return value;
+    }
+}
+
+// Honest MEM_WRITE (xenia :1092-1108): [addr, data*(count-1)]; sequential
+// BE dwords, per-word endianness from addr low bits, addr advances by 4
+// including its flag bits each iteration.
+void ExecuteMemWrite(uint32_t wordAddr, uint32_t count)
+{
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t addr = wordAddr;
+    for (uint32_t i = 1; i < count; ++i)
+    {
+        uint32_t data = 0;
+        if (!mem.ReadU32BE(addr, &data))
+        {
+            break;
+        }
+        const uint32_t swapped = GpuSwap32(data, addr & 0x3);
+        (void)mem.WriteU32BE(addr & ~0x3u, swapped);
+        addr += 4;
+    }
+}
+
+// Linear indirect-buffer executor (xenia ExecuteIndirectBuffer :575-593):
+// contiguous guest memory holding the same packet encoding as the primary
+// ring. Depth-guarded against runaway nesting.
+void DrainIndirectBuffer(uint32_t byteAddr, uint32_t dwordCount, int depth);
+
+bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t& outAdvanceDwords)
+{
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t header = 0;
+    if (!mem.ReadU32BE(byteAddr, &header))
+    {
+        return false;
+    }
+
+    const uint32_t type = header >> 30;
+    if (type == 2)
+    {
+        outAdvanceDwords = 1; // TYPE-2 filler NOP
+        return true;
+    }
+
+    if (type == 0)
+    {
+        const uint32_t count = ((header >> 16) & 0x3FFFu) + 1u;
+        static std::atomic<uint32_t> ibType0Seen{0};
+        if (ibType0Seen.fetch_add(1) < 8)
+        {
+            MCLA_LOG_INFO("CP[IB]: TYPE0 base={:03X} count={}", header & 0x3FFFu, count);
+        }
+        outAdvanceDwords = count + 1u;
+        return true;
+    }
+
+    if (type != 3)
+    {
+        MCLA_LOG_WARN("CP[IB]: unsupported packet type={} at {:08X}", type, byteAddr);
+        return false;
+    }
+
+    const uint32_t count = ((header >> 16) & 0x3FFFu) + 1u;
+    const uint32_t opcode = (header >> 8) & 0x7Fu;
+
+    switch (opcode)
+    {
+    case kPm4IndirectBuffer:
+    {
+        if (depth >= 4)
+        {
+            MCLA_LOG_WARN("CP[IB]: nested INDIRECT_BUFFER beyond depth limit");
+            return false;
+        }
+        uint32_t listPtr = 0, listLen = 0;
+        if (!mem.ReadU32BE(byteAddr + 4, &listPtr) ||
+            !mem.ReadU32BE(byteAddr + 8, &listLen))
+        {
+            return false;
+        }
+        DrainIndirectBuffer(listPtr & ~0x3u, listLen & 0xFFFFFu, depth + 1);
+        outAdvanceDwords = count + 1u;
+        return true;
+    }
+    case kPm4MeInit:
+    {
+        static std::atomic<uint32_t> meInitSeen{0};
+        if (meInitSeen.fetch_add(1) < 4)
+        {
+            MCLA_LOG_INFO("CP[IB]: ME_INIT count={}", count);
+        }
+        outAdvanceDwords = count + 1u;
+        return true;
+    }
+    case kPm4MemWrite:
+    {
+        uint32_t wordAddr = 0;
+        if (!mem.ReadU32BE(byteAddr + 4, &wordAddr))
+        {
+            return false;
+        }
+        // Payload dwords live contiguously after the addr word.
+        ExecuteMemWrite(wordAddr, count);
+        outAdvanceDwords = count + 1u;
+        return true;
+    }
+    default:
+        LogUnknownOpcode(opcode, count);
+        outAdvanceDwords = count + 1u;
+        return true;
+    }
+}
+
+void DrainIndirectBuffer(uint32_t byteAddr, uint32_t dwordCount, int depth)
+{
+    constexpr uint32_t kMaxDwords = 0x100000u; // hard stop vs runaway streams
+    const uint32_t limited = dwordCount > kMaxDwords ? kMaxDwords : dwordCount;
+
+    static std::atomic<uint32_t> ibEnterSeen{0};
+    if (ibEnterSeen.fetch_add(1) < 12)
+    {
+        MCLA_LOG_INFO("CP: INDIRECT_BUFFER @ {:08X} dwords={} depth={}", byteAddr, limited, depth);
+    }
+
+    uint32_t p = 0;
+    while (p < limited)
+    {
+        uint32_t advance = 0;
+        if (!DrainPacketAt(byteAddr + p * 4, depth, advance))
+        {
+            MCLA_LOG_WARN("CP[IB]: desync at dword {} - aborting buffer", p);
+            break;
+        }
+        p += advance;
+    }
+}
+
 // Drain packets from rptr up to wptr (both dword indices mod capacity).
 // Synchronous on the guest submitter thread - no other thread touches the
 // ring indices, so plain atomics are sufficient.
@@ -165,6 +320,30 @@ void DrainRing(uint32_t wptr)
                 {
                     MCLA_LOG_INFO("CP: XE_SWAP #{} magic={:08X} fb={:08X} {}x{}", n, magic, fb, width, height);
                 }
+            }
+            else if (opcode == kPm4IndirectBuffer && count >= 2)
+            {
+                // PM4_INDIRECT_BUFFER (xenia :943-953): [list_ptr, list_len]
+                // - execute the referenced buffer's packets now.
+                uint32_t listPtr = ReadRingU32((rptr + 1u) % cap);
+                uint32_t listLen = ReadRingU32((rptr + 2u) % cap);
+                DrainIndirectBuffer(listPtr & ~0x3u, listLen & 0xFFFFFu, 0);
+            }
+            else if (opcode == kPm4MeInit)
+            {
+                // PM4_ME_INIT (xenia :880-890): CP micro-engine init -
+                // consumes count dwords of ME binary; no memory side effects.
+                static std::atomic<uint32_t> meInitSeen{0};
+                if (meInitSeen.fetch_add(1) < 4)
+                {
+                    MCLA_LOG_INFO("CP: ME_INIT count={}", count);
+                }
+            }
+            else if (opcode == kPm4MemWrite && count >= 2)
+            {
+                // PM4_MEM_WRITE (xenia :1092-1108): honest memory writes.
+                const uint32_t wordAddr = ReadRingU32((rptr + 1u) % cap);
+                ExecuteMemWrite(wordAddr, count);
             }
             else
             {
