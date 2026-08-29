@@ -17,6 +17,11 @@
 #include "kernel/memory.h"
 #include <image.h>
 
+// P4 vtable-word scan (defined in task_dispatch_trace.cpp)
+namespace mcla::trace {
+void ScanForDispatchVtableWords(uint32_t imageBase, uint32_t imageSize);
+}
+
 // Forward declare Xex2LoadImage from XenonRecomp (Image is defined in image.h)
 Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 
@@ -673,6 +678,9 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     app->SetPPCBase(g_base);
     mcla::kernel::GuestMemoryHeap::Instance().Adopt(g_base, GuestMemorySize);
 
+    // TU83 spawn pointer scanner (Lead 1) — runs once after guest memory is adopted
+    mcla::native::kernel::ScanGuestMemoryForTU83SpawnPointers();
+
     // Kernel heaps must exist before any guest import allocates. Skipping this
     // left heap==physicalHeap==nullptr and the first allocation crashed inside
     // o1heapAllocate reading handle->diagnostics.capacity at instance+0x208.
@@ -732,6 +740,7 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
 
     InstallGuestImage(image);
     DumpImageRegion(0x827EB900u, 32);
+    mcla::trace::ScanForDispatchVtableWords((uint32_t)image.base, image.size);
     const size_t mapped = InstallFunctionTable();
     {
         char lbuf[256];

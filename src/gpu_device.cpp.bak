@@ -638,51 +638,52 @@ const CapturedDrawV1* mcla_gpu_GetLastCapturedDraw(uint32_t* outTotal)
     return &g_lastDraw;
 }
 
-PPC_FUNC_IMPL(__imp__sub_82420BA8);
-static std::atomic<uint32_t> s_h20BA8{0};
-PPC_FUNC(sub_82420BA8)
-{
-    const uint32_t n = s_h20BA8.fetch_add(1) + 1;
-    const uint32_t dev = ctx.r3.u32;
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    if (dev != 0 && mem.IsValid(dev + 0x2FA0, 4))
-    {
-        CapturedDrawV1 cap{};
-        cap.primTypeFlags = ctx.r4.u32;
-        for (uint32_t i = 0; i < 4; ++i)
-        {
-            (void)mem.ReadU32BE(ctx.r5.u32 + i * 4, &cap.vbDesc[0][i]);
-            (void)mem.ReadU32BE(ctx.r7.u32 + i * 4, &cap.vbDesc[1][i]);
-            (void)mem.ReadU32BE(ctx.r6.u32 + i * 4, &cap.ibDesc[i]);
-        }
-        (void)mem.ReadU32BE(ctx.r6.u32 + 0x20, &cap.ibBase);
-        (void)mem.ReadU32BE(ctx.r6.u32 + 0x24, &cap.ibCounts);
-        (void)mem.ReadU32BE(ctx.r6.u32 + 0x28, &cap.indexWidthBits);
-        for (uint32_t w = 0; w < 6; ++w)
-        {
-            (void)mem.ReadU32BE(dev + 0x10 + w * 4, &cap.dirtyMask[w]);
-        }
-        for (uint32_t d = 0; d < CapturedDrawV1::kShadowDwords; ++d)
-        {
-            (void)mem.ReadU32BE(dev + 0x28CC + d * 4, &cap.shadow[d]);
-        }
-        cap.seq = n;
-
-        g_lastDraw = cap;
-        const uint32_t total = g_capturedDrawCount.fetch_add(1) + 1;
-        if (total == 1 || (total % 500) == 0)
-        {
-            MCLA_LOG_INFO("P4'-CAPTURE draw #{} prim={:08X} ibBase={:08X} ibCnt={:08X} "
-                          "dirty={:08X}{:08X}",
-                          total, cap.primTypeFlags, cap.ibBase, cap.ibCounts,
-                          cap.dirtyMask[1], cap.dirtyMask[0]);
-        }
-    }
-    if (n <= 12 || (n % 1000) == 0)
-        MCLA_LOG_INFO("SUBMIT-census sub_82420BA8 #{} dev={:08X} flags={:X} blk={:08X} desc={:08X}/{:08X} r10={:08X}",
-                      n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r10.u32);
-    __imp__sub_82420BA8(ctx, base);
-}
+// PPC_FUNC_IMPL(__imp__sub_82420BA8);
+// static std::atomic<uint32_t> s_h20BA8{0};
+// PPC_FUNC(sub_82420BA8) - DISABLED: crashes on invalid dev + 0x2FA0 read
+// Use DRAW-SEAM hooks (sub_82413660, sub_82411840) instead
+// {
+//     const uint32_t n = s_h20BA8.fetch_add(1) + 1;
+//     const uint32_t dev = ctx.r3.u32;
+//     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+//     if (dev != 0 && mem.IsValid(dev + 0x2FA0, 4))
+//     {
+//         CapturedDrawV1 cap{};
+//         cap.primTypeFlags = ctx.r4.u32;
+//         for (uint32_t i = 0; i < 4; ++i)
+//         {
+//             (void)mem.ReadU32BE(ctx.r5.u32 + i * 4, &cap.vbDesc[0][i]);
+//             (void)mem.ReadU32BE(ctx.r7.u32 + i * 4, &cap.vbDesc[1][i]);
+//             (void)mem.ReadU32BE(ctx.r6.u32 + i * 4, &cap.ibDesc[i]);
+//         }
+//         (void)mem.ReadU32BE(ctx.r6.u32 + 0x20, &cap.ibBase);
+//         (void)mem.ReadU32BE(ctx.r6.u32 + 0x24, &cap.ibCounts);
+//         (void)mem.ReadU32BE(ctx.r6.u32 + 0x28, &cap.indexWidthBits);
+//         for (uint32_t w = 0; w < 6; ++w)
+//         {
+//             (void)mem.ReadU32BE(dev + 0x10 + w * 4, &cap.dirtyMask[w]);
+//         }
+//         for (uint32_t d = 0; d < CapturedDrawV1::kShadowDwords; ++d)
+//         {
+//             (void)mem.ReadU32BE(dev + 0x28CC + d * 4, &cap.shadow[d]);
+//         }
+//         cap.seq = n;
+//
+//         g_lastDraw = cap;
+//         const uint32_t total = g_capturedDrawCount.fetch_add(1) + 1;
+//         if (total == 1 || (total % 500) == 0)
+//         {
+//             MCLA_LOG_INFO("P4'-CAPTURE draw #{} prim={:08X} ibBase={:08X} ibCnt={:08X} "
+//                           "dirty={:08X}{:08X}",
+//                           total, cap.primTypeFlags, cap.ibBase, cap.ibCounts,
+//                           cap.dirtyMask[1], cap.dirtyMask[0]);
+//         }
+//     }
+//     if (n <= 12 || (n % 1000) == 0)
+//         MCLA_LOG_INFO("SUBMIT-census sub_82420BA8 #{} dev={:08X} flags={:X} blk={:08X} desc={:08X}/{:08X} r10={:08X}",
+//                       n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r10.u32);
+//     __imp__sub_82420BA8(ctx, base);
+// }
 
 // ---------------------------------------------------------------------------
 // P4' CAPTURE: PresentKick frame boundary. sub_824294E0 = raw kick
@@ -702,98 +703,111 @@ PPC_FUNC(sub_824294E0)
         MCLA_LOG_INFO("P4'-PRESENT kick #{} dev={:08X} fb={:08X}", n, ctx.r3.u32, ctx.r4.u32);
     __imp__sub_824294E0(ctx, base);
 }
-
-namespace mcla::gpu {
-
-// Global frame counter for draw-flip correlation
-static std::atomic<uint32_t> g_frameCounter{0};
-
-// Captured draw data for native renderer (V2 - safe VB/IB capture)
-static CapturedDrawV2 g_lastDrawV2{};
-
-// Mutex for protecting g_lastDrawV2 access
-static std::mutex g_drawMutex;
-
-uint32_t mcla_gpu_GetFrameCounter()
-{
-    return g_frameCounter.load(std::memory_order_relaxed);
-}
-
-const CapturedDrawV2* mcla_gpu_GetLastDrawV2()
-{
-    return &g_lastDrawV2;
-}
-
-std::mutex& mcla_gpu_GetDrawMutex()
-{
-    return g_drawMutex;
-}
-
-} // namespace mcla::gpu
-
-PPC_FUNC_IMPL(__imp__sub_82413660);
-static std::atomic<uint32_t> s_h13660{0};
-PPC_FUNC(sub_82413660)
-{
-    const uint32_t n = s_h13660.fetch_add(1) + 1;
-    const uint32_t dev = ctx.r3.u32;
-    const uint32_t r4 = ctx.r4.u32;
-    const uint32_t r5 = ctx.r5.u32; // VB desc pointer
-    const uint32_t r6 = ctx.r6.u32; // IB desc pointer
-
-    // P4' Step 3: Capture draw submit details
-    if (n <= 10 || (n % 1000) == 0)
-    {
-        MCLA_LOG_INFO("DRAW-SEAM sub_82413660 #{} dev={:08X} r4={:08X} r5={:08X} r6={:08X} lr={:08X}",
-                      n, dev, r4, r5, r6, ctx.lr);
-    }
-
-    // Capture VB/IB descriptors to global struct for render thread
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    __try
-    {
-        if (r5 != 0 && mem.IsValid(r5, 16))
-        {
-            uint32_t vbBase = 0, vbStride = 0, vbSize = 0;
-            if (mem.ReadU32BE(r5 + 0, &vbBase) && mem.ReadU32BE(r5 + 4, &vbStride) && mem.ReadU32BE(r5 + 8, &vbSize))
-            {
-                std::lock_guard<std::mutex> lock(mcla::gpu::mcla_gpu_GetDrawMutex());
-                mcla::gpu::g_lastDrawV2.vbBase = vbBase;
-                mcla::gpu::g_lastDrawV2.vbStride = vbStride;
-                mcla::gpu::g_lastDrawV2.vbSize = vbSize;
-                mcla::gpu::g_lastDrawV2.dev = dev;
-                mcla::gpu::g_lastDrawV2.primTypeFlags = r4;
-                mcla::gpu::g_lastDrawV2.frameId = mcla::gpu::g_frameCounter.load(std::memory_order_relaxed);
-            }
-        }
-        if (r6 != 0 && mem.IsValid(r6, 16))
-        {
-            uint32_t ibBase = 0, ibSize = 0, ibFmt = 0;
-            if (mem.ReadU32BE(r6 + 0, &ibBase) && mem.ReadU32BE(r6 + 4, &ibSize) && mem.ReadU32BE(r6 + 8, &ibFmt))
-            {
-                std::lock_guard<std::mutex> lock(mcla::gpu::mcla_gpu_GetDrawMutex());
-                mcla::gpu::g_lastDrawV2.ibBase = ibBase;
-                mcla::gpu::g_lastDrawV2.ibSize = ibSize;
-                mcla::gpu::g_lastDrawV2.ibFmt = ibFmt;
-            }
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        // Ignore access violations from uncommitted guest memory pages
-    }
-
-    __imp__sub_82413660(ctx, base);
-}
+706: 
+707: // Captured draw data for native renderer
+708: struct CapturedDraw
+709: {
+710:     uint32_t seq = 0;
+711:     uint32_t dev = 0;
+712:     uint32_t primTypeFlags = 0;
+713:     uint32_t vbBase = 0, vbStride = 0, vbSize = 0;
+714:     uint32_t ibBase = 0, ibSize = 0, ibFmt = 0;
+715:     uint32_t frameId = 0;
+716: };
+717: 
+718: static std::atomic<uint32_t> g_frameCounter{0};
+719: static CapturedDraw g_lastDraw{};
+720: static std::mutex g_drawMutex;
+721: 
+722: const CapturedDraw* mcla_gpu_GetLastDraw()
+723: {
+724:     return &g_lastDraw;
+725: }
+726: 
+727: uint32_t mcla_gpu_GetFrameCounter()
+728: {
+729:     return g_frameCounter.load(std::memory_order_relaxed);
+730: }
+731: 
+732: PPC_FUNC_IMPL(__imp__sub_82413660);
+733: static std::atomic<uint32_t> s_h13660{0};
+734: PPC_FUNC(sub_82413660)
+735: {
+736:     const uint32_t n = s_h13660.fetch_add(1) + 1;
+737:     const uint32_t dev = ctx.r3.u32;
+738:     const uint32_t r4 = ctx.r4.u32;
+739:     const uint32_t r5 = ctx.r5.u32; // VB desc pointer
+740:     const uint32_t r6 = ctx.r6.u32; // IB desc pointer
+741: 
+742:     // P4' Step 3: Capture draw submit details
+743:     if (n <= 10 || (n % 1000) == 0)
+744:     {
+745:         MCLA_LOG_INFO("DRAW-SEAM sub_82413660 #{} dev={:08X} r4={:08X} r5={:08X} r6={:08X} lr={:08X}",
+746:                       n, dev, r4, r5, r6, ctx.lr);
+747:     }
+748: 
+749:     // Safe VB/IB descriptor capture (bounds-checked)
+750:     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+751:     CapturedDraw draw{};
+752:     draw.seq = n;
+753:     draw.dev = dev;
+754:     draw.primTypeFlags = r4;
+755:     draw.frameId = g_frameCounter.load(std::memory_order_relaxed);
+756: 
+757:     __try
+758:     {
+759:         if (r5 != 0 && mem.IsValid(r5, 16))
+760:         {
+761:             uint32_t vbBase = 0, vbStride = 0, vbSize = 0;
+762:             if (mem.ReadU32BE(r5 + 0, &vbBase) && mem.ReadU32BE(r5 + 4, &vbStride) && mem.ReadU32BE(r5 + 8, &vbSize))
+763:             {
+764:                 draw.vbBase = vbBase;
+765:                 draw.vbStride = vbStride;
+766:                 draw.vbSize = vbSize;
+767:                 if (n <= 10 || (n % 1000) == 0)
+768:                     MCLA_LOG_INFO("  VB: base={:08X} stride={:08X} size={:08X}", vbBase, vbStride, vbSize);
+769:             }
+770:         }
+771:         if (r6 != 0 && mem.IsValid(r6, 16))
+772:         {
+773:             uint32_t ibBase = 0, ibSize = 0, ibFmt = 0;
+774:             if (mem.ReadU32BE(r6 + 0, &ibBase) && mem.ReadU32BE(r6 + 4, &ibSize) && mem.ReadU32BE(r6 + 8, &ibFmt))
+775:             {
+776:                 draw.ibBase = ibBase;
+777:                 draw.ibSize = ibSize;
+778:                 draw.ibFmt = ibFmt;
+779:                 if (n <= 10 || (n % 1000) == 0)
+780:                     MCLA_LOG_INFO("  IB: base={:08X} size={:08X} fmt={:08X}", ibBase, ibSize, ibFmt);
+781:             }
+782:         }
+783:     }
+784:     __except (EXCEPTION_EXECUTE_HANDLER)
+785:     {
+786:         // Ignore access violations from uncommitted guest memory pages
+787:     }
+788: 
+789:     {
+790:         std::lock_guard<std::mutex> lock(g_drawMutex);
+791:         g_lastDraw = draw;
+792:     }
+793: 
+794:     __imp__sub_82413660(ctx, base);
+795: }
 
 PPC_FUNC_IMPL(__imp__sub_82411840);
 static std::atomic<uint32_t> s_h11840{0};
 PPC_FUNC(sub_82411840)
 {
     const uint32_t n = s_h11840.fetch_add(1) + 1;
-    if (n <= 12 || (n % 5000) == 0)
-        MCLA_LOG_INFO("SUBMIT-census sub_82411840 #{} dev={:08X} cls={} a={}",
-                      n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t cls = ctx.r4.u32;
+    const uint32_t arg = ctx.r5.u32;
+
+    if (n <= 10 || (n % 1000) == 0)
+    {
+        MCLA_LOG_INFO("DRAW-SEAM sub_82411840 #{} dev={:08X} class={} arg={:08X} lr={:08X}",
+                      n, dev, cls, arg, ctx.lr);
+    }
     __imp__sub_82411840(ctx, base);
 }
 
@@ -976,8 +990,6 @@ PPC_FUNC(sub_82419718)
     if (n <= 12 || (n % 2000) == 0)
         MCLA_LOG_INFO("FLIP sub_82419718 #{} dev={:08X} cb={:08X} q[0..2]={:08X}/{:08X}/{:08X}",
                       n, dev, cb, q0, q1, q2);
-    // Increment frame counter on each flip for draw-flip correlation
-    mcla::gpu::g_frameCounter.fetch_add(1, std::memory_order_relaxed);
     __imp__sub_82419718(ctx, base);
 }
 

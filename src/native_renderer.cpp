@@ -9,6 +9,7 @@
 #include "logging.h"
 #include "guest_memory.h"
 #include "gpu_mmio.h"
+#include "gpu_device.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "renderer/shader_translator.h"
 #include "renderer/pipeline_cache.h"
@@ -442,6 +443,52 @@ GetPipelineForPacket(D3D12Backend* backend, const DrawPacket& packet) {
 
     auto& cache = backend->GetPipelineCache();
     return cache.GetOrCompile(key, vsOut.hlsl, psOut.hlsl, inputLayout);
+}
+
+// Read vertex/index buffers from guest memory and validate captured device-boundary data
+// Actual drawing is done by the render thread via command queue
+bool TryConsumeDeviceBoundaryDraw(D3D12Backend* backend) {
+    static std::unordered_set<std::string> s_emittedReasons;
+
+    auto refuse = [&](const char* reason) {
+        std::string key(reason);
+        if (s_emittedReasons.insert(key).second) {
+            MCLA_LOG_WARN("Native render: device-boundary draw not consumable ({}) \u2014 falling back to fixture quad",
+                        reason);
+        }
+        return false;
+    };
+
+    if (!backend) return false;
+
+    const mcla::gpu::CapturedDrawV2* draw = mcla::gpu::mcla_gpu_GetLastDrawV2();
+    if (!draw) return refuse("no captured draw data");
+
+    uint32_t frameId = mcla::gpu::mcla_gpu_GetFrameCounter();
+    if (draw->frameId == 0 || frameId == 0) return refuse("frame counter not ready");
+    if (draw->frameId != frameId) return refuse("captured draw frame mismatch");
+
+    if (draw->vbBase == 0 || draw->vbSize == 0 || draw->vbStride == 0) {
+        return refuse("VB not captured");
+    }
+    if (draw->ibBase == 0 || draw->ibSize == 0) {
+        return refuse("IB not captured");
+    }
+
+    // Validate vertex buffer is readable from guest memory
+    GuestMemoryView& memView = GetDrawAccumulator()->GetMemoryView();
+    if (!memView.IsValidRange(draw->vbBase, draw->vbSize)) {
+        return refuse("guest VB range not fully mapped");
+    }
+
+    // Validate index buffer is readable from guest memory
+    if (!memView.IsValidRange(draw->ibBase, draw->ibSize)) {
+        return refuse("guest IB range not fully mapped");
+    }
+
+    // Data is valid - the render thread will do the actual drawing
+    // via the command queue (enqueued by hk_sub_82413660 hook)
+    return true;
 }
 
 bool TryConsumeCapturedGeometry(D3D12Backend* backend, const DrawPacket* packet) {

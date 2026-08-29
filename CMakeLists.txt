@@ -85,6 +85,7 @@ add_executable(mcla
     src/gpu_cp.h
     src/gpu_device.cpp
     src/gpu_device.h
+    src/task_dispatch_trace.cpp
     src/native_renderer.cpp
     src/native_renderer.h
     src/renderer_mode.cpp
@@ -93,6 +94,7 @@ add_executable(mcla
     src/renderer_hook_dispatch.h
     src/guest_memory.cpp
     src/guest_memory.h
+    src/guest_mem_scan.cpp
     src/frame_trace.cpp
     src/frame_trace.h
     src/capture_hooks.cpp
@@ -102,6 +104,8 @@ add_executable(mcla
     src/vfs_rpf.h
     src/d3d12_backend.cpp
     src/d3d12_backend.h
+    src/render_command_queue.cpp
+    src/render_command_queue.h
     src/compat.cpp
     src/compat.h
     src/apu/audio.cpp
@@ -143,6 +147,9 @@ add_executable(mcla
     src/renderer/texture_decode.cpp
     src/renderer/texture_decode.h
     src/renderer/test_shaders.h
+    src/render_queue.h
+    src/render_thread.cpp
+    src/render_thread.h
     generated/ppc_xenon/ppc_func_mapping.cpp
     generated/ppc_xenon/ppc_recomp.0.cpp
     generated/ppc_xenon/ppc_recomp.1.cpp

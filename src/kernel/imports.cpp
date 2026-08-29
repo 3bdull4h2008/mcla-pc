@@ -18,6 +18,13 @@
 // boot_host.cpp when the boot worker starts.
 std::atomic<uint32_t> g_mainGuestThreadId{0};
 
+// Forward declaration for VSync thread's scheduler tick signaling.
+// Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
+// This is the kernel-role duty that the real hardware GPU ISR/vblank path would perform.
+// The game's main thread waits on 0x40004D7C with ~30ms timeout; without this signal,
+// the main thread parks forever.
+static void SignalSchedulerTick();
+
 static std::atomic<uint32_t> g_keSetEventGeneration;
 
 // Forward declarations
@@ -232,6 +239,21 @@ uint32_t XamSessionRefObjByHandle(uint32_t handle, be<uint32_t>* objectOut)
 
 uint32_t XMsgStartIORequest(uint32_t App, uint32_t Message, XXOVERLAPPED* lpOverlapped, void* Buffer, uint32_t szBuffer)
 {
+    // XMsgStartIORequest census probe (Lead 3)
+    {
+        static std::atomic<uint32_t> s_xmsgCalls{0};
+        const uint32_t n = s_xmsgCalls.fetch_add(1) + 1;
+        if (n <= 100)
+        {
+            MCLA_LOG_INFO("XMSG-IO #{} App={:08X} Msg={:08X} ovl={:08X} buf={:08X} sz={:08X} lr={:08X}",
+                          n, App, Message,
+                          lpOverlapped ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lpOverlapped)) : 0,
+                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Buffer)),
+                          szBuffer,
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+    }
+
     (void)App;
     (void)Message;
     (void)Buffer;
@@ -503,6 +525,12 @@ uint32_t NtCreateFile
     std::string virtualPath = mcla::vfs::GuestPathToVirtual(guestPath);
     MCLA_LOG_INFO("NtCreateFile: '{}' -> '{}'", guestPath, virtualPath);
 
+    // Probe for .bik movie files
+    if (strstr(virtualPath.c_str(), ".bik") || strstr(virtualPath.c_str(), ".BIK"))
+    {
+        MCLA_LOG_INFO("BIK MOVIE OPEN: '{}' -> '{}'", guestPath, virtualPath);
+    }
+
     mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
     mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fileHandle;
     if (!vfs.OpenFile(virtualPath, fileHandle))
@@ -594,6 +622,19 @@ uint32_t FscSetCacheElementCount()
 
 uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
+    // PRODUCER-DEATH CENSUS: see KeWaitForSingleObject note.
+    {
+        static std::atomic<uint32_t> s_wcNtw{0};
+        const uint32_t n = s_wcNtw.fetch_add(1) + 1;
+        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+        const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
+        if (hot || n <= 120 || (n % 300) == 0)
+        {
+            MCLA_LOG_INFO("WAIT[NTWFSO] #{:05}{} tid={:08X} handle={:08X} alertable={} to={}ms lr={:08X}",
+                          n, hot ? "!" : " ", GetCurrentThreadId(), Handle,
+                          Alertable, GuestTimeoutToMilliseconds(Timeout), lr);
+        }
+    }
     // MAIN-THREAD PARK PROBE
     {
         static std::atomic<uint32_t> s_parkLogs2{0};
@@ -609,7 +650,16 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Al
 
     if (IsKernelObject(Handle))
     {
-        return GetKernelObject(Handle)->Wait(timeout);
+        const uint32_t st = GetKernelObject(Handle)->Wait(timeout);
+        {
+            static std::atomic<uint32_t> s_wcNtwR{0};
+            const uint32_t n = s_wcNtwR.fetch_add(1) + 1;
+            const uint32_t lr2 = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+            if ((lr2 >= 0x82410000u && lr2 < 0x82430000u) || n <= 120 || (n % 300) == 0)
+                MCLA_LOG_INFO("WAKE[NTWFSO] #{:05} tid={:08X} status={:08X} lr={:08X}",
+                              n, GetCurrentThreadId(), st, lr2);
+        }
+        return st;
     }
     else
     {
@@ -723,9 +773,78 @@ uint32_t ExGetXConfigSetting(uint16_t Category, uint16_t Setting, void* Buffer, 
     return 0;
 }
 
-void NtQueryVirtualMemory()
+namespace {
+// X_MEM_* / X_PAGE_* per Xenia src/xenia/xbox.h (documented 360 values).
+constexpr uint32_t kXMemCommit = 0x00001000;
+constexpr uint32_t kXMemReserve = 0x00002000;
+constexpr uint32_t kXMemDecommit = 0x00004000;
+constexpr uint32_t kXMemRelease = 0x00008000;
+constexpr uint32_t kXMemFree = 0x00010000;
+constexpr uint32_t kXMemPrivate = 0x00020000;
+constexpr uint32_t kXMemReset = 0x00080000;
+constexpr uint32_t kXMemTopDown = 0x00100000;
+constexpr uint32_t kXMemNozero = 0x00800000;
+constexpr uint32_t kXMemLargePages = 0x20000000;
+constexpr uint32_t kXPageReadonly = 0x00000002;
+constexpr uint32_t kXPageReadWrite = 0x00000004;
+
+using VirtualRegionInfo = mcla::kernel::GuestMemoryHeap::VirtualRegionInfo;
+
+constexpr uint32_t kVirtPageSize = mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
+inline uint32_t RoundUp64K(uint32_t v) { return (v + kVirtPageSize - 1) & ~(kVirtPageSize - 1); }
+
+// Allocation census for the virtual-memory surface (P2): every call, first
+// 500 then every 500th. Proves which VAs the game asks for and what we grant.
+void LogVirtualAlloc(const char* api, uint32_t baseIn, uint32_t baseOut, uint32_t size,
+                     uint32_t type, uint32_t status)
 {
-    LOG_UTILITY("!!! STUB !!!");
+    static std::atomic<uint32_t> s_allocCalls{0};
+    const uint32_t n = s_allocCalls.fetch_add(1) + 1;
+    if (n <= 500 || n % 500 == 0)
+    {
+        MCLA_LOG_INFO("{} #{} base={:08X}->{} size={:08X} type={:08X} st={:08X} lr={:08X}",
+                      api, n, baseIn, baseOut, size, type, status,
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+}
+} // namespace
+
+uint32_t NtQueryVirtualMemory(uint32_t baseAddress, be<uint32_t>* memoryBasicInformation)
+{
+    // Xbox 360 semantics (Xenia): (PVOID BaseAddress, PMEMORY_BASIC_INFORMATION).
+    // X_MEMORY_BASIC_INFORMATION = 7 BE dwords:
+    //   base_address, allocation_base, allocation_protect, region_size,
+    //   state (COMMIT/RESERVE/FREE), protect, type (X_MEM_PRIVATE).
+    if (!memoryBasicInformation)
+        return STATUS_INVALID_PARAMETER;
+
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    VirtualRegionInfo info;
+    if (!mem.QueryVirtualRegion(baseAddress, &info))
+        return STATUS_INVALID_PARAMETER;
+
+    const uint32_t xState =
+        info.committed ? kXMemCommit : (info.reserved ? kXMemReserve : kXMemFree);
+    const uint32_t xProtect =
+        (baseAddress != 0 && !info.reserved) ? 0 : kXPageReadWrite;
+
+    memoryBasicInformation[0].set(info.base);
+    memoryBasicInformation[1].set(info.allocationBase);
+    memoryBasicInformation[2].set(xProtect);
+    memoryBasicInformation[3].set(info.size);
+    memoryBasicInformation[4].set(xState);
+    memoryBasicInformation[5].set(xProtect);
+    memoryBasicInformation[6].set(kXMemPrivate);
+
+    static std::atomic<uint32_t> s_queryCalls{0};
+    const uint32_t n = s_queryCalls.fetch_add(1) + 1;
+    if (n <= 64 || n % 500 == 0)
+    {
+        MCLA_LOG_INFO("NtQueryVM #{} base={:08X} region={:08X} size={:08X} state={:08X} lr={:08X}",
+                      n, baseAddress, info.base, info.size, xState,
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+    return STATUS_SUCCESS;
 }
 
 void MmQueryStatistics()
@@ -748,6 +867,12 @@ uint32_t NtCreateEvent(be<uint32_t>* handle, void* objAttributes, uint32_t event
             MCLA_LOG_INFO("EVENT-CREATE #{} h={:08X} type={} init={} lr={:08X}",
                           n, static_cast<uint32_t>(*handle), eventType, initialState,
                           static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+            // TARGETED CENSUS for C9ADB800 (TU83 worker wait event)
+            if (static_cast<uint32_t>(*handle) == 0xC9ADB800) {
+                MCLA_LOG_WARN("EVENT-CREATE TARGET C9ADB800 h={:08X} type={} init={} lr={:08X}",
+                              static_cast<uint32_t>(*handle), eventType, initialState,
+                              static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+            }
         }
     }
 
@@ -817,6 +942,19 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
         return STATUS_USER_APC;
 
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+
+    // PRODUCER-DEATH CENSUS: long delays from the driver range are producer
+    // parks in a timing loop (classification D candidates).
+    {
+        static std::atomic<uint32_t> s_wcDelay{0};
+        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+        const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
+        if ((hot && timeout >= 1) || ++s_wcDelay <= 60)
+        {
+            MCLA_LOG_INFO("WAIT[KDELAY] tid={:08X} to={}ms lr={:08X}{}",
+                          GetCurrentThreadId(), timeout, lr, hot ? " !" : "");
+        }
+    }
 
     // MAIN-THREAD PARK PROBE: name where the guest main loop sleeps.
     {
@@ -973,46 +1111,129 @@ void NtDuplicateObject()
     LOG_UTILITY("!!! STUB !!!");
 }
 
-uint32_t NtAllocateVirtualMemory(be<uint32_t>* baseAddress, be<uint32_t>* regionSize, uint32_t allocationType, uint32_t protect)
+uint32_t NtAllocateVirtualMemory(be<uint32_t>* baseAddress, be<uint32_t>* regionSize,
+                                 uint32_t allocationType, uint32_t protect /*, debugMemory r7 ignored */)
 {
-    uint32_t base = baseAddress ? baseAddress->get() : 0;
-    uint32_t size = regionSize ? regionSize->get() : 0;
+    // Xbox 360 semantics (Xenia xboxkrnl_memory.cc NtAllocateVirtualMemory_entry):
+    // _Inout_ PVOID *BaseAddress, _Inout_ PSIZE_T RegionSize,
+    // _In_ ULONG AllocationType, _In_ ULONG Protect, _In_ BOOLEAN DebugMemory.
+    // Explicit bases MUST land in the guest-virtual window AND must actually
+    // be reservable; success merely because Translate() succeeds was a bug
+    // (it ACKed reservations we never made, letting two systems share pages).
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
 
-    if (base != 0)
+    if (!baseAddress || !regionSize)
+        return STATUS_INVALID_PARAMETER;
+
+    const uint32_t baseIn = baseAddress->get();
+    const int32_t sizeSigned = static_cast<int32_t>(regionSize->get());
+
+    if (sizeSigned == 0)
+        return STATUS_INVALID_PARAMETER;
+    if (!(allocationType & (kXMemCommit | kXMemReset | kXMemReserve)))
+        return STATUS_INVALID_PARAMETER;
+    if ((allocationType & kXMemReset) && (allocationType & ~kXMemReset))
+        return STATUS_INVALID_PARAMETER;
+
+    // Guest-virtual window only; physical/heap ranges are not this API's space.
+    if (baseIn != 0 &&
+        (baseIn < mcla::kernel::GuestMemoryHeap::kGuestVirtualBase ||
+         baseIn >= mcla::kernel::GuestMemoryHeap::kGuestVirtualEnd))
     {
-        void* ptr = mcla::kernel::GuestMemoryHeap::Instance().Translate(base);
-        if (ptr)
-        {
-            *regionSize = size;
-            return 0;
-        }
+        MCLA_LOG_WARN("NtAllocVM: base {:08X} outside guest-virtual window", baseIn);
+        LogVirtualAlloc("NtAllocVM", baseIn, 0, static_cast<uint32_t>(sizeSigned),
+                        allocationType, STATUS_INVALID_PARAMETER);
+        return STATUS_INVALID_PARAMETER;
     }
 
-    void* ptr = g_userHeap.AllocPhysical(size, 0x1000);
-    uint32_t guestAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
-    MmTrackAllocationSize(guestAddr, size);
+    const uint32_t pageSize = mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
+    const uint32_t adjustedBase = baseIn - (baseIn % pageSize);
+    const uint32_t adjustedSize =
+        RoundUp64K(static_cast<uint32_t>(sizeSigned < 0 ? -sizeSigned : sizeSigned));
 
-    if (baseAddress) baseAddress->set(guestAddr);
-    if (regionSize) regionSize->set(size);
+    bool commit = (allocationType & kXMemCommit) != 0;
+    const bool zeroFresh = (allocationType & kXMemNozero) == 0;
 
-    return 0;
+    uint32_t address = 0;
+    uint32_t status = STATUS_SUCCESS;
+    if (adjustedBase != 0)
+    {
+        bool wasCommitted = false;
+        if (!mem.AllocVirtualFixed(adjustedBase, adjustedSize, commit, zeroFresh, &wasCommitted))
+            status = STATUS_NO_MEMORY;
+        else
+            address = adjustedBase;
+    }
+    else
+    {
+        if (!mem.AllocVirtualAny(adjustedSize, (allocationType & kXMemTopDown) != 0, commit,
+                                 zeroFresh, &address))
+            status = STATUS_NO_MEMORY;
+    }
+
+    LogVirtualAlloc("NtAllocVM", baseIn, address, adjustedSize, allocationType, status);
+
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    baseAddress->set(address);
+    regionSize->set(adjustedSize);
+    return STATUS_SUCCESS;
 }
 
 uint32_t NtFreeVirtualMemory(be<uint32_t>* baseAddress, be<uint32_t>* regionSize, uint32_t freeType)
 {
-    uint32_t base = baseAddress ? baseAddress->get() : 0;
+    // _Inout_ PVOID *BaseAddress, _Inout_ PSIZE_T RegionSize, _In_ ULONG FreeType.
+    // Only tracked guest-virtual regions may be freed. The previous impl called
+    // g_userHeap.Free(Translate(base)) for ANY translated address - a foreign
+    // pointer routed into o1heap (rejected by validate-before-free today, heap
+    // corruption before that guard existed).
+    if (!baseAddress || !regionSize)
+        return STATUS_INVALID_PARAMETER;
+
+    const uint32_t base = baseAddress->get();
     if (base == 0)
+        return STATUS_MEMORY_NOT_ALLOCATED;
+
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t status = STATUS_UNSUCCESSFUL;
+    uint32_t outSize = 0;
+
+    if (freeType & kXMemRelease)
     {
-        return 0;
+        outSize = 0;
+        if (mem.ReleaseVirtual(base, &outSize))
+        {
+            regionSize->set(outSize);
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            status = STATUS_MEMORY_NOT_ALLOCATED;
+        }
+    }
+    else if (freeType & kXMemDecommit)
+    {
+        outSize = 0;
+        if (mem.DecommitVirtual(base, regionSize->get(), &outSize))
+        {
+            regionSize->set(outSize);
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            status = STATUS_MEMORY_NOT_ALLOCATED;
+        }
+    }
+    else
+    {
+        status = STATUS_INVALID_PARAMETER;
     }
 
-    void* ptr = mcla::kernel::GuestMemoryHeap::Instance().Translate(base);
-    if (ptr)
-    {
-        g_userHeap.Free(ptr);
-    }
-
-    return 0;
+    LogVirtualAlloc("NtFreeVM", base, 0, outSize, freeType, status);
+    if (status == STATUS_SUCCESS)
+        baseAddress->set(base);
+    return status;
 }
 
 void ObDereferenceObject(uint32_t object)
@@ -1200,6 +1421,36 @@ void VdSwap(uint32_t buf, uint32_t fetch, uint32_t unk2, uint32_t unk3, uint32_t
 
 void VdGetSystemCommandBuffer(uint32_t p0, uint32_t p1)
 {
+    // Kernel-acceptance layer (diagnostic): under
+    // cp_deferred_consume_experiment=1 this export returns coherent
+    // system-command-buffer state instead of BEEF markers.
+    //   out1 (p0): 0x94-byte descriptor struct - contents unproven from any
+    //              reference, so it stays ZEROED (xenia-parity neutral).
+    //   out2 (p1): opaque identifier token; the guest stores it into
+    //              subctx+8 (77.cpp decode) and passes it around opaquely.
+    //              It changes only when real deferred consumption advances.
+    if (mcla::gpu::CpDeferredConsumeEnabled())
+    {
+        if (p0)
+        {
+            static const uint8_t zeroBuf[0x94] = {0};
+            (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(p0, zeroBuf, 0x94);
+        }
+        if (p1)
+        {
+            const uint32_t token = mcla::gpu::CpScbToken();
+            (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p1, token);
+            static std::atomic<uint32_t> s_gscb{0};
+            const uint32_t n = s_gscb.fetch_add(1) + 1;
+            if (n <= 8 || (n % 500) == 0)
+            {
+                MCLA_LOG_INFO("VdGetSystemCommandBuffer[{}] token={} idAddr={:08X}",
+                              n, token, mcla::gpu::CpGpuIdentifierAddress());
+            }
+        }
+        return;
+    }
+
     // Xenia: p0.Zero(0x94), write 0xBEEF0000@p0, 0xBEEF0001@p1
     if (p0)
     {
@@ -1254,13 +1505,14 @@ void VdEnableRingBufferRPtrWriteBack(uint32_t ringBuffer, uint32_t blockSizeLog2
 
 void VdInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2)
 {
-    // Xenia: r3=phys addr, r4=log2 size, ring size=1<<(log2+3), zero ring
-    uint32_t ringSize = 1u << (sizeLog2 + 3);
-    MCLA_LOG_INFO("VdInitializeRingBuffer: physAddr=0x{:08X} sizeLog2={} ringSize={}", physAddr, sizeLog2, ringSize);
+    // Xenia xboxkrnl_video.cc -> CommandProcessor::InitializeRingBuffer:
+    // records base/size and resets the read index ONLY - no memory writes
+    // to the ring body. Zeroing here would destroy unread packets when the
+    // guest re-initializes a still-active ring (per-ring REINIT in gpu_cp.cpp
+    // deliberately RETAINS such state).
+    MCLA_LOG_INFO("VdInitializeRingBuffer: physAddr=0x{:08X} sizeLog2={}", physAddr, sizeLog2);
     if (physAddr)
     {
-        std::vector<uint8_t> zeroBuf(ringSize, 0);
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(physAddr, zeroBuf.data(), ringSize);
         mcla::gpu::CpInitializeRingBuffer(physAddr, sizeLog2);
     }
 }
@@ -1268,7 +1520,10 @@ void VdInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2)
 void VdSetSystemCommandBufferGpuIdentifierAddress(uint32_t gpuIdAddr)
 {
     MCLA_LOG_INFO("VdSetSystemCommandBufferGpuIdentifierAddress: 0x{:08X}", gpuIdAddr);
-    // GPU init plumbing - store the GPU identifier address
+    // Record the registered identifier/writeback slot (= &subctx[8]).
+    // Bookkeeping is unconditional; consumers act only under the
+    // cp_deferred_consume_experiment flag.
+    mcla::gpu::CpRegisterGpuIdentifierAddress(gpuIdAddr);
 }
 
 void _vsnprintf_x()
@@ -1378,13 +1633,20 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
                         {
                             fn(cbCtx, base);
                         }
-                        // EXPERIMENT (gate-cracker + xenia-scout 2026-08-23):
-                        // KTHREAD+0x58 progress must reach snapshot+5000 for
-                        // sub_82412F98 to exit; no writer exists in the guest
-                        // module and xenia never synthesizes it (MCLA freezes
-                        // there too). Bump per vblank from our pump; revert if
-                        // disproven. Rate chosen to cross threshold ~1.3s.
-                        mcla::gpu::CpVblankBump(64);
+                        // Kernel-role vblank duty (2026-08-24): drain the
+                        // primary ring up to the driver's current wptr via
+                        // the existing frozen-capability DrainRing. XTEB+88
+                        // progress and subctx publication advance ONLY by
+                        // real consumed dwords (see CpVblankDrainToWptr).
+                        mcla::gpu::CpVblankDrainToWptr();
+
+                        // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
+                        // This is the kernel-role duty that the real hardware GPU ISR/vblank path
+                        // would perform. The game's main thread waits on 0x40004D7C with ~30ms timeout;
+                        // without this signal, the main thread parks forever.
+                        // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
+                        // This is the kernel-role duty that the real hardware GPU ISR/vblank path would perform.
+                        SignalSchedulerTick();
 
                         // Ring-buffer submission probe: sample the head of the
                         // primary ring every ~2s (120 frames) to see whether
@@ -1423,6 +1685,41 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
     }
 }
 
+// Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait
+// This is the kernel-role duty that the real hardware GPU ISR/vblank path would perform.
+// The game's main thread waits on 0x40004D7C with ~30ms timeout; without this signal,
+// the main thread parks forever.
+static void SignalSchedulerTick()
+{
+    constexpr uint32_t kSchedulerTickSem = 0x40004D7C;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    if (!mem.IsValid(kSchedulerTickSem, 4))
+    {
+        return;
+    }
+    // Use identity-first resolution (same pattern as imports.cpp NtReleaseSemaphore)
+    // to avoid lazy-wrap phantom wrapper issues.
+    uint32_t hdrVal = 0;
+    if (!mem.ReadU32BE(kSchedulerTickSem, &hdrVal) || hdrVal != 0x58424F58) // 'XBOX' signature
+    {
+        // Not a kernel-created semaphore; skip to avoid phantom wrapper
+        return;
+    }
+    // Direct identity translation: handle IS the guest VA of the dispatcher header
+    void* hostPtr = mem.Translate(kSchedulerTickSem);
+    if (!hostPtr)
+    {
+        return;
+    }
+    // Manually increment semaphore count (kernel semaphore structure:
+    // XDISPATCHER_HEADER(16) + SignalState@0x10 + WaitListHead@0x18/0x1C)
+    uint32_t* signalState = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(hostPtr) + 0x10);
+    (*signalState)++;
+    // Note: proper kernel wake would need condition_variable notify, but
+    // guest waiters poll the signal state directly (sub_821C90C0 -> NtWaitForSingleObjectEx
+    // on semaphore with timeout), so incrementing the count is sufficient.
+}
+
 uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg, uint32_t pfp, uint32_t me)
 {
     MCLA_LOG_INFO("VdInitializeEngines: unk=0x{:08X} cb=0x{:08X} arg=0x{:08X} pfp=0x{:08X} me=0x{:08X}", unk, cb, arg, pfp, me);
@@ -1440,9 +1737,10 @@ uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg, uint32_t p
 
     if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000)
     {
-        // Initialize spinlocks at +0x4148 and +0x4158
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4148, 0);
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4158, 0);
+        // Initialize spinlocks at +0x4148 and +0x4158 to 1 (unlocked state)
+        // TU83 manual spawn check expects non-zero spinlocks
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4148, 1);
+        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4158, 1);
 
         // Initialize command buffer pointers at +0x30 and +0x38
         (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x30, 0);
@@ -1456,7 +1754,7 @@ uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg, uint32_t p
         // State field at +0xD0 (checked by Function_824E37E0)
         (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0xD0, 1);
 
-        MCLA_LOG_INFO("VdInitializeEngines: initialized GPU context at 0x{:08X}", gpuCtxPtr);
+MCLA_LOG_INFO("VdInitializeEngines: initialized GPU context at 0x{:08X}", gpuCtxPtr);
     }
     else
     {
@@ -1479,26 +1777,19 @@ void InitGpuBackendManual(uint32_t gpuCtxPtr)
     // Call VdSetGraphicsInterruptCallback with VSync callback 0x82411478 and userData = GPU context
     VdSetGraphicsInterruptCallback(0x82411478, gpuCtxPtr);
 
-    // Initialize ring buffer
-    uint32_t ring_buf = 0;
-    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtr + 14836, &ring_buf);
-    if (ring_buf != 0)
-    {
-        MCLA_LOG_INFO("InitGpuBackendManual: Initializing ring buffer 0x{:08X}", ring_buf);
-        VdInitializeRingBuffer(ring_buf, 12);
-        VdEnableRingBufferRPtrWriteBack(ring_buf, 12); // blockSizeLog2=12 for 4KB blocks
-    }
-
-    // Initialize sub context
-    uint32_t sub_ctx = 0;
-    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtr + 10896, &sub_ctx);
-    if (sub_ctx != 0)
-    {
-        MCLA_LOG_INFO("InitGpuBackendManual: Initializing sub context 0x{:08X}", sub_ctx);
-        VdInitializeRingBuffer(sub_ctx + 60, 19);
-        VdEnableRingBufferRPtrWriteBack(sub_ctx + 60, 19);
-    }
-
+    // RING INIT REMOVED (2026-08-25). This shim used to call
+    // VdInitializeRingBuffer + VdEnableRingBufferRPtrWriteBack for
+    // [gpuCtx+14836] and for sub_ctx+60. Log forensics (mcla.log 00:51:22-23)
+    // prove the GUEST already performs the genuine pair ~670ms earlier via
+    // generated ppc_recomp.77.cpp:23344-23377:
+    //   init(MmGetPhysicalAddress(ring), 12); enableWB(phys(subctx+60), 6).
+    // The injected calls then: (a) re-inited the LIVE ring and reset its rptr
+    // mid-flight, (b) repointed the writeback INTO the ring body so
+    // PublishRptr wrote into live ring memory, and (c) fabricated a phantom
+    // "4MB ring" on top of the driver sub-context (zero-filling 4MB of heap
+    // starting at the rptr write-back mirror subctx+60), which hijacked all
+    // later doorbells and starved E98/F98. Per-ring CP state now lives in
+    // gpu_cp.cpp; only genuine guest registrations create rings.
     MCLA_LOG_INFO("InitGpuBackendManual: GPU backend initialization complete");
 }
 
@@ -1608,6 +1899,16 @@ uint32_t MmAllocatePhysicalMemoryEx
         return 0;
     }
     uint32_t guestAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
+    // Session-27 window census: catch the allocation feeding the
+    // deterministic unconstructed swf object at 0x88825500.
+    if ((guestAddr & 0xFFFF0000u) == 0x88820000u)
+    {
+        uint32_t lr = 0;
+        if (const PPCContext* c = GetPPCContext())
+            lr = static_cast<uint32_t>(c->lr);
+        MCLA_LOG_WARN("ALLOC-WIN MmPhys -> {:08X} size={:#x} align={:#x} flags={:08X} lr={:08X}",
+                      guestAddr, size, alignment, flags, lr);
+    }
     MmTrackAllocationSize(guestAddr, size);
     return guestAddr;
 }
@@ -1711,6 +2012,36 @@ bool KeResetEvent(XKEVENT* pEvent)
 
 uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
+    // PRODUCER-DEATH CENSUS (2026-08-25): all-thread wait/return telemetry.
+    // Always logs waits whose caller sits in the GPU-driver range (the
+    // producers); other callers are sampled. LOG-ONLY.
+    {
+        static std::atomic<uint32_t> s_wcKwfs{0};
+        const uint32_t n = s_wcKwfs.fetch_add(1) + 1;
+        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+        const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
+        if (hot || n <= 120 || (n % 300) == 0)
+        {
+            uint32_t r13 = g_ppcContext ? g_ppcContext->r13.u32 : 0;
+            uint32_t objAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
+            uint32_t pc = 0, put = 0, rptrWb = 0, gpuCtx = 0;
+            auto& memC = mcla::kernel::GuestMemoryHeap::Instance();
+            if (r13 != 0)
+            {
+                uint32_t blk = 0;
+                if (memC.ReadU32BE(r13 + 256, &blk) && blk != 0)
+                    (void)memC.ReadU32BE(blk + 88, &pc);
+            }
+            (void)memC.ReadU32BE(0x82839254u, &gpuCtx);
+            if (gpuCtx != 0)
+                (void)memC.ReadU32BE(gpuCtx + 10908u, &put);
+            (void)memC.ReadU32BE(0xC701C4BCu, &rptrWb);
+            MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} to={}ms lr={:08X} put={} rptrWB={:04X} pc={}",
+                          n, hot ? "!" : " ", GetCurrentThreadId(), objAddr,
+                          WaitReason, GuestTimeoutToMilliseconds(Timeout), lr,
+                          put, rptrWb & 0xFFFF, pc);
+        }
+    }
     // MAIN-THREAD PARK PROBE
     {
         static std::atomic<uint32_t> s_parkLogs3{0};
@@ -1753,6 +2084,17 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, 
             return STATUS_TIMEOUT;
     }
 
+    {
+        static std::atomic<uint32_t> s_wcKwfsR{0};
+        const uint32_t n = s_wcKwfsR.fetch_add(1) + 1;
+        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+        if ((lr >= 0x82410000u && lr < 0x82430000u) || n <= 120 || (n % 300) == 0)
+        {
+            MCLA_LOG_INFO("WAKE[KWFSO] #{:05}{} tid={:08X} status={:08X} lr={:08X}",
+                          n, (lr >= 0x82410000u && lr < 0x82430000u) ? "!" : " ",
+                          GetCurrentThreadId(), STATUS_SUCCESS, lr);
+        }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -2479,6 +2821,13 @@ uint32_t ExCreateThread(be<uint32_t>* handle, uint32_t stackSize, be<uint32_t>* 
                 }
                 MCLA_LOG_INFO("THREAD-NODE #{} @ {:08X}:{}", n, startContext, words);
             }
+            // TU83 worker thread census (Lead 1/3)
+            if (startAddress == 0x824569C8u || startAddress == 0x823F69C8u)
+            {
+                MCLA_LOG_WARN("THREAD-CREATE TU83 WORKER #{} start={:08X} ctx={:08X} flags={:08X} lr={:08X}",
+                              n, startAddress, startContext, creationFlags,
+                              static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+            }
         }
     }
 
@@ -2522,6 +2871,15 @@ uint32_t ExAllocatePoolTypeWithTag(uint32_t poolType, uint32_t numberOfBytes, ui
     void* ptr = g_userHeap.Alloc(numberOfBytes);
     if (!ptr) return 0;
     uint32_t guestAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
+    // Session-27 window census (deterministic swf object 0x88825500).
+    if ((guestAddr & 0xFFFF0000u) == 0x88820000u)
+    {
+        uint32_t lr = 0;
+        if (const PPCContext* c = GetPPCContext())
+            lr = static_cast<uint32_t>(c->lr);
+        MCLA_LOG_WARN("ALLOC-WIN Pool -> {:08X} size={:#x} tag={:08X} lr={:08X}",
+                      guestAddr, numberOfBytes, tag, lr);
+    }
     MmTrackAllocationSize(guestAddr, numberOfBytes);
     return guestAddr;
 }

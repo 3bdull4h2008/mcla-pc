@@ -433,6 +433,14 @@ typedef struct _XAMINPUT_STATE
 #ifndef STATUS_NO_MEMORY
 #define STATUS_NO_MEMORY                 ((uint32_t)0xC0000017L)
 #endif
+
+#ifndef STATUS_MEMORY_NOT_ALLOCATED
+#define STATUS_MEMORY_NOT_ALLOCATED      ((uint32_t)0xC00000A0L)
+#endif
+
+#ifndef STATUS_UNSUCCESSFUL
+#define STATUS_UNSUCCESSFUL              ((uint32_t)0xC0000001L)
+#endif
 #ifndef STATUS_INVALID_INFO_CLASS
 #define STATUS_INVALID_INFO_CLASS        ((uint32_t)0xC0000003L)
 #endif

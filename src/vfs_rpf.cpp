@@ -159,7 +159,16 @@ bool RpfVirtualFileSystem::Initialize(const std::string& extracted_cache_root) {
 
     MCLA_LOG_INFO("VFS: Initializing with extracted cache root: {}", extracted_cache_root);
 
+    // First scan the extracted cache (xarchive packages, etc.)
     BuildIndex(extracted_cache_root);
+
+    // Also scan the game_data root for loose files like .bik movies
+    std::filesystem::path extracted_path(extracted_cache_root);
+    std::filesystem::path game_data_root = extracted_path.parent_path();
+    if (std::filesystem::exists(game_data_root)) {
+        MCLA_LOG_INFO("VFS: Also scanning game_data root for loose files: {}", game_data_root.string());
+        BuildIndex(game_data_root.string());
+    }
 
     MCLA_LOG_INFO("VFS: Indexed {} files/directories", m_file_index.size());
 

@@ -17,4 +17,19 @@ constexpr uint32_t kMclaDeviceCreateAddr = 0x82413588;
 // Live device guest VA once creation succeeded; 0 before that.
 uint32_t DeviceGuestAddr();
 
+// Captured draw data for native renderer (V2 - safe VB/IB capture)
+struct CapturedDrawV2
+{
+    uint32_t seq = 0;
+    uint32_t dev = 0;
+    uint32_t primTypeFlags = 0;
+    uint32_t vbBase = 0, vbStride = 0, vbSize = 0;
+    uint32_t ibBase = 0, ibSize = 0, ibFmt = 0;
+    uint32_t frameId = 0;
+};
+
+// Access captured draw data for native renderer
+const CapturedDrawV2* mcla_gpu_GetLastDrawV2();
+uint32_t mcla_gpu_GetFrameCounter();
+
 } // namespace mcla::gpu

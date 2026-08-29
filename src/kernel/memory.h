@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 #include <windows.h>
 #include "xbox.h"
 
@@ -52,6 +54,43 @@ public:
     uint32_t Alloc(size_t size, size_t alignment = 16);
     void Free(uint32_t guestAddr, size_t size);
 
+    // --- Guest-virtual region tracking (NtAllocateVirtualMemory honesty) ---
+    // Xbox 360 semantics (Xenia reference): the guest-virtual window
+    // [0x40000000, 0x80000000) uses 64 KB pages and is carved exclusively by
+    // NtAllocateVirtualMemory/NtFreeVirtualMemory. The flat guest window maps
+    // it identity-style; this tracker only records allocation STATE so that
+    // explicit-base requests fail loudly instead of being rubber-stamped.
+    static constexpr uint32_t kGuestVirtualBase = 0x40000000;
+    static constexpr uint32_t kGuestVirtualEnd = 0x80000000;     // exclusive
+    static constexpr uint32_t kGuestVirtualPageSize = 0x10000;   // 64 KB
+
+    struct VirtualRegionInfo {
+        uint32_t base = 0;
+        uint32_t allocationBase = 0;
+        uint32_t size = 0;
+        bool committed = false;
+        bool reserved = false; // false => FREE
+    };
+
+    // Region containing addr (FREE info if untracked but inside window).
+    [[nodiscard]] bool QueryVirtualRegion(uint32_t addr, VirtualRegionInfo* out) const;
+
+    // Fixed-base reservation. Fails if [base, base+size) overlaps a DIFFERENT
+    // region or exits the window. commit over an existing reservation upgrades
+    // it (whole-region granularity, matching our coarse bookkeeping).
+    // *outWasCommitted = true when the range was already committed.
+    [[nodiscard]] bool AllocVirtualFixed(uint32_t base, uint32_t size, bool commit, bool zeroFresh, bool* outWasCommitted);
+
+    // Bottom-up (or top-down) search for a free gap of `size`; inserts region.
+    [[nodiscard]] bool AllocVirtualAny(uint32_t size, bool topDown, bool commit, bool zeroFresh, uint32_t* outBase);
+
+    // Mark the region containing [base, base+size) uncommitted. Returns the
+    // containing region's full size via *outSize. False if no such region.
+    [[nodiscard]] bool DecommitVirtual(uint32_t base, uint32_t size, uint32_t* outSize);
+
+    // Remove the region whose ALLOCATION BASE == base. *outSize = its size.
+    [[nodiscard]] bool ReleaseVirtual(uint32_t base, uint32_t* outSize);
+
     // Checked, endian-explicit read/write helpers
     [[nodiscard]] bool ReadU8(uint32_t guestAddr, uint8_t* outVal) const;
     [[nodiscard]] bool ReadU16BE(uint32_t guestAddr, uint16_t* outVal) const;
@@ -74,6 +113,14 @@ private:
     uint64_t m_size = 0;
     bool m_initialized = false;
     bool m_owned = false;
+
+    struct VirtualRegion {
+        uint32_t base;
+        uint32_t size;
+        bool committed;
+    };
+    mutable std::mutex m_virtualMutex;
+    std::vector<VirtualRegion> m_virtualRegions; // sorted by base, disjoint
 
     static uint16_t Swap16(uint16_t val) { return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }
     static uint32_t Swap32(uint32_t val) { return ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | ((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }

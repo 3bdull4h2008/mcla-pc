@@ -61,6 +61,13 @@ void SetGpuMmioHandlers(GpuMmioWriteFn writeFn, GpuMmioReadFn readFn);
 GpuMmioWriteFn GetGpuMmioWriteHandler();
 GpuMmioReadFn GetGpuMmioReadHandler();
 
+// Arm a guest-address watch range: every checked guest store into
+// [start,end) is reported (value + caller LR) by the page-watch logger.
+void RegisterGuestWatchRange(uint32_t start, uint32_t end);
+// Arm a value watch: every checked guest store whose stored VALUE equals
+// `value` is reported (destination + caller LR).
+void RegisterGuestWatchValue(uint32_t value);
+
 // Routed, checked, endian-explicit accessors for the PPC ABI macros.
 inline uint8_t ReadGuestU8(uint32_t guestAddr) {
     uint8_t val = 0;
@@ -99,5 +106,11 @@ inline void WriteGuestU64(uint32_t guestAddr, uint64_t val) {
 // Returns a 64-bit tick count suitable for the Xbox 360 timebase register.
 // Uses high-resolution performance counter scaled to ~800 MHz (Xenon timebase frequency).
 uint64_t QueryGuestTimebase();
+
+// TU83 spawn pointer scanner (Lead 1): searches guest memory for function
+// pointers to sub_8213178C, sub_821BD8C0, sub_824569C8, sub_823F69C8.
+namespace kernel {
+void ScanGuestMemoryForTU83SpawnPointers();
+}
 
 } // namespace mcla::native

@@ -309,5 +309,234 @@ mcla::kernel::GuestMemoryHeap& mcla::kernel::GuestMemoryHeap::Instance()
     return instance;
 }
 
+// --- Guest-virtual region tracking -------------------------------------------
+// Coarse, allocation-granular bookkeeping (not page-granular): enough to make
+// NtAllocateVirtualMemory/NtFreeVirtualMemory/NtQueryVirtualMemory honest
+// without inventing a second allocator model. The flat window remains
+// identity-mapped; only STATE is tracked.
+
+namespace {
+constexpr uint32_t kVirtPage = mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
+
+uint32_t RoundUpPage(uint32_t v) { return (v + kVirtPage - 1) & ~(kVirtPage - 1); }
+} // namespace
+
+bool mcla::kernel::GuestMemoryHeap::QueryVirtualRegion(uint32_t addr, VirtualRegionInfo* out) const
+{
+    if (!out)
+        return false;
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    for (const auto& r : m_virtualRegions)
+    {
+        if (addr >= r.base && addr < r.base + r.size)
+        {
+            out->base = r.base;
+            out->allocationBase = r.base;
+            out->size = r.size;
+            out->committed = r.committed;
+            out->reserved = true;
+            return true;
+        }
+    }
+    // Untracked: report FREE within the window (page-granular slice).
+    if (addr < kGuestVirtualBase || addr >= kGuestVirtualEnd)
+        return false;
+    uint32_t nextBound = kGuestVirtualEnd;
+    for (const auto& r : m_virtualRegions)
+    {
+        if (r.base > addr)
+        {
+            nextBound = r.base;
+            break;
+        }
+    }
+    out->base = addr & ~(kVirtPage - 1);
+    out->allocationBase = 0;
+    out->size = RoundUpPage(nextBound - out->base);
+    out->committed = false;
+    out->reserved = false;
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::AllocVirtualFixed(uint32_t base, uint32_t size, bool commit, bool zeroFresh, bool* outWasCommitted)
+{
+    *outWasCommitted = false;
+    if (!m_initialized || size == 0)
+        return false;
+    if (base < kGuestVirtualBase || size > kGuestVirtualEnd - base)
+        return false;
+
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    const uint32_t end = base + size;
+
+    // 1) Exact-match re-commit / upgrade / reserve-no-op.
+    for (auto& r : m_virtualRegions)
+    {
+        if (r.base == base && r.size == size)
+        {
+            if (commit && !r.committed)
+            {
+                r.committed = true;
+                if (zeroFresh)
+                    memset(Base() + base, 0, size);
+            }
+            else if (commit && r.committed)
+            {
+                *outWasCommitted = true;
+            }
+            return true;
+        }
+    }
+
+    // 2) Contained within ONE existing region: legal reserve->commit /
+    //    sub-commit (Xenia allows page-granular commit inside reservations;
+    //    our bookkeeping is region-granular, so we upgrade the whole region
+    //    but zero only the freshly-committed sub-range).
+    const VirtualRegion* containing = nullptr;
+    for (const auto& r : m_virtualRegions)
+    {
+        if (base >= r.base && end <= r.base + r.size)
+        {
+            containing = &r;
+            break;
+        }
+    }
+    if (containing)
+    {
+        // Non-const upgrade through mutable vector storage.
+        for (auto& r : m_virtualRegions)
+        {
+            if (&r == containing)
+            {
+                if (commit && !r.committed)
+                {
+                    r.committed = true;
+                    if (zeroFresh)
+                        memset(Base() + base, 0, size);
+                }
+                else if (commit && r.committed)
+                {
+                    *outWasCommitted = true;
+                }
+                return true;
+            }
+        }
+    }
+
+    // 3) Otherwise the whole range must be free of any region.
+    for (const auto& r : m_virtualRegions)
+    {
+        if (r.base < end && base < r.base + r.size)
+            return false; // partial overlap = real conflict
+    }
+
+    if (commit && zeroFresh)
+        memset(Base() + base, 0, size);
+    m_virtualRegions.insert(
+        std::lower_bound(m_virtualRegions.begin(), m_virtualRegions.end(), base,
+                         [](const VirtualRegion& r, uint32_t b) { return r.base < b; }),
+        VirtualRegion{base, size, commit});
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::AllocVirtualAny(uint32_t size, bool topDown, bool commit, bool zeroFresh, uint32_t* outBase)
+{
+    if (!m_initialized || size == 0 || size > kGuestVirtualEnd - kGuestVirtualBase)
+        return false;
+
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+
+    auto gapFits = [size](uint32_t lo, uint32_t hi) { return hi >= lo && hi - lo >= size; };
+
+    if (!topDown)
+    {
+        // Walk regions in order; first gap before/between/after them wins.
+        uint32_t cursor = kGuestVirtualBase;
+        for (const auto& r : m_virtualRegions)
+        {
+            if (gapFits(cursor, r.base))
+            {
+                if (commit && zeroFresh)
+                    memset(Base() + cursor, 0, size);
+                m_virtualRegions.insert(
+                    std::lower_bound(m_virtualRegions.begin(), m_virtualRegions.end(), cursor,
+                                     [](const VirtualRegion& rr, uint32_t b) { return rr.base < b; }),
+                    VirtualRegion{cursor, size, commit});
+                *outBase = cursor;
+                return true;
+            }
+            cursor = std::max(cursor, r.base + r.size);
+        }
+        if (gapFits(cursor, kGuestVirtualEnd))
+        {
+            if (commit && zeroFresh)
+                memset(Base() + cursor, 0, size);
+            m_virtualRegions.emplace_back(VirtualRegion{cursor, size, commit}); // append at end
+            *outBase = cursor;
+            return true;
+        }
+        return false;
+    }
+
+    // Top-down: last gap near the window end.
+    uint32_t hi = kGuestVirtualEnd;
+    for (auto it = m_virtualRegions.rbegin(); it != m_virtualRegions.rend(); ++it)
+    {
+        if (gapFits(it->base + it->size, hi))
+        {
+            uint32_t base = hi - size;
+            if (commit && zeroFresh)
+                memset(Base() + base, 0, size);
+            m_virtualRegions.insert(
+                std::lower_bound(m_virtualRegions.begin(), m_virtualRegions.end(), base,
+                                 [](const VirtualRegion& r, uint32_t b) { return r.base < b; }),
+                VirtualRegion{base, size, commit});
+            *outBase = base;
+            return true;
+        }
+        hi = std::min(hi, it->base);
+    }
+    if (gapFits(kGuestVirtualBase, hi))
+    {
+        uint32_t base = hi - size;
+        if (commit && zeroFresh)
+            memset(Base() + base, 0, size);
+        m_virtualRegions.insert(m_virtualRegions.begin(), VirtualRegion{base, size, commit});
+        *outBase = base;
+        return true;
+    }
+    return false;
+}
+
+bool mcla::kernel::GuestMemoryHeap::DecommitVirtual(uint32_t base, uint32_t size, uint32_t* outSize)
+{
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    for (auto& r : m_virtualRegions)
+    {
+        if (base >= r.base && base < r.base + r.size)
+        {
+            r.committed = false;
+            *outSize = r.size;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool mcla::kernel::GuestMemoryHeap::ReleaseVirtual(uint32_t base, uint32_t* outSize)
+{
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    for (auto it = m_virtualRegions.begin(); it != m_virtualRegions.end(); ++it)
+    {
+        if (it->base == base)
+        {
+            *outSize = it->size;
+            m_virtualRegions.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 mcla::kernel::Memory mcla::kernel::g_memory;
 Heap g_userHeap;

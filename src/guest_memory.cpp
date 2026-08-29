@@ -12,9 +12,94 @@ void PageWatchOnRead(uint32_t guestAddr, uint32_t value);
 
 static constexpr uint32_t kWatchPage = 0x50000000u;
 
+// Dynamic watch ranges (session 26): armed by censuses when they observe a
+// suspicious structure (e.g. empty dispatch method-object). Guest stores into
+// these ranges are reported by PageWatchOnWrite with caller LR.
+constexpr uint32_t kMaxWatchRanges = 8;
+struct WatchRange
+{
+    std::atomic<uint32_t> start{0};
+    std::atomic<uint32_t> end{0};
+};
+WatchRange g_watchRanges[kMaxWatchRanges];
+std::atomic<uint32_t> g_watchRangeCount{0};
+
+void mcla::native::RegisterGuestWatchRange(uint32_t start, uint32_t end)
+{
+    const uint32_t n = g_watchRangeCount.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        if (g_watchRanges[i].start.load(std::memory_order_relaxed) == start)
+        {
+            return; // already armed
+        }
+    }
+    if (n >= kMaxWatchRanges)
+    {
+        return;
+    }
+    g_watchRanges[n].start.store(start, std::memory_order_relaxed);
+    g_watchRanges[n].end.store(end, std::memory_order_relaxed);
+    g_watchRangeCount.store(n + 1, std::memory_order_release);
+    MCLA_LOG_WARN("WATCH: range armed [{:08X},{:08X})", start, end);
+}
+
+// Value watch (session 27): log every store whose VALUE equals a registered
+// constant - catches pointer registration sites (e.g. who links object
+// 0x88825500 into the swf display-list chain).
+constexpr uint32_t kMaxWatchValues = 4;
+std::atomic<uint32_t> g_watchValues[kMaxWatchValues];
+std::atomic<uint32_t> g_watchValueCount{0};
+
+void mcla::native::RegisterGuestWatchValue(uint32_t value)
+{
+    const uint32_t n = g_watchValueCount.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        if (g_watchValues[i].load(std::memory_order_relaxed) == value)
+        {
+            return;
+        }
+    }
+    if (n >= kMaxWatchValues)
+    {
+        return;
+    }
+    g_watchValues[n].store(value, std::memory_order_relaxed);
+    g_watchValueCount.store(n + 1, std::memory_order_release);
+    MCLA_LOG_WARN("WATCH: value armed {:08X}", value);
+}
+
+inline bool WatchValueHit(uint32_t value)
+{
+    const uint32_t n = g_watchValueCount.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        if (g_watchValues[i].load(std::memory_order_relaxed) == value)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline bool PageWatchHit(uint32_t guestAddr)
 {
-    return (guestAddr & 0xFFFFF000u) == kWatchPage;
+    if ((guestAddr & 0xFFFFF000u) == kWatchPage)
+    {
+        return true;
+    }
+    const uint32_t n = g_watchRangeCount.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const uint32_t s = g_watchRanges[i].start.load(std::memory_order_relaxed);
+        const uint32_t e = g_watchRanges[i].end.load(std::memory_order_relaxed);
+        if (guestAddr >= s && guestAddr < e)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 namespace mcla::native {
@@ -136,6 +221,8 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
     std::memcpy(ptr, &be, sizeof(be));
     if (PageWatchHit(guestAddr))
         mcla::gpu::PageWatchOnWrite(guestAddr, val);
+    else if (WatchValueHit(val))
+        mcla::gpu::PageWatchOnWrite(guestAddr, val);
     return true;
 }
 
@@ -144,6 +231,17 @@ bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
     if (!ptr) return false;
     uint64_t be = Swap64(val);
     std::memcpy(ptr, &be, sizeof(be));
+    if (PageWatchHit(guestAddr) || PageWatchHit(guestAddr + 4))
+    {
+        mcla::gpu::PageWatchOnWrite(guestAddr, static_cast<uint32_t>(val >> 32));
+        mcla::gpu::PageWatchOnWrite(guestAddr + 4, static_cast<uint32_t>(val));
+    }
+    else if (WatchValueHit(static_cast<uint32_t>(val >> 32)) ||
+             WatchValueHit(static_cast<uint32_t>(val)))
+    {
+        mcla::gpu::PageWatchOnWrite(guestAddr, static_cast<uint32_t>(val >> 32));
+        mcla::gpu::PageWatchOnWrite(guestAddr + 4, static_cast<uint32_t>(val));
+    }
     return true;
 }
 
@@ -151,6 +249,29 @@ bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t s
     uint8_t* ptr = GetHostPtrMutable(guestAddr, size);
     if (!ptr || !src) return false;
     std::memcpy(ptr, src, size);
+    if (size >= 4)
+    {
+        // Watch coverage for bulk copies of ANY size: check first + last
+        // dword against range and value watches (asset blobs carry stale
+        // pointers mid-buffer; a hit logs LR attribution for the copy).
+        uint32_t vFirst = 0, vLast = 0;
+        std::memcpy(&vFirst, ptr, sizeof(vFirst));
+        std::memcpy(&vLast, ptr + size - sizeof(uint32_t), sizeof(vLast));
+        vFirst = Swap32(vFirst);
+        vLast = Swap32(vLast);
+        const bool rangeHit = PageWatchHit(guestAddr) ||
+                              PageWatchHit(guestAddr + size - 4);
+        const bool valueHit =
+            WatchValueHit(vFirst) || WatchValueHit(vLast);
+        if (rangeHit || valueHit)
+        {
+            mcla::gpu::PageWatchOnWrite(guestAddr, vFirst);
+            if (size > 4)
+            {
+                mcla::gpu::PageWatchOnWrite(guestAddr + size - 4, vLast);
+            }
+        }
+    }
     return true;
 }
 

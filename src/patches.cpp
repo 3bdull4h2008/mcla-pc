@@ -8,6 +8,10 @@
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "logging.h"
 #include "app.h"
+#include "cpu/ppc_context.h"
+#include "gpu_device.h"
+#include "render_queue.h"
+#include "render_thread.h"
 
 #include <algorithm>
 #include <atomic>
@@ -226,7 +230,20 @@ extern "C" void hk_sub_82554E20(mcla::native::PPCContext& ctx, uint8_t* base);
 extern "C" void hk_VdInitializeEngines(mcla::native::PPCContext& ctx, uint8_t* base);
 extern "C" void hk_sub_82554590(mcla::native::PPCContext& ctx, uint8_t* base);
 extern "C" void hk_GpuKick(mcla::native::PPCContext& ctx, uint8_t* base);
+extern "C" void hk_sub_821C29A0(mcla::native::PPCContext& ctx, uint8_t* base);
+extern "C" void hk_sub_824569C8(mcla::native::PPCContext& ctx, uint8_t* base);
+extern "C" void hk_sub_82413660(mcla::native::PPCContext& ctx, uint8_t* base);
+extern "C" void hk_sub_82411840(mcla::native::PPCContext& ctx, uint8_t* base);
+
+PPC_FUNC_IMPL(__imp__sub_82413660);
+PPC_FUNC_IMPL(__imp__sub_82411840);
+
 static PPCFunc* g_orig_sub_82554E20 = nullptr;
+static PPCFunc* g_orig_sub_821C29A0 = nullptr;
+static PPCFunc* g_orig_sub_82130B50 = nullptr;
+static PPCFunc* g_fast_pool_alloc = nullptr;
+static PPCFunc* g_debug_alloc_caller = nullptr;
+static PPCFunc* g_orig_sub_824569C8 = nullptr;
 static PPCFunc* g_orig_VdSwap_observer = nullptr;
 PPCFunc* g_orig_VdInitializeEngines = nullptr;
 
@@ -319,6 +336,8 @@ static void MclaPatchSdkExecutePacketType3Overflow() {
 
 MCLA_CVAR_STRING(mcla_patch_groups, "all", "MCLA Renderer",
                       "Which hook groups to install: all|none|sdk,guest,native");
+MCLA_CVAR_BOOL(tu83_manual_spawn, false, "MCLA Kernel",
+               "Enable manual TU83 worker spawn (EXPERIMENTAL - workaround for missing async trigger, defaults OFF)");
 bool BisectGroupEnabled(std::string_view group) {
     const std::string_view groups = MCLA_CVAR_GET_STRING(mcla_patch_groups);
     if (groups == "all") return true;
@@ -338,9 +357,16 @@ bool BisectGroupEnabled(std::string_view group) {
 }
 
 void mcla_ApplyPatches(mcla::App::FunctionDispatcher* dispatcher) {
+    MCLA_LOG_ERROR("=== mcla_ApplyPatches ENTERED ===");
     g_dispatcher = dispatcher;
 
     dispatcher->SetFunction(0x82554080, sub_82554080_stub);
+
+    // Register recompiled allocation functions so they can be hooked
+    dispatcher->SetFunction(0x821C29A0, sub_821C29A0);
+    dispatcher->SetFunction(0x821DE9D8, sub_821DE9D8);
+    dispatcher->SetFunction(0x821BD618, sub_821BD618);
+    dispatcher->SetFunction(0x821C1BB0, sub_821C1BB0);
 
     const std::string_view mode = MCLA_CVAR_GET_STRING(renderer_mode);
     if (mode == "compat") {
@@ -501,9 +527,18 @@ if (BisectGroupEnabled("gp")) {
         }
     }
 
-    if (dispatcher) {
-        mcla::native::InstallNativeRenderer(dispatcher);
-    }
+    // Start render thread for P4.5' - owns all D3D12 calls
+    // DISABLED for bisection: mcla::native::g_renderThread.start();
+    // MCLA_LOG_ERROR("mcla_ApplyPatches: Render thread started (P4.5')");
+
+    // Device-boundary hooks for native draw path (sub_82413660, sub_82411840)
+    // DISABLED for bisection:
+    // if (BisectGroupEnabled("gp")) {
+    //     dispatcher->SetFunction(0x82413660, hk_sub_82413660);
+    //     MCLA_LOG_INFO("Device-boundary hook: sub_82413660 (draw submit) hooked");
+    //     dispatcher->SetFunction(0x82411840, hk_sub_82411840);
+    //     MCLA_LOG_INFO("Device-boundary hook: sub_82411840 (draw consumer) hooked");
+    // }
 
     if (BisectGroupEnabled("gp")) {
         dispatcher->SetFunction(0x82130690, hk_sub_82130690);
@@ -519,12 +554,54 @@ if (BisectGroupEnabled("ps")) {
         MCLA_LOG_INFO("Press Start shim thunk allocated+registered at 0x{:08X}", g_press_start_shim_thunk);
     }
 
+    // Allocation function hook (sub_821C29A0) - fixes fallback logic bug (unconditional)
+    g_orig_sub_821C29A0 = dispatcher->GetFunction(0x821C29A0);
+    if (g_orig_sub_821C29A0) {
+        dispatcher->SetFunction(0x821C29A0, hk_sub_821C29A0);
+        MCLA_LOG_INFO("Allocation function (sub_821C29A0) hooked");
+    } else {
+        MCLA_LOG_ERROR("sub_821C29A0 not found in dispatcher");
+    }
+
+    // Register recompiled sub_82130B50 so it can be hooked
+    dispatcher->SetFunction(0x82130B50, sub_82130B50);
+
+    // Allocation function hook (sub_82130B50) - fixes same fallback bug in GPU worker path
+    g_orig_sub_82130B50 = dispatcher->GetFunction(0x82130B50);
+    if (g_orig_sub_82130B50) {
+        dispatcher->SetFunction(0x82130B50, hk_sub_821C29A0);  // reuse same hook
+        MCLA_LOG_INFO("Allocation function (sub_82130B50) hooked");
+    } else {
+        MCLA_LOG_ERROR("sub_82130B50 not found in dispatcher");
+    }
+
+    // Get fast pool allocator (sub_821DE9D8) and debug allocator caller (sub_821BD618)
+    g_fast_pool_alloc = dispatcher->GetFunction(0x821DE9D8);
+    g_debug_alloc_caller = dispatcher->GetFunction(0x821BD618);
+    if (g_fast_pool_alloc && g_debug_alloc_caller) {
+        MCLA_LOG_INFO("Fast pool allocator (sub_821DE9D8) and debug alloc caller (sub_821BD618) resolved");
+    } else {
+        MCLA_LOG_WARN("Fast pool allocator: {}, Debug alloc caller: {}",
+                      g_fast_pool_alloc ? "OK" : "MISSING",
+                      g_debug_alloc_caller ? "OK" : "MISSING");
+    }
+
     g_orig_sub_82554E20 = dispatcher->GetFunction(0x82554E20);
     if (g_orig_sub_82554E20) {
         dispatcher->SetFunction(0x82554E20, hk_sub_82554E20);
         MCLA_LOG_INFO("Screen manager (sub_82554E20) hooked");
     } else {
         MCLA_LOG_ERROR("sub_82554E20 not found in dispatcher");
+    }
+
+    // Worker entry census (sub_824569C8) — TU83 driver worker
+    dispatcher->SetFunction(0x824569C8, sub_824569C8);  // ensure registered
+    g_orig_sub_824569C8 = dispatcher->GetFunction(0x824569C8);
+    if (g_orig_sub_824569C8) {
+        dispatcher->SetFunction(0x824569C8, hk_sub_824569C8);
+        MCLA_LOG_INFO("Worker entry sub_824569C8 hooked for census");
+    } else {
+        MCLA_LOG_ERROR("sub_824569C8 not found in dispatcher");
     }
 
     if (g_virtual_membase) {
@@ -739,6 +816,157 @@ PPC_FUNC_IMPL(hk_NtClose) {
 
 PPC_FUNC_IMPL(hk_sub_82554E20) {
     if (g_orig_sub_82554E20) g_orig_sub_82554E20(ctx, base);
+}
+
+PPC_FUNC_IMPL(hk_sub_821C29A0) {
+    // Fixed allocation function for sub_821C29A0
+    // Bug: fallback path passes heap max size (offset 152) instead of actual requested size
+    // Fix: call fast pool allocator for valid pool_idx, on failure call debug allocator with correct size
+    // For pool_idx > 64 (large allocations), call sub_821C1BB0
+
+    static std::atomic<uint64_t> s_alloc_count{0};
+    uint64_t count = s_alloc_count.fetch_add(1) + 1;
+
+    uint32_t heap_mgr = ctx.r3.u32;
+    uint32_t pool_idx = ctx.r4.u32;
+    uint32_t req_size = ctx.r5.u32;
+
+    const char* path = "unknown";
+    uint32_t result = 0;
+
+    // Valid fast pool range: pool_idx <= 64 (matches original fast path condition)
+    if (pool_idx <= 64) {
+        // Call fast pool allocator (sub_821DE9D8)
+        if (g_fast_pool_alloc) {
+            uint32_t saved_r3 = ctx.r3.u32;
+            uint32_t saved_r4 = ctx.r4.u32;
+            ctx.r3.u32 = heap_mgr;
+            ctx.r4.u32 = pool_idx;
+            g_fast_pool_alloc(ctx, base);
+            result = ctx.r3.u32;
+            ctx.r3.u32 = saved_r3;
+            ctx.r4.u32 = saved_r4;
+
+            if (result != 0) {
+                path = "fast-pool-hit";
+                ctx.r3.u32 = result;
+            } else {
+                path = "debug-fallback";
+            }
+        } else {
+            path = "debug-fallback (no-fast-pool)";
+        }
+
+        // Fast pool failed or not available - call debug allocator with CORRECT size
+        if (result == 0 && g_debug_alloc_caller) {
+            uint32_t saved_r3 = ctx.r3.u32;
+            uint32_t saved_r4 = ctx.r4.u32;
+            uint32_t saved_r5 = ctx.r5.u32;
+
+            // Format string: "Not enough memory to allocate %u bytes (%u available)"
+            ctx.r3.u32 = 0x82011F78;
+            ctx.r4.u32 = pool_idx;
+            ctx.r5.u32 = req_size;  // CORRECT: pass actual requested size, not heap max size
+
+            g_debug_alloc_caller(ctx, base);
+
+            // Capture result BEFORE restoring registers
+            result = ctx.r3.u32;
+
+            ctx.r3.u32 = saved_r3;
+            ctx.r4.u32 = saved_r4;
+            ctx.r5.u32 = saved_r5;
+
+            ctx.r3.u32 = result;
+        } else if (result != 0) {
+            ctx.r3.u32 = result;
+        }
+    } else {
+        // Large allocation path (pool_idx > 64) - call sub_821C1BB0
+        path = "large-alloc (sub_821C1BB0)";
+        PPCFunc* orig_c1bb0 = g_dispatcher->GetFunction(0x821C1BB0);
+        if (orig_c1bb0) {
+            orig_c1bb0(ctx, base);
+            result = ctx.r3.u32;
+        } else {
+            MCLA_LOG_ERROR("sub_821C1BB0 not registered for large allocation");
+            result = 0;
+        }
+    }
+
+    // Rate-limited diagnostic logging
+    if (count <= 10 || (count % 1000 == 0) || result == 0) {
+        MCLA_LOG_INFO("ALLOC[{}] pool_idx={} req_size={} path={} result={:08X}",
+                      count, pool_idx, req_size, path, result);
+    }
+
+    // Return result in r3 (already set above)
+}
+
+PPC_FUNC_IMPL(hk_sub_824569C8) {
+    MCLA_LOG_WARN("WORKER-ENTRY sub_824569C8 called: r3={:08X} r4={:08X} r5={:08X} r13={:08X} lr={:08X}",
+                  ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r13.u32,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (g_orig_sub_824569C8) g_orig_sub_824569C8(ctx, base);
+}
+
+PPC_FUNC_IMPL(hk_sub_82413660) {
+    // Device-boundary draw submit hook - native path
+    const uint32_t n = 0;
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t r4 = ctx.r4.u32;
+    const uint32_t r5 = ctx.r5.u32; // VB desc
+    const uint32_t r6 = ctx.r6.u32; // IB desc
+
+    // Get the captured draw data
+    const mcla::gpu::CapturedDrawV2* draw = mcla::gpu::mcla_gpu_GetLastDrawV2();
+    uint32_t frameId = mcla::gpu::mcla_gpu_GetFrameCounter();
+
+    if (draw && (draw->frameId == frameId || frameId == 0)) {
+        // Native path: enqueue draw command to render thread
+        MCLA_LOG_INFO("NATIVE DRAW: sub_82413660 #{} dev={:08X} r4={:08X} r5={:08X} r6={:08X} "
+                      "vb=0x{:08X}/{:08X}/{:08X} ib=0x{:08X}/{:08X}/{:08X}",
+                      n, dev, r4, r5, r6,
+                      draw->vbBase, draw->vbStride, draw->vbSize,
+                      draw->ibBase, draw->ibSize, draw->ibFmt);
+
+        // Enqueue draw command to render thread
+        mcla::native::RenderCommand cmd;
+        cmd.type = mcla::native::RenderCommand::DRAW_INDEXED;
+        auto& drawCmd = cmd.data.emplace<mcla::native::DrawIndexedCommand>();
+        drawCmd.vbAddr = draw->vbBase;
+        drawCmd.ibAddr = draw->ibBase;
+        drawCmd.indexCount = draw->ibSize / 2; // assuming 16-bit indices
+        drawCmd.startIndexLocation = 0;
+        drawCmd.baseVertexLocation = 0;
+        drawCmd.vbStride = draw->vbStride;
+        drawCmd.ibFormat = 0x10; // DXGI_FORMAT_R16_UINT
+        drawCmd.primitiveTopology = 0x3; // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+
+        mcla::native::g_commandQueue.push(cmd);
+        MCLA_LOG_INFO("Enqueued DrawIndexed to command queue (queue size: {})", mcla::native::g_commandQueue.size());
+    }
+
+    // Chain to original for legacy path
+    __imp__sub_82413660(ctx, base);
+}
+
+PPC_FUNC_IMPL(hk_sub_82411840) {
+    // Device-boundary draw consumer hook - native path
+    const uint32_t n = 0;
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t cls = ctx.r4.u32;
+    const uint32_t arg = ctx.r5.u32;
+
+    MCLA_LOG_INFO("NATIVE DRAW CONSUMER: sub_82411840 #{} dev={:08X} class={} arg={:08X}",
+                  n, dev, cls, arg);
+
+    // Enqueue state change command if needed
+    // For now just log and chain to original
+    // TODO: Enqueue state change commands
+
+    // Chain to original for legacy path
+    __imp__sub_82411840(ctx, base);
 }
 
 PPC_FUNC_IMPL(hk_sub_822A3998) {
