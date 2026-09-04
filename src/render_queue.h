@@ -40,6 +40,11 @@ struct PresentCommand {
     uint32_t frameNumber;
 };
 
+struct SetRenderStateCommand {
+    uint32_t deviceAddr;
+    uint32_t value;
+};
+
 struct RenderCommand {
     enum Type : uint8_t {
         DRAW_INDEXED,
@@ -47,6 +52,7 @@ struct RenderCommand {
         SET_VERTEX_BUFFERS,
         SET_INDEX_BUFFER,
         PRESENT,
+        SET_RENDER_STATE,
         NOOP
     };
     
@@ -56,7 +62,8 @@ struct RenderCommand {
         SetPipelineStateCommand,
         SetVertexBuffersCommand,
         SetIndexBufferCommand,
-        PresentCommand
+        PresentCommand,
+        SetRenderStateCommand
     > data;
 };
 

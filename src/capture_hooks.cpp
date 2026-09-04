@@ -368,3 +368,35 @@ bool DrawPacketAccumulator::ValidatePacket(DrawPacket& packet) const {
 }
 
 } // namespace mcla::native
+
+// ---------------------------------------------------------------------------
+// P4'/P5' device-method capture hook: intercepts a simple FP-table render-state
+// setter (sub_82413950, FP-table slot 14, device+0x78) and enqueues a
+// SetRenderState command to the render thread queue (log-only, no D3D12).
+// Signature: func(r3=device, r4=renderStateValue)
+// ---------------------------------------------------------------------------
+
+#include "render_queue.h"
+#include "kernel/memory.h"
+#include "generated/ppc_xenon/ppc_recomp_shared.h"
+#include <cpu/ppc_context.h>
+
+PPC_FUNC_IMPL(__imp__sub_82413950);
+static std::atomic<uint32_t> s_hSetRS{0};
+
+PPC_FUNC(sub_82413950)
+{
+    const uint32_t n = s_hSetRS.fetch_add(1) + 1;
+    const uint32_t dev = ctx.r3.u32;
+    const uint32_t value = ctx.r4.u32;
+
+    if (n <= 20 || (n % 2000) == 0)
+        MCLA_LOG_INFO("CAPTURE-SET_RS sub_82413950 #{} dev={:08X} value={:08X}", n, dev, value);
+
+    mcla::native::RenderCommand cmd;
+    cmd.type = mcla::native::RenderCommand::SET_RENDER_STATE;
+    cmd.data = mcla::native::SetRenderStateCommand{ dev, value };
+    mcla::native::g_commandQueue.push(cmd);
+
+    __imp__sub_82413950(ctx, base);
+}

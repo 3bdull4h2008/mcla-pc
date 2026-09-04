@@ -1,7 +1,5 @@
 #include "render_thread.h"
-#include "d3d12_backend.h"
 #include "logging.h"
-#include "native_renderer.h"
 
 namespace mcla::native {
 
@@ -16,100 +14,78 @@ RenderThread::~RenderThread() {
 
 void RenderThread::start() {
     if (running_) return;
-    
+
     running_ = true;
     shouldStop_ = false;
-    MCLA_LOG_ERROR(">>> RenderThread::start() called <<<");
+    MCLA_LOG_INFO("RenderThread: started");
     thread_ = std::thread(&RenderThread::threadMain, this);
-    MCLA_LOG_ERROR(">>> Render thread started (P4.5') <<<");
 }
 
 void RenderThread::stop() {
     if (!running_) return;
-    
+
     shouldStop_ = true;
     g_commandQueue.shutdown();
-    
+
     if (thread_.joinable()) {
         thread_.join();
     }
-    
+
     running_ = false;
-    MCLA_LOG_INFO("Render thread stopped");
+    MCLA_LOG_INFO("RenderThread: stopped");
 }
 
 void RenderThread::threadMain() {
-    MCLA_LOG_INFO("Render thread main loop starting");
-    
+    MCLA_LOG_INFO("RenderThread: entering command loop");
+
     while (!shouldStop_) {
         RenderCommand cmd;
         if (!g_commandQueue.pop(cmd)) {
-            break; // Queue shutdown
+            break;
         }
-        
         processCommand(cmd);
     }
-    
-    MCLA_LOG_INFO("Render thread main loop exiting");
+
+    MCLA_LOG_INFO("RenderThread: exiting command loop");
 }
 
 void RenderThread::processCommand(const RenderCommand& cmd) {
     switch (cmd.type) {
-        case RenderCommand::DRAW_INDEXED:
-            executeDrawIndexed(std::get<DrawIndexedCommand>(cmd.data));
+        case RenderCommand::DRAW_INDEXED: {
+            const auto& d = std::get<DrawIndexedCommand>(cmd.data);
+            static std::atomic<uint32_t> drawCount{0};
+            const uint32_t n = drawCount.fetch_add(1) + 1;
+            if (n <= 20 || (n % 1000) == 0)
+                MCLA_LOG_INFO("RenderThread: DRAW_INDEXED #{} prim={} vb={:08X} ib={:08X} "
+                              "count={} stride={} ibFmt={}",
+                              n, d.primitiveTopology, d.vbAddr, d.ibAddr,
+                              d.indexCount, d.vbStride, d.ibFormat);
             break;
-            
-        case RenderCommand::SET_PIPELINE_STATE:
-            executeSetPipelineState(std::get<SetPipelineStateCommand>(cmd.data));
+        }
+        case RenderCommand::SET_PIPELINE_STATE: {
+            const auto& p = std::get<SetPipelineStateCommand>(cmd.data);
+            MCLA_LOG_DEBUG("RenderThread: SetPipelineState hash={:016X}", p.psoHash);
             break;
-            
-        case RenderCommand::PRESENT:
-            executePresent(std::get<PresentCommand>(cmd.data));
+        }
+        case RenderCommand::SET_RENDER_STATE: {
+            const auto& rs = std::get<SetRenderStateCommand>(cmd.data);
+            static std::atomic<uint32_t> rsCount{0};
+            const uint32_t n = rsCount.fetch_add(1) + 1;
+            if (n <= 20 || (n % 1000) == 0)
+                MCLA_LOG_INFO("RenderThread: SET_RENDER_STATE #{} dev={:08X} value={:08X}",
+                              n, rs.deviceAddr, rs.value);
             break;
-            
+        }
+        case RenderCommand::PRESENT: {
+            const auto& p = std::get<PresentCommand>(cmd.data);
+            MCLA_LOG_DEBUG("RenderThread: Present frame={}", p.frameNumber);
+            break;
+        }
         case RenderCommand::SET_VERTEX_BUFFERS:
         case RenderCommand::SET_INDEX_BUFFER:
         case RenderCommand::NOOP:
-            // Not implemented yet
             break;
     }
-}
-
-void RenderThread::executeDrawIndexed(const DrawIndexedCommand& cmd) {
-    // Move the actual D3D12 call here from TryConsumeDeviceBoundaryDraw
-    // This is where all D3D12 API calls happen now
-    
-    MCLA_LOG_DEBUG("Render thread: DrawIndexed vb={:08X} ib={:08X} count={}", 
-                   cmd.vbAddr, cmd.ibAddr, cmd.indexCount);
-    
-    D3D12Backend* backend = GetD3D12Backend();
-    if (!backend || !backend->IsInitialized()) {
-        return;
-    }
-    
-    D3D12Backend::DynamicMeshDesc desc = {};
-    desc.vertexBytes = nullptr; // Will be filled from guest memory
-    desc.vertexBytesSize = 0;
-    desc.vertexStride = cmd.vbStride;
-    desc.vertexCount = cmd.indexCount;
-    desc.indexed = true;
-    desc.indexBytes = nullptr;
-    desc.indexBytesSize = 0;
-    desc.indexFormat = static_cast<DXGI_FORMAT>(cmd.ibFormat);
-    
-    // We need to read vertex/index data from guest memory
-    // For now, just log that we're executing
-    MCLA_LOG_INFO("Render thread: executing DrawIndexed (stub - need guest memory read)");
-}
-
-void RenderThread::executeSetPipelineState(const SetPipelineStateCommand& cmd) {
-    MCLA_LOG_DEBUG("Render thread: SetPipelineState hash={:016X}", cmd.psoHash);
-    // TODO: Set PSO
-}
-
-void RenderThread::executePresent(const PresentCommand& cmd) {
-    MCLA_LOG_DEBUG("Render thread: Present frame={}", cmd.frameNumber);
-    // TODO: Call swap chain present
 }
 
 } // namespace mcla::native

@@ -147,6 +147,13 @@ uint32_t FlushProgressAtVblank()
     }
     if (blk == 0)
     {
+        static std::atomic<uint32_t> s_flushNoBlk{0};
+        const uint32_t nb = s_flushNoBlk.fetch_add(1) + 1;
+        if (nb <= 8 || (nb % 500) == 0)
+        {
+            MCLA_LOG_WARN("CP: PROGRESS-FLUSH #{} blk=0 (no TLS page and no "
+                          "cached submitter block) - retrying later", nb);
+        }
         g_progressPending.fetch_add(add, std::memory_order_relaxed); // retry later
         return 0;
     }
@@ -1251,8 +1258,60 @@ void ConsumePendingAtVblank()
 // Credit pending windows whose bytes an executed INDIRECT_BUFFER range
 // actually covered. Called from DrainIndirectBuffer - i.e. consumption is
 
+// VDRAIN CENSUS (2026-08-31 session 35): the hot WAIT census shows pc=0
+// forever while this function produces no VDRAIN lines at all - meaning it
+// exits early on some branch, but every early-exit here is silent. Count each
+// reason and surface the ring registry state; log-only, no behavior change.
+static std::atomic<uint32_t> s_vdInvocations{0};
+static std::atomic<uint32_t> s_vdNoCtx{0};
+static std::atomic<uint32_t> s_vdNoCtx30{0};
+static std::atomic<uint32_t> s_vdNoRing{0};
+static std::atomic<uint32_t> s_vdSameWptr{0};
+static std::atomic<uint32_t> s_vdBusy{0};
+static std::atomic<uint32_t> s_vdRejected{0};
+
 void CpVblankDrainToWptr()
 {
+    const uint32_t vdN = s_vdInvocations.fetch_add(1) + 1;
+    if (vdN <= 16 || (vdN % 500) == 0)
+    {
+        auto& memC = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t gpuCtxC = 0, wptrVAC = 0;
+        (void)memC.ReadU32BE(0x82839254u, &gpuCtxC);
+        if (gpuCtxC != 0)
+        {
+            (void)memC.ReadU32BE(gpuCtxC + 0x30u, &wptrVAC);
+        }
+        std::string ringDump;
+        {
+            std::lock_guard<std::mutex> dumpLock(g_ringMutex);
+            for (size_t i = 0; i < kMaxRings; ++i)
+            {
+                const RingState& r = g_rings[i];
+                if (!r.initialized.load(std::memory_order_acquire))
+                    continue;
+                ringDump += fmt::format(" {}[base={:08X} cap={} rptr={:04X} db={:08X} wb={:08X}]",
+                                        r.id, r.baseGuestVA, r.capDwords,
+                                        r.rptrIndex.load(std::memory_order_relaxed),
+                                        r.lastDoorbellWptr.load(std::memory_order_relaxed),
+                                        r.writebackVA.load(std::memory_order_relaxed));
+            }
+        }
+        MCLA_LOG_INFO("CP: VDRAIN-CENSUS #{} def={} gpuCtx={:08X} ctx+30={:08X} "
+                      "doorbells={} drains={} swaps={} exits[noCtx={} noCtx30={} "
+                      "noRing={} sameWptr={} busy={} rejected={}]{}",
+                      vdN, DeferredConsumeEnabled() ? 1 : 0, gpuCtxC, wptrVAC,
+                      g_doorbellCount.load(std::memory_order_relaxed),
+                      g_drainCount.load(std::memory_order_relaxed),
+                      g_swapCount.load(std::memory_order_relaxed),
+                      s_vdNoCtx.load(std::memory_order_relaxed),
+                      s_vdNoCtx30.load(std::memory_order_relaxed),
+                      s_vdNoRing.load(std::memory_order_relaxed),
+                      s_vdSameWptr.load(std::memory_order_relaxed),
+                      s_vdBusy.load(std::memory_order_relaxed),
+                      s_vdRejected.load(std::memory_order_relaxed),
+                      ringDump);
+    }
     // Deferred-consumption experiment: credit submitted-but-unconsumed
     // driver windows here, paced by vblank, before the ring-drain duty.
     if (DeferredConsumeEnabled())
@@ -1299,18 +1358,25 @@ void CpVblankDrainToWptr()
 
     uint32_t ctxPtr = 0;
     if (!mem.ReadU32BE(0x82839254u, &ctxPtr) || ctxPtr == 0)
+    {
+        s_vdNoCtx.fetch_add(1, std::memory_order_relaxed);
         return; // GPU context not published yet
+    }
 
     // GPU_ctx+0x30 holds a driver-space BYTE VA (BOOT_HANDOFF: 0xC62346BC),
     // not a dword index. Route by EXACT ownership: the ring whose registered
     // window contains that byte VA is the one the driver produced into.
     uint32_t wptrVA = 0;
     if (!mem.ReadU32BE(ctxPtr + 0x30u, &wptrVA))
+    {
+        s_vdNoCtx30.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
 
     RingState* ring = RingOwningCursorVA(wptrVA);
     if (!ring)
     {
+        s_vdNoRing.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<bool> warnedNoOwner{false};
         if (!warnedNoOwner.exchange(true))
         {
@@ -1329,12 +1395,18 @@ void CpVblankDrainToWptr()
     const uint32_t wptr =
         static_cast<uint32_t>(((uint64_t(wptrVA) - ring->baseGuestVA) >> 2) % cap);
     if (wptr == oldRptr)
+    {
+        s_vdSameWptr.fetch_add(1, std::memory_order_relaxed);
         return; // nothing produced: zero consumption, zero publication
+    }
 
     // Single-drain guard per ring: DrainRing was designed for the synchronous
     // submitter thread; a concurrent doorbell drain must not interleave.
     if (ring->draining.exchange(true))
+    {
+        s_vdBusy.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
 
     uint32_t probeDev = 0, pubBefore = 0;
     ForEachDevice([&](uint32_t dev) {
@@ -1351,6 +1423,7 @@ void CpVblankDrainToWptr()
     const bool ran = g_drainCount.load(std::memory_order_relaxed) != drainsBefore;
     if (!ran)
     {
+        s_vdRejected.fetch_add(1, std::memory_order_relaxed);
         ring->draining.store(false, std::memory_order_release);
         return; // rejected/desync: nothing consumed, nothing published
     }

@@ -2024,22 +2024,21 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, 
         {
             uint32_t r13 = g_ppcContext ? g_ppcContext->r13.u32 : 0;
             uint32_t objAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
-            uint32_t pc = 0, put = 0, rptrWb = 0, gpuCtx = 0;
+            uint32_t pc = 0, pcBlk = 0, put = 0, rptrWb = 0, gpuCtx = 0;
             auto& memC = mcla::kernel::GuestMemoryHeap::Instance();
             if (r13 != 0)
             {
-                uint32_t blk = 0;
-                if (memC.ReadU32BE(r13 + 256, &blk) && blk != 0)
-                    (void)memC.ReadU32BE(blk + 88, &pc);
+                if (memC.ReadU32BE(r13 + 256, &pcBlk) && pcBlk != 0)
+                    (void)memC.ReadU32BE(pcBlk + 88, &pc);
             }
             (void)memC.ReadU32BE(0x82839254u, &gpuCtx);
             if (gpuCtx != 0)
                 (void)memC.ReadU32BE(gpuCtx + 10908u, &put);
             (void)memC.ReadU32BE(0xC701C4BCu, &rptrWb);
-            MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} to={}ms lr={:08X} put={} rptrWB={:04X} pc={}",
+            MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} to={}ms lr={:08X} put={} rptrWB={:04X} pc={:08X}:{}",
                           n, hot ? "!" : " ", GetCurrentThreadId(), objAddr,
                           WaitReason, GuestTimeoutToMilliseconds(Timeout), lr,
-                          put, rptrWb & 0xFFFF, pc);
+                          put, rptrWb & 0xFFFF, pcBlk, pc);
         }
     }
     // MAIN-THREAD PARK PROBE

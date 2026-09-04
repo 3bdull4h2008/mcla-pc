@@ -1,5 +1,6 @@
 #include "gpu_device.h"
 #include "gpu_cp.h"
+#include "render_queue.h"
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include <cpu/ppc_context.h>
@@ -681,6 +682,35 @@ PPC_FUNC(sub_82420BA8)
     if (n <= 12 || (n % 1000) == 0)
         MCLA_LOG_INFO("SUBMIT-census sub_82420BA8 #{} dev={:08X} flags={:X} blk={:08X} desc={:08X}/{:08X} r10={:08X}",
                       n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r10.u32);
+
+    {
+        mcla::native::DrawIndexedCommand dic{};
+        dic.primitiveTopology = ctx.r4.u32 & 7u;
+        if (ctx.r5.u32 != 0 && mem.IsValid(ctx.r5.u32, 8))
+        {
+            (void)mem.ReadU32BE(ctx.r5.u32 + 0, &dic.vbAddr);
+            (void)mem.ReadU32BE(ctx.r5.u32 + 4, &dic.vbStride);
+        }
+        if (ctx.r6.u32 != 0 && mem.IsValid(ctx.r6.u32, 12))
+        {
+            (void)mem.ReadU32BE(ctx.r6.u32 + 0, &dic.ibAddr);
+            (void)mem.ReadU32BE(ctx.r6.u32 + 8, &dic.ibFormat);
+        }
+        if (dev != 0 && mem.IsValid(dev + 0x2FA0, 4))
+        {
+            uint32_t ibCntRaw = 0;
+            (void)mem.ReadU32BE(ctx.r6.u32 + 0x24, &ibCntRaw);
+            dic.indexCount = ibCntRaw & 0x1FFFu;
+            dic.startIndexLocation = 0;
+            dic.baseVertexLocation = 0;
+        }
+        mcla::native::g_commandQueue.push(
+            mcla::native::RenderCommand{
+                mcla::native::RenderCommand::DRAW_INDEXED,
+                dic
+            });
+    }
+
     __imp__sub_82420BA8(ctx, base);
 }
 
@@ -752,7 +782,7 @@ PPC_FUNC(sub_82413660)
     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
     __try
     {
-        if (r5 != 0 && mem.IsValid(r5, 16))
+        if (r5 >= 0x10000 && mem.IsValid(r5, 16))
         {
             uint32_t vbBase = 0, vbStride = 0, vbSize = 0;
             if (mem.ReadU32BE(r5 + 0, &vbBase) && mem.ReadU32BE(r5 + 4, &vbStride) && mem.ReadU32BE(r5 + 8, &vbSize))
@@ -766,7 +796,7 @@ PPC_FUNC(sub_82413660)
                 mcla::gpu::g_lastDrawV2.frameId = mcla::gpu::g_frameCounter.load(std::memory_order_relaxed);
             }
         }
-        if (r6 != 0 && mem.IsValid(r6, 16))
+        if (r6 >= 0x10000 && mem.IsValid(r6, 16))
         {
             uint32_t ibBase = 0, ibSize = 0, ibFmt = 0;
             if (mem.ReadU32BE(r6 + 0, &ibBase) && mem.ReadU32BE(r6 + 4, &ibSize) && mem.ReadU32BE(r6 + 8, &ibFmt))
@@ -1231,4 +1261,29 @@ PPC_FUNC(sub_824569C8)
                       "f184={} f188={:08X} f196={:08X} f200={:08X} f208={:08X} f212={:08X} cbt={:08X}",
                       n, lr, ev52, dl128, dl132, f184 != 0, f188, f196, f200, f208, f212, cbTarget);
     __imp__sub_824569C8(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// GPU fence wait short-circuit: sub_82412F98 busy-loops reading
+// *(TLS_block+332) but the CP drain only writes to *(TLS_block+88).
+// The fence never signals, parking the main thread forever in boot.
+// Override returns r3=0 (success) to unblock boot → start menu.
+// Reference: PARK-SAMPLE shows thread stuck at lr=82412FA0 (mid-function
+// label inside sub_82412F98), polling dev+10896 sub-context via TLS.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82412F98);
+static std::atomic<uint32_t> s_h12F98{0};
+PPC_FUNC(sub_82412F98)
+{
+    const uint32_t n = s_h12F98.fetch_add(1) + 1;
+    // r3 = frame pointer, *(r3+0) = device context
+    const uint32_t dev = ctx.r3.u32;
+    uint32_t actualDev = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(dev, &actualDev);
+    }
+    if (n <= 6 || (n % 500) == 0)
+        MCLA_LOG_INFO("F98-SKIP #{} frame={:08X} dev={:08X}", n, dev, actualDev);
+    ctx.r3.u64 = 0; // return 0 = "fence satisfied, proceed"
 }

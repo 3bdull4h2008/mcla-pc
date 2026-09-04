@@ -1,0 +1,591 @@
+============================================================================
+MCLA XBOX 360 — RPF3 FILE FORMAT REFERENCE FOR AI CODE GENERATION
+============================================================================
+
+PURPOSE: Use this document to write C/C++ code that reads, parses, extracts,
+and modifies RPF3 archive files from Midnight Club: Los Angeles (Xbox 360).
+The recompiled MCLA executable already contains internal RPF reading code;
+your job is to understand the format so you can modify, extend, or hook into
+that code.
+
+============================================================================
+1. RPF FORMAT VERSION MAP
+============================================================================
+
+  Magic (hex)   Magic (ASCII)   Version   Used By
+  0x52504630    "RPF0"          v0        Rockstar Table Tennis
+  0x52504632    "RPF2"          v2        GTA IV (main game archives)
+  0x52504633    "RPF3"          v3        GTA IV Audio, **MCLA (ALL archives)**
+  0x52504634    "RPF4"          v4        Max Payne 3
+  0x52504636    "RPF6"          v6        Red Dead Redemption
+  0x52504637    "RPF7"          v7        GTA V
+  0x52504638    "RPF8"          v8        Red Dead Redemption 2
+
+MCLA uses RPF3 exclusively. RPF3 uses the SAME internal structure as RPFv0.
+
+============================================================================
+2. XBOX 360 ENCODING DETAILS
+============================================================================
+
+  - Xbox 360 CPU is PowerPC (big-endian)
+  - RPF files on Xbox 360 store multi-byte integers in **big-endian** byte order
+  - PS3 RPF files are also big-endian
+  - PC RPF files are little-endian
+  - When reading Xbox 360 RPFs on a little-endian host, you MUST byte-swap
+    all multi-byte fields (INT32, UINT32, INT24)
+
+  CRITICAL: The recompiled MCLA code (if running on x86/x64) must swap bytes
+  when reading the original Xbox 360 RPF files. If recompiled for Xbox 360
+  target, native big-endian reads work directly.
+
+============================================================================
+3. RPF3 FILE LAYOUT (MCLA)
+============================================================================
+
+  Offset         Size            Content
+  ─────────────────────────────────────────────────
+  0x0000         2048 bytes      HEADER PADDING (zeros)
+  0x0800         12 bytes        RPF HEADER (3 x INT32)
+  0x080C         ??? bytes       PADDING to 2048 alignment
+  0x1000         TOC_SIZE bytes  TABLE OF CONTENTS (TOC)
+  0x1000+TOC_SZ  ??? bytes      FILENAME SECTION (null-terminated strings)
+  ...            ...             FILE DATA (actual packed file contents)
+
+  The TOC and Filename Section together form a contiguous block.
+  File data offsets in TOC entries are ABSOLUTE from file start (zero-based).
+
+============================================================================
+4. RPF3 HEADER STRUCTURE (12 bytes at offset 0x0800)
+============================================================================
+
+  Offset  Size   Type    Field
+  ─────────────────────────────────────────
+  +0      4B     INT32   magic         // 0x52504633 = "RPF3"
+  +4      4B     INT32   toc_size      // Size of Table of Contents in bytes
+  +8      4B     INT32   entry_count   // Number of TOC entries (root '/' included)
+
+  NOTE: On Xbox 360, read these as big-endian 32-bit integers.
+
+  In C (big-endian read):
+    uint8_t hdr[12];
+    fseek(fp, 0x800, SEEK_SET);
+    fread(hdr, 1, 12, fp);
+    uint32_t magic    = (hdr[0]<<24)|(hdr[1]<<16)|(hdr[2]<<8)|hdr[3];
+    uint32_t toc_size = (hdr[4]<<24)|(hdr[5]<<16)|(hdr[6]<<8)|hdr[7];
+    uint32_t entries  = (hdr[8]<<24)|(hdr[9]<<16)|(hdr[10]<<8)|hdr[11];
+
+  Validation:
+    if (magic != 0x52504633) { /* not an RPF3 file */ }
+    // Root entry '/' is counted in entry_count, so actual files = entry_count - 1
+
+============================================================================
+5. TABLE OF CONTENTS (TOC)
+============================================================================
+
+  Location: Starts at file offset 0x1000 (2048)
+  Size:     toc_size bytes (from header)
+  Entries:  entry_count entries, each EXACTLY 16 bytes
+  Minimum:  2048 bytes (padded with zeros if fewer entries)
+
+  Two entry types exist, distinguished by the high bit of byte[3]:
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  DIRECTORY ENTRY (byte[3] & 0x80 != 0)                       │
+  ├──────────────────────────────────────────────────────────────┤
+  │  Offset  Size   Type     Field                              │
+  │  +0      3B     INT24    name_offset  // Into filename sect.│
+  │  +3      1B     BYTE     type_flags   // 0x80 = directory    │
+  │  +4      4B     UINT32   first_index  // First child TOC idx │
+  │  +8      4B     UINT32   entry_count  // Number of children  │
+  │  +12     4B     UINT32   entry_count2 // Same (padding)      │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  FILE ENTRY (byte[3] & 0x80 == 0)                           │
+  ├──────────────────────────────────────────────────────────────┤
+  │  Offset  Size   Type     Field                              │
+  │  +0      3B     INT24    name_offset  // Into filename sect.│
+  │  +3      1B     BYTE     type_flags   // 0x00 = file         │
+  │  +4      4B     INT32    data_offset  // File data offset    │
+  │  +8      4B     INT32    file_size    // Compressed size     │
+  │  +12     4B     INT32    uncompressed  // Uncompressed size  │
+  └──────────────────────────────────────────────────────────────┘
+
+  COMPRESSION DETECTION:
+    if (file_size == uncompressed) -> file is STORED (no compression)
+    if (file_size != uncompressed) -> file is COMPRESSED
+
+============================================================================
+6. FILENAME SECTION
+============================================================================
+
+  Location: Immediately after the TOC block
+  Offset:   0x1000 + toc_size
+  Format:   Concatenated null-terminated ASCII strings
+
+  Each TOC entry's name_offset field is an offset FROM THE START of this
+  filename section (NOT from file start). To get absolute file offset:
+
+    absolute_name_offset = 0x1000 + toc_size + entry.name_offset
+
+  Then read null-terminated string starting at that offset.
+
+  Example: If name_offset = 0, the name starts at the very beginning
+  of the filename section.
+
+============================================================================
+7. FILE DATA EXTRACTION
+============================================================================
+
+  For each FILE entry in the TOC:
+
+  1. Seek to data_offset (absolute from file start)
+  2. Read file_size bytes
+  3. If file_size == uncompressed: data is raw, use as-is
+  4. If file_size != uncompressed: data is compressed (see section 8)
+
+  Write the (possibly decompressed) data to output with the filename
+  from the filename section.
+
+============================================================================
+8. COMPRESSION — XBOX 360 XMEM LZX
+============================================================================
+
+  Xbox 360 RPF3 files use **XMem LZX compression** (Microsoft's proprietary
+  LZX variant used in XDK). This is NOT standard zlib/deflate.
+
+  The XMem API:
+    XMEMCODEC_DEFAULT (0)  - Default codec
+    XMEMCODEC_LZX    (1)  - LZX codec (used by MCLA RPFs)
+
+  XMemDecompress API (from xcompress32.dll or XDK):
+
+    // Create decompression context
+    HRESULT XMemCreateDecompressionContext(
+        XMEMCODEC_TYPE CodecType,    // XMEMCODEC_LZX = 1
+        const void* pCompressionParams, // NULL for default
+        UINT32 CompressionBlockSize,   // typically 0x10000 (65536)
+        XMEM_DECOMPRESS_CONTEXT* pContext  // output context
+    );
+
+    // Decompress data
+    size_t XMemDecompress(
+        XMEM_DECOMPRESS_CONTEXT pContext,
+        void* pDestination,      // output buffer (uncompressed_size)
+        size_t* pDestSize,       // in: buffer size, out: bytes written
+        const void* pSource,     // compressed data
+        size_t SourceSize        // compressed data size
+    );
+
+    // Destroy context
+    void XMemDestroyDecompressionContext(
+        XMEM_DECOMPRESS_CONTEXT pContext
+    );
+
+  For PC recompilation, you need xcompress32.dll (33KB, exportable) or an
+  open-source LZX implementation. The OXM0DD3R tool bundles this exact DLL.
+
+  ALTERNATIVE: Some MCLA RPF entries may use zlib (deflate) without the
+  standard 2-byte zlib header. In that case, use raw inflate (windowBits = -15).
+
+  Decompression decision tree:
+    if compressed_size == uncompressed_size -> no compression
+    else -> try XMem LZX first, fall back to raw zlib deflate
+
+============================================================================
+9. ENCRYPTION (RPF3 TOC)
+============================================================================
+
+  MCLA Xbox 360 RPF3 archives MAY have AES-encrypted TOC blocks.
+
+  Detection:
+    - The original RPFv0 format has NO encryption flag in the header
+    - RPFv2+ has a 5th INT32 "encrypted" field; RPF3/v0 does NOT
+    - For MCLA, the game executable itself contains the AES decryption key
+      hardcoded (or derives it). Check the game's .text section for AES
+      key schedules (16/24/32 byte keys with high entropy).
+
+  If TOC is encrypted:
+    - The TOC block at 0x1000 is AES-CBC encrypted
+    - Key is extracted from the MCLA executable (see pyrpfiv approach below)
+    - Use RijndaelManaged (AES) with:
+        Block size: 128 bits (16 bytes)
+        Key size:   128, 192, or 256 bits (check the game exe)
+        Mode:       CBC
+        Padding:    None (TOC size is always a multiple of 16)
+
+  How to find the key in recompiled MCLA code:
+    1. Search for AES key setup functions (look for 176/208/240 byte
+       expanded key schedules, or the Rijndael key expansion constants)
+    2. The key is typically stored as a global byte array near the RPF
+       parsing function
+    3. In the OXM0DD3R tool, the key is likely extracted from the game's
+       .exe file or is hardcoded in the tool's RPFLib
+
+============================================================================
+10. FILENAME HASHING (Rockstar's custom hash functions)
+============================================================================
+
+  RAGE engine uses TWO custom hash algorithms for filename lookups:
+
+  ┌────────────────────────────────────────────────────────────┐
+  │  GtaO Hash (Jenkins one-at-a-time variant)                │
+  ├────────────────────────────────────────────────────────────┤
+  │  uint32_t gtao_hash(const char* str) {                    │
+  │      uint32_t hash = 0;                                   │
+  │      while (*str) {                                       │
+  │          hash += (uint8_t)*str++;                         │
+  │          hash += (hash << 10);                            │
+  │          hash ^= (hash >> 6);                             │
+  │      }                                                    │
+  │      hash += (hash << 3);                                 │
+  │      hash ^= (hash >> 11);                                │
+  │      hash += (hash << 15);                                │
+  │      return hash;                                         │
+  │  }                                                        │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────┐
+  │  GtaQ Hash (second Jenkins variant, different constants)  │
+  ├────────────────────────────────────────────────────────────┤
+  │  uint32_t gtaq_hash(const char* str) {                    │
+  │      uint32_t hash = 0;                                   │
+  │      while (*str) {                                       │
+  │          hash += tolower((uint8_t)*str++);  // case-INSENS│
+  │          hash += (hash << 10);                            │
+  │          hash ^= (hash >> 6);                             │
+  │      }                                                    │
+  │      hash += (hash << 3);                                 │
+  │      hash ^= (hash >> 11);                                │
+  │      hash += (hash << 15);                                │
+  │      return hash;                                         │
+  │  }                                                        │
+  └────────────────────────────────────────────────────────────┘
+
+  NOTE: GtaO is case-SENSITIVE, GtaQ is case-INSENSITIVE (uses tolower).
+  NOTE: On Xbox 360, hash values are stored big-endian in TOC entries.
+  NOTE: Some filenames are stored as hashes only (no plaintext in name table).
+
+  There is also an FNV-1a variant (FNvaRA) used in some contexts:
+
+    uint32_t fnv1a_hash(const char* str) {
+        uint32_t hash = 0x811C9DC5;  // FNV offset basis
+        while (*str) {
+            hash ^= (uint8_t)*str++;
+            hash *= 0x01000193;      // FNV prime
+        }
+        return hash;
+    }
+
+  To resolve hashed filenames, the OXM0DD3R tool embeds a KnownFilenames.txt
+  resource that maps hash values back to filenames.
+
+============================================================================
+11. DIRECTORY TREE RECONSTRUCTION
+============================================================================
+
+  The TOC is a flat array of 16-byte entries. To build a tree:
+
+  1. Entry[0] is always the root directory "/" (type_flags = 0x80)
+     - first_index = index of its first child entry
+     - entry_count = total number of children (files + subdirs)
+
+  2. Recurse: for each directory, its children are TOC entries at
+     indices [first_index, first_index + entry_count)
+
+  3. Children can be files (type_flags == 0x00) or subdirectories
+     (type_flags == 0x80). Subdirectories have their own first_index
+     and entry_count.
+
+  Pseudocode:
+    void parse_directory(FILE* fp, int dir_index, int toc_start,
+                        rpf_entry_t* toc, int entry_count,
+                        int name_section_offset, const char* parent_path) {
+        rpf_entry_t* dir = &toc[dir_index];
+        int child_start = dir->first_index;
+        int child_end = child_start + dir->entry_count;
+
+        for (int i = child_start; i < child_end && i < entry_count; i++) {
+            rpf_entry_t* child = &toc[i];
+            char name[256];
+            read_name(fp, name_section_offset + child->name_offset, name);
+            char full_path[512];
+            snprintf(full_path, sizeof(full_path), "%s/%s", parent_path, name);
+
+            if (child->type_flags & 0x80) {
+                // Subdirectory - recurse
+                parse_directory(fp, i, toc_start, toc, entry_count,
+                              name_section_offset, full_path);
+            } else {
+                // File - extract it
+                extract_file(fp, child->data_offset, child->file_size,
+                           child->uncompressed, full_path);
+            }
+        }
+    }
+
+============================================================================
+12. PS3 WPS3 FORMAT (bonus — MCLA PS3 uses this wrapper)
+============================================================================
+
+  PS3 MCLA archives may be wrapped in WPS3 containers.
+  WPS3 is a PS3-specific wrapper around RPF data.
+
+  WPS3 Header (preliminary, based on tool analysis):
+    - Contains its own header with size/offset to the inner RPF data
+    - The inner RPF data is standard RPF3 format
+    - May have additional encryption/layering specific to PS3
+
+============================================================================
+13. COMPLETE C CODE EXAMPLE (Xbox 360 big-endian RPF3 reader)
+============================================================================
+
+/*
+ * MCLA RPF3 Reader - Xbox 360 (big-endian) format
+ * Reads RPFv3 archives from Midnight Club: Los Angeles on Xbox 360
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t  name_offset[3];  // 24-bit: offset into filename section
+    uint8_t  type_flags;      // 0x80 = directory, 0x00 = file
+    uint32_t data_or_index;   // file: data_offset, dir: first child index
+    uint32_t size_or_count;  // file: compressed_size, dir: entry_count
+    uint32_t extra;           // file: uncompressed_size, dir: entry_count (dup)
+} rpf3_entry_t;
+#pragma pack(pop)
+
+/* Read big-endian uint32 from buffer */
+static uint32_t read_be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+}
+
+/* Read big-endian uint24 from buffer */
+static uint32_t read_be24(const uint8_t* p) {
+    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+}
+
+/* Read a null-terminated string from file at given offset */
+static void read_name(FILE* fp, long offset, char* buf, int bufsize) {
+    long cur = ftell(fp);
+    fseek(fp, offset, SEEK_SET);
+    int i = 0;
+    while (i < bufsize - 1) {
+        int c = fgetc(fp);
+        if (c == EOF || c == 0) break;
+        buf[i++] = (char)c;
+    }
+    buf[i] = '\0';
+    fseek(fp, cur, SEEK_SET);
+}
+
+/* Parse TOC entry from big-endian buffer */
+static void parse_entry(const uint8_t* raw, rpf3_entry_t* entry) {
+    entry->name_offset[0] = raw[0];
+    entry->name_offset[1] = raw[1];
+    entry->name_offset[2] = raw[2];
+    entry->type_flags     = raw[3];
+    entry->data_or_index = read_be32(raw + 4);
+    entry->size_or_count = read_be32(raw + 8);
+    entry->extra          = read_be32(raw + 12);
+}
+
+/* Recursively dump RPF3 contents */
+static void dump_directory(FILE* fp, const rpf3_entry_t* toc,
+                           uint32_t entry_count, uint32_t dir_index,
+                           uint32_t name_section_offset,
+                           const char* parent_path, int depth) {
+    const rpf3_entry_t* dir = &toc[dir_index];
+    uint32_t child_start = dir->data_or_index;  // first_index
+    uint32_t child_count = dir->size_or_count;   // entry_count
+
+    for (uint32_t i = child_start; i < child_start + child_count && i < entry_count; i++) {
+        const rpf3_entry_t* child = &toc[i];
+        uint32_t name_off = read_be24(child->name_offset);
+
+        char name[256];
+        read_name(fp, name_section_offset + name_off, name, sizeof(name));
+
+        /* Print indentation and path */
+        for (int d = 0; d < depth; d++) printf("  ");
+
+        if (child->type_flags & 0x80) {
+            /* Directory */
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", parent_path, name);
+            printf("[DIR]  %s/  (%u children)\n", path, child->size_or_count);
+            dump_directory(fp, toc, entry_count, i, name_section_offset, path, depth + 1);
+        } else {
+            /* File */
+            uint32_t data_offset  = child->data_or_index;
+            uint32_t comp_size    = child->size_or_count;
+            uint32_t uncomp_size  = child->extra;
+            int is_compressed = (comp_size != uncomp_size);
+
+            printf("[FILE] %s/%s  offset=0x%08X  size=%u  uncomp=%u  %s\n",
+                   parent_path, name, data_offset, comp_size, uncomp_size,
+                   is_compressed ? "[COMPRESSED-XMEM-LZX]" : "[RAW]");
+        }
+    }
+}
+
+/* Main RPF3 reader */
+int read_rpf3_xbox360(const char* filename) {
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) { perror("fopen"); return -1; }
+
+    /* Read header at offset 0x800 */
+    uint8_t hdr[12];
+    fseek(fp, 0x800, SEEK_SET);
+    if (fread(hdr, 1, 12, fp) != 12) {
+        fprintf(stderr, "Failed to read RPF header\n");
+        fclose(fp); return -1;
+    }
+
+    uint32_t magic    = read_be32(hdr);
+    uint32_t toc_size = read_be32(hdr + 4);
+    uint32_t entries  = read_be32(hdr + 8);
+
+    printf("Magic: 0x%08X (%c%c%c%c)\n", magic,
+           (magic>>24)&0xFF, (magic>>16)&0xFF, (magic>>8)&0xFF, magic&0xFF);
+    printf("TOC Size: %u bytes\n", toc_size);
+    printf("Entry Count: %u\n", entries);
+
+    if (magic != 0x52504633) {
+        fprintf(stderr, "Not an RPF3 file!\n");
+        fclose(fp); return -1;
+    }
+
+    /* Read TOC at offset 0x1000 */
+    uint8_t* toc_raw = malloc(toc_size);
+    if (!toc_raw) { fclose(fp); return -1; }
+    fseek(fp, 0x1000, SEEK_SET);
+    fread(toc_raw, 1, toc_size, fp);
+
+    /* If TOC is encrypted, decrypt here with AES-CBC key from game exe */
+    /* ... (see Section 9) ... */
+
+    /* Parse all TOC entries */
+    rpf3_entry_t* toc = calloc(entries, sizeof(rpf3_entry_t));
+    for (uint32_t i = 0; i < entries; i++) {
+        parse_entry(toc_raw + (i * 16), &toc[i]);
+    }
+    free(toc_raw);
+
+    /* Filename section starts right after TOC */
+    uint32_t name_section = 0x1000 + toc_size;
+
+    /* Dump tree starting from root (entry 0) */
+    printf("\n=== Archive Contents ===\n");
+    dump_directory(fp, toc, entries, 0, name_section, "", 0);
+
+    free(toc);
+    fclose(fp);
+    return 0;
+}
+
+/*
+ * XMem LZX decompression stub (requires xcompress library)
+ * Link with -lxcompress or use xcompress32.dll via LoadLibrary/GetProcAddress
+ *
+ * Pseudo-code for decompressing a file entry:
+ *
+ *   void* ctx;
+ *   XMemCreateDecompressionContext(XMEMCODEC_LZX, NULL, 0x10000, &ctx);
+ *   size_t out_size = entry->extra;  // uncompressed size
+ *   void* output = malloc(out_size);
+ *   XMemDecompress(ctx, output, &out_size, compressed_data, entry->size_or_count);
+ *   XMemDestroyDecompressionContext(ctx);
+ */
+
+============================================================================
+14. KEY POINTS FOR MODIFYING RECOMPILED MCLA CODE
+============================================================================
+
+  When modifying the recompiled MCLA Xbox 360 executable to access RPF files:
+
+  A) FINDING THE EXISTING RPF CODE:
+     - Search for the magic constant 0x52504633 in the binary
+     - Search for the constant 0x800 (2048) used as header offset
+     - Search for the 16-byte entry size (0x10) used for TOC iteration
+     - Look for XMemDecompress imports or XMem LZX codec references
+
+  B) HOOKING / EXTENDING:
+     - The game's fiDeviceRPF or rage::fiPackfile class handles RPF I/O
+     - Hook the file open/read functions to intercept RPF access
+     - To add new RPF support, replicate the TOC parsing logic above
+
+  C) BIG-ENDIAN ON LITTLE-ENDIAN:
+     - If recompiled for x86/PC, add byte-swapping to all multi-byte reads
+     - On original Xbox 360 hardware, native reads are already big-endian
+
+  D) DECOMPRESSION:
+     - Link against xcompress32.dll or an LZX implementation
+     - Compression block size is typically 0x10000 (65536 bytes)
+     - Some entries may use raw zlib deflate instead (try both)
+
+  E) FILENAME RESOLUTION:
+     - The game uses GtaO/GtaQ hashes internally for file lookup
+     - If modifying file paths, recompute the hash with the same algorithm
+     - KnownFilenames.txt from the OXM0DD3R tool can help resolve unknown hashes
+
+============================================================================
+15. OPEN SOURCE REFERENCES FOR IMPLEMENTATION DETAILS
+============================================================================
+
+  - pyrpfiv (Python, RPF3 with AES decryption):
+    https://github.com/gmroder/pyrpfiv
+    Shows exact AES key extraction from GTA IV exe, TOC decryption, and
+    file extraction. The RPF3 parsing logic is directly applicable to MCLA.
+
+  - twisted89/rpftool (C#/.NET, RPF3/4/6 for MCLA/MP3/RDR):
+    https://github.com/twisted89/rpftool
+    Most similar to the OXM0DD3R tool. C# .NET WinForms app supporting
+    the exact same games (MCLA, RDR, MP3) on Xbox 360.
+
+  - Foxxyyy/Magic-RDR (C#, RPF3/4/6, Xbox 360/PS4/Switch/PC):
+    https://github.com/Foxxyyy/Magic-RDR
+    RPF editor with multi-platform support including Xbox 360.
+
+  - VIRUXE/rage-rpf (Rust, RPF0-RPF8):
+    https://github.com/VIRUXE/rage-rpf
+    Most comprehensive RPF library. Good for understanding all version
+    differences.
+
+  - GTAMods Wiki (RPF format specification):
+    https://gtamods.com/wiki/RPF_archive
+    Authoritative community-maintained format documentation.
+
+  - GTAForums RPF 7/8 Documentation:
+    https://gtaforums.com/topic/917813-rpf-78
+    Detailed reverse-engineered RPF format spec with TOC structures.
+
+============================================================================
+16. MCLA-SPECIFIC FILE TYPES FOUND IN RPFs
+============================================================================
+
+  Common file extensions inside MCLA RPF archives:
+
+    .wtd  - Texture Dictionary (DXT-compressed textures)
+    .wdr  - Drawable (3D model data)
+    .wdd  - Drawable Dictionary (collection of drawables)
+    .wft  - Fragment Type (fragment/destroyable models)
+    .wbd  - Bounds Dictionary (collision data)
+    .wpl  - Placement (map object placement data)
+    .ide  - Item Definitions (object type definitions)
+    .iwz  - Interior Zone
+    .sco  - Script (compiled game scripts)
+    .dat  - Data files (miscellaneous game data)
+    .gxt  - GXT Text (localized strings)
+    .wpf  - PS3-specific wrapper format
+    .wps3 - PS3 RAGE package container
+
+============================================================================
+END OF REFERENCE
+============================================================================

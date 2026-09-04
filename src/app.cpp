@@ -4,6 +4,7 @@
 #include "boot_host.h"
 #include "native_renderer.h"
 #include "renderer_mode.h"
+#include "render_thread.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "vfs_rpf.h"
 
@@ -86,9 +87,15 @@ m_running = true;
     // Start GPU context poller (Phase 4) - waits for game to allocate GPU context
     StartGpuContextPoller();
 
+    // P4.5': Start the dedicated render thread before boot::Start() which
+    // blocks (watchdog loop) for up to 5 minutes. The thread sits idle in
+    // a blocking pop() until guest code enqueues RenderCommands.
+    mcla::native::g_renderThread.start();
+
     // Start the guest boot worker once the host services it will touch (VFS,
     // kernel stubs, logging) are up. The worker parks in the game main loop;
     // its outcome is reported in mcla.log by the boot watchdog.
+    // NOTE: boot::Start blocks (watchdog loop) — render thread must already be up.
     if (m_bootEntry != 0) {
         boot::Start(m_bootEntry);
     }
@@ -104,6 +111,9 @@ void App::Shutdown() {
     if (!m_running && m_window == nullptr) return;
 
     m_running = false;
+
+    // P4.5': Stop the render thread before tearing down D3D12/window.
+    mcla::native::g_renderThread.stop();
 
     // Save config
     mcla::cvar::CVarSystem::Instance().SaveConfig(m_cacheRoot / "mcla.toml");

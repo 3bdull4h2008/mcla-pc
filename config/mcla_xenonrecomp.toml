@@ -1,0 +1,57 @@
+[main]
+file_path = "build/game_data/default.xex"
+out_directory_path = "generated/ppc_xenon"
+switch_table_file_path = ".research/XenonRecomp/XenonAnalyse/jump_tables.toml"
+
+# Save/restore ABI functions (from disassembly / XenonAnalyse).
+savegprlr_14_address = 0x823D91C0
+restgprlr_14_address = 0x823D9210
+savefpr_14_address = 0x823DB9A0
+restfpr_14_address = 0x823DB9EC
+savevmx_14_address = 0x823DD2C0
+restvmx_14_address = 0x823DD558
+savevmx_64_address = 0x823DD354
+restvmx_64_address = 0x823DD5EC
+
+# setjmp/longjmp addresses. VERIFIED ABSENT (2026-08-20): scanned decompressed
+# PE (find_abi_addrs.py + manual .text pattern scan) - no __imp__setjmp/
+# __imp__longjmp imports, no Microsoft-CRT setjmp/longjmp code pattern in .text,
+# no _setjmp/_longjmp symbols in the function map. MCLA uses SEH exception
+# handling (__C_specific_handler import). Leaving these unset (0) is correct.
+# longjmp_address = 0x
+# setjmp_address = 0x
+
+# Register locality flags (optimizations). Matches the generated ppc_config.h.
+# NOTE: skip_lr / skip_msr are intentionally left OFF until exceptions are researched.
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = true
+non_volatile_as_local = true
+
+# Authoritative config: FULL recompile (no `functions` list) so the output is
+# the 179-TU set wired into CMakeLists.txt (ppc_recomp.0..178.cpp). A
+# boot-critical 111-function subset was evaluated and dropped; see
+# XENONRECOMP_REBUILD_PLAN.md Phase 5 reconciliation.
+
+
+# ---- Session-28: explicit dispatcher spans. These functions contain their
+# embedded jump tables + handler code inline; the default analysis splits
+# pseudo-functions at the table bytes, which orphans switch labels outside
+# the function body (recompiler emits "// ERROR: <target>" + return).
+# Sizes = distance to next authoritative function start (IDA-verified):
+#   FDA90 -> next func 0x825FDB30
+#   B588  -> next func 0x8260B608
+#   DEE40 -> next func 0x821E05E0
+[[main.functions]]
+address = 0x825FDA90
+size = 0xA0
+
+[[main.functions]]
+address = 0x8260B588
+size = 0x80
+
+[[main.functions]]
+address = 0x821DEE40
+size = 0x17A0
