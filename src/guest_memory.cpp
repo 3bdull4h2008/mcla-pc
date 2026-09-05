@@ -15,7 +15,7 @@ static constexpr uint32_t kWatchPage = 0x50000000u;
 // Dynamic watch ranges (session 26): armed by censuses when they observe a
 // suspicious structure (e.g. empty dispatch method-object). Guest stores into
 // these ranges are reported by PageWatchOnWrite with caller LR.
-constexpr uint32_t kMaxWatchRanges = 8;
+constexpr uint32_t kMaxWatchRanges = 64;
 struct WatchRange
 {
     std::atomic<uint32_t> start{0};
@@ -161,9 +161,13 @@ bool GuestMemoryView::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const {
     }
     const uint8_t* ptr = GetHostPtr(guestAddr, sizeof(uint32_t));
     if (!ptr || !outVal) return false;
-    uint32_t val;
-    std::memcpy(&val, ptr, sizeof(val));
-    *outVal = Swap32(val);
+    __try
+    {
+        uint32_t val;
+        std::memcpy(&val, ptr, sizeof(val));
+        *outVal = Swap32(val);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     if (PageWatchHit(guestAddr))
         mcla::gpu::PageWatchOnRead(guestAddr, *outVal);
     return true;
@@ -172,41 +176,58 @@ bool GuestMemoryView::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const {
 bool GuestMemoryView::ReadU64BE(uint32_t guestAddr, uint64_t* outVal) const {
     const uint8_t* ptr = GetHostPtr(guestAddr, sizeof(uint64_t));
     if (!ptr || !outVal) return false;
-    uint64_t val;
-    std::memcpy(&val, ptr, sizeof(val));
-    *outVal = Swap64(val);
+    __try
+    {
+        uint64_t val;
+        std::memcpy(&val, ptr, sizeof(val));
+        *outVal = Swap64(val);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 }
 
 bool GuestMemoryView::ReadF32BE(uint32_t guestAddr, float* outVal) const {
     const uint8_t* ptr = GetHostPtr(guestAddr, sizeof(float));
     if (!ptr || !outVal) return false;
-    uint32_t val;
-    std::memcpy(&val, ptr, sizeof(val));
-    uint32_t swapped = Swap32(val);
-    std::memcpy(outVal, &swapped, sizeof(float));
+    __try
+    {
+        uint32_t val;
+        std::memcpy(&val, ptr, sizeof(val));
+        uint32_t swapped = Swap32(val);
+        std::memcpy(outVal, &swapped, sizeof(float));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 }
 
 bool GuestMemoryView::ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t size) const {
     const uint8_t* ptr = GetHostPtr(guestAddr, size);
     if (!ptr || !outBuffer) return false;
-    std::memcpy(outBuffer, ptr, size);
+    __try
+    {
+        std::memcpy(outBuffer, ptr, size);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 }
 
 bool GuestMemoryView::WriteU8(uint32_t guestAddr, uint8_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint8_t));
     if (!ptr) return false;
-    *ptr = val;
+    __try { *ptr = val; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 }
 
 bool GuestMemoryView::WriteU16BE(uint32_t guestAddr, uint16_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint16_t));
     if (!ptr) return false;
-    uint16_t be = Swap16(val);
-    std::memcpy(ptr, &be, sizeof(be));
+    __try
+    {
+        uint16_t be = Swap16(val);
+        std::memcpy(ptr, &be, sizeof(be));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 }
 
@@ -217,8 +238,12 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
     }
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint32_t));
     if (!ptr) return false;
-    uint32_t be = Swap32(val);
-    std::memcpy(ptr, &be, sizeof(be));
+    __try
+    {
+        uint32_t be = Swap32(val);
+        std::memcpy(ptr, &be, sizeof(be));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     if (PageWatchHit(guestAddr))
         mcla::gpu::PageWatchOnWrite(guestAddr, val);
     else if (WatchValueHit(val))
@@ -229,8 +254,12 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
 bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint64_t));
     if (!ptr) return false;
-    uint64_t be = Swap64(val);
-    std::memcpy(ptr, &be, sizeof(be));
+    __try
+    {
+        uint64_t be = Swap64(val);
+        std::memcpy(ptr, &be, sizeof(be));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     if (PageWatchHit(guestAddr) || PageWatchHit(guestAddr + 4))
     {
         mcla::gpu::PageWatchOnWrite(guestAddr, static_cast<uint32_t>(val >> 32));
@@ -248,7 +277,11 @@ bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
 bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t size) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, size);
     if (!ptr || !src) return false;
-    std::memcpy(ptr, src, size);
+    __try
+    {
+        std::memcpy(ptr, src, size);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     if (size >= 4)
     {
         // Watch coverage for bulk copies of ANY size: check first + last

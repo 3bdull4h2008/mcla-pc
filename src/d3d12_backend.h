@@ -288,9 +288,19 @@ public:
     ID3D12Device* GetDevice() const { return m_device.Get(); }
     ID3D12GraphicsCommandList* GetCommandList() const { return m_commandList.Get(); }
     ID3D12CommandQueue* GetCommandQueue() const { return m_commandQueue.Get(); }
+    ID3D12CommandQueue* GetCopyQueue() const { return m_copyQueue.Get(); }
     uint32_t GetCurrentFrameIndex() const { return m_frameIndex; }
     uint32_t GetWidth() const { return m_width; }
     uint32_t GetHeight() const { return m_height; }
+
+    // Streaming upload via copy queue (P4.5′)
+    // Uploads host data to a DEFAULT-heap resource using the copy queue.
+    // The caller must ensure the resource is in COPY_DEST state before calling.
+    bool StreamingUpload(ID3D12Resource* dest, const void* data, uint32_t size);
+    // Signal a fence on the copy queue; returns the fence value.
+    uint64_t SignalCopyFence();
+    // Wait for the copy queue to reach a given fence value.
+    void WaitForCopyFence(uint64_t fenceValue);
 
     // Wait for all GPU work to complete
     void WaitForGpu();
@@ -461,6 +471,7 @@ private:
     bool CreateSwapChain(HWND hwnd, uint32_t width, uint32_t height);
     bool CreateRenderTargets();
     bool CreateCommandObjects();
+    bool CreateCopyQueue();
     bool CreateSyncObjects();
 
     bool m_initialized = false;
@@ -479,6 +490,14 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_commandAllocators[kBufferCount];
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
+
+    // Copy queue for streaming uploads (P4.5′)
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_copyQueue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_copyAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_copyCommandList;
+    Microsoft::WRL::ComPtr<ID3D12Fence> m_copyFence;
+    HANDLE m_copyFenceEvent = nullptr;
+    uint64_t m_copyFenceValue = 0;
 
     // CPU-GPU sync
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;

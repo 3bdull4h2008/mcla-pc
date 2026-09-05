@@ -77,17 +77,33 @@ bool mcla::kernel::GuestMemoryHeap::ReadU16BE(uint32_t guestAddr, uint16_t* outV
 bool mcla::kernel::GuestMemoryHeap::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const
 {
     if (!IsValid(guestAddr, sizeof(uint32_t)) || !outVal) return false;
-    const uint32_t beVal = *reinterpret_cast<const uint32_t*>(Translate(guestAddr));
-    *outVal = Swap32(beVal);
-    return true;
+    const uint8_t* ptr = static_cast<const uint8_t*>(Translate(guestAddr));
+    __try
+    {
+        const uint32_t beVal = *reinterpret_cast<const uint32_t*>(ptr);
+        *outVal = Swap32(beVal);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
 }
 
 bool mcla::kernel::GuestMemoryHeap::ReadU64BE(uint32_t guestAddr, uint64_t* outVal) const
 {
     if (!IsValid(guestAddr, sizeof(uint64_t)) || !outVal) return false;
-    const uint64_t beVal = *reinterpret_cast<const uint64_t*>(Translate(guestAddr));
-    *outVal = Swap64(beVal);
-    return true;
+    const uint8_t* ptr = static_cast<const uint8_t*>(Translate(guestAddr));
+    __try
+    {
+        const uint64_t beVal = *reinterpret_cast<const uint64_t*>(ptr);
+        *outVal = Swap64(beVal);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
 }
 
 bool mcla::kernel::GuestMemoryHeap::ReadF32BE(uint32_t guestAddr, float* outVal) const
@@ -102,43 +118,71 @@ bool mcla::kernel::GuestMemoryHeap::ReadF32BE(uint32_t guestAddr, float* outVal)
 bool mcla::kernel::GuestMemoryHeap::ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t size) const
 {
     if (!IsValid(guestAddr, size) || !outBuffer) return false;
-    memcpy(outBuffer, Translate(guestAddr), size);
-    return true;
+    const uint8_t* src = static_cast<const uint8_t*>(Translate(guestAddr));
+    __try
+    {
+        memcpy(outBuffer, src, size);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
 }
 
 bool mcla::kernel::GuestMemoryHeap::WriteU8(uint32_t guestAddr, uint8_t val)
 {
     if (!IsValid(guestAddr, sizeof(uint8_t))) return false;
-    *reinterpret_cast<uint8_t*>(Translate(guestAddr)) = val;
-    return true;
+    __try
+    {
+        *reinterpret_cast<uint8_t*>(Translate(guestAddr)) = val;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool mcla::kernel::GuestMemoryHeap::WriteU16BE(uint32_t guestAddr, uint16_t val)
 {
     if (!IsValid(guestAddr, sizeof(uint16_t))) return false;
-    *reinterpret_cast<uint16_t*>(Translate(guestAddr)) = Swap16(val);
-    return true;
+    __try
+    {
+        *reinterpret_cast<uint16_t*>(Translate(guestAddr)) = Swap16(val);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool mcla::kernel::GuestMemoryHeap::WriteU32BE(uint32_t guestAddr, uint32_t val)
 {
     if (!IsValid(guestAddr, sizeof(uint32_t))) return false;
-    *reinterpret_cast<uint32_t*>(Translate(guestAddr)) = Swap32(val);
-    return true;
+    __try
+    {
+        *reinterpret_cast<uint32_t*>(Translate(guestAddr)) = Swap32(val);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool mcla::kernel::GuestMemoryHeap::WriteU64BE(uint32_t guestAddr, uint64_t val)
 {
     if (!IsValid(guestAddr, sizeof(uint64_t))) return false;
-    *reinterpret_cast<uint64_t*>(Translate(guestAddr)) = Swap64(val);
-    return true;
+    __try
+    {
+        *reinterpret_cast<uint64_t*>(Translate(guestAddr)) = Swap64(val);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool mcla::kernel::GuestMemoryHeap::WriteBytes(uint32_t guestAddr, const void* src, uint32_t size)
 {
     if (!IsValid(guestAddr, size) || !src) return false;
-    memcpy(Translate(guestAddr), src, size);
-    return true;
+    __try
+    {
+        memcpy(Translate(guestAddr), src, size);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 mcla::kernel::GuestMemoryHeap::~GuestMemoryHeap()

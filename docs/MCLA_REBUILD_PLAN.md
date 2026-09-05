@@ -82,27 +82,53 @@ execution). That rebuilds the superseded Phase-4 CP emulator. Effective now:
 5. Asset access (RPF VFS + 1,264-file ucode corpus) feeds the takeover's
    shader/resource needs per golden rules 12/14 - no from-scratch engine.
 
-### CURRENT BLOCKER (2026-09-05 refresh — sessions 33–37)
+### CURRENT BLOCKER (2026-09-05 refresh — sessions 38 / 33–37 bridge)
 
 Authoritative live trail: `docs/BOOT_HANDOFF.md`; ledger: `.clinerules/memory/`.
 
-1. **Intermittent OOM fatal ~T+15s**, churn heap struct `0x82830CD8`, cap
-   `0x02E7FFF0` (46.5 MB fixed, `sub_821C1BB0` has NO grow path). Corrected field
-   map: +76=cap, +84=carved, +152=free — heap is ~4% used at fatal (session-35
-   "97-100% full" readings were a swapped-label artifact).
-2. **Prime suspect:** class allocator `sub_821DE9D8` (ppc_recomp.20.cpp) returns 0
-   WITHOUT calling C1BB0 on inconsistent slab header ([slab+8] count>0 but
-   [slab+12] freelist empty/garbage) → `sub_821C29A0` fast-path raise.
-3. **Hook mechanism truth:** dispatcher-map SetFunction is NEVER consulted for
-   guest calls. Working override = global-scope `PPC_FUNC(sub_XXXX)` weak-alias
-   strong def. Live censuses: OOM-CENSUS, PHYSALLOC-CENSUS, ARENA-CENSUS.
-4. **Secondary (session 34):** GPU-progress-wait class — ring put advances, guest
-   progress counter never does; fix only as kernel/CP-legacy work (freeze line).
-5. **Session 37 done:** Enhanced `PPC_FUNC(sub_821DE9D8)` census — full slab chain
+1. **OOM front: mitigated, not closed.** Session-49 chain rebuild in `patches.cpp`
+   fired 4x in the 2026-09-05 soak (16-byte pool, classHead `82830DB8`, ~632
+   elements recovered per corrupted slab). There was NO OOM fatal in the soak,
+   but root cause of the overflow (who writes >16 bytes into 16-byte pool elements)
+   remains unidentified; chain-rebuild is a mitigation, not a cure.
+2. **NEW FRONTIER (session 38): deterministic AV inside original**
+   `sub_8218CC70` body (`__imp__sub_8218CC70 +0xC1`), T+8s in run 1 and
+   T+~2min in soak 2. Host `r8 = 0xffffffff7e780000` = session-25-decoded
+   `PPC_LOOKUP_FUNC` arithmetic on target=0 → indirect dispatch through a
+   NULL/garbage handler pointer.
+3. **Dispatch signature / call chain:** `sub_82305E38 → sub_821C3048 →
+   sub_821FC008 → sub_8217A068 → sub_8217FFF8 → sub_8217F768 →
+   sub_8218CC70(config dispatch by index) → target_fn`. PPC `lr=821782AC`
+   (memset call site) and `CONFIG-DISPATCH` global at `0x82839270` is currently
+   ZERO. The last valid dispatch logged is `#1 idx=6 ... struct=400020D4
+   targetFn=827CD063 [VALID_CODE]`; a later dispatch crashed without a log.
+4. **Hook mechanism truth remains the same:** dispatcher-map `SetFunction` is
+   NOT consulted for guest calls. The live override path is the global-scope
+   `PPC_FUNC(sub_XXXX)` weak-alias strong def; the null-handler bug is in the
+   config table / registration path, not the hook bridge itself.
+5. **Required next work (session 38):**
+   1. Add CONFIG-DISPATCH census v2: log every dispatch (idx, offset, base_ptr,
+      struct, target_fn, valid-bit) for the first 200 calls, then every 100th call
+      plus the GLOBAL `@82839270` value per call.
+   2. Confirm who should initialize the GLOBAL `@82839270` / handler table; likely
+      a registration never ran or a `0xB5800000`-class phys alloc returned wrong memory.
+   3. After the dispatch front closes: writer-attribution census on the 16-byte pool
+      slab range (S5 of the plan audit) to close the overflow root cause.
+   4. Then resume P4′ step 3 render-thread work.
+6. **Secondary (session 34):** GPU-progress-wait class — ring put advances but the
+   guest progress counter never does; fix only as kernel/CP-legacy work (freeze line).
+7. **Session 37 done:** Enhanced `PPC_FUNC(sub_821DE9D8)` census — full slab chain
    dump on every return-0 (up to 32 slabs, per-slab next/prev/count/freelist/owner,
    chainLen, countMatch check). Build clean.
-6. **Next (session 38):** Run gate soak → analyze POOL-CENSUS FAIL# output →
-   root-cause slab corruption from live data → then P4′ step 3 render thread.
+
+### Warnings / Freeze Line
+- stash@{0} 'session33-audlo-forensics-gpu_device-capture-hardening' REGRESSES
+  boot (stalls ~5s) and hardcodes AUDLO answers - salvage individually, never pop.
+- generated/default is a STALE second regen - only generated/ppc_xenon is compiled
+  (CMakeLists). Do not decode from generated/default.
+- Freeze line: no PM4, no manual GPU seeding, no opcode expansion.
+- Worktree has ~1183 lines UNCOMMITTED in patches.cpp (sessions 37-51 census work
+  + chain rebuild). Commit checkpoint recommended before further surgery.
 
 External recon (web-verified 2026-09-03 — research round: ~18 sources):
 

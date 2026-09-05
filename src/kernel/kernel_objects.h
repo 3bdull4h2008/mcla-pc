@@ -220,6 +220,23 @@ struct FileObject final : KernelObject
     }
 };
 
+struct SectionObject final : KernelObject
+{
+    uint32_t fileHandle;   // guest kernel handle to the backing FileObject
+    uint64_t maximumSize;  // maximum section size in bytes
+
+    SectionObject(uint32_t fh, uint64_t maxSize)
+        : fileHandle(fh), maximumSize(maxSize)
+    {
+    }
+
+    uint32_t Wait(uint32_t timeout) override
+    {
+        (void)timeout;
+        return STATUS_SUCCESS;
+    }
+};
+
 inline void CloseKernelObject(XDISPATCHER_HEADER& header)
 {
     if (header.WaitListHead.Flink != OBJECT_SIGNATURE)

@@ -38,11 +38,34 @@ struct SetIndexBufferCommand {
 
 struct PresentCommand {
     uint32_t frameNumber;
+    uint32_t obj;
+    uint32_t swapInfo;
 };
 
 struct SetRenderStateCommand {
     uint32_t deviceAddr;
     uint32_t value;
+};
+
+struct InitD3D12Command {
+    void* hwnd;
+    uint32_t width;
+    uint32_t height;
+};
+
+struct DrawCapturedCommand {
+    uint32_t vbBase;
+    uint32_t vbSize;
+    uint32_t vbStride;
+    uint32_t ibBase;
+    uint32_t ibSize;
+    uint32_t frameId;
+    uint64_t psoHash;
+};
+
+struct ResizeCommand {
+    uint32_t width;
+    uint32_t height;
 };
 
 struct RenderCommand {
@@ -53,7 +76,10 @@ struct RenderCommand {
         SET_INDEX_BUFFER,
         PRESENT,
         SET_RENDER_STATE,
-        NOOP
+        NOOP,
+        INIT_D3D12,
+        DRAW_CAPTURED,
+        RESIZE,
     };
     
     Type type;
@@ -63,7 +89,10 @@ struct RenderCommand {
         SetVertexBuffersCommand,
         SetIndexBufferCommand,
         PresentCommand,
-        SetRenderStateCommand
+        SetRenderStateCommand,
+        InitD3D12Command,
+        DrawCapturedCommand,
+        ResizeCommand
     > data;
 };
 

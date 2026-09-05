@@ -4,11 +4,6 @@
 /pathb/
 /build-smoke/
 /build-standalone/
-# Unreferenced XenonRecomp vendor copy (see BOOT_REBUILD_PLAN.md cleanup candidate)
-/tools/XenonRecomp/
-# Large local dumps / personal config
-/disasm.txt
-/config.json
 
 # ── Derived / regenerable ───────────────────────────────────
 # Recompilation output (never editable; regenerated from game)
@@ -33,38 +28,23 @@ npm-debug.log*
 # ── Downloaded installers / binaries ─────────────────────────
 /SDL3.zip
 /SDL3_extract/
-/OXM0DD3R_RPF_TOOL.exe
-/xcompress32.dll
 
 # ── Misc ─────────────────────────────────────────────────────
 *.tracy
 *.dmp
 *.log
-crash_log_early.txt
 Thumbs.db
 .DS_Store
-# root build artifacts n junk
 *.obj
 *.d
 ninja_out.txt
 ninja_err.txt
-.second-brain.lock
 
-# re / planning docs stay local only
-/MCLA_REBUILD_PLAN.md
-/PHASE2_IMPLEMENTATION_PLAN.md
-/MCLA_RPF3_Technical_Reference.txt
-/flowchart.drawio
+# ── Local-only config (archived references) ─────────────────
+/config/opencode.json
+/config/config.json
 
-# ai tooling n local-only stuff, not part of the repo
-.opencode/
-/opencode.json
-/AGENTS.md
-/start_ghidra_mcp.bat
-/mcla_manifest.toml
-/mcla_vanilla_test.toml
-
-# old debug/duplicate wrapper scripts (configure.bat + ninja_build.bat r the real ones)
+# ── Old debug/duplicate wrapper scripts ─────────────────────
 /cmake_config.bat
 /cmake_config_debug.bat
 /cmake_debug.bat
@@ -87,7 +67,19 @@ ninja_err.txt
 /run_silent.bat
 /run_test.bat
 
-/BOOT_HANDOFF.md
-
 flutter_windows_*
 *_b.cmd
+
+# ── Local tooling / caches ──────────────────────────────────
+.cache/
+.freebuff/
+.vscode/
+crash_log_early.txt
+build_out.txt
+
+# ── Third-party binaries in tools/ ──────────────────────────
+tools/*.exe
+tools/*.dll
+
+# ── AI tooling (local only) ─────────────────────────────────
+.opencode/

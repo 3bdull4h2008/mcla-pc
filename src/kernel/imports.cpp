@@ -14,15 +14,16 @@
 #include <user/config.h>
 #include <os/logger.h>
 
+
 // Host thread id of the guest main thread (see xdm.h). Defined here; set by
 // boot_host.cpp when the boot worker starts.
 std::atomic<uint32_t> g_mainGuestThreadId{0};
 
 // Forward declaration for VSync thread's scheduler tick signaling.
 // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
-// This is the kernel-role duty that the real hardware GPU ISR/vblank path would perform.
-// The game's main thread waits on 0x40004D7C with ~30ms timeout; without this signal,
-// the main thread parks forever.
+// This is the kernel-role duty that the real hardware GPU ISR/vblank path would
+// perform. The game's main thread waits on 0x40004D7C with ~30ms timeout;
+// without this signal, the main thread parks forever.
 static void SignalSchedulerTick();
 
 static std::atomic<uint32_t> g_keSetEventGeneration;
@@ -43,158 +44,127 @@ void XeKeysGetKey();
 void sub_821305B8_NoOp();
 
 // XTL allocator - used by guest code via r13 thread block
-PPC_FUNC(__xtl_alloc)
-{
-    uint32_t align = ctx.r5.u32;
-    if (align < 16 || (align & (align - 1)) != 0)
-        align = 16;
-    ctx.r3.u32 = mcla::kernel::GuestMemoryHeap::Instance().Alloc(ctx.r4.u32, align);
+PPC_FUNC(__xtl_alloc) {
+  uint32_t align = ctx.r5.u32;
+  if (align < 16 || (align & (align - 1)) != 0)
+    align = 16;
+  ctx.r3.u32 =
+      mcla::kernel::GuestMemoryHeap::Instance().Alloc(ctx.r4.u32, align);
 }
 
-PPC_FUNC(__xtl_free)
-{
-    ctx.r3.u32 = 1;
-}
+PPC_FUNC(__xtl_free) { ctx.r3.u32 = 1; }
 
 // ---- File metadata queries (shared impls, called from the PPC_FUNC wrappers
 // below; these were silent fake-success stubs which made packfile loading fail
 // with "Cannot load archive" before a single byte was ever read) ----
 
-static uint32_t NtQueryInformationFileImpl(uint32_t handle, uint32_t ioStatusAddr, uint32_t bufferAddr, uint32_t length, uint32_t infoClass)
-{
-    // X_FILE_STANDARD_INFORMATION (5): AllocationSize(8) EndOfFile(8)
-    // NumberOfLinks(4) DeletePending(1) Directory(1)
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+static uint32_t NtQueryInformationFileImpl(uint32_t handle,
+                                           uint32_t ioStatusAddr,
+                                           uint32_t bufferAddr, uint32_t length,
+                                           uint32_t infoClass) {
+  // X_FILE_STANDARD_INFORMATION (5): AllocationSize(8) EndOfFile(8)
+  // NumberOfLinks(4) DeletePending(1) Directory(1)
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
 
-    KernelObject* obj = nullptr;
-    if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle))
-    {
-        KernelObject* o = GetKernelObject(handle);
-        if (o && o->IsValid()) obj = o;
-    }
-    FileObject* fileObj = (obj && obj->IsValid()) ? dynamic_cast<FileObject*>(obj) : nullptr;
+  KernelObject *obj = nullptr;
+  if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle)) {
+    KernelObject *o = GetKernelObject(handle);
+    if (o && o->IsValid())
+      obj = o;
+  }
+  FileObject *fileObj =
+      (obj && obj->IsValid()) ? dynamic_cast<FileObject *>(obj) : nullptr;
 
-    if (infoClass == 34 && bufferAddr != 0 && length >= 52 && fileObj)
-    {
-        // X_FILE_NETWORK_OPEN_INFORMATION (NT NETWORK_OPEN_INFORMATION):
-        // Creation/LastAccess/LastWrite/ChangeTime (8 each), AllocationSize(8),
-        // EndOfFile(8), FileAttributes(4). The packfile loader gates on
-        // EndOfFile being the REAL archive size.
-        const uint64_t fileSize = fileObj->fileHandle.size;
-        (void)mem.WriteU64BE(bufferAddr + 0, 0);            // CreationTime
-        (void)mem.WriteU64BE(bufferAddr + 8, 0);            // LastAccessTime
-        (void)mem.WriteU64BE(bufferAddr + 16, 0);           // LastWriteTime
-        (void)mem.WriteU64BE(bufferAddr + 24, 0);           // ChangeTime
-        (void)mem.WriteU64BE(bufferAddr + 32, fileSize);    // AllocationSize
-        (void)mem.WriteU64BE(bufferAddr + 40, fileSize);    // EndOfFile
-        (void)mem.WriteU32BE(bufferAddr + 48, 0x20);        // FILE_ATTRIBUTE_ARCHIVE
-        if (ioStatusAddr)
-        {
-            (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-            (void)mem.WriteU32BE(ioStatusAddr + 4, 52);
-        }
-        MCLA_LOG_INFO("NtQueryInformationFile: NETWORK_OPEN_INFO size={}", fileSize);
-        return STATUS_SUCCESS;
+  if (infoClass == 34 && bufferAddr != 0 && length >= 52 && fileObj) {
+    // X_FILE_NETWORK_OPEN_INFORMATION (NT NETWORK_OPEN_INFORMATION):
+    // Creation/LastAccess/LastWrite/ChangeTime (8 each), AllocationSize(8),
+    // EndOfFile(8), FileAttributes(4). The packfile loader gates on
+    // EndOfFile being the REAL archive size.
+    const uint64_t fileSize = fileObj->fileHandle.size;
+    (void)mem.WriteU64BE(bufferAddr + 0, 0);         // CreationTime
+    (void)mem.WriteU64BE(bufferAddr + 8, 0);         // LastAccessTime
+    (void)mem.WriteU64BE(bufferAddr + 16, 0);        // LastWriteTime
+    (void)mem.WriteU64BE(bufferAddr + 24, 0);        // ChangeTime
+    (void)mem.WriteU64BE(bufferAddr + 32, fileSize); // AllocationSize
+    (void)mem.WriteU64BE(bufferAddr + 40, fileSize); // EndOfFile
+    (void)mem.WriteU32BE(bufferAddr + 48, 0x20);     // FILE_ATTRIBUTE_ARCHIVE
+    if (ioStatusAddr) {
+      (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+      (void)mem.WriteU32BE(ioStatusAddr + 4, 52);
     }
+    MCLA_LOG_INFO("NtQueryInformationFile: NETWORK_OPEN_INFO size={}",
+                  fileSize);
+    return STATUS_SUCCESS;
+  }
 
-    if (infoClass == 5 && bufferAddr != 0 && length >= 24 && fileObj)
-    {
-        const uint64_t fileSize = fileObj->fileHandle.size;
-        (void)mem.WriteU64BE(bufferAddr + 0, fileSize);
-        (void)mem.WriteU64BE(bufferAddr + 8, fileSize);
-        (void)mem.WriteU32BE(bufferAddr + 16, 1);
-        (void)mem.WriteU16BE(bufferAddr + 20, 0);
-        if (ioStatusAddr)
-        {
-            (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
-            (void)mem.WriteU32BE(ioStatusAddr + 4, 24);
-        }
-        return STATUS_SUCCESS;
+  if (infoClass == 5 && bufferAddr != 0 && length >= 24 && fileObj) {
+    const uint64_t fileSize = fileObj->fileHandle.size;
+    (void)mem.WriteU64BE(bufferAddr + 0, fileSize);
+    (void)mem.WriteU64BE(bufferAddr + 8, fileSize);
+    (void)mem.WriteU32BE(bufferAddr + 16, 1);
+    (void)mem.WriteU16BE(bufferAddr + 20, 0);
+    if (ioStatusAddr) {
+      (void)mem.WriteU32BE(ioStatusAddr, STATUS_SUCCESS);
+      (void)mem.WriteU32BE(ioStatusAddr + 4, 24);
     }
+    return STATUS_SUCCESS;
+  }
 
-    // Xenia semantics: never fake-success with zeros - the game branches on
-    // the returned data, so unsupported classes must fail loudly.
-    if (infoClass != 5 && infoClass != 34)
-    {
-        MCLA_LOG_WARN("NtQueryInformationFile: class={} -> STATUS_INVALID_INFO_CLASS", infoClass);
-        if (ioStatusAddr)
-        {
-            (void)mem.WriteU32BE(ioStatusAddr, STATUS_INVALID_INFO_CLASS);
-            (void)mem.WriteU32BE(ioStatusAddr + 4, 0);
-        }
-        return STATUS_INVALID_INFO_CLASS;
+  // Xenia semantics: never fake-success with zeros - the game branches on
+  // the returned data, so unsupported classes must fail loudly.
+  if (infoClass != 5 && infoClass != 34) {
+    MCLA_LOG_WARN(
+        "NtQueryInformationFile: class={} -> STATUS_INVALID_INFO_CLASS",
+        infoClass);
+    if (ioStatusAddr) {
+      (void)mem.WriteU32BE(ioStatusAddr, STATUS_INVALID_INFO_CLASS);
+      (void)mem.WriteU32BE(ioStatusAddr + 4, 0);
     }
+    return STATUS_INVALID_INFO_CLASS;
+  }
 
-    MCLA_LOG_WARN("NtQueryInformationFile: class={} len={} handleValid={} -> INFO_LENGTH_MISMATCH",
-                  infoClass, length, fileObj != nullptr);
-    if (ioStatusAddr)
-    {
-        (void)mem.WriteU32BE(ioStatusAddr, STATUS_INFO_LENGTH_MISMATCH);
-        (void)mem.WriteU32BE(ioStatusAddr + 4, 0);
-    }
-    return STATUS_INFO_LENGTH_MISMATCH;
+  MCLA_LOG_WARN("NtQueryInformationFile: class={} len={} handleValid={} -> "
+                "INFO_LENGTH_MISMATCH",
+                infoClass, length, fileObj != nullptr);
+  if (ioStatusAddr) {
+    (void)mem.WriteU32BE(ioStatusAddr, STATUS_INFO_LENGTH_MISMATCH);
+    (void)mem.WriteU32BE(ioStatusAddr + 4, 0);
+  }
+  return STATUS_INFO_LENGTH_MISMATCH;
 }
 
 // NtQueryVolumeInformationFile / NtQueryDirectoryFile: typed impls live below
 // (near NtReadFile) and are GUEST_FUNCTION_HOOKed at the bottom of this file.
 
-PPC_FUNC(__imp__NtQueryInformationFile)
-{
-    // r3=handle, r4=ioStatus, r5=buffer, r6=length, r7=infoClass
-    ctx.r3.u32 = NtQueryInformationFileImpl(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
+PPC_FUNC(__imp__NtQueryInformationFile) {
+  // r3=handle, r4=ioStatus, r5=buffer, r6=length, r7=infoClass
+  ctx.r3.u32 = NtQueryInformationFileImpl(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                                          ctx.r6.u32, ctx.r7.u32);
 }
 
-void VdHSIOCalibrationLock()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void VdHSIOCalibrationLock() { LOG_UTILITY("!!! STUB !!!"); }
 
-void KeCertMonitorData()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void KeCertMonitorData() { LOG_UTILITY("!!! STUB !!!"); }
 
-void XexExecutableModuleHandle()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void XexExecutableModuleHandle() { LOG_UTILITY("!!! STUB !!!"); }
 
-void ExLoadedCommandLine()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void ExLoadedCommandLine() { LOG_UTILITY("!!! STUB !!!"); }
 
-void KeDebugMonitorData()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void KeDebugMonitorData() { LOG_UTILITY("!!! STUB !!!"); }
 
-void ExThreadObjectType()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void ExThreadObjectType() { LOG_UTILITY("!!! STUB !!!"); }
 
-void KeTimeStampBundle()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void KeTimeStampBundle() { LOG_UTILITY("!!! STUB !!!"); }
 
-void XboxHardwareInfo()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void XboxHardwareInfo() { LOG_UTILITY("!!! STUB !!!"); }
 
-void XGetVideoMode()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void XGetVideoMode() { LOG_UTILITY("!!! STUB !!!"); }
 
-uint32_t XGetGameRegion()
-{
-    if (Config::Language == ELanguage::Japanese)
-        return 0x0101;
+uint32_t XGetGameRegion() {
+  if (Config::Language == ELanguage::Japanese)
+    return 0x0101;
 
-    return 0x03FF;
+  return 0x03FF;
 }
 
 // MCLA task dispatcher posts XAM msg 251 through a strict
@@ -202,575 +172,534 @@ uint32_t XGetGameRegion()
 // return 0 or the post is skipped and the main thread parks forever in
 // Function_824E5350 (ppc_recomp.158.cpp:27368-27420, 159.cpp:1015+,
 // soak evidence 2026-08-23: ring put cursor frozen).
-uint32_t XamSessionCreateHandle(be<uint32_t>* handleOut)
-{
-    if (!handleOut)
-        return STATUS_INVALID_PARAMETER;
+uint32_t XamSessionCreateHandle(be<uint32_t> *handleOut) {
+  if (!handleOut)
+    return STATUS_INVALID_PARAMETER;
 
-    // Identity-handle model: handle = guest VA of a small session object.
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t obj = mem.Alloc(16, 8);
-    if (obj == 0)
-        return STATUS_NO_MEMORY;
+  // Identity-handle model: handle = guest VA of a small session object.
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t obj = mem.Alloc(16, 8);
+  if (obj == 0)
+    return STATUS_NO_MEMORY;
 
-    (void)mem.WriteU32BE(obj, 0);
-    (void)mem.WriteU32BE(obj + 4, 0);
-    handleOut->set(obj);
-    return STATUS_SUCCESS;
+  (void)mem.WriteU32BE(obj, 0);
+  (void)mem.WriteU32BE(obj + 4, 0);
+  handleOut->set(obj);
+  return STATUS_SUCCESS;
 }
 
-uint32_t XamSessionRefObjByHandle(uint32_t handle, be<uint32_t>* objectOut)
-{
-    if (!objectOut)
-        return STATUS_INVALID_PARAMETER;
-    if (handle == 0 || handle == 0xFFFFFFFF)
-        return STATUS_INVALID_HANDLE;
+uint32_t XamSessionRefObjByHandle(uint32_t handle, be<uint32_t> *objectOut) {
+  if (!objectOut)
+    return STATUS_INVALID_PARAMETER;
+  if (handle == 0 || handle == 0xFFFFFFFF)
+    return STATUS_INVALID_HANDLE;
 
-    // Identity handles: the referenced object IS the handle's guest VA.
-    // Validate readability before handing it back as a pointer.
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t probe = 0;
-    if (!mem.ReadU32BE(handle, &probe))
-        return STATUS_INVALID_HANDLE;
+  // Identity handles: the referenced object IS the handle's guest VA.
+  // Validate readability before handing it back as a pointer.
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t probe = 0;
+  if (!mem.ReadU32BE(handle, &probe))
+    return STATUS_INVALID_HANDLE;
 
-    objectOut->set(handle);
-    return STATUS_SUCCESS;
+  objectOut->set(handle);
+  return STATUS_SUCCESS;
 }
 
-uint32_t XMsgStartIORequest(uint32_t App, uint32_t Message, XXOVERLAPPED* lpOverlapped, void* Buffer, uint32_t szBuffer)
-{
-    // XMsgStartIORequest census probe (Lead 3)
-    {
-        static std::atomic<uint32_t> s_xmsgCalls{0};
-        const uint32_t n = s_xmsgCalls.fetch_add(1) + 1;
-        if (n <= 100)
-        {
-            MCLA_LOG_INFO("XMSG-IO #{} App={:08X} Msg={:08X} ovl={:08X} buf={:08X} sz={:08X} lr={:08X}",
-                          n, App, Message,
-                          lpOverlapped ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lpOverlapped)) : 0,
-                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Buffer)),
-                          szBuffer,
-                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
+uint32_t XMsgStartIORequest(uint32_t App, uint32_t Message,
+                            XXOVERLAPPED *lpOverlapped, void *Buffer,
+                            uint32_t szBuffer) {
+  // XMsgStartIORequest census probe (Lead 3)
+  {
+    static std::atomic<uint32_t> s_xmsgCalls{0};
+    const uint32_t n = s_xmsgCalls.fetch_add(1) + 1;
+    if (n <= 100) {
+      MCLA_LOG_INFO(
+          "XMSG-IO #{} App={:08X} Msg={:08X} ovl={:08X} buf={:08X} sz={:08X} "
+          "lr={:08X}",
+          n, App, Message,
+          lpOverlapped
+              ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lpOverlapped))
+              : 0,
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Buffer)), szBuffer,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
+  }
 
-    (void)App;
-    (void)Message;
-    (void)Buffer;
+  (void)App;
+  (void)Message;
+  (void)Buffer;
 
-    if (lpOverlapped)
-    {
-        // Complete synchronously and UNCONDITIONALLY: MCLA's app-task
-        // dispatcher (sub_824E37E0 case 9) posts event-less overlappeds
-        // (hEvent=0, pCompletionRoutine=0 - ppc_recomp.159.cpp:1100-1116)
-        // then hot-polls Error for != STATUS_IO_INCOMPLETE (997). A no-op
-        // here parks the main thread in Function_824E5350 forever with the
-        // ring put cursor frozen (2026-08-23 soak evidence).
-        lpOverlapped->Error.set(STATUS_SUCCESS);
-        lpOverlapped->Length.set(szBuffer);
+  if (lpOverlapped) {
+    // Complete synchronously and UNCONDITIONALLY: MCLA's app-task
+    // dispatcher (sub_824E37E0 case 9) posts event-less overlappeds
+    // (hEvent=0, pCompletionRoutine=0 - ppc_recomp.159.cpp:1100-1116)
+    // then hot-polls Error for != STATUS_IO_INCOMPLETE (997). A no-op
+    // here parks the main thread in Function_824E5350 forever with the
+    // ring put cursor frozen (2026-08-23 soak evidence).
+    lpOverlapped->Error.set(STATUS_SUCCESS);
+    lpOverlapped->Length.set(szBuffer);
 
-        // pCompletionRoutine: MCLA's known consumers poll Error instead of
-        // using callbacks; guest-dispatch callback wiring deferred until a
-        // consumer demands it (no invented behavior).
+    // pCompletionRoutine: MCLA's known consumers poll Error instead of
+    // using callbacks; guest-dispatch callback wiring deferred until a
+    // consumer demands it (no invented behavior).
 
-        if (lpOverlapped->hEvent)
-        {
-            XKEVENT* event = (XKEVENT*)mcla::kernel::GuestMemoryHeap::Instance().Translate(lpOverlapped->hEvent);
-            if (event)
-            {
-                QueryKernelObject<Event>(*event)->Set();
-            }
-        }
+    if (lpOverlapped->hEvent) {
+      XKEVENT *event =
+          (XKEVENT *)mcla::kernel::GuestMemoryHeap::Instance().Translate(
+              lpOverlapped->hEvent);
+      if (event) {
+        QueryKernelObject<Event>(*event)->Set();
+      }
     }
+  }
 
-    return STATUS_SUCCESS;
+  return STATUS_SUCCESS;
 }
 
-uint32_t XamUserGetSigninState(uint32_t userIndex)
-{
-    return true;
+uint32_t XamUserGetSigninState(uint32_t userIndex) { return true; }
+
+uint32_t XamGetSystemVersion() {
+  // Return 2.0.17559.0 as the system version (similar to Xenia)
+  return 0x00021755;
 }
 
-uint32_t XamGetSystemVersion()
-{
-    // Return 2.0.17559.0 as the system version (similar to Xenia)
-    return 0x00021755;
+uint32_t XamContentDelete(uint32_t userIndex, void *deviceId,
+                          XCONTENT_DATA *contentData,
+                          XXOVERLAPPED *overlapped) {
+  (void)userIndex;
+  (void)deviceId;
+  (void)contentData;
+  (void)overlapped;
+  return 0; // Success
 }
 
-uint32_t XamContentDelete(uint32_t userIndex, void* deviceId, XCONTENT_DATA* contentData, XXOVERLAPPED* overlapped)
-{
-    (void)userIndex;
-    (void)deviceId;
-    (void)contentData;
-    (void)overlapped;
-    return 0; // Success
+uint32_t XamContentGetCreator(uint32_t userIndex,
+                              const XCONTENT_DATA *contentData,
+                              be<uint32_t> *isCreator, be<uint64_t> *xuid,
+                              XXOVERLAPPED *overlapped) {
+  if (isCreator)
+    *isCreator = true;
+
+  if (xuid)
+    *xuid = 0xB13EBABEBABEBABE;
+
+  return 0;
 }
 
-uint32_t XamContentGetCreator(uint32_t userIndex, const XCONTENT_DATA* contentData, be<uint32_t>* isCreator, be<uint64_t>* xuid, XXOVERLAPPED* overlapped)
-{
-    if (isCreator)
-        *isCreator = true;
+uint32_t XamContentGetDeviceState() { return 0; }
 
-    if (xuid)
-        *xuid = 0xB13EBABEBABEBABE;
-
+uint32_t XamUserGetSigninInfo(uint32_t userIndex, uint32_t flags,
+                              XUSER_SIGNIN_INFO *info) {
+  if (userIndex == 0) {
+    memset(info, 0, sizeof(*info));
+    info->xuid = 0xB13EBABEBABEBABE;
+    info->SigninState = 1;
+    strcpy(info->Name, "SWA");
     return 0;
+  }
+
+  return 0x00000525; // ERROR_NO_SUCH_USER
 }
 
-uint32_t XamContentGetDeviceState()
-{
+void XamShowSigninUI() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t XamShowDeviceSelectorUI(uint32_t userIndex, uint32_t contentType,
+                                 uint32_t contentFlags, uint64_t totalRequested,
+                                 be<uint32_t> *deviceId,
+                                 XXOVERLAPPED *overlapped) {
+  XamNotifyEnqueueEvent(9, true);
+  *deviceId = 1;
+  XamNotifyEnqueueEvent(9, false);
+  return 0;
+}
+
+void XamShowDirtyDiscErrorUI() {
+  // Don't show UI, just return - let boot continue
+  MCLA_LOG_INFO("XamShowDirtyDiscErrorUI called (suppressed)");
+
+  // Dump the guest call chain so we can find which media check routed us
+  // here. EABI frames: back chain at [sp], saved LR at [sp+4].
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint64_t lr = g_ppcContext ? g_ppcContext->lr : 0;
+  uint32_t sp = g_ppcContext ? g_ppcContext->r1.u32 : 0;
+  for (int depth = 0; depth < 16; ++depth) {
+    MCLA_LOG_INFO("  dirty-disc chain[{}]: lr=0x{:08X} sp=0x{:08X}", depth,
+                  static_cast<uint32_t>(lr), sp);
+    uint32_t nextSp = 0;
+    uint32_t nextLr = 0;
+    if (sp == 0 || !mem.ReadU32BE(sp, &nextSp) ||
+        !mem.ReadU32BE(sp + 4, &nextLr))
+      break;
+    if (nextSp <= sp || (nextSp & 3) != 0)
+      break;
+    lr = nextLr;
+    sp = nextSp;
+  }
+  spdlog::default_logger()->flush();
+}
+
+void XamEnableInactivityProcessing() {
+  // No-op - inactivity processing not needed for headless boot
+}
+
+void XamResetInactivity() {
+  // No-op
+}
+
+uint32_t XamShowMessageBoxUIEx(uint32_t userIndex, uint32_t flags, void *title,
+                               void *text, uint32_t buttons,
+                               uint32_t defaultButton, uint32_t *result,
+                               XXOVERLAPPED *overlapped) {
+  (void)userIndex;
+  (void)flags;
+  (void)title;
+  (void)text;
+  (void)buttons;
+  (void)defaultButton;
+  (void)overlapped;
+  if (result)
+    *result = 1; // First button
+  return 0;
+}
+
+void XamLoaderTerminateTitle() {
+  // No-op - don't terminate
+  MCLA_LOG_INFO("XamLoaderTerminateTitle called");
+  spdlog::default_logger()->flush();
+}
+
+void XamGetExecutionId() {
+  // No-op - execution ID not needed
+}
+
+void XamLoaderLaunchTitle() {
+  // No-op - don't launch another title
+}
+
+uint32_t XamLoaderMediaGetInfo(uint32_t mediaId, void *infoBuffer) {
+  // Xbox 360 media info query. Game expects valid game disc.
+  // Returns XAM_MEDIA_TYPE_GAME_DVD (0x0C) on success.
+  if (g_ppcContext && infoBuffer) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    // XAM_MEDIA_INFO structure: MediaType(4), MediaFlags(4), MediaId(4), etc.
+    uint8_t info[16] = {};
+    *reinterpret_cast<uint32_t *>(&info[0]) =
+        __builtin_bswap32(0x0C); // XAM_MEDIA_TYPE_GAME_DVD
+    *reinterpret_cast<uint32_t *>(&info[4]) =
+        __builtin_bswap32(0x0); // MediaFlags
+    *reinterpret_cast<uint32_t *>(&info[8]) = __builtin_bswap32(0x0); // MediaId
+    *reinterpret_cast<uint32_t *>(&info[12]) =
+        __builtin_bswap32(0x0); // SessionId
+    (void)mem.WriteBytes(g_ppcContext->r4.u32, info, 16);
+  }
+  return 0; // ERROR_SUCCESS
+}
+
+uint32_t XamLoaderGetDvdTrayState() {
+  // Xbox 360 DVD tray state. Must return CLOSED (0) for valid boot.
+  return 0; // XAM_LOADER_DVD_TRAY_STATE_CLOSED
+}
+
+uint32_t XGetLanguage() { return (uint32_t)Config::Language; }
+
+uint32_t XGetAVPack() {
+  // Returns the A/V pack type. 3 = HDMI (widescreen/HD).
+  // For 1280x720, return 3 (HDMI).
+  return 3;
+}
+
+void NtOpenFile() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlInitAnsiString(XANSI_STRING *destination, char *source) {
+  const uint16_t length = source ? static_cast<uint16_t>(strlen(source)) : 0;
+
+  destination->Length.set(length);
+  destination->MaximumLength.set(length + 1);
+  destination->Buffer = xpointer<char>(source);
+}
+
+uint32_t NtCreateFile(be<uint32_t> *FileHandle, uint32_t DesiredAccess,
+                      XOBJECT_ATTRIBUTES *Attributes,
+                      XIO_STATUS_BLOCK *IoStatusBlock, uint64_t *AllocationSize,
+                      uint32_t FileAttributes, uint32_t ShareAccess,
+                      uint32_t CreateDisposition, uint32_t CreateOptions) {
+  (void)DesiredAccess;
+  (void)FileAttributes;
+  (void)ShareAccess;
+  (void)CreateDisposition;
+  (void)CreateOptions;
+  (void)AllocationSize;
+
+  if (!FileHandle || !Attributes || !IoStatusBlock) {
+    return 0xC000000D; // STATUS_INVALID_PARAMETER
+  }
+
+  // Get the object name from attributes
+  XANSI_STRING *name = Attributes->Name.get();
+  if (!name || !name->Buffer) {
+    IoStatusBlock->Status.set(0xC0000034); // STATUS_OBJECT_NAME_INVALID
+    return 0xC0000034;
+  }
+
+  // Read the ANSI string from guest memory
+  char guestPath[260];
+  uint16_t length = name->Length.get();
+  if (length >= sizeof(guestPath))
+    length = sizeof(guestPath) - 1;
+
+  void *srcPtr =
+      mcla::kernel::GuestMemoryHeap::Instance().Translate(name->Buffer.ptr);
+  if (!srcPtr) {
+    IoStatusBlock->Status.set(0xC0000005); // STATUS_ACCESS_VIOLATION
+    return 0xC0000005;
+  }
+
+  memcpy(guestPath, srcPtr, length);
+  guestPath[length] = '\0';
+
+  // Open file via VFS
+  std::string virtualPath = mcla::vfs::GuestPathToVirtual(guestPath);
+  MCLA_LOG_INFO("NtCreateFile: '{}' -> '{}'", guestPath, virtualPath);
+
+  // Probe for .bik movie files
+  if (strstr(virtualPath.c_str(), ".bik") ||
+      strstr(virtualPath.c_str(), ".BIK")) {
+    MCLA_LOG_INFO("BIK MOVIE OPEN: '{}' -> '{}'", guestPath, virtualPath);
+  }
+
+  mcla::vfs::RpfVirtualFileSystem &vfs =
+      mcla::vfs::RpfVirtualFileSystem::Instance();
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fileHandle;
+  if (!vfs.OpenFile(virtualPath, fileHandle)) {
+    // Raw device opens (\Device\Harddisk0\partition0 etc) have no VFS
+    // backing. The boot validation loop treats a failed open as fatal, so
+    // hand back an empty pseudo-file instead.
+    constexpr auto startsWithDevice = [](const char *p) {
+      return std::strncmp(p, "\\Device\\", 8) == 0 ||
+             std::strncmp(p, "/Device/", 8) == 0;
+    };
+    const bool isRawDevice = startsWithDevice(guestPath);
+    if (!isRawDevice) {
+      MCLA_LOG_WARN("NtCreateFile: FAILED '{}' (guest '{}') -> "
+                    "STATUS_OBJECT_NAME_NOT_FOUND",
+                    virtualPath, guestPath);
+      IoStatusBlock->Status.set(0xC0000034); // STATUS_OBJECT_NAME_NOT_FOUND
+      return 0xC0000034;
+    }
+    MCLA_LOG_INFO("NtCreateFile: raw device '{}' -> empty pseudo-file",
+                  guestPath);
+    fileHandle = mcla::vfs::RpfVirtualFileSystem::OpenFileHandle{};
+    fileHandle.virtual_path = virtualPath;
+    fileHandle.size = 0;
+    fileHandle.position = 0;
+  }
+
+  // Create kernel file object - MUST live in the guest physical heap so the
+  // identity handle (its guest VA) round-trips through Translate(). Plain
+  // `new` yields host pointers that MapVirtual cannot represent.
+  auto *fileObj2 = CreateKernelObject<FileObject>(std::move(fileHandle));
+  uint32_t kernelHandle = GetKernelHandle(fileObj2);
+  FileHandle->set(kernelHandle);
+  MCLA_LOG_INFO("NtCreateFile: '{}' opened, handle={:08X}", virtualPath,
+                kernelHandle);
+
+  IoStatusBlock->Status.set(STATUS_SUCCESS);
+  IoStatusBlock->Information.set(1); // FILE_OPENED
+
+  return STATUS_SUCCESS;
+}
+
+uint32_t NtClose(uint32_t handle) {
+  if (handle == GUEST_INVALID_HANDLE_VALUE)
+    return 0xFFFFFFFF;
+
+  if (IsKernelObject(handle)) {
+    KernelObject *obj = GetKernelObject(handle);
+    MCLA_LOG_INFO("NtClose: handle={:08X} valid={}", handle,
+                  obj ? obj->IsValid() : false);
+    if (obj && obj->IsValid()) {
+      // Try to close VFS file if it's a FileObject
+      FileObject *fileObj = dynamic_cast<FileObject *>(obj);
+      if (fileObj) {
+        mcla::vfs::RpfVirtualFileSystem::Instance().CloseFile(
+            fileObj->fileHandle);
+      }
+      DestroyKernelObject(obj);
+    }
+    // Handles we don't recognize as host wrappers (raw guest structs the
+    // game treats as handles) are simply ignored - closing them must not
+    // fault or tear down guest memory.
     return 0;
-}
-
-uint32_t XamUserGetSigninInfo(uint32_t userIndex, uint32_t flags, XUSER_SIGNIN_INFO* info)
-{
-    if (userIndex == 0)
-    {
-        memset(info, 0, sizeof(*info));
-        info->xuid = 0xB13EBABEBABEBABE;
-        info->SigninState = 1;
-        strcpy(info->Name, "SWA");
-        return 0;
-    }
-
-    return 0x00000525; // ERROR_NO_SUCH_USER
-}
-
-void XamShowSigninUI()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t XamShowDeviceSelectorUI
-(
-    uint32_t userIndex,
-    uint32_t contentType,
-    uint32_t contentFlags,
-    uint64_t totalRequested,
-    be<uint32_t>* deviceId,
-    XXOVERLAPPED* overlapped
-)
-{
-    XamNotifyEnqueueEvent(9, true);
-    *deviceId = 1;
-    XamNotifyEnqueueEvent(9, false);
+  } else {
     return 0;
+  }
 }
 
-void XamShowDirtyDiscErrorUI()
-{
-    // Don't show UI, just return - let boot continue
-    MCLA_LOG_INFO("XamShowDirtyDiscErrorUI called (suppressed)");
+uint32_t NtSetInformationFile(uint32_t handle, XIO_STATUS_BLOCK *ioStatus,
+                              void *buffer, uint32_t length,
+                              uint32_t infoClass) {
+  (void)handle;
+  (void)ioStatus;
+  (void)buffer;
+  (void)length;
+  (void)infoClass;
 
-    // Dump the guest call chain so we can find which media check routed us
-    // here. EABI frames: back chain at [sp], saved LR at [sp+4].
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint64_t lr = g_ppcContext ? g_ppcContext->lr : 0;
-    uint32_t sp = g_ppcContext ? g_ppcContext->r1.u32 : 0;
-    for (int depth = 0; depth < 16; ++depth)
-    {
-        MCLA_LOG_INFO("  dirty-disc chain[{}]: lr=0x{:08X} sp=0x{:08X}", depth,
-                      static_cast<uint32_t>(lr), sp);
-        uint32_t nextSp = 0;
-        uint32_t nextLr = 0;
-        if (sp == 0 || !mem.ReadU32BE(sp, &nextSp) || !mem.ReadU32BE(sp + 4, &nextLr))
-            break;
-        if (nextSp <= sp || (nextSp & 3) != 0)
-            break;
-        lr = nextLr;
-        sp = nextSp;
+  // Common info classes: FilePositionInformation (14), FileEndOfFileInformation
+  // (20) For now, return success
+  if (ioStatus)
+    ioStatus->Status.set(STATUS_SUCCESS);
+  return STATUS_SUCCESS;
+}
+
+uint32_t FscSetCacheElementCount() { return 0; }
+
+uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
+                                 uint32_t Alertable, be<int64_t> *Timeout) {
+  // PRODUCER-DEATH CENSUS: see KeWaitForSingleObject note.
+  {
+    static std::atomic<uint32_t> s_wcNtw{0};
+    const uint32_t n = s_wcNtw.fetch_add(1) + 1;
+    const uint32_t lr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+    const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
+    if (hot || n <= 120 || (n % 300) == 0) {
+      MCLA_LOG_INFO("WAIT[NTWFSO] #{:05}{} tid={:08X} handle={:08X} "
+                    "alertable={} to={}ms lr={:08X}",
+                    n, hot ? "!" : " ", GetCurrentThreadId(), Handle, Alertable,
+                    GuestTimeoutToMilliseconds(Timeout), lr);
     }
-    spdlog::default_logger()->flush();
-}
-
-void XamEnableInactivityProcessing()
-{
-    // No-op - inactivity processing not needed for headless boot
-}
-
-void XamResetInactivity()
-{
-    // No-op
-}
-
-uint32_t XamShowMessageBoxUIEx(uint32_t userIndex, uint32_t flags, void* title, void* text, uint32_t buttons, uint32_t defaultButton, uint32_t* result, XXOVERLAPPED* overlapped)
-{
-    (void)userIndex;
-    (void)flags;
-    (void)title;
-    (void)text;
-    (void)buttons;
-    (void)defaultButton;
-    (void)overlapped;
-    if (result) *result = 1; // First button
-    return 0;
-}
-
-void XamLoaderTerminateTitle()
-{
-    // No-op - don't terminate
-    MCLA_LOG_INFO("XamLoaderTerminateTitle called");
-    spdlog::default_logger()->flush();
-}
-
-void XamGetExecutionId()
-{
-    // No-op - execution ID not needed
-}
-
-void XamLoaderLaunchTitle()
-{
-    // No-op - don't launch another title
-}
-
-uint32_t XamLoaderMediaGetInfo(uint32_t mediaId, void* infoBuffer)
-{
-    // Xbox 360 media info query. Game expects valid game disc.
-    // Returns XAM_MEDIA_TYPE_GAME_DVD (0x0C) on success.
-    if (g_ppcContext && infoBuffer)
-    {
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        // XAM_MEDIA_INFO structure: MediaType(4), MediaFlags(4), MediaId(4), etc.
-        uint8_t info[16] = {};
-        *reinterpret_cast<uint32_t*>(&info[0]) = __builtin_bswap32(0x0C); // XAM_MEDIA_TYPE_GAME_DVD
-        *reinterpret_cast<uint32_t*>(&info[4]) = __builtin_bswap32(0x0);  // MediaFlags
-        *reinterpret_cast<uint32_t*>(&info[8]) = __builtin_bswap32(0x0);  // MediaId
-        *reinterpret_cast<uint32_t*>(&info[12]) = __builtin_bswap32(0x0); // SessionId
-        (void)mem.WriteBytes(g_ppcContext->r4.u32, info, 16);
+  }
+  // MAIN-THREAD PARK PROBE
+  {
+    static std::atomic<uint32_t> s_parkLogs2{0};
+    uint32_t mainId = g_mainGuestThreadId.load();
+    if (mainId != 0 && GetCurrentThreadId() == mainId &&
+        s_parkLogs2.fetch_add(1) < 200) {
+      MCLA_LOG_INFO("[main-park] NtWaitForSingleObjectEx handle={:08X} "
+                    "alertable={} lr={:08X}",
+                    Handle, Alertable,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
-    return 0; // ERROR_SUCCESS
+  }
+  uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+  assert(timeout == 0 || timeout == INFINITE);
+
+  if (IsKernelObject(Handle)) {
+    const uint32_t st = GetKernelObject(Handle)->Wait(timeout);
+    {
+      static std::atomic<uint32_t> s_wcNtwR{0};
+      const uint32_t n = s_wcNtwR.fetch_add(1) + 1;
+      const uint32_t lr2 =
+          g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+      if ((lr2 >= 0x82410000u && lr2 < 0x82430000u) || n <= 120 ||
+          (n % 300) == 0)
+        MCLA_LOG_INFO("WAKE[NTWFSO] #{:05} tid={:08X} status={:08X} lr={:08X}",
+                      n, GetCurrentThreadId(), st, lr2);
+    }
+    return st;
+  } else {
+    assert(false && "Unrecognized handle value.");
+  }
+
+  return STATUS_TIMEOUT;
 }
 
-uint32_t XamLoaderGetDvdTrayState()
-{
-    // Xbox 360 DVD tray state. Must return CLOSED (0) for valid boot.
-    return 0; // XAM_LOADER_DVD_TRAY_STATE_CLOSED
-}
+uint32_t NtWriteFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
+                     uint32_t apcContext, XIO_STATUS_BLOCK *ioStatus,
+                     void *buffer, uint32_t length, be<uint64_t> *byteOffset,
+                     uint32_t *key) {
+  (void)handle;
+  (void)event;
+  (void)apcRoutine;
+  (void)apcContext;
+  (void)key;
+  (void)byteOffset;
 
-uint32_t XGetLanguage()
-{
-    return (uint32_t)Config::Language;
-}
-
-uint32_t XGetAVPack()
-{
-    // Returns the A/V pack type. 3 = HDMI (widescreen/HD).
-    // For 1280x720, return 3 (HDMI).
-    return 3;
-}
-
-void NtOpenFile()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void RtlInitAnsiString(XANSI_STRING* destination, char* source)
-{
-    const uint16_t length = source ? static_cast<uint16_t>(strlen(source)) : 0;
-    
-    destination->Length.set(length);
-    destination->MaximumLength.set(length + 1);
-    destination->Buffer = xpointer<char>(source);
-}
-
-uint32_t NtCreateFile
-(
-    be<uint32_t>* FileHandle,
-    uint32_t DesiredAccess,
-    XOBJECT_ATTRIBUTES* Attributes,
-    XIO_STATUS_BLOCK* IoStatusBlock,
-    uint64_t* AllocationSize,
-    uint32_t FileAttributes,
-    uint32_t ShareAccess,
-    uint32_t CreateDisposition,
-    uint32_t CreateOptions
-)
-{
-    (void)DesiredAccess;
-    (void)FileAttributes;
-    (void)ShareAccess;
-    (void)CreateDisposition;
-    (void)CreateOptions;
-    (void)AllocationSize;
-
-    if (!FileHandle || !Attributes || !IoStatusBlock)
-    {
-        return 0xC000000D; // STATUS_INVALID_PARAMETER
-    }
-
-    // Get the object name from attributes
-    XANSI_STRING* name = Attributes->Name.get();
-    if (!name || !name->Buffer)
-    {
-        IoStatusBlock->Status.set(0xC0000034); // STATUS_OBJECT_NAME_INVALID
-        return 0xC0000034;
-    }
-
-    // Read the ANSI string from guest memory
-    char guestPath[260];
-    uint16_t length = name->Length.get();
-    if (length >= sizeof(guestPath)) length = sizeof(guestPath) - 1;
-    
-    void* srcPtr = mcla::kernel::GuestMemoryHeap::Instance().Translate(name->Buffer.ptr);
-    if (!srcPtr)
-    {
-        IoStatusBlock->Status.set(0xC0000005); // STATUS_ACCESS_VIOLATION
-        return 0xC0000005;
-    }
-
-    memcpy(guestPath, srcPtr, length);
-    guestPath[length] = '\0';
-
-    // Open file via VFS
-    std::string virtualPath = mcla::vfs::GuestPathToVirtual(guestPath);
-    MCLA_LOG_INFO("NtCreateFile: '{}' -> '{}'", guestPath, virtualPath);
-
-    // Probe for .bik movie files
-    if (strstr(virtualPath.c_str(), ".bik") || strstr(virtualPath.c_str(), ".BIK"))
-    {
-        MCLA_LOG_INFO("BIK MOVIE OPEN: '{}' -> '{}'", guestPath, virtualPath);
-    }
-
-    mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
-    mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fileHandle;
-    if (!vfs.OpenFile(virtualPath, fileHandle))
-    {
-        // Raw device opens (\Device\Harddisk0\partition0 etc) have no VFS
-        // backing. The boot validation loop treats a failed open as fatal, so
-        // hand back an empty pseudo-file instead.
-        constexpr auto startsWithDevice = [](const char* p) {
-            return std::strncmp(p, "\\Device\\", 8) == 0 || std::strncmp(p, "/Device/", 8) == 0;
-        };
-        const bool isRawDevice = startsWithDevice(guestPath);
-        if (!isRawDevice)
-        {
-            MCLA_LOG_WARN("NtCreateFile: FAILED '{}' (guest '{}') -> STATUS_OBJECT_NAME_NOT_FOUND",
-                          virtualPath, guestPath);
-            IoStatusBlock->Status.set(0xC0000034); // STATUS_OBJECT_NAME_NOT_FOUND
-            return 0xC0000034;
-        }
-        MCLA_LOG_INFO("NtCreateFile: raw device '{}' -> empty pseudo-file", guestPath);
-        fileHandle = mcla::vfs::RpfVirtualFileSystem::OpenFileHandle{};
-        fileHandle.virtual_path = virtualPath;
-        fileHandle.size = 0;
-        fileHandle.position = 0;
-    }
-
-    // Create kernel file object - MUST live in the guest physical heap so the
-    // identity handle (its guest VA) round-trips through Translate(). Plain
-    // `new` yields host pointers that MapVirtual cannot represent.
-    auto* fileObj2 = CreateKernelObject<FileObject>(std::move(fileHandle));
-    uint32_t kernelHandle = GetKernelHandle(fileObj2);
-    FileHandle->set(kernelHandle);
-    MCLA_LOG_INFO("NtCreateFile: '{}' opened, handle={:08X}", virtualPath, kernelHandle);
-
-    IoStatusBlock->Status.set(STATUS_SUCCESS);
-    IoStatusBlock->Information.set(1); // FILE_OPENED
-
-    return STATUS_SUCCESS;
-}
-
-uint32_t NtClose(uint32_t handle)
-{
-    if (handle == GUEST_INVALID_HANDLE_VALUE)
-        return 0xFFFFFFFF;
-
-    if (IsKernelObject(handle))
-    {
-        KernelObject* obj = GetKernelObject(handle);
-        MCLA_LOG_INFO("NtClose: handle={:08X} valid={}", handle, obj ? obj->IsValid() : false);
-        if (obj && obj->IsValid())
-        {
-            // Try to close VFS file if it's a FileObject
-            FileObject* fileObj = dynamic_cast<FileObject*>(obj);
-            if (fileObj)
-            {
-                mcla::vfs::RpfVirtualFileSystem::Instance().CloseFile(fileObj->fileHandle);
-            }
-            DestroyKernelObject(obj);
-        }
-        // Handles we don't recognize as host wrappers (raw guest structs the
-        // game treats as handles) are simply ignored - closing them must not
-        // fault or tear down guest memory.
-        return 0;
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-
-uint32_t NtSetInformationFile(uint32_t handle, XIO_STATUS_BLOCK* ioStatus, void* buffer, uint32_t length, uint32_t infoClass)
-{
-    (void)handle;
-    (void)ioStatus;
-    (void)buffer;
-    (void)length;
-    (void)infoClass;
-
-    // Common info classes: FilePositionInformation (14), FileEndOfFileInformation (20)
-    // For now, return success
-    if (ioStatus) ioStatus->Status.set(STATUS_SUCCESS);
-    return STATUS_SUCCESS;
-}
-
-uint32_t FscSetCacheElementCount()
-{
-    return 0;
-}
-
-uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
-{
-    // PRODUCER-DEATH CENSUS: see KeWaitForSingleObject note.
-    {
-        static std::atomic<uint32_t> s_wcNtw{0};
-        const uint32_t n = s_wcNtw.fetch_add(1) + 1;
-        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
-        const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
-        if (hot || n <= 120 || (n % 300) == 0)
-        {
-            MCLA_LOG_INFO("WAIT[NTWFSO] #{:05}{} tid={:08X} handle={:08X} alertable={} to={}ms lr={:08X}",
-                          n, hot ? "!" : " ", GetCurrentThreadId(), Handle,
-                          Alertable, GuestTimeoutToMilliseconds(Timeout), lr);
-        }
-    }
-    // MAIN-THREAD PARK PROBE
-    {
-        static std::atomic<uint32_t> s_parkLogs2{0};
-        uint32_t mainId = g_mainGuestThreadId.load();
-        if (mainId != 0 && GetCurrentThreadId() == mainId && s_parkLogs2.fetch_add(1) < 200)
-        {
-            MCLA_LOG_INFO("[main-park] NtWaitForSingleObjectEx handle={:08X} alertable={} lr={:08X}",
-                          Handle, Alertable, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
-    }
-    uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == 0 || timeout == INFINITE);
-
-    if (IsKernelObject(Handle))
-    {
-        const uint32_t st = GetKernelObject(Handle)->Wait(timeout);
-        {
-            static std::atomic<uint32_t> s_wcNtwR{0};
-            const uint32_t n = s_wcNtwR.fetch_add(1) + 1;
-            const uint32_t lr2 = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
-            if ((lr2 >= 0x82410000u && lr2 < 0x82430000u) || n <= 120 || (n % 300) == 0)
-                MCLA_LOG_INFO("WAKE[NTWFSO] #{:05} tid={:08X} status={:08X} lr={:08X}",
-                              n, GetCurrentThreadId(), st, lr2);
-        }
-        return st;
-    }
-    else
-    {
-        assert(false && "Unrecognized handle value.");
-    }
-
-    return STATUS_TIMEOUT;
-}
-
-uint32_t NtWriteFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, XIO_STATUS_BLOCK* ioStatus, void* buffer, uint32_t length, be<uint64_t>* byteOffset, uint32_t* key)
-{
-    (void)handle;
-    (void)event;
-    (void)apcRoutine;
-    (void)apcContext;
-    (void)key;
-    (void)byteOffset;
-
-    if (buffer == nullptr || length == 0)
-    {
-        if (ioStatus) ioStatus->Status.set(STATUS_SUCCESS);
-        return STATUS_SUCCESS;
-    }
-
-    auto& guestMem = mcla::kernel::GuestMemoryHeap::Instance();
-    const uint32_t bufferAddr = guestMem.MapVirtual(buffer);
-    void* hostPtr = (bufferAddr != 0) ? guestMem.Translate(bufferAddr) : nullptr;
-    if (!hostPtr)
-    {
-        if (ioStatus) ioStatus->Status.set(0xC0000005);
-        return 0xC0000005;
-    }
-
+  if (buffer == nullptr || length == 0) {
     if (ioStatus)
-    {
-        ioStatus->Status.set(STATUS_SUCCESS);
-        ioStatus->Information.set(length);
-    }
+      ioStatus->Status.set(STATUS_SUCCESS);
     return STATUS_SUCCESS;
+  }
+
+  auto &guestMem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t bufferAddr = guestMem.MapVirtual(buffer);
+  void *hostPtr = (bufferAddr != 0) ? guestMem.Translate(bufferAddr) : nullptr;
+  if (!hostPtr) {
+    if (ioStatus)
+      ioStatus->Status.set(0xC0000005);
+    return 0xC0000005;
+  }
+
+  if (ioStatus) {
+    ioStatus->Status.set(STATUS_SUCCESS);
+    ioStatus->Information.set(length);
+  }
+  return STATUS_SUCCESS;
 }
 
-void vsprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void vsprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
 
-uint32_t ExGetXConfigSetting(uint16_t Category, uint16_t Setting, void* Buffer, uint16_t SizeOfBuffer, be<uint32_t>* RequiredSize)
-{
-    uint32_t data[4]{};
+uint32_t ExGetXConfigSetting(uint16_t Category, uint16_t Setting, void *Buffer,
+                             uint16_t SizeOfBuffer,
+                             be<uint32_t> *RequiredSize) {
+  uint32_t data[4]{};
 
-    switch (Category)
-    {
-        // XCONFIG_SECURED_CATEGORY
-        case 0x0002:
-        {
-            switch (Setting)
-            {
-                // XCONFIG_SECURED_AV_REGION
-                case 0x0002:
-                    data[0] = ByteSwap(0x00001000); // USA/Canada
-                    break;
+  switch (Category) {
+  // XCONFIG_SECURED_CATEGORY
+  case 0x0002: {
+    switch (Setting) {
+    // XCONFIG_SECURED_AV_REGION
+    case 0x0002:
+      data[0] = ByteSwap(0x00001000); // USA/Canada
+      break;
 
-                default:
-                    return 1;
-            }
-        }
-
-        case 0x0003:
-        {
-            switch (Setting)
-            {
-                case 0x0001: // XCONFIG_USER_TIME_ZONE_BIAS
-                case 0x0002: // XCONFIG_USER_TIME_ZONE_STD_NAME
-                case 0x0003: // XCONFIG_USER_TIME_ZONE_DLT_NAME
-                case 0x0004: // XCONFIG_USER_TIME_ZONE_STD_DATE
-                case 0x0005: // XCONFIG_USER_TIME_ZONE_DLT_DATE
-                case 0x0006: // XCONFIG_USER_TIME_ZONE_STD_BIAS
-                case 0x0007: // XCONFIG_USER_TIME_ZONE_DLT_BIAS
-                    data[0] = 0;
-                    break;
-
-                // XCONFIG_USER_LANGUAGE
-                case 0x0009:
-                    data[0] = ByteSwap((uint32_t)Config::Language);
-                    break;
-
-                // XCONFIG_USER_VIDEO_FLAGS
-                case 0x000A:
-                    data[0] = ByteSwap(0x00040000);
-                    break;
-
-                // XCONFIG_USER_RETAIL_FLAGS
-                case 0x000C:
-                    data[0] = ByteSwap(1);
-                    break;
-
-                // XCONFIG_USER_COUNTRY
-                case 0x000E:
-                    data[0] = ByteSwap(103);
-                    break;
-
-                default:
-                    return 1;
-            }
-        }
+    default:
+      return 1;
     }
+  }
 
-    *RequiredSize = 4;
-    memcpy(Buffer, data, std::min((size_t)SizeOfBuffer, sizeof(data)));
+  case 0x0003: {
+    switch (Setting) {
+    case 0x0001: // XCONFIG_USER_TIME_ZONE_BIAS
+    case 0x0002: // XCONFIG_USER_TIME_ZONE_STD_NAME
+    case 0x0003: // XCONFIG_USER_TIME_ZONE_DLT_NAME
+    case 0x0004: // XCONFIG_USER_TIME_ZONE_STD_DATE
+    case 0x0005: // XCONFIG_USER_TIME_ZONE_DLT_DATE
+    case 0x0006: // XCONFIG_USER_TIME_ZONE_STD_BIAS
+    case 0x0007: // XCONFIG_USER_TIME_ZONE_DLT_BIAS
+      data[0] = 0;
+      break;
 
-    return 0;
+    // XCONFIG_USER_LANGUAGE
+    case 0x0009:
+      data[0] = ByteSwap((uint32_t)Config::Language);
+      break;
+
+    // XCONFIG_USER_VIDEO_FLAGS
+    case 0x000A:
+      data[0] = ByteSwap(0x00040000);
+      break;
+
+    // XCONFIG_USER_RETAIL_FLAGS
+    case 0x000C:
+      data[0] = ByteSwap(1);
+      break;
+
+    // XCONFIG_USER_COUNTRY
+    case 0x000E:
+      data[0] = ByteSwap(103);
+      break;
+
+    default:
+      return 1;
+    }
+  }
+  }
+
+  *RequiredSize = 4;
+  memcpy(Buffer, data, std::min((size_t)SizeOfBuffer, sizeof(data)));
+
+  return 0;
 }
 
 namespace {
@@ -790,200 +719,184 @@ constexpr uint32_t kXPageReadWrite = 0x00000004;
 
 using VirtualRegionInfo = mcla::kernel::GuestMemoryHeap::VirtualRegionInfo;
 
-constexpr uint32_t kVirtPageSize = mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
-inline uint32_t RoundUp64K(uint32_t v) { return (v + kVirtPageSize - 1) & ~(kVirtPageSize - 1); }
+constexpr uint32_t kVirtPageSize =
+    mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
+inline uint32_t RoundUp64K(uint32_t v) {
+  return (v + kVirtPageSize - 1) & ~(kVirtPageSize - 1);
+}
 
 // Allocation census for the virtual-memory surface (P2): every call, first
 // 500 then every 500th. Proves which VAs the game asks for and what we grant.
-void LogVirtualAlloc(const char* api, uint32_t baseIn, uint32_t baseOut, uint32_t size,
-                     uint32_t type, uint32_t status)
-{
-    static std::atomic<uint32_t> s_allocCalls{0};
-    const uint32_t n = s_allocCalls.fetch_add(1) + 1;
-    if (n <= 500 || n % 500 == 0)
-    {
-        MCLA_LOG_INFO("{} #{} base={:08X}->{} size={:08X} type={:08X} st={:08X} lr={:08X}",
-                      api, n, baseIn, baseOut, size, type, status,
-                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    }
+void LogVirtualAlloc(const char *api, uint32_t baseIn, uint32_t baseOut,
+                     uint32_t size, uint32_t type, uint32_t status) {
+  static std::atomic<uint32_t> s_allocCalls{0};
+  const uint32_t n = s_allocCalls.fetch_add(1) + 1;
+  if (n <= 500 || n % 500 == 0) {
+    MCLA_LOG_INFO(
+        "{} #{} base={:08X}->{} size={:08X} type={:08X} st={:08X} lr={:08X}",
+        api, n, baseIn, baseOut, size, type, status,
+        static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
 }
 } // namespace
 
-uint32_t NtQueryVirtualMemory(uint32_t baseAddress, be<uint32_t>* memoryBasicInformation)
-{
-    // Xbox 360 semantics (Xenia): (PVOID BaseAddress, PMEMORY_BASIC_INFORMATION).
-    // X_MEMORY_BASIC_INFORMATION = 7 BE dwords:
-    //   base_address, allocation_base, allocation_protect, region_size,
-    //   state (COMMIT/RESERVE/FREE), protect, type (X_MEM_PRIVATE).
-    if (!memoryBasicInformation)
-        return STATUS_INVALID_PARAMETER;
+uint32_t NtQueryVirtualMemory(uint32_t baseAddress,
+                              be<uint32_t> *memoryBasicInformation) {
+  // Xbox 360 semantics (Xenia): (PVOID BaseAddress, PMEMORY_BASIC_INFORMATION).
+  // X_MEMORY_BASIC_INFORMATION = 7 BE dwords:
+  //   base_address, allocation_base, allocation_protect, region_size,
+  //   state (COMMIT/RESERVE/FREE), protect, type (X_MEM_PRIVATE).
+  if (!memoryBasicInformation)
+    return STATUS_INVALID_PARAMETER;
 
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    VirtualRegionInfo info;
-    if (!mem.QueryVirtualRegion(baseAddress, &info))
-        return STATUS_INVALID_PARAMETER;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  VirtualRegionInfo info;
+  if (!mem.QueryVirtualRegion(baseAddress, &info))
+    return STATUS_INVALID_PARAMETER;
 
-    const uint32_t xState =
-        info.committed ? kXMemCommit : (info.reserved ? kXMemReserve : kXMemFree);
-    const uint32_t xProtect =
-        (baseAddress != 0 && !info.reserved) ? 0 : kXPageReadWrite;
+  const uint32_t xState =
+      info.committed ? kXMemCommit : (info.reserved ? kXMemReserve : kXMemFree);
+  const uint32_t xProtect =
+      (baseAddress != 0 && !info.reserved) ? 0 : kXPageReadWrite;
 
-    memoryBasicInformation[0].set(info.base);
-    memoryBasicInformation[1].set(info.allocationBase);
-    memoryBasicInformation[2].set(xProtect);
-    memoryBasicInformation[3].set(info.size);
-    memoryBasicInformation[4].set(xState);
-    memoryBasicInformation[5].set(xProtect);
-    memoryBasicInformation[6].set(kXMemPrivate);
+  memoryBasicInformation[0].set(info.base);
+  memoryBasicInformation[1].set(info.allocationBase);
+  memoryBasicInformation[2].set(xProtect);
+  memoryBasicInformation[3].set(info.size);
+  memoryBasicInformation[4].set(xState);
+  memoryBasicInformation[5].set(xProtect);
+  memoryBasicInformation[6].set(kXMemPrivate);
 
-    static std::atomic<uint32_t> s_queryCalls{0};
-    const uint32_t n = s_queryCalls.fetch_add(1) + 1;
-    if (n <= 64 || n % 500 == 0)
-    {
-        MCLA_LOG_INFO("NtQueryVM #{} base={:08X} region={:08X} size={:08X} state={:08X} lr={:08X}",
-                      n, baseAddress, info.base, info.size, xState,
-                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  static std::atomic<uint32_t> s_queryCalls{0};
+  const uint32_t n = s_queryCalls.fetch_add(1) + 1;
+  if (n <= 64 || n % 500 == 0) {
+    MCLA_LOG_INFO("NtQueryVM #{} base={:08X} region={:08X} size={:08X} "
+                  "state={:08X} lr={:08X}",
+                  n, baseAddress, info.base, info.size, xState,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  return STATUS_SUCCESS;
+}
+
+void MmQueryStatistics() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t NtCreateEvent(be<uint32_t> *handle, void *objAttributes,
+                       uint32_t eventType, uint32_t initialState) {
+  *handle =
+      GetKernelHandle(CreateKernelObject<Event>(!eventType, !!initialState));
+
+  // EVENT-CREATE CENSUS (2026-08-23 session 10): handle -> creation-LR map.
+  // The TU83 driver worker waits on event [0x827D3738+52]=C9ADB800; matching
+  // that handle against this census identifies the creation site statically.
+  {
+    static std::atomic<uint32_t> s_evtCreates{0};
+    const uint32_t n = s_evtCreates.fetch_add(1) + 1;
+    if (n <= 500) {
+      MCLA_LOG_INFO("EVENT-CREATE #{} h={:08X} type={} init={} lr={:08X}", n,
+                    static_cast<uint32_t>(*handle), eventType, initialState,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      // TARGETED CENSUS for C9ADB800 (TU83 worker wait event)
+      if (static_cast<uint32_t>(*handle) == 0xC9ADB800) {
+        MCLA_LOG_WARN(
+            "EVENT-CREATE TARGET C9ADB800 h={:08X} type={} init={} lr={:08X}",
+            static_cast<uint32_t>(*handle), eventType, initialState,
+            static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      }
     }
-    return STATUS_SUCCESS;
+  }
+
+  return 0;
 }
 
-void MmQueryStatistics()
-{
-    LOG_UTILITY("!!! STUB !!!");
+uint32_t XexCheckExecutablePrivilege() {
+  // Returns 1 if the executable has the required privilege (signed, valid
+  // signature, etc.) For dev mode: always return success so the game proceeds
+  // past the XEX check
+  return 1;
 }
 
-uint32_t NtCreateEvent(be<uint32_t>* handle, void* objAttributes, uint32_t eventType, uint32_t initialState)
-{
-    *handle = GetKernelHandle(CreateKernelObject<Event>(!eventType, !!initialState));
+void DbgPrint() { LOG_UTILITY("!!! STUB !!!"); }
 
-    // EVENT-CREATE CENSUS (2026-08-23 session 10): handle -> creation-LR map.
-    // The TU83 driver worker waits on event [0x827D3738+52]=C9ADB800; matching
-    // that handle against this census identifies the creation site statically.
-    {
-        static std::atomic<uint32_t> s_evtCreates{0};
-        const uint32_t n = s_evtCreates.fetch_add(1) + 1;
-        if (n <= 500)
-        {
-            MCLA_LOG_INFO("EVENT-CREATE #{} h={:08X} type={} init={} lr={:08X}",
-                          n, static_cast<uint32_t>(*handle), eventType, initialState,
-                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-            // TARGETED CENSUS for C9ADB800 (TU83 worker wait event)
-            if (static_cast<uint32_t>(*handle) == 0xC9ADB800) {
-                MCLA_LOG_WARN("EVENT-CREATE TARGET C9ADB800 h={:08X} type={} init={} lr={:08X}",
-                              static_cast<uint32_t>(*handle), eventType, initialState,
-                              static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-            }
-        }
+void __C_specific_handler_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlNtStatusToDosError() { LOG_UTILITY("!!! STUB !!!"); }
+
+void XexGetProcedureAddress() { LOG_UTILITY("!!! STUB !!!"); }
+
+void XexGetModuleSection() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t RtlUnicodeToMultiByteN(char *MultiByteString,
+                                uint32_t MaxBytesInMultiByteString,
+                                be<uint32_t> *BytesInMultiByteString,
+                                const be<uint16_t> *UnicodeString,
+                                uint32_t BytesInUnicodeString) {
+  const auto reqSize = BytesInUnicodeString / sizeof(uint16_t);
+
+  if (BytesInMultiByteString)
+    BytesInMultiByteString->set(reqSize);
+
+  if (reqSize > MaxBytesInMultiByteString)
+    return STATUS_FAIL_CHECK;
+
+  const be<uint16_t> *src = UnicodeString;
+  if (!src)
+    return STATUS_FAIL_CHECK;
+
+  for (size_t i = 0; i < reqSize; i++) {
+    uint16_t c = src[i].get();
+
+    MultiByteString[i] = c < 256 ? static_cast<char>(c) : '?';
+  }
+
+  return STATUS_SUCCESS;
+}
+
+uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable,
+                                be<int64_t> *Timeout) {
+  // We don't do async file reads.
+  if (Alertable)
+    return STATUS_USER_APC;
+
+  uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+
+  // PRODUCER-DEATH CENSUS: long delays from the driver range are producer
+  // parks in a timing loop (classification D candidates).
+  {
+    static std::atomic<uint32_t> s_wcDelay{0};
+    const uint32_t lr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+    const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
+    if ((hot && timeout >= 1) || ++s_wcDelay <= 60) {
+      MCLA_LOG_INFO("WAIT[KDELAY] tid={:08X} to={}ms lr={:08X}{}",
+                    GetCurrentThreadId(), timeout, lr, hot ? " !" : "");
     }
+  }
 
-    return 0;
-}
-
-uint32_t XexCheckExecutablePrivilege()
-{
-    // Returns 1 if the executable has the required privilege (signed, valid signature, etc.)
-    // For dev mode: always return success so the game proceeds past the XEX check
-    return 1;
-}
-
-void DbgPrint()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void __C_specific_handler_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void RtlNtStatusToDosError()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void XexGetProcedureAddress()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void XexGetModuleSection()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t RtlUnicodeToMultiByteN(char* MultiByteString, uint32_t MaxBytesInMultiByteString, be<uint32_t>* BytesInMultiByteString, const be<uint16_t>* UnicodeString, uint32_t BytesInUnicodeString)
-{
-    const auto reqSize = BytesInUnicodeString / sizeof(uint16_t);
-
-    if (BytesInMultiByteString)
-        BytesInMultiByteString->set(reqSize);
-
-    if (reqSize > MaxBytesInMultiByteString)
-        return STATUS_FAIL_CHECK;
-
-    const be<uint16_t>* src = UnicodeString;
-    if (!src)
-        return STATUS_FAIL_CHECK;
-
-    for (size_t i = 0; i < reqSize; i++)
-    {
-        uint16_t c = src[i].get();
-
-        MultiByteString[i] = c < 256 ? static_cast<char>(c) : '?';
+  // MAIN-THREAD PARK PROBE: name where the guest main loop sleeps.
+  {
+    static std::atomic<uint32_t> s_parkLogs{0};
+    uint32_t mainId = g_mainGuestThreadId.load();
+    if (mainId != 0 && GetCurrentThreadId() == mainId && timeout >= 8 &&
+        s_parkLogs.fetch_add(1) < 200) {
+      MCLA_LOG_INFO("[main-park] KeDelayExecutionThread timeout={}ms lr={:08X}",
+                    timeout,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
-
-    return STATUS_SUCCESS;
-}
-
-uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
-{
-    // We don't do async file reads.
-    if (Alertable)
-        return STATUS_USER_APC;
-
-    uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-
-    // PRODUCER-DEATH CENSUS: long delays from the driver range are producer
-    // parks in a timing loop (classification D candidates).
-    {
-        static std::atomic<uint32_t> s_wcDelay{0};
-        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
-        const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
-        if ((hot && timeout >= 1) || ++s_wcDelay <= 60)
-        {
-            MCLA_LOG_INFO("WAIT[KDELAY] tid={:08X} to={}ms lr={:08X}{}",
-                          GetCurrentThreadId(), timeout, lr, hot ? " !" : "");
-        }
-    }
-
-    // MAIN-THREAD PARK PROBE: name where the guest main loop sleeps.
-    {
-        static std::atomic<uint32_t> s_parkLogs{0};
-        uint32_t mainId = g_mainGuestThreadId.load();
-        if (mainId != 0 && GetCurrentThreadId() == mainId && timeout >= 8 &&
-            s_parkLogs.fetch_add(1) < 200)
-        {
-            MCLA_LOG_INFO("[main-park] KeDelayExecutionThread timeout={}ms lr={:08X}",
-                          timeout, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
-    }
+  }
 
 #ifdef _WIN32
-    Sleep(timeout);
+  Sleep(timeout);
 #else
-    if (timeout == 0)
-        std::this_thread::yield();
-    else
-        std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+  if (timeout == 0)
+    std::this_thread::yield();
+  else
+    std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
 #endif
 
-    return STATUS_SUCCESS;
+  return STATUS_SUCCESS;
 }
 
-void ExFreePool()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void ExFreePool() { LOG_UTILITY("!!! STUB !!!"); }
 
 // NtQueryInformationFile: real typed implementation lives above (near
 // NtCreateFile) - it answers X_FILE_STANDARD_INFORMATION with true sizes.
@@ -993,966 +906,860 @@ void ExFreePool()
 // which is exactly why packfile loading reported "Cannot load archive" without
 // a single read. All three are typed + hooked now.
 
-uint32_t NtQueryVolumeInformationFile(uint32_t handle, XIO_STATUS_BLOCK* ioStatus, void* fsInfo, uint32_t length, uint32_t infoClass)
-{
-    (void)handle;
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    MCLA_LOG_INFO("NtQueryVolumeInformationFile: class={} len={}", infoClass, length);
-    if (fsInfo)
-    {
-        // zero-filled volume info = "empty fixed volume"; refine per class when
-        // boot proves it matters
-        const uint32_t addr = mem.MapVirtual(fsInfo);
-        const uint32_t n = std::min<uint32_t>(length, 64);
-        for (uint32_t off = 0; addr != 0 && off < n; off += 4) (void)mem.WriteU32BE(addr + off, 0);
-    }
+uint32_t NtQueryVolumeInformationFile(uint32_t handle,
+                                      XIO_STATUS_BLOCK *ioStatus, void *fsInfo,
+                                      uint32_t length, uint32_t infoClass) {
+  (void)handle;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  MCLA_LOG_INFO("NtQueryVolumeInformationFile: class={} len={}", infoClass,
+                length);
+  if (fsInfo) {
+    // zero-filled volume info = "empty fixed volume"; refine per class when
+    // boot proves it matters
+    const uint32_t addr = mem.MapVirtual(fsInfo);
+    const uint32_t n = std::min<uint32_t>(length, 64);
+    for (uint32_t off = 0; addr != 0 && off < n; off += 4)
+      (void)mem.WriteU32BE(addr + off, 0);
+  }
+  if (ioStatus) {
+    ioStatus->Status.set(STATUS_SUCCESS);
+    ioStatus->Information.set(fsInfo ? std::min<uint32_t>(length, 64) : 0);
+  }
+  return STATUS_SUCCESS;
+}
+
+uint32_t NtQueryDirectoryFile(uint32_t handle, uint32_t event,
+                              uint32_t apcRoutine, uint32_t apcContext,
+                              XIO_STATUS_BLOCK *ioStatus, void *fileInformation,
+                              uint32_t length, uint32_t infoClass,
+                              uint32_t singleEntry, uint32_t dirIndex,
+                              uint32_t restartScan) {
+  (void)handle;
+  (void)event;
+  (void)apcRoutine;
+  (void)apcContext;
+  (void)fileInformation;
+  (void)length;
+  (void)infoClass;
+  (void)singleEntry;
+  (void)dirIndex;
+  (void)restartScan;
+  MCLA_LOG_INFO("NtQueryDirectoryFile: class={}", infoClass);
+  if (ioStatus)
+    ioStatus->Status.set(0x80000006); // STATUS_NO_MORE_FILES
+  return 0x80000006;
+}
+
+uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
+                    uint32_t apcContext, XIO_STATUS_BLOCK *ioStatus,
+                    void *buffer, uint32_t length, be<uint64_t> *byteOffset,
+                    uint32_t *key) {
+  (void)event;
+  (void)apcRoutine;
+  (void)apcContext;
+  (void)key;
+
+  if (buffer == nullptr || length == 0) {
     if (ioStatus)
-    {
-        ioStatus->Status.set(STATUS_SUCCESS);
-        ioStatus->Information.set(fsInfo ? std::min<uint32_t>(length, 64) : 0);
-    }
+      ioStatus->Status.set(STATUS_SUCCESS);
     return STATUS_SUCCESS;
-}
+  }
 
-uint32_t NtQueryDirectoryFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, XIO_STATUS_BLOCK* ioStatus, void* fileInformation, uint32_t length, uint32_t infoClass, uint32_t singleEntry, uint32_t dirIndex, uint32_t restartScan)
-{
-    (void)handle; (void)event; (void)apcRoutine; (void)apcContext;
-    (void)fileInformation; (void)length; (void)infoClass; (void)singleEntry; (void)dirIndex; (void)restartScan;
-    MCLA_LOG_INFO("NtQueryDirectoryFile: class={}", infoClass);
-    if (ioStatus) ioStatus->Status.set(0x80000006); // STATUS_NO_MORE_FILES
-    return 0x80000006;
-}
-
-uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine, uint32_t apcContext, XIO_STATUS_BLOCK* ioStatus, void* buffer, uint32_t length, be<uint64_t>* byteOffset, uint32_t* key)
-{
-    (void)event;
-    (void)apcRoutine;
-    (void)apcContext;
-    (void)key;
-
-    if (buffer == nullptr || length == 0)
-    {
-        if (ioStatus) ioStatus->Status.set(STATUS_SUCCESS);
-        return STATUS_SUCCESS;
-    }
-
-    auto& guestMem = mcla::kernel::GuestMemoryHeap::Instance();
-    const uint32_t bufferAddr = guestMem.MapVirtual(buffer);
-    void* hostPtr = (bufferAddr != 0) ? guestMem.Translate(bufferAddr) : nullptr;
-    if (!hostPtr)
-    {
-        if (ioStatus) ioStatus->Status.set(0xC0000005);
-        return 0xC0000005;
-    }
-
-    // SECURITY: clamp length so the write stays inside the guest window -
-    // Translate() only validates the buffer START, a huge length would
-    // otherwise write out-of-bounds host memory past the window end.
-    {
-        auto& heapForBounds = mcla::kernel::GuestMemoryHeap::Instance();
-        const uint64_t winSize = heapForBounds.Size();
-        const uint64_t bufOff = bufferAddr;
-        if (bufOff < winSize && length > winSize - bufOff)
-        {
-            length = static_cast<uint32_t>(winSize - bufOff);
-        }
-    }
-
-    // Resolve the kernel file object and serve real bytes from the VFS.
-    FileObject* fileObj = nullptr;
-    if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle))
-    {
-        KernelObject* obj = GetKernelObject(handle);
-        if (obj && obj->IsValid()) fileObj = dynamic_cast<FileObject*>(obj);
-    }
-
-    uint64_t bytesRead = 0;
-    bool ok = false;
-    if (fileObj)
-    {
-        auto& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
-        uint64_t offset = 0;
-        if (byteOffset)
-        {
-            offset = byteOffset->get();
-            vfs.SeekFile(fileObj->fileHandle, static_cast<int64_t>(offset), 0 /* FILE_BEGIN */);
-        }
-        else
-        {
-            offset = fileObj->fileHandle.position;
-        }
-        ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
-        MCLA_LOG_DEBUG("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes", handle, offset, length, bytesRead);
-    }
-    else
-    {
-        // Non-VFS handles (device opens etc): zero-fill keeps legacy behavior.
-        std::memset(hostPtr, 0, length);
-        bytesRead = length;
-        ok = true;
-    }
-
+  auto &guestMem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t bufferAddr = guestMem.MapVirtual(buffer);
+  void *hostPtr = (bufferAddr != 0) ? guestMem.Translate(bufferAddr) : nullptr;
+  if (!hostPtr) {
     if (ioStatus)
-    {
-        ioStatus->Status.set(ok ? STATUS_SUCCESS : 0xC000000D);
-        ioStatus->Information.set(static_cast<uint64_t>(bytesRead));
+      ioStatus->Status.set(0xC0000005);
+    return 0xC0000005;
+  }
+
+  // SECURITY: clamp length so the write stays inside the guest window -
+  // Translate() only validates the buffer START, a huge length would
+  // otherwise write out-of-bounds host memory past the window end.
+  {
+    auto &heapForBounds = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint64_t winSize = heapForBounds.Size();
+    const uint64_t bufOff = bufferAddr;
+    if (bufOff < winSize && length > winSize - bufOff) {
+      length = static_cast<uint32_t>(winSize - bufOff);
     }
-    return ok ? STATUS_SUCCESS : 0xC000000D;
+  }
+
+  // Resolve the kernel file object and serve real bytes from the VFS.
+  FileObject *fileObj = nullptr;
+  if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle)) {
+    KernelObject *obj = GetKernelObject(handle);
+    if (obj && obj->IsValid())
+      fileObj = dynamic_cast<FileObject *>(obj);
+  }
+
+  uint64_t bytesRead = 0;
+  bool ok = false;
+  if (fileObj) {
+    auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+    uint64_t offset = 0;
+    if (byteOffset) {
+      offset = byteOffset->get();
+      vfs.SeekFile(fileObj->fileHandle, static_cast<int64_t>(offset),
+                   0 /* FILE_BEGIN */);
+    } else {
+      offset = fileObj->fileHandle.position;
+    }
+    ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
+    MCLA_LOG_DEBUG("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes", handle,
+                   offset, length, bytesRead);
+  } else {
+    // Non-VFS handles (device opens etc): zero-fill keeps legacy behavior.
+    std::memset(hostPtr, 0, length);
+    bytesRead = length;
+    ok = true;
+  }
+
+  if (ioStatus) {
+    ioStatus->Status.set(ok ? STATUS_SUCCESS : 0xC000000D);
+    ioStatus->Information.set(static_cast<uint64_t>(bytesRead));
+  }
+  return ok ? STATUS_SUCCESS : 0xC000000D;
 }
 
-uint32_t NtReadFileScatter()
-{
-    LOG_UTILITY("!!! STUB !!!");
-    return STATUS_SUCCESS;
+uint32_t NtReadFileScatter() {
+  LOG_UTILITY("!!! STUB !!!");
+  return STATUS_SUCCESS;
 }
 
-void NtDuplicateObject()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void NtDuplicateObject() { LOG_UTILITY("!!! STUB !!!"); }
 
-uint32_t NtAllocateVirtualMemory(be<uint32_t>* baseAddress, be<uint32_t>* regionSize,
-                                 uint32_t allocationType, uint32_t protect /*, debugMemory r7 ignored */)
-{
-    // Xbox 360 semantics (Xenia xboxkrnl_memory.cc NtAllocateVirtualMemory_entry):
-    // _Inout_ PVOID *BaseAddress, _Inout_ PSIZE_T RegionSize,
-    // _In_ ULONG AllocationType, _In_ ULONG Protect, _In_ BOOLEAN DebugMemory.
-    // Explicit bases MUST land in the guest-virtual window AND must actually
-    // be reservable; success merely because Translate() succeeds was a bug
-    // (it ACKed reservations we never made, letting two systems share pages).
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+uint32_t
+NtAllocateVirtualMemory(be<uint32_t> *baseAddress, be<uint32_t> *regionSize,
+                        uint32_t allocationType,
+                        uint32_t protect /*, debugMemory r7 ignored */) {
+  // Xbox 360 semantics (Xenia xboxkrnl_memory.cc
+  // NtAllocateVirtualMemory_entry): _Inout_ PVOID *BaseAddress, _Inout_ PSIZE_T
+  // RegionSize, _In_ ULONG AllocationType, _In_ ULONG Protect, _In_ BOOLEAN
+  // DebugMemory. Explicit bases MUST land in the guest-virtual window AND must
+  // actually be reservable; success merely because Translate() succeeds was a
+  // bug (it ACKed reservations we never made, letting two systems share pages).
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
 
-    if (!baseAddress || !regionSize)
-        return STATUS_INVALID_PARAMETER;
+  if (!baseAddress || !regionSize)
+    return STATUS_INVALID_PARAMETER;
 
-    const uint32_t baseIn = baseAddress->get();
-    const int32_t sizeSigned = static_cast<int32_t>(regionSize->get());
+  const uint32_t baseIn = baseAddress->get();
+  const int32_t sizeSigned = static_cast<int32_t>(regionSize->get());
 
-    if (sizeSigned == 0)
-        return STATUS_INVALID_PARAMETER;
-    if (!(allocationType & (kXMemCommit | kXMemReset | kXMemReserve)))
-        return STATUS_INVALID_PARAMETER;
-    if ((allocationType & kXMemReset) && (allocationType & ~kXMemReset))
-        return STATUS_INVALID_PARAMETER;
+  if (sizeSigned == 0)
+    return STATUS_INVALID_PARAMETER;
+  if (!(allocationType & (kXMemCommit | kXMemReset | kXMemReserve)))
+    return STATUS_INVALID_PARAMETER;
+  if ((allocationType & kXMemReset) && (allocationType & ~kXMemReset))
+    return STATUS_INVALID_PARAMETER;
 
-    // Guest-virtual window only; physical/heap ranges are not this API's space.
-    if (baseIn != 0 &&
-        (baseIn < mcla::kernel::GuestMemoryHeap::kGuestVirtualBase ||
-         baseIn >= mcla::kernel::GuestMemoryHeap::kGuestVirtualEnd))
-    {
-        MCLA_LOG_WARN("NtAllocVM: base {:08X} outside guest-virtual window", baseIn);
-        LogVirtualAlloc("NtAllocVM", baseIn, 0, static_cast<uint32_t>(sizeSigned),
-                        allocationType, STATUS_INVALID_PARAMETER);
-        return STATUS_INVALID_PARAMETER;
-    }
+  // Guest-virtual window only; physical/heap ranges are not this API's space.
+  if (baseIn != 0 &&
+      (baseIn < mcla::kernel::GuestMemoryHeap::kGuestVirtualBase ||
+       baseIn >= mcla::kernel::GuestMemoryHeap::kGuestVirtualEnd)) {
+    MCLA_LOG_WARN("NtAllocVM: base {:08X} outside guest-virtual window",
+                  baseIn);
+    LogVirtualAlloc("NtAllocVM", baseIn, 0, static_cast<uint32_t>(sizeSigned),
+                    allocationType, STATUS_INVALID_PARAMETER);
+    return STATUS_INVALID_PARAMETER;
+  }
 
-    const uint32_t pageSize = mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
-    const uint32_t adjustedBase = baseIn - (baseIn % pageSize);
-    const uint32_t adjustedSize =
-        RoundUp64K(static_cast<uint32_t>(sizeSigned < 0 ? -sizeSigned : sizeSigned));
+  const uint32_t pageSize =
+      mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
+  const uint32_t adjustedBase = baseIn - (baseIn % pageSize);
+  const uint32_t adjustedSize = RoundUp64K(
+      static_cast<uint32_t>(sizeSigned < 0 ? -sizeSigned : sizeSigned));
 
-    bool commit = (allocationType & kXMemCommit) != 0;
-    const bool zeroFresh = (allocationType & kXMemNozero) == 0;
+  bool commit = (allocationType & kXMemCommit) != 0;
+  const bool zeroFresh = (allocationType & kXMemNozero) == 0;
 
-    uint32_t address = 0;
-    uint32_t status = STATUS_SUCCESS;
-    if (adjustedBase != 0)
-    {
-        bool wasCommitted = false;
-        if (!mem.AllocVirtualFixed(adjustedBase, adjustedSize, commit, zeroFresh, &wasCommitted))
-            status = STATUS_NO_MEMORY;
-        else
-            address = adjustedBase;
-    }
+  uint32_t address = 0;
+  uint32_t status = STATUS_SUCCESS;
+  if (adjustedBase != 0) {
+    bool wasCommitted = false;
+    if (!mem.AllocVirtualFixed(adjustedBase, adjustedSize, commit, zeroFresh,
+                               &wasCommitted))
+      status = STATUS_NO_MEMORY;
     else
-    {
-        if (!mem.AllocVirtualAny(adjustedSize, (allocationType & kXMemTopDown) != 0, commit,
-                                 zeroFresh, &address))
-            status = STATUS_NO_MEMORY;
-    }
+      address = adjustedBase;
+  } else {
+    if (!mem.AllocVirtualAny(adjustedSize, (allocationType & kXMemTopDown) != 0,
+                             commit, zeroFresh, &address))
+      status = STATUS_NO_MEMORY;
+  }
 
-    LogVirtualAlloc("NtAllocVM", baseIn, address, adjustedSize, allocationType, status);
+  LogVirtualAlloc("NtAllocVM", baseIn, address, adjustedSize, allocationType,
+                  status);
 
-    if (status != STATUS_SUCCESS)
-        return status;
-
-    baseAddress->set(address);
-    regionSize->set(adjustedSize);
-    return STATUS_SUCCESS;
-}
-
-uint32_t NtFreeVirtualMemory(be<uint32_t>* baseAddress, be<uint32_t>* regionSize, uint32_t freeType)
-{
-    // _Inout_ PVOID *BaseAddress, _Inout_ PSIZE_T RegionSize, _In_ ULONG FreeType.
-    // Only tracked guest-virtual regions may be freed. The previous impl called
-    // g_userHeap.Free(Translate(base)) for ANY translated address - a foreign
-    // pointer routed into o1heap (rejected by validate-before-free today, heap
-    // corruption before that guard existed).
-    if (!baseAddress || !regionSize)
-        return STATUS_INVALID_PARAMETER;
-
-    const uint32_t base = baseAddress->get();
-    if (base == 0)
-        return STATUS_MEMORY_NOT_ALLOCATED;
-
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t status = STATUS_UNSUCCESSFUL;
-    uint32_t outSize = 0;
-
-    if (freeType & kXMemRelease)
-    {
-        outSize = 0;
-        if (mem.ReleaseVirtual(base, &outSize))
-        {
-            regionSize->set(outSize);
-            status = STATUS_SUCCESS;
-        }
-        else
-        {
-            status = STATUS_MEMORY_NOT_ALLOCATED;
-        }
-    }
-    else if (freeType & kXMemDecommit)
-    {
-        outSize = 0;
-        if (mem.DecommitVirtual(base, regionSize->get(), &outSize))
-        {
-            regionSize->set(outSize);
-            status = STATUS_SUCCESS;
-        }
-        else
-        {
-            status = STATUS_MEMORY_NOT_ALLOCATED;
-        }
-    }
-    else
-    {
-        status = STATUS_INVALID_PARAMETER;
-    }
-
-    LogVirtualAlloc("NtFreeVM", base, 0, outSize, freeType, status);
-    if (status == STATUS_SUCCESS)
-        baseAddress->set(base);
+  if (status != STATUS_SUCCESS)
     return status;
+
+  baseAddress->set(address);
+  regionSize->set(adjustedSize);
+  return STATUS_SUCCESS;
 }
 
-void ObDereferenceObject(uint32_t object)
-{
-    (void)object;
-    // In the identity handle model, dereferencing is a no-op
-    // The kernel object is managed by the handle table
-    // Object lifetime is tied to handle count
+uint32_t NtFreeVirtualMemory(be<uint32_t> *baseAddress,
+                             be<uint32_t> *regionSize, uint32_t freeType) {
+  // _Inout_ PVOID *BaseAddress, _Inout_ PSIZE_T RegionSize, _In_ ULONG
+  // FreeType. Only tracked guest-virtual regions may be freed. The previous
+  // impl called g_userHeap.Free(Translate(base)) for ANY translated address - a
+  // foreign pointer routed into o1heap (rejected by validate-before-free today,
+  // heap corruption before that guard existed).
+  if (!baseAddress || !regionSize)
+    return STATUS_INVALID_PARAMETER;
+
+  const uint32_t base = baseAddress->get();
+  if (base == 0)
+    return STATUS_MEMORY_NOT_ALLOCATED;
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t status = STATUS_UNSUCCESSFUL;
+  uint32_t outSize = 0;
+
+  if (freeType & kXMemRelease) {
+    outSize = 0;
+    if (mem.ReleaseVirtual(base, &outSize)) {
+      regionSize->set(outSize);
+      status = STATUS_SUCCESS;
+    } else {
+      status = STATUS_MEMORY_NOT_ALLOCATED;
+    }
+  } else if (freeType & kXMemDecommit) {
+    outSize = 0;
+    if (mem.DecommitVirtual(base, regionSize->get(), &outSize)) {
+      regionSize->set(outSize);
+      status = STATUS_SUCCESS;
+    } else {
+      status = STATUS_MEMORY_NOT_ALLOCATED;
+    }
+  } else {
+    status = STATUS_INVALID_PARAMETER;
+  }
+
+  LogVirtualAlloc("NtFreeVM", base, 0, outSize, freeType, status);
+  if (status == STATUS_SUCCESS)
+    baseAddress->set(base);
+  return status;
 }
 
-void KeSetBasePriorityThread(GuestThreadHandle* hThread, int priority)
-{
+void ObDereferenceObject(uint32_t object) {
+  (void)object;
+  // In the identity handle model, dereferencing is a no-op
+  // The kernel object is managed by the handle table
+  // Object lifetime is tied to handle count
+}
+
+void KeSetBasePriorityThread(GuestThreadHandle *hThread, int priority) {
 #ifdef _WIN32
-    if (priority == 16)
-    {
-        priority = 15;
-    }
-    else if (priority == -16)
-    {
-        priority = -15;
-    }
+  if (priority == 16) {
+    priority = 15;
+  } else if (priority == -16) {
+    priority = -15;
+  }
 
-    SetThreadPriority(hThread == GetKernelObject(CURRENT_THREAD_HANDLE) ? GetCurrentThread() : hThread->thread.native_handle(), priority);
+  SetThreadPriority(hThread == GetKernelObject(CURRENT_THREAD_HANDLE)
+                        ? GetCurrentThread()
+                        : hThread->thread.native_handle(),
+                    priority);
 #endif
 }
 
-uint32_t ObReferenceObjectByHandle(uint32_t handle, uint32_t objectType, be<uint32_t>* object)
-{
-    *object = handle;
-    return 0;
+uint32_t ObReferenceObjectByHandle(uint32_t handle, uint32_t objectType,
+                                   be<uint32_t> *object) {
+  *object = handle;
+  return 0;
 }
 
-void KeQueryBasePriorityThread()
-{
-    LOG_UTILITY("!!! STUB !!!");
+void KeQueryBasePriorityThread() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t NtSuspendThread(GuestThreadHandle *hThread, uint32_t *suspendCount) {
+  assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE) &&
+         hThread->GetThreadId() == GuestThread::GetCurrentThreadId());
+
+  hThread->suspended = true;
+  hThread->suspended.wait(true);
+
+  return S_OK;
 }
 
-uint32_t NtSuspendThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
-{
-    assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE) && hThread->GetThreadId() == GuestThread::GetCurrentThreadId());
+uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity,
+                             be<uint32_t> *lpPreviousAffinity) {
+  if (lpPreviousAffinity)
+    *lpPreviousAffinity = 2;
 
-    hThread->suspended = true;
-    hThread->suspended.wait(true);
-
-    return S_OK;
+  return 0;
 }
 
-uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* lpPreviousAffinity)
-{
-    if (lpPreviousAffinity)
-        *lpPreviousAffinity = 2;
+void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION *cs) {
+  int32_t recursionCount = cs->RecursionCount;
+  if (recursionCount > 0) {
+    recursionCount--;
+    cs->RecursionCount = recursionCount;
+  }
 
-    return 0;
+  if (recursionCount != 0)
+    return;
+
+  std::atomic_ref owningThread(cs->OwningThread);
+  owningThread.store(0);
+  owningThread.notify_one();
 }
 
-void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
-{
-    int32_t recursionCount = cs->RecursionCount;
-    if (recursionCount > 0)
-    {
-        recursionCount--;
-        cs->RecursionCount = recursionCount;
+void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION *cs) {
+  uint32_t thisThread = g_ppcContext->r13.u32;
+  assert(thisThread != NULL);
+
+  std::atomic_ref owningThread(cs->OwningThread);
+
+  while (true) {
+    uint32_t previousOwner = 0;
+
+    if (owningThread.compare_exchange_weak(previousOwner, thisThread) ||
+        previousOwner == thisThread) {
+      cs->RecursionCount++;
+      return;
     }
 
-    if (recursionCount != 0)
-        return;
-
-    std::atomic_ref owningThread(cs->OwningThread);
-    owningThread.store(0);
-    owningThread.notify_one();
+    owningThread.wait(previousOwner);
+  }
 }
 
-void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
-{
-    uint32_t thisThread = g_ppcContext->r13.u32;
-    assert(thisThread != NULL);
+void RtlImageXexHeaderField() { LOG_UTILITY("!!! STUB !!!"); }
 
-    std::atomic_ref owningThread(cs->OwningThread);
+void HalReturnToFirmware(uint32_t type) {
+  // Terminates, never returns - but MCLA calls it mid-boot and continues
+  // Must return (not std::exit) or process dies
+  MCLA_LOG_INFO("HalReturnToFirmware: type={}", type);
+  // Return to caller - game will continue
+}
 
-    while (true)
-    {
-        uint32_t previousOwner = 0;
+void RtlFillMemoryUlong() { LOG_UTILITY("!!! STUB !!!"); }
 
-        if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
-        {
-            cs->RecursionCount++;
-            return;
-        }
+void KeBugCheckEx() { __builtin_debugtrap(); }
 
-        owningThread.wait(previousOwner);
+uint32_t KeGetCurrentProcessType() { return 1; }
+
+void RtlCompareMemoryUlong() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t RtlInitializeCriticalSection(XRTL_CRITICAL_SECTION *cs) {
+  cs->Header.Absolute = 0;
+  cs->LockCount = -1;
+  cs->RecursionCount = 0;
+  cs->OwningThread = 0;
+
+  return 0;
+}
+
+void RtlRaiseException_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void KfReleaseSpinLock(uint32_t *spinLock) {
+  std::atomic_ref spinLockRef(*spinLock);
+  spinLockRef = 0;
+}
+
+void KfAcquireSpinLock(uint32_t *spinLock) {
+  std::atomic_ref spinLockRef(*spinLock);
+
+  while (true) {
+    uint32_t expected = 0;
+    if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
+      break;
+
+    std::this_thread::yield();
+  }
+}
+
+uint64_t KeQueryPerformanceFrequency() { return 49875000; }
+
+void MmFreePhysicalMemory(uint32_t type, uint32_t guestAddress) {
+  if (guestAddress != NULL)
+    g_userHeap.Free(
+        mcla::kernel::GuestMemoryHeap::Instance().Translate(guestAddress));
+}
+
+bool VdPersistDisplay(uint32_t a1, uint32_t *a2) {
+  *a2 = NULL;
+  return false;
+}
+
+void VdSwap(uint32_t buf, uint32_t fetch, uint32_t unk2, uint32_t unk3,
+            uint32_t unk4, uint32_t fbuf, uint32_t fmt, uint32_t cs, uint32_t w,
+            uint32_t h) {
+  MCLA_LOG_INFO(
+      "VdSwap: buf=0x{:08X} fetch=0x{:08X} unk2=0x{:08X} unk3=0x{:08X} "
+      "unk4=0x{:08X} fbuf=0x{:08X} fmt=0x{:08X} cs=0x{:08X} w={} h={}",
+      buf, fetch, unk2, unk3, unk4, fbuf, fmt, cs, w, h);
+  // Present callback - chain to native renderer hook
+}
+
+void VdGetSystemCommandBuffer(uint32_t p0, uint32_t p1) {
+  // Kernel-acceptance layer (diagnostic): under
+  // cp_deferred_consume_experiment=1 this export returns coherent
+  // system-command-buffer state instead of BEEF markers.
+  //   out1 (p0): 0x94-byte descriptor struct - contents unproven from any
+  //              reference, so it stays ZEROED (xenia-parity neutral).
+  //   out2 (p1): opaque identifier token; the guest stores it into
+  //              subctx+8 (77.cpp decode) and passes it around opaquely.
+  //              It changes only when real deferred consumption advances.
+  if (mcla::gpu::CpDeferredConsumeEnabled()) {
+    if (p0) {
+      static const uint8_t zeroBuf[0x94] = {0};
+      (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(p0, zeroBuf,
+                                                                 0x94);
     }
-}
-
-void RtlImageXexHeaderField()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void HalReturnToFirmware(uint32_t type)
-{
-    // Terminates, never returns - but MCLA calls it mid-boot and continues
-    // Must return (not std::exit) or process dies
-    MCLA_LOG_INFO("HalReturnToFirmware: type={}", type);
-    // Return to caller - game will continue
-}
-
-void RtlFillMemoryUlong()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void KeBugCheckEx()
-{
-    __builtin_debugtrap();
-}
-
-uint32_t KeGetCurrentProcessType()
-{
-    return 1;
-}
-
-void RtlCompareMemoryUlong()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t RtlInitializeCriticalSection(XRTL_CRITICAL_SECTION* cs)
-{
-    cs->Header.Absolute = 0;
-    cs->LockCount = -1;
-    cs->RecursionCount = 0;
-    cs->OwningThread = 0;
-
-    return 0;
-}
-
-void RtlRaiseException_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void KfReleaseSpinLock(uint32_t* spinLock)
-{
-    std::atomic_ref spinLockRef(*spinLock);
-    spinLockRef = 0;
-}
-
-void KfAcquireSpinLock(uint32_t* spinLock)
-{
-    std::atomic_ref spinLockRef(*spinLock);
-
-    while (true)
-    {
-        uint32_t expected = 0;
-        if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
-            break;
-
-        std::this_thread::yield();
+    if (p1) {
+      const uint32_t token = mcla::gpu::CpScbToken();
+      (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p1, token);
+      static std::atomic<uint32_t> s_gscb{0};
+      const uint32_t n = s_gscb.fetch_add(1) + 1;
+      if (n <= 8 || (n % 500) == 0) {
+        MCLA_LOG_INFO("VdGetSystemCommandBuffer[{}] token={} idAddr={:08X}", n,
+                      token, mcla::gpu::CpGpuIdentifierAddress());
+      }
     }
+    return;
+  }
+
+  // Xenia: p0.Zero(0x94), write 0xBEEF0000@p0, 0xBEEF0001@p1
+  if (p0) {
+    static const uint8_t zeroBuf[0x94] = {0};
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(p0, zeroBuf,
+                                                               0x94);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p0, 0xBEEF0000);
+  }
+  if (p1) {
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p1, 0xBEEF0001);
+  }
 }
 
-uint64_t KeQueryPerformanceFrequency()
-{
-    return 49875000;
+void KeReleaseSpinLockFromRaisedIrql(uint32_t *spinLock) {
+  std::atomic_ref spinLockRef(*spinLock);
+  spinLockRef = 0;
 }
 
-void MmFreePhysicalMemory(uint32_t type, uint32_t guestAddress)
-{
-    if (guestAddress != NULL)
-        g_userHeap.Free(mcla::kernel::GuestMemoryHeap::Instance().Translate(guestAddress));
+void KeAcquireSpinLockAtRaisedIrql(uint32_t *spinLock) {
+  std::atomic_ref spinLockRef(*spinLock);
+
+  while (true) {
+    uint32_t expected = 0;
+    if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
+      break;
+
+    std::this_thread::yield();
+  }
 }
 
-bool VdPersistDisplay(uint32_t a1, uint32_t* a2)
-{
-    *a2 = NULL;
-    return false;
+void KeInitializeSpinLock(uint32_t *spinLock) {
+  // Spinlock init (guest memory) - zero the spinlock
+  *spinLock = 0;
 }
 
-void VdSwap(uint32_t buf, uint32_t fetch, uint32_t unk2, uint32_t unk3, uint32_t unk4, uint32_t fbuf, uint32_t fmt, uint32_t cs, uint32_t w, uint32_t h)
-{
-    MCLA_LOG_INFO("VdSwap: buf=0x{:08X} fetch=0x{:08X} unk2=0x{:08X} unk3=0x{:08X} unk4=0x{:08X} fbuf=0x{:08X} fmt=0x{:08X} cs=0x{:08X} w={} h={}",
-        buf, fetch, unk2, unk3, unk4, fbuf, fmt, cs, w, h);
-    // Present callback - chain to native renderer hook
+uint32_t KiApcNormalRoutineNop() { return 0; }
+
+void VdEnableRingBufferRPtrWriteBack(uint32_t ringBuffer,
+                                     uint32_t blockSizeLog2) {
+  // Xenia: r3 IS the read-pointer writeback address (CP_RB_RPTR_ADDR),
+  // not a ring base. The host CP publishes the advanced dword index there.
+  MCLA_LOG_INFO(
+      "VdEnableRingBufferRPtrWriteBack: writeback=0x{:08X} blockLog2={}",
+      ringBuffer, blockSizeLog2);
+  mcla::gpu::CpEnableRPtrWriteBack(ringBuffer, blockSizeLog2);
 }
 
-void VdGetSystemCommandBuffer(uint32_t p0, uint32_t p1)
-{
-    // Kernel-acceptance layer (diagnostic): under
-    // cp_deferred_consume_experiment=1 this export returns coherent
-    // system-command-buffer state instead of BEEF markers.
-    //   out1 (p0): 0x94-byte descriptor struct - contents unproven from any
-    //              reference, so it stays ZEROED (xenia-parity neutral).
-    //   out2 (p1): opaque identifier token; the guest stores it into
-    //              subctx+8 (77.cpp decode) and passes it around opaquely.
-    //              It changes only when real deferred consumption advances.
-    if (mcla::gpu::CpDeferredConsumeEnabled())
-    {
-        if (p0)
-        {
-            static const uint8_t zeroBuf[0x94] = {0};
-            (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(p0, zeroBuf, 0x94);
-        }
-        if (p1)
-        {
-            const uint32_t token = mcla::gpu::CpScbToken();
-            (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p1, token);
-            static std::atomic<uint32_t> s_gscb{0};
-            const uint32_t n = s_gscb.fetch_add(1) + 1;
-            if (n <= 8 || (n % 500) == 0)
-            {
-                MCLA_LOG_INFO("VdGetSystemCommandBuffer[{}] token={} idAddr={:08X}",
-                              n, token, mcla::gpu::CpGpuIdentifierAddress());
+void VdInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2) {
+  // Xenia xboxkrnl_video.cc -> CommandProcessor::InitializeRingBuffer:
+  // records base/size and resets the read index ONLY - no memory writes
+  // to the ring body. Zeroing here would destroy unread packets when the
+  // guest re-initializes a still-active ring (per-ring REINIT in gpu_cp.cpp
+  // deliberately RETAINS such state).
+  MCLA_LOG_INFO("VdInitializeRingBuffer: physAddr=0x{:08X} sizeLog2={}",
+                physAddr, sizeLog2);
+  if (physAddr) {
+    mcla::gpu::CpInitializeRingBuffer(physAddr, sizeLog2);
+  }
+}
+
+void VdSetSystemCommandBufferGpuIdentifierAddress(uint32_t gpuIdAddr) {
+  MCLA_LOG_INFO("VdSetSystemCommandBufferGpuIdentifierAddress: 0x{:08X}",
+                gpuIdAddr);
+  // Record the registered identifier/writeback slot (= &subctx[8]).
+  // Bookkeeping is unconditional; consumers act only under the
+  // cp_deferred_consume_experiment flag.
+  mcla::gpu::CpRegisterGpuIdentifierAddress(gpuIdAddr);
+}
+
+void _vsnprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void sprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void ExRegisterTitleTerminateNotification() { LOG_UTILITY("!!! STUB !!!"); }
+
+void VdShutdownEngines() { LOG_UTILITY("!!! STUB !!!"); }
+
+void VdQueryVideoMode(XVIDEO_MODE *vm) {
+  memset(vm, 0, sizeof(XVIDEO_MODE));
+  vm->DisplayWidth = 1280;
+  vm->DisplayHeight = 720;
+  vm->IsInterlaced = false;
+  vm->IsWidescreen = true;
+  vm->IsHighDefinition = true;
+  vm->RefreshRate = 0x42700000;
+  vm->VideoStandard = 1;
+  vm->Unknown4A = 0x4A;
+  vm->Unknown01 = 0x01;
+}
+
+void VdGetCurrentDisplayInformation() { LOG_UTILITY("!!! STUB !!!"); }
+
+void VdSetDisplayMode() { LOG_UTILITY("!!! STUB !!!"); }
+
+void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
+  MCLA_LOG_INFO(
+      "VdSetGraphicsInterruptCallback: callback=0x{:08X} user=0x{:08X}",
+      callback, userData);
+
+  static std::atomic<uint32_t> s_vsyncCallback{0};
+  static std::atomic<uint32_t> s_vsyncUserData{0};
+  static std::atomic<bool> s_vsyncRunning{false};
+  static uint32_t s_frameCounter = 0;
+
+  s_vsyncCallback.store(callback);
+  s_vsyncUserData.store(userData);
+
+  if (!s_vsyncRunning.exchange(true)) {
+    std::thread([=]() {
+      MCLA_LOG_INFO("VSync thread started: callback=0x{:08X}", callback);
+      while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps
+        uint32_t currentCallback = s_vsyncCallback.load();
+        uint32_t currentUserData = s_vsyncUserData.load();
+        if (currentCallback != 0) {
+          uint8_t *base = mcla::kernel::g_memory.base;
+          PPCFunc *fn = PPC_LOOKUP_FUNC(base, currentCallback);
+          if (fn) {
+            PPCContext cbCtx{};
+            // r3 = INTERRUPT TYPE, not userData (decoded from
+            // generated sub_82411478). Xenia ground truth: vblank
+            // delivers r3=0 (graphics/vblank branch — MarkVblank,
+            // graphics_system.cc:97-118); r3=1 fires ONLY when the
+            // CP drains a PM4_INTERRUPT packet
+            // (command_processor.cc:900-913), which we never
+            // synthesize. 2026-08-23 session-5 correction of the
+            // earlier r3=1 flip: our timer is the vertical blank,
+            // so deliver type 0.
+            cbCtx.r3.u32 = 0;
+            cbCtx.r4.u32 = currentUserData; // GPU context pointer
+            cbCtx.r5.u32 = 0;               // field counter
+            cbCtx.r13.u32 =
+                0x8F200000; // thread block pointer (from boot_host.cpp)
+            cbCtx.r1.u32 = 0x8F000000; // stack top (from boot_host.cpp)
+            cbCtx.lr = 0x00FFFFFF;     // dummy LR
+            cbCtx.msr = 0x200A000;
+
+            // Publish this thread's context so guest imports can read
+            // TLS/TEB/r13
+            SetPPCContext(cbCtx);
+
+            // Per-frame spam demoted (ship-blocker #2): first 3
+            // frames + every 500th only. Counter increments every
+            // frame regardless.
+            const uint32_t frame = s_frameCounter++;
+            if (frame <= 3 || (frame % 500) == 0) {
+              MCLA_LOG_INFO("VSync: calling callback 0x{:08X} with "
+                            "userData=0x{:08X} (frame={})",
+                            currentCallback, currentUserData, frame);
+              fn(cbCtx, base);
+              MCLA_LOG_INFO("VSync: callback returned");
+            } else {
+              fn(cbCtx, base);
             }
-        }
-        return;
-    }
+            // Kernel-role vblank duty (2026-08-24): drain the
+            // primary ring up to the driver's current wptr via
+            // the existing frozen-capability DrainRing. XTEB+88
+            // progress and subctx publication advance ONLY by
+            // real consumed dwords (see CpVblankDrainToWptr).
+            mcla::gpu::CpVblankDrainToWptr();
 
-    // Xenia: p0.Zero(0x94), write 0xBEEF0000@p0, 0xBEEF0001@p1
-    if (p0)
-    {
-        static const uint8_t zeroBuf[0x94] = {0};
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(p0, zeroBuf, 0x94);
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p0, 0xBEEF0000);
-    }
-    if (p1)
-    {
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(p1, 0xBEEF0001);
-    }
-}
+            // Signal scheduler tick semaphore (0x40004D7C) to unblock main
+            // thread wait. This is the kernel-role duty that the real hardware
+            // GPU ISR/vblank path would perform. The game's main thread waits
+            // on 0x40004D7C with ~30ms timeout; without this signal, the main
+            // thread parks forever. Signal scheduler tick semaphore
+            // (0x40004D7C) to unblock main thread wait. This is the kernel-role
+            // duty that the real hardware GPU ISR/vblank path would perform.
+            SignalSchedulerTick();
 
-void KeReleaseSpinLockFromRaisedIrql(uint32_t* spinLock)
-{
-    std::atomic_ref spinLockRef(*spinLock);
-    spinLockRef = 0;
-}
-
-void KeAcquireSpinLockAtRaisedIrql(uint32_t* spinLock)
-{
-    std::atomic_ref spinLockRef(*spinLock);
-
-    while (true)
-    {
-        uint32_t expected = 0;
-        if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
-            break;
-
-        std::this_thread::yield();
-    }
-}
-
-void KeInitializeSpinLock(uint32_t* spinLock)
-{
-    // Spinlock init (guest memory) - zero the spinlock
-    *spinLock = 0;
-}
-
-uint32_t KiApcNormalRoutineNop()
-{
-    return 0;
-}
-
-void VdEnableRingBufferRPtrWriteBack(uint32_t ringBuffer, uint32_t blockSizeLog2)
-{
-    // Xenia: r3 IS the read-pointer writeback address (CP_RB_RPTR_ADDR),
-    // not a ring base. The host CP publishes the advanced dword index there.
-    MCLA_LOG_INFO("VdEnableRingBufferRPtrWriteBack: writeback=0x{:08X} blockLog2={}", ringBuffer, blockSizeLog2);
-    mcla::gpu::CpEnableRPtrWriteBack(ringBuffer, blockSizeLog2);
-}
-
-void VdInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2)
-{
-    // Xenia xboxkrnl_video.cc -> CommandProcessor::InitializeRingBuffer:
-    // records base/size and resets the read index ONLY - no memory writes
-    // to the ring body. Zeroing here would destroy unread packets when the
-    // guest re-initializes a still-active ring (per-ring REINIT in gpu_cp.cpp
-    // deliberately RETAINS such state).
-    MCLA_LOG_INFO("VdInitializeRingBuffer: physAddr=0x{:08X} sizeLog2={}", physAddr, sizeLog2);
-    if (physAddr)
-    {
-        mcla::gpu::CpInitializeRingBuffer(physAddr, sizeLog2);
-    }
-}
-
-void VdSetSystemCommandBufferGpuIdentifierAddress(uint32_t gpuIdAddr)
-{
-    MCLA_LOG_INFO("VdSetSystemCommandBufferGpuIdentifierAddress: 0x{:08X}", gpuIdAddr);
-    // Record the registered identifier/writeback slot (= &subctx[8]).
-    // Bookkeeping is unconditional; consumers act only under the
-    // cp_deferred_consume_experiment flag.
-    mcla::gpu::CpRegisterGpuIdentifierAddress(gpuIdAddr);
-}
-
-void _vsnprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void sprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void ExRegisterTitleTerminateNotification()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void VdShutdownEngines()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void VdQueryVideoMode(XVIDEO_MODE* vm)
-{
-    memset(vm, 0, sizeof(XVIDEO_MODE));
-    vm->DisplayWidth = 1280;
-    vm->DisplayHeight = 720;
-    vm->IsInterlaced = false;
-    vm->IsWidescreen = true;
-    vm->IsHighDefinition = true;
-    vm->RefreshRate = 0x42700000;
-    vm->VideoStandard = 1;
-    vm->Unknown4A = 0x4A;
-    vm->Unknown01 = 0x01;
-}
-
-void VdGetCurrentDisplayInformation()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void VdSetDisplayMode()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData)
-{
-    MCLA_LOG_INFO("VdSetGraphicsInterruptCallback: callback=0x{:08X} user=0x{:08X}", callback, userData);
-
-    static std::atomic<uint32_t> s_vsyncCallback{0};
-    static std::atomic<uint32_t> s_vsyncUserData{0};
-    static std::atomic<bool> s_vsyncRunning{false};
-    static uint32_t s_frameCounter = 0;
-
-    s_vsyncCallback.store(callback);
-    s_vsyncUserData.store(userData);
-
-    if (!s_vsyncRunning.exchange(true))
-    {
-        std::thread([=]() {
-            MCLA_LOG_INFO("VSync thread started: callback=0x{:08X}", callback);
-            while (true)
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps
-                uint32_t currentCallback = s_vsyncCallback.load();
-                uint32_t currentUserData = s_vsyncUserData.load();
-                if (currentCallback != 0)
-                {
-                    uint8_t* base = mcla::kernel::g_memory.base;
-                    PPCFunc* fn = PPC_LOOKUP_FUNC(base, currentCallback);
-                    if (fn)
-                    {
-                        PPCContext cbCtx{};
-                        // r3 = INTERRUPT TYPE, not userData (decoded from
-                        // generated sub_82411478). Xenia ground truth: vblank
-                        // delivers r3=0 (graphics/vblank branch — MarkVblank,
-                        // graphics_system.cc:97-118); r3=1 fires ONLY when the
-                        // CP drains a PM4_INTERRUPT packet
-                        // (command_processor.cc:900-913), which we never
-                        // synthesize. 2026-08-23 session-5 correction of the
-                        // earlier r3=1 flip: our timer is the vertical blank,
-                        // so deliver type 0.
-                        cbCtx.r3.u32 = 0;
-                        cbCtx.r4.u32 = currentUserData; // GPU context pointer
-                        cbCtx.r5.u32 = 0; // field counter
-                        cbCtx.r13.u32 = 0x8F200000; // thread block pointer (from boot_host.cpp)
-                        cbCtx.r1.u32 = 0x8F000000; // stack top (from boot_host.cpp)
-                        cbCtx.lr = 0x00FFFFFF; // dummy LR
-                        cbCtx.msr = 0x200A000;
-
-                        // Publish this thread's context so guest imports can read TLS/TEB/r13
-                        SetPPCContext(cbCtx);
-
-                        // Per-frame spam demoted (ship-blocker #2): first 3
-                        // frames + every 500th only. Counter increments every
-                        // frame regardless.
-                        const uint32_t frame = s_frameCounter++;
-                        if (frame <= 3 || (frame % 500) == 0)
-                        {
-                            MCLA_LOG_INFO("VSync: calling callback 0x{:08X} with userData=0x{:08X} (frame={})",
-                                          currentCallback, currentUserData, frame);
-                            fn(cbCtx, base);
-                            MCLA_LOG_INFO("VSync: callback returned");
-                        }
-                        else
-                        {
-                            fn(cbCtx, base);
-                        }
-                        // Kernel-role vblank duty (2026-08-24): drain the
-                        // primary ring up to the driver's current wptr via
-                        // the existing frozen-capability DrainRing. XTEB+88
-                        // progress and subctx publication advance ONLY by
-                        // real consumed dwords (see CpVblankDrainToWptr).
-                        mcla::gpu::CpVblankDrainToWptr();
-
-                        // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
-                        // This is the kernel-role duty that the real hardware GPU ISR/vblank path
-                        // would perform. The game's main thread waits on 0x40004D7C with ~30ms timeout;
-                        // without this signal, the main thread parks forever.
-                        // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
-                        // This is the kernel-role duty that the real hardware GPU ISR/vblank path would perform.
-                        SignalSchedulerTick();
-
-                        // Ring-buffer submission probe: sample the head of the
-                        // primary ring every ~2s (120 frames) to see whether
-                        // the game ever writes PM4 packets for us to consume.
-                        if ((frame % 120) == 0)
-                        {
-                            auto& memProbe = mcla::kernel::GuestMemoryHeap::Instance();
-                            uint32_t ctxPtr = 0;
-                            if (memProbe.ReadU32BE(0x82839254, &ctxPtr) && ctxPtr != 0)
-                            {
-                                uint32_t p0 = 0, p1 = 0;
-                                const bool p0Ok = memProbe.ReadU32BE(ctxPtr + 0x30, &p0);
-                                const bool p1Ok = memProbe.ReadU32BE(ctxPtr + 0x38, &p1);
-                                uint8_t head[8] = {};
-                                bool headOk = true;
-                                for (int bi = 0; bi < 8; ++bi)
-                                    headOk &= memProbe.ReadU8(0xC6224480 + static_cast<uint32_t>(bi), &head[bi]);
-                                // Drain-chain truth: published RPTR word (the one
-                                // sub_82411218 polls) + host CP drain/swap counters.
-                                uint32_t wbVal = 0;
-                                const bool wbOk = memProbe.ReadU32BE(0x072344BC, &wbVal);
-                                if (p0Ok && p1Ok && headOk && wbOk)
-                                {
-                                    MCLA_LOG_INFO("RING: ctx+30={:08X} ctx+38={:08X} head={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}"
-                                                  " rptrWB={:08X} drains={} swaps={}",
-                                                  p0, p1, head[0], head[1], head[2], head[3],
-                                                  head[4], head[5], head[6], head[7],
-                                                  wbVal, mcla::gpu::CpDrainCount(), mcla::gpu::CpSwapCount());
-                                }
-                            }
-                        }
-                    }
+            // Ring-buffer submission probe: sample the head of the
+            // primary ring every ~2s (120 frames) to see whether
+            // the game ever writes PM4 packets for us to consume.
+            if ((frame % 120) == 0) {
+              auto &memProbe = mcla::kernel::GuestMemoryHeap::Instance();
+              uint32_t ctxPtr = 0;
+              if (memProbe.ReadU32BE(0x82839254, &ctxPtr) && ctxPtr != 0) {
+                uint32_t p0 = 0, p1 = 0;
+                const bool p0Ok = memProbe.ReadU32BE(ctxPtr + 0x30, &p0);
+                const bool p1Ok = memProbe.ReadU32BE(ctxPtr + 0x38, &p1);
+                uint8_t head[8] = {};
+                bool headOk = true;
+                for (int bi = 0; bi < 8; ++bi)
+                  headOk &= memProbe.ReadU8(
+                      0xC6224480 + static_cast<uint32_t>(bi), &head[bi]);
+                // Drain-chain truth: published RPTR word (the one
+                // sub_82411218 polls) + host CP drain/swap counters.
+                uint32_t wbVal = 0;
+                const bool wbOk = memProbe.ReadU32BE(0x072344BC, &wbVal);
+                if (p0Ok && p1Ok && headOk && wbOk) {
+                  MCLA_LOG_INFO(
+                      "RING: ctx+30={:08X} ctx+38={:08X} "
+                      "head={:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}"
+                      " rptrWB={:08X} drains={} swaps={}",
+                      p0, p1, head[0], head[1], head[2], head[3], head[4],
+                      head[5], head[6], head[7], wbVal,
+                      mcla::gpu::CpDrainCount(), mcla::gpu::CpSwapCount());
                 }
+              }
             }
-        }).detach();
-    }
+          }
+        }
+      }
+    }).detach();
+  }
 }
 
 // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait
-// This is the kernel-role duty that the real hardware GPU ISR/vblank path would perform.
-// The game's main thread waits on 0x40004D7C with ~30ms timeout; without this signal,
-// the main thread parks forever.
-static void SignalSchedulerTick()
-{
-    constexpr uint32_t kSchedulerTickSem = 0x40004D7C;
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    if (!mem.IsValid(kSchedulerTickSem, 4))
-    {
-        return;
-    }
-    // Use identity-first resolution (same pattern as imports.cpp NtReleaseSemaphore)
-    // to avoid lazy-wrap phantom wrapper issues.
-    uint32_t hdrVal = 0;
-    if (!mem.ReadU32BE(kSchedulerTickSem, &hdrVal) || hdrVal != 0x58424F58) // 'XBOX' signature
-    {
-        // Not a kernel-created semaphore; skip to avoid phantom wrapper
-        return;
-    }
-    // Direct identity translation: handle IS the guest VA of the dispatcher header
-    void* hostPtr = mem.Translate(kSchedulerTickSem);
-    if (!hostPtr)
-    {
-        return;
-    }
-    // Manually increment semaphore count (kernel semaphore structure:
-    // XDISPATCHER_HEADER(16) + SignalState@0x10 + WaitListHead@0x18/0x1C)
-    uint32_t* signalState = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(hostPtr) + 0x10);
-    (*signalState)++;
-    // Note: proper kernel wake would need condition_variable notify, but
-    // guest waiters poll the signal state directly (sub_821C90C0 -> NtWaitForSingleObjectEx
-    // on semaphore with timeout), so incrementing the count is sufficient.
+// This is the kernel-role duty that the real hardware GPU ISR/vblank path would
+// perform. The game's main thread waits on 0x40004D7C with ~30ms timeout;
+// without this signal, the main thread parks forever.
+static void SignalSchedulerTick() {
+  constexpr uint32_t kSchedulerTickSem = 0x40004D7C;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (!mem.IsValid(kSchedulerTickSem, 4)) {
+    return;
+  }
+  // Use identity-first resolution (same pattern as imports.cpp
+  // NtReleaseSemaphore) to avoid lazy-wrap phantom wrapper issues.
+  uint32_t hdrVal = 0;
+  if (!mem.ReadU32BE(kSchedulerTickSem, &hdrVal) ||
+      hdrVal != 0x58424F58) // 'XBOX' signature
+  {
+    // Not a kernel-created semaphore; skip to avoid phantom wrapper
+    return;
+  }
+  // Direct identity translation: handle IS the guest VA of the dispatcher
+  // header
+  void *hostPtr = mem.Translate(kSchedulerTickSem);
+  if (!hostPtr) {
+    return;
+  }
+  // Manually increment semaphore count (kernel semaphore structure:
+  // XDISPATCHER_HEADER(16) + SignalState@0x10 + WaitListHead@0x18/0x1C)
+  uint32_t *signalState =
+      reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(hostPtr) + 0x10);
+  (*signalState)++;
+  // Note: proper kernel wake would need condition_variable notify, but
+  // guest waiters poll the signal state directly (sub_821C90C0 ->
+  // NtWaitForSingleObjectEx on semaphore with timeout), so incrementing the
+  // count is sufficient.
 }
 
-uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg, uint32_t pfp, uint32_t me)
-{
-    MCLA_LOG_INFO("VdInitializeEngines: unk=0x{:08X} cb=0x{:08X} arg=0x{:08X} pfp=0x{:08X} me=0x{:08X}", unk, cb, arg, pfp, me);
+uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg,
+                             uint32_t pfp, uint32_t me) {
+  MCLA_LOG_INFO("VdInitializeEngines: unk=0x{:08X} cb=0x{:08X} arg=0x{:08X} "
+                "pfp=0x{:08X} me=0x{:08X}",
+                unk, cb, arg, pfp, me);
 
-    // Xenia: r3=0x4E810000, returns 2. Must fully init GPU context:
-    // spinlocks at +0x4148, +0x4158, cmd buffer at +0x30/+0x38, present callback at +0x40A0
-    // The GPU context is allocated by the game. We initialize the structure at the
-    // address the game provides (typically via a global pointer).
+  // Xenia: r3=0x4E810000, returns 2. Must fully init GPU context:
+  // spinlocks at +0x4148, +0x4158, cmd buffer at +0x30/+0x38, present callback
+  // at +0x40A0 The GPU context is allocated by the game. We initialize the
+  // structure at the address the game provides (typically via a global
+  // pointer).
 
-    // The game stores the GPU context pointer at a known global address.
-    // Based on Xenia and MCLA analysis, the GPU context pointer is at 0x82839254.
-    constexpr uint32_t gpuCtxPtrAddr = 0x82839254;
-    uint32_t gpuCtxPtr = 0;
-    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr, &gpuCtxPtr);
+  // The game stores the GPU context pointer at a known global address.
+  // Based on Xenia and MCLA analysis, the GPU context pointer is at 0x82839254.
+  constexpr uint32_t gpuCtxPtrAddr = 0x82839254;
+  uint32_t gpuCtxPtr = 0;
+  (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr,
+                                                            &gpuCtxPtr);
 
-    if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000)
-    {
-        // Initialize spinlocks at +0x4148 and +0x4158 to 1 (unlocked state)
-        // TU83 manual spawn check expects non-zero spinlocks
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4148, 1);
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x4158, 1);
+  if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000) {
+    // Initialize spinlocks at +0x4148 and +0x4158 to 1 (unlocked state)
+    // TU83 manual spawn check expects non-zero spinlocks
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(
+        gpuCtxPtr + 0x4148, 1);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(
+        gpuCtxPtr + 0x4158, 1);
 
-        // Initialize command buffer pointers at +0x30 and +0x38
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x30, 0);
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x38, 0);
+    // Initialize command buffer pointers at +0x30 and +0x38
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x30,
+                                                               0);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x38,
+                                                               0);
 
-        // Present callback at +0x40A0 - will be set by VdSetGraphicsInterruptCallback chain
-        // The game sets this up; we don't manually seed it here.
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x40A0, 0);
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x40A4, 0);
+    // Present callback at +0x40A0 - will be set by
+    // VdSetGraphicsInterruptCallback chain The game sets this up; we don't
+    // manually seed it here.
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(
+        gpuCtxPtr + 0x40A0, 0);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(
+        gpuCtxPtr + 0x40A4, 0);
 
-        // State field at +0xD0 (checked by Function_824E37E0)
-        (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0xD0, 1);
+    // State field at +0xD0 (checked by Function_824E37E0)
+    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0xD0,
+                                                               1);
 
-MCLA_LOG_INFO("VdInitializeEngines: initialized GPU context at 0x{:08X}", gpuCtxPtr);
-    }
-    else
-    {
-        MCLA_LOG_WARN("VdInitializeEngines: GPU context pointer not set at 0x82839254");
-    }
+    MCLA_LOG_INFO("VdInitializeEngines: initialized GPU context at 0x{:08X}",
+                  gpuCtxPtr);
+  } else {
+    MCLA_LOG_WARN(
+        "VdInitializeEngines: GPU context pointer not set at 0x82839254");
+  }
 
-    return 2;
+  return 2;
 }
 
 // Manual GPU backend initialization - replicates ReinitGpuBackend logic
 // Call this after boot to trigger graphics initialization
-void InitGpuBackendManual(uint32_t gpuCtxPtr)
-{
-    MCLA_LOG_INFO("InitGpuBackendManual: Starting manual GPU backend initialization for GPU context 0x{:08X}", gpuCtxPtr);
+void InitGpuBackendManual(uint32_t gpuCtxPtr) {
+  MCLA_LOG_INFO("InitGpuBackendManual: Starting manual GPU backend "
+                "initialization for GPU context 0x{:08X}",
+                gpuCtxPtr);
 
-    // Call VdInitializeEngines with same args as ReinitGpuBackend
-    // r3=0x1B530000, r4=0x82425D78, r5=0, r6=0x82066110, r7=0x82066590
-    VdInitializeEngines(0x1B530000, 0x82425D78, 0, 0x82066110, 0x82066590);
+  // Call VdInitializeEngines with same args as ReinitGpuBackend
+  // r3=0x1B530000, r4=0x82425D78, r5=0, r6=0x82066110, r7=0x82066590
+  VdInitializeEngines(0x1B530000, 0x82425D78, 0, 0x82066110, 0x82066590);
 
-    // Call VdSetGraphicsInterruptCallback with VSync callback 0x82411478 and userData = GPU context
-    VdSetGraphicsInterruptCallback(0x82411478, gpuCtxPtr);
+  // Call VdSetGraphicsInterruptCallback with VSync callback 0x82411478 and
+  // userData = GPU context
+  VdSetGraphicsInterruptCallback(0x82411478, gpuCtxPtr);
 
-    // RING INIT REMOVED (2026-08-25). This shim used to call
-    // VdInitializeRingBuffer + VdEnableRingBufferRPtrWriteBack for
-    // [gpuCtx+14836] and for sub_ctx+60. Log forensics (mcla.log 00:51:22-23)
-    // prove the GUEST already performs the genuine pair ~670ms earlier via
-    // generated ppc_recomp.77.cpp:23344-23377:
-    //   init(MmGetPhysicalAddress(ring), 12); enableWB(phys(subctx+60), 6).
-    // The injected calls then: (a) re-inited the LIVE ring and reset its rptr
-    // mid-flight, (b) repointed the writeback INTO the ring body so
-    // PublishRptr wrote into live ring memory, and (c) fabricated a phantom
-    // "4MB ring" on top of the driver sub-context (zero-filling 4MB of heap
-    // starting at the rptr write-back mirror subctx+60), which hijacked all
-    // later doorbells and starved E98/F98. Per-ring CP state now lives in
-    // gpu_cp.cpp; only genuine guest registrations create rings.
-    MCLA_LOG_INFO("InitGpuBackendManual: GPU backend initialization complete");
+  // RING INIT REMOVED (2026-08-25). This shim used to call
+  // VdInitializeRingBuffer + VdEnableRingBufferRPtrWriteBack for
+  // [gpuCtx+14836] and for sub_ctx+60. Log forensics (mcla.log 00:51:22-23)
+  // prove the GUEST already performs the genuine pair ~670ms earlier via
+  // generated ppc_recomp.77.cpp:23344-23377:
+  //   init(MmGetPhysicalAddress(ring), 12); enableWB(phys(subctx+60), 6).
+  // The injected calls then: (a) re-inited the LIVE ring and reset its rptr
+  // mid-flight, (b) repointed the writeback INTO the ring body so
+  // PublishRptr wrote into live ring memory, and (c) fabricated a phantom
+  // "4MB ring" on top of the driver sub-context (zero-filling 4MB of heap
+  // starting at the rptr write-back mirror subctx+60), which hijacked all
+  // later doorbells and starved E98/F98. Per-ring CP state now lives in
+  // gpu_cp.cpp; only genuine guest registrations create rings.
+  MCLA_LOG_INFO("InitGpuBackendManual: GPU backend initialization complete");
 }
 
 // Background poller for GPU context allocation
 static std::atomic<bool> s_gpuInitDone{false};
 static std::atomic<bool> s_gpuPollerRunning{false};
 
-void StartGpuContextPoller()
-{
-    if (s_gpuPollerRunning.exchange(true))
-        return;
+void StartGpuContextPoller() {
+  if (s_gpuPollerRunning.exchange(true))
+    return;
 
-    std::thread([]() {
-        MCLA_LOG_INFO("GpuContextPoller: Started polling for GPU context at 0x82839254");
-        while (!s_gpuInitDone.load())
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            
-            constexpr uint32_t gpuCtxPtrAddr = 0x82839254;
-            uint32_t gpuCtxPtr = 0;
-            (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr, &gpuCtxPtr);
-            
-            if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000 && !s_gpuInitDone.load())
-            {
-                MCLA_LOG_INFO("GpuContextPoller: GPU context allocated at 0x{:08X}, initializing...", gpuCtxPtr);
-                if (!s_gpuInitDone.exchange(true))
-                {
-                    InitGpuBackendManual(gpuCtxPtr);
-                }
-                break;
-            }
+  std::thread([]() {
+    MCLA_LOG_INFO(
+        "GpuContextPoller: Started polling for GPU context at 0x82839254");
+    while (!s_gpuInitDone.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+      constexpr uint32_t gpuCtxPtrAddr = 0x82839254;
+      uint32_t gpuCtxPtr = 0;
+      (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(gpuCtxPtrAddr,
+                                                                &gpuCtxPtr);
+
+      if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000 && !s_gpuInitDone.load()) {
+        MCLA_LOG_INFO("GpuContextPoller: GPU context allocated at 0x{:08X}, "
+                      "initializing...",
+                      gpuCtxPtr);
+        if (!s_gpuInitDone.exchange(true)) {
+          InitGpuBackendManual(gpuCtxPtr);
         }
-        MCLA_LOG_INFO("GpuContextPoller: Stopped");
-    }).detach();
-}
-
-void VdQueryVideoFlags(uint32_t* flags)
-{
-    // Xenia: widescreen?1 | width>=1280?2 | width>=1920?4
-    // 1280x720: widescreen=1, width>=1280=1 -> 1|2 = 3
-    if (flags)
-    {
-        *flags = 3;
+        break;
+      }
     }
-    MCLA_LOG_INFO("VdQueryVideoFlags: returning 3 (widescreen|width>=1280)");
+    MCLA_LOG_INFO("GpuContextPoller: Stopped");
+  }).detach();
 }
 
-void VdCallGraphicsNotificationRoutines()
-{
-    LOG_UTILITY("!!! STUB !!!");
+void VdQueryVideoFlags(uint32_t *flags) {
+  // Xenia: widescreen?1 | width>=1280?2 | width>=1920?4
+  // 1280x720: widescreen=1, width>=1280=1 -> 1|2 = 3
+  if (flags) {
+    *flags = 3;
+  }
+  MCLA_LOG_INFO("VdQueryVideoFlags: returning 3 (widescreen|width>=1280)");
 }
 
-void VdInitializeScalerCommandBuffer()
-{
-    LOG_UTILITY("!!! STUB !!!");
+void VdCallGraphicsNotificationRoutines() { LOG_UTILITY("!!! STUB !!!"); }
+
+void VdInitializeScalerCommandBuffer() { LOG_UTILITY("!!! STUB !!!"); }
+
+void KeLeaveCriticalRegion() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t VdRetrainEDRAM() { return 0; }
+
+void VdRetrainEDRAMWorker() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t VdIsHSIOTrainingSucceeded() {
+  // Return 1 (succeeded) to allow boot to continue
+  return 1;
 }
 
-void KeLeaveCriticalRegion()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void VdGetCurrentDisplayGamma() { LOG_UTILITY("!!! STUB !!!"); }
 
-uint32_t VdRetrainEDRAM()
-{
+void KeEnterCriticalRegion() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size,
+                                    uint32_t protect, uint32_t minAddress,
+                                    uint32_t maxAddress, uint32_t alignment) {
+  LOGF_UTILITY("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}", flags, size,
+               protect, minAddress, maxAddress, alignment);
+  void *ptr = g_userHeap.AllocPhysical(size, alignment);
+  if (!ptr) {
+    static std::atomic<uint32_t> s_allocFails{0};
+    if (s_allocFails.fetch_add(1) < 50)
+      MCLA_LOG_WARN("MmAllocatePhysicalMemoryEx: FAILED size={:#x} align={:#x} "
+                    "(count={})",
+                    size, alignment, s_allocFails.load());
     return 0;
+  }
+  uint32_t guestAddr =
+      mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
+  // Session-27 window census: catch the allocation feeding the
+  // deterministic unconstructed swf object at 0x88825500.
+  if ((guestAddr & 0xFFFF0000u) == 0x88820000u) {
+    uint32_t lr = 0;
+    if (const PPCContext *c = GetPPCContext())
+      lr = static_cast<uint32_t>(c->lr);
+    MCLA_LOG_WARN("ALLOC-WIN MmPhys -> {:08X} size={:#x} align={:#x} "
+                  "flags={:08X} lr={:08X}",
+                  guestAddr, size, alignment, flags, lr);
+  }
+  MmTrackAllocationSize(guestAddr, size);
+  return guestAddr;
 }
 
-void VdRetrainEDRAMWorker()
-{
-    LOG_UTILITY("!!! STUB !!!");
+uint32_t MmGetPhysicalAddress(uint32_t address) {
+  LOGF_UTILITY("0x{:x}", address);
+  return address;
 }
 
-uint32_t VdIsHSIOTrainingSucceeded()
-{
-    // Return 1 (succeeded) to allow boot to continue
-    return 1;
-}
+void ObDeleteSymbolicLink() { LOG_UTILITY("!!! STUB !!!"); }
 
-void VdGetCurrentDisplayGamma()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void ObCreateSymbolicLink() { LOG_UTILITY("!!! STUB !!!"); }
 
-void KeEnterCriticalRegion()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+uint32_t MmQueryAddressProtect(uint32_t guestAddress) { return PAGE_READWRITE; }
 
-uint32_t MmAllocatePhysicalMemoryEx
-(
-    uint32_t flags,
-    uint32_t size,
-    uint32_t protect,
-    uint32_t minAddress,
-    uint32_t maxAddress,
-    uint32_t alignment
-)
-{
-    LOGF_UTILITY("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}", flags, size, protect, minAddress, maxAddress, alignment);
-    void* ptr = g_userHeap.AllocPhysical(size, alignment);
-    if (!ptr)
-    {
-        static std::atomic<uint32_t> s_allocFails{0};
-        if (s_allocFails.fetch_add(1) < 50)
-            MCLA_LOG_WARN("MmAllocatePhysicalMemoryEx: FAILED size={:#x} align={:#x} (count={})",
-                          size, alignment, s_allocFails.load());
-        return 0;
-    }
-    uint32_t guestAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
-    // Session-27 window census: catch the allocation feeding the
-    // deterministic unconstructed swf object at 0x88825500.
-    if ((guestAddr & 0xFFFF0000u) == 0x88820000u)
-    {
-        uint32_t lr = 0;
-        if (const PPCContext* c = GetPPCContext())
-            lr = static_cast<uint32_t>(c->lr);
-        MCLA_LOG_WARN("ALLOC-WIN MmPhys -> {:08X} size={:#x} align={:#x} flags={:08X} lr={:08X}",
-                      guestAddr, size, alignment, flags, lr);
-    }
-    MmTrackAllocationSize(guestAddr, size);
-    return guestAddr;
-}
+void VdEnableDisableClockGating() { LOG_UTILITY("!!! STUB !!!"); }
 
-uint32_t MmGetPhysicalAddress(uint32_t address)
-{
-    LOGF_UTILITY("0x{:x}", address);
-    return address;
-}
+void KeBugCheck() { __builtin_debugtrap(); }
 
-void ObDeleteSymbolicLink()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void KeLockL2() { LOG_UTILITY("!!! STUB !!!"); }
 
-void ObCreateSymbolicLink()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t MmQueryAddressProtect(uint32_t guestAddress)
-{
-    return PAGE_READWRITE;
-}
-
-void VdEnableDisableClockGating()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void KeBugCheck()
-{
-    __builtin_debugtrap();
-}
-
-void KeLockL2()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void KeUnlockL2()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void KeUnlockL2() { LOG_UTILITY("!!! STUB !!!"); }
 
 // IDENTITY-FIRST RESOLUTION (session 16 audit, systemic fix): kernel-created
 // wrappers can have their guest dispatcher-header signature WIPED by the
@@ -1963,1140 +1770,992 @@ void KeUnlockL2()
 // memory still hosts a valid wrapper; fall back to lazy-wrap only for
 // genuinely embedded/never-created objects.
 template <typename T>
-static T* ResolveCreatedObject(void* guestPtr, size_t guestSize)
-{
-    const uint32_t guestAddr =
-        static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(guestPtr) -
-                              mcla::kernel::g_memory.base);
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    if (mem.IsValid(guestAddr, guestSize))
-    {
-        auto* direct = reinterpret_cast<T*>(mem.Translate(guestAddr));
-        if (direct->IsValid())
-        {
-            return direct;
-        }
+static T *ResolveCreatedObject(void *guestPtr, size_t guestSize) {
+  const uint32_t guestAddr =
+      static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(guestPtr) -
+                            mcla::kernel::g_memory.base);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (mem.IsValid(guestAddr, guestSize)) {
+    auto *direct = reinterpret_cast<T *>(mem.Translate(guestAddr));
+    if (direct->IsValid()) {
+      return direct;
     }
-    return nullptr;
+  }
+  return nullptr;
 }
 
-bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
-{
-    // SIGNAL CENSUS (2026-08-23 session 9): who signals what. Caller LR
-    // attributes the producer site statically afterwards.
-    {
-        static std::atomic<uint32_t> s_signalLogs{0};
-        const uint32_t n = s_signalLogs.fetch_add(1) + 1;
-        if (n <= 40 || (n % 2000) == 0)
-        {
-            MCLA_LOG_INFO("SIGNAL KeSetEvent obj={:08X} inc={} wait={} lr={:08X}",
-                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pEvent)), Increment,
-                          Wait ? 1 : 0, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
+bool KeSetEvent(XKEVENT *pEvent, uint32_t Increment, bool Wait) {
+  // SIGNAL CENSUS (2026-08-23 session 9): who signals what. Caller LR
+  // attributes the producer site statically afterwards.
+  {
+    static std::atomic<uint32_t> s_signalLogs{0};
+    const uint32_t n = s_signalLogs.fetch_add(1) + 1;
+    if (n <= 40 || (n % 2000) == 0) {
+      MCLA_LOG_INFO("SIGNAL KeSetEvent obj={:08X} inc={} wait={} lr={:08X}",
+                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pEvent)),
+                    Increment, Wait ? 1 : 0,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
+  }
 
-    Event* ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
-    bool result = ev ? ev->Set() : QueryKernelObject<Event>(*pEvent)->Set();
+  Event *ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
+  bool result = ev ? ev->Set() : QueryKernelObject<Event>(*pEvent)->Set();
 
-    ++g_keSetEventGeneration;
-    g_keSetEventGeneration.notify_all();
+  ++g_keSetEventGeneration;
+  g_keSetEventGeneration.notify_all();
 
-    return result;
+  return result;
 }
 
-bool KeResetEvent(XKEVENT* pEvent)
-{
-    Event* ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
-    return ev ? ev->Reset() : QueryKernelObject<Event>(*pEvent)->Reset();
+bool KeResetEvent(XKEVENT *pEvent) {
+  Event *ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
+  return ev ? ev->Reset() : QueryKernelObject<Event>(*pEvent)->Reset();
 }
 
-uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
-{
-    // PRODUCER-DEATH CENSUS (2026-08-25): all-thread wait/return telemetry.
-    // Always logs waits whose caller sits in the GPU-driver range (the
-    // producers); other callers are sampled. LOG-ONLY.
-    {
-        static std::atomic<uint32_t> s_wcKwfs{0};
-        const uint32_t n = s_wcKwfs.fetch_add(1) + 1;
-        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
-        const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
-        if (hot || n <= 120 || (n % 300) == 0)
-        {
-            uint32_t r13 = g_ppcContext ? g_ppcContext->r13.u32 : 0;
-            uint32_t objAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
-            uint32_t pc = 0, pcBlk = 0, put = 0, rptrWb = 0, gpuCtx = 0;
-            auto& memC = mcla::kernel::GuestMemoryHeap::Instance();
-            if (r13 != 0)
-            {
-                if (memC.ReadU32BE(r13 + 256, &pcBlk) && pcBlk != 0)
-                    (void)memC.ReadU32BE(pcBlk + 88, &pc);
-            }
-            (void)memC.ReadU32BE(0x82839254u, &gpuCtx);
-            if (gpuCtx != 0)
-                (void)memC.ReadU32BE(gpuCtx + 10908u, &put);
-            (void)memC.ReadU32BE(0xC701C4BCu, &rptrWb);
-            MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} to={}ms lr={:08X} put={} rptrWB={:04X} pc={:08X}:{}",
-                          n, hot ? "!" : " ", GetCurrentThreadId(), objAddr,
-                          WaitReason, GuestTimeoutToMilliseconds(Timeout), lr,
-                          put, rptrWb & 0xFFFF, pcBlk, pc);
-        }
+uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
+                               uint32_t WaitMode, bool Alertable,
+                               be<int64_t> *Timeout) {
+  // PRODUCER-DEATH CENSUS (2026-08-25): all-thread wait/return telemetry.
+  // Always logs waits whose caller sits in the GPU-driver range (the
+  // producers); other callers are sampled. LOG-ONLY.
+  {
+    static std::atomic<uint32_t> s_wcKwfs{0};
+    const uint32_t n = s_wcKwfs.fetch_add(1) + 1;
+    const uint32_t lr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+    const bool hot = lr >= 0x82410000u && lr < 0x82430000u;
+    if (hot || n <= 120 || (n % 300) == 0) {
+      uint32_t r13 = g_ppcContext ? g_ppcContext->r13.u32 : 0;
+      uint32_t objAddr =
+          mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
+      uint32_t pc = 0, pcBlk = 0, put = 0, rptrWb = 0, gpuCtx = 0;
+      auto &memC = mcla::kernel::GuestMemoryHeap::Instance();
+      if (r13 != 0) {
+        if (memC.ReadU32BE(r13 + 256, &pcBlk) && pcBlk != 0)
+          (void)memC.ReadU32BE(pcBlk + 88, &pc);
+      }
+      (void)memC.ReadU32BE(0x82839254u, &gpuCtx);
+      if (gpuCtx != 0)
+        (void)memC.ReadU32BE(gpuCtx + 10908u, &put);
+      (void)memC.ReadU32BE(0xC701C4BCu, &rptrWb);
+      MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} "
+                    "to={}ms lr={:08X} put={} rptrWB={:04X} pc={:08X}:{}",
+                    n, hot ? "!" : " ", GetCurrentThreadId(), objAddr,
+                    WaitReason, GuestTimeoutToMilliseconds(Timeout), lr, put,
+                    rptrWb & 0xFFFF, pcBlk, pc);
     }
-    // MAIN-THREAD PARK PROBE
-    {
-        static std::atomic<uint32_t> s_parkLogs3{0};
-        uint32_t mainId = g_mainGuestThreadId.load();
-        if (mainId != 0 && GetCurrentThreadId() == mainId && s_parkLogs3.fetch_add(1) < 200)
-        {
-            MCLA_LOG_INFO("[main-park] KeWaitForSingleObject obj={:08X} reason={} lr={:08X}",
-                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)), WaitReason,
-                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
+  }
+  // MAIN-THREAD PARK PROBE
+  {
+    static std::atomic<uint32_t> s_parkLogs3{0};
+    uint32_t mainId = g_mainGuestThreadId.load();
+    if (mainId != 0 && GetCurrentThreadId() == mainId &&
+        s_parkLogs3.fetch_add(1) < 200) {
+      MCLA_LOG_INFO(
+          "[main-park] KeWaitForSingleObject obj={:08X} reason={} lr={:08X}",
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)),
+          WaitReason,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
-    const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == 0 || timeout == INFINITE);
+  }
+  const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+  assert(timeout == 0 || timeout == INFINITE);
 
-    uint8_t type = Object->Type;
+  uint8_t type = Object->Type;
 
-    switch (type)
-    {
-        case 0:
-        case 1:
-        {
-            Event* ev = ResolveCreatedObject<Event>(Object, sizeof(XKEVENT));
-            if (!ev)
-                ev = QueryKernelObject<Event>(*Object);
-            ev->Wait(timeout);
-            break;
-        }
+  switch (type) {
+  case 0:
+  case 1: {
+    Event *ev = ResolveCreatedObject<Event>(Object, sizeof(XKEVENT));
+    if (!ev)
+      ev = QueryKernelObject<Event>(*Object);
+    ev->Wait(timeout);
+    break;
+  }
 
-        case 5:
-        {
-            Semaphore* sem = ResolveCreatedObject<Semaphore>(Object, sizeof(XKSEMAPHORE));
-            if (!sem)
-                sem = QueryKernelObject<Semaphore>(*Object);
-            sem->Wait(timeout);
-            break;
-        }
+  case 5: {
+    Semaphore *sem =
+        ResolveCreatedObject<Semaphore>(Object, sizeof(XKSEMAPHORE));
+    if (!sem)
+      sem = QueryKernelObject<Semaphore>(*Object);
+    sem->Wait(timeout);
+    break;
+  }
 
-        default:
-            assert(false && "Unrecognized kernel object type.");
-            return STATUS_TIMEOUT;
+  default:
+    assert(false && "Unrecognized kernel object type.");
+    return STATUS_TIMEOUT;
+  }
+
+  {
+    static std::atomic<uint32_t> s_wcKwfsR{0};
+    const uint32_t n = s_wcKwfsR.fetch_add(1) + 1;
+    const uint32_t lr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
+    if ((lr >= 0x82410000u && lr < 0x82430000u) || n <= 120 || (n % 300) == 0) {
+      MCLA_LOG_INFO("WAKE[KWFSO] #{:05}{} tid={:08X} status={:08X} lr={:08X}",
+                    n, (lr >= 0x82410000u && lr < 0x82430000u) ? "!" : " ",
+                    GetCurrentThreadId(), STATUS_SUCCESS, lr);
     }
-
-    {
-        static std::atomic<uint32_t> s_wcKwfsR{0};
-        const uint32_t n = s_wcKwfsR.fetch_add(1) + 1;
-        const uint32_t lr = g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0;
-        if ((lr >= 0x82410000u && lr < 0x82430000u) || n <= 120 || (n % 300) == 0)
-        {
-            MCLA_LOG_INFO("WAKE[KWFSO] #{:05}{} tid={:08X} status={:08X} lr={:08X}",
-                          n, (lr >= 0x82410000u && lr < 0x82430000u) ? "!" : " ",
-                          GetCurrentThreadId(), STATUS_SUCCESS, lr);
-        }
-    }
-    return STATUS_SUCCESS;
+  }
+  return STATUS_SUCCESS;
 }
 
 static std::vector<size_t> g_tlsFreeIndices;
 static size_t g_tlsNextIndex = 0;
 static Mutex g_tlsAllocationMutex;
 
-static uint32_t& KeTlsGetValueRef(size_t index)
-{
-    // Having this a global thread_local variable
-    // for some reason crashes on boot in debug builds.
-    thread_local std::vector<uint32_t> s_tlsValues;
+static uint32_t &KeTlsGetValueRef(size_t index) {
+  // Having this a global thread_local variable
+  // for some reason crashes on boot in debug builds.
+  thread_local std::vector<uint32_t> s_tlsValues;
 
-    if (s_tlsValues.size() <= index)
-    {
-        s_tlsValues.resize(index + 1, 0);
+  if (s_tlsValues.size() <= index) {
+    s_tlsValues.resize(index + 1, 0);
+  }
+
+  return s_tlsValues[index];
+}
+
+uint32_t KeTlsGetValue(uint32_t dwTlsIndex) {
+  return KeTlsGetValueRef(dwTlsIndex);
+}
+
+uint32_t KeTlsSetValue(uint32_t dwTlsIndex, uint32_t lpTlsValue) {
+  KeTlsGetValueRef(dwTlsIndex) = lpTlsValue;
+  return TRUE;
+}
+
+uint32_t KeTlsAlloc() {
+  std::lock_guard<Mutex> lock(g_tlsAllocationMutex);
+  if (!g_tlsFreeIndices.empty()) {
+    size_t index = g_tlsFreeIndices.back();
+    g_tlsFreeIndices.pop_back();
+    return index;
+  }
+
+  return g_tlsNextIndex++;
+}
+
+uint32_t KeTlsFree(uint32_t dwTlsIndex) {
+  std::lock_guard<Mutex> lock(g_tlsAllocationMutex);
+  g_tlsFreeIndices.push_back(dwTlsIndex);
+  return TRUE;
+}
+
+uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, be<uint32_t> *param1,
+                           be<uint32_t> *param2) {
+  if (message == 0x7001B) {
+    uint32_t param1_val = param1 ? param1->get() : 0;
+    if (param1_val > 1) {
+      uint32_t *ptr = reinterpret_cast<uint32_t *>(
+          mcla::kernel::GuestMemoryHeap::Instance().Translate(
+              param1_val + 1 * sizeof(uint32_t)));
+      if (ptr) {
+        ptr[0] = 0;
+        ptr[1] = 0;
+      }
     }
+  }
 
-    return s_tlsValues[index];
+  return 0;
 }
 
-uint32_t KeTlsGetValue(uint32_t dwTlsIndex)
-{
-    return KeTlsGetValueRef(dwTlsIndex);
-}
-
-uint32_t KeTlsSetValue(uint32_t dwTlsIndex, uint32_t lpTlsValue)
-{
-    KeTlsGetValueRef(dwTlsIndex) = lpTlsValue;
-    return TRUE;
-}
-
-uint32_t KeTlsAlloc()
-{
-    std::lock_guard<Mutex> lock(g_tlsAllocationMutex);
-    if (!g_tlsFreeIndices.empty())
-    {
-        size_t index = g_tlsFreeIndices.back();
-        g_tlsFreeIndices.pop_back();
-        return index;
-    }
-
-    return g_tlsNextIndex++;
-}
-
-uint32_t KeTlsFree(uint32_t dwTlsIndex)
-{
-    std::lock_guard<Mutex> lock(g_tlsAllocationMutex);
-    g_tlsFreeIndices.push_back(dwTlsIndex);
-    return TRUE;
-}
-
-uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, be<uint32_t>* param1, be<uint32_t>* param2)
-{
-    if (message == 0x7001B)
-    {
-        uint32_t param1_val = param1 ? param1->get() : 0;
-        if (param1_val > 1)
-        {
-            uint32_t* ptr = reinterpret_cast<uint32_t*>(mcla::kernel::GuestMemoryHeap::Instance().Translate(param1_val + 1 * sizeof(uint32_t)));
-            if (ptr)
-            {
-                ptr[0] = 0;
-                ptr[1] = 0;
-            }
-        }
-    }
-
-    return 0;
-}
-
-void XamUserReadProfileSettings
-(
-    uint32_t titleId,
-    uint32_t userIndex,
-    uint32_t xuidCount,
-    uint64_t* xuids,
-    uint32_t settingCount,
-    uint32_t* settingIds,
-    be<uint32_t>* bufferSize,
-    void* buffer,
-    void* overlapped
-)
-{
-    if (buffer != nullptr)
-    {
-        memset(buffer, 0, *bufferSize);
-    }
-    else
-    {
-        *bufferSize = 4;
-    }
+void XamUserReadProfileSettings(uint32_t titleId, uint32_t userIndex,
+                                uint32_t xuidCount, uint64_t *xuids,
+                                uint32_t settingCount, uint32_t *settingIds,
+                                be<uint32_t> *bufferSize, void *buffer,
+                                void *overlapped) {
+  if (buffer != nullptr) {
+    memset(buffer, 0, *bufferSize);
+  } else {
+    *bufferSize = 4;
+  }
 }
 
 // NOTE: NetDll_* exports take a leading selector arg (generated wrappers pass
 // r3=1 before the real WinSock args â€” see sub_8244A258 in generated code).
-uint32_t NetDll_WSAStartup(uint32_t dllSelector, uint16_t versionRequested, void* wsaData)
-{
-    // WinSock 1.1-style WSADATA on 360 (Xenia xboxkrnl_net.cc semantics):
-    // wVersion@0, wHighVersion@2, szDescription@4, szSystemStatus@261,
-    // iMaxSockets@390, iMaxUdpDg@392, lpVendorInfo@396.
-    // Evidence (generated sub_821E44A0): the game re-reads wVersion and only
-    // accepts the exact word the caller passed (0x0002 here) â€” store it
-    // verbatim, big-endian, no MAKEWORD reshuffling.
-    const uint16_t reportedVersion = static_cast<uint16_t>(versionRequested);
-    constexpr uint16_t kHighVersion = 0x0202;
-    (void)dllSelector;
+uint32_t NetDll_WSAStartup(uint32_t dllSelector, uint16_t versionRequested,
+                           void *wsaData) {
+  // WinSock 1.1-style WSADATA on 360 (Xenia xboxkrnl_net.cc semantics):
+  // wVersion@0, wHighVersion@2, szDescription@4, szSystemStatus@261,
+  // iMaxSockets@390, iMaxUdpDg@392, lpVendorInfo@396.
+  // Evidence (generated sub_821E44A0): the game re-reads wVersion and only
+  // accepts the exact word the caller passed (0x0002 here) â€” store it
+  // verbatim, big-endian, no MAKEWORD reshuffling.
+  const uint16_t reportedVersion = static_cast<uint16_t>(versionRequested);
+  constexpr uint16_t kHighVersion = 0x0202;
+  (void)dllSelector;
 
-    if (wsaData)
-    {
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        const uint32_t base = mem.MapVirtual(wsaData);
-        if (base != 0)
-        {
-            (void)mem.WriteU16BE(base + 0, reportedVersion);   // wVersion = echoed request
-            (void)mem.WriteU16BE(base + 2, kHighVersion);      // wHighVersion
+  if (wsaData) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t base = mem.MapVirtual(wsaData);
+    if (base != 0) {
+      (void)mem.WriteU16BE(base + 0,
+                           reportedVersion);        // wVersion = echoed request
+      (void)mem.WriteU16BE(base + 2, kHighVersion); // wHighVersion
 
-            const char description[] = "MCLA native recomp winsock 2.2";
-            (void)mem.WriteBytes(base + 4, description, sizeof(description));
-            const char systemStatus[] = "Running";
-            (void)mem.WriteBytes(base + 261, systemStatus, sizeof(systemStatus));
+      const char description[] = "MCLA native recomp winsock 2.2";
+      (void)mem.WriteBytes(base + 4, description, sizeof(description));
+      const char systemStatus[] = "Running";
+      (void)mem.WriteBytes(base + 261, systemStatus, sizeof(systemStatus));
 
-            (void)mem.WriteU16BE(base + 390, 1024);            // iMaxSockets
-            (void)mem.WriteU16BE(base + 392, 64);              // iMaxUdpDg
-            (void)mem.WriteU32BE(base + 396, 0);               // lpVendorInfo = NULL
-        }
+      (void)mem.WriteU16BE(base + 390, 1024); // iMaxSockets
+      (void)mem.WriteU16BE(base + 392, 64);   // iMaxUdpDg
+      (void)mem.WriteU32BE(base + 396, 0);    // lpVendorInfo = NULL
     }
-    return 0; // SUCCESS
+  }
+  return 0; // SUCCESS
 }
 
-uint32_t NetDll_WSACleanup()
-{
-    return 0; // Success
+uint32_t NetDll_WSACleanup() {
+  return 0; // Success
 }
 
-uint32_t NetDll_socket(int af, int type, int protocol)
-{
-    (void)af;
-    (void)type;
-    (void)protocol;
-    return 0xFFFFFFFF; // INVALID_SOCKET
+uint32_t NetDll_socket(int af, int type, int protocol) {
+  (void)af;
+  (void)type;
+  (void)protocol;
+  return 0xFFFFFFFF; // INVALID_SOCKET
 }
 
-uint32_t NetDll_closesocket(uint32_t s)
-{
-    (void)s;
-    return 0; // Success
+uint32_t NetDll_closesocket(uint32_t s) {
+  (void)s;
+  return 0; // Success
 }
 
-uint32_t NetDll_setsockopt(uint32_t s, int level, int optname, const char* optval, int optlen)
-{
-    (void)s;
-    (void)level;
-    (void)optname;
-    (void)optval;
-    (void)optlen;
-    return 0; // Success
+uint32_t NetDll_setsockopt(uint32_t s, int level, int optname,
+                           const char *optval, int optlen) {
+  (void)s;
+  (void)level;
+  (void)optname;
+  (void)optval;
+  (void)optlen;
+  return 0; // Success
 }
 
-uint32_t NetDll_bind(uint32_t s, void* addr, int namelen)
-{
-    (void)s;
-    (void)addr;
-    (void)namelen;
-    return 0; // Success
+uint32_t NetDll_bind(uint32_t s, void *addr, int namelen) {
+  (void)s;
+  (void)addr;
+  (void)namelen;
+  return 0; // Success
 }
 
-uint32_t NetDll_connect(uint32_t s, void* addr, int namelen)
-{
-    (void)s;
-    (void)addr;
-    (void)namelen;
-    return 0; // Success
+uint32_t NetDll_connect(uint32_t s, void *addr, int namelen) {
+  (void)s;
+  (void)addr;
+  (void)namelen;
+  return 0; // Success
 }
 
-uint32_t NetDll_listen(uint32_t s, int backlog)
-{
-    (void)s;
-    (void)backlog;
-    return 0; // Success
+uint32_t NetDll_listen(uint32_t s, int backlog) {
+  (void)s;
+  (void)backlog;
+  return 0; // Success
 }
 
-uint32_t NetDll_accept(uint32_t s, void* addr, int* addrlen)
-{
-    (void)s;
-    (void)addr;
-    (void)addrlen;
-    return 0xFFFFFFFF; // INVALID_SOCKET
+uint32_t NetDll_accept(uint32_t s, void *addr, int *addrlen) {
+  (void)s;
+  (void)addr;
+  (void)addrlen;
+  return 0xFFFFFFFF; // INVALID_SOCKET
 }
 
-uint32_t NetDll_select(int nfds, void* readfds, void* writefds, void* exceptfds, void* timeout)
-{
-    (void)nfds;
-    (void)readfds;
-    (void)writefds;
-    (void)exceptfds;
-    (void)timeout;
-    return 0; // Success
+uint32_t NetDll_select(int nfds, void *readfds, void *writefds, void *exceptfds,
+                       void *timeout) {
+  (void)nfds;
+  (void)readfds;
+  (void)writefds;
+  (void)exceptfds;
+  (void)timeout;
+  return 0; // Success
 }
 
-uint32_t NetDll_recv(uint32_t s, void* buf, int len, int flags)
-{
-    (void)s;
-    (void)buf;
-    (void)len;
-    (void)flags;
-    return 0; // Success (0 bytes received)
+uint32_t NetDll_recv(uint32_t s, void *buf, int len, int flags) {
+  (void)s;
+  (void)buf;
+  (void)len;
+  (void)flags;
+  return 0; // Success (0 bytes received)
 }
 
-uint32_t NetDll_send(uint32_t s, const void* buf, int len, int flags)
-{
-    (void)s;
-    (void)buf;
-    (void)len;
-    (void)flags;
-    return len; // Success (all bytes sent)
+uint32_t NetDll_send(uint32_t s, const void *buf, int len, int flags) {
+  (void)s;
+  (void)buf;
+  (void)len;
+  (void)flags;
+  return len; // Success (all bytes sent)
 }
 
-PPC_FUNC(__imp__NetDll_inet_addr)
-{
-    // r3 = cp (const char*)
-    // Return INADDR_NONE (0xFFFFFFFF) in r3
-    ctx.r3.u32 = 0xFFFFFFFF;
+PPC_FUNC(__imp__NetDll_inet_addr) {
+  // r3 = cp (const char*)
+  // Return INADDR_NONE (0xFFFFFFFF) in r3
+  ctx.r3.u32 = 0xFFFFFFFF;
 }
 
-PPC_FUNC(__imp__NetDll___WSAFDIsSet)
-{
-    // r3 = fd, r4 = set
-    // Return 0 (not set) in r3
-    ctx.r3.u32 = 0;
+PPC_FUNC(__imp__NetDll___WSAFDIsSet) {
+  // r3 = fd, r4 = set
+  // Return 0 (not set) in r3
+  ctx.r3.u32 = 0;
 }
 
-void NetDll___WSAFDIsSet()
-{
-    LOG_UTILITY("!!! STUB !!!");
+void NetDll___WSAFDIsSet() { LOG_UTILITY("!!! STUB !!!"); }
+
+void XMsgStartIORequestEx() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t XexGetModuleHandle(uint32_t moduleName, be<uint32_t> *handle) {
+  (void)moduleName;
+  if (handle) {
+    // Return the main executable handle
+    handle->set(0x82000000);
+  }
+  return 0;
 }
 
-void XMsgStartIORequestEx()
-{
-    LOG_UTILITY("!!! STUB !!!");
+bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION *cs) {
+  uint32_t thisThread = g_ppcContext->r13.u32;
+  assert(thisThread != NULL);
+
+  std::atomic_ref owningThread(cs->OwningThread);
+
+  uint32_t previousOwner = 0;
+
+  if (owningThread.compare_exchange_weak(previousOwner, thisThread) ||
+      previousOwner == thisThread) {
+    cs->RecursionCount++;
+    return true;
+  }
+
+  return false;
 }
 
-uint32_t XexGetModuleHandle(uint32_t moduleName, be<uint32_t>* handle)
-{
-    (void)moduleName;
-    if (handle)
-    {
-        // Return the main executable handle
-        handle->set(0x82000000);
+void RtlInitializeCriticalSectionAndSpinCount(XRTL_CRITICAL_SECTION *cs,
+                                              uint32_t spinCount) {
+  cs->Header.Absolute = (spinCount + 255) >> 8;
+  cs->LockCount = -1;
+  cs->RecursionCount = 0;
+  cs->OwningThread = 0;
+}
+
+void _vswprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void _vscwprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void _swprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void _snwprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void XeKeysGetKey() {
+  // Xbox 360 kernel cert for XEX signature verification.
+  // Key 0x36 = console certificate (RSA-2048 public key + metadata).
+  // Xenia provides a valid cert here; we emit a minimal placeholder
+  // that satisfies size checks so XexLoadImage signature verification proceeds.
+  // Guest passes: r3=keyType, r4=output ptr, r5=outputSize (per xenia)
+  // We use g_ppcContext to read guest register arguments.
+  if (g_ppcContext) {
+    uint32_t keyType = g_ppcContext->r3.u32;
+    uint32_t output = g_ppcContext->r4.u32;
+    uint32_t outputSize = g_ppcContext->r5.u32;
+    if (output && outputSize >= 0x140) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      uint8_t cert[0x140] = {};
+      // Write key type at offset 0 (big-endian)
+      *reinterpret_cast<uint32_t *>(&cert[0]) = __builtin_bswap32(keyType);
+      // Certificate length at offset 4
+      *reinterpret_cast<uint32_t *>(&cert[4]) = __builtin_bswap32(0x138);
+      // Exponent at offset 8 (standard 65537)
+      *reinterpret_cast<uint32_t *>(&cert[8]) = __builtin_bswap32(0x10001);
+      // Remaining bytes are modulus (zero = signature verify "passes" with zero
+      // modulus)
+      (void)mem.WriteBytes(output, cert, outputSize);
     }
-    return 0;
-}
-
-bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
-{
-    uint32_t thisThread = g_ppcContext->r13.u32;
-    assert(thisThread != NULL);
-
-    std::atomic_ref owningThread(cs->OwningThread);
-
-    uint32_t previousOwner = 0;
-
-    if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
-    {
-        cs->RecursionCount++;
-        return true;
-    }
-
-    return false;
-}
-
-void RtlInitializeCriticalSectionAndSpinCount(XRTL_CRITICAL_SECTION* cs, uint32_t spinCount)
-{
-    cs->Header.Absolute = (spinCount + 255) >> 8;
-    cs->LockCount = -1;
-    cs->RecursionCount = 0;
-    cs->OwningThread = 0;
-}
-
-void _vswprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void _vscwprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void _swprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void _snwprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void XeKeysGetKey()
-{
-    // Xbox 360 kernel cert for XEX signature verification.
-    // Key 0x36 = console certificate (RSA-2048 public key + metadata).
-    // Xenia provides a valid cert here; we emit a minimal placeholder
-    // that satisfies size checks so XexLoadImage signature verification proceeds.
-    // Guest passes: r3=keyType, r4=output ptr, r5=outputSize (per xenia)
-    // We use g_ppcContext to read guest register arguments.
-    if (g_ppcContext)
-    {
-        uint32_t keyType = g_ppcContext->r3.u32;
-        uint32_t output = g_ppcContext->r4.u32;
-        uint32_t outputSize = g_ppcContext->r5.u32;
-        if (output && outputSize >= 0x140)
-        {
-            auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-            uint8_t cert[0x140] = {};
-            // Write key type at offset 0 (big-endian)
-            *reinterpret_cast<uint32_t*>(&cert[0]) = __builtin_bswap32(keyType);
-            // Certificate length at offset 4
-            *reinterpret_cast<uint32_t*>(&cert[4]) = __builtin_bswap32(0x138);
-            // Exponent at offset 8 (standard 65537)
-            *reinterpret_cast<uint32_t*>(&cert[8]) = __builtin_bswap32(0x10001);
-            // Remaining bytes are modulus (zero = signature verify "passes" with zero modulus)
-            (void)mem.WriteBytes(output, cert, outputSize);
-        }
-    }
+  }
 }
 
 // XEX crypto implementations (must precede hook registrations)
-void XeCryptBnQwBeSigVerify()
-{
-    // RSA-2048 PKCS#1 v1.5 signature verification
-    // Guest args: r3 = keyModulusPtr, r4 = keyExponent, r5 = signaturePtr, r6 = hashPtr, r7 = hashLen
-    // Returns 1 if valid, 0 if invalid
-    // For dev mode: always return success so XEX signature verification passes
-    if (g_ppcContext)
-    {
-        g_ppcContext->r3.u32 = 1; // TRUE - signature valid
-    }
+void XeCryptBnQwBeSigVerify() {
+  // RSA-2048 PKCS#1 v1.5 signature verification
+  // Guest args: r3 = keyModulusPtr, r4 = keyExponent, r5 = signaturePtr, r6 =
+  // hashPtr, r7 = hashLen Returns 1 if valid, 0 if invalid For dev mode: always
+  // return success so XEX signature verification passes
+  if (g_ppcContext) {
+    g_ppcContext->r3.u32 = 1; // TRUE - signature valid
+  }
 }
 
-void XeCryptSha()
-{
-    // SHA-1 or SHA-256 hash computation
-    // Guest args: r3 = inputPtr, r4 = inputLen, r5 = outputPtr
-    if (!g_ppcContext)
-        return;
+void XeCryptSha() {
+  // SHA-1 or SHA-256 hash computation
+  // Guest args: r3 = inputPtr, r4 = inputLen, r5 = outputPtr
+  if (!g_ppcContext)
+    return;
 
-    uint32_t inputPtr = g_ppcContext->r3.u32;
-    uint32_t inputLen = g_ppcContext->r4.u32;
-    uint32_t outputPtr = g_ppcContext->r5.u32;
+  uint32_t inputPtr = g_ppcContext->r3.u32;
+  uint32_t inputLen = g_ppcContext->r4.u32;
+  uint32_t outputPtr = g_ppcContext->r5.u32;
 
-    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+  g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
 
-    if (outputPtr)
-    {
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        // Write 20-byte SHA-1 zero hash (placeholder)
-        uint8_t hash[20] = {};
-        (void)mem.WriteBytes(outputPtr, hash, 20);
-    }
+  if (outputPtr) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    // Write 20-byte SHA-1 zero hash (placeholder)
+    uint8_t hash[20] = {};
+    (void)mem.WriteBytes(outputPtr, hash, 20);
+  }
 }
 
-void XeCryptRotSumSha()
-{
-    // Rotating sum SHA - used for hash verification
-    // Guest args: r3 = inputPtr, r4 = inputLen, r5 = outputPtr
-    // Returns 0 on success
-    if (!g_ppcContext)
-        return;
+void XeCryptRotSumSha() {
+  // Rotating sum SHA - used for hash verification
+  // Guest args: r3 = inputPtr, r4 = inputLen, r5 = outputPtr
+  // Returns 0 on success
+  if (!g_ppcContext)
+    return;
 
-    uint32_t inputPtr = g_ppcContext->r3.u32;
-    uint32_t inputLen = g_ppcContext->r4.u32;
-    uint32_t outputPtr = g_ppcContext->r5.u32;
+  uint32_t inputPtr = g_ppcContext->r3.u32;
+  uint32_t inputLen = g_ppcContext->r4.u32;
+  uint32_t outputPtr = g_ppcContext->r5.u32;
 
-    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+  g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
 
-    if (outputPtr && inputLen > 0)
-    {
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        uint8_t hash[20] = {};
-        (void)mem.WriteBytes(outputPtr, hash, 20);
-    }
+  if (outputPtr && inputLen > 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint8_t hash[20] = {};
+    (void)mem.WriteBytes(outputPtr, hash, 20);
+  }
 }
 
-void KeEnableFpuExceptions()
-{
-    LOG_UTILITY("!!! STUB !!!");
+void KeEnableFpuExceptions() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlUnwind_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlCaptureContext_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void NtQueryFullAttributesFile() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t RtlMultiByteToUnicodeN(be<uint16_t> *UnicodeString,
+                                uint32_t MaxBytesInUnicodeString,
+                                be<uint32_t> *BytesInUnicodeString,
+                                const char *MultiByteString,
+                                uint32_t BytesInMultiByteString) {
+  uint32_t length =
+      std::min(MaxBytesInUnicodeString / 2, BytesInMultiByteString);
+
+  be<uint16_t> *dest = UnicodeString;
+  if (!dest)
+    return STATUS_FAIL_CHECK;
+
+  for (size_t i = 0; i < length; i++) {
+    dest[i].set(static_cast<uint16_t>(MultiByteString[i]));
+  }
+
+  if (BytesInUnicodeString != nullptr)
+    BytesInUnicodeString->set(length * 2);
+
+  return STATUS_SUCCESS;
 }
 
-void RtlUnwind_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void RtlCaptureContext_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void NtQueryFullAttributesFile()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t RtlMultiByteToUnicodeN(be<uint16_t>* UnicodeString, uint32_t MaxBytesInUnicodeString, be<uint32_t>* BytesInUnicodeString, const char* MultiByteString, uint32_t BytesInMultiByteString)
-{
-    uint32_t length = std::min(MaxBytesInUnicodeString / 2, BytesInMultiByteString);
-
-    be<uint16_t>* dest = UnicodeString;
-    if (!dest)
-        return STATUS_FAIL_CHECK;
-
-    for (size_t i = 0; i < length; i++)
-    {
-        dest[i].set(static_cast<uint16_t>(MultiByteString[i]));
-    }
-
-    if (BytesInUnicodeString != nullptr)
-        BytesInUnicodeString->set(length * 2);
-
-    return STATUS_SUCCESS;
-}
-
-void DbgBreakPoint()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
+void DbgBreakPoint() { LOG_UTILITY("!!! STUB !!!"); }
 
 // Track physical allocations for MmQueryAllocationSize
 static std::unordered_map<uint32_t, uint32_t> s_allocSizeMap;
 static std::mutex s_allocSizeMutex;
 
-uint32_t MmQueryAllocationSize(uint32_t guestAddress)
-{
-    // Returns real allocation size, not the address
-    // Used by destructors: memset(addr, 0, MmQueryAllocationSize(addr))
-    // Must not return address as size or it wipes heap descriptor at 0x40000000
-    
-    std::lock_guard<std::mutex> lock(s_allocSizeMutex);
-    auto it = s_allocSizeMap.find(guestAddress);
-    if (it != s_allocSizeMap.end())
-    {
-        return it->second;
+uint32_t MmQueryAllocationSize(uint32_t guestAddress) {
+  // Returns real allocation size, not the address
+  // Used by destructors: memset(addr, 0, MmQueryAllocationSize(addr))
+  // Must not return address as size or it wipes heap descriptor at 0x40000000
+
+  std::lock_guard<std::mutex> lock(s_allocSizeMutex);
+  auto it = s_allocSizeMap.find(guestAddress);
+  if (it != s_allocSizeMap.end()) {
+    return it->second;
+  }
+
+  // Fallback: try to get size from heap
+  if (guestAddress != 0) {
+    void *hostPtr =
+        mcla::kernel::GuestMemoryHeap::Instance().Translate(guestAddress);
+    if (hostPtr) {
+      size_t size = g_userHeap.Size(hostPtr);
+      if (size > 0 && size < 0x1000000)
+        return static_cast<uint32_t>(size);
     }
-    
-    // Fallback: try to get size from heap
-    if (guestAddress != 0)
-    {
-        void* hostPtr = mcla::kernel::GuestMemoryHeap::Instance().Translate(guestAddress);
-        if (hostPtr)
-        {
-            size_t size = g_userHeap.Size(hostPtr);
-            if (size > 0 && size < 0x1000000)
-                return static_cast<uint32_t>(size);
-        }
-    }
-    
-    // Default page size fallback
-    return 0x1000;
+  }
+
+  // Default page size fallback
+  return 0x1000;
 }
 
 // Called when allocating physical memory to track sizes
-void MmTrackAllocationSize(uint32_t guestAddress, uint32_t size)
-{
-    std::lock_guard<std::mutex> lock(s_allocSizeMutex);
-    s_allocSizeMap[guestAddress] = size;
+void MmTrackAllocationSize(uint32_t guestAddress, uint32_t size) {
+  std::lock_guard<std::mutex> lock(s_allocSizeMutex);
+  s_allocSizeMap[guestAddress] = size;
 }
 
-uint32_t NtClearEvent(Event* handle, uint32_t* previousState)
-{
-    handle->Reset();
+uint32_t NtClearEvent(Event *handle, uint32_t *previousState) {
+  handle->Reset();
+  return 0;
+}
+
+uint32_t NtResumeThread(GuestThreadHandle *hThread, uint32_t *suspendCount) {
+  assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE));
+
+  hThread->suspended = false;
+  hThread->suspended.notify_all();
+
+  return S_OK;
+}
+
+uint32_t NtSetEvent(Event *handle, uint32_t *previousState) {
+  handle->Set();
+  return 0;
+}
+
+uint32_t NtCreateSemaphore(be<uint32_t> *Handle,
+                           XOBJECT_ATTRIBUTES *ObjectAttributes,
+                           uint32_t InitialCount, uint32_t MaximumCount) {
+  Handle->set(GetKernelHandle(
+      CreateKernelObject<Semaphore>(InitialCount, MaximumCount)));
+
+  // SEMA-CREATE CENSUS (session 10): the main-thread park waits on handle
+  // C9ADB800 (NOT an NtCreateEvent product) - identify its creator.
+  {
+    static std::atomic<uint32_t> s_semaCreates{0};
+    const uint32_t n = s_semaCreates.fetch_add(1) + 1;
+    if (n <= 100) {
+      MCLA_LOG_INFO("SEMA-CREATE #{} h={:08X} init={} max={} lr={:08X}", n,
+                    static_cast<uint32_t>(*Handle), InitialCount, MaximumCount,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
+uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
+                            int32_t *PreviousCount) {
+  // SIGNAL CENSUS (session 12): Ghidra proved completers use
+  // NtReleaseSemaphore (NOT KeReleaseSemaphore) - prior census watched
+  // the wrong twin and reported zero signals.
+  {
+    static std::atomic<uint32_t> s_ntRelLogs{0};
+    const uint32_t n = s_ntRelLogs.fetch_add(1) + 1;
+    if (n <= 40 || (n % 2000) == 0) {
+      // Guest VA of the caller's XKSEMAPHORE* + the address our typed
+      // Header field resolves to - session 15 showed census/probe
+      // disagreeing across runs; measure both in one place.
+      const uint32_t guestHandle =
+          static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
+                                mcla::kernel::g_memory.base);
+      MCLA_LOG_INFO(
+          "SIGNAL NtReleaseSemaphore guest={:08X} hdrOff={} count={} lr={:08X}",
+          guestHandle,
+          reinterpret_cast<uintptr_t>(&Handle->Header) -
+              reinterpret_cast<uintptr_t>(Handle),
+          ReleaseCount,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
+
+  // IDENTITY RESOLUTION (session 16 fix): the game's driver re-initializes
+  // dispatcher headers after NtCreateSemaphore (it owns these structs),
+  // wiping our OBJECT_SIGNATURE - QueryKernelObject's lazy-wrap then built
+  // a PHANTOM wrapper over raw bytes (probe: release landed on guest
+  // C9ADB880 with garbage count while consumers waited wrapper C5218280).
+  // Resolve identically to the wait path (NtWaitForSingleObjectEx ->
+  // GetKernelObject = pure identity translation) and only fall back to
+  // lazy-wrap for addresses we never created.
+  Semaphore *sem = ResolveCreatedObject<Semaphore>(Handle, sizeof(XKSEMAPHORE));
+  if (!sem) {
+    sem = QueryKernelObject<Semaphore>(Handle->Header);
+  }
+
+  uint32_t previousCount;
+  sem->Release(ReleaseCount, &previousCount);
+
+  if (PreviousCount != nullptr)
+    *PreviousCount = previousCount;
+
+  return STATUS_SUCCESS;
+}
+
+void NtWaitForMultipleObjectsEx() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlCompareStringN() { LOG_UTILITY("!!! STUB !!!"); }
+
+void _snprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
+
+void StfsControlDevice() {
+  // STFS control device - return success
+  if (!g_ppcContext)
+    return;
+  g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+}
+
+void StfsCreateDevice() {
+  if (!g_ppcContext)
+    return;
+  g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+}
+
+// Fatal error dispatcher override: the generated weak function has an infinite
+// loop. We provide a strong definition that terminates the game instead of
+// infinite-looping.
+void sub_821BD618(PPCContext &ctx, uint8_t *base) {
+  (void)base;
+  // Original dispatcher: reads handler from slot 0x8285FEA0, calls it if
+  // non-zero, then infinite loops. The callers expect this to NEVER return. We
+  // dump state first so we know who routed us here, then terminate.
+  MCLA_LOG_ERROR("Fatal error dispatcher invoked - terminating game");
+  MCLA_LOG_ERROR("  fatal-dispatch regs: lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} "
+                 "r4=0x{:08X} r5=0x{:08X} r6=0x{:08X}",
+                 static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r3.u32,
+                 ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t slotValue = 0;
+  if (mem.ReadU32BE(0x8285FEA0, &slotValue))
+    MCLA_LOG_ERROR("  slot 0x8285FEA0 = 0x{:08X}", slotValue);
+
+  // r3 usually points at the fatal message string - read it straight out
+  if (ctx.r3.u32 >= 0x82000000u && ctx.r3.u32 < 0x83000000u) {
+    if (const void *p = mem.Translate(ctx.r3.u32))
+      MCLA_LOG_ERROR("  fatal message: '{}'", static_cast<const char *>(p));
+    if (ctx.r4.u32 >= 0x82000000u && ctx.r4.u32 < 0x83000000u) {
+      if (const void *p4 = mem.Translate(ctx.r4.u32))
+        MCLA_LOG_ERROR("  fatal aux r4: '{}'", static_cast<const char *>(p4));
+    } else if (ctx.r4.u32 >= 0x8E000000u && ctx.r4.u32 < 0x90000000u) {
+      // varargs: %s value passed directly - r4 IS the char* (stack copy)
+      if (const void *ps = mem.Translate(ctx.r4.u32))
+        MCLA_LOG_ERROR("  fatal %%s arg: '{}'", static_cast<const char *>(ps));
+      uint32_t strPtr = 0;
+      if (mem.ReadU32BE(ctx.r4.u32, &strPtr) && strPtr >= 0x82000000u &&
+          strPtr < 0x83000000u) {
+        if (const void *ps2 = mem.Translate(strPtr))
+          MCLA_LOG_ERROR("  fatal %s indirection -> '{}'",
+                         static_cast<const char *>(ps2));
+      }
+    }
+  }
+
+  // EABI frames: back chain at [sp], saved LR at [sp+4].
+  uint64_t lr = ctx.lr;
+  uint32_t sp = ctx.r1.u32;
+  for (int depth = 0; depth < 16; ++depth) {
+    MCLA_LOG_ERROR("  fatal chain[{}]: lr=0x{:08X} sp=0x{:08X}", depth,
+                   static_cast<uint32_t>(lr), sp);
+    uint32_t nextSp = 0;
+    uint32_t nextLr = 0;
+    if (sp == 0 || !mem.ReadU32BE(sp, &nextSp) ||
+        !mem.ReadU32BE(sp + 4, &nextLr))
+      break;
+    if (nextSp <= sp || (nextSp & 3) != 0)
+      break;
+    lr = nextLr;
+    sp = nextSp;
+  }
+  spdlog::default_logger()->flush();
+  ExitProcess(0x80000003); // STATUS_BREAKPOINT
+}
+
+// CRT init function that unconditionally calls fatal dispatcher - make it a
+// no-op
+void sub_821305B8_NoOp() {
+  // This CRT init function unconditionally calls the fatal error dispatcher.
+  // We NOP it to allow boot to proceed past early CRT init.
+}
+
+void NtFlushBuffersFile() { LOG_UTILITY("!!! STUB !!!"); }
+
+void KeQuerySystemTime(be<uint64_t> *time) {
+  constexpr int64_t FILETIME_EPOCH_DIFFERENCE = 116444736000000000LL;
+
+  auto now = std::chrono::system_clock::now();
+  auto timeSinceEpoch = now.time_since_epoch();
+
+  int64_t currentTime100ns =
+      std::chrono::duration_cast<
+          std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(
+          timeSinceEpoch)
+          .count();
+  currentTime100ns += FILETIME_EPOCH_DIFFERENCE;
+
+  *time = currentTime100ns;
+}
+
+void RtlTimeToTimeFields() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlFreeAnsiString() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlUnicodeStringToAnsiString() { LOG_UTILITY("!!! STUB !!!"); }
+
+void RtlInitUnicodeString() { LOG_UTILITY("!!! STUB !!!"); }
+
+void ExTerminateThread() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t ExCreateThread(be<uint32_t> *handle, uint32_t stackSize,
+                        be<uint32_t> *threadId, uint32_t xApiThreadStartup,
+                        uint32_t startAddress, uint32_t startContext,
+                        uint32_t creationFlags) {
+  // THREAD-CREATE CENSUS (session 10): completer threads must be visible.
+  // The async-op drainer Function_823EC990 family never ran - verify
+  // whether its spawn ever happens (LOGF_UTILITY is compiled out).
+  {
+    static std::atomic<uint32_t> s_threadCreates{0};
+    const uint32_t n = s_threadCreates.fetch_add(1) + 1;
+    if (n <= 60) {
+      MCLA_LOG_INFO(
+          "THREAD-CREATE #{} start={:08X} ctx={:08X} flags={:08X} lr={:08X}", n,
+          startAddress, startContext, creationFlags,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      // Trampoline 0x821C91C8 copies {proc,arg} (44 bytes) from the ctx
+      // node onto its stack then bctrls - dump the node so the REAL
+      // thread procedures become visible.
+      if (startAddress == 0x821C91C8u && startContext != 0) {
+        auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+        std::string words;
+        for (uint32_t off = 0; off < 48; off += 4) {
+          uint32_t w = 0;
+          (void)mem.ReadU32BE(startContext + off, &w);
+          words += fmt::format(" {:08X}", w);
+        }
+        MCLA_LOG_INFO("THREAD-NODE #{} @ {:08X}:{}", n, startContext, words);
+      }
+      // TU83 worker thread census (Lead 1/3)
+      if (startAddress == 0x824569C8u || startAddress == 0x823F69C8u) {
+        MCLA_LOG_WARN(
+            "THREAD-CREATE TU83 WORKER #{} start={:08X} ctx={:08X} "
+            "flags={:08X} lr={:08X}",
+            n, startAddress, startContext, creationFlags,
+            static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      }
+    }
+  }
+
+  LOGF_UTILITY("0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}",
+               handle ? handle->get() : 0, stackSize,
+               threadId ? threadId->get() : 0, xApiThreadStartup, startAddress,
+               startContext, creationFlags);
+
+  uint32_t hostThreadId;
+
+  uint32_t kernelHandle = GetKernelHandle(GuestThread::Start(
+      {startAddress, startContext, creationFlags}, &hostThreadId));
+  if (handle)
+    handle->set(kernelHandle);
+
+  if (threadId)
+    threadId->set(hostThreadId);
+
+  return 0;
+}
+
+void IoInvalidDeviceRequest() { LOG_UTILITY("!!! STUB !!!"); }
+
+void ObReferenceObject() { LOG_UTILITY("!!! STUB !!!"); }
+
+void IoCreateDevice() { LOG_UTILITY("!!! STUB !!!"); }
+
+void IoDeleteDevice() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t ExAllocatePoolTypeWithTag(uint32_t poolType, uint32_t numberOfBytes,
+                                   uint32_t tag, uint32_t lookasideListEx) {
+  LOGF_UTILITY("poolType=0x{:X} size=0x{:X} tag=0x{:X} lookaside=0x{:X}",
+               poolType, numberOfBytes, tag, lookasideListEx);
+  void *ptr = g_userHeap.Alloc(numberOfBytes);
+  if (!ptr)
     return 0;
+  uint32_t guestAddr =
+      mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
+  // Session-27 window census (deterministic swf object 0x88825500).
+  if ((guestAddr & 0xFFFF0000u) == 0x88820000u) {
+    uint32_t lr = 0;
+    if (const PPCContext *c = GetPPCContext())
+      lr = static_cast<uint32_t>(c->lr);
+    MCLA_LOG_WARN("ALLOC-WIN Pool -> {:08X} size={:#x} tag={:08X} lr={:08X}",
+                  guestAddr, numberOfBytes, tag, lr);
+  }
+  MmTrackAllocationSize(guestAddr, numberOfBytes);
+  return guestAddr;
 }
 
-uint32_t NtResumeThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
-{
-    assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE));
+void RtlTimeFieldsToTime() { LOG_UTILITY("!!! STUB !!!"); }
 
-    hThread->suspended = false;
-    hThread->suspended.notify_all();
+void IoCompleteRequest() { LOG_UTILITY("!!! STUB !!!"); }
 
-    return S_OK;
+void RtlUpcaseUnicodeChar() { LOG_UTILITY("!!! STUB !!!"); }
+
+void ObIsTitleObject() { LOG_UTILITY("!!! STUB !!!"); }
+
+void IoCheckShareAccess() { LOG_UTILITY("!!! STUB !!!"); }
+
+void IoSetShareAccess() { LOG_UTILITY("!!! STUB !!!"); }
+
+void IoRemoveShareAccess() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t NetDll_XNetStartup(void *xnaddr) {
+  (void)xnaddr;
+  return 0; // Success
 }
 
-uint32_t NtSetEvent(Event* handle, uint32_t* previousState)
-{
-    handle->Set();
-    return 0;
+uint32_t NetDll_XNetGetTitleXnAddr(void *xnaddr) {
+  (void)xnaddr;
+  return 0; // Success
 }
 
-uint32_t NtCreateSemaphore(be<uint32_t>* Handle, XOBJECT_ATTRIBUTES* ObjectAttributes, uint32_t InitialCount, uint32_t MaximumCount)
-{
-    Handle->set(GetKernelHandle(CreateKernelObject<Semaphore>(InitialCount, MaximumCount)));
+uint32_t KeWaitForMultipleObjects(uint32_t Count,
+                                  xpointer<XDISPATCHER_HEADER> *Objects,
+                                  uint32_t WaitType, uint32_t WaitReason,
+                                  uint32_t WaitMode, uint32_t Alertable,
+                                  be<int64_t> *Timeout) {
+  const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
+  assert(timeout == INFINITE || timeout == 0);
 
-    // SEMA-CREATE CENSUS (session 10): the main-thread park waits on handle
-    // C9ADB800 (NOT an NtCreateEvent product) - identify its creator.
-    {
-        static std::atomic<uint32_t> s_semaCreates{0};
-        const uint32_t n = s_semaCreates.fetch_add(1) + 1;
-        if (n <= 100)
-        {
-            MCLA_LOG_INFO("SEMA-CREATE #{} h={:08X} init={} max={} lr={:08X}",
-                          n, static_cast<uint32_t>(*Handle), InitialCount, MaximumCount,
-                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  // MAIN-THREAD PARK PROBE
+  {
+    static std::atomic<uint32_t> s_parkLogs4{0};
+    uint32_t mainId = g_mainGuestThreadId.load();
+    if (mainId != 0 && GetCurrentThreadId() == mainId &&
+        s_parkLogs4.fetch_add(1) < 200) {
+      MCLA_LOG_INFO("[main-park] KeWaitForMultipleObjects count={} waitType={} "
+                    "obj0={:08X} lr={:08X}",
+                    Count, WaitType,
+                    Objects ? static_cast<uint32_t>(
+                                  reinterpret_cast<uintptr_t>(Objects[0].get()))
+                            : 0,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
+
+  if (WaitType == 0) // Wait all
+  {
+    for (size_t i = 0; i < Count; i++) {
+      xpointer<XDISPATCHER_HEADER> obj = Objects[i];
+      if (!obj)
+        continue;
+      uint8_t type = obj->Type;
+      switch (type) {
+      case 0:
+      case 1:
+        QueryKernelObject<Event>(*obj)->Wait(static_cast<uint32_t>(timeout));
+        break;
+      case 5:
+        QueryKernelObject<Semaphore>(*obj)->Wait(
+            static_cast<uint32_t>(timeout));
+        break;
+      default:
+        assert(false && "Unrecognized kernel object type in WaitAll");
+        return STATUS_TIMEOUT;
+      }
+    }
+    return STATUS_WAIT_0;
+  } else // Wait any
+  {
+    thread_local std::vector<KernelObject *> s_objects;
+    s_objects.resize(Count);
+
+    for (size_t i = 0; i < Count; i++) {
+      xpointer<XDISPATCHER_HEADER> obj = Objects[i];
+      if (!obj) {
+        s_objects[i] = nullptr;
+        continue;
+      }
+      uint8_t type = obj->Type;
+      switch (type) {
+      case 0:
+      case 1:
+        s_objects[i] = QueryKernelObject<Event>(*obj);
+        break;
+      case 5:
+        s_objects[i] = QueryKernelObject<Semaphore>(*obj);
+        break;
+      default:
+        assert(false && "Unrecognized kernel object type in WaitAny");
+        return STATUS_TIMEOUT;
+      }
+    }
+
+    while (true) {
+      uint32_t generation = g_keSetEventGeneration.load();
+
+      for (size_t i = 0; i < Count; i++) {
+        if (s_objects[i] && s_objects[i]->Wait(0) == STATUS_SUCCESS) {
+          return STATUS_WAIT_0 + static_cast<uint32_t>(i);
         }
+      }
+
+      if (timeout == 0)
+        return STATUS_TIMEOUT;
+
+      g_keSetEventGeneration.wait(generation);
     }
-    return STATUS_SUCCESS;
+  }
 }
 
-uint32_t NtReleaseSemaphore(XKSEMAPHORE* Handle, uint32_t ReleaseCount, int32_t* PreviousCount)
-{
-    // SIGNAL CENSUS (session 12): Ghidra proved completers use
-    // NtReleaseSemaphore (NOT KeReleaseSemaphore) - prior census watched
-    // the wrong twin and reported zero signals.
-    {
-        static std::atomic<uint32_t> s_ntRelLogs{0};
-        const uint32_t n = s_ntRelLogs.fetch_add(1) + 1;
-        if (n <= 40 || (n % 2000) == 0)
-        {
-            // Guest VA of the caller's XKSEMAPHORE* + the address our typed
-            // Header field resolves to - session 15 showed census/probe
-            // disagreeing across runs; measure both in one place.
-            const uint32_t guestHandle =
-                static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(Handle) -
-                                      mcla::kernel::g_memory.base);
-            MCLA_LOG_INFO("SIGNAL NtReleaseSemaphore guest={:08X} hdrOff={} count={} lr={:08X}",
-                          guestHandle,
-                          reinterpret_cast<uintptr_t>(&Handle->Header) - reinterpret_cast<uintptr_t>(Handle),
-                          ReleaseCount,
-                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
+uint32_t KeRaiseIrqlToDpcLevel() { return 0; }
+
+void KfLowerIrql() {}
+
+uint32_t KeReleaseSemaphore(XKSEMAPHORE *semaphore, uint32_t increment,
+                            uint32_t adjustment, uint32_t wait) {
+  // SIGNAL CENSUS (2026-08-23 session 9): same attribution as KeSetEvent.
+  {
+    static std::atomic<uint32_t> s_signalLogs2{0};
+    const uint32_t n = s_signalLogs2.fetch_add(1) + 1;
+    if (n <= 40 || (n % 2000) == 0) {
+      MCLA_LOG_INFO(
+          "SIGNAL KeReleaseSemaphore obj={:08X} inc={} adj={} lr={:08X}",
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(semaphore)),
+          increment, adjustment,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
+  }
 
-    // IDENTITY RESOLUTION (session 16 fix): the game's driver re-initializes
-    // dispatcher headers after NtCreateSemaphore (it owns these structs),
-    // wiping our OBJECT_SIGNATURE - QueryKernelObject's lazy-wrap then built
-    // a PHANTOM wrapper over raw bytes (probe: release landed on guest
-    // C9ADB880 with garbage count while consumers waited wrapper C5218280).
-    // Resolve identically to the wait path (NtWaitForSingleObjectEx ->
-    // GetKernelObject = pure identity translation) and only fall back to
-    // lazy-wrap for addresses we never created.
-    Semaphore* sem = ResolveCreatedObject<Semaphore>(Handle, sizeof(XKSEMAPHORE));
-    if (!sem)
-    {
-        sem = QueryKernelObject<Semaphore>(Handle->Header);
-    }
+  Semaphore *sem =
+      ResolveCreatedObject<Semaphore>(semaphore, sizeof(XKSEMAPHORE));
+  if (!sem) {
+    sem = QueryKernelObject<Semaphore>(semaphore->Header);
+  }
+  sem->Release(adjustment, nullptr);
 
-    uint32_t previousCount;
-    sem->Release(ReleaseCount, &previousCount);
+  ++g_keSetEventGeneration;
+  g_keSetEventGeneration.notify_all();
 
-    if (PreviousCount != nullptr)
-        *PreviousCount = previousCount;
-
-    return STATUS_SUCCESS;
+  return STATUS_SUCCESS;
 }
 
-void NtWaitForMultipleObjectsEx()
-{
-    LOG_UTILITY("!!! STUB !!!");
+void XAudioGetVoiceCategoryVolume() { LOG_UTILITY("!!! STUB !!!"); }
+
+uint32_t XAudioGetVoiceCategoryVolumeChangeMask(uint32_t Driver,
+                                                be<uint32_t> *Mask) {
+  *Mask = 0;
+  return 0;
 }
 
-void RtlCompareStringN()
-{
-    LOG_UTILITY("!!! STUB !!!");
+uint32_t KeResumeThread(GuestThreadHandle *object) {
+  assert(object != GetKernelObject(CURRENT_THREAD_HANDLE));
+
+  object->suspended = false;
+  object->suspended.notify_all();
+  return 0;
 }
 
-void _snprintf_x()
-{
-    LOG_UTILITY("!!! STUB !!!");
+void KeInitializeSemaphore(XKSEMAPHORE *semaphore, uint32_t count,
+                           uint32_t limit) {
+  semaphore->Header.Type = 5; // Semaphore object type
+  semaphore->Header.SignalState.set(count);
+  semaphore->Limit.set(limit);
+
+  auto *object = QueryKernelObject<Semaphore>(semaphore->Header);
 }
 
-void StfsControlDevice()
-{
-    // STFS control device - return success
-    if (!g_ppcContext)
-        return;
-    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
-}
+void XMAReleaseContext() { LOG_UTILITY("!!! STUB !!!"); }
 
-void StfsCreateDevice()
-{
-    if (!g_ppcContext)
-        return;
-    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
-}
+void XMACreateContext() { LOG_UTILITY("!!! STUB !!!"); }
 
-// Fatal error dispatcher override: the generated weak function has an infinite loop.
-// We provide a strong definition that terminates the game instead of infinite-looping.
-void sub_821BD618(PPCContext& ctx, uint8_t* base)
-{
-    (void)base;
-    // Original dispatcher: reads handler from slot 0x8285FEA0, calls it if non-zero,
-    // then infinite loops. The callers expect this to NEVER return.
-    // We dump state first so we know who routed us here, then terminate.
-    MCLA_LOG_ERROR("Fatal error dispatcher invoked - terminating game");
-    MCLA_LOG_ERROR("  fatal-dispatch regs: lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X}",
-                   static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
-
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t slotValue = 0;
-    if (mem.ReadU32BE(0x8285FEA0, &slotValue))
-        MCLA_LOG_ERROR("  slot 0x8285FEA0 = 0x{:08X}", slotValue);
-
-    // r3 usually points at the fatal message string - read it straight out
-    if (ctx.r3.u32 >= 0x82000000u && ctx.r3.u32 < 0x83000000u)
-    {
-        if (const void* p = mem.Translate(ctx.r3.u32))
-            MCLA_LOG_ERROR("  fatal message: '{}'", static_cast<const char*>(p));
-        if (ctx.r4.u32 >= 0x82000000u && ctx.r4.u32 < 0x83000000u)
-        {
-            if (const void* p4 = mem.Translate(ctx.r4.u32))
-                MCLA_LOG_ERROR("  fatal aux r4: '{}'", static_cast<const char*>(p4));
-        }
-        else if (ctx.r4.u32 >= 0x8E000000u && ctx.r4.u32 < 0x90000000u)
-        {
-            // varargs: %s value passed directly - r4 IS the char* (stack copy)
-            if (const void* ps = mem.Translate(ctx.r4.u32))
-                MCLA_LOG_ERROR("  fatal %%s arg: '{}'", static_cast<const char*>(ps));
-            uint32_t strPtr = 0;
-            if (mem.ReadU32BE(ctx.r4.u32, &strPtr) && strPtr >= 0x82000000u && strPtr < 0x83000000u)
-            {
-                if (const void* ps2 = mem.Translate(strPtr))
-                    MCLA_LOG_ERROR("  fatal %s indirection -> '{}'", static_cast<const char*>(ps2));
-            }
-        }
-    }
-
-    // EABI frames: back chain at [sp], saved LR at [sp+4].
-    uint64_t lr = ctx.lr;
-    uint32_t sp = ctx.r1.u32;
-    for (int depth = 0; depth < 16; ++depth)
-    {
-        MCLA_LOG_ERROR("  fatal chain[{}]: lr=0x{:08X} sp=0x{:08X}", depth,
-                       static_cast<uint32_t>(lr), sp);
-        uint32_t nextSp = 0;
-        uint32_t nextLr = 0;
-        if (sp == 0 || !mem.ReadU32BE(sp, &nextSp) || !mem.ReadU32BE(sp + 4, &nextLr))
-            break;
-        if (nextSp <= sp || (nextSp & 3) != 0)
-            break;
-        lr = nextLr;
-        sp = nextSp;
-    }
-    spdlog::default_logger()->flush();
-    ExitProcess(0x80000003); // STATUS_BREAKPOINT
-}
-
-// CRT init function that unconditionally calls fatal dispatcher - make it a no-op
-void sub_821305B8_NoOp()
-{
-    // This CRT init function unconditionally calls the fatal error dispatcher.
-    // We NOP it to allow boot to proceed past early CRT init.
-}
-
-void NtFlushBuffersFile()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void KeQuerySystemTime(be<uint64_t>* time)
-{
-    constexpr int64_t FILETIME_EPOCH_DIFFERENCE = 116444736000000000LL;
-
-    auto now = std::chrono::system_clock::now();
-    auto timeSinceEpoch = now.time_since_epoch();
-
-    int64_t currentTime100ns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(timeSinceEpoch).count();
-    currentTime100ns += FILETIME_EPOCH_DIFFERENCE;
-
-    *time = currentTime100ns;
-}
-
-void RtlTimeToTimeFields()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void RtlFreeAnsiString()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void RtlUnicodeStringToAnsiString()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void RtlInitUnicodeString()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void ExTerminateThread()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t ExCreateThread(be<uint32_t>* handle, uint32_t stackSize, be<uint32_t>* threadId, uint32_t xApiThreadStartup, uint32_t startAddress, uint32_t startContext, uint32_t creationFlags)
-{
-    // THREAD-CREATE CENSUS (session 10): completer threads must be visible.
-    // The async-op drainer Function_823EC990 family never ran - verify
-    // whether its spawn ever happens (LOGF_UTILITY is compiled out).
-    {
-        static std::atomic<uint32_t> s_threadCreates{0};
-        const uint32_t n = s_threadCreates.fetch_add(1) + 1;
-        if (n <= 60)
-        {
-            MCLA_LOG_INFO("THREAD-CREATE #{} start={:08X} ctx={:08X} flags={:08X} lr={:08X}",
-                          n, startAddress, startContext, creationFlags,
-                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-            // Trampoline 0x821C91C8 copies {proc,arg} (44 bytes) from the ctx
-            // node onto its stack then bctrls - dump the node so the REAL
-            // thread procedures become visible.
-            if (startAddress == 0x821C91C8u && startContext != 0)
-            {
-                auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-                std::string words;
-                for (uint32_t off = 0; off < 48; off += 4)
-                {
-                    uint32_t w = 0;
-                    (void)mem.ReadU32BE(startContext + off, &w);
-                    words += fmt::format(" {:08X}", w);
-                }
-                MCLA_LOG_INFO("THREAD-NODE #{} @ {:08X}:{}", n, startContext, words);
-            }
-            // TU83 worker thread census (Lead 1/3)
-            if (startAddress == 0x824569C8u || startAddress == 0x823F69C8u)
-            {
-                MCLA_LOG_WARN("THREAD-CREATE TU83 WORKER #{} start={:08X} ctx={:08X} flags={:08X} lr={:08X}",
-                              n, startAddress, startContext, creationFlags,
-                              static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-            }
-        }
-    }
-
-    LOGF_UTILITY("0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}",
-        handle ? handle->get() : 0, stackSize, threadId ? threadId->get() : 0, xApiThreadStartup, startAddress, startContext, creationFlags);
-
-    uint32_t hostThreadId;
-
-    uint32_t kernelHandle = GetKernelHandle(GuestThread::Start({ startAddress, startContext, creationFlags }, &hostThreadId));
-    if (handle) handle->set(kernelHandle);
-
-    if (threadId)
-        threadId->set(hostThreadId);
-
-    return 0;
-}
-
-void IoInvalidDeviceRequest()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void ObReferenceObject()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void IoCreateDevice()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void IoDeleteDevice()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t ExAllocatePoolTypeWithTag(uint32_t poolType, uint32_t numberOfBytes, uint32_t tag, uint32_t lookasideListEx)
-{
-    LOGF_UTILITY("poolType=0x{:X} size=0x{:X} tag=0x{:X} lookaside=0x{:X}", poolType, numberOfBytes, tag, lookasideListEx);
-    void* ptr = g_userHeap.Alloc(numberOfBytes);
-    if (!ptr) return 0;
-    uint32_t guestAddr = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
-    // Session-27 window census (deterministic swf object 0x88825500).
-    if ((guestAddr & 0xFFFF0000u) == 0x88820000u)
-    {
-        uint32_t lr = 0;
-        if (const PPCContext* c = GetPPCContext())
-            lr = static_cast<uint32_t>(c->lr);
-        MCLA_LOG_WARN("ALLOC-WIN Pool -> {:08X} size={:#x} tag={:08X} lr={:08X}",
-                      guestAddr, numberOfBytes, tag, lr);
-    }
-    MmTrackAllocationSize(guestAddr, numberOfBytes);
-    return guestAddr;
-}
-
-void RtlTimeFieldsToTime()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void IoCompleteRequest()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void RtlUpcaseUnicodeChar()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void ObIsTitleObject()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void IoCheckShareAccess()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void IoSetShareAccess()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void IoRemoveShareAccess()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t NetDll_XNetStartup(void* xnaddr)
-{
-    (void)xnaddr;
-    return 0; // Success
-}
-
-uint32_t NetDll_XNetGetTitleXnAddr(void* xnaddr)
-{
-    (void)xnaddr;
-    return 0; // Success
-}
-
-uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* Objects, uint32_t WaitType, uint32_t WaitReason, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
-{
-    const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == INFINITE || timeout == 0);
-
-    // MAIN-THREAD PARK PROBE
-    {
-        static std::atomic<uint32_t> s_parkLogs4{0};
-        uint32_t mainId = g_mainGuestThreadId.load();
-        if (mainId != 0 && GetCurrentThreadId() == mainId && s_parkLogs4.fetch_add(1) < 200)
-        {
-            MCLA_LOG_INFO("[main-park] KeWaitForMultipleObjects count={} waitType={} obj0={:08X} lr={:08X}",
-                          Count, WaitType,
-                          Objects ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Objects[0].get())) : 0,
-                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
-    }
-
-    if (WaitType == 0) // Wait all
-    {
-        for (size_t i = 0; i < Count; i++)
-        {
-            xpointer<XDISPATCHER_HEADER> obj = Objects[i];
-            if (!obj) continue;
-            uint8_t type = obj->Type;
-            switch (type)
-            {
-                case 0:
-                case 1:
-                    QueryKernelObject<Event>(*obj)->Wait(static_cast<uint32_t>(timeout));
-                    break;
-                case 5:
-                    QueryKernelObject<Semaphore>(*obj)->Wait(static_cast<uint32_t>(timeout));
-                    break;
-                default:
-                    assert(false && "Unrecognized kernel object type in WaitAll");
-                    return STATUS_TIMEOUT;
-            }
-        }
-        return STATUS_WAIT_0;
-    }
-    else // Wait any
-    {
-        thread_local std::vector<KernelObject*> s_objects;
-        s_objects.resize(Count);
-
-        for (size_t i = 0; i < Count; i++)
-        {
-            xpointer<XDISPATCHER_HEADER> obj = Objects[i];
-            if (!obj)
-            { 
-                s_objects[i] = nullptr; 
-                continue; 
-            }
-            uint8_t type = obj->Type;
-            switch (type)
-            {
-                case 0:
-                case 1:
-                    s_objects[i] = QueryKernelObject<Event>(*obj);
-                    break;
-                case 5:
-                    s_objects[i] = QueryKernelObject<Semaphore>(*obj);
-                    break;
-                default:
-                    assert(false && "Unrecognized kernel object type in WaitAny");
-                    return STATUS_TIMEOUT;
-            }
-        }
-
-        while (true)
-        {
-            uint32_t generation = g_keSetEventGeneration.load();
-
-            for (size_t i = 0; i < Count; i++)
-            {
-                if (s_objects[i] && s_objects[i]->Wait(0) == STATUS_SUCCESS)
-                {
-                    return STATUS_WAIT_0 + static_cast<uint32_t>(i);
-                }
-            }
-
-            if (timeout == 0)
-                return STATUS_TIMEOUT;
-
-            g_keSetEventGeneration.wait(generation);
-        }
-    }
-}
-
-uint32_t KeRaiseIrqlToDpcLevel()
-{
-    return 0;
-}
-
-void KfLowerIrql() { }
-
-uint32_t KeReleaseSemaphore(XKSEMAPHORE* semaphore, uint32_t increment, uint32_t adjustment, uint32_t wait)
-{
-    // SIGNAL CENSUS (2026-08-23 session 9): same attribution as KeSetEvent.
-    {
-        static std::atomic<uint32_t> s_signalLogs2{0};
-        const uint32_t n = s_signalLogs2.fetch_add(1) + 1;
-        if (n <= 40 || (n % 2000) == 0)
-        {
-            MCLA_LOG_INFO("SIGNAL KeReleaseSemaphore obj={:08X} inc={} adj={} lr={:08X}",
-                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(semaphore)), increment,
-                          adjustment, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-        }
-    }
-
-    Semaphore* sem = ResolveCreatedObject<Semaphore>(semaphore, sizeof(XKSEMAPHORE));
-    if (!sem)
-    {
-        sem = QueryKernelObject<Semaphore>(semaphore->Header);
-    }
-    sem->Release(adjustment, nullptr);
-
-    ++g_keSetEventGeneration;
-    g_keSetEventGeneration.notify_all();
-
-    return STATUS_SUCCESS;
-}
-
-void XAudioGetVoiceCategoryVolume()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-uint32_t XAudioGetVoiceCategoryVolumeChangeMask(uint32_t Driver, be<uint32_t>* Mask)
-{
-    *Mask = 0;
-    return 0;
-}
-
-uint32_t KeResumeThread(GuestThreadHandle* object)
-{
-    assert(object != GetKernelObject(CURRENT_THREAD_HANDLE));
-
-    object->suspended = false;
-    object->suspended.notify_all();
-    return 0;
-}
-
-void KeInitializeSemaphore(XKSEMAPHORE* semaphore, uint32_t count, uint32_t limit)
-{
-    semaphore->Header.Type = 5; // Semaphore object type
-    semaphore->Header.SignalState.set(count);
-    semaphore->Limit.set(limit);
-
-    auto* object = QueryKernelObject<Semaphore>(semaphore->Header);
-}
-
-void XMAReleaseContext()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-void XMACreateContext()
-{
-    LOG_UTILITY("!!! STUB !!!");
-}
-
-// uint32_t XAudioRegisterRenderDriverClient(be<uint32_t>* callback, be<uint32_t>* driver)
+// uint32_t XAudioRegisterRenderDriverClient(be<uint32_t>* callback,
+// be<uint32_t>* driver)
 // {
 //     //printf("XAudioRegisterRenderDriverClient(): %x %x\n");
-// 
+//
 //     *driver = apu::RegisterClient(callback[0], callback[1]);
 //     return 0;
 // }
@@ -3110,7 +2769,7 @@ void XMACreateContext()
 // {
 //     // printf("!!! STUB !!! XAudioSubmitRenderDriverFrame\n");
 //     apu::SubmitFrames(samples);
-// 
+//
 //     return 0;
 // }
 
@@ -3124,7 +2783,8 @@ GUEST_FUNCTION_HOOK(__imp__XamContentCreateEx, XamContentCreateEx);
 GUEST_FUNCTION_HOOK(__imp__XamContentDelete, XamContentDelete);
 GUEST_FUNCTION_HOOK(__imp__XamContentClose, XamContentClose);
 GUEST_FUNCTION_HOOK(__imp__XamContentGetCreator, XamContentGetCreator);
-GUEST_FUNCTION_HOOK(__imp__XamContentCreateEnumerator, XamContentCreateEnumerator);
+GUEST_FUNCTION_HOOK(__imp__XamContentCreateEnumerator,
+                    XamContentCreateEnumerator);
 GUEST_FUNCTION_HOOK(__imp__XamContentGetDeviceState, XamContentGetDeviceState);
 GUEST_FUNCTION_HOOK(__imp__XamContentGetDeviceData, XamContentGetDeviceData);
 GUEST_FUNCTION_HOOK(__imp__XamEnumerate, XamEnumerate);
@@ -3134,7 +2794,8 @@ GUEST_FUNCTION_HOOK(__imp__XamShowSigninUI, XamShowSigninUI);
 GUEST_FUNCTION_HOOK(__imp__XamShowDeviceSelectorUI, XamShowDeviceSelectorUI);
 GUEST_FUNCTION_HOOK(__imp__XamShowMessageBoxUI, XamShowMessageBoxUI);
 GUEST_FUNCTION_HOOK(__imp__XamShowDirtyDiscErrorUI, XamShowDirtyDiscErrorUI);
-GUEST_FUNCTION_HOOK(__imp__XamEnableInactivityProcessing, XamEnableInactivityProcessing);
+GUEST_FUNCTION_HOOK(__imp__XamEnableInactivityProcessing,
+                    XamEnableInactivityProcessing);
 GUEST_FUNCTION_HOOK(__imp__XamResetInactivity, XamResetInactivity);
 GUEST_FUNCTION_HOOK(__imp__XamShowMessageBoxUIEx, XamShowMessageBoxUIEx);
 GUEST_FUNCTION_HOOK(__imp__XGetLanguage, XGetLanguage);
@@ -3157,7 +2818,8 @@ GUEST_FUNCTION_HOOK(__imp__ExGetXConfigSetting, ExGetXConfigSetting);
 GUEST_FUNCTION_HOOK(__imp__NtQueryVirtualMemory, NtQueryVirtualMemory);
 GUEST_FUNCTION_HOOK(__imp__MmQueryStatistics, MmQueryStatistics);
 GUEST_FUNCTION_HOOK(__imp__NtCreateEvent, NtCreateEvent);
-GUEST_FUNCTION_HOOK(__imp__XexCheckExecutablePrivilege, XexCheckExecutablePrivilege);
+GUEST_FUNCTION_HOOK(__imp__XexCheckExecutablePrivilege,
+                    XexCheckExecutablePrivilege);
 GUEST_FUNCTION_HOOK(__imp__DbgPrint, DbgPrint);
 GUEST_FUNCTION_HOOK(__imp____C_specific_handler, __C_specific_handler_x);
 GUEST_FUNCTION_HOOK(__imp__RtlNtStatusToDosError, RtlNtStatusToDosError);
@@ -3168,7 +2830,8 @@ GUEST_FUNCTION_HOOK(__imp__KeDelayExecutionThread, KeDelayExecutionThread);
 GUEST_FUNCTION_HOOK(__imp__ExFreePool, ExFreePool);
 // NtQueryInformationFile stays on its PPC_FUNC wrapper (no typed impl yet);
 // Volume/Directory queries use the typed impls above.
-GUEST_FUNCTION_HOOK(__imp__NtQueryVolumeInformationFile, NtQueryVolumeInformationFile);
+GUEST_FUNCTION_HOOK(__imp__NtQueryVolumeInformationFile,
+                    NtQueryVolumeInformationFile);
 GUEST_FUNCTION_HOOK(__imp__NtQueryDirectoryFile, NtQueryDirectoryFile);
 GUEST_FUNCTION_HOOK(__imp__NtReadFileScatter, NtReadFileScatter);
 GUEST_FUNCTION_HOOK(__imp__NtReadFile, NtReadFile);
@@ -3177,8 +2840,10 @@ GUEST_FUNCTION_HOOK(__imp__NtAllocateVirtualMemory, NtAllocateVirtualMemory);
 GUEST_FUNCTION_HOOK(__imp__NtFreeVirtualMemory, NtFreeVirtualMemory);
 GUEST_FUNCTION_HOOK(__imp__ObDereferenceObject, ObDereferenceObject);
 GUEST_FUNCTION_HOOK(__imp__KeSetBasePriorityThread, KeSetBasePriorityThread);
-GUEST_FUNCTION_HOOK(__imp__ObReferenceObjectByHandle, ObReferenceObjectByHandle);
-GUEST_FUNCTION_HOOK(__imp__KeQueryBasePriorityThread, KeQueryBasePriorityThread);
+GUEST_FUNCTION_HOOK(__imp__ObReferenceObjectByHandle,
+                    ObReferenceObjectByHandle);
+GUEST_FUNCTION_HOOK(__imp__KeQueryBasePriorityThread,
+                    KeQueryBasePriorityThread);
 GUEST_FUNCTION_HOOK(__imp__NtSuspendThread, NtSuspendThread);
 GUEST_FUNCTION_HOOK(__imp__KeSetAffinityThread, KeSetAffinityThread);
 GUEST_FUNCTION_HOOK(__imp__RtlLeaveCriticalSection, RtlLeaveCriticalSection);
@@ -3189,34 +2854,46 @@ GUEST_FUNCTION_HOOK(__imp__RtlFillMemoryUlong, RtlFillMemoryUlong);
 GUEST_FUNCTION_HOOK(__imp__KeBugCheckEx, KeBugCheckEx);
 GUEST_FUNCTION_HOOK(__imp__KeGetCurrentProcessType, KeGetCurrentProcessType);
 GUEST_FUNCTION_HOOK(__imp__RtlCompareMemoryUlong, RtlCompareMemoryUlong);
-GUEST_FUNCTION_HOOK(__imp__RtlInitializeCriticalSection, RtlInitializeCriticalSection);
+GUEST_FUNCTION_HOOK(__imp__RtlInitializeCriticalSection,
+                    RtlInitializeCriticalSection);
 GUEST_FUNCTION_HOOK(__imp__RtlRaiseException, RtlRaiseException_x);
 GUEST_FUNCTION_HOOK(__imp__KfReleaseSpinLock, KfReleaseSpinLock);
 GUEST_FUNCTION_HOOK(__imp__KfAcquireSpinLock, KfAcquireSpinLock);
-GUEST_FUNCTION_HOOK(__imp__KeQueryPerformanceFrequency, KeQueryPerformanceFrequency);
+GUEST_FUNCTION_HOOK(__imp__KeQueryPerformanceFrequency,
+                    KeQueryPerformanceFrequency);
 GUEST_FUNCTION_HOOK(__imp__MmFreePhysicalMemory, MmFreePhysicalMemory);
 GUEST_FUNCTION_HOOK(__imp__VdPersistDisplay, VdPersistDisplay);
 GUEST_FUNCTION_HOOK(__imp__VdSwap, VdSwap);
 GUEST_FUNCTION_HOOK(__imp__VdGetSystemCommandBuffer, VdGetSystemCommandBuffer);
-GUEST_FUNCTION_HOOK(__imp__KeReleaseSpinLockFromRaisedIrql, KeReleaseSpinLockFromRaisedIrql);
-GUEST_FUNCTION_HOOK(__imp__KeAcquireSpinLockAtRaisedIrql, KeAcquireSpinLockAtRaisedIrql);
+GUEST_FUNCTION_HOOK(__imp__KeReleaseSpinLockFromRaisedIrql,
+                    KeReleaseSpinLockFromRaisedIrql);
+GUEST_FUNCTION_HOOK(__imp__KeAcquireSpinLockAtRaisedIrql,
+                    KeAcquireSpinLockAtRaisedIrql);
 GUEST_FUNCTION_HOOK(__imp__KiApcNormalRoutineNop, KiApcNormalRoutineNop);
-GUEST_FUNCTION_HOOK(__imp__VdEnableRingBufferRPtrWriteBack, VdEnableRingBufferRPtrWriteBack);
+GUEST_FUNCTION_HOOK(__imp__VdEnableRingBufferRPtrWriteBack,
+                    VdEnableRingBufferRPtrWriteBack);
 GUEST_FUNCTION_HOOK(__imp__VdInitializeRingBuffer, VdInitializeRingBuffer);
 GUEST_FUNCTION_HOOK(__imp__MmGetPhysicalAddress, MmGetPhysicalAddress);
-GUEST_FUNCTION_HOOK(__imp__VdSetSystemCommandBufferGpuIdentifierAddress, VdSetSystemCommandBufferGpuIdentifierAddress);
-GUEST_FUNCTION_HOOK(__imp__ExRegisterTitleTerminateNotification, ExRegisterTitleTerminateNotification);
+GUEST_FUNCTION_HOOK(__imp__VdSetSystemCommandBufferGpuIdentifierAddress,
+                    VdSetSystemCommandBufferGpuIdentifierAddress);
+GUEST_FUNCTION_HOOK(__imp__ExRegisterTitleTerminateNotification,
+                    ExRegisterTitleTerminateNotification);
 GUEST_FUNCTION_HOOK(__imp__VdShutdownEngines, VdShutdownEngines);
 GUEST_FUNCTION_HOOK(__imp__VdQueryVideoMode, VdQueryVideoMode);
-GUEST_FUNCTION_HOOK(__imp__VdGetCurrentDisplayInformation, VdGetCurrentDisplayInformation);
+GUEST_FUNCTION_HOOK(__imp__VdGetCurrentDisplayInformation,
+                    VdGetCurrentDisplayInformation);
 GUEST_FUNCTION_HOOK(__imp__VdSetDisplayMode, VdSetDisplayMode);
-GUEST_FUNCTION_HOOK(__imp__VdSetGraphicsInterruptCallback, VdSetGraphicsInterruptCallback);
+GUEST_FUNCTION_HOOK(__imp__VdSetGraphicsInterruptCallback,
+                    VdSetGraphicsInterruptCallback);
 GUEST_FUNCTION_HOOK(__imp__VdInitializeEngines, VdInitializeEngines);
-GUEST_FUNCTION_HOOK(__imp__VdIsHSIOTrainingSucceeded, VdIsHSIOTrainingSucceeded);
+GUEST_FUNCTION_HOOK(__imp__VdIsHSIOTrainingSucceeded,
+                    VdIsHSIOTrainingSucceeded);
 GUEST_FUNCTION_HOOK(__imp__VdGetCurrentDisplayGamma, VdGetCurrentDisplayGamma);
 GUEST_FUNCTION_HOOK(__imp__VdQueryVideoFlags, VdQueryVideoFlags);
-GUEST_FUNCTION_HOOK(__imp__VdCallGraphicsNotificationRoutines, VdCallGraphicsNotificationRoutines);
-GUEST_FUNCTION_HOOK(__imp__VdInitializeScalerCommandBuffer, VdInitializeScalerCommandBuffer);
+GUEST_FUNCTION_HOOK(__imp__VdCallGraphicsNotificationRoutines,
+                    VdCallGraphicsNotificationRoutines);
+GUEST_FUNCTION_HOOK(__imp__VdInitializeScalerCommandBuffer,
+                    VdInitializeScalerCommandBuffer);
 GUEST_FUNCTION_HOOK(__imp__KeLeaveCriticalRegion, KeLeaveCriticalRegion);
 GUEST_FUNCTION_HOOK(__imp__VdRetrainEDRAM, VdRetrainEDRAM);
 GUEST_FUNCTION_HOOK(__imp__VdRetrainEDRAMWorker, VdRetrainEDRAMWorker);
@@ -3224,7 +2901,8 @@ GUEST_FUNCTION_HOOK(__imp__KeEnterCriticalRegion, KeEnterCriticalRegion);
 GUEST_FUNCTION_HOOK(__imp__ObDeleteSymbolicLink, ObDeleteSymbolicLink);
 GUEST_FUNCTION_HOOK(__imp__ObCreateSymbolicLink, ObCreateSymbolicLink);
 GUEST_FUNCTION_HOOK(__imp__MmQueryAddressProtect, MmQueryAddressProtect);
-GUEST_FUNCTION_HOOK(__imp__VdEnableDisableClockGating, VdEnableDisableClockGating);
+GUEST_FUNCTION_HOOK(__imp__VdEnableDisableClockGating,
+                    VdEnableDisableClockGating);
 GUEST_FUNCTION_HOOK(__imp__KeBugCheck, KeBugCheck);
 GUEST_FUNCTION_HOOK(__imp__KeLockL2, KeLockL2);
 GUEST_FUNCTION_HOOK(__imp__KeUnlockL2, KeUnlockL2);
@@ -3236,7 +2914,8 @@ GUEST_FUNCTION_HOOK(__imp__KeTlsSetValue, KeTlsSetValue);
 GUEST_FUNCTION_HOOK(__imp__KeTlsAlloc, KeTlsAlloc);
 GUEST_FUNCTION_HOOK(__imp__KeTlsFree, KeTlsFree);
 GUEST_FUNCTION_HOOK(__imp__XMsgInProcessCall, XMsgInProcessCall);
-GUEST_FUNCTION_HOOK(__imp__XamUserReadProfileSettings, XamUserReadProfileSettings);
+GUEST_FUNCTION_HOOK(__imp__XamUserReadProfileSettings,
+                    XamUserReadProfileSettings);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSAStartup, NetDll_WSAStartup);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSACleanup, NetDll_WSACleanup);
 GUEST_FUNCTION_HOOK(__imp__NetDll_socket, NetDll_socket);
@@ -3259,8 +2938,10 @@ GUEST_FUNCTION_HOOK(__imp__XexLoadImage, XexLoadImage);
 GUEST_FUNCTION_HOOK(__imp__XexLoadImageHeaders, XexLoadImageHeaders);
 GUEST_FUNCTION_HOOK(__imp__XexUnloadImage, XexUnloadImage);
 GUEST_FUNCTION_HOOK(__imp__XexCheckExecutablePages, XexCheckExecutablePages);
-GUEST_FUNCTION_HOOK(__imp__RtlTryEnterCriticalSection, RtlTryEnterCriticalSection);
-GUEST_FUNCTION_HOOK(__imp__RtlInitializeCriticalSectionAndSpinCount, RtlInitializeCriticalSectionAndSpinCount);
+GUEST_FUNCTION_HOOK(__imp__RtlTryEnterCriticalSection,
+                    RtlTryEnterCriticalSection);
+GUEST_FUNCTION_HOOK(__imp__RtlInitializeCriticalSectionAndSpinCount,
+                    RtlInitializeCriticalSectionAndSpinCount);
 GUEST_FUNCTION_HOOK(__imp__XeCryptBnQwBeSigVerify, XeCryptBnQwBeSigVerify);
 GUEST_FUNCTION_HOOK(__imp__XeKeysGetKey, XeKeysGetKey);
 GUEST_FUNCTION_HOOK(__imp__XeCryptRotSumSha, XeCryptRotSumSha);
@@ -3268,7 +2949,8 @@ GUEST_FUNCTION_HOOK(__imp__XeCryptSha, XeCryptSha);
 GUEST_FUNCTION_HOOK(__imp__KeEnableFpuExceptions, KeEnableFpuExceptions);
 GUEST_FUNCTION_HOOK(__imp__RtlUnwind, RtlUnwind_x);
 GUEST_FUNCTION_HOOK(__imp__RtlCaptureContext, RtlCaptureContext_x);
-GUEST_FUNCTION_HOOK(__imp__NtQueryFullAttributesFile, NtQueryFullAttributesFile);
+GUEST_FUNCTION_HOOK(__imp__NtQueryFullAttributesFile,
+                    NtQueryFullAttributesFile);
 GUEST_FUNCTION_HOOK(__imp__RtlMultiByteToUnicodeN, RtlMultiByteToUnicodeN);
 GUEST_FUNCTION_HOOK(__imp__DbgBreakPoint, DbgBreakPoint);
 GUEST_FUNCTION_HOOK(__imp__MmQueryAllocationSize, MmQueryAllocationSize);
@@ -3277,13 +2959,15 @@ GUEST_FUNCTION_HOOK(__imp__NtResumeThread, NtResumeThread);
 GUEST_FUNCTION_HOOK(__imp__NtSetEvent, NtSetEvent);
 GUEST_FUNCTION_HOOK(__imp__NtCreateSemaphore, NtCreateSemaphore);
 GUEST_FUNCTION_HOOK(__imp__NtReleaseSemaphore, NtReleaseSemaphore);
-GUEST_FUNCTION_HOOK(__imp__NtWaitForMultipleObjectsEx, NtWaitForMultipleObjectsEx);
+GUEST_FUNCTION_HOOK(__imp__NtWaitForMultipleObjectsEx,
+                    NtWaitForMultipleObjectsEx);
 GUEST_FUNCTION_HOOK(__imp__RtlCompareStringN, RtlCompareStringN);
 GUEST_FUNCTION_HOOK(__imp__NtFlushBuffersFile, NtFlushBuffersFile);
 GUEST_FUNCTION_HOOK(__imp__KeQuerySystemTime, KeQuerySystemTime);
 GUEST_FUNCTION_HOOK(__imp__RtlTimeToTimeFields, RtlTimeToTimeFields);
 GUEST_FUNCTION_HOOK(__imp__RtlFreeAnsiString, RtlFreeAnsiString);
-GUEST_FUNCTION_HOOK(__imp__RtlUnicodeStringToAnsiString, RtlUnicodeStringToAnsiString);
+GUEST_FUNCTION_HOOK(__imp__RtlUnicodeStringToAnsiString,
+                    RtlUnicodeStringToAnsiString);
 GUEST_FUNCTION_HOOK(__imp__RtlInitUnicodeString, RtlInitUnicodeString);
 GUEST_FUNCTION_HOOK(__imp__ExTerminateThread, ExTerminateThread);
 GUEST_FUNCTION_HOOK(__imp__ExCreateThread, ExCreateThread);
@@ -3291,7 +2975,8 @@ GUEST_FUNCTION_HOOK(__imp__IoInvalidDeviceRequest, IoInvalidDeviceRequest);
 GUEST_FUNCTION_HOOK(__imp__ObReferenceObject, ObReferenceObject);
 GUEST_FUNCTION_HOOK(__imp__IoCreateDevice, IoCreateDevice);
 GUEST_FUNCTION_HOOK(__imp__IoDeleteDevice, IoDeleteDevice);
-GUEST_FUNCTION_HOOK(__imp__ExAllocatePoolTypeWithTag, ExAllocatePoolTypeWithTag);
+GUEST_FUNCTION_HOOK(__imp__ExAllocatePoolTypeWithTag,
+                    ExAllocatePoolTypeWithTag);
 GUEST_FUNCTION_HOOK(__imp__RtlTimeFieldsToTime, RtlTimeFieldsToTime);
 GUEST_FUNCTION_HOOK(__imp__IoCompleteRequest, IoCompleteRequest);
 GUEST_FUNCTION_HOOK(__imp__RtlUpcaseUnicodeChar, RtlUpcaseUnicodeChar);
@@ -3300,15 +2985,18 @@ GUEST_FUNCTION_HOOK(__imp__IoCheckShareAccess, IoCheckShareAccess);
 GUEST_FUNCTION_HOOK(__imp__IoSetShareAccess, IoSetShareAccess);
 GUEST_FUNCTION_HOOK(__imp__IoRemoveShareAccess, IoRemoveShareAccess);
 GUEST_FUNCTION_HOOK(__imp__NetDll_XNetStartup, NetDll_XNetStartup);
-GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetTitleXnAddr, NetDll_XNetGetTitleXnAddr);
+GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetTitleXnAddr,
+                    NetDll_XNetGetTitleXnAddr);
 GUEST_FUNCTION_HOOK(__imp__KeWaitForMultipleObjects, KeWaitForMultipleObjects);
 GUEST_FUNCTION_HOOK(__imp__KeRaiseIrqlToDpcLevel, KeRaiseIrqlToDpcLevel);
 GUEST_FUNCTION_HOOK(__imp__StfsControlDevice, StfsControlDevice);
 GUEST_FUNCTION_HOOK(__imp__StfsCreateDevice, StfsCreateDevice);
 GUEST_FUNCTION_HOOK(__imp__KfLowerIrql, KfLowerIrql);
 GUEST_FUNCTION_HOOK(__imp__KeReleaseSemaphore, KeReleaseSemaphore);
-GUEST_FUNCTION_HOOK(__imp__XAudioGetVoiceCategoryVolume, XAudioGetVoiceCategoryVolume);
-GUEST_FUNCTION_HOOK(__imp__XAudioGetVoiceCategoryVolumeChangeMask, XAudioGetVoiceCategoryVolumeChangeMask);
+GUEST_FUNCTION_HOOK(__imp__XAudioGetVoiceCategoryVolume,
+                    XAudioGetVoiceCategoryVolume);
+GUEST_FUNCTION_HOOK(__imp__XAudioGetVoiceCategoryVolumeChangeMask,
+                    XAudioGetVoiceCategoryVolumeChangeMask);
 GUEST_FUNCTION_HOOK(__imp__KeResumeThread, KeResumeThread);
 GUEST_FUNCTION_HOOK(__imp__KeInitializeSemaphore, KeInitializeSemaphore);
 GUEST_FUNCTION_HOOK(__imp__XMAReleaseContext, XMAReleaseContext);
@@ -3316,109 +3004,110 @@ GUEST_FUNCTION_HOOK(__imp__XMACreateContext, XMACreateContext);
 GUEST_FUNCTION_HOOK(sub_821305B8, sub_821305B8_NoOp);
 
 // Missing Xam/NetDll imports referenced by generated code
-void XamShowFriendsUI() { }
-void XamShowGamerCardUIForXUID() { }
-void XamShowAchievementsUI() { }
-void XamShowPlayerReviewUI() { }
-void XamShowMarketplaceUI() { }
-void KeSetDisableBoostThread() { }
-void XamLoaderSetLaunchData() { }
-void XamLoaderGetLaunchData() { }
-void XamLoaderGetLaunchDataSize() { }
-void XamCreateEnumeratorHandle() { }
-void XamGetPrivateEnumStructureFromHandle() { }
+void XamShowFriendsUI() {}
+void XamShowGamerCardUIForXUID() {}
+void XamShowAchievementsUI() {}
+void XamShowPlayerReviewUI() {}
+void XamShowMarketplaceUI() {}
+void KeSetDisableBoostThread() {}
+void XamLoaderSetLaunchData() {}
+void XamLoaderGetLaunchData() {}
+void XamLoaderGetLaunchDataSize() {}
+void XamCreateEnumeratorHandle() {}
+void XamGetPrivateEnumStructureFromHandle() {}
 
-uint32_t NetDll_ioctlsocket(uint32_t s, int cmd, uint32_t* argp)
-{
-    (void)s; (void)cmd; (void)argp;
-    return 0;
+uint32_t NetDll_ioctlsocket(uint32_t s, int cmd, uint32_t *argp) {
+  (void)s;
+  (void)cmd;
+  (void)argp;
+  return 0;
 }
 
-uint32_t NetDll_getsockname(uint32_t s, void* addr, int* addrlen)
-{
-    (void)s; (void)addr; (void)addrlen;
-    return 0;
+uint32_t NetDll_getsockname(uint32_t s, void *addr, int *addrlen) {
+  (void)s;
+  (void)addr;
+  (void)addrlen;
+  return 0;
 }
 
-uint32_t NetDll_recvfrom(uint32_t s, void* buf, int len, int flags, void* from, int* fromlen)
-{
-    (void)s; (void)buf; (void)len; (void)flags; (void)from; (void)fromlen;
-    return 0;
+uint32_t NetDll_recvfrom(uint32_t s, void *buf, int len, int flags, void *from,
+                         int *fromlen) {
+  (void)s;
+  (void)buf;
+  (void)len;
+  (void)flags;
+  (void)from;
+  (void)fromlen;
+  return 0;
 }
 
-uint32_t NetDll_sendto(uint32_t s, const void* buf, int len, int flags, const void* to, int tolen)
-{
-    (void)s; (void)buf; (void)len; (void)flags; (void)to; (void)tolen;
-    return len;
+uint32_t NetDll_sendto(uint32_t s, const void *buf, int len, int flags,
+                       const void *to, int tolen) {
+  (void)s;
+  (void)buf;
+  (void)len;
+  (void)flags;
+  (void)to;
+  (void)tolen;
+  return len;
 }
 
-int NetDll_WSAGetLastError()
-{
-    return 0;
+int NetDll_WSAGetLastError() { return 0; }
+
+void NetDll_XNetCleanup() {}
+
+uint32_t NetDll_XNetRegisterKey(uint32_t keyType, void *key, uint32_t keyLen) {
+  (void)keyType;
+  (void)key;
+  (void)keyLen;
+  return 0;
 }
 
-void NetDll_XNetCleanup() { }
+void NetDll_XNetUnregisterKey(uint32_t keyType) { (void)keyType; }
 
-uint32_t NetDll_XNetRegisterKey(uint32_t keyType, void* key, uint32_t keyLen)
-{
-    (void)keyType; (void)key; (void)keyLen;
-    return 0;
+uint32_t NetDll_XNetXnAddrToInAddr(void *xnAddr, void *inAddr, void *xnkid) {
+  (void)xnAddr;
+  (void)inAddr;
+  (void)xnkid;
+  return 0;
 }
 
-void NetDll_XNetUnregisterKey(uint32_t keyType)
-{
-    (void)keyType;
+uint32_t NetDll_XNetServerToInAddr(void *xnAddr, void *inAddr, void *xnkid) {
+  (void)xnAddr;
+  (void)inAddr;
+  (void)xnkid;
+  return 0;
 }
 
-uint32_t NetDll_XNetXnAddrToInAddr(void* xnAddr, void* inAddr, void* xnkid)
-{
-    (void)xnAddr; (void)inAddr; (void)xnkid;
-    return 0;
+void NetDll_XNetUnregisterInAddr(void *inAddr) { (void)inAddr; }
+
+uint32_t NetDll_XNetConnect(void *xnAddr) {
+  (void)xnAddr;
+  return 0;
 }
 
-uint32_t NetDll_XNetServerToInAddr(void* xnAddr, void* inAddr, void* xnkid)
-{
-    (void)xnAddr; (void)inAddr; (void)xnkid;
-    return 0;
+uint32_t NetDll_XNetGetConnectStatus(void *xnAddr) {
+  (void)xnAddr;
+  return 1; // Connected
 }
 
-void NetDll_XNetUnregisterInAddr(void* inAddr)
-{
-    (void)inAddr;
+uint32_t NetDll_XNetQosListen(void *socket, uint32_t flags) {
+  (void)socket;
+  (void)flags;
+  return 0;
 }
 
-uint32_t NetDll_XNetConnect(void* xnAddr)
-{
-    (void)xnAddr;
-    return 0;
+uint32_t NetDll_XNetQosLookup(void *xnAddr, uint32_t qosFlags, void *probe) {
+  (void)xnAddr;
+  (void)qosFlags;
+  (void)probe;
+  return 0;
 }
 
-uint32_t NetDll_XNetGetConnectStatus(void* xnAddr)
-{
-    (void)xnAddr;
-    return 1; // Connected
-}
+void NetDll_XNetQosRelease(void *probe) { (void)probe; }
 
-uint32_t NetDll_XNetQosListen(void* socket, uint32_t flags)
-{
-    (void)socket; (void)flags;
-    return 0;
-}
-
-uint32_t NetDll_XNetQosLookup(void* xnAddr, uint32_t qosFlags, void* probe)
-{
-    (void)xnAddr; (void)qosFlags; (void)probe;
-    return 0;
-}
-
-void NetDll_XNetQosRelease(void* probe)
-{
-    (void)probe;
-}
-
-uint32_t NetDll_XNetGetEthernetLinkStatus()
-{
-    return 1; // Link up
+uint32_t NetDll_XNetGetEthernetLinkStatus() {
+  return 1; // Link up
 }
 void XNetLogonGetTitleID() { LOG_UTILITY("!!! STUB !!!"); }
 void XamUserGetXUID() { LOG_UTILITY("!!! STUB !!!"); }
@@ -3438,13 +3127,12 @@ void NtDeviceIoControlFile() { LOG_UTILITY("!!! STUB !!!"); }
 void NtReleaseMutant() { LOG_UTILITY("!!! STUB !!!"); }
 void NtSetTimerEx() { LOG_UTILITY("!!! STUB !!!"); }
 void XAudioGetSpeakerConfig() { LOG_UTILITY("!!! STUB !!!"); }
-uint32_t XMsgCancelIORequest(uint32_t App, XXOVERLAPPED* lpOverlapped)
-{
-    (void)App;
-    (void)lpOverlapped;
-    // For synchronous I/O completion, cancellation is a no-op
-    // If we had a real async queue, we'd remove the overlapped from the queue
-    return STATUS_SUCCESS;
+uint32_t XMsgCancelIORequest(uint32_t App, XXOVERLAPPED *lpOverlapped) {
+  (void)App;
+  (void)lpOverlapped;
+  // For synchronous I/O completion, cancellation is a no-op
+  // If we had a real async queue, we'd remove the overlapped from the queue
+  return STATUS_SUCCESS;
 }
 void XamInputGetKeystrokeEx() { LOG_UTILITY("!!! STUB !!!"); }
 void XamParseGamerTileKey() { LOG_UTILITY("!!! STUB !!!"); }
@@ -3458,72 +3146,69 @@ void XamVoiceCreate() { LOG_UTILITY("!!! STUB !!!"); }
 void XamVoiceHeadsetPresent() { LOG_UTILITY("!!! STUB !!!"); }
 void XamVoiceSubmitPacket() { LOG_UTILITY("!!! STUB !!!"); }
 void XamWriteGamerTile() { LOG_UTILITY("!!! STUB !!!"); }
-void XexLoadImage()
-{
-    // XexLoadImage: loads an XEX module from a file handle.
-    // Guest args: r3 = FileHandle, r4 = ModuleTypeFlags, r5 = Version, r6 = ModuleHandleOut
-    // Returns 0 on success, writes module handle to output.
-    if (!g_ppcContext)
-        return;
+void XexLoadImage() {
+  // XexLoadImage: loads an XEX module from a file handle.
+  // Guest args: r3 = FileHandle, r4 = ModuleTypeFlags, r5 = Version, r6 =
+  // ModuleHandleOut Returns 0 on success, writes module handle to output.
+  if (!g_ppcContext)
+    return;
 
-    uint32_t fileHandle = g_ppcContext->r3.u32;
-    uint32_t moduleTypeFlags = g_ppcContext->r4.u32;
-    uint32_t version = g_ppcContext->r5.u32;
-    uint32_t moduleHandleOut = g_ppcContext->r6.u32;
+  uint32_t fileHandle = g_ppcContext->r3.u32;
+  uint32_t moduleTypeFlags = g_ppcContext->r4.u32;
+  uint32_t version = g_ppcContext->r5.u32;
+  uint32_t moduleHandleOut = g_ppcContext->r6.u32;
 
-    // For now, return success for any load attempt (dev mode).
-    // Real implementation would parse XEX headers, verify signature via XeKeys/XeCrypt,
-    // map sections, and register module in kernel loader table.
-    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+  // For now, return success for any load attempt (dev mode).
+  // Real implementation would parse XEX headers, verify signature via
+  // XeKeys/XeCrypt, map sections, and register module in kernel loader table.
+  g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
 
-    if (moduleHandleOut)
-    {
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        uint32_t handle = 0x82000000; // Dummy handle
-        (void)mem.WriteU32BE(moduleHandleOut, handle);
-    }
+  if (moduleHandleOut) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t handle = 0x82000000; // Dummy handle
+    (void)mem.WriteU32BE(moduleHandleOut, handle);
+  }
 }
 
-void XexLoadImageHeaders()
-{
-    // XexLoadImageHeaders: reads XEX header from file into buffer without loading executable sections.
-    // Guest args: r3 = FileHandle, r4 = BufferOut, r5 = BufferSize
-    if (!g_ppcContext)
-        return;
+void XexLoadImageHeaders() {
+  // XexLoadImageHeaders: reads XEX header from file into buffer without loading
+  // executable sections. Guest args: r3 = FileHandle, r4 = BufferOut, r5 =
+  // BufferSize
+  if (!g_ppcContext)
+    return;
 
-    uint32_t fileHandle = g_ppcContext->r3.u32;
-    uint32_t bufferOut = g_ppcContext->r4.u32;
-    uint32_t bufferSize = g_ppcContext->r5.u32;
+  uint32_t fileHandle = g_ppcContext->r3.u32;
+  uint32_t bufferOut = g_ppcContext->r4.u32;
+  uint32_t bufferSize = g_ppcContext->r5.u32;
 
-    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+  g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
 
-    if (bufferOut && bufferSize >= 0x1000)
-    {
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-        // Minimal XEX2 header
-        uint8_t header[0x1000] = {};
-        *reinterpret_cast<uint32_t*>(&header[0]) = __builtin_bswap32(0x58455832); // 'XEX2' magic
-        *reinterpret_cast<uint32_t*>(&header[4]) = __builtin_bswap32(0x0); // ModuleFlags
-        *reinterpret_cast<uint32_t*>(&header[8]) = __builtin_bswap32(0x1000); // HeaderSize
-        (void)mem.WriteBytes(bufferOut, header, bufferSize);
-    }
+  if (bufferOut && bufferSize >= 0x1000) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    // Minimal XEX2 header
+    uint8_t header[0x1000] = {};
+    *reinterpret_cast<uint32_t *>(&header[0]) =
+        __builtin_bswap32(0x58455832); // 'XEX2' magic
+    *reinterpret_cast<uint32_t *>(&header[4]) =
+        __builtin_bswap32(0x0); // ModuleFlags
+    *reinterpret_cast<uint32_t *>(&header[8]) =
+        __builtin_bswap32(0x1000); // HeaderSize
+    (void)mem.WriteBytes(bufferOut, header, bufferSize);
+  }
 }
-void XexUnloadImage()
-{
-    // XexUnloadImage: unloads a previously loaded module
-    // Guest args: r3 = ModuleHandle
-    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+void XexUnloadImage() {
+  // XexUnloadImage: unloads a previously loaded module
+  // Guest args: r3 = ModuleHandle
+  g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
 }
 
-void XexCheckExecutablePages()
-{
-    // XexCheckExecutablePages: verifies executable pages integrity
-    // Guest args: r3 = ModuleHandle, r4 = Flags
-    // Returns 0 on success
-    if (g_ppcContext)
-    {
-        g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
-    }
+void XexCheckExecutablePages() {
+  // XexCheckExecutablePages: verifies executable pages integrity
+  // Guest args: r3 = ModuleHandle, r4 = Flags
+  // Returns 0 on success
+  if (g_ppcContext) {
+    g_ppcContext->r3.u32 = 0; // STATUS_SUCCESS
+  }
 }
 
 void _snprintf() { LOG_UTILITY("!!! STUB !!!"); }
@@ -3539,7 +3224,8 @@ GUEST_FUNCTION_STUB(__imp__XamShowAchievementsUI);
 GUEST_FUNCTION_STUB(__imp__XamShowPlayerReviewUI);
 GUEST_FUNCTION_STUB(__imp__XamShowMarketplaceUI);
 GUEST_FUNCTION_STUB(__imp__KeSetDisableBoostThread);
-GUEST_FUNCTION_HOOK(__imp__MmAllocatePhysicalMemoryEx, MmAllocatePhysicalMemoryEx);
+GUEST_FUNCTION_HOOK(__imp__MmAllocatePhysicalMemoryEx,
+                    MmAllocatePhysicalMemoryEx);
 GUEST_FUNCTION_STUB(__imp__XamLoaderSetLaunchData);
 GUEST_FUNCTION_STUB(__imp__XamLoaderGetLaunchData);
 GUEST_FUNCTION_STUB(__imp__XamLoaderGetLaunchDataSize);
@@ -3597,7 +3283,6 @@ GUEST_FUNCTION_STUB(__imp__XamVoiceSubmitPacket);
 GUEST_FUNCTION_STUB(__imp__XamWriteGamerTile);
 GUEST_FUNCTION_STUB(__imp__XeKeysConsolePrivateKeySign);
 GUEST_FUNCTION_STUB(__imp__XeKeysConsoleSignatureVerification);
-
 
 GUEST_FUNCTION_STUB(__imp___snprintf);
 GUEST_FUNCTION_STUB(__imp___vsnprintf);

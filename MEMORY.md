@@ -51,7 +51,7 @@ tools\run_phase_gates.ps1  # Run all gates with regression detection
 - Working hook mechanism = `PPC_FUNC(sub_XXXX)` weak-alias strong def (dispatcher-map SetFunction is NEVER consulted for guest calls); live censuses: OOM-CENSUS, PHYSALLOC-CENSUS, ARENA-CENSUS
 - Session-34 also observed the GPU-progress-wait class: steady 30ms poll, ring put advances but progress counter (pc) never advances → legacy CP publication not reaching guest (secondary; fix under freeze line)
 
-**Next (session 38):** Run gate soak → analyze POOL-CENSUS FAIL# output → root-cause slab corruption from live data → then P4′ step 3 render thread.
+**Next (session 40):** Run gate soak → dense census MUST catch crash dispatch → analyze `global8270` value on failing call → trace who should initialize config global → then P4′ step 3 render thread.
 
 History: the old "[0x7FC86544] bit0 park" blocker was superseded (2026-08-24) by the bctrl dispatch crash at `sub_825FDB30` (fully decoded — node-chain walk via data-section vtables; the "raw host pointer 0x7E780000" was arithmetic on ctr=0, myth busted).
 
@@ -83,6 +83,6 @@ History: the old "[0x7FC86544] bit0 park" blocker was superseded (2026-08-24) by
 7. Search before acting — always verify with Ghidra/RenderDoc first
 
 ## Last Updated
-- 2026-09-05: Session 37 — enhanced sub_821DE9D8 census (full slab chain dump on return-0)
+- 2026-09-05: Session 39 — CONFIG-DISPATCH census v3 (dense 500 calls + GLOBAL@82839270 tracking)
 - 2026-09-03: Full doc resync (README/ARCHITECTURE/AGENTS/plan) — statuses, blocker, stale paths, validator counts
 - 2026-08-30: Directory cleanup for Cline (rules → `.clinerules/`, handoffs → `docs/handoffs/`)

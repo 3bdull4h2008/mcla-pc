@@ -113,6 +113,7 @@ void App::Shutdown() {
     m_running = false;
 
     // P4.5': Stop the render thread before tearing down D3D12/window.
+    // The render thread owns D3D12 and shuts it down in stop().
     mcla::native::g_renderThread.stop();
 
     // Save config
@@ -120,11 +121,6 @@ void App::Shutdown() {
 
     // Unmount VFS
     mcla::vfs::RpfVirtualFileSystem::Instance().Unmount();
-
-    // Shutdown D3D12 backend
-    if (auto* backend = native::GetD3D12Backend()) {
-        backend->Shutdown();
-    }
 
     // Destroy window
     if (m_window) {
@@ -213,15 +209,15 @@ bool App::CreateSDLWindow() {
 }
 
 bool App::InitD3D12() {
-    // Only initialize D3D12 in native renderer mode
+    // D3D12 initialization is deferred to the render thread (P4′ Step 3).
+    // The render thread owns all D3D12 calls. We just store the window params
+    // and the render thread will initialize D3D12 when it starts.
     if (mcla::renderer::GetRendererMode() == mcla::renderer::RendererMode::Native) {
-        if (!native::GetD3D12Backend()->Initialize(m_hwnd, m_width, m_height)) {
-            MCLA_LOG_ERROR("Failed to initialize D3D12 backend");
-            return false;
-        }
-        MCLA_LOG_INFO("D3D12 backend initialized in native mode");
+        mcla::native::g_renderThread.SetWindowParams(m_hwnd, m_width, m_height);
+        MCLA_LOG_INFO("D3D12 deferred to render thread (HWND=0x{:X} {}x{})",
+                      reinterpret_cast<uintptr_t>(m_hwnd), m_width, m_height);
     } else {
-        MCLA_LOG_INFO("Renderer mode is legacy/capture; D3D12 backend will initialize lazily");
+        MCLA_LOG_INFO("Renderer mode is legacy/capture; D3D12 not needed");
     }
     return true;
 }
@@ -276,10 +272,13 @@ void App::OnResize(uint32_t width, uint32_t height) {
     m_width = width;
     m_height = height;
 
-    if (auto* backend = native::GetD3D12Backend()) {
-        if (backend->IsInitialized()) {
-            backend->Resize(width, height);
-        }
+    if (mcla::renderer::GetRendererMode() == mcla::renderer::RendererMode::Native) {
+        mcla::native::RenderCommand cmd;
+        cmd.type = mcla::native::RenderCommand::RESIZE;
+        auto& resize = cmd.data.emplace<mcla::native::ResizeCommand>();
+        resize.width = width;
+        resize.height = height;
+        mcla::native::g_commandQueue.push(cmd);
     }
 
     MCLA_LOG_INFO("Window resized to {}x{}", width, height);

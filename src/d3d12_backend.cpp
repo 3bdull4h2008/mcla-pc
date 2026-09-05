@@ -54,6 +54,7 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
 
     if (!CreateDevice()) return false;
     if (!CreateCommandObjects()) return false;
+    if (!CreateCopyQueue()) return false;
     if (!CreateSwapChain(hwnd, m_width, m_height)) return false;
     if (!CreateRenderTargets()) return false;
     if (!CreateSyncObjects()) return false;
@@ -159,6 +160,46 @@ bool D3D12Backend::CreateCommandObjects() {
     }
 
     m_commandList->Close();
+    return true;
+}
+
+bool D3D12Backend::CreateCopyQueue() {
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+
+    HRESULT hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_copyQueue));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreateCopyQueue failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    hr = m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&m_copyAllocator));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreateCopyAllocator failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    hr = m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, m_copyAllocator.Get(), nullptr, IID_PPV_ARGS(&m_copyCommandList));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreateCopyCommandList failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    m_copyCommandList->Close();
+
+    hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_copyFence));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreateCopyFence failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    m_copyFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!m_copyFenceEvent) {
+        MCLA_LOG_ERROR("D3D12Backend: CreateEvent(copy fence) failed");
+        return false;
+    }
+
+    MCLA_LOG_INFO("D3D12Backend: Copy queue created (type=COPY)");
     return true;
 }
 
@@ -1430,6 +1471,80 @@ void D3D12Backend::WaitForGpu() {
     }
 }
 
+bool D3D12Backend::StreamingUpload(ID3D12Resource* dest, const void* data, uint32_t size) {
+    if (!m_device || !m_copyQueue || !m_copyCommandList || !dest || !data || size == 0) return false;
+
+    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC bufDesc = {};
+    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufDesc.Width = (size + 255) & ~255u; // align to 256 bytes
+    bufDesc.Height = 1;
+    bufDesc.DepthOrArraySize = 1;
+    bufDesc.MipLevels = 1;
+    bufDesc.SampleDesc.Count = 1;
+    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> uploadBuffer;
+    HRESULT hr = m_device->CreateCommittedResource(
+        &uploadHeapProps, D3D12_HEAP_FLAG_NONE,
+        &bufDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr, IID_PPV_ARGS(&uploadBuffer));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: StreamingUpload CreateCommittedResource failed hr=0x{:08X}",
+                       static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {0, 0};
+    hr = uploadBuffer->Map(0, &readRange, &mapped);
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: StreamingUpload Map failed hr=0x{:08X}",
+                       static_cast<uint32_t>(hr));
+        return false;
+    }
+    memcpy(mapped, data, size);
+    uploadBuffer->Unmap(0, nullptr);
+
+    hr = m_copyCommandList->Reset(m_copyAllocator.Get(), nullptr);
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: StreamingUpload CopyReset failed hr=0x{:08X}",
+                       static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    m_copyCommandList->CopyBufferRegion(dest, 0, uploadBuffer.Get(), 0, size);
+
+    hr = m_copyCommandList->Close();
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: StreamingUpload Close failed hr=0x{:08X}",
+                       static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = { m_copyCommandList.Get() };
+    m_copyQueue->ExecuteCommandLists(1, lists);
+
+    return true;
+}
+
+uint64_t D3D12Backend::SignalCopyFence() {
+    if (!m_copyQueue || !m_copyFence) return 0;
+    ++m_copyFenceValue;
+    m_copyQueue->Signal(m_copyFence.Get(), m_copyFenceValue);
+    return m_copyFenceValue;
+}
+
+void D3D12Backend::WaitForCopyFence(uint64_t fenceValue) {
+    if (!m_copyFence || !m_copyFenceEvent) return;
+    if (m_copyFence->GetCompletedValue() < fenceValue) {
+        m_copyFence->SetEventOnCompletion(fenceValue, m_copyFenceEvent);
+        WaitForSingleObject(m_copyFenceEvent, INFINITE);
+    }
+}
+
 bool D3D12Backend::Resize(uint32_t width, uint32_t height) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized || !m_swapChain) return false;
@@ -1559,7 +1674,13 @@ void D3D12Backend::Shutdown() {
         m_fenceEvent = nullptr;
     }
 
+    if (m_copyFenceEvent) {
+        CloseHandle(m_copyFenceEvent);
+        m_copyFenceEvent = nullptr;
+    }
+
     m_fence.Reset();
+    m_copyFence.Reset();
     for (uint32_t i = 0; i < kBufferCount; ++i) {
         m_renderTargets[i].Reset();
         m_commandAllocators[i].Reset();
@@ -1567,6 +1688,9 @@ void D3D12Backend::Shutdown() {
     m_rtvHeap.Reset();
     m_commandList.Reset();
     m_commandQueue.Reset();
+    m_copyCommandList.Reset();
+    m_copyAllocator.Reset();
+    m_copyQueue.Reset();
     m_swapChain.Reset();
 
     // Phase 3 draw-path resources: clear the persistent upload mapping and

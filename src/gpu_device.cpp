@@ -646,19 +646,27 @@ PPC_FUNC(sub_82420BA8)
     const uint32_t n = s_h20BA8.fetch_add(1) + 1;
     const uint32_t dev = ctx.r3.u32;
     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    if (dev != 0 && mem.IsValid(dev + 0x2FA0, 4))
+    const bool devOk = dev != 0 && mem.IsValid(dev + 0x2FA0, 4);
+    if (devOk)
     {
+        const uint32_t r5 = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32;
+        const bool vb0Ok = mem.IsValid(r5, 16);
+        const bool vb1Ok = mem.IsValid(r7, 16);
+        const bool ibOk  = mem.IsValid(r6, 0x2C);
         CapturedDrawV1 cap{};
         cap.primTypeFlags = ctx.r4.u32;
-        for (uint32_t i = 0; i < 4; ++i)
+        if (vb0Ok && vb1Ok && ibOk)
         {
-            (void)mem.ReadU32BE(ctx.r5.u32 + i * 4, &cap.vbDesc[0][i]);
-            (void)mem.ReadU32BE(ctx.r7.u32 + i * 4, &cap.vbDesc[1][i]);
-            (void)mem.ReadU32BE(ctx.r6.u32 + i * 4, &cap.ibDesc[i]);
+            for (uint32_t i = 0; i < 4; ++i)
+            {
+                (void)mem.ReadU32BE(r5 + i * 4, &cap.vbDesc[0][i]);
+                (void)mem.ReadU32BE(r7 + i * 4, &cap.vbDesc[1][i]);
+                (void)mem.ReadU32BE(r6 + i * 4, &cap.ibDesc[i]);
+            }
+            (void)mem.ReadU32BE(r6 + 0x20, &cap.ibBase);
+            (void)mem.ReadU32BE(r6 + 0x24, &cap.ibCounts);
+            (void)mem.ReadU32BE(r6 + 0x28, &cap.indexWidthBits);
         }
-        (void)mem.ReadU32BE(ctx.r6.u32 + 0x20, &cap.ibBase);
-        (void)mem.ReadU32BE(ctx.r6.u32 + 0x24, &cap.ibCounts);
-        (void)mem.ReadU32BE(ctx.r6.u32 + 0x28, &cap.indexWidthBits);
         for (uint32_t w = 0; w < 6; ++w)
         {
             (void)mem.ReadU32BE(dev + 0x10 + w * 4, &cap.dirtyMask[w]);
@@ -691,12 +699,12 @@ PPC_FUNC(sub_82420BA8)
             (void)mem.ReadU32BE(ctx.r5.u32 + 0, &dic.vbAddr);
             (void)mem.ReadU32BE(ctx.r5.u32 + 4, &dic.vbStride);
         }
-        if (ctx.r6.u32 != 0 && mem.IsValid(ctx.r6.u32, 12))
+        if (ctx.r6.u32 != 0 && mem.IsValid(ctx.r6.u32, 0x2C))
         {
             (void)mem.ReadU32BE(ctx.r6.u32 + 0, &dic.ibAddr);
             (void)mem.ReadU32BE(ctx.r6.u32 + 8, &dic.ibFormat);
         }
-        if (dev != 0 && mem.IsValid(dev + 0x2FA0, 4))
+        if (ctx.r6.u32 != 0 && mem.IsValid(ctx.r6.u32 + 0x24, 4))
         {
             uint32_t ibCntRaw = 0;
             (void)mem.ReadU32BE(ctx.r6.u32 + 0x24, &ibCntRaw);

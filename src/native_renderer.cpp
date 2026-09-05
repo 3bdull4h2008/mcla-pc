@@ -10,6 +10,8 @@
 #include "guest_memory.h"
 #include "gpu_mmio.h"
 #include "gpu_device.h"
+#include "render_queue.h"
+#include "render_thread.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "renderer/shader_translator.h"
 #include "renderer/pipeline_cache.h"
@@ -562,64 +564,23 @@ PPC_FUNC_IMPL(Hooked_VdSwap) {
                     mcla::renderer::RendererModeName(mcla::renderer::GetRendererMode()));
     }
 
-    DrawPacket capturedSnapshot{};
-    bool haveCaptured = false;
-    {
-        const DrawPacket* captured = nullptr;
-        if (GetDrawAccumulator()->LastPacket(captured)) {
-            capturedSnapshot = *captured;
-            haveCaptured = true;
-        }
-    }
     GetDrawAccumulator()->OnFrameEnd();
 
     if (mcla::renderer::GetRendererMode() == mcla::renderer::RendererMode::Native) {
-        auto* d3dBackend = GetD3D12Backend();
-        if (!d3dBackend->IsInitialized()) {
-            auto* app = mcla::GetApp();
-            if (app && app->GetHwnd()) {
-                d3dBackend->Initialize(app->GetHwnd(), app->GetWidth(), app->GetHeight());
-            }
-        }
+        static uint64_t s_nativeFrameCount = 0;
+        s_nativeFrameCount++;
 
-        if (d3dBackend->IsInitialized()) {
-            static uint64_t s_nativeFrameCount = 0;
-            s_nativeFrameCount++;
+        mcla::native::RenderCommand cmd;
+        cmd.type = mcla::native::RenderCommand::PRESENT;
+        auto& present = cmd.data.emplace<mcla::native::PresentCommand>();
+        present.frameNumber = static_cast<uint32_t>(s_nativeFrameCount);
+        present.obj = obj;
+        present.swapInfo = swap_info;
+        mcla::native::g_commandQueue.push(cmd);
 
-            auto graph = d3dBackend->CreateRenderGraph();
-
-            bool consumed = false;
-            if (haveCaptured) {
-                graph.AddPass(L"ConsumeCapturedGeometry",
-                    {},
-                    [&](ID3D12GraphicsCommandList* cmdList) {
-                        auto* backend = GetD3D12Backend();
-                        if (TryConsumeCapturedGeometry(backend, &capturedSnapshot)) {
-                        }
-                    });
-            }
-
-            graph.AddPass(L"DrawTestTriangle",
-                {},
-                [&](ID3D12GraphicsCommandList* cmdList) {
-                    auto* backend = GetD3D12Backend();
-                    static uint64_t s_nativeFrameCount = 0;
-                    s_nativeFrameCount++;
-                    backend->DrawTestMeshedTriangle(static_cast<uint32_t>(s_nativeFrameCount));
-                });
-
-            if (graph.Build()) {
-                graph.Execute();
-            }
-            graph.Reset();
-
-            static uint64_t s_nativeReportFrame = 0;
-            if (static_cast<uint64_t>(s_nativeFrameCount) % 120 == 0) {
-                const auto& stats = d3dBackend->Stats();
-                MCLA_LOG_INFO("Native render frame={} draws={} uploaded_bytes_total={} cache_hits={} cache_misses={}",
-                            s_nativeFrameCount, stats.drawsIssued, stats.uploadsBytes,
-                            stats.cacheHits, stats.cacheMisses);
-            }
+        if (s_nativeFrameCount % 120 == 0) {
+            MCLA_LOG_INFO("VdSwap[{}] enqueued PRESENT #{} (queue size: {})",
+                        swapCount, s_nativeFrameCount, mcla::native::g_commandQueue.size());
         }
     } else {
         // Legacy / Capture mode - chain to original if needed for game logic

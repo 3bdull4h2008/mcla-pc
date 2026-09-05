@@ -40,10 +40,14 @@ the Xenos CP runs, PM4 is submitted by us, or draw data is guessed.
 [vsync interrupt thread]                  LIVE   callback @0x82411478 firing 60fps; r3=interrupt
       |                                          type (r3=0 graphics, r3=1 vsync event)
       v
-[OOM fatal / boot blocker]                ❌ ACTIVE  intermittent OOM ~T+15s, churn heap 0x82830CD8;
-      |                                          class allocator sub_821DE9D8 prime suspect (sessions
-      |                                          33-37; census enhanced session 37; see BOOT_HANDOFF.md)
-      |                                          — everything below is BLOCKED until this closes
+[OOM / heap churn]                        🟡 ACTIVE  OOM front mitigated but not closed; chain-rebuild
+      |                                          fired 4x in the 2026-09-05 soak, no OOM fatal, but
+      |                                          overflow root cause remains unidentified
+      v
+[config dispatch null-handler AV]         ❌ ACTIVE  session-38 deterministic AV inside original
+      |                                          sub_8218CC70 body; host r8=0xffffffff7e780000 indicates
+      |                                          NULL/garbage handler via PPC_LOOKUP_FUNC arithmetic on
+      |                                          target=0; config global @0x82839270 is currently ZERO
       v
 [device-method capture]                   🟡 P4′   create-hook @sub_82413588 + packet capture v2
       |                                          @sub_82411640 armed (steps 1-2 done); remaining
@@ -80,28 +84,36 @@ CP-emulation gates are superseded:
 | P6′ | Native default & legacy retirement (delete gpu_cp.cpp) | ⏳ pending |
 | P7′–P9′ | Build env, codegen config, kernel surface | ⏳ pending |
 
-## 5. Current Front Line (session 37 done, refreshed 2026-09-05)
+## 5. Current Front Line (session 38 refreshed, 2026-09-05)
 
-**Blocker:** intermittent OOM fatal ~T+15s in the guest churn heap — heap struct
-`0x82830CD8`, 46.5 MB fixed cap (`sub_821C1BB0`, no grow path), ~4% used at fatal
-(earlier "97-100% full" readings were a swapped-label artifact, corrected session 36).
+**Primary blocker:** deterministic AV in the original `sub_8218CC70` config-dispatch
+path. The OOM front is still active as a related allocator problem, but it is now
+considered mitigated rather than the single active blocker: the 2026-09-05 soak saw
+chain rebuild fire 4x and no fatal OOM, but the write that overflowed the 16-byte
+pool remains unidentified.
 
-Prime hypotheses:
-1. **Class allocator `sub_821DE9D8` returns 0 without refill** — inconsistent slab
-   header ([slab+8] count>0 but [slab+12] freelist empty/garbage) → `sub_821C29A0`
-   fast-path raise; slab corruption (double-free / elemsize mismatch / node overflow).
-2. **GPU-progress-wait class (secondary, session 34):** ring put advances but the
+Active front:
+1. **Config-dispatch null-handler AV** — `__imp__sub_8218CC70 +0xC1`, host
+   `r8 = 0xffffffff7e780000`, which is the session-25-decoded
+   `PPC_LOOKUP_FUNC` arithmetic on target=0. The call chain lands in the config
+   dispatch path, and `CONFIG-DISPATCH GLOBAL @0x82839270` is currently ZERO.
+2. **Allocator overflow still unresolved** — class allocator `sub_821DE9D8`
+   and the 16-byte pool are still under census; the root cause of the actual
+   write overflow has not been identified despite chain-rebuild mitigation.
+3. **GPU-progress-wait class (secondary, session 34):** ring put advances but the
    GPU progress counter never does → legacy CP publication not reaching the guest;
    fix only under the CP freeze line as kernel/CP-legacy work.
 
-Discriminating probes (session 37 done, census enhanced):
-- `PPC_FUNC(sub_821DE9D8)` census enhanced: every return-0 dumps the FULL slab chain
-  (up to 32 slabs) with per-slab [+0]next, [+4]prev, [+8]count, [+12]freelist,
-  [+16]owner, chainLen. Added head fields (elemsize, capacity), summary (totalSlabs,
-  slabsWithFree, totalFree), FIRST-NONZERO diagnostic with count-vs-chainLen match.
-  No sampling — logs every failure.
-- **Next (session 38):** Run gate soak → analyze POOL-CENSUS FAIL# output →
-  root-cause slab corruption from live data → then P4′ step 3 render thread.
+Discriminating probes (session 38 next):
+- `CONFIG-DISPATCH` census v2: log every dispatch (idx, offset, base_ptr,
+  struct, target_fn, valid-bit) for the first 200 calls, then every 100th call,
+  plus the GLOBAL `@82839270` value per call.
+- Confirm the initializer for the config global / handler table and the allocator
+  registration path; likely the registration never ran or a `0xB5800000`-class
+  phys alloc returned wrong memory.
+- After the dispatch front closes, run the writer-attribution census on the 16-byte
+  pool slab range to close the overflow root cause.
+- Then resume P4′ step 3 render-thread work.
 
 History: post-P3 park ([0x7FC86544] bit0) → superseded 2026-08-24 by the bctrl
 dispatch crash at `sub_825FDB30` (decoded: node-chain walk reachable only via
