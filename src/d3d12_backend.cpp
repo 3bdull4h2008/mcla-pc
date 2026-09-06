@@ -403,7 +403,7 @@ uint8_t* D3D12Backend::MapUpload(size_t size, size_t alignment, D3D12_GPU_VIRTUA
 
 bool D3D12Backend::CreateSrvHeap() {
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 1;
+    heapDesc.NumDescriptors = kShaderTextureSlotCount;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
@@ -414,6 +414,20 @@ bool D3D12Backend::CreateSrvHeap() {
         return false;
     }
     m_srvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // D3D12 requires every descriptor in a bound table to be initialized.
+    // Prefill all slots with null SRVs; CreateDecodedTexture overwrites slot
+    // kTexture2DSlot with the real 2D texture.
+    D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv = {};
+    nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    nullSrv.Texture2D.MipLevels = 1;
+    for (uint32_t i = 0; i < kShaderTextureSlotCount; ++i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+        h.ptr += static_cast<size_t>(i) * m_srvDescriptorSize;
+        m_device->CreateShaderResourceView(nullptr, &nullSrv, h);
+    }
     return true;
 }
 
@@ -805,7 +819,10 @@ bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t wi
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Texture2D.MipLevels = 1;
 
+    // 2D textures bind at slot kTexture2DSlot -> t1, matching the translator's
+    // `Texture2D t2D : register(t1)` declaration.
     D3D12_CPU_DESCRIPTOR_HANDLE srvHandle(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+    srvHandle.ptr += static_cast<size_t>(kTexture2DSlot) * m_srvDescriptorSize;
     m_device->CreateShaderResourceView(texture.Get(), &srvDesc, srvHandle);
     m_decodedTextureSrvGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
 
@@ -820,29 +837,43 @@ bool D3D12Backend::CreateDecodedTexture(const uint8_t* linearPixels, uint32_t wi
 }
 
 void D3D12Backend::BindDecodedTexture() {
-    if (!m_srvHeap || !m_decodedTexture) return;
+    if (!m_srvHeap) return;
+    // Always bind the SRV table (slots are null-initialized; unused slots are
+    // valid null SRVs). A translated shader's descriptor table must never be
+    // left unset on the command list.
     m_commandList->SetDescriptorHeaps(1, m_srvHeap.GetAddressOf());
-    m_commandList->SetGraphicsRootDescriptorTable(0, m_decodedTextureSrvGpu);
+    const D3D12_GPU_DESCRIPTOR_HANDLE base = m_decodedTexture
+        ? m_decodedTextureSrvGpu
+        : m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    m_commandList->SetGraphicsRootDescriptorTable(0, base);
 }
 
 bool D3D12Backend::CreateTestRootSignature() {
-    // Root signature for the deterministic test shaders. The existing test
-    // VS/PS do not sample, but the Phase 4 decoded-texture path needs a
-    // pixel-visible SRV descriptor table at t0 and a static sampler at s0 so a
-    // captured texture can be bound without recompiling the root signature.
-    // Shaders that ignore the table are unaffected by it.
+    // Shared root signature for every pipeline (test fallback AND pipeline-cache
+    // worker PSOs). It mirrors the binding contract of shader_translator's
+    // generated HLSL:
+    //   - SRV descriptor table t0..t3 (t1D/t2D/t3D/tCube), visibility ALL
+    //     (Xenos vertex shaders can tfetch too).
+    //   - Root CBV at b0 (cbuffer ShaderConstants, 256 float4 constants),
+    //     visibility ALL (VS and PS share register b0 in the translator).
+    //   - Static sampler at s0, visibility ALL.
     D3D12_DESCRIPTOR_RANGE srvRange = {};
     srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange.NumDescriptors = 1;
-    srvRange.BaseShaderRegister = 0;  // t0
+    srvRange.NumDescriptors = kShaderTextureSlotCount;  // t0..t3
+    srvRange.BaseShaderRegister = 0;
     srvRange.RegisterSpace = 0;
     srvRange.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER rootParams[1] = {};
+    D3D12_ROOT_PARAMETER rootParams[2] = {};
     rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
     rootParams[0].DescriptorTable.pDescriptorRanges = &srvRange;
-    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[1].Descriptor.ShaderRegister = 0;  // b0
+    rootParams[1].Descriptor.RegisterSpace = 0;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_STATIC_SAMPLER_DESC staticSampler = {};
     staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -857,7 +888,7 @@ bool D3D12Backend::CreateTestRootSignature() {
     staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
     staticSampler.ShaderRegister = 0;  // s0
     staticSampler.RegisterSpace = 0;
-    staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
     rootDesc.NumParameters = _countof(rootParams);
@@ -1329,14 +1360,16 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     if (!m_initialized) return false;
     if (!desc.vertexBytes || desc.vertexBytesSize == 0 || desc.vertexCount == 0) return false;
 
-    // The test PSO input layout is exactly { float3 pos, float4 color } = 28
-    // bytes. Refusing any other stride keeps us honest: a captured stream with
-    // a different layout is not invented into this layout.
-    constexpr uint32_t kLayoutStride = 28;
-    if (desc.vertexStride != kLayoutStride) {
-        MCLA_LOG_WARN("D3D12Backend: DrawDynamicMesh refused vertex stride {} (test layout is {})",
-                    desc.vertexStride, kLayoutStride);
-        return false;
+    // When using the test PSO, enforce the test layout stride (28 bytes).
+    // When a real PSO is provided, accept any stride — the PSO's input layout
+    // defines the correct vertex format.
+    if (pipeline == m_testPipeline.Get() || !pipeline) {
+        constexpr uint32_t kLayoutStride = 28;
+        if (desc.vertexStride != kLayoutStride) {
+            MCLA_LOG_WARN("D3D12Backend: DrawDynamicMesh refused vertex stride {} (test layout is {})",
+                        desc.vertexStride, kLayoutStride);
+            return false;
+        }
     }
     if (desc.indexed && !desc.cachedIndexGpu &&
         (!desc.indexBytes || desc.indexBytesSize == 0)) {
@@ -1418,6 +1451,16 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     }
 
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+
+    // Root CBV b0 (ShaderConstants). Real Xenos float-constant capture is a
+    // later task; until then bind a zero-filled 256-float4 bank so translated
+    // shaders with a cbuffer execute with defined (zero) constants.
+    D3D12_GPU_VIRTUAL_ADDRESS cbGpu = 0;
+    uint8_t* cbDst = MapUpload(kShaderConstantBytes, 256, cbGpu);
+    if (cbDst) {
+        std::memset(cbDst, 0, kShaderConstantBytes);
+        m_commandList->SetGraphicsRootConstantBufferView(1, cbGpu);
+    }
 
     // Use the provided pipeline or fall back to test pipeline
     ID3D12PipelineState* pso = pipeline ? pipeline : m_testPipeline.Get();

@@ -1,41 +1,82 @@
-﻿# BOOT HANDOFF - updated 2026-09-05 (session 58 — P4.5′ done)
+﻿# BOOT HANDOFF - updated 2026-09-06 (session 64 — VSYNC-ISR deadlock fixed)
 
 ## Current state
-- **Game runs 120+ seconds clean, zero crashes.** All previous fronts closed:
-  - CONFIG-DISPATCH AV: FIXED (session 55) — `compiledFuncs` map bypasses
-    garbage function table entries; no-op stub dispatch for uncompiled funcs
-  - OOM front: MITIGATED (session 49 chain-rebuild) + Census (session 56)
-    found no actual overflow — 64 FREE-CORRUPT detections are all false
-    positives (normal alloc-init-free cycle; census compared alloc-time fill
-    pattern CDCDCDCD against free-time initialized data)
-  - RenderThread: started successfully, running WAIT/WAKE loop on GPU fence
+- **Guest park blocker CLOSED.** Driver worker wakes (status=0) and the
+  game runs 10+ min in loading screens with zero crashes.
+- **Phase gates:** P1-P3 done; P4' steps 1-3 done; P4.5' done; P5' code
+  complete, runtime test ongoing (see session 64 handoff).
+
+## Session 64 — VSYNC-ISR Deadlock Fix (DONE)
+Two root causes, both fixed (full evidence:
+`docs/handoffs/2026-09-06-session64-vsync-deadlock-fix.md`):
+1. **Spinlock poison:** `VdInitializeEngines` seeded gpuCtx+0x4148/+0x4158
+   with 1, but `KfAcquireSpinLock` is 0=unlocked. The vblank ISR
+   (`sub_82411478` r3=0 → `sub_82419718` when bit0 of 0x7FC86544 set)
+   spun forever on the phantom holder (38.6M spins observed), wedging the
+   vsync thread at ~frame 4 — so `SignalSchedulerTick()` never ran. Fixed:
+   seeds are 0 now. `KfAcquireSpinLock` also stores BE r13 and has a 5s
+   lock-recovery steal net (`KFSPIN-RECOVERY`).
+2. **Phantom kernel-object wrappers:** `QueryKernelObject` trusted the
+   guest header's Flink/Blink for wrapper identity; the guest driver
+   rewrites them, so wait and release resolved DIFFERENT host Semaphore
+   instances (wake-loss). Fixed: durable host-side identity map
+   (`WrapperIdentityMap()` in xdm.h, keyed by header guest addr + Type).
+- Verification: phase0_validator 13/13 PASS; ISR runs indefinitely;
+  TICK-PROBE release every cycle; CP drains doorbells==drains, rptr==db.
+- **Multiple waiters** share tick sem 0x40004D7C (main thread + worker):
+  ~30ms release cadence consumed by race winner; ~7.5s successful wakes
+  per waiter is EXPECTED (HW-like 30ms timeout pacing), not a bug.
+
+## Session 63 — Scheduler Tick Semaphore Fix (DONE, superseded by S64)
+- **Root cause of guest park:** `SignalSchedulerTick()` wrote to raw guest
+  memory at offset 0x10 in the XKSEMAPHORE struct, but `KeWaitForSingleObject`
+  resolves the object to a **host-side `Semaphore` wrapper** whose `Wait()`
+  polls a separate `std::atomic<uint32_t> count` — never synced from guest
+  memory. The signal never reached the waiter, parking the driver worker
+  thread forever in a 30ms timeout loop (`NtWaitForSingleObject` on
+  `obj@0x40004D7C`), preventing all GPU work submission after the initial
+  2 doorbell drains.
+- **Fix:** `SignalSchedulerTick()` now calls `QueryKernelObject<Semaphore>()`
+  to resolve the host wrapper and `sem->Release(1, nullptr)`, which increments
+  the host atomic AND calls `notify_all()` to wake the waiter.
+- **Build: 2/2 files, 0 errors, linked.**
+- **Next: runtime test** — verify the guest unblocks and draws reach the
+  pipeline. Expect to see new log activity from DRAW_INDEXED handler and
+  PipelineCache.
 
 ## Session 57 — P4′ Step 3: Render Thread (DONE)
-- **Render thread now owns ALL D3D12 calls.** Guest threads only enqueue
-  `RenderCommand` structs to `g_commandQueue`; render thread processes them.
-- **D3D12 initialization deferred** to render thread startup (`SetWindowParams`
-  from main thread, `backend_.Initialize()` on render thread).
-- **Hooked_VdSwap** now enqueues `PRESENT` command instead of calling
-  `GetD3D12Backend()` directly. Golden rule 13 satisfied.
+- Render thread now owns ALL D3D12 calls.
 
 ## Session 58 — P4.5′: Copy Queue + Frame Pacing + Queue Depth (DONE)
-- **Copy queue** — separate `D3D12_COMMAND_LIST_TYPE_COPY` command queue
-  for streaming uploads. `StreamingUpload()` method on D3D12Backend handles
-  host→device buffer copies on the copy queue, non-blocking to the render queue.
-- **Frame pacing** — render thread targets 30fps (33.33ms/frame). After each
-  PRESENT, sleeps remaining interval if early. Prevents spinning.
-- **Queue depth monitoring** — tracks `g_commandQueue.size()` each tick.
-  - ≥30 commands: warns
-  - ≥60 commands: drops non-critical commands (SET_RENDER_STATE, SET_PIPELINE_STATE,
-    SET_VERTEX_BUFFERS, SET_INDEX_BUFFER, DRAW_INDEXED, NOOP) to prevent queue
-    overflow when guest PPC is faster than the render thread.
+- Copy queue, 30fps frame pacing, queue depth monitoring (warn 30, drop 60).
 
-## Next: P5′ — Real Draws via Device Boundary
-1. **Wire device-method hooks** (`hk_sub_82413660`, `Hooked_Sub82420BA8`) to
-   enqueue `DRAW_CAPTURED` commands instead of log-only
-2. **First native triangle** with real Xenos shaders → DXIL pipeline
-3. **PSO management** — create graphics pipeline state objects from captured
-   Xenos shader hashes
+## Session 60-61 — P5′ Shader Pipeline (CODE DONE) + Park Identified
+- PSO cache + async worker, root signature matching translator contract,
+  grcFvf input layout — all wired (B9/B10/B11 code-complete). Details:
+  `docs/handoffs/2026-09-06-session61-p5-shader-pipeline-and-park.md`.
+- **Blocker now:** guest parks at ~t=4-7min in `WAIT[KWFSO]` loop
+  (tid=0x69C0, lr=0x8242FC1C, obj@0x40004D7C, put=11 rptrWB=001F frozen);
+  no draws ever reach B9-B11. Decode `sub_8242FB88`'s wait condition next.
+- app.cpp: CVar LoadConfig now before InitD3D12 (native mode actually
+  initializes D3D12 now).
+
+## Session 59 — P5′: First Native Draw Wired (DONE)
+- **DRAW_INDEXED now actually renders.** `sub_82420BA8` capture pushes
+  `DrawIndexedCommand` with `{vbAddr, ibAddr, vbSize, ibSize, vbStride,
+  ibFormat, indexCount}` to the render queue. Render thread reads guest
+  memory, uploads VB/IB to D3D12, calls `DrawDynamicMesh()`.
+- Added `vbSize` and `ibSize` fields to `DrawIndexedCommand` (read from
+  VB descriptor at r5+8 and IB descriptor at r6+4).
+- Index format auto-detected from `ibFormat` bit 0: 0=16-bit, 1=32-bit.
+- **This should produce visible geometry** when VB/IB data is valid.
+
+## Next: P5′ continued — PSO Management + Shader Pipeline
+1. **PSO cache** — create D3D12 graphics pipeline state objects from Xenos
+   shader hashes. Cache by `(VS hash, PS hash, blend/depth/rasterizer state)`.
+2. **Root signature** — currently hardcoded test root sig; need to match
+   Xenia's register layout (CBVs, SRVs, samplers).
+3. **Vertex input layout** — decode Xenos FVF vertex declarations into
+   D3D12 input element descriptions.
 
 ## Session 55 — Dispatch Fix (DONE)
 - **Root cause:** Function table has non-NULL garbage (`0x0c800c800c800c800`)
@@ -61,13 +102,11 @@
   overflow pattern (writes past element boundary into adjacent elements)
 - **Raw output:** `build/cache/pool16_writers.log`
 
-## Next: P4′ Step 3 — Render Thread
-1. **Render command queue** — moodycamel blocking queue pattern from UR
-   `UnleashedRecomp/gpu/video.cpp:1006/315/5249`
-2. **Dedicated render thread** — owns ALL D3D12 calls; guest threads only
-   enqueue `RenderCommand` structs
-3. **Device-method handlers** → enqueue only (golden rule 13)
-4. Reference: `docs/handoffs/2026-08-22-ur-vs-mcla-full-diff.md`
+## Next: P5′ continued — Runtime Test + Root Signature
+1. **Runtime test** — run and verify PSO cache wiring works end-to-end
+2. **Root signature** — if PSO creation fails (shader CBVs not in root sig),
+   add CBV root parameters for VS/PS constant buffers (b0/b1)
+3. **G-CORPUS-* gates** — verify all 1,264+ existing ucode shader dumps compile
 
 ## Key Tables
 

@@ -1,6 +1,6 @@
 # MCLA Native PC — Cline Agent Todo List
 
-**Updated:** 2026-09-05 (Session 56 — census done, moving to render thread)  
+**Updated:** 2026-09-06 (Session 64 — VSYNC-ISR deadlock root-caused & fixed, guest unblocked)  
 **Plan:** `docs/MCLA_REBUILD_PLAN.md`  
 **Handoff:** `docs/BOOT_HANDOFF.md`  
 **Live Frontier:** `docs/handoffs/`
@@ -24,9 +24,10 @@
 | B5 | **P4.5′: Copy queue** — separate D3D12 command queue for streaming uploads | 🔴 CRITICAL | ✅ DONE (S58) | StreamingUpload() on copy queue |
 | B6 | **P4.5′: Frame pacing** — render thread owns vsync/present timing | 🟡 HIGH | ✅ DONE (S58) | 30fps target, Sleep-based pacing |
 | B7 | **P4.5′: Queue depth monitoring** — track queue fill, drop non-critical cmds | 🟡 HIGH | ✅ DONE (S58) | Warn at 30, drop at 60 |
-| B8 | **P5′: Wire device-method hooks** — enqueue DRAW_CAPTURED from hooks | 🔴 CRITICAL | ⏳ IN PROGRESS | hk_sub_82413660 + Hooked_Sub82420BA8 |
-| B9 | **P5′: First native triangle** — real Xenos shaders → DXIL pipeline | 🔴 CRITICAL | ⏳ PENDING | After hooks wired |
-| B10 | **P5′: PSO management** — create graphics pipeline state objects | 🟡 HIGH | ⏳ PENDING | After first triangle |
+| B8 | **P5′: Wire DRAW_INDEXED to render** — read guest VB/IB + DrawDynamicMesh | 🔴 CRITICAL | ✅ DONE (S59) | sub_82420BA8 capture → render thread draws |
+| B9 | **P5′: PSO cache** — D3D12 graphics pipeline state objects from Xenos shaders | 🔴 CRITICAL | ✅ CODE DONE (S60-62) | PipelineCache + async DXC worker wired; full shader→PSO path in render_thread; awaits runtime test |
+| B10 | **P5′: Root signature** — match translator HLSL contract (SRVs t0–t3, CBV b0, sampler s0) | 🟡 HIGH | ✅ DONE (S60) | Shared root sig feeds test PSO + pipeline-cache worker; zeroed CBV bound per draw; CVar ordering fix in app.cpp |
+| B11 | **P5′: Vertex input layout** — decode Xenos FVF → D3D12 input elements | 🟡 HIGH | ✅ CODE DONE (S60-62) | grcFvf decode → BuildInputLayoutFromGrcFvf, VS-reflection fallback; grcFvf data captured from device struct |
 
 ---
 
@@ -39,19 +40,21 @@
 | P3 | Critical Import Implementations | ✅ PASSED 2026-08-22 | Boot → main loop, archives load, VSync 60fps |
 | P4′ | Device-Boundary Takeover | ✅ Steps 1-3 done | CP drain + render thread own all D3D12 |
 | P4.5′ | Render Thread & Queues | ✅ DONE (S58) | Copy queue + frame pacing + queue depth |
-| P5′ | Real Draws via Device Boundary | ⏳ IN PROGRESS | First native triangle with real shaders |
+| P5′ | Real Draws via Device Boundary | ⏳ Code done, testing | Full shader→PSO pipeline wired; runtime test next |
 | P5.5′ | Offline Shader Cache | ❌ NOT STARTED | Blocked on P5′ |
 | P6′ | Native Default | ❌ NOT STARTING | Blocked on all above |
 
 ---
 
-## 🎯 IMMEDIATE NEXT ACTIONS (Session 58+)
+## 🎯 IMMEDIATE NEXT ACTIONS (Session 65+)
 
-### P5′ — Real Draws via Device Boundary (B8-B10)
-- [ ] **Wire device-method hooks** — `hk_sub_82413660`, `Hooked_Sub82420BA8` enqueue DRAW_CAPTURED
-- [ ] **First native triangle** — real Xenos shaders → DXIL pipeline
-- [ ] **PSO management** — create graphics pipeline state objects from Xenos shader hashes
-- [ ] **Wire DRAW_CAPTURED** from VdSwap/swap chain to actually draw
+### P5′ — Runtime Test (park blocker CLOSED in S64)
+- [x] **Scheduler tick signal** — `SignalSchedulerTick()` resolves host Semaphore wrapper and calls Release(1) (S63)
+- [x] **VSYNC-ISR deadlock fix** — spinlock seeds 1→0 in VdInitializeEngines + durable kernel-wrapper identity map (S64, phase0 13/13 PASS)
+- [ ] **Loading-progress gate** — game stays in loading screens (VdSwap ~1/15s, no DRAW_INDEXED yet); decode what guest waits on post-load (fences/kick completion/subctx publication) — use `gate-cracker` mode
+- [ ] **Probe hygiene** — demote VSYNC-ISR / KFSPIN-CONTENDED / TICK-PROBE probes (first 60 + every 5000) before perf work
+- [ ] **Root signature CBV slots** — add CBV root parameters if shader reflection finds CBVs not in root sig
+- [ ] **First visible native triangle** — verify Xenos shader → HLSL → DXIL pipeline produces correct geometry
 
 ### Post-P5′
 - [ ] P5.5′: Offline shader cache (Xenos microcode → DXIL at build time)
@@ -142,4 +145,4 @@ build\backend_validator.exe
 
 ---
 
-*Last updated by Cline agent — Session 58 (P4.5′ done, moving to P5′)*
+*Last updated by Cline agent — Session 59 (P5′ first draw wired, PSO cache next)*

@@ -26,6 +26,17 @@ struct CapturedDrawV2
     uint32_t vbBase = 0, vbStride = 0, vbSize = 0;
     uint32_t ibBase = 0, ibSize = 0, ibFmt = 0;
     uint32_t frameId = 0;
+    // Shader programs for PSO lookup
+    uint32_t vsProgram = 0;
+    uint32_t psProgram = 0;
+    // grcFvf vertex declaration
+    uint32_t fvfMask = 0;
+    uint8_t  fvfSize = 0;
+    uint8_t  fvfFlags = 0;
+    uint8_t  fvfDynamicOrder = 0;
+    uint8_t  fvfChannelCount = 0;
+    uint64_t fvfTypes = 0;
+    uint8_t  hasGrcFvf = 0;
 };
 
 // Access captured draw data for native renderer

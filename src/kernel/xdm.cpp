@@ -6,6 +6,11 @@ Mutex g_kernelLock;
 
 void DestroyKernelObject(KernelObject* obj)
 {
+    // DURABLE WRAPPER IDENTITY (session 64): drop the side-map entry so a
+    // recycled guest header cannot resolve to a destroyed wrapper.
+    if (obj->identityHdrAddr != 0)
+        WrapperIdentityMap().erase(obj->identityHdrAddr);
+
     obj->~KernelObject();
     g_userHeap.Free(obj);
 }

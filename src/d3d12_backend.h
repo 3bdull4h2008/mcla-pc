@@ -289,6 +289,7 @@ public:
     ID3D12GraphicsCommandList* GetCommandList() const { return m_commandList.Get(); }
     ID3D12CommandQueue* GetCommandQueue() const { return m_commandQueue.Get(); }
     ID3D12CommandQueue* GetCopyQueue() const { return m_copyQueue.Get(); }
+    ID3D12RootSignature* GetRootSignature() const { return m_rootSignature.Get(); }
     uint32_t GetCurrentFrameIndex() const { return m_frameIndex; }
     uint32_t GetWidth() const { return m_width; }
     uint32_t GetHeight() const { return m_height; }
@@ -339,6 +340,12 @@ public:
     ResourceCache m_resourceCache;
 
     // Phase 4 texture resources (decoded host-linear pixels -> texture + SRV).
+    // Shader-visible SRV heap layout matches the translator's HLSL contract:
+    // slot 0 -> t0 (t1D), 1 -> t1 (t2D), 2 -> t2 (t3D), 3 -> t3 (tCube).
+    static constexpr uint32_t kShaderTextureSlotCount = 4;
+    static constexpr uint32_t kTexture2DSlot = 1;
+    // Xenos float-constant bank size bound at root CBV b0.
+    static constexpr uint32_t kShaderConstantBytes = 256 * 16;
     bool CreateSrvHeap();
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_srvHeap;
     uint32_t m_srvDescriptorSize = 0;

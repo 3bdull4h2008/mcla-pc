@@ -489,7 +489,7 @@ bool TryConsumeDeviceBoundaryDraw(D3D12Backend* backend) {
     }
 
     // Data is valid - the render thread will do the actual drawing
-    // via the command queue (enqueued by hk_sub_82413660 hook)
+    // via the command queue (enqueued by PPC_FUNC(sub_82413660) in gpu_device.cpp)
     return true;
 }
 

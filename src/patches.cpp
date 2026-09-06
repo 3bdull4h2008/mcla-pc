@@ -269,7 +269,9 @@ extern "C" void hk_VdInitializeEngines(mcla::native::PPCContext &ctx,
 extern "C" void hk_sub_82554590(mcla::native::PPCContext &ctx, uint8_t *base);
 extern "C" void hk_GpuKick(mcla::native::PPCContext &ctx, uint8_t *base);
 extern "C" void hk_sub_824569C8(mcla::native::PPCContext &ctx, uint8_t *base);
-extern "C" void hk_sub_82413660(mcla::native::PPCContext &ctx, uint8_t *base);
+// hk_sub_82413660 (dead dispatcher duplicate) removed in P5'/B8 — the live
+// owner of guest 0x82413660 is the global-scope PPC_FUNC override in
+// src/gpu_device.cpp, which now enqueues DRAW_CAPTURED directly.
 extern "C" void hk_sub_82411840(mcla::native::PPCContext &ctx, uint8_t *base);
 
 PPC_FUNC_IMPL(__imp__sub_82413660);
@@ -614,15 +616,10 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     // DISABLED for bisection: mcla::native::g_renderThread.start();
     // MCLA_LOG_ERROR("mcla_ApplyPatches: Render thread started (P4.5')");
 
-    // Device-boundary hooks for native draw path (sub_82413660, sub_82411840)
-    // DISABLED for bisection:
-    // if (BisectGroupEnabled("gp")) {
-    //     dispatcher->SetFunction(0x82413660, hk_sub_82413660);
-    //     MCLA_LOG_INFO("Device-boundary hook: sub_82413660 (draw submit)
-    //     hooked"); dispatcher->SetFunction(0x82411840, hk_sub_82411840);
-    //     MCLA_LOG_INFO("Device-boundary hook: sub_82411840 (draw consumer)
-    //     hooked");
-    // }
+    // Device-boundary draw capture (sub_82413660) is owned by the
+    // global-scope PPC_FUNC override in src/gpu_device.cpp (P5'/B8) — the
+    // dispatcher map is not consulted for guest calls, so registering here
+    // would be dead code.
 
     if (BisectGroupEnabled("gp")) {
       dispatcher->SetFunction(0x82130690, hk_sub_82130690);
@@ -911,47 +908,10 @@ PPC_FUNC_IMPL(hk_sub_824569C8) {
     g_orig_sub_824569C8(ctx, base);
 }
 
-PPC_FUNC_IMPL(hk_sub_82413660) {
-  // Device-boundary draw submit hook - native path
-  const uint32_t n = 0;
-  const uint32_t dev = ctx.r3.u32;
-  const uint32_t r4 = ctx.r4.u32;
-  const uint32_t r5 = ctx.r5.u32; // VB desc
-  const uint32_t r6 = ctx.r6.u32; // IB desc
-
-  // Get the captured draw data
-  const mcla::gpu::CapturedDrawV2 *draw = mcla::gpu::mcla_gpu_GetLastDrawV2();
-  uint32_t frameId = mcla::gpu::mcla_gpu_GetFrameCounter();
-
-  if (draw && (draw->frameId == frameId || frameId == 0)) {
-    // Native path: enqueue draw command to render thread
-    MCLA_LOG_INFO("NATIVE DRAW: sub_82413660 #{} dev={:08X} r4={:08X} "
-                  "r5={:08X} r6={:08X} "
-                  "vb=0x{:08X}/{:08X}/{:08X} ib=0x{:08X}/{:08X}/{:08X}",
-                  n, dev, r4, r5, r6, draw->vbBase, draw->vbStride,
-                  draw->vbSize, draw->ibBase, draw->ibSize, draw->ibFmt);
-
-    // Enqueue draw command to render thread
-    mcla::native::RenderCommand cmd;
-    cmd.type = mcla::native::RenderCommand::DRAW_CAPTURED;
-    cmd.data = mcla::native::DrawCapturedCommand{
-      draw->vbBase,
-      draw->vbSize,
-      draw->vbStride,
-      draw->ibBase,
-      draw->ibSize,
-      draw->frameId,
-      0,
-    };
-
-    mcla::native::g_commandQueue.push(cmd);
-    MCLA_LOG_INFO("Enqueued DrawCaptured to command queue (queue size: {})",
-                  mcla::native::g_commandQueue.size());
-  }
-
-  // Chain to original for legacy path
-  __imp__sub_82413660(ctx, base);
-}
+// hk_sub_82413660 removed (P5'/B8): never registered (dispatcher map is not
+// consulted for guest calls), and duplicated the live global-scope override
+// PPC_FUNC(sub_82413660) in src/gpu_device.cpp, which now owns both the
+// VB/IB capture and the DRAW_CAPTURED enqueue for the render thread.
 
 PPC_FUNC_IMPL(hk_sub_82411840) {
   // Device-boundary draw consumer hook - native path

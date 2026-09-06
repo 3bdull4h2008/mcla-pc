@@ -10,6 +10,7 @@
 #include "xdm.h"
 #include "kernel_objects.h"
 #include "logging.h"
+#include <bit>
 #include <gpu_cp.h>
 #include <user/config.h>
 #include <os/logger.h>
@@ -1260,14 +1261,64 @@ void KfReleaseSpinLock(uint32_t *spinLock) {
   spinLockRef = 0;
 }
 
-void KfAcquireSpinLock(uint32_t *spinLock) {
-  std::atomic_ref spinLockRef(*spinLock);
+static constexpr uint32_t bswap32(uint32_t v) { return __builtin_bswap32(v); }
 
+void KfAcquireSpinLock(uint32_t *spinLock) {
+  // The lock word lives in GUEST memory and guest inline code reads/writes it
+  // through BE accessors (PPC_LOAD_U32/PPC_STORE_U32 bswap). All values we
+  // store here must therefore be byte-swapped into guest order, and the
+  // unlocked sentinel (0) is endian-symmetric.
+  std::atomic_ref spinLockRef(*spinLock);
+  const uint32_t selfBe = bswap32(g_ppcContext->r13.u32);
+
+  // CONTENTION PROBE (session 64): the vblank ISR stalled on 2026-09-06 and
+  // the guest driver worker parked on its tick semaphore — attribute who
+  // holds the lock and who spins (caller lr). Guest addr for the log:
+  // ptr - g_memory.base.
+  const auto start = std::chrono::steady_clock::now();
+  bool recovered = false;
+  uint32_t spins = 0;
   while (true) {
     uint32_t expected = 0;
-    if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
+    if (spinLockRef.compare_exchange_weak(expected, selfBe))
       break;
 
+    // LOCK-RECOVERY SAFETY NET (session 64): a healthy holder keeps this
+    // lock for microseconds. If we're still spinning ~5s later the holder
+    // is phantom/garbage (e.g. a stale seed or a died-without-release
+    // thread) and no host thread can ever release it — the ISR would wedge
+    // the whole vsync path. Log once, then steal the lock. Real HW never
+    // sees this because a raised-IRQL ISR preempts the holding thread; our
+    // cooperative host threads cannot preempt guest code, so stealing is
+    // the honest emulation point here.
+    if (!recovered &&
+        std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) {
+      recovered = true;
+      MCLA_LOG_WARN("KFSPIN-RECOVERY lock@{:08X} holder_r13be={:08X} "
+                    "spins={} lr={:08X} — stealing after 5s",
+                    static_cast<uint32_t>(
+                        reinterpret_cast<uintptr_t>(spinLock) -
+                        reinterpret_cast<uintptr_t>(
+                            mcla::kernel::g_memory.base)),
+                    bswap32(spinLockRef.load()), spins,
+                    g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr)
+                                 : 0);
+      spinLockRef.store(selfBe, std::memory_order_release);
+      break;
+    }
+
+    const uint32_t n = ++spins;
+    if (n <= 40 || (n % 1024) == 0) {
+      const uint32_t holder = bswap32(spinLockRef.load());
+      MCLA_LOG_INFO("KFSPIN-CONTENDED lock@{:08X} holder_r13be={:08X} "
+                    "spins={} lr={:08X}",
+                    static_cast<uint32_t>(
+                        reinterpret_cast<uintptr_t>(spinLock) -
+                        reinterpret_cast<uintptr_t>(
+                            mcla::kernel::g_memory.base)),
+                    holder, n,
+                    g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0);
+    }
     std::this_thread::yield();
   }
 }
@@ -1463,19 +1514,27 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
             // TLS/TEB/r13
             SetPPCContext(cbCtx);
 
-            // Per-frame spam demoted (ship-blocker #2): first 3
-            // frames + every 500th only. Counter increments every
-            // frame regardless.
+            // Per-frame ISR enter/exit probe (session 64): the vblank ISR
+            // hung silently between frames 4-490 on the 2026-09-06 run (zero
+            // SEMA-release probes after ~#7, zero frame%500 logs) — log
+            // enter+exit with GPU-context diagnostics so the hang site is
+            // attributable. spin=ctx+16712 (KfAcquireSpinLock stores the
+            // holder's r13; the ISR holds it itself during the flip-done
+            // bctrl, and the ISR's fake r13 is 0x8F200000), flips
+            // cur/tgt = ctx+16700/16704, flip-done cb = ctx+16544.
             const uint32_t frame = s_frameCounter++;
-            if (frame <= 3 || (frame % 500) == 0) {
-              MCLA_LOG_INFO("VSync: calling callback 0x{:08X} with "
-                            "userData=0x{:08X} (frame={})",
-                            currentCallback, currentUserData, frame);
-              fn(cbCtx, base);
-              MCLA_LOG_INFO("VSync: callback returned");
-            } else {
-              fn(cbCtx, base);
-            }
+            auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
+            uint32_t isrSpin = 0, flipCur = 0, flipTgt = 0, flipCb = 0;
+            if (!memP.ReadU32BE(currentUserData + 16712, &isrSpin))
+              isrSpin = 0xDEADBEEF;
+            (void)memP.ReadU32BE(currentUserData + 16700, &flipCur);
+            (void)memP.ReadU32BE(currentUserData + 16704, &flipTgt);
+            (void)memP.ReadU32BE(currentUserData + 16544, &flipCb);
+            MCLA_LOG_INFO("VSYNC-ISR enter f={} spin={:08X} flips={}/{} "
+                          "cb={:08X}",
+                          frame, isrSpin, flipCur, flipTgt, flipCb);
+            fn(cbCtx, base);
+            MCLA_LOG_INFO("VSYNC-ISR exit f={}", frame);
             // Kernel-role vblank duty (2026-08-24): drain the
             // primary ring up to the driver's current wptr via
             // the existing frozen-capability DrainRing. XTEB+88
@@ -1536,33 +1595,44 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
 static void SignalSchedulerTick() {
   constexpr uint32_t kSchedulerTickSem = 0x40004D7C;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  // FAILURE-PATH PROBE (session 64): ISR ran 2261 times but the waiter woke
+  // only every ~7.5s — attribute which guard bounces the tick signal.
+  static std::atomic<uint32_t> s_tickProbes{0};
+  const uint32_t probeN = s_tickProbes.fetch_add(1) + 1;
+  auto logPath = [&](const char *path) {
+    if (probeN <= 20 || (probeN % 500) == 0)
+      MCLA_LOG_INFO("TICK-PROBE #{} path={}", probeN, path);
+  };
+
   if (!mem.IsValid(kSchedulerTickSem, 4)) {
+    logPath("invalid");
     return;
   }
-  // Use identity-first resolution (same pattern as imports.cpp
-  // NtReleaseSemaphore) to avoid lazy-wrap phantom wrapper issues.
-  uint32_t hdrVal = 0;
-  if (!mem.ReadU32BE(kSchedulerTickSem, &hdrVal) ||
-      hdrVal != 0x58424F58) // 'XBOX' signature
-  {
-    // Not a kernel-created semaphore; skip to avoid phantom wrapper
+
+  // Resolve the HOST-SIDE Semaphore wrapper and Release() it. The old code
+  // wrote raw guest memory at offset 0x10 (the XKSEMAPHORE signal state),
+  // but KeWaitForSingleObject resolves to a host-side Semaphore object
+  // whose Wait() polls a separate std::atomic count — never synced from
+  // guest memory. The signal never reached the waiter, parking the driver
+  // worker forever in a 30ms timeout loop.
+  auto *header = reinterpret_cast<XDISPATCHER_HEADER *>(
+      static_cast<uint8_t *>(mem.Translate(kSchedulerTickSem)));
+  if (!header) {
     return;
   }
-  // Direct identity translation: handle IS the guest VA of the dispatcher
-  // header
-  void *hostPtr = mem.Translate(kSchedulerTickSem);
-  if (!hostPtr) {
+
+  // QueryKernelObject resolves or lazy-wraps the host-side Semaphore.
+  // The OBJECT_SIGNATURE marker was set when the guest first initialized
+  // this semaphore via KeInitializeSemaphore / NtCreateSemaphore.
+  Semaphore *sem = QueryKernelObject<Semaphore>(*header);
+  if (!sem) {
+    logPath("no-sem");
     return;
   }
-  // Manually increment semaphore count (kernel semaphore structure:
-  // XDISPATCHER_HEADER(16) + SignalState@0x10 + WaitListHead@0x18/0x1C)
-  uint32_t *signalState =
-      reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(hostPtr) + 0x10);
-  (*signalState)++;
-  // Note: proper kernel wake would need condition_variable notify, but
-  // guest waiters poll the signal state directly (sub_821C90C0 ->
-  // NtWaitForSingleObjectEx on semaphore with timeout), so incrementing the
-  // count is sufficient.
+
+  logPath("release");
+  sem->Release(1, nullptr);
 }
 
 uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg,
@@ -1585,12 +1655,18 @@ uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg,
                                                             &gpuCtxPtr);
 
   if (gpuCtxPtr != 0 && gpuCtxPtr < 0x90000000) {
-    // Initialize spinlocks at +0x4148 and +0x4158 to 1 (unlocked state)
-    // TU83 manual spawn check expects non-zero spinlocks
+    // Spinlocks at +0x4148 and +0x4158: UNLOCKED STATE IS 0, not 1.
+    // (Session 64 root cause: seeding 1 planted a phantom permanent holder
+    // for KfAcquireSpinLock (0=unlocked protocol) — the vblank ISR
+    // (sub_82419718, lock at gpuCtx+16712=0x4148) then spun forever
+    // (38M+ yields observed), wedging the vsync thread so
+    // SignalSchedulerTick never fired and the driver worker parked on its
+    // tick semaphore 0x40004D7C. The old "TU83 expects non-zero" heuristic
+    // predated the discovery that the vblank path acquires this word.)
     (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(
-        gpuCtxPtr + 0x4148, 1);
+        gpuCtxPtr + 0x4148, 0);
     (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(
-        gpuCtxPtr + 0x4158, 1);
+        gpuCtxPtr + 0x4158, 0);
 
     // Initialize command buffer pointers at +0x30 and +0x38
     (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(gpuCtxPtr + 0x30,
@@ -1863,13 +1939,19 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
 
   uint8_t type = Object->Type;
 
+  // Return the real wait result. Previously this hooked call returned
+  // STATUS_SUCCESS unconditionally, which starved guest workers that branch
+  // on STATUS_TIMEOUT (e.g. driver worker sub_8242FB88 checking r3==0x102 to
+  // run its periodic GPU drain/maintenance — see session 61-62 handoff).
+  uint32_t waitStatus = STATUS_TIMEOUT;
+
   switch (type) {
   case 0:
   case 1: {
     Event *ev = ResolveCreatedObject<Event>(Object, sizeof(XKEVENT));
     if (!ev)
       ev = QueryKernelObject<Event>(*Object);
-    ev->Wait(timeout);
+    waitStatus = ev->Wait(timeout);
     break;
   }
 
@@ -1878,7 +1960,7 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
         ResolveCreatedObject<Semaphore>(Object, sizeof(XKSEMAPHORE));
     if (!sem)
       sem = QueryKernelObject<Semaphore>(*Object);
-    sem->Wait(timeout);
+    waitStatus = sem->Wait(timeout);
     break;
   }
 
@@ -1895,10 +1977,10 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     if ((lr >= 0x82410000u && lr < 0x82430000u) || n <= 120 || (n % 300) == 0) {
       MCLA_LOG_INFO("WAKE[KWFSO] #{:05}{} tid={:08X} status={:08X} lr={:08X}",
                     n, (lr >= 0x82410000u && lr < 0x82430000u) ? "!" : " ",
-                    GetCurrentThreadId(), STATUS_SUCCESS, lr);
+                    GetCurrentThreadId(), waitStatus, lr);
     }
   }
-  return STATUS_SUCCESS;
+  return waitStatus;
 }
 
 static std::vector<size_t> g_tlsFreeIndices;

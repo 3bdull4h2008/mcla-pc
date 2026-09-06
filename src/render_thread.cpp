@@ -2,7 +2,13 @@
 #include "logging.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "kernel/memory.h"
+#include "renderer/shader_translator.h"
+#include "renderer/pipeline_cache.h"
+#include "renderer/xenos_shader_ir.h"
+#include "renderer/grc_fvf_decode.h"
+#include "d3d12_backend.h"
 #include <chrono>
+#include <unordered_map>
 
 namespace mcla::native {
 
@@ -48,6 +54,7 @@ void RenderThread::stop() {
     }
 
     if (d3d12Initialized_) {
+        backend_.GetPipelineCache().StopWorker();
         backend_.Shutdown();
         d3d12Initialized_ = false;
     }
@@ -64,6 +71,10 @@ void RenderThread::threadMain() {
             d3d12Initialized_ = true;
             MCLA_LOG_INFO("RenderThread: D3D12 initialized on thread start ({}x{})",
                           pendingWidth_, pendingHeight_);
+            // Start the pipeline cache async compilation worker
+            backend_.GetPipelineCache().StartWorker(
+                backend_.GetDevice(), backend_.GetRootSignature());
+            MCLA_LOG_INFO("RenderThread: PipelineCache worker started");
         } else {
             MCLA_LOG_ERROR("RenderThread: D3D12 initialization failed on thread start");
         }
@@ -110,6 +121,54 @@ void RenderThread::threadMain() {
     MCLA_LOG_INFO("RenderThread: exiting command loop");
 }
 
+// ---------------------------------------------------------------------------
+// Shader container reader: reads a Xenos .fxc container from guest memory.
+// Returns the raw container bytes. Returns empty on failure.
+// ---------------------------------------------------------------------------
+static std::vector<uint8_t> ReadShaderContainer(mcla::kernel::GuestMemoryHeap& mem,
+                                                 uint32_t guestAddr) {
+    if (guestAddr == 0) return {};
+
+    uint32_t header[9] = {};
+    if (!mem.IsValid(guestAddr, 36) ||
+        !mem.ReadBytes(guestAddr, header, 36)) {
+        return {};
+    }
+
+    // Validate container header: flags field must have (flags & 0xFFFFFF00) == 0x102A1100
+    const uint32_t flags = mcla::renderer::AssembleBE32(
+        reinterpret_cast<const uint8_t*>(header));
+    if ((flags & 0xFFFFFF00) != 0x102A1100) {
+        return {};
+    }
+
+    const uint32_t vsize = mcla::renderer::AssembleBE32(
+        reinterpret_cast<const uint8_t*>(&header[1]));
+    const uint32_t psize = mcla::renderer::AssembleBE32(
+        reinterpret_cast<const uint8_t*>(header + 2));
+    if (vsize + psize < vsize || vsize + psize < psize) {
+        return {};
+    }
+
+    const uint32_t totalSize = 36 + vsize + psize;  // header(36) + virtual + physical
+    std::vector<uint8_t> container(totalSize);
+    // Copy the already-read header
+    std::memcpy(container.data(), header, 36);
+    // Read the rest
+    if (!mem.ReadBytes(guestAddr + 36, container.data() + 36, totalSize - 36)) {
+        return {};
+    }
+
+    return container;
+}
+
+// ---------------------------------------------------------------------------
+// PSO lookup stats
+// ---------------------------------------------------------------------------
+static std::atomic<uint32_t> s_psoCacheHits{0};
+static std::atomic<uint32_t> s_psoCacheMisses{0};
+static std::atomic<uint32_t> s_psoTranslateFailures{0};
+
 void RenderThread::processCommand(const RenderCommand& cmd) {
     switch (cmd.type) {
         case RenderCommand::INIT_D3D12: {
@@ -125,14 +184,171 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             break;
         }
         case RenderCommand::DRAW_INDEXED: {
+            if (!d3d12Initialized_) break;
             const auto& d = std::get<DrawIndexedCommand>(cmd.data);
             static std::atomic<uint32_t> drawCount{0};
             const uint32_t n = drawCount.fetch_add(1) + 1;
             if (n <= 20 || (n % 1000) == 0)
                 MCLA_LOG_INFO("RenderThread: DRAW_INDEXED #{} prim={} vb={:08X} ib={:08X} "
-                              "count={} stride={} ibFmt={}",
+                              "count={} stride={} vbSize={} ibSize={} vs={:08X} ps={:08X}",
                               n, d.primitiveTopology, d.vbAddr, d.ibAddr,
-                              d.indexCount, d.vbStride, d.ibFormat);
+                              d.indexCount, d.vbStride, d.vbSize, d.ibSize,
+                              d.vsProgram, d.psProgram);
+
+            if (d.vbAddr == 0 || d.vbSize == 0 || d.ibAddr == 0 || d.ibSize == 0 || d.indexCount == 0) break;
+
+            auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+            std::vector<uint8_t> vb(d.vbSize);
+            std::vector<uint8_t> ib(d.ibSize);
+            if (!mem.ReadBytes(d.vbAddr, vb.data(), d.vbSize)) break;
+            if (!mem.ReadBytes(d.ibAddr, ib.data(), d.ibSize)) break;
+
+            // Attempt PSO lookup from shader programs
+            ID3D12PipelineState* pipeline = nullptr;
+            Microsoft::WRL::ComPtr<ID3D12PipelineState> cachedPso;
+
+            if (d.vsProgram != 0 && d.psProgram != 0) {
+                // Read shader containers from guest memory
+                auto vsContainer = ReadShaderContainer(mem, d.vsProgram);
+                auto psContainer = ReadShaderContainer(mem, d.psProgram);
+
+                if (!vsContainer.empty() && !psContainer.empty()) {
+                    // Translate shaders to HLSL
+                    mcla::renderer::TranslatedShader vsOut, psOut;
+                    bool vsOk = mcla::renderer::TranslateShader(
+                        vsContainer.data(), vsContainer.size(), {}, vsOut);
+                    bool psOk = mcla::renderer::TranslateShader(
+                        psContainer.data(), psContainer.size(), {}, psOut);
+
+                    if (vsOk && psOk && !vsOut.hlsl.empty() && !psOut.hlsl.empty()) {
+                        // Parse VS IR for vertex input layout
+                        mcla::renderer::ShaderProgram vsProg;
+                        if (mcla::renderer::ParseShaderProgram(
+                                vsContainer.data(), vsContainer.size(), vsProg)) {
+
+                            // Build input layout: prefer grcFvf if available,
+                            // otherwise fall back to VS reflection
+                            std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+                            uint64_t vertexDeclHash = 0;
+
+                            if (d.hasGrcFvf && d.fvfMask != 0 && d.fvfSize != 0) {
+                                // Build from grcFvf
+                                GrcFvfDesc fvf{};
+                                fvf.fvfMask = d.fvfMask;
+                                fvf.fvfSize = d.fvfSize;
+                                fvf.flags = d.fvfFlags;
+                                fvf.dynamicOrder = d.fvfDynamicOrder;
+                                fvf.channelCount = d.fvfChannelCount;
+                                fvf.types = d.fvfTypes;
+                                inputLayout = backend_.BuildInputLayoutFromGrcFvf(fvf);
+                                if (!inputLayout.empty()) {
+                                    vertexDeclHash = mcla::native::HashGrcFvfDeclaration(
+                                        mcla::native::DecodeGrcFvf(fvf));
+                                }
+                            }
+
+                            // Fallback: build from VS reflection
+                            if (inputLayout.empty()) {
+                                const auto refs = mcla::renderer::ReferencedVertexInputs(vsProg);
+                                for (const auto& r : refs) {
+                                    D3D12_INPUT_ELEMENT_DESC desc = {};
+                                    desc.SemanticName = mcla::renderer::VertexUsageSemanticName(r.usage);
+                                    desc.SemanticIndex = r.usageIndex;
+                                    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                                    desc.InputSlot = 0;
+                                    desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+                                    desc.AlignedByteOffset = D3D12_APPEND_ALIGNED_ELEMENT;
+                                    inputLayout.push_back(desc);
+                                }
+                                // Hash from VS vertex declaration
+                                std::vector<uint32_t> vf;
+                                std::vector<uint8_t> usage, usageIndex;
+                                for (const auto& r : refs) {
+                                    vf.push_back(r.vertexFormat);
+                                    usage.push_back(static_cast<uint8_t>(r.usage));
+                                    usageIndex.push_back(static_cast<uint8_t>(r.usageIndex));
+                                }
+                                if (!vf.empty()) {
+                                    vertexDeclHash = mcla::renderer::HashShaderBytecode(
+                                        std::vector<uint8_t>(
+                                            reinterpret_cast<const uint8_t*>(vf.data()),
+                                            reinterpret_cast<const uint8_t*>(vf.data() + vf.size())));
+                                }
+                            }
+
+                            if (!inputLayout.empty()) {
+                                // Build pipeline state
+                                mcla::renderer::PipelineState state = {};
+                                state.targetFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                                state.depthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                                state.blendState = 0;
+                                state.rasterState = 0;
+                                state.depthStencilState = 0;
+                                state.topology = 0; // triangle
+                                state.sampleCount = 1;
+
+                                // Compute pipeline key
+                                mcla::renderer::PipelineKey key = mcla::renderer::ComputePipelineKey(
+                                    vsOut.programHash, psOut.programHash,
+                                    vertexDeclHash, state);
+
+                                // Look up or compile PSO
+                                auto& cache = backend_.GetPipelineCache();
+                                cachedPso = cache.GetOrCompile(
+                                    key, vsOut.hlsl, psOut.hlsl, inputLayout);
+                                if (cachedPso) {
+                                    pipeline = cachedPso.Get();
+                                    s_psoCacheHits.fetch_add(1, std::memory_order_relaxed);
+                                    if (n <= 5 || (n % 500) == 0)
+                                        MCLA_LOG_INFO("RenderThread: PSO HIT #{} vs={:016X} ps={:016X}",
+                                                      n, vsOut.programHash, psOut.programHash);
+                                } else {
+                                    s_psoCacheMisses.fetch_add(1, std::memory_order_relaxed);
+                                    if (n <= 5 || (n % 500) == 0)
+                                        MCLA_LOG_INFO("RenderThread: PSO MISS #{} (async compile in progress)",
+                                                      n);
+                                }
+                            }
+                        }
+                    } else {
+                        s_psoTranslateFailures.fetch_add(1, std::memory_order_relaxed);
+                        if (n <= 3 || (n % 1000) == 0)
+                            MCLA_LOG_WARN("RenderThread: shader translate failed #{} vs={} ps={}",
+                                          n, d.vsProgram, d.psProgram);
+                    }
+                } else {
+                    if (n <= 3 || (n % 1000) == 0)
+                        MCLA_LOG_WARN("RenderThread: shader container read failed #{} vs={} ps={}",
+                                      n, d.vsProgram, d.psProgram);
+                }
+            }
+
+            // Stats logging
+            if (n == 1 || (n % 2000) == 0) {
+                MCLA_LOG_INFO("RenderThread: PSO stats — hits={} misses={} translate_fails={}",
+                              s_psoCacheHits.load(), s_psoCacheMisses.load(),
+                              s_psoTranslateFailures.load());
+            }
+
+            D3D12Backend::DynamicMeshDesc desc = {};
+            desc.vertexBytes = vb.data();
+            desc.vertexBytesSize = d.vbSize;
+            desc.vertexStride = d.vbStride;
+            desc.vertexCount = d.vbSize / d.vbStride;
+            desc.indexed = true;
+            desc.indexBytes = ib.data();
+            desc.indexBytesSize = d.ibSize;
+            desc.indexFormat = (d.ibFormat & 1) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+            desc.indexCount = d.indexCount;
+
+            if (backend_.BeginFrame()) {
+                if (pipeline) {
+                    backend_.DrawDynamicMeshWithPipeline(desc, pipeline);
+                } else {
+                    backend_.DrawDynamicMesh(desc);
+                }
+                backend_.ClearAndPresent(0.0f, 0.0f, 0.02f, 1.0f);
+            }
             break;
         }
         case RenderCommand::SET_PIPELINE_STATE: {

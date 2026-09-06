@@ -694,14 +694,16 @@ PPC_FUNC(sub_82420BA8)
     {
         mcla::native::DrawIndexedCommand dic{};
         dic.primitiveTopology = ctx.r4.u32 & 7u;
-        if (ctx.r5.u32 != 0 && mem.IsValid(ctx.r5.u32, 8))
+        if (ctx.r5.u32 != 0 && mem.IsValid(ctx.r5.u32, 16))
         {
             (void)mem.ReadU32BE(ctx.r5.u32 + 0, &dic.vbAddr);
             (void)mem.ReadU32BE(ctx.r5.u32 + 4, &dic.vbStride);
+            (void)mem.ReadU32BE(ctx.r5.u32 + 8, &dic.vbSize);
         }
         if (ctx.r6.u32 != 0 && mem.IsValid(ctx.r6.u32, 0x2C))
         {
             (void)mem.ReadU32BE(ctx.r6.u32 + 0, &dic.ibAddr);
+            (void)mem.ReadU32BE(ctx.r6.u32 + 4, &dic.ibSize);
             (void)mem.ReadU32BE(ctx.r6.u32 + 8, &dic.ibFormat);
         }
         if (ctx.r6.u32 != 0 && mem.IsValid(ctx.r6.u32 + 0x24, 4))
@@ -712,11 +714,30 @@ PPC_FUNC(sub_82420BA8)
             dic.startIndexLocation = 0;
             dic.baseVertexLocation = 0;
         }
-        mcla::native::g_commandQueue.push(
-            mcla::native::RenderCommand{
-                mcla::native::RenderCommand::DRAW_INDEXED,
-                dic
-            });
+
+        // Read shader program addresses from MclaGpuContext
+        // Device struct layout: sqVsProgram @ +0x3184, sqPsProgram @ +0x3188
+        if (dev != 0 && mem.IsValid(dev + 0x3188, 4))
+        {
+            (void)mem.ReadU32BE(dev + 0x3184, &dic.vsProgram);
+            (void)mem.ReadU32BE(dev + 0x3188, &dic.psProgram);
+        }
+
+        // P5' (B8): only enqueue draws with plausible geometry. The guest
+        // calls this builder with null/dummy descriptors during init and
+        // menu-state polling; forwarding those just burns queue slots and
+        // gets discarded by the render thread's own validation anyway.
+        const bool plausible =
+            dic.vbAddr >= 0x10000u && dic.vbSize != 0 && dic.vbStride != 0 &&
+            dic.ibAddr >= 0x10000u && dic.ibSize != 0 && dic.indexCount != 0;
+        if (plausible)
+        {
+            mcla::native::g_commandQueue.push(
+                mcla::native::RenderCommand{
+                    mcla::native::RenderCommand::DRAW_INDEXED,
+                    dic
+                });
+        }
     }
 
     __imp__sub_82420BA8(ctx, base);
@@ -731,20 +752,27 @@ PPC_FUNC(sub_82420BA8)
 static std::atomic<uint32_t> s_presentKickCount{0};
 static std::atomic<uint32_t> s_lastFbAddr{0};
 
+namespace mcla::gpu {
+// Global frame counter for draw-flip correlation. Defined early so the
+// present-kick hook (sub_824294E0, below) can advance it; the draw hook
+// (sub_82413660) and mcla_gpu_GetFrameCounter() read it.
+static std::atomic<uint32_t> g_frameCounter{0};
+} // namespace mcla::gpu
+
 PPC_FUNC_IMPL(__imp__sub_824294E0);
 PPC_FUNC(sub_824294E0)
 {
     const uint32_t n = s_presentKickCount.fetch_add(1) + 1;
     s_lastFbAddr.store(ctx.r4.u32, std::memory_order_relaxed);
+    // P5' (B8): present kick = frame boundary. Advance the frame counter so
+    // DRAW_CAPTURED frameId correlation in the device-draw hook is live.
+    mcla::gpu::g_frameCounter.fetch_add(1, std::memory_order_relaxed);
     if (n <= 8 || (n % 500) == 0)
         MCLA_LOG_INFO("P4'-PRESENT kick #{} dev={:08X} fb={:08X}", n, ctx.r3.u32, ctx.r4.u32);
     __imp__sub_824294E0(ctx, base);
 }
 
 namespace mcla::gpu {
-
-// Global frame counter for draw-flip correlation
-static std::atomic<uint32_t> g_frameCounter{0};
 
 // Captured draw data for native renderer (V2 - safe VB/IB capture)
 static CapturedDrawV2 g_lastDrawV2{};
@@ -769,6 +797,77 @@ std::mutex& mcla_gpu_GetDrawMutex()
 
 } // namespace mcla::gpu
 
+// P5' (B8): publish a captured draw to the guest-side snapshot and enqueue
+// DRAW_CAPTURED for the render thread. Kept as a separate function because
+// the caller's __try/__except (SEH) cannot coexist with C++ object
+// destructors (lock_guard, std::variant move) — clang-cl ICEs otherwise.
+static void PublishCapturedDraw(uint32_t dev, uint32_t primFlags,
+                                uint32_t vbBase, uint32_t vbStride,
+                                uint32_t vbSize, uint32_t ibBase,
+                                uint32_t ibSize, uint32_t ibFmt)
+{
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t frameId =
+        mcla::gpu::g_frameCounter.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(mcla::gpu::mcla_gpu_GetDrawMutex());
+        mcla::gpu::g_lastDrawV2.vbBase = vbBase;
+        mcla::gpu::g_lastDrawV2.vbStride = vbStride;
+        mcla::gpu::g_lastDrawV2.vbSize = vbSize;
+        mcla::gpu::g_lastDrawV2.ibBase = ibBase;
+        mcla::gpu::g_lastDrawV2.ibSize = ibSize;
+        mcla::gpu::g_lastDrawV2.ibFmt = ibFmt;
+        mcla::gpu::g_lastDrawV2.dev = dev;
+        mcla::gpu::g_lastDrawV2.primTypeFlags = primFlags;
+        mcla::gpu::g_lastDrawV2.frameId = frameId;
+        // Read shader program addresses from MclaGpuContext
+        if (dev != 0 && mem.IsValid(dev + 0x3188, 4))
+        {
+            (void)mem.ReadU32BE(dev + 0x3184, &mcla::gpu::g_lastDrawV2.vsProgram);
+            (void)mem.ReadU32BE(dev + 0x3188, &mcla::gpu::g_lastDrawV2.psProgram);
+        }
+    }
+
+    // Capture-only hand-off: no D3D12 here, just queue the intent.
+    mcla::native::RenderCommand cmd;
+    cmd.type = mcla::native::RenderCommand::DRAW_CAPTURED;
+    cmd.data = mcla::native::DrawCapturedCommand{
+        vbBase, vbSize, vbStride, ibBase, ibSize, frameId, 0};
+    mcla::native::g_commandQueue.push(std::move(cmd));
+}
+
+// SEH-safe VB/IB capture. Separate function because clang-cl ICEs when
+// __try/__except shares a frame with C++ destructors (lock_guard, variant).
+struct DrawDescriptors {
+    uint32_t vbBase, vbStride, vbSize;
+    uint32_t ibBase, ibSize, ibFmt;
+};
+static DrawDescriptors CaptureDrawDescriptors(uint32_t r5, uint32_t r6)
+{
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    DrawDescriptors dd{};
+    __try
+    {
+        if (r5 >= 0x10000 && mem.IsValid(r5, 16))
+        {
+            (void)mem.ReadU32BE(r5 + 0, &dd.vbBase);
+            (void)mem.ReadU32BE(r5 + 4, &dd.vbStride);
+            (void)mem.ReadU32BE(r5 + 8, &dd.vbSize);
+        }
+        if (r6 >= 0x10000 && mem.IsValid(r6, 16))
+        {
+            (void)mem.ReadU32BE(r6 + 0, &dd.ibBase);
+            (void)mem.ReadU32BE(r6 + 4, &dd.ibSize);
+            (void)mem.ReadU32BE(r6 + 8, &dd.ibFmt);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        dd = {};
+    }
+    return dd;
+}
+
 PPC_FUNC_IMPL(__imp__sub_82413660);
 static std::atomic<uint32_t> s_h13660{0};
 PPC_FUNC(sub_82413660)
@@ -786,39 +885,16 @@ PPC_FUNC(sub_82413660)
                       n, dev, r4, r5, r6, ctx.lr);
     }
 
-    // Capture VB/IB descriptors to global struct for render thread
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    __try
+    // P5' (B8): capture VB/IB descriptors into guest-side snapshot AND enqueue
+    // DRAW_CAPTURED for the render thread. This global-scope PPC_FUNC override
+    // is the LIVE owner of guest address 0x82413660 (dispatcher->SetFunction
+    // is not consulted for guest calls); the dead patches.cpp duplicate
+    // (hk_sub_82413660) was removed in the same change.
+    const auto dd = CaptureDrawDescriptors(r5, r6);
+    if (dd.vbBase != 0 && dd.vbStride != 0 && dd.vbSize != 0)
     {
-        if (r5 >= 0x10000 && mem.IsValid(r5, 16))
-        {
-            uint32_t vbBase = 0, vbStride = 0, vbSize = 0;
-            if (mem.ReadU32BE(r5 + 0, &vbBase) && mem.ReadU32BE(r5 + 4, &vbStride) && mem.ReadU32BE(r5 + 8, &vbSize))
-            {
-                std::lock_guard<std::mutex> lock(mcla::gpu::mcla_gpu_GetDrawMutex());
-                mcla::gpu::g_lastDrawV2.vbBase = vbBase;
-                mcla::gpu::g_lastDrawV2.vbStride = vbStride;
-                mcla::gpu::g_lastDrawV2.vbSize = vbSize;
-                mcla::gpu::g_lastDrawV2.dev = dev;
-                mcla::gpu::g_lastDrawV2.primTypeFlags = r4;
-                mcla::gpu::g_lastDrawV2.frameId = mcla::gpu::g_frameCounter.load(std::memory_order_relaxed);
-            }
-        }
-        if (r6 >= 0x10000 && mem.IsValid(r6, 16))
-        {
-            uint32_t ibBase = 0, ibSize = 0, ibFmt = 0;
-            if (mem.ReadU32BE(r6 + 0, &ibBase) && mem.ReadU32BE(r6 + 4, &ibSize) && mem.ReadU32BE(r6 + 8, &ibFmt))
-            {
-                std::lock_guard<std::mutex> lock(mcla::gpu::mcla_gpu_GetDrawMutex());
-                mcla::gpu::g_lastDrawV2.ibBase = ibBase;
-                mcla::gpu::g_lastDrawV2.ibSize = ibSize;
-                mcla::gpu::g_lastDrawV2.ibFmt = ibFmt;
-            }
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        // Ignore access violations from uncommitted guest memory pages
+        PublishCapturedDraw(dev, r4, dd.vbBase, dd.vbStride, dd.vbSize,
+                            dd.ibBase, dd.ibSize, dd.ibFmt);
     }
 
     __imp__sub_82413660(ctx, base);

@@ -12,12 +12,26 @@ namespace mcla::native {
 struct DrawIndexedCommand {
     uint32_t vbAddr;
     uint32_t ibAddr;
+    uint32_t vbSize;
+    uint32_t ibSize;
     uint32_t indexCount;
     uint32_t startIndexLocation;
     uint32_t baseVertexLocation;
     uint32_t vbStride;
     uint32_t ibFormat;
     uint32_t primitiveTopology;
+    // Shader program guest addresses for PSO lookup
+    uint32_t vsProgram;       // SQ_VS_PROGRAM guest address (.fxc container)
+    uint32_t psProgram;       // SQ_PS_PROGRAM guest address (.fxc container)
+    // grcFvf vertex declaration (16 bytes, host-endian)
+    uint32_t fvfMask;
+    uint8_t  fvfSize;
+    uint8_t  fvfFlags;
+    uint8_t  fvfDynamicOrder;
+    uint8_t  fvfChannelCount;
+    uint64_t fvfTypes;
+    uint8_t  hasGrcFvf;       // 1 when grcFvf is valid
+    uint8_t  _pad[7];
 };
 
 struct SetPipelineStateCommand {

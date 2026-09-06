@@ -1,4 +1,4 @@
-﻿#include "app.h"
+#include "app.h"
 #include "logging.h"
 #include "patches.h"
 #include "boot_host.h"
@@ -42,11 +42,13 @@ bool App::Initialize() {
     if (!InitSDL()) return false;
     if (!InitPaths()) return false;
     if (!CreateSDLWindow()) return false;
+    // Load CVars before InitD3D12: the renderer_mode gate reads the CVar.
+    mcla::cvar::CVarSystem::Instance().LoadConfig(m_cacheRoot / "mcla.toml");
+
     if (!InitD3D12()) return false;
 
     // Initialize logging first so patches can log
-    mcla::cvar::CVarSystem::Instance().LoadConfig(m_cacheRoot / "mcla.toml");
-    mcla::log::Initialize(m_name.c_str(), mcla::log::Level::Info,
+        mcla::log::Initialize(m_name.c_str(), mcla::log::Level::Info,
                           (m_cacheRoot / "mcla.log").string().c_str());
 
 MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());

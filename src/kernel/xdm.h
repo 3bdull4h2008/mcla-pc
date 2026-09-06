@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <spdlog/spdlog.h>
+#include <unordered_map>
 #include "heap.h"
 #include "memory.h"
 #include "xbox.h"
@@ -29,6 +31,11 @@ struct KernelObject
     {
         header.WaitListHead.Flink = 0; // invalidate on destruction
     }
+
+    // Host-only: guest address of the embedded dispatcher header this wrapper
+    // was lazy-wrapped over (0 = kernel-created object). Used by
+    // QueryKernelObject's durable identity map and erased on destroy.
+    uint32_t identityHdrAddr = 0;
 
     virtual uint32_t Wait(uint32_t timeout)
     {
@@ -71,30 +78,67 @@ inline T* GetInvalidKernelObject()
 
 extern Mutex g_kernelLock;
 
-template<typename T>
+// DURABLE WRAPPER IDENTITY (session 64): the guest driver owns its dispatcher
+// headers and rewrites WaitListHead.Flink/Blink at will, so OBJECT_SIGNATURE
+// in guest memory is NOT a durable marker — lazy-wraps kept building phantom
+// wrappers and signals were lost between the wait and release paths (the
+// 0x40004D7C tick-semaphore wake-loss: releases landed on wrapper A, the
+// waiter blocked on wrapper B). Wrapper identity is now kept host-side,
+// keyed by the header's guest address + the header's Type byte.
+struct WrapperRecord
+{
+    KernelObject* obj;
+    uint8_t type;
+};
+inline std::unordered_map<uint32_t, WrapperRecord>& WrapperIdentityMap()
+{
+    static std::unordered_map<uint32_t, WrapperRecord> s_map;
+    return s_map;
+}
+
+template<typename T = KernelObject>
 inline T* QueryKernelObject(XDISPATCHER_HEADER& header)
 {
     std::lock_guard guard{ g_kernelLock };
-    if (header.WaitListHead.Flink != OBJECT_SIGNATURE)
-    {
-        header.WaitListHead.Flink = OBJECT_SIGNATURE;
-        auto* obj = CreateKernelObject<T>(reinterpret_cast<typename T::guest_type*>(&header));
-        header.WaitListHead.Blink = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(obj);
+    const uint32_t hdrAddr = mcla::kernel::g_memory.MapVirtual(&header);
+    const uint8_t wantType = header.Type;
 
-        return obj;
+    auto it = WrapperIdentityMap().find(hdrAddr);
+    if (it != WrapperIdentityMap().end() && it->second.type == wantType)
+        return static_cast<T*>(it->second.obj);
+
+    // TYPE-FLIP PROBE (session 64): a rewrite of the guest Type byte would
+    // mint a fresh wrapper per call and orphan the one the waiter sleeps on.
+    if (it != WrapperIdentityMap().end())
+    {
+        static std::atomic<uint32_t> s_typeFlips{0};
+        const uint32_t n = s_typeFlips.fetch_add(1) + 1;
+        if (n <= 20 || (n % 500) == 0)
+            spdlog::warn("KOBJ-TYPEFLIP #{0} hdr={1:08X} old={2:02X} new={3:02X}",
+                         n, hdrAddr, it->second.type, wantType);
     }
 
-    return static_cast<T*>(mcla::kernel::GuestMemoryHeap::Instance().Translate(header.WaitListHead.Blink));
+    auto* obj = CreateKernelObject<T>(reinterpret_cast<typename T::guest_type*>(&header));
+    obj->identityHdrAddr = hdrAddr;
+    WrapperIdentityMap()[hdrAddr] = {obj, wantType};
+
+    // Keep the legacy guest-visible markers in sync for code paths (guest-side
+    // thunks validate Flink == 'XBOX' before touching the object).
+    header.WaitListHead.Flink = OBJECT_SIGNATURE;
+    header.WaitListHead.Blink = mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(obj);
+
+    return obj;
 }
 
 // Get object without initialisation
-template<typename T>
+template<typename T = void>
 inline T* TryQueryKernelObject(XDISPATCHER_HEADER& header)
 {
-    if (header.WaitListHead.Flink != OBJECT_SIGNATURE)
-        return nullptr;
-
-    return static_cast<T*>(mcla::kernel::GuestMemoryHeap::Instance().Translate(header.WaitListHead.Blink));
+    const uint32_t hdrAddr = mcla::kernel::g_memory.MapVirtual(&header);
+    auto it = WrapperIdentityMap().find(hdrAddr);
+    if (it != WrapperIdentityMap().end() && it->second.type == header.Type)
+        return static_cast<T*>(it->second.obj);
+    return nullptr;
 }
 
 // TLS functions
