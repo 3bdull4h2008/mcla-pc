@@ -1,6 +1,17 @@
 # MCLA Native PC — Architecture Brainmap
 
-Updated 2026-09-05 · **Live frontier:** `docs/BOOT_HANDOFF.md` · Plan: `MCLA_REBUILD_PLAN.md` · Handoffs: `docs/handoffs/` · Default renderer mode: `legacy`
+Updated 2026-09-06 · **Live frontier:** `docs/BOOT_HANDOFF.md` · Plan: `MCLA_REBUILD_PLAN.md` · Handoffs: `docs/handoffs/` · Default renderer mode: `legacy`
+
+> **S64 kernel-layer deltas (2026-09-06):** (a) `KfAcquireSpinLock` protocol is
+> 0=unlocked — `VdInitializeEngines` must seed GPU-context spinlocks with 0
+> (seeding 1 wedged the vblank ISR and silently killed `SignalSchedulerTick`);
+> spinlock stores are BE-coherent plus a 5s `KFSPIN-RECOVERY` steal net.
+> (b) `QueryKernelObject`/`TryQueryKernelObject` wrapper identity lives ONLY in
+> the host-side `WrapperIdentityMap()` (xdm.h, keyed by guest header addr+Type,
+> all access under `g_kernelLock`) — guest `WaitListHead.Flink/Blink` is
+> display-only; the guest driver rewrites its own headers, so guest-sided
+> identity mints phantom wrappers and loses semaphore signals between the
+> wait and release paths.
 
 ## 1. Purpose
 

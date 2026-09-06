@@ -134,6 +134,7 @@ inline T* QueryKernelObject(XDISPATCHER_HEADER& header)
 template<typename T = void>
 inline T* TryQueryKernelObject(XDISPATCHER_HEADER& header)
 {
+    std::lock_guard guard{ g_kernelLock };
     const uint32_t hdrAddr = mcla::kernel::g_memory.MapVirtual(&header);
     auto it = WrapperIdentityMap().find(hdrAddr);
     if (it != WrapperIdentityMap().end() && it->second.type == header.Type)

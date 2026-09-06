@@ -93,10 +93,27 @@ lines 32081+, `sub_8242FB88`)
   contention probe, 5s recovery); VdInitializeEngines spinlock seeds 1→0;
   SignalSchedulerTick TICK-PROBE.
 - `src/kernel/xdm.h`: WrapperIdentityMap + QueryKernelObject/
-  TryQueryKernelObject rewrite + KOBJ-TYPEFLIP probe + identityHdrAddr.
+  TryQueryKernelObject rewrite + KOBJ-TYPEFLIP probe + identityHdrAddr +
+  (phase-gate audit fix) g_kernelLock guard added to TryQueryKernelObject —
+  the original unlocked read was a data race on the map (QueryKernelObject
+  and DestroyKernelObject already hold g_kernelLock).
 - `src/kernel/xdm.cpp`: DestroyKernelObject erases map entry.
 - `build/cache/mcla.toml`: created (renderer_mode=native) — keep for runs,
   node-owned manifest untouched.
+
+## Residual finding (open, next session)
+Long run survived ~35 min then crashed at 19:01:17: vectored exception
+`0x80000003` (int3/trap) inside generated code
+`__imp__sub_821B3548 +0x172B` (callers: sub_821A0800 ← sub_821917A8 ←
+sub_82192150 ← sub_82192448 ← sub_82612B00 ← sub_826137A0 ← sub_82613970
+← sub_82611738 ← sub_8249CC00), ppc lr=0x821B37F4, r3=0xC, thread pool
+context (r8=0xA02DC580 POOL16 block, POOL16-WRITE AA555555 fill pattern
+active), followed by AV 0xC0000005 in the exception dispatcher. Just
+before: `F98-SKIP` polls continuing normally. Next session (debugger /
+gate-cracker mode): disassemble sub_821B3548+0x172B to identify the trap
+(probably an unimplemented-PPC-op `__builtin_trap` or deliberate
+VdCallsAssert); correlate with POOL16 pool-audit call stack. Note
+frame/var context: guest was deep into loading, not a boot regression.
 
 ## Warnings
 - `<bit>`/std::byteswap NOT available in this clang-cl config — use
