@@ -235,6 +235,12 @@ uint32_t XamInputGetCapabilities(uint32_t unk, uint32_t userIndex, uint32_t flag
 
 uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* state)
 {
+    static int callCount = 0;
+    callCount++;
+    if (callCount <= 20 || (callCount % 1000) == 0) {
+        MCLA_LOG_INFO("XamInputGetState(import)[{}]: userIndex={} flags={} state=0x{:x}",
+                      callCount, userIndex, flags, reinterpret_cast<uintptr_t>(state));
+    }
     if (state)
     {
         state->dwPacketNumber = 0;

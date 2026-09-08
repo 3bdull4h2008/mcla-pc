@@ -170,7 +170,7 @@ For each import in `kernel_stubs_body.inc`:
 
 **Validation Gate:** 
 - `cmake --build build` succeeds (zero errors)
-- `phase0_validator.exe` 9/9 tests pass
+- `phase0_validator.exe` 13/13 tests pass
 - Zero `reinterpret_cast` on guest data in `imports.cpp`
 - Zero manual `ctx.rN` reads in `imports.cpp`
 - `kernel_stubs.cpp` and `kernel_stubs_body.inc` deleted

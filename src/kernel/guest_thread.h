@@ -35,6 +35,7 @@ struct GuestThreadHandle : KernelObject
     std::atomic<bool> suspended;
 #ifdef USE_PTHREAD
     pthread_t thread;
+    bool threadCreated;
 #else
     std::thread thread;
 #endif

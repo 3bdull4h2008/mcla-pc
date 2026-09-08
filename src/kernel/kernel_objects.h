@@ -134,7 +134,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         {
             static std::atomic<uint32_t> s_semaWaitLogs{0};
             const uint32_t n = s_semaWaitLogs.fetch_add(1) + 1;
-            if (timeout == INFINITE && (n <= 24 || (n % 2000) == 0))
+            if (n <= 60 || (n % 2000) == 0)
                 SemaphoreProbeLog(this, "wait", count.load());
         }
         if (timeout == 0)

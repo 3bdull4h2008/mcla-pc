@@ -220,7 +220,7 @@ static bool ParseGeometry(const uint8_t* ptr, const uint8_t* end, DffMesh& out_m
     out_mesh.material_hash = 0;
 
     // Triangles: 3 x u16 index per triangle.
-    if (struct_end - ptr < num_triangles * 6) return false;
+    if (static_cast<uint64_t>(num_triangles) * 6 > static_cast<uint64_t>(struct_end - ptr)) return false;
     out_mesh.indices.reserve(num_triangles * 3);
     for (uint32_t t = 0; t < num_triangles; ++t) {
         out_mesh.indices.push_back(ReadU16LE(ptr));
@@ -230,12 +230,12 @@ static bool ParseGeometry(const uint8_t* ptr, const uint8_t* end, DffMesh& out_m
     }
 
     // Per-frame vertex groups.
-    if (struct_end - ptr < num_frames * 8) return false;
+    if (static_cast<uint64_t>(num_frames) * 8 > static_cast<uint64_t>(struct_end - ptr)) return false;
     ptr += num_frames * 8;
 
     // Vertices.
     if (has_positions) {
-        if (struct_end - ptr < num_vertices * 12) return false;
+        if (static_cast<uint64_t>(num_vertices) * 12 > static_cast<uint64_t>(struct_end - ptr)) return false;
         out_mesh.positions.reserve(num_vertices * 3);
         for (uint32_t v = 0; v < num_vertices; ++v) {
             out_mesh.positions.push_back(ReadF32LE(ptr));
@@ -245,7 +245,7 @@ static bool ParseGeometry(const uint8_t* ptr, const uint8_t* end, DffMesh& out_m
         }
     }
     if (has_normals) {
-        if (struct_end - ptr < num_vertices * 12) return false;
+        if (static_cast<uint64_t>(num_vertices) * 12 > static_cast<uint64_t>(struct_end - ptr)) return false;
         out_mesh.normals.reserve(num_vertices * 3);
         for (uint32_t v = 0; v < num_vertices; ++v) {
             out_mesh.normals.push_back(ReadF32LE(ptr));
@@ -255,7 +255,7 @@ static bool ParseGeometry(const uint8_t* ptr, const uint8_t* end, DffMesh& out_m
         }
     }
     if (num_uv_sets > 0) {
-        if (struct_end - ptr < num_uv_sets * num_vertices * 8) return false;
+        if (static_cast<uint64_t>(num_uv_sets) * num_vertices * 8 > static_cast<uint64_t>(struct_end - ptr)) return false;
         out_mesh.texcoords.reserve(num_uv_sets * num_vertices * 2);
         for (uint32_t s = 0; s < num_uv_sets; ++s) {
             for (uint32_t v = 0; v < num_vertices; ++v) {
@@ -266,7 +266,7 @@ static bool ParseGeometry(const uint8_t* ptr, const uint8_t* end, DffMesh& out_m
         }
     }
     if (has_colors) {
-        if (struct_end - ptr < num_vertices * 4) return false;
+        if (static_cast<uint64_t>(num_vertices) * 4 > static_cast<uint64_t>(struct_end - ptr)) return false;
         ptr += num_vertices * 4;
     }
 

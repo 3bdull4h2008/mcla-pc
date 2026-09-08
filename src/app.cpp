@@ -7,6 +7,7 @@
 #include "render_thread.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "vfs_rpf.h"
+#include "kernel/memory.h"
 
 // Forward declaration for GPU context poller (Phase 4)
 void StartGpuContextPoller();
@@ -34,24 +35,28 @@ App* GetApp() {
 }
 
 bool App::Initialize() {
+    // Initialize logging first so all subsequent log calls have a sink.
+    // InitPaths() must run first to compute m_cacheRoot for the log file path,
+    // but InitPaths/InitSDL log calls before this point are safely dropped by
+    // spdlog's default null-logger.
+    if (!InitSDL()) return false;
+    if (!InitPaths()) return false;
+
+    mcla::log::Initialize(m_name.c_str(), mcla::log::Level::Info,
+                      (m_cacheRoot / "mcla.log").string().c_str());
+
     MCLA_LOG_INFO("Initializing {}...", m_name);
 
     // The PPC ABI load/store macros route through the checked guest-memory view.
     SetActiveGuestMemoryView(&m_guestMemoryView);
 
-    if (!InitSDL()) return false;
-    if (!InitPaths()) return false;
     if (!CreateSDLWindow()) return false;
     // Load CVars before InitD3D12: the renderer_mode gate reads the CVar.
     mcla::cvar::CVarSystem::Instance().LoadConfig(m_cacheRoot / "mcla.toml");
 
     if (!InitD3D12()) return false;
 
-    // Initialize logging first so patches can log
-        mcla::log::Initialize(m_name.c_str(), mcla::log::Level::Info,
-                          (m_cacheRoot / "mcla.log").string().c_str());
-
-MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
+    MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
     MCLA_LOG_INFO("Cache root: {}", m_cacheRoot.string());
 
     // Phase 5 (BOOT_REBUILD_PLAN): load the game image into the 4 GiB guest
@@ -72,6 +77,8 @@ MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
     m_dispatcher = std::make_unique<FunctionDispatcher>();
     if (m_dispatcher) {
         mcla_ApplyPatches(m_dispatcher.get());
+        mcla::cvar::CVarSystem::Instance().SetString("renderer_mode", "native");
+        mcla::native::InstallNativeRenderer(m_dispatcher.get());
     }
 
     // Initialize VFS for city art
@@ -85,6 +92,18 @@ MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
     }
 
 m_running = true;
+
+    // Initialize SDL and create window
+    if (!InitSDL()) {
+        MCLA_LOG_ERROR("Failed to initialize SDL");
+        return false;
+    }
+
+    // Initialize D3D12 (must be after window creation for HWND)
+    if (!InitD3D12()) {
+        MCLA_LOG_ERROR("Failed to initialize D3D12");
+        return false;
+    }
 
     // Start GPU context poller (Phase 4) - waits for game to allocate GPU context
     StartGpuContextPoller();
@@ -287,15 +306,35 @@ void App::OnResize(uint32_t width, uint32_t height) {
 }
 
 // FunctionDispatcher implementation
+//
+// DESIGN NOTE: the recompiled guest dispatch table lives in
+// Memory::InsertFunction / PPC_LOOKUP_FUNC.  For decades the dispatcher
+// map (m_functions) was only consulted by GetFunction/SetFunction and
+// *never* at runtime – SetFunction was effectively dead code.  This fix
+// makes SetFunction also write into the real dispatch table so that
+// hooks installed via the dispatcher actually intercept guest calls.
+// GetFunction falls back to the dispatch table so the original can be
+// retrieved before the hook overwrites it.
+
 App::FunctionDispatcher::PPCFunc App::FunctionDispatcher::GetFunction(uint32_t addr) const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_functions.find(addr);
-    return (it != m_functions.end()) ? it->second : nullptr;
+    // 1. Check the override map first (SetFunction registrations).
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_functions.find(addr);
+        if (it != m_functions.end())
+            return it->second;
+    }
+    // 2. Fall back to the real dispatch table so the original generated
+    //    function can be retrieved before we overwrite it with a hook.
+    return kernel::g_memory.FindFunction(addr);
 }
 
 void App::FunctionDispatcher::SetFunction(uint32_t addr, PPCFunc func) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_functions[addr] = func;
+    // Also install in the real dispatch table so guest calls actually
+    // reach the hook (or replacement) at runtime.
+    kernel::g_memory.InsertFunction(addr, func);
 }
 
 uint32_t App::FunctionDispatcher::AllocateThunk(PPCFunc func, uint32_t originalAddr) {

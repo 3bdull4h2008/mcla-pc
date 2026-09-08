@@ -33,17 +33,17 @@ void ScanGuestMemoryForTU83SpawnPointers()
         if (!mem.ReadU32BE(addr, &val))
             continue;
 
-        for (uint32_t target : targets)
+        for (size_t idx = 0; idx < sizeof(targets)/sizeof(targets[0]); ++idx)
         {
-            if (val == target)
+            if (val == targets[idx])
             {
                 hits++;
                 MCLA_LOG_WARN("HIT: 0x{:08X} -> 0x{:08X} (target {}.{})",
                               addr, val,
-                              (&target - targets) + 1,
-                              (target == 0x8213178C ? "sub_8213178C" :
-                               target == 0x821BD8C0 ? "sub_821BD8C0" :
-                               target == 0x824569C8 ? "sub_824569C8" : "sub_823F69C8"));
+                              idx + 1,
+                              (targets[idx] == 0x8213178C ? "sub_8213178C" :
+                               targets[idx] == 0x821BD8C0 ? "sub_821BD8C0" :
+                               targets[idx] == 0x824569C8 ? "sub_824569C8" : "sub_823F69C8"));
 
                 uint32_t ctx[9] = {0};
                 for (int i = -4; i <= 4; i++)

@@ -4,6 +4,7 @@
 #include <functional>
 #include <d3d12.h>
 #include "dxc_runtime.h"
+#include "d3d12_backend.h"
 
 namespace mcla::renderer {
 
@@ -104,11 +105,128 @@ void PipelineCache::StopWorker() {
 }
 
 void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
-                               Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature) {
+                                Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature) {
     // DXC COM compiler objects are not thread-safe; the worker owns one runtime
     // for its lifetime, lazily loaded on the first task.
     DxcRuntime dxc;
     bool dxcLoaded = false;
+
+    // Cache of root signatures keyed by CBV binding hash
+    std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12RootSignature>> rootSigCache;
+
+    auto getOrCreateRootSignature = [&](const std::vector<DxcRuntime::CbvBinding>& vsCbvs,
+                                         const std::vector<DxcRuntime::CbvBinding>& psCbvs)
+        -> Microsoft::WRL::ComPtr<ID3D12RootSignature> {
+        // Compute a hash of all CBV bindings
+        uint64_t hash = 0;
+        for (const auto& cbv : vsCbvs) {
+            hash = (hash * 1315423911u) ^ (static_cast<uint64_t>(cbv.register_) << 32 | cbv.space_);
+        }
+        for (const auto& cbv : psCbvs) {
+            hash = (hash * 1315423911u) ^ (static_cast<uint64_t>(cbv.register_) << 32 | cbv.space_ | 0x80000000);
+        }
+
+        auto it = rootSigCache.find(hash);
+        if (it != rootSigCache.end()) {
+            return it->second;
+        }
+
+        // Collect all unique CBV (register, space) pairs
+        std::vector<std::pair<uint32_t, uint32_t>> allCbvs;
+        for (const auto& cbv : vsCbvs) {
+            allCbvs.emplace_back(cbv.register_, cbv.space_);
+        }
+        for (const auto& cbv : psCbvs) {
+            allCbvs.emplace_back(cbv.register_, cbv.space_);
+        }
+
+        // Sort and deduplicate
+        std::sort(allCbvs.begin(), allCbvs.end());
+        allCbvs.erase(std::unique(allCbvs.begin(), allCbvs.end()), allCbvs.end());
+
+        // Build root signature with CBV slots for each unique CBV
+        // Start with base root params: SRV table (t0..t3), static sampler (s0)
+        std::vector<D3D12_ROOT_PARAMETER> rootParams;
+        
+        // Root param 0: SRV descriptor table (t0..t3)
+        D3D12_DESCRIPTOR_RANGE srvRange = {};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 4;  // t0..t3
+        srvRange.BaseShaderRegister = 0;
+        srvRange.RegisterSpace = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+        D3D12_ROOT_PARAMETER srvParam = {};
+        srvParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        srvParam.DescriptorTable.NumDescriptorRanges = 1;
+        srvParam.DescriptorTable.pDescriptorRanges = &srvRange;
+        srvParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rootParams.push_back(srvParam);
+
+        // Root params for each CBV
+        std::vector<D3D12_ROOT_PARAMETER> cbvParams;
+        cbvParams.reserve(allCbvs.size());
+        for (const auto& cbv : allCbvs) {
+            D3D12_ROOT_PARAMETER cbvParam = {};
+            cbvParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            cbvParam.Descriptor.ShaderRegister = cbv.first;
+            cbvParam.Descriptor.RegisterSpace = cbv.second;
+            cbvParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            cbvParams.push_back(cbvParam);
+        }
+
+        // Static sampler at s0
+        D3D12_STATIC_SAMPLER_DESC staticSampler = {};
+        staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSampler.MipLODBias = 0.0f;
+        staticSampler.MaxAnisotropy = 1;
+        staticSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        staticSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSampler.MinLOD = 0.0f;
+        staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
+        staticSampler.ShaderRegister = 0;  // s0
+        staticSampler.RegisterSpace = 0;
+        staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        // Combine all root params: SRV table + CBVs
+        std::vector<D3D12_ROOT_PARAMETER> allRootParams;
+        allRootParams.reserve(1 + cbvParams.size());
+        allRootParams.push_back(srvParam);
+        for (auto& p : cbvParams) {
+            allRootParams.push_back(p);
+        }
+
+        D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+        rootDesc.NumParameters = static_cast<UINT>(allRootParams.size());
+        rootDesc.pParameters = allRootParams.data();
+        rootDesc.NumStaticSamplers = 1;
+        rootDesc.pStaticSamplers = &staticSampler;
+        rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        Microsoft::WRL::ComPtr<ID3DBlob> signatureBlob;
+        Microsoft::WRL::ComPtr<ID3DBlob> errorBlob;
+        HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                 &signatureBlob, &errorBlob);
+        if (FAILED(hr)) {
+            std::fprintf(stderr, "PipelineCache: D3D12SerializeRootSignature failed (hr=0x%08X)\n", static_cast<unsigned>(hr));
+            return rootSignature;  // Fall back to the default
+        }
+
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> newRootSig;
+        hr = device->CreateRootSignature(0, signatureBlob->GetBufferPointer(),
+                                         signatureBlob->GetBufferSize(),
+                                         IID_PPV_ARGS(&newRootSig));
+        if (FAILED(hr)) {
+            std::fprintf(stderr, "PipelineCache: CreateRootSignature failed (hr=0x%08X)\n", static_cast<unsigned>(hr));
+            return rootSignature;  // Fall back to the default
+        }
+
+        rootSigCache.emplace(hash, newRootSig);
+        return newRootSig;
+    };
 
     while (true) {
         CompileTask task;
@@ -123,10 +241,9 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
 
         // Compile HLSL -> DXIL and create the PSO on this thread. The key is
         // left in pendingKeys_ on any failure so it is not retried per draw.
-        if (!device || !rootSignature || task.vsHlsl.empty() || task.psHlsl.empty()) {
+        if (!device || task.vsHlsl.empty() || task.psHlsl.empty()) {
             std::fprintf(stderr,
-                         "PipelineCache: dropped task (missing device/root signature "
-                         "or empty HLSL)\n");
+                         "PipelineCache: dropped task (missing device or empty HLSL)\n");
             task.promise.set_value(nullptr);
             continue;
         }
@@ -144,28 +261,34 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
 
         std::vector<uint8_t> vsDxil, psDxil;
         std::string error;
-        if (!dxc.Compile(task.vsHlsl, "main", "vs_6_0", vsDxil, error)) {
+        // Compile WITH reflection data to enable CBV binding detection
+        if (!dxc.Compile(task.vsHlsl, "main", "vs_6_0", vsDxil, error, true)) {
             std::fprintf(stderr, "PipelineCache: VS HLSL compilation failed: %s\n", error.c_str());
             task.promise.set_value(nullptr);
             continue;
         }
-        if (!dxc.Compile(task.psHlsl, "main", "ps_6_0", psDxil, error)) {
+        if (!dxc.Compile(task.psHlsl, "main", "ps_6_0", psDxil, error, true)) {
             std::fprintf(stderr, "PipelineCache: PS HLSL compilation failed: %s\n", error.c_str());
             task.promise.set_value(nullptr);
             continue;
         }
 
+        // Reflect CBV bindings from both VS and PS
+        std::vector<DxcRuntime::CbvBinding> vsCbvs, psCbvs;
+        if (!dxc.ReflectCbvBindings(vsDxil, vsCbvs, error)) {
+            std::fprintf(stderr, "PipelineCache: VS CBV reflection failed: %s\n", error.c_str());
+        }
+        if (!dxc.ReflectCbvBindings(psDxil, psCbvs, error)) {
+            std::fprintf(stderr, "PipelineCache: PS CBV reflection failed: %s\n", error.c_str());
+        }
+
+        // Get or create root signature with appropriate CBV slots
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> rs = getOrCreateRootSignature(vsCbvs, psCbvs);
+
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
         {
-            // The key hashes render-state fields (RTV formats, depth-stencil,
-            // raster, topology, blend, sample count) but the desc below
-            // intentionally fixes them to the capture-instrumentation profile
-            // (R8G8B8A8, triangle, no-depth, cull-none, full write mask).
-            // Mapping keyed state into the PSO desc is deferred to a later
-            // gate; today the real guest VS/PS HLSL and input layout are what
-            // vary between entries.
             D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-            psoDesc.pRootSignature = rootSignature.Get();
+            psoDesc.pRootSignature = rs.Get();
             psoDesc.VS = { vsDxil.data(), vsDxil.size() };
             psoDesc.PS = { psDxil.data(), psDxil.size() };
             psoDesc.InputLayout = { task.inputLayout.data(), static_cast<UINT>(task.inputLayout.size()) };
@@ -284,6 +407,7 @@ void PipelineCache::Insert(const PipelineKey& key, Microsoft::WRL::ComPtr<ID3D12
         }
     }
 
+    if (map_.count(key)) return;
     map_.emplace(key, pso);
     order_.push_back(key);
 }

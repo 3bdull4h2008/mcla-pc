@@ -1,0 +1,22 @@
+{
+  "servers": {
+    "renderdoc": {
+      "command": "python",
+      "args": ["-m", "renderdoc_mcp"],
+      "env": {
+        "RENDERDOC_MODULE_PATH": "C:\\Program Files\\RenderDoc"
+      }
+    },
+    "ghidra": {
+      "command": "python",
+      "args": ["-m", "ghidra_headless_mcp"],
+      "env": {
+        "GHIDRA_INSTALL_DIR": "C:\\Program Files\\Ghidra\\ghidra_12.0_PUBLIC"
+      }
+    },
+    "visualstudio": {
+      "type": "http",
+      "url": "http://localhost:5050"
+    }
+  }
+}

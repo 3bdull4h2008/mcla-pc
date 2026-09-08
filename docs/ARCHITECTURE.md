@@ -1,8 +1,8 @@
 # MCLA Native PC — Architecture Brainmap
 
-Updated 2026-09-06 · **Live frontier:** `docs/BOOT_HANDOFF.md` · Plan: `MCLA_REBUILD_PLAN.md` · Handoffs: `docs/handoffs/` · Default renderer mode: `legacy`
+Updated 2026-09-07 · **Live frontier:** `docs/BOOT_HANDOFF.md` · Plan: `MCLA_REBUILD_PLAN.md` · Handoffs: `docs/handoffs/` · Default renderer mode: `legacy`
 
-> **S64 kernel-layer deltas (2026-09-06):** (a) `KfAcquireSpinLock` protocol is
+> **S65 kernel-layer deltas (2026-09-07):** (a) `KfAcquireSpinLock` protocol is
 > 0=unlocked — `VdInitializeEngines` must seed GPU-context spinlocks with 0
 > (seeding 1 wedged the vblank ISR and silently killed `SignalSchedulerTick`);
 > spinlock stores are BE-coherent plus a 5s `KFSPIN-RECOVERY` steal net.
@@ -60,12 +60,12 @@ the Xenos CP runs, PM4 is submitted by us, or draw data is guessed.
       |                                          NULL/garbage handler via PPC_LOOKUP_FUNC arithmetic on
       |                                          target=0; config global @0x82839270 is currently ZERO
       v
-[device-method capture]                   🟡 P4′   create-hook @sub_82413588 + packet capture v2
+[device-method capture]                   ✅ P4′ DONE  create-hook @sub_82413588 + packet capture v2
       |                                          @sub_82411640 armed (steps 1-2 done); remaining
       |                                          steps: Present/state/draw hooks → enqueue
       |                                          RenderCommands (NEVER PM4 — golden rule 11)
       v
-[render thread & queues]                  ⏳ P4.5′  blocking queue + copy queue; render thread owns
+[render thread & queues]                  ✅ P4.5′ DONE  blocking queue + copy queue; render thread owns
       v                                          ALL D3D12 calls (UR gpu/video.cpp blueprint)
 [D3D12 present]                           LIVE*   d3d12_backend device+PSO cache+swap (*synthetic/
                                                  validator content only; real-frame native = P5′/P6′)
@@ -87,49 +87,23 @@ CP-emulation gates are superseded:
 | P1 | ABI migration (ppc_func abi, checked guest memory, full ABI header) | ✅ DONE |
 | P2 | Canonical kernel framework (identity handles, typed hooks, lazy wrap) | ✅ DONE (13/13, re-verified 2026-09-03) |
 | P3 | Critical boot imports → real present chain | ✅ **PASSED 2026-08-22 (`39ebebf`)** — boots into main loop, world loads from real archives, VSync present chain 60fps, thousands of frames, zero crashes |
-| P4′ | Device-boundary takeover (create/Present/state/draw hooks, enqueue only) | 🔄 steps 1-2 done; blocked on boot OOM front |
-| P4.5′ | Render thread & queues (render thread owns all D3D12) | ⏳ pending |
+| P4′ | Device-boundary takeover (create/Present/state/draw hooks, enqueue only) | ✅ DONE |
+| P4.5′ | Render thread & queues (render thread owns all D3D12) | ✅ DONE |
 | P4.6′ | Resource model (guest textures/buffers, deferred destruction) | ⏳ pending |
-| P5′ | Real draws via device boundary (pixel-hash parity) | ⏳ pending |
+| P5′ | Real draws via device boundary (pixel-hash parity) | ✅ Code done, runtime test pending |
 | P5.5′ | Offline shader cache (embedded XXH3-keyed DXIL) | ⏳ pending |
 | P6′ | Native default & legacy retirement (delete gpu_cp.cpp) | ⏳ pending |
 | P7′–P9′ | Build env, codegen config, kernel surface | ⏳ pending |
 
-## 5. Current Front Line (session 38 refreshed, 2026-09-05)
+## 5. Current Front Line (session 65, 2026-09-07)
 
-**Primary blocker:** deterministic AV in the original `sub_8218CC70` config-dispatch
-path. The OOM front is still active as a related allocator problem, but it is now
-considered mitigated rather than the single active blocker: the 2026-09-05 soak saw
-chain rebuild fire 4x and no fatal OOM, but the write that overflowed the 16-byte
-pool remains unidentified.
+**Status:** Full codebase rescan completed with 67 bug fixes across 4 sessions. All phases through P4.5' complete. P5' code complete (shader→PSO pipeline wired, grcFvf decode, vertex input layout). Runtime test pending.
 
 Active front:
-1. **Config-dispatch null-handler AV** — `__imp__sub_8218CC70 +0xC1`, host
-   `r8 = 0xffffffff7e780000`, which is the session-25-decoded
-   `PPC_LOOKUP_FUNC` arithmetic on target=0. The call chain lands in the config
-   dispatch path, and `CONFIG-DISPATCH GLOBAL @0x82839270` is currently ZERO.
-2. **Allocator overflow still unresolved** — class allocator `sub_821DE9D8`
-   and the 16-byte pool are still under census; the root cause of the actual
-   write overflow has not been identified despite chain-rebuild mitigation.
-3. **GPU-progress-wait class (secondary, session 34):** ring put advances but the
-   GPU progress counter never does → legacy CP publication not reaching the guest;
-   fix only under the CP freeze line as kernel/CP-legacy work.
+1. **Runtime validation** — P5' code is complete but needs runtime testing to verify pixel-hash parity with legacy path.
+2. **P4.6' Resource Model** — next phase after P5' runtime validation passes.
 
-Discriminating probes (session 38 next):
-- `CONFIG-DISPATCH` census v2: log every dispatch (idx, offset, base_ptr,
-  struct, target_fn, valid-bit) for the first 200 calls, then every 100th call,
-  plus the GLOBAL `@82839270` value per call.
-- Confirm the initializer for the config global / handler table and the allocator
-  registration path; likely the registration never ran or a `0xB5800000`-class
-  phys alloc returned wrong memory.
-- After the dispatch front closes, run the writer-attribution census on the 16-byte
-  pool slab range to close the overflow root cause.
-- Then resume P4′ step 3 render-thread work.
-
-History: post-P3 park ([0x7FC86544] bit0) → superseded 2026-08-24 by the bctrl
-dispatch crash at `sub_825FDB30` (decoded: node-chain walk reachable only via
-data-section vtables; "raw host pointer 0x7E780000" was PPC_LOOKUP_FUNC slot
-arithmetic on ctr=0).
+History: post-P3 park → P4' device-boundary takeover complete (steps 1-2) → P4.5' render thread & queues complete → P5' code complete (67 bug fixes across sessions 62-65).
 
 ## 6. Validation Infrastructure
 

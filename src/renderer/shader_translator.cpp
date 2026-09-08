@@ -393,13 +393,13 @@ private:
             }
             for (uint32_t i = 0; i < 4; i++) {
                 if ((mask >> i) & 0x1)
-                    result += kSwizzle[((swizzle >> (i * 2)) + i) & 0x3];
+                    result += kSwizzle[(swizzle >> (i * 2)) & 0x3];
             }
             break;
         }
         case OperandKind::Scalar0:
         case OperandKind::ScalarConstant0:
-            result += kSwizzle[((swizzle >> 6) + 3) & 0x3];
+            result += kSwizzle[(swizzle >> 6) & 0x3];
             break;
         case OperandKind::Scalar1:
         case OperandKind::ScalarConstant1:
@@ -488,9 +488,10 @@ private:
                     : samplerDim[index] == 2 ? "tCube"
                     : samplerDim[index] == 1 ? "t2D"
                                              : "t1D";
-                std::string texRef = std::string(dimName);
-                (void)it;
-                (void)texRef;
+                std::string texName = (it != samplerConstants_.end())
+                    ? "tex_" + std::to_string(index)
+                    : std::string("tex_") + std::to_string(index);
+                out_ += "Texture2D " + texName + " : register(t" + std::to_string(index) + ");\n";
             }
         }
     }
@@ -808,7 +809,7 @@ private:
         // vector+scalar channels get 1 (reference post-pass).
         if (instr.exportData && !exportReg.empty()) {
             uint32_t zeroMask =
-                instr.scalarDestRelative ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
+                instr.exportData ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
             uint32_t oneMask = instr.vectorWriteMask & instr.scalarWriteMask;
             for (uint32_t i = 0; i < 4; i++) {
                 uint32_t mask = 1u << i;
@@ -1041,7 +1042,6 @@ private:
             }
             out_ += "    " + dst + " = ps;\n";
         }
-        (void)ps;
     }
 
     // ---- fetch lowering ---------------------------------------------------

@@ -61,9 +61,9 @@ No game code or assets are included in the repository. Users must provide their 
 | Phase 1 | ABI Migration | ✅ COMPLETE |
 | Phase 2 | Kernel Framework | ✅ COMPLETE (13/13 tests) |
 | Phase 3 | Critical Imports (Boot) | ✅ PASSED (2026-08-22) |
-| Phase 4' | Device-Boundary Takeover | 🔄 IN PROGRESS (Steps 1-2 done) |
-| Phase 4.5' | Render Thread & Queues | ⏳ PENDING |
-| Phase 5' | Real Draws via Device Boundary | ⏳ PENDING |
+| Phase 4' | Device-Boundary Takeover | ✅ DONE |
+| Phase 4.5' | Render Thread & Queues | ✅ DONE |
+| Phase 5' | Real Draws via Device Boundary | ✅ Code done, runtime test pending |
 | Phase 6' | Native Default & Legacy Retirement | ⏳ PENDING |
 | Phase 7' | Build Env Modernization | ⏳ PENDING |
 | Phase 8' | Codegen Config Completion | ⏳ PENDING |

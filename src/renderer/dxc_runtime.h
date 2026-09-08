@@ -39,9 +39,18 @@ public:
     // Compiles complete HLSL source into a DXIL blob. `entry` defaults to
     // "main"; `profile` is "vs_6_0" or "ps_6_0". True on success; on failure
     // `error` holds the first DXC diagnostic and `dxil` stays empty.
+    // If `keepReflection` is true, the output DXIL will contain reflection data
+    // suitable for ID3D12ShaderReflection.
     bool Compile(std::string_view hlsl, std::string_view entry,
                  std::string_view profile, std::vector<uint8_t>& dxil,
-                 std::string& error) const;
+                 std::string& error, bool keepReflection = false) const;
+
+    // Reflects a compiled DXIL blob to extract CBV register bindings.
+    // Returns a vector of (register, space) pairs for all CBVs found.
+    struct CbvBinding { uint32_t register_; uint32_t space_; };
+    bool ReflectCbvBindings(const std::vector<uint8_t>& dxil,
+                            std::vector<CbvBinding>& outCbvs,
+                            std::string& error) const;
 
     explicit operator bool() const { return impl_ != nullptr && loaded_; }
 

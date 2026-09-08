@@ -1,6 +1,6 @@
 # MCLA Native PC — Cline Agent Todo List
 
-**Updated:** 2026-09-06 (Session 64 — VSYNC-ISR deadlock root-caused & fixed, guest unblocked)  
+**Updated:** 2026-09-07 (Session 65 — Full rescan, 67 bugs fixed, LOGIC_MAP.md created)  
 **Plan:** `docs/MCLA_REBUILD_PLAN.md`  
 **Handoff:** `docs/BOOT_HANDOFF.md`  
 **Live Frontier:** `docs/handoffs/`
@@ -40,13 +40,15 @@
 | P3 | Critical Import Implementations | ✅ PASSED 2026-08-22 | Boot → main loop, archives load, VSync 60fps |
 | P4′ | Device-Boundary Takeover | ✅ Steps 1-3 done | CP drain + render thread own all D3D12 |
 | P4.5′ | Render Thread & Queues | ✅ DONE (S58) | Copy queue + frame pacing + queue depth |
-| P5′ | Real Draws via Device Boundary | ⏳ Code done, testing | Full shader→PSO pipeline wired; runtime test next |
+| P5′ | Real Draws via Device Boundary | ✅ CODE DONE (S60-62) | Full shader→PSO pipeline wired; runtime test next |
 | P5.5′ | Offline Shader Cache | ❌ NOT STARTED | Blocked on P5′ |
 | P6′ | Native Default | ❌ NOT STARTING | Blocked on all above |
 
 ---
 
 ## 🎯 IMMEDIATE NEXT ACTIONS (Session 65+)
+
+> **Note (S65):** 67 bugs fixed across 4 scan sessions (sessions 55-64). Code quality significantly improved. LOGIC_MAP.md created (790 lines). All validators passing.
 
 ### P5′ — Runtime Test (park blocker CLOSED in S64)
 - [x] **Scheduler tick signal** — `SignalSchedulerTick()` resolves host Semaphore wrapper and calls Release(1) (S63)

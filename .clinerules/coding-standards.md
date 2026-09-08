@@ -17,7 +17,7 @@
 - **One hook owner per guest address** — use the composable dispatcher
 - Hooks **only capture state** — no D3D12 calls, no `rex::graphics::RegisterFile` dependency
 - Hook return: `HookResult::Continue` | `HookResult::Override` (with captured payload)
-- Register hook chains in `src/hooks/registry.cpp` only
+- Register hook chains in `src/patches.cpp` only
 
 ## Renderer Abstraction
 - Default mode = `legacy` (Xenos command processor) until phase gates pass

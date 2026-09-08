@@ -44,6 +44,81 @@ find_package(spdlog REQUIRED)
 # DXC headers (for shader compilation)
 find_path(DXC_INCLUDE_DIR dxc/dxcapi.h PATHS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/inc" NO_DEFAULT_PATH)
 
+# XenosRecomp shader cache generator (P5.5')
+# Dependencies: zstd, xxHash, smol-v, DXC (from .research/XenosRecomp/thirdparty)
+set(XENOS_RECOMP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/XenosRecomp")
+set(XENOS_RECOMP_THIRDPARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/thirdparty")
+
+# Build third-party dependencies for XenosRecomp
+add_subdirectory(${XENOS_RECOMP_THIRDPARTY_DIR}/zstd/build/cmake zstd_build)
+add_subdirectory(${XENOS_RECOMP_THIRDPARTY_DIR}/xxHash/cmake_unofficial xxhash_build)
+
+# Create smol-v static library (header-only wrapper + implementation)
+add_library(smol-v STATIC
+    ${XENOS_RECOMP_THIRDPARTY_DIR}/smol-v/source/smolv.cpp
+)
+target_include_directories(smol-v PUBLIC
+    ${XENOS_RECOMP_THIRDPARTY_DIR}/smol-v/source
+)
+target_compile_definitions(smol-v PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+# DXC libraries are loaded dynamically at runtime by XenosRecomp (LoadLibrary)
+# No link-time dependency needed
+
+# XenosRecomp executable for shader cache generation
+add_executable(XenosRecomp
+    ${XENOS_RECOMP_SOURCE_DIR}/main.cpp
+    ${XENOS_RECOMP_SOURCE_DIR}/shader_recompiler.cpp
+    ${XENOS_RECOMP_SOURCE_DIR}/dxc_compiler.cpp
+)
+target_include_directories(XenosRecomp PRIVATE
+    ${XENOS_RECOMP_SOURCE_DIR}
+    ${XENOS_RECOMP_THIRDPARTY_DIR}/fmt/include
+    ${XENOS_RECOMP_THIRDPARTY_DIR}/smol-v/source
+    ${XENOS_RECOMP_THIRDPARTY_DIR}/xxHash/lib
+    ${XENOS_RECOMP_THIRDPARTY_DIR}/zstd/lib
+    ${DXC_INCLUDE_DIR}
+)
+target_compile_definitions(XenosRecomp PRIVATE
+    XENOS_RECOMP_DXIL
+    NOMINMAX
+    _CRT_SECURE_NO_WARNINGS
+)
+# Force include minimal standard headers needed by XenosRecomp
+# Using /FI for clang-cl with path in build directory (no spaces)
+# Escape the path for CMake's argument parsing
+target_compile_options(XenosRecomp PRIVATE
+    "/FI${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp_include/force_include.h"
+)
+target_link_libraries(XenosRecomp PRIVATE
+    fmt::fmt
+    libzstd_static xxhash smol-v
+    ${XENOS_RECOMP_THIRDPARTY_DIR}/dxc-bin/lib/x64/dxcompiler.lib
+    user32.lib advapi32.lib
+)
+
+# P5.5': Offline shader cache generation (DISABLED - XenosRecomp has bugs with .fxc files)
+# Run XenosRecomp at build time on the game's shader corpus to produce an embedded C++ cache
+# set(SHADER_CORPUS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_data/xarchive_cache/shaders")
+# set(SHADER_COMMON_HEADER "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp_include/empty_common.hlsl")
+# set(SHADER_CACHE_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/shader_cache.cpp")
+#
+# add_custom_command(
+#     OUTPUT ${SHADER_CACHE_OUTPUT}
+#     COMMAND XenosRecomp
+#         ${SHADER_CORPUS_DIR}
+#         ${SHADER_CACHE_OUTPUT}
+#         ${SHADER_COMMON_HEADER}
+#     DEPENDS XenosRecomp ${SHADER_COMMON_HEADER}
+#     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+#     COMMENT "Generating offline shader cache from Xenos microcode corpus"
+#     VERBATIM
+# )
+
+# Add the generated shader cache to the main executable
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CXX_KNOWN_TARGETS mcla)
+list(APPEND MCLA_GENERATED_SOURCES ${SHADER_CACHE_OUTPUT})
+
 # MSVC toolset path (VS 2022 BuildTools has both headers and libraries; VS 2026 BuildTools is minimal)
 set(MSVC_TOOLSET_PATH "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207")
 set(MSVC_INCLUDE_PATH "${MSVC_TOOLSET_PATH}/include")

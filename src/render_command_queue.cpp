@@ -41,7 +41,7 @@ void RenderCommandQueue::Wake() {
 }
 
 void RenderCommandQueue::Shutdown() {
-    m_shutdown.store(true, std::memory_order_relaxed);
+    m_shutdown.store(true, std::memory_order_release);
     m_cv.notify_all();
 }
 
@@ -54,19 +54,19 @@ bool RenderCommandQueue::IsShutdown() const {
     return m_shutdown.load(std::memory_order_relaxed);
 }
 
-RenderThread::RenderThread() = default;
+RenderCommandProcessor::RenderCommandProcessor() = default;
 
-RenderThread::~RenderThread() {
+RenderCommandProcessor::~RenderCommandProcessor() {
     Stop();
 }
 
-bool RenderThread::Start(void* hwnd, uint32_t width, uint32_t height) {
+bool RenderCommandProcessor::Start(void* hwnd, uint32_t width, uint32_t height) {
     if (m_running.exchange(true)) return false;
-    m_thread = std::thread(&RenderThread::ThreadMain, this, hwnd, width, height);
+    m_thread = std::thread(&RenderCommandProcessor::ThreadMain, this, hwnd, width, height);
     return true;
 }
 
-void RenderThread::Stop() {
+void RenderCommandProcessor::Stop() {
     if (!m_running.exchange(false)) return;
     m_queue.Shutdown();
     if (m_thread.joinable()) {
@@ -74,24 +74,24 @@ void RenderThread::Stop() {
     }
 }
 
-void RenderThread::EnqueueCommand(RenderCommand&& cmd) {
+void RenderCommandProcessor::EnqueueCommand(RenderCommand&& cmd) {
     m_queue.Enqueue(std::move(cmd));
 }
 
-RenderThread& RenderThread::Instance() {
-    static RenderThread instance;
+RenderCommandProcessor& RenderCommandProcessor::Instance() {
+    static RenderCommandProcessor instance;
     return instance;
 }
 
-void RenderThread::ThreadMain(void* hwnd, uint32_t width, uint32_t height) {
+void RenderCommandProcessor::ThreadMain(void* hwnd, uint32_t width, uint32_t height) {
     mcla::native::D3D12Backend backend;
     if (!backend.Initialize(static_cast<HWND>(hwnd), width, height)) {
-        MCLA_LOG_ERROR("RenderThread: D3D12Backend initialization failed");
+        MCLA_LOG_ERROR("RenderCommandProcessor: D3D12Backend initialization failed");
         m_running.store(false);
         return;
     }
 
-    MCLA_LOG_INFO("RenderThread: started, entering command loop");
+    MCLA_LOG_INFO("RenderCommandProcessor: started, entering command loop");
 
     while (m_running.load(std::memory_order_relaxed)) {
         auto cmdOpt = m_queue.Dequeue();
@@ -102,7 +102,7 @@ void RenderThread::ThreadMain(void* hwnd, uint32_t width, uint32_t height) {
         switch (cmd.type) {
             case RenderCommand::Type::Draw: {
                 const auto& d = cmd.draw;
-                MCLA_LOG_INFO("RenderThread: Draw seq={} dev={:08X} prim={:08X} ibBase={:08X} ibCnt={:08X}",
+                MCLA_LOG_INFO("RenderCommandProcessor: Draw seq={} dev={:08X} prim={:08X} ibBase={:08X} ibCnt={:08X}",
                               cmd.sequence, cmd.deviceVA, d.primTypeFlags, d.ibBase, d.ibCounts);
 
                 mcla::native::D3D12Backend::DynamicMeshDesc desc = {};
@@ -111,38 +111,38 @@ void RenderThread::ThreadMain(void* hwnd, uint32_t width, uint32_t height) {
                 desc.indexed = false;
 
                 if (!backend.BeginFrame()) {
-                    MCLA_LOG_WARN("RenderThread: BeginFrame failed");
+                    MCLA_LOG_WARN("RenderCommandProcessor: BeginFrame failed");
                     continue;
                 }
 
                 bool ok = backend.DrawDynamicMesh(desc);
                 if (!ok) {
-                    MCLA_LOG_WARN("RenderThread: DrawDynamicMesh failed");
+                    MCLA_LOG_WARN("RenderCommandProcessor: DrawDynamicMesh failed");
                 }
 
                 if (!backend.ClearAndPresent(0.0f, 0.0f, 0.2f, 1.0f)) {
-                    MCLA_LOG_WARN("RenderThread: ClearAndPresent failed");
+                    MCLA_LOG_WARN("RenderCommandProcessor: ClearAndPresent failed");
                 }
                 break;
             }
             case RenderCommand::Type::Present: {
                 const auto& p = cmd.present;
-                MCLA_LOG_INFO("RenderThread: Present seq={} dev={:08X} fb={:08X} bbIdx={} bbCount={} bbBase={:08X}",
+                MCLA_LOG_INFO("RenderCommandProcessor: Present seq={} dev={:08X} fb={:08X} bbIdx={} bbCount={} bbBase={:08X}",
                               cmd.sequence, cmd.deviceVA, p.fbAddr, p.bbIdx, p.bbCount, p.bbBase);
 
                 if (!backend.BeginFrame()) {
-                    MCLA_LOG_WARN("RenderThread: BeginFrame failed");
+                    MCLA_LOG_WARN("RenderCommandProcessor: BeginFrame failed");
                     continue;
                 }
 
                 if (!backend.ClearAndPresent(0.0f, 0.0f, 0.2f, 1.0f)) {
-                    MCLA_LOG_WARN("RenderThread: ClearAndPresent failed");
+                    MCLA_LOG_WARN("RenderCommandProcessor: ClearAndPresent failed");
                 }
                 break;
             }
             case RenderCommand::Type::StateSetup: {
                 const auto& s = cmd.stateSetup;
-                MCLA_LOG_INFO("RenderThread: StateSetup seq={} dev={:08X} srcState={:08X}",
+                MCLA_LOG_INFO("RenderCommandProcessor: StateSetup seq={} dev={:08X} srcState={:08X}",
                               cmd.sequence, cmd.deviceVA, s.srcStateVA);
                 break;
             }
@@ -150,7 +150,7 @@ void RenderThread::ThreadMain(void* hwnd, uint32_t width, uint32_t height) {
     }
 
     backend.Shutdown();
-    MCLA_LOG_INFO("RenderThread: stopped");
+    MCLA_LOG_INFO("RenderCommandProcessor: stopped");
 }
 
 } // namespace mcla::gpu

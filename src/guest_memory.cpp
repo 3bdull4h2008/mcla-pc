@@ -2,6 +2,7 @@
 #include "logging.h"
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 // PAGE-WATCH hooks (session 24): defined in gpu_cp.cpp which owns the full
 // PPCContext includes - keeps this hot-path TU free of ABI header chains.
@@ -24,8 +25,11 @@ struct WatchRange
 WatchRange g_watchRanges[kMaxWatchRanges];
 std::atomic<uint32_t> g_watchRangeCount{0};
 
+static std::mutex s_watchMtx;
+
 void mcla::native::RegisterGuestWatchRange(uint32_t start, uint32_t end)
 {
+    std::lock_guard lock(s_watchMtx);
     const uint32_t n = g_watchRangeCount.load(std::memory_order_relaxed);
     for (uint32_t i = 0; i < n; ++i)
     {
@@ -53,6 +57,7 @@ std::atomic<uint32_t> g_watchValueCount{0};
 
 void mcla::native::RegisterGuestWatchValue(uint32_t value)
 {
+    std::lock_guard lock(s_watchMtx);
     const uint32_t n = g_watchValueCount.load(std::memory_order_relaxed);
     for (uint32_t i = 0; i < n; ++i)
     {

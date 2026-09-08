@@ -334,7 +334,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             desc.vertexBytes = vb.data();
             desc.vertexBytesSize = d.vbSize;
             desc.vertexStride = d.vbStride;
-            desc.vertexCount = d.vbSize / d.vbStride;
+            desc.vertexCount = (d.vbStride > 0) ? (d.vbSize / d.vbStride) : 0;
             desc.indexed = true;
             desc.indexBytes = ib.data();
             desc.indexBytesSize = d.ibSize;
@@ -416,11 +416,12 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             desc.vertexBytes = vb.data();
             desc.vertexBytesSize = dc.vbSize;
             desc.vertexStride = dc.vbStride;
-            desc.vertexCount = dc.vbSize / dc.vbStride;
+            desc.vertexCount = (dc.vbStride > 0) ? (dc.vbSize / dc.vbStride) : 0;
             desc.indexed = true;
             desc.indexBytes = ib.data();
             desc.indexBytesSize = dc.ibSize;
             desc.indexFormat = DXGI_FORMAT_R16_UINT;
+            // FIXME: Assumes 16-bit indices; DRAW_CAPTURED doesn't carry ibFmt
             desc.indexCount = dc.ibSize / 2;
 
             if (backend_.BeginFrame()) {

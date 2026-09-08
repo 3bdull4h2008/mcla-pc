@@ -208,11 +208,11 @@ void RpfVirtualFileSystem::Unmount() {
 
 bool RpfVirtualFileSystem::IsVirtualPath(const std::string& path) const {
     std::string norm = NormalizePath(path);
-    return (path.rfind("t:\\", 0) == 0 ||
-            path.rfind("t:/", 0) == 0 ||
-            path.rfind("t:\\mc4", 0) == 0 ||
-            path.rfind("t:/mc4", 0) == 0 ||
-            path.rfind("mc4/", 0) == 0);
+    return (norm.rfind("t:\\", 0) == 0 ||
+            norm.rfind("t:/", 0) == 0 ||
+            norm.rfind("t:\\mc4", 0) == 0 ||
+            norm.rfind("t:/mc4", 0) == 0 ||
+            norm.rfind("mc4/", 0) == 0);
 }
 
 std::string RpfVirtualFileSystem::GuestToVirtualPath(const std::string& guest_path) const {
@@ -638,11 +638,12 @@ bool RpfVirtualFileSystem::SeekFile(OpenFileHandle& file, int64_t offset, int wh
     if (whence == 1) moveMethod = FILE_CURRENT;
     else if (whence == 2) moveMethod = FILE_END;
 
-    DWORD newPos = SetFilePointer(static_cast<HANDLE>(file.handle), static_cast<LONG>(offset), nullptr, moveMethod);
-    if (newPos == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR) {
+    LARGE_INTEGER liOffset, liNewPos;
+    liOffset.QuadPart = offset;
+    if (!::SetFilePointerEx(static_cast<HANDLE>(file.handle), liOffset, &liNewPos, moveMethod)) {
         return false;
     }
-    file.position = newPos;
+    file.position = static_cast<uint64_t>(liNewPos.QuadPart);
     return true;
 }
 
@@ -669,25 +670,25 @@ bool NtCreateFileHook(uint32_t oa, mcla::native::GuestMemoryView& view, uint32_t
     return false;
 }
 
-bool NtReadFileHook(uint32_t file_handle, void* buffer, uint32_t length, uint32_t& bytes_read) {
+bool NtReadFileHook(uint32_t file_handle, uint32_t buffer_guest_addr, uint32_t length, uint32_t& bytes_read) {
     (void)file_handle;
-    (void)buffer;
+    (void)buffer_guest_addr;
     (void)length;
     (void)bytes_read;
     return false;
 }
 
-bool NtQueryInformationFileHook(uint32_t file_handle, void* buffer, uint32_t length, uint32_t info_class) {
+bool NtQueryInformationFileHook(uint32_t file_handle, uint32_t buffer_guest_addr, uint32_t length, uint32_t info_class) {
     (void)file_handle;
-    (void)buffer;
+    (void)buffer_guest_addr;
     (void)length;
     (void)info_class;
     return false;
 }
 
-bool NtQueryDirectoryFileHook(uint32_t file_handle, void* buffer, uint32_t length, uint32_t info_class) {
+bool NtQueryDirectoryFileHook(uint32_t file_handle, uint32_t buffer_guest_addr, uint32_t length, uint32_t info_class) {
     (void)file_handle;
-    (void)buffer;
+    (void)buffer_guest_addr;
     (void)length;
     (void)info_class;
     return false;

@@ -344,78 +344,84 @@ namespace
         return buf;
     }
 
-    int FilterCapture(EXCEPTION_POINTERS* info)
+    static void CaptureFaultInfo(EXCEPTION_POINTERS* info, BootReport& report, bool captureStack)
     {
-        {
-            const uintptr_t pc = (uintptr_t)info->ContextRecord->Rip;
+        const uintptr_t pc = (uintptr_t)info->ContextRecord->Rip;
 
+        if (captureStack)
+        {
             void* frames[24] = {};
             const WORD n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
-            g_report.faultStack.clear();
+            report.faultStack.clear();
             for (WORD i = 0; i < n; i++)
             {
                 const uintptr_t fa = (uintptr_t)frames[i];
                 char buf[128];
                 std::snprintf(buf, sizeof(buf), "0x%016zx %s", (size_t)fa, NearestFunctionName(fa));
-                g_report.faultStack.emplace_back(buf);
-            }
-
-            DWORD64 imageBase = 0;
-            const PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(pc, &imageBase, nullptr);
-            if (fn != nullptr)
-            {
-                g_report.faultOwnerStart = imageBase + fn->BeginAddress;
-                g_report.faultOwnerOffset = pc - g_report.faultOwnerStart;
-            }
-            g_report.faultInfo = NearestFunctionName(pc);
-            g_report.faultHost = pc;
-            g_report.faultRva = pc - g_moduleBase;
-            g_report.faultCode = info->ExceptionRecord->ExceptionCode;
-            g_report.faultAddr = (uintptr_t)info->ExceptionRecord->ExceptionInformation[1];
-            g_report.readFault = info->ExceptionRecord->ExceptionInformation[0] == 0;
-
-            g_report.faultRax = info->ContextRecord->Rax;
-            g_report.faultRbx = info->ContextRecord->Rbx;
-            g_report.faultRcx = info->ContextRecord->Rcx;
-            g_report.faultRdx = info->ContextRecord->Rdx;
-            g_report.faultRsi = info->ContextRecord->Rsi;
-            g_report.faultRdi = info->ContextRecord->Rdi;
-            g_report.faultR1 = g_faultCtx ? g_faultCtx->r1.u32 : 0;
-            g_report.faultR3 = g_faultCtx ? g_faultCtx->r3.u32 : 0;
-            g_report.faultR13 = g_faultCtx ? g_faultCtx->r13.u32 : 0;
-            g_report.faultLR = g_faultCtx ? (uint32_t)g_faultCtx->lr : 0;
-            if (g_faultCtx != nullptr)
-            {
-                std::memset(g_report.faultGpr, 0, sizeof(g_report.faultGpr));
-                g_report.faultGpr[1] = g_faultCtx->r1.u32;
-                g_report.faultGpr[3] = g_faultCtx->r3.u32;
-                g_report.faultGpr[4] = g_faultCtx->r4.u32;
-                g_report.faultGpr[5] = g_faultCtx->r5.u32;
-                g_report.faultGpr[6] = g_faultCtx->r6.u32;
-                g_report.faultGpr[7] = g_faultCtx->r7.u32;
-                g_report.faultGpr[8] = g_faultCtx->r8.u32;
-                g_report.faultGpr[9] = g_faultCtx->r9.u32;
-                g_report.faultGpr[10] = g_faultCtx->r10.u32;
-                g_report.faultGpr[13] = g_faultCtx->r13.u32;
-            }
-
-            std::memset(g_report.faultBytes, 0, sizeof(g_report.faultBytes));
-            if (pc >= g_moduleBase)
-                std::memcpy(g_report.faultBytes, (const void*)pc, sizeof(g_report.faultBytes));
-
-            if (g_base != nullptr)
-            {
-                for (int i = 0; i < 16; i++)
-                    g_report.faultTable[i] = ReadU32BE(g_base, 0x827EB900u + (uint32_t)i * 4);
-            }
-
-            if (g_report.faultR1 != 0 && g_base != nullptr)
-            {
-                uint32_t callerLR = 0;
-                std::memcpy(&callerLR, g_base + g_report.faultR1 + 88, sizeof(callerLR));
-                g_report.faultCallerLR = callerLR;
+                report.faultStack.emplace_back(buf);
             }
         }
+
+        DWORD64 imageBase = 0;
+        const PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(pc, &imageBase, nullptr);
+        if (fn != nullptr)
+        {
+            report.faultOwnerStart = imageBase + fn->BeginAddress;
+            report.faultOwnerOffset = pc - report.faultOwnerStart;
+        }
+        report.faultInfo = NearestFunctionName(pc);
+        report.faultHost = pc;
+        report.faultRva = pc - g_moduleBase;
+        report.faultCode = info->ExceptionRecord->ExceptionCode;
+        report.faultAddr = (uintptr_t)info->ExceptionRecord->ExceptionInformation[1];
+        report.readFault = info->ExceptionRecord->ExceptionInformation[0] == 0;
+
+        report.faultRax = info->ContextRecord->Rax;
+        report.faultRbx = info->ContextRecord->Rbx;
+        report.faultRcx = info->ContextRecord->Rcx;
+        report.faultRdx = info->ContextRecord->Rdx;
+        report.faultRsi = info->ContextRecord->Rsi;
+        report.faultRdi = info->ContextRecord->Rdi;
+        report.faultR1 = g_faultCtx ? g_faultCtx->r1.u32 : 0;
+        report.faultR3 = g_faultCtx ? g_faultCtx->r3.u32 : 0;
+        report.faultR13 = g_faultCtx ? g_faultCtx->r13.u32 : 0;
+        report.faultLR = g_faultCtx ? (uint32_t)g_faultCtx->lr : 0;
+        if (g_faultCtx != nullptr)
+        {
+            std::memset(report.faultGpr, 0, sizeof(report.faultGpr));
+            report.faultGpr[1] = g_faultCtx->r1.u32;
+            report.faultGpr[3] = g_faultCtx->r3.u32;
+            report.faultGpr[4] = g_faultCtx->r4.u32;
+            report.faultGpr[5] = g_faultCtx->r5.u32;
+            report.faultGpr[6] = g_faultCtx->r6.u32;
+            report.faultGpr[7] = g_faultCtx->r7.u32;
+            report.faultGpr[8] = g_faultCtx->r8.u32;
+            report.faultGpr[9] = g_faultCtx->r9.u32;
+            report.faultGpr[10] = g_faultCtx->r10.u32;
+            report.faultGpr[13] = g_faultCtx->r13.u32;
+        }
+
+        std::memset(report.faultBytes, 0, sizeof(report.faultBytes));
+        if (pc >= g_moduleBase)
+            std::memcpy(report.faultBytes, (const void*)pc, sizeof(report.faultBytes));
+
+        if (g_base != nullptr)
+        {
+            for (int i = 0; i < 16; i++)
+                report.faultTable[i] = ReadU32BE(g_base, 0x827EB900u + (uint32_t)i * 4);
+        }
+
+        if (report.faultR1 != 0 && g_base != nullptr)
+        {
+            uint32_t callerLR = 0;
+            std::memcpy(&callerLR, g_base + report.faultR1 + 88, sizeof(callerLR));
+            report.faultCallerLR = callerLR;
+        }
+    }
+
+    int FilterCapture(EXCEPTION_POINTERS* info)
+    {
+        CaptureFaultInfo(info, g_report, true);
         return EXCEPTION_EXECUTE_HANDLER;
     }
 
@@ -475,66 +481,7 @@ static LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info)
     if (g_faultCtx == nullptr)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    // Capture fault info similar to the VEH handler
-    const uintptr_t pc = (uintptr_t)info->ContextRecord->Rip;
-    const PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(pc, nullptr, nullptr);
-    if (fn != nullptr)
-    {
-        g_report.faultOwnerStart = (uintptr_t)fn->BeginAddress;
-        g_report.faultOwnerOffset = pc - g_report.faultOwnerStart;
-    }
-    g_report.faultInfo = NearestFunctionName(pc);
-    g_report.faultHost = pc;
-    g_report.faultRva = pc - g_moduleBase;
-    g_report.faultCode = info->ExceptionRecord->ExceptionCode;
-    g_report.faultAddr = (uintptr_t)info->ExceptionRecord->ExceptionInformation[1];
-    g_report.readFault = info->ExceptionRecord->ExceptionInformation[0] == 0;
-
-    // Capture register state
-    g_report.faultRax = info->ContextRecord->Rax;
-    g_report.faultRbx = info->ContextRecord->Rbx;
-    g_report.faultRcx = info->ContextRecord->Rcx;
-    g_report.faultRdx = info->ContextRecord->Rdx;
-    g_report.faultRsi = info->ContextRecord->Rsi;
-    g_report.faultRdi = info->ContextRecord->Rdi;
-    g_report.faultR1 = g_faultCtx ? g_faultCtx->r1.u32 : 0;
-    g_report.faultR3 = g_faultCtx ? g_faultCtx->r3.u32 : 0;
-    g_report.faultR13 = g_faultCtx ? g_faultCtx->r13.u32 : 0;
-    g_report.faultLR = g_faultCtx ? (uint32_t)g_faultCtx->lr : 0;
-    if (g_faultCtx != nullptr)
-    {
-        g_report.faultGpr[1] = g_faultCtx->r1.u32;
-        g_report.faultGpr[3] = g_faultCtx->r3.u32;
-        g_report.faultGpr[4] = g_faultCtx->r4.u32;
-        g_report.faultGpr[5] = g_faultCtx->r5.u32;
-        g_report.faultGpr[6] = g_faultCtx->r6.u32;
-        g_report.faultGpr[7] = g_faultCtx->r7.u32;
-        g_report.faultGpr[8] = g_faultCtx->r8.u32;
-        g_report.faultGpr[9] = g_faultCtx->r9.u32;
-        g_report.faultGpr[10] = g_faultCtx->r10.u32;
-        g_report.faultGpr[13] = g_faultCtx->r13.u32;
-    }
-
-    // Capture fault bytes
-    if (pc >= g_moduleBase)
-        std::memcpy(g_report.faultBytes, (const void*)pc, sizeof(g_report.faultBytes));
-
-    if (g_base != nullptr)
-    {
-        for (int i = 0; i < 16; i++)
-            g_report.faultTable[i] = ReadU32BE(g_base, 0x827EB900u + (uint32_t)i * 4);
-    }
-
-    if (g_report.faultR1 != 0 && g_base != nullptr)
-    {
-        uint32_t callerLR = 0;
-        std::memcpy(&callerLR, g_base + g_report.faultR1 + 88, sizeof(callerLR));
-        g_report.faultCallerLR = callerLR;
-    }
-
-    // Store exception info for reporting
-    g_report.faultInfo = NearestFunctionName(pc);
-
+    CaptureFaultInfo(info, g_report, false);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 

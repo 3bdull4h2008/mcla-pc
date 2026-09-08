@@ -1,6 +1,7 @@
 ﻿#include "capture_hooks.h"
 #include "renderer_mode.h"
 #include "logging.h"
+#include "kernel/memory.h"
 
 #include <chrono>
 #include <algorithm>
@@ -110,7 +111,7 @@ void DrawPacketAccumulator::OnDrawBuild(::MclaGpuContext* gpuCtx, ::PPCContext& 
     m_currentPacket.viewportTL = gpuCtx->rbSurfaceInfoP2;
     m_currentPacket.viewportBR = gpuCtx->rbSurfaceInfoP3;
     m_currentPacket.scissorTL = gpuCtx->rbSurfaceInfoP4;
-    m_currentPacket.scissorBR = gpuCtx->rbSurfaceInfoP4;
+    m_currentPacket.scissorBR = gpuCtx->rbSurfaceInfoP5;
 
     uint32_t vbPtr = ctx.r7.u32;
     m_currentPacket.vertexStreamCount = 0;
@@ -135,8 +136,9 @@ void DrawPacketAccumulator::OnDrawBuild(::MclaGpuContext* gpuCtx, ::PPCContext& 
 
     constexpr uint32_t kDrawableOffset = 10896;
     uint32_t drawablePtr = 0;
-    if (m_memoryView.IsValidRange(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, 4)) {
-        m_memoryView.ReadU32BE(reinterpret_cast<uintptr_t>(gpuCtx) + kDrawableOffset, &drawablePtr);
+    uint32_t gpuCtxGuestAddr = mcla::kernel::g_memory.MapVirtual(gpuCtx);
+    if (m_memoryView.IsValidRange(gpuCtxGuestAddr + kDrawableOffset, 4)) {
+        m_memoryView.ReadU32BE(gpuCtxGuestAddr + kDrawableOffset, &drawablePtr);
     }
 
     constexpr uint32_t kDrawableShaderGroupOff[] = { 0x28, 0x30, 0x38, 0x20 };

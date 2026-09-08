@@ -6,6 +6,8 @@ Mutex g_kernelLock;
 
 void DestroyKernelObject(KernelObject* obj)
 {
+    if (!obj) return;
+    std::lock_guard lock(g_kernelLock);
     // DURABLE WRAPPER IDENTITY (session 64): drop the side-map entry so a
     // recycled guest header cannot resolve to a destroyed wrapper.
     if (obj->identityHdrAddr != 0)
@@ -23,7 +25,9 @@ uint32_t GetKernelHandle(KernelObject* obj)
 
 void DestroyKernelObject(uint32_t handle)
 {
-    DestroyKernelObject(GetKernelObject(handle));
+    auto* obj = GetKernelObject(handle);
+    if (!obj) return;
+    DestroyKernelObject(obj);
 }
 
 bool IsKernelObject(uint32_t handle)

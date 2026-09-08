@@ -975,7 +975,7 @@ bool D3D12Backend::CreateMipGenPipeline() {
     uavRange.RegisterSpace = 0;
     uavRange.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER rootParams[2] = {};
+    D3D12_ROOT_PARAMETER rootParams[3] = {};
     rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
     rootParams[0].DescriptorTable.pDescriptorRanges = &srvRange;
@@ -985,6 +985,11 @@ bool D3D12Backend::CreateMipGenPipeline() {
     rootParams[1].Descriptor.ShaderRegister = 0;  // b0
     rootParams[1].Descriptor.RegisterSpace = 0;
     rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
+    rootParams[2].DescriptorTable.pDescriptorRanges = &uavRange;
+    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
     rootDesc.NumParameters = _countof(rootParams);
@@ -1381,7 +1386,6 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     }
 
     m_stats.bytesThisFrame = 0;
-    m_uploadOffset = 0;
 
     // Wait for the GPU to finish the previous frame that used this back
     // buffer's upload region before we write into it again. This must happen
@@ -1643,6 +1647,7 @@ bool D3D12Backend::BeginFrame() {
     if (FAILED(hr)) return false;
 
     m_inFrame = true;
+    m_uploadOffset = 0;
     return true;
 }
 

@@ -198,15 +198,20 @@ void Heap::Free(void* ptr)
 
 size_t Heap::Size(void* ptr)
 {
-    if (ptr)
-        return *((size_t*)ptr - 2) - O1HEAP_ALIGNMENT; // relies on fragment header in o1heap.c
-
+    if (!ptr) return 0;
+    // Only read header if ptr was allocated from this heap
+    LiveProbe probe;
+    if (IsLiveAllocation(heapArenaBase, heapArenaSize, ptr, &probe))
+        return *((size_t*)ptr - 2) - O1HEAP_ALIGNMENT;
+    if (physicalHeap != nullptr && IsLiveAllocation(physArenaBase, physArenaSize, ptr, &probe))
+        return *((size_t*)ptr - 2) - O1HEAP_ALIGNMENT;
     return 0;
 }
 
 uint32_t RtlAllocateHeap(uint32_t heapHandle, uint32_t flags, uint32_t size)
 {
     void* ptr = g_userHeap.Alloc(size);
+    if (!ptr) return 0;
     if ((flags & 0x8) != 0)
         memset(ptr, 0, size);
 
@@ -217,6 +222,7 @@ uint32_t RtlAllocateHeap(uint32_t heapHandle, uint32_t flags, uint32_t size)
 uint32_t RtlReAllocateHeap(uint32_t heapHandle, uint32_t flags, uint32_t memoryPointer, uint32_t size)
 {
     void* ptr = g_userHeap.Alloc(size);
+    if (!ptr) return 0;
     if ((flags & 0x8) != 0)
         memset(ptr, 0, size);
 

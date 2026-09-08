@@ -119,6 +119,10 @@ bool FrameTraceReader::Open(const std::filesystem::path& tracePath) {
         return false;
     }
 
+    if (m_header.packetCount > 10000000) {
+        MCLA_LOG_ERROR("FrameTraceReader: packetCount {} exceeds sanity limit", m_header.packetCount);
+        return false;
+    }
     m_packets.resize(m_header.packetCount);
     if (m_header.packetCount > 0) {
         file.read(reinterpret_cast<char*>(m_packets.data()), m_header.packetCount * sizeof(DrawPacket));

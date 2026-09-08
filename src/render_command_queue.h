@@ -68,16 +68,16 @@ private:
     std::atomic<uint32_t> m_sequence{0};
 };
 
-class RenderThread {
+class RenderCommandProcessor {
 public:
-    RenderThread();
-    ~RenderThread();
+    RenderCommandProcessor();
+    ~RenderCommandProcessor();
 
     bool Start(void* hwnd, uint32_t width, uint32_t height);
     void Stop();
     void EnqueueCommand(RenderCommand&& cmd);
 
-    static RenderThread& Instance();
+    static RenderCommandProcessor& Instance();
 
 private:
     void ThreadMain(void* hwnd, uint32_t width, uint32_t height);

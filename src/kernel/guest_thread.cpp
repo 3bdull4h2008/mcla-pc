@@ -81,15 +81,18 @@ static void GuestThreadFunc(GuestThreadHandle* hThread)
 GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
     : params(params), suspended((params.flags & 0x1) != 0)
 #ifdef USE_PTHREAD
+    , threadCreated(false)
 {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, GetStackSize());
     const auto ret = pthread_create(&thread, &attr, GuestThreadFunc, this);
+    pthread_attr_destroy(&attr);
     if (ret != 0) {
         fprintf(stderr, "pthread_create failed with error code 0x%X.\n", ret);
         return;
     }
+    threadCreated = true;
 }
 #else
       , thread(GuestThreadFunc, this)
@@ -100,7 +103,8 @@ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
 GuestThreadHandle::~GuestThreadHandle()
 {
 #ifdef USE_PTHREAD
-    pthread_join(thread, nullptr);
+    if (threadCreated)
+        pthread_join(thread, nullptr);
 #else
     if (thread.joinable())
         thread.join();
@@ -130,7 +134,8 @@ uint32_t GuestThreadHandle::Wait(uint32_t timeout)
     assert(timeout == INFINITE);
 
 #ifdef USE_PTHREAD
-    pthread_join(thread, nullptr);
+    if (threadCreated)
+        pthread_join(thread, nullptr);
 #else
     if (thread.joinable())
         thread.join();
@@ -147,7 +152,9 @@ uint32_t GuestThread::Start(const GuestThreadParams& params)
     GuestThreadContext ctx(cpuNumber);
     ctx.ppcContext.r3.u64 = params.value;
 
-    mcla::kernel::g_memory.FindFunction(params.function)(ctx.ppcContext, mcla::kernel::g_memory.base);
+    auto func = mcla::kernel::g_memory.FindFunction(params.function);
+    if (!func) return 0;
+    func(ctx.ppcContext, mcla::kernel::g_memory.base);
 
     return ctx.ppcContext.r3.u32;
 }

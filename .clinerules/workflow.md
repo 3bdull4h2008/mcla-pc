@@ -20,7 +20,7 @@ validate:   build/mcla.exe --validate-shaders --headless
 
 ## Hook Development
 1. Discover guest address/struct via `reverser` (Ghidra, recomp output)
-2. Add hook to `src/hooks/registry.cpp` using composable dispatcher
+2. Add hook to `src/patches.cpp` using composable dispatcher
 3. Hook captures **only** state — no D3D12, no side effects
 4. Verify with `security-auditor` (bounds, endianness, OOB)
 5. Register in dispatcher; one owner per address

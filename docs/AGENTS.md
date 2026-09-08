@@ -13,8 +13,7 @@ This file is loaded into every session. Detailed standards live in
 
 ## Purpose
 
-Replace the Xenos command-processor rendering path in the recompiled Xbox 360
-game with a native Direct3D 12 renderer. Recompiled PPC code keeps running; its
+Recompiled PPC code keeps running; its
 rendering intent is captured at the high-level draw boundary and executed as
 native D3D12 work. The default renderer mode must remain `legacy` until the
 phase gates in `MCLA_REBUILD_PLAN.md` pass.

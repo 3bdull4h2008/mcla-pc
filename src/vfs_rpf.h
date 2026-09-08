@@ -115,9 +115,9 @@ inline std::string GuestPathToVirtual(const std::string& guest_path) {
 namespace hooks {
 
 bool NtCreateFileHook(uint32_t oa, mcla::native::GuestMemoryView& view, uint32_t& out_status);
-bool NtReadFileHook(uint32_t file_handle, void* buffer, uint32_t length, uint32_t& bytes_read);
-bool NtQueryInformationFileHook(uint32_t file_handle, void* buffer, uint32_t length, uint32_t info_class);
-bool NtQueryDirectoryFileHook(uint32_t file_handle, void* buffer, uint32_t length, uint32_t info_class);
+bool NtReadFileHook(uint32_t file_handle, uint32_t buffer_guest_addr, uint32_t length, uint32_t& bytes_read);
+bool NtQueryInformationFileHook(uint32_t file_handle, uint32_t buffer_guest_addr, uint32_t length, uint32_t info_class);
+bool NtQueryDirectoryFileHook(uint32_t file_handle, uint32_t buffer_guest_addr, uint32_t length, uint32_t info_class);
 bool NtCloseHook(uint32_t file_handle);
 
 } // namespace hooks

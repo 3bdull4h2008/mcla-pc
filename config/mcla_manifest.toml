@@ -22,7 +22,7 @@ jump_tables = ".research/XenonRecomp/XenonAnalyse/jump_tables.toml"
 # Format: "0x82xxxxxx" = "namespace::function_name"
 
 [render]
-renderer_mode = "legacy"  # legacy | native | capture
+renderer_mode = "native"  # legacy | native | capture
 native_renderer_trace = "off"  # off | frames | all
 
 [capture]

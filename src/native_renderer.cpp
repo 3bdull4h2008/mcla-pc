@@ -81,6 +81,7 @@ PPC_FUNC_IMPL(Hooked_GfxCmdBufSubmit) {
     uint32_t ctx_guest = ctx.r3.u32;
 
     if (ctx_guest) {
+        if (ctx_guest < 0x1000 || ctx_guest > 0xFFFFFFFF) return;
         ::MclaGpuContext* gpuCtx = reinterpret_cast<::MclaGpuContext*>(base + ctx_guest);
 
         static int drawCount = 0;
@@ -151,6 +152,9 @@ PPC_FUNC_IMPL(Hooked_Sub8241ABB8) {
     uint32_t src_state   = ctx.r4.u32;
 
     if (ctx_guest && src_state) {
+        GuestMemoryView& memView = GetDrawAccumulator()->GetMemoryView();
+        if (!memView.IsValidRange(src_state, 128)) return;
+
         ::MclaGpuContext* gpuCtx = reinterpret_cast<::MclaGpuContext*>(base + ctx_guest);
 
         gpuCtx->rbSurfaceInfoP0 = PPC_LOAD_U32(src_state + 108);
@@ -158,6 +162,7 @@ PPC_FUNC_IMPL(Hooked_Sub8241ABB8) {
         gpuCtx->rbSurfaceInfoP2 = PPC_LOAD_U32(src_state + 116);
         gpuCtx->rbSurfaceInfoP3 = PPC_LOAD_U32(src_state + 120);
         gpuCtx->rbSurfaceInfoP4 = PPC_LOAD_U32(src_state + 124);
+        gpuCtx->rbSurfaceInfoP5 = PPC_LOAD_U32(src_state + 128);
 
         GetDrawAccumulator()->OnStateSetup(gpuCtx, src_state);
     }
@@ -197,7 +202,8 @@ static bool ReadShaderContainerFromGuest(GuestMemoryView& memView, uint32_t gues
     if (vsize + psize < vsize || vsize + psize < psize) {
         return false;
     }
-    uint32_t containerSize = vsize + psize;
+    uint32_t containerSize = 36 + vsize + psize;
+    if (containerSize < vsize) return false;
     if (containerSize > 16 * 1024 * 1024) {
         return false;
     }

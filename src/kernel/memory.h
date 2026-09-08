@@ -155,9 +155,8 @@ struct Memory {
     }
 
     void* Translate(size_t offset) const noexcept {
-        if (offset) {
-            assert(offset < size);
-        }
+        if (!base) return nullptr;
+        if (offset) { assert(offset < size); }
         return base + offset;
     }
 

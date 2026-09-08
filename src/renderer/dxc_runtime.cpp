@@ -7,8 +7,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <unknwn.h>  // IUnknown for DXC COM interfaces
+#include <unknwn.h>
 #include <dxc/dxcapi.h>
+#include <d3d12shader.h>  // for ID3D12ShaderReflection
 #include <wrl/client.h>
 
 #include <cstdlib>
@@ -151,8 +152,8 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
 }
 
 bool DxcRuntime::Compile(std::string_view hlsl, std::string_view entry,
-                         std::string_view profile, std::vector<uint8_t>& dxil,
-                         std::string& error) const {
+                          std::string_view profile, std::vector<uint8_t>& dxil,
+                          std::string& error, bool keepReflection) const {
     dxil.clear();
     error.clear();
     if (!impl_ || !impl_->compiler || !impl_->utils || !loaded_) {
@@ -175,7 +176,7 @@ bool DxcRuntime::Compile(std::string_view hlsl, std::string_view entry,
 
     // Mirror the reference invocation in
     // .research/XenosRecomp/XenosRecomp/dxc_compiler.cpp: same profiles,
-    // HLSL 2021, all-resources-bound, and stripped debug/reflect containers.
+    // HLSL 2021, all-resources-bound.
     const std::wstring wEntry = ToWide(entry.empty() ? "main" : entry);
     const std::wstring wProfile = ToWide(profile);
     std::vector<const wchar_t*> args;
@@ -187,8 +188,10 @@ bool DxcRuntime::Compile(std::string_view hlsl, std::string_view entry,
     args.push_back(L"2021");
     args.push_back(L"-all-resources-bound");
     args.push_back(L"-Wno-ignored-attributes");
-    args.push_back(L"-Qstrip_reflect");
-    args.push_back(L"-Qstrip_debug");
+    if (!keepReflection) {
+        args.push_back(L"-Qstrip_reflect");
+        args.push_back(L"-Qstrip_debug");
+    }
 
     ComPtr<IDxcResult> result;
     hr = impl_->compiler->Compile(&source, args.data(), static_cast<uint32_t>(args.size()),
@@ -223,6 +226,73 @@ bool DxcRuntime::Compile(std::string_view hlsl, std::string_view entry,
     }
     const auto* p = static_cast<const uint8_t*>(obj->GetBufferPointer());
     dxil.assign(p, p + obj->GetBufferSize());
+    return true;
+}
+
+bool DxcRuntime::ReflectCbvBindings(const std::vector<uint8_t>& dxil,
+                                    std::vector<CbvBinding>& outCbvs,
+                                    std::string& error) const {
+    outCbvs.clear();
+    error.clear();
+
+    if (!impl_ || !impl_->utils || !loaded_) {
+        error = "DxcRuntime not loaded";
+        return false;
+    }
+
+    // Create a blob from the DXIL bytes
+    ComPtr<IDxcBlobEncoding> dxilBlob;
+    HRESULT hr = impl_->utils->CreateBlobFromPinned(
+        dxil.data(), static_cast<uint32_t>(dxil.size()), DXC_CP_UTF8,
+        dxilBlob.GetAddressOf());
+    if (FAILED(hr) || !dxilBlob) {
+        error = "CreateBlobFromPinned failed " + HexHr(hr);
+        return false;
+    }
+
+    // Create container reflection
+    DxcBuffer buffer{};
+    buffer.Ptr = dxilBlob->GetBufferPointer();
+    buffer.Size = dxilBlob->GetBufferSize();
+
+    ComPtr<IDxcContainerReflection> reflection;
+    hr = impl_->utils->CreateReflection(&buffer, __uuidof(IDxcContainerReflection),
+                                        reinterpret_cast<void**>(reflection.GetAddressOf()));
+    if (FAILED(hr) || !reflection) {
+        error = "CreateReflection failed " + HexHr(hr);
+        return false;
+    }
+
+    UINT32 partCount = 0;
+    hr = reflection->GetPartCount(&partCount);
+    if (FAILED(hr)) {
+        error = "GetPartCount failed " + HexHr(hr);
+        return false;
+    }
+
+    for (UINT32 part = 0; part < partCount; ++part) {
+        ComPtr<ID3D12ShaderReflection> reflector;
+        hr = reflection->GetPartReflection(part, __uuidof(ID3D12ShaderReflection),
+                                           reinterpret_cast<void**>(reflector.GetAddressOf()));
+        if (FAILED(hr) || !reflector) continue;
+
+        D3D12_SHADER_DESC shaderDesc;
+        hr = reflector->GetDesc(&shaderDesc);
+        if (FAILED(hr)) continue;
+
+        // Iterate all resources and find constant buffers (CBVs)
+        for (UINT i = 0; i < shaderDesc.BoundResources; ++i) {
+            D3D12_SHADER_INPUT_BIND_DESC bindDesc;
+            hr = reflector->GetResourceBindingDesc(i, &bindDesc);
+            if (FAILED(hr)) continue;
+
+            // Type D3D_SIT_CBUFFER = constant buffer (CBV)
+            if (bindDesc.Type == D3D_SIT_CBUFFER) {
+                outCbvs.push_back({bindDesc.BindPoint, bindDesc.Space});
+            }
+        }
+    }
+
     return true;
 }
 

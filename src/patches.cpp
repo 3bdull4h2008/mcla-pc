@@ -13,6 +13,10 @@
 #include "renderer_mode.h"
 #include "vfs_rpf.h"
 
+#include "kernel/memory.h"
+#include "kernel/xbox.h"
+#include "kernel/kernel_objects.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -25,10 +29,12 @@
 #include <unordered_set>
 #include <vector>
 
-
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+
+// Forward declarations for kernel functions via import thunks
+extern "C" uint32_t KeReleaseSemaphore(void *, uint32_t, uint32_t, uint32_t);
 
 static mcla::App::FunctionDispatcher *g_dispatcher = nullptr;
 static uint8_t *g_virtual_membase = nullptr;
@@ -49,6 +55,7 @@ bool StartPulseActive() {
     held = !held;
     phase_end = now + (held ? kStartHoldMs : kStartReleaseMs);
   }
+  return held;
 }
 
 // SESSION 44b: minimal census on sub_821C2AB8 to verify call path
@@ -271,7 +278,7 @@ extern "C" void hk_GpuKick(mcla::native::PPCContext &ctx, uint8_t *base);
 extern "C" void hk_sub_824569C8(mcla::native::PPCContext &ctx, uint8_t *base);
 // hk_sub_82413660 (dead dispatcher duplicate) removed in P5'/B8 — the live
 // owner of guest 0x82413660 is the global-scope PPC_FUNC override in
-// src/gpu_device.cpp, which now enqueues DRAW_CAPTURED directly.
+// src/gpu_device.cpp; native geometry submission is owned by sub_82420BA8.
 extern "C" void hk_sub_82411840(mcla::native::PPCContext &ctx, uint8_t *base);
 
 PPC_FUNC_IMPL(__imp__sub_82413660);
@@ -421,6 +428,9 @@ bool BisectGroupEnabled(std::string_view group) {
 
 void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
   MCLA_LOG_ERROR("=== mcla_ApplyPatches ENTERED ===");
+  const std::string_view groups = MCLA_CVAR_GET_STRING(mcla_patch_groups);
+  MCLA_LOG_ERROR("mcla_patch_groups = '{}'", groups);
+  MCLA_LOG_ERROR("BisectGroupEnabled('ke') = {}", BisectGroupEnabled("ke") ? "true" : "false");
   g_dispatcher = dispatcher;
 
   dispatcher->SetFunction(0x82554080, sub_82554080_stub);
@@ -460,68 +470,57 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     return;
   }
 
-  if (BisectGroupEnabled("ke")) {
+  if (true) { // BisectGroupEnabled("ke") - FORCE ENABLED
+    MCLA_LOG_WARN("Installing KeWaitForSingleObject hook at 0x827BD5A4 (FORCE ENABLED)");
+    g_original_KeWait = dispatcher->GetFunction(0x827BD5A4);
     dispatcher->SetFunction(0x827BD5A4, hk_KeWaitForSingleObject);
-    g_original_KeWait = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(
-            reinterpret_cast<void *>(&__imp__KeWaitForSingleObject)),
-        hk_KeWaitForSingleObject);
     if (!g_original_KeWait) {
-      MCLA_LOG_ERROR("Failed to detour __imp__KeWaitForSingleObject");
+      MCLA_LOG_ERROR("KeWaitForSingleObject original not found in dispatch table");
     }
   }
 
   if (BisectGroupEnabled("fs")) {
+    g_original_NtCreateFile = dispatcher->GetFunction(0x827BD934);
     dispatcher->SetFunction(0x827BD934, hk_NtCreateFile);
-    g_original_NtCreateFile = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(
-            reinterpret_cast<void *>(&__imp__NtCreateFile)),
-        hk_NtCreateFile);
     if (!g_original_NtCreateFile) {
-      MCLA_LOG_ERROR("Failed to detour __imp__NtCreateFile");
+      MCLA_LOG_ERROR("NtCreateFile original not found in dispatch table");
     }
 
+    g_original_NtReadFile = dispatcher->GetFunction(0x827BD914);
     dispatcher->SetFunction(0x827BD914, hk_NtReadFile);
-    g_original_NtReadFile = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(
-            reinterpret_cast<void *>(&__imp__NtReadFile)),
-        hk_NtReadFile);
     if (!g_original_NtReadFile) {
-      MCLA_LOG_ERROR("Failed to detour __imp__NtReadFile");
+      MCLA_LOG_ERROR("NtReadFile original not found in dispatch table");
     }
 
+    g_original_NtQueryInformationFile = dispatcher->GetFunction(0x827BD9D4);
     dispatcher->SetFunction(0x827BD9D4, hk_NtQueryInformationFile);
-    g_original_NtQueryInformationFile = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(
-            reinterpret_cast<void *>(&__imp__NtQueryInformationFile)),
-        hk_NtQueryInformationFile);
     if (!g_original_NtQueryInformationFile) {
-      MCLA_LOG_ERROR("Failed to detour __imp__NtQueryInformationFile");
+      MCLA_LOG_ERROR("NtQueryInformationFile original not found in dispatch table");
     }
 
+    g_original_NtClose = dispatcher->GetFunction(0x827BCEB4);
     dispatcher->SetFunction(0x827BCEB4, hk_NtClose);
-    g_original_NtClose = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(reinterpret_cast<void *>(&__imp__NtClose)),
-        hk_NtClose);
     if (!g_original_NtClose) {
-      MCLA_LOG_ERROR("Failed to detour __imp__NtClose");
+      MCLA_LOG_ERROR("NtClose original not found in dispatch table");
     }
   }
 
   if (BisectGroupEnabled("in")) {
     dispatcher->SetFunction(0x827BDC64, hk_XamInputGetState);
+
+    auto *ks = mcla::GetApp();
+    if (ks) {
+      g_virtual_membase = ks->GetPPCBase();
+    }
+
+    // DetourImportThunk for hotpatch thunk analysis (x86 pointer, not PPC)
     g_original_XamInputGetState = mcla_DetourImportThunk(
         reinterpret_cast<uint8_t *>(
             reinterpret_cast<void *>(&__imp__XamInputGetState)),
         hk_XamInputGetState);
     if (!g_original_XamInputGetState) {
-      MCLA_LOG_ERROR("Failed to detour __imp__XamInputGetState");
+      MCLA_LOG_WARN("XamInputGetState thunk detour failed (hotpatch analysis skipped, hook still active)");
     } else {
-      auto *ks = mcla::GetApp();
-      if (ks) {
-        g_virtual_membase = ks->GetPPCBase();
-      }
-
       uint8_t *hotpatch_thunk = (uint8_t *)g_original_XamInputGetState;
       if (hotpatch_thunk[0] == 0xE9) {
         int32_t rel = *reinterpret_cast<int32_t *>(hotpatch_thunk + 1);
@@ -599,7 +598,7 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
       }
     }
 
-    if (BisectGroupEnabled("gp")) {
+    if (true) { // BisectGroupEnabled("gp") - FORCE ENABLED
       mcla::gpu::CpInstallMmioRouting();
       mcla::gpu::InstallGpuHooks(dispatcher, mcla::gpu::GpuHooks{});
 
@@ -613,15 +612,15 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     }
 
     // Start render thread for P4.5' - owns all D3D12 calls
-    // DISABLED for bisection: mcla::native::g_renderThread.start();
-    // MCLA_LOG_ERROR("mcla_ApplyPatches: Render thread started (P4.5')");
+    mcla::native::g_renderThread.start();
+    MCLA_LOG_ERROR("mcla_ApplyPatches: Render thread started (P4.5')");
 
     // Device-boundary draw capture (sub_82413660) is owned by the
     // global-scope PPC_FUNC override in src/gpu_device.cpp (P5'/B8) — the
     // dispatcher map is not consulted for guest calls, so registering here
     // would be dead code.
 
-    if (BisectGroupEnabled("gp")) {
+    if (true) { // BisectGroupEnabled("gp") - FORCE ENABLED
       dispatcher->SetFunction(0x82130690, hk_sub_82130690);
       dispatcher->SetFunction(0x82130770, hk_sub_82130770);
       dispatcher->SetFunction(0x82130850, hk_sub_82130850);
@@ -629,7 +628,7 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
       dispatcher->SetFunction(0x82130A18, hk_sub_82130A18);
     }
 
-    if (BisectGroupEnabled("ps")) {
+    if (true) { // BisectGroupEnabled("ps") - FORCE ENABLED
       g_press_start_shim_thunk =
           dispatcher->AllocateThunk(hk_press_start_shim, 0x82554080);
       dispatcher->SetFunction(g_press_start_shim_thunk, hk_press_start_shim);
@@ -668,32 +667,40 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
   } // end BisectGroupEnabled("gp")
 
   if (mode != "compat" && !BisectGroupEnabled("native")) {
+    g_orig_VdSwap_observer = dispatcher->GetFunction(0x827BD6E4);
     dispatcher->SetFunction(0x827BD6E4, hk_vdswap_observer);
-    g_orig_VdSwap_observer = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(reinterpret_cast<void *>(&__imp__VdSwap)),
-        hk_vdswap_observer);
     if (g_orig_VdSwap_observer) {
       MCLA_LOG_INFO("VdSwap observer installed (passthrough, legacy mode)");
     } else {
-      MCLA_LOG_ERROR("VdSwap observer: thunk detour FAILED");
+      MCLA_LOG_ERROR("VdSwap observer: original not found in dispatch table");
     }
 
     // Detour VdInitializeEngines to call the recompiled implementation
+    g_orig_VdInitializeEngines = dispatcher->GetFunction(0x827BD574);
     dispatcher->SetFunction(0x827BD574, hk_VdInitializeEngines);
-    g_orig_VdInitializeEngines = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(
-            reinterpret_cast<void *>(&__imp__VdInitializeEngines)),
-        hk_VdInitializeEngines);
     if (g_orig_VdInitializeEngines) {
       MCLA_LOG_INFO(
           "VdInitializeEngines detour installed (calls recompiled impl)");
     } else {
-      MCLA_LOG_ERROR("VdInitializeEngines detour: thunk detour FAILED");
+      MCLA_LOG_ERROR("VdInitializeEngines original not found in dispatch table");
     }
   }
 
   MCLA_LOG_INFO("MCLA patches applied (1 entry + 5 GPU hooks + 5 timer hooks + "
                 "native renderer + screen hooks)");
+
+  // Signal the GPU init semaphore (0x40004D7C) after 3 seconds to unblock loading screen
+  std::thread([ ] {
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    void *sem_host = mem.Translate(0x40004D7C);
+    if (sem_host) {
+      KeReleaseSemaphore(sem_host, 1, 1, 0);
+      MCLA_LOG_WARN("Signaled GPU init semaphore 0x40004D7C via KeReleaseSemaphore");
+    } else {
+      MCLA_LOG_ERROR("Failed to translate semaphore 0x40004D7C");
+    }
+  }).detach();
 }
 
 static constexpr uint32_t kMaxPm4Count = 0x800;
@@ -791,16 +798,16 @@ PPC_FUNC_IMPL(hk_KeWaitForSingleObject) {
   static int waitCount = 0;
   waitCount++;
 
-  if (ctx.r3.u32 == kDisplaySyncSem) {
+  if (ctx.r3.u32 == kDisplaySyncSem || ctx.r3.u32 == kSchedulerTick) {
     if (waitCount <= 5) {
-      MCLA_LOG_INFO("KeWait[{}] DISPLAY-SYNC SEM 0x{:08X} -> SKIPPED",
+      MCLA_LOG_WARN("KeWait[{}] SEM 0x{:08X} -> SKIPPED (return 0)",
                     waitCount, ctx.r3.u32);
     }
     ctx.r3.u64 = 0;
     return;
   }
 
-  if (ctx.r3.u32 != kSchedulerTick && waitCount <= 200) {
+  if (waitCount <= 200) {
     MCLA_LOG_INFO("KeWait[{}] obj=0x{:08X} -> chaining to original", waitCount,
                   ctx.r3.u32);
   }
@@ -817,9 +824,10 @@ PPC_FUNC_IMPL(hk_XamInputGetState) {
   uint32_t port = ctx.r3.u32;
   uint32_t buf = ctx.r5.u32;
 
-  if (callCount <= 10) {
-    MCLA_LOG_INFO("XamInputGetState[{}]: port={} buf=0x{:08X} held={}",
-                  callCount, port, buf, StartPulseActive());
+  if (callCount <= 100 || (callCount % 1000) == 0) {
+    MCLA_LOG_INFO("XamInputGetState[{}]: port={} buf=0x{:08X} held={} lr={:08X}",
+                  callCount, port, buf, StartPulseActive(),
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
   }
 
   if (buf >= 0x10000000) {
@@ -828,7 +836,7 @@ PPC_FUNC_IMPL(hk_XamInputGetState) {
     } else {
       PPC_STORE_U16(buf + 4, 0x0000);
     }
-    if (callCount <= 5) {
+    if (callCount <= 50 || (callCount % 1000) == 0) {
       MCLA_LOG_INFO("XamInputGetState[{}]: Start held={} buf=0x{:08X}",
                     callCount, StartPulseActive(), buf);
     }
@@ -851,13 +859,15 @@ PPC_FUNC_IMPL(hk_NtCreateFile) {
 
 PPC_FUNC_IMPL(hk_NtReadFile) {
   uint32_t file_handle = ctx.r3.u32;
-  void *buffer = reinterpret_cast<void *>(ctx.r4.u32);
-  uint32_t length = ctx.r5.u32;
+  uint32_t io_status = ctx.r7.u32;
+  uint32_t buffer = ctx.r8.u32;
+  uint32_t length = ctx.r9.u32;
   uint32_t bytes_read = 0;
   if (mcla::vfs::hooks::NtReadFileHook(file_handle, buffer, length,
                                        bytes_read)) {
     ctx.r3.u32 = 0;
-    ctx.r4.u32 = bytes_read;
+    if (io_status)
+      mcla::native::WriteGuestU32(io_status, bytes_read);
     return;
   }
   if (g_original_NtReadFile)
@@ -866,9 +876,10 @@ PPC_FUNC_IMPL(hk_NtReadFile) {
 
 PPC_FUNC_IMPL(hk_NtQueryInformationFile) {
   uint32_t file_handle = ctx.r3.u32;
-  void *buffer = reinterpret_cast<void *>(ctx.r4.u32);
-  uint32_t length = ctx.r5.u32;
-  uint32_t info_class = ctx.r6.u32;
+  uint32_t io_status = ctx.r4.u32;
+  uint32_t buffer = ctx.r5.u32;
+  uint32_t length = ctx.r6.u32;
+  uint32_t info_class = ctx.r7.u32;
   if (mcla::vfs::hooks::NtQueryInformationFileHook(file_handle, buffer, length,
                                                    info_class)) {
     ctx.r3.u32 = 0;
@@ -889,6 +900,12 @@ PPC_FUNC_IMPL(hk_NtClose) {
 }
 
 PPC_FUNC_IMPL(hk_sub_82554E20) {
+  static int callCount = 0;
+  callCount++;
+  if (callCount <= 50 || (callCount % 1000) == 0) {
+    MCLA_LOG_INFO("hk_sub_82554E20[{}]: lr={:08X}", callCount,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
   if (g_orig_sub_82554E20)
     g_orig_sub_82554E20(ctx, base);
 }
@@ -910,12 +927,13 @@ PPC_FUNC_IMPL(hk_sub_824569C8) {
 
 // hk_sub_82413660 removed (P5'/B8): never registered (dispatcher map is not
 // consulted for guest calls), and duplicated the live global-scope override
-// PPC_FUNC(sub_82413660) in src/gpu_device.cpp, which now owns both the
-// VB/IB capture and the DRAW_CAPTURED enqueue for the render thread.
+// PPC_FUNC(sub_82413660) in src/gpu_device.cpp, which remains diagnostic-only;
+// native geometry submission is owned by sub_82420BA8.
 
 PPC_FUNC_IMPL(hk_sub_82411840) {
   // Device-boundary draw consumer hook - native path
-  const uint32_t n = 0;
+  static std::atomic<uint32_t> s_hookCount{0};
+  const uint32_t n = s_hookCount.fetch_add(1) + 1;
   const uint32_t dev = ctx.r3.u32;
   const uint32_t cls = ctx.r4.u32;
   const uint32_t arg = ctx.r5.u32;
@@ -1721,9 +1739,10 @@ PPC_FUNC(sub_821DE9D8) {
     // with full caller context (LR, stack, TLS) to identify who later overflows
     // the 16-byte elements. The overflow root cause is a write >16 bytes into
     // these nodes - we need to know who allocates them and where from.
+    const uint32_t a = s_allocCensus.fetch_add(1) + 1;
     if (elemsize == 16 && capacity == 1018) {
       Arm16BytePoolPayloadWatch(slab, elemsize, capacity);
-      const uint32_t allocIdx = s_allocCensus.fetch_add(1) + 1;
+      const uint32_t allocIdx = a;
       const uint32_t sp = ctx.r1.u32;
       const uint32_t bc = OomCensusReadU32(sp);
 
@@ -1817,7 +1836,6 @@ PPC_FUNC(sub_821DE9D8) {
       }
     }
 
-    const uint32_t a = s_allocCensus.fetch_add(1) + 1;
     if (a <= 16 || a % 4096 == 0) {
       const uint32_t sp = ctx.r1.u32;
       const uint32_t bc = OomCensusReadU32(sp);

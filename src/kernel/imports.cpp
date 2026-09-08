@@ -291,6 +291,7 @@ uint32_t XamContentGetDeviceState() { return 0; }
 
 uint32_t XamUserGetSigninInfo(uint32_t userIndex, uint32_t flags,
                               XUSER_SIGNIN_INFO *info) {
+  if (!info) return ERROR_INVALID_PARAMETER;
   if (userIndex == 0) {
     memset(info, 0, sizeof(*info));
     info->xuid = 0xB13EBABEBABEBABE;
@@ -309,7 +310,7 @@ uint32_t XamShowDeviceSelectorUI(uint32_t userIndex, uint32_t contentType,
                                  be<uint32_t> *deviceId,
                                  XXOVERLAPPED *overlapped) {
   XamNotifyEnqueueEvent(9, true);
-  *deviceId = 1;
+  if (deviceId) *deviceId = 1;
   XamNotifyEnqueueEvent(9, false);
   return 0;
 }
@@ -583,10 +584,11 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
     }
   }
   uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-  assert(timeout == 0 || timeout == INFINITE);
 
   if (IsKernelObject(Handle)) {
-    const uint32_t st = GetKernelObject(Handle)->Wait(timeout);
+    auto* obj = GetKernelObject(Handle);
+    if (!obj) { g_ppcContext->r3.u32 = STATUS_INVALID_HANDLE; return STATUS_INVALID_HANDLE; }
+    const uint32_t st = obj->Wait(timeout);
     {
       static std::atomic<uint32_t> s_wcNtwR{0};
       const uint32_t n = s_wcNtwR.fetch_add(1) + 1;
@@ -657,6 +659,7 @@ uint32_t ExGetXConfigSetting(uint16_t Category, uint16_t Setting, void *Buffer,
     default:
       return 1;
     }
+    break;
   }
 
   case 0x0003: {
@@ -783,6 +786,7 @@ void MmQueryStatistics() { LOG_UTILITY("!!! STUB !!!"); }
 
 uint32_t NtCreateEvent(be<uint32_t> *handle, void *objAttributes,
                        uint32_t eventType, uint32_t initialState) {
+  if (!handle) return STATUS_INVALID_PARAMETER;
   *handle =
       GetKernelHandle(CreateKernelObject<Event>(!eventType, !!initialState));
 
@@ -1008,6 +1012,9 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
       offset = fileObj->fileHandle.position;
     }
     ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
+    if (ok) {
+      fileObj->fileHandle.position += bytesRead;
+    }
     MCLA_LOG_DEBUG("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes", handle,
                    offset, length, bytesRead);
   } else {
@@ -1170,6 +1177,7 @@ void KeSetBasePriorityThread(GuestThreadHandle *hThread, int priority) {
 
 uint32_t ObReferenceObjectByHandle(uint32_t handle, uint32_t objectType,
                                    be<uint32_t> *object) {
+  if (!object) return STATUS_INVALID_PARAMETER;
   *object = handle;
   return 0;
 }
@@ -1308,7 +1316,7 @@ void KfAcquireSpinLock(uint32_t *spinLock) {
     }
 
     const uint32_t n = ++spins;
-    if (n <= 40 || (n % 1024) == 0) {
+    if (n <= 60 || (n % 5000) == 0) {
       const uint32_t holder = bswap32(spinLockRef.load());
       MCLA_LOG_INFO("KFSPIN-CONTENDED lock@{:08X} holder_r13be={:08X} "
                     "spins={} lr={:08X}",
@@ -1332,7 +1340,7 @@ void MmFreePhysicalMemory(uint32_t type, uint32_t guestAddress) {
 }
 
 bool VdPersistDisplay(uint32_t a1, uint32_t *a2) {
-  *a2 = NULL;
+  if (a2) *a2 = NULL;
   return false;
 }
 
@@ -1396,7 +1404,7 @@ void KeAcquireSpinLockAtRaisedIrql(uint32_t *spinLock) {
 
   while (true) {
     uint32_t expected = 0;
-    if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
+    if (spinLockRef.compare_exchange_weak(expected, bswap32(g_ppcContext->r13.u32)))
       break;
 
     std::this_thread::yield();
@@ -1530,11 +1538,15 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
             (void)memP.ReadU32BE(currentUserData + 16700, &flipCur);
             (void)memP.ReadU32BE(currentUserData + 16704, &flipTgt);
             (void)memP.ReadU32BE(currentUserData + 16544, &flipCb);
-            MCLA_LOG_INFO("VSYNC-ISR enter f={} spin={:08X} flips={}/{} "
-                          "cb={:08X}",
-                          frame, isrSpin, flipCur, flipTgt, flipCb);
-            fn(cbCtx, base);
-            MCLA_LOG_INFO("VSYNC-ISR exit f={}", frame);
+            if (frame < 60 || (frame % 5000) == 0) {
+                MCLA_LOG_INFO("VSYNC-ISR enter f={} spin={:08X} flips={}/{} "
+                              "cb={:08X}",
+                              frame, isrSpin, flipCur, flipTgt, flipCb);
+                fn(cbCtx, base);
+                MCLA_LOG_INFO("VSYNC-ISR exit f={}", frame);
+            } else {
+                fn(cbCtx, base);
+            }
             // Kernel-role vblank duty (2026-08-24): drain the
             // primary ring up to the driver's current wptr via
             // the existing frozen-capability DrainRing. XTEB+88
@@ -1601,7 +1613,7 @@ static void SignalSchedulerTick() {
   static std::atomic<uint32_t> s_tickProbes{0};
   const uint32_t probeN = s_tickProbes.fetch_add(1) + 1;
   auto logPath = [&](const char *path) {
-    if (probeN <= 20 || (probeN % 500) == 0)
+    if (probeN <= 60 || (probeN % 5000) == 0)
       MCLA_LOG_INFO("TICK-PROBE #{} path={}", probeN, path);
   };
 
@@ -1874,8 +1886,7 @@ bool KeSetEvent(XKEVENT *pEvent, uint32_t Increment, bool Wait) {
     }
   }
 
-  Event *ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
-  bool result = ev ? ev->Set() : QueryKernelObject<Event>(*pEvent)->Set();
+  bool result = QueryKernelObject<Event>(*pEvent)->Set();
 
   ++g_keSetEventGeneration;
   g_keSetEventGeneration.notify_all();
@@ -1884,8 +1895,7 @@ bool KeSetEvent(XKEVENT *pEvent, uint32_t Increment, bool Wait) {
 }
 
 bool KeResetEvent(XKEVENT *pEvent) {
-  Event *ev = ResolveCreatedObject<Event>(pEvent, sizeof(XKEVENT));
-  return ev ? ev->Reset() : QueryKernelObject<Event>(*pEvent)->Reset();
+  return QueryKernelObject<Event>(*pEvent)->Reset();
 }
 
 uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
@@ -1935,9 +1945,22 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     }
   }
   const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-  assert(timeout == 0 || timeout == INFINITE);
 
   uint8_t type = Object->Type;
+
+  // TYPE CENSUS: track all incoming types to confirm the default path theory.
+  {
+    static std::atomic<uint32_t> s_typeLogs{};
+    const uint32_t n = s_typeLogs.fetch_add(1) + 1;
+    if (n <= 20 || (n % 500) == 0) {
+      MCLA_LOG_INFO("KWFSO type-census #{:04} type={:02X} obj={:08X} "
+                    "timeout={:08X} lr={:08X}",
+                    n, type,
+                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)),
+                    timeout,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
 
   // Return the real wait result. Previously this hooked call returned
   // STATUS_SUCCESS unconditionally, which starved guest workers that branch
@@ -1948,25 +1971,40 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   switch (type) {
   case 0:
   case 1: {
-    Event *ev = ResolveCreatedObject<Event>(Object, sizeof(XKEVENT));
-    if (!ev)
-      ev = QueryKernelObject<Event>(*Object);
-    waitStatus = ev->Wait(timeout);
+    // TYPE-0 SEMAPHORE FIX: game driver writes Type=0 (EventNotification)
+    // into the dispatcher header of semaphores. Release paths always use
+    // QueryKernelObject<Semaphore>, so check if the wrapper map already
+    // has a Semaphore for this address — if so, wait on that instead of
+    // creating a mismatched Event wrapper.
+    Semaphore *sem = TryQueryKernelObject<Semaphore>(*Object);
+    if (sem) {
+      waitStatus = sem->Wait(timeout);
+    } else {
+      Event *ev = QueryKernelObject<Event>(*Object);
+      waitStatus = ev->Wait(timeout);
+    }
     break;
   }
 
   case 5: {
-    Semaphore *sem =
-        ResolveCreatedObject<Semaphore>(Object, sizeof(XKSEMAPHORE));
-    if (!sem)
-      sem = QueryKernelObject<Semaphore>(*Object);
+    Semaphore *sem = QueryKernelObject<Semaphore>(*Object);
     waitStatus = sem->Wait(timeout);
     break;
   }
 
-  default:
-    assert(false && "Unrecognized kernel object type.");
+  default: {
+    static std::atomic<uint32_t> s_typeCensus{};
+    const uint32_t n = s_typeCensus.fetch_add(1) + 1;
+    if (n <= 20 || (n % 500) == 0) {
+      uint32_t objAddr =
+          mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
+      MCLA_LOG_WARN("KWFSO unknown-type #{:04} obj={:08X} type={:02X} "
+                    "timeout={:08X} lr={:08X}",
+                    n, objAddr, type, timeout,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
     return STATUS_TIMEOUT;
+  }
   }
 
   {
@@ -2249,7 +2287,8 @@ void XeKeysGetKey() {
       *reinterpret_cast<uint32_t *>(&cert[8]) = __builtin_bswap32(0x10001);
       // Remaining bytes are modulus (zero = signature verify "passes" with zero
       // modulus)
-      (void)mem.WriteBytes(output, cert, outputSize);
+      uint32_t readSize = (std::min)(outputSize, 0x140u);
+      (void)mem.WriteBytes(output, cert, readSize);
     }
   }
 }
@@ -2373,23 +2412,43 @@ void MmTrackAllocationSize(uint32_t guestAddress, uint32_t size) {
   s_allocSizeMap[guestAddress] = size;
 }
 
-uint32_t NtClearEvent(Event *handle, uint32_t *previousState) {
-  handle->Reset();
-  return 0;
+uint32_t NtClearEvent(uint32_t handle, uint32_t *previousState) {
+  if (auto* obj = GetKernelObject(handle)) {
+    if (auto* evt = dynamic_cast<Event*>(obj)) {
+      evt->Reset();
+      if (previousState) *previousState = 0;
+      return 0;
+    }
+    DestroyKernelObject(obj);
+  }
+  return STATUS_INVALID_HANDLE;
 }
 
-uint32_t NtResumeThread(GuestThreadHandle *hThread, uint32_t *suspendCount) {
-  assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE));
+uint32_t NtResumeThread(uint32_t hThread, uint32_t *suspendCount) {
+  if (auto* obj = GetKernelObject(hThread)) {
+    if (auto* th = dynamic_cast<GuestThreadHandle*>(obj)) {
+      assert(th != GetKernelObject(CURRENT_THREAD_HANDLE));
 
-  hThread->suspended = false;
-  hThread->suspended.notify_all();
+      th->suspended = false;
+      th->suspended.notify_all();
 
-  return S_OK;
+      return S_OK;
+    }
+    DestroyKernelObject(obj);
+  }
+  return STATUS_INVALID_HANDLE;
 }
 
-uint32_t NtSetEvent(Event *handle, uint32_t *previousState) {
-  handle->Set();
-  return 0;
+uint32_t NtSetEvent(uint32_t handle, uint32_t *previousState) {
+  if (auto* obj = GetKernelObject(handle)) {
+    if (auto* evt = dynamic_cast<Event*>(obj)) {
+      evt->Set();
+      if (previousState) *previousState = 0;
+      return 0;
+    }
+    DestroyKernelObject(obj);
+  }
+  return STATUS_INVALID_HANDLE;
 }
 
 uint32_t NtCreateSemaphore(be<uint32_t> *Handle,
@@ -2437,18 +2496,7 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
     }
   }
 
-  // IDENTITY RESOLUTION (session 16 fix): the game's driver re-initializes
-  // dispatcher headers after NtCreateSemaphore (it owns these structs),
-  // wiping our OBJECT_SIGNATURE - QueryKernelObject's lazy-wrap then built
-  // a PHANTOM wrapper over raw bytes (probe: release landed on guest
-  // C9ADB880 with garbage count while consumers waited wrapper C5218280).
-  // Resolve identically to the wait path (NtWaitForSingleObjectEx ->
-  // GetKernelObject = pure identity translation) and only fall back to
-  // lazy-wrap for addresses we never created.
-  Semaphore *sem = ResolveCreatedObject<Semaphore>(Handle, sizeof(XKSEMAPHORE));
-  if (!sem) {
-    sem = QueryKernelObject<Semaphore>(Handle->Header);
-  }
+  Semaphore *sem = QueryKernelObject<Semaphore>(Handle->Header);
 
   uint32_t previousCount;
   sem->Release(ReleaseCount, &previousCount);
@@ -2776,7 +2824,7 @@ uint32_t KeRaiseIrqlToDpcLevel() { return 0; }
 
 void KfLowerIrql() {}
 
-uint32_t KeReleaseSemaphore(XKSEMAPHORE *semaphore, uint32_t increment,
+extern "C" uint32_t KeReleaseSemaphore(XKSEMAPHORE *semaphore, uint32_t increment,
                             uint32_t adjustment, uint32_t wait) {
   // SIGNAL CENSUS (2026-08-23 session 9): same attribution as KeSetEvent.
   {
@@ -2791,11 +2839,7 @@ uint32_t KeReleaseSemaphore(XKSEMAPHORE *semaphore, uint32_t increment,
     }
   }
 
-  Semaphore *sem =
-      ResolveCreatedObject<Semaphore>(semaphore, sizeof(XKSEMAPHORE));
-  if (!sem) {
-    sem = QueryKernelObject<Semaphore>(semaphore->Header);
-  }
+  Semaphore *sem = QueryKernelObject<Semaphore>(semaphore->Header);
   sem->Release(adjustment, nullptr);
 
   ++g_keSetEventGeneration;
@@ -2945,7 +2989,12 @@ GUEST_FUNCTION_HOOK(__imp__KeQueryPerformanceFrequency,
                     KeQueryPerformanceFrequency);
 GUEST_FUNCTION_HOOK(__imp__MmFreePhysicalMemory, MmFreePhysicalMemory);
 GUEST_FUNCTION_HOOK(__imp__VdPersistDisplay, VdPersistDisplay);
-GUEST_FUNCTION_HOOK(__imp__VdSwap, VdSwap);
+// VdSwap: replaced GUEST_FUNCTION_HOOK with direct forwarding to native renderer.
+// The original GUEST_FUNCTION_HOOK intercepted the import thunk and called a no-op,
+// preventing Hooked_VdSwap at 0x827BD6E4 from ever executing.
+// Forward to the native renderer's Hooked_VdSwap which handles PRESENT + frame advance.
+extern "C" void Hooked_VdSwap(PPCContext &ctx, unsigned char *base);
+PPC_FUNC(__imp__VdSwap) { Hooked_VdSwap(ctx, base); }
 GUEST_FUNCTION_HOOK(__imp__VdGetSystemCommandBuffer, VdGetSystemCommandBuffer);
 GUEST_FUNCTION_HOOK(__imp__KeReleaseSpinLockFromRaisedIrql,
                     KeReleaseSpinLockFromRaisedIrql);

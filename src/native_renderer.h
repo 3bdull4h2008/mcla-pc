@@ -53,8 +53,9 @@ struct MclaGpuContext {
     uint32_t rbSurfaceInfoP2;
     uint32_t rbSurfaceInfoP3;
     uint32_t rbSurfaceInfoP4;
+    uint32_t rbSurfaceInfoP5;
 
-    uint8_t _pad30D0[0x317C - 0x30AC];
+    uint8_t _pad30B0[0x317C - 0x30B0];
 
     uint32_t sqVsConst;
     uint32_t sqPsConst;
