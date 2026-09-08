@@ -95,7 +95,7 @@ std::atomic<uint32_t> g_progressBlk{0}; // submitting thread's *(r13+256) block
 //
 // Cursors kept strictly separate:
 //   producedEnd  - driver-space endVA through which the guest has SUBMITTED
-//                  (fed by reservations; cross-checked vs GPU_ctx+0x30)
+//                  (fed by reservations; cross-checked vs primary ring wptr)
 //   consumedEnd  - driver-space endVA the host consumer has accounted
 //   g_pushWatermark - guest-visible consumed watermark (pub mirrors)
 //   XTEB+0x58    - per-thread progress, advanced ONLY by real consumption
@@ -348,9 +348,7 @@ void CpAdvanceGuestPublication(uint32_t windowsCompleted) {
       st = &g_pubStates.back();
     }
     uint32_t next = st->count + 2u * windowsCompleted;
-    if (next > put) {
-      next = put; // never publish beyond the guest's own production cursor
-    }
+    if (next < st->count || next > put) next = put;  // overflow guard
     if (next != st->count) {
       const uint32_t prev = st->count;
       st->count = next;
@@ -522,13 +520,15 @@ void CreditDeferredRange(uint32_t startVA, uint32_t endVA) {
   std::vector<PendingConsume> done;
   {
     std::lock_guard<std::mutex> lock(g_pendingMutex);
-    for (size_t i = g_pendingWindows.size(); i-- > 0;) {
-      const auto &w = g_pendingWindows[i];
-      if (w.startVA >= startVA && w.endVA <= endVA) {
-        done.push_back(w);
-        g_pendingWindows.erase(g_pendingWindows.begin() + static_cast<long>(i));
-      }
-    }
+    auto it = std::remove_if(g_pendingWindows.begin(), g_pendingWindows.end(),
+                             [&](const PendingConsume &w) {
+                               if (w.startVA >= startVA && w.endVA <= endVA) {
+                                 done.push_back(w);
+                                 return true;
+                               }
+                               return false;
+                             });
+    g_pendingWindows.erase(it, g_pendingWindows.end());
   }
   if (done.empty()) {
     return;
@@ -963,10 +963,13 @@ void CpConsumePushWindow(uint32_t endVA, uint32_t dwords) {
   if (DeferredConsumeEnabled()) {
     // Experiment: record the submitted range; do NOT credit consumption.
     // The vblank-paced consumer credits it once the driver's production
-    // cursor (GPU_ctx+0x30) actually covers the range.
+    // cursor (PrimaryRing lastDoorbellWptr) actually covers the range.
     std::lock_guard<std::mutex> lock(g_pendingMutex);
     const uint32_t prevEnd = g_producedEnd.load(std::memory_order_relaxed);
     if (endVA > prevEnd) {
+      if (g_pendingWindows.size() >= 4096) {
+        g_pendingWindows.erase(g_pendingWindows.begin());
+      }
       g_pendingWindows.push_back({prevEnd, endVA, dwords});
       g_producedEnd.store(endVA, std::memory_order_relaxed);
       // Bound sanity: production between vblanks is frame-sized; a
@@ -1007,29 +1010,37 @@ void CpConsumePushWindow(uint32_t endVA, uint32_t dwords) {
 }
 
 // VBLANK-PACED CONSUMER (deferred-consumption experiment). Credits only
-// ranges the driver has actually produced (GPU_ctx+0x30 covers them), then
-// publishes the consumed watermark and advances progress by EXACTLY those
-// dwords - never a forced amount. Runs once per vblank from
+// ranges the driver has actually produced (via PrimaryRing lastDoorbellWptr),
+// then publishes the consumed watermark and advances progress by EXACTLY
+// those dwords - never a forced amount. Runs once per vblank from
 // CpVblankDrainToWptr; no-op unless the experiment flag is on.
 void ConsumePendingAtVblank() {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
 
-  uint32_t gpuCtxPtr = 0, producedVA = 0;
-  if (!mem.ReadU32BE(0x82839254u, &gpuCtxPtr) || gpuCtxPtr == 0) {
+  RingState *ring = PrimaryRing();
+  if (!ring) {
     return;
   }
-  if (!mem.ReadU32BE(gpuCtxPtr + 0x30u, &producedVA)) {
+  const uint32_t wptrIdx =
+      ring->lastDoorbellWptr.load(std::memory_order_relaxed);
+  if (wptrIdx == 0xFFFFFFFFu) {
     return;
   }
+  // Convert dword wptr index to byte VA in the ring's address space.
+  const uint32_t producedVA =
+      ring->baseGuestVA + wptrIdx * 4u;
 
   std::vector<PendingConsume> ready;
   {
     std::lock_guard<std::mutex> lock(g_pendingMutex);
-    while (!g_pendingWindows.empty() &&
-           g_pendingWindows.front().endVA <= producedVA) {
-      ready.push_back(g_pendingWindows.front());
-      g_pendingWindows.erase(g_pendingWindows.begin());
+    size_t count = 0;
+    while (count < g_pendingWindows.size() &&
+           g_pendingWindows[count].endVA <= producedVA) {
+      ready.push_back(g_pendingWindows[count]);
+      count++;
     }
+    g_pendingWindows.erase(g_pendingWindows.begin(),
+                           g_pendingWindows.begin() + count);
   }
   if (ready.empty()) {
     return;
@@ -1106,11 +1117,15 @@ void CpVblankDrainToWptr() {
   const uint32_t vdN = s_vdInvocations.fetch_add(1) + 1;
   if (vdN <= 16 || (vdN % 500) == 0) {
     auto &memC = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t gpuCtxC = 0, wptrVAC = 0;
+    uint32_t gpuCtxC = 0, ctx30Val = 0;
     (void)memC.ReadU32BE(0x82839254u, &gpuCtxC);
     if (gpuCtxC != 0) {
-      (void)memC.ReadU32BE(gpuCtxC + 0x30u, &wptrVAC);
+      (void)memC.ReadU32BE(gpuCtxC + 0x30u, &ctx30Val);
     }
+    RingState *pring = PrimaryRing();
+    const uint32_t primaryWptr =
+        pring ? pring->lastDoorbellWptr.load(std::memory_order_relaxed)
+              : 0xFFFFFFFFu;
     std::string ringDump;
     {
       std::lock_guard<std::mutex> dumpLock(g_ringMutex);
@@ -1127,9 +1142,11 @@ void CpVblankDrainToWptr() {
       }
     }
     MCLA_LOG_INFO("CP: VDRAIN-CENSUS #{} def={} gpuCtx={:08X} ctx+30={:08X} "
+                  "primaryWptr={:08X} "
                   "doorbells={} drains={} swaps={} exits[noCtx={} noCtx30={} "
                   "noRing={} sameWptr={} busy={} rejected={}]{}",
-                  vdN, DeferredConsumeEnabled() ? 1 : 0, gpuCtxC, wptrVAC,
+                  vdN, DeferredConsumeEnabled() ? 1 : 0, gpuCtxC, ctx30Val,
+                  primaryWptr,
                   g_doorbellCount.load(std::memory_order_relaxed),
                   g_drainCount.load(std::memory_order_relaxed),
                   g_swapCount.load(std::memory_order_relaxed),
@@ -1168,52 +1185,38 @@ void CpVblankDrainToWptr() {
     // Single batched publication point per vblank.
     FlushProgressAtVblank();
   }
-  // Kernel-role vblank duty (2026-08-24). REPLACES both the retired fake
-  // pub=put mirror (it force-refreshed F98 snapshots every tick, pinning
-  // delta==0 forever - see sub_82412F98 decode) and the retired rate-based
-  // +64 experiment. On HW the kernel CP fetches the ring continuously; the
-  // closest honest emulation point we own is: at vblank, consume whatever
-  // the driver has ACTUALLY produced (rptr -> GPU_ctx+0x30 wptr) through
-  // the existing frozen-capability DrainRing. Progress/publication are
-  // then consequences of real consumption only:
+  // Kernel-role vblank duty (2026-08-24, REWRITTEN 2026-09-08).
+  //
+  // ROOT CAUSE of 1492+ noRing exits: GPU_ctx+0x30 contains command buffer
+  // pointers (ME/PFP init buffers, e.g. C601C4FC/C609C5E8/C601C5BC), NOT
+  // ring buffer cursors. Those addresses fall OUTSIDE Ring A's window
+  // (C600C500–C6014500), so RingOwningCursorVA always returned nullptr.
+  // The REJECTED HYPOTHESIS comment (gpu_cp.cpp:224) confirmed this.
+  //
+  // On real HW the kernel CP reads the write pointer from the CP_RB_WPTR
+  // register (doorbell MMIO 0x7FC80714). Our doorbell handler already
+  // tracks this in PrimaryRing()->lastDoorbellWptr. Use that directly.
+  //
+  // Progress/publication are consequences of real consumption only:
   //  - PublishRptr (inside DrainRing) publishes the consumed watermark.
   //  - DrainRing's consumed-dword accounting advances XTEB+88 progress.
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
 
-  uint32_t ctxPtr = 0;
-  if (!mem.ReadU32BE(0x82839254u, &ctxPtr) || ctxPtr == 0) {
-    s_vdNoCtx.fetch_add(1, std::memory_order_relaxed);
-    return; // GPU context not published yet
-  }
-
-  // GPU_ctx+0x30 holds a driver-space BYTE VA (BOOT_HANDOFF: 0xC62346BC),
-  // not a dword index. Route by EXACT ownership: the ring whose registered
-  // window contains that byte VA is the one the driver produced into.
-  uint32_t wptrVA = 0;
-  if (!mem.ReadU32BE(ctxPtr + 0x30u, &wptrVA)) {
-    s_vdNoCtx30.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-
-  RingState *ring = RingOwningCursorVA(wptrVA);
+  RingState *ring = PrimaryRing();
   if (!ring) {
     s_vdNoRing.fetch_add(1, std::memory_order_relaxed);
-    static std::atomic<bool> warnedNoOwner{false};
-    if (!warnedNoOwner.exchange(true)) {
-      MCLA_LOG_WARN("CP: VDRAIN wptrVA={:08X} matches no registered ring "
-                    "window - not consuming (would be fabrication)",
-                    wptrVA);
-    }
-    return;
+    return; // no ring registered yet
+  }
+
+  const uint32_t wptr =
+      ring->lastDoorbellWptr.load(std::memory_order_relaxed);
+  if (wptr == 0xFFFFFFFFu) {
+    s_vdNoCtx30.fetch_add(1, std::memory_order_relaxed);
+    return; // no doorbell has been rung yet
   }
 
   const uint32_t cap = ring->capDwords;
   const uint32_t oldRptr = ring->rptrIndex.load(std::memory_order_relaxed);
-
-  // Byte-cursor -> dword index mod cap. Handles both in-body cursors and
-  // wrap-aliased cursors past the physical end (see RingOwningCursorVA).
-  const uint32_t wptr = static_cast<uint32_t>(
-      ((uint64_t(wptrVA) - ring->baseGuestVA) >> 2) % cap);
   if (wptr == oldRptr) {
     s_vdSameWptr.fetch_add(1, std::memory_order_relaxed);
     return; // nothing produced: zero consumption, zero publication
@@ -1248,6 +1251,17 @@ void CpVblankDrainToWptr() {
   const uint32_t newRptr = ring->rptrIndex.load(std::memory_order_relaxed);
   const uint32_t consumed = (newRptr - oldRptr + cap) % cap;
 
+  // ADVANCE PUBLICATION: DrainRing processes ring data but does NOT call
+  // CpAdvanceGuestPublication. The game's sub_82411E98 waits on
+  // *(subctx+0) >= needed (consumed-window COUNT). During loading, the
+  // capture path (sub_82411640 -> CpConsumePushWindow) may not run, so
+  // pub freezes while put grows. Publish 1 window per drain cycle if any
+  // data was consumed. CpAdvanceGuestPublication clamps to put, so
+  // over-publishing is safe.
+  if (consumed > 0) {
+    CpAdvanceGuestPublication(1);
+  }
+
   uint32_t pubAfter = 0;
   {
     uint32_t subctx = 0;
@@ -1260,9 +1274,9 @@ void CpVblankDrainToWptr() {
   const uint32_t n = s_vdrain.fetch_add(1) + 1;
   if (n <= 24 || (n % 500) == 0) {
     MCLA_LOG_INFO("CP: VDRAIN #{} RING {} base={:08X} cap={} dev={:08X} "
-                  "wptrVA={:08X}->wptr={:04X} rptr {:04X}->{:04X} consumed={} "
+                  "wptr={:04X} rptr {:04X}->{:04X} consumed={} "
                   "wb={:08X} pub {:X}->{}",
-                  n, ring->id, ring->baseGuestVA, cap, probeDev, wptrVA, wptr,
+                  n, ring->id, ring->baseGuestVA, cap, probeDev, wptr,
                   oldRptr, newRptr, consumed,
                   ring->writebackVA.load(std::memory_order_relaxed), pubBefore,
                   pubAfter);
@@ -1348,6 +1362,12 @@ bool CpMmioWrite(uint32_t guestAddr, uint32_t value) {
             ring->rptrIndex.load(std::memory_order_relaxed);
         const uint32_t consumed =
             (endRptr - startRptr + ring->capDwords) % ring->capDwords;
+        // ADVANCE PUBLICATION: same as VSYNC drain path. The game's
+        // sub_82411E98 waits on *(subctx+0) >= needed. Without this,
+        // the doorbell drain processes ring data but pub never advances.
+        if (consumed > 0) {
+          CpAdvanceGuestPublication(1);
+        }
         // Phase-4 trace: full per-ring drain record.
         if (n <= 16 || (n % 500) == 0) {
           MCLA_LOG_INFO("CP: RING {} DRAIN src=doorbell base={:08X} cap={} "

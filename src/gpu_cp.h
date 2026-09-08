@@ -47,7 +47,8 @@ void CpConsumePushWindow(uint32_t endVA, uint32_t dwords);
 // When enabled, CpConsumePushWindow records submitted windows WITHOUT
 // crediting consumption; a vblank-paced consumer (inside
 // CpVblankDrainToWptr) later consumes only ranges the driver has actually
-// produced (GPU_ctx+0x30), advancing XTEB+0x58 by exactly those dwords.
+// produced (via PrimaryRing lastDoorbellWptr), advancing XTEB+0x58 by
+// exactly those dwords.
 // Diagnostic timing experiment ONLY - not final HW semantics.
 bool CpDeferredConsumeEnabled();
 void CpDeferredSnapshot(uint32_t* producedEnd, uint32_t* consumedEnd,
