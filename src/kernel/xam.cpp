@@ -2,6 +2,7 @@
 #include "xam.h"
 #include "xdm.h"
 #include <cpu/guest_thread.h>
+#include <cpu/ppc_context.h>
 #include <ranges>
 #include <unordered_set>
 #include <unordered_map>
@@ -162,6 +163,13 @@ uint32_t XamShowMessageBoxUI(
     be<uint32_t>* pResult,
     XXOVERLAPPED* pOverlapped)
 {
+    static std::atomic<uint32_t> s_census{0};
+    const uint32_t n = s_census.fetch_add(1) + 1;
+    if (n <= 20 || (n % 100) == 0) {
+      MCLA_LOG_INFO("XAM-CENSUS[MsgBoxUI] #{:04} user={} buttons={} flags=0x{:X} lr={:08X}", n,
+                    dwUserIndex, cButtons, dwFlags,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
     MCLA_LOG_INFO("XamShowMessageBoxUI: user={} buttons={} flags=0x{:X}", dwUserIndex, cButtons, dwFlags);
 
     if (pOverlapped)

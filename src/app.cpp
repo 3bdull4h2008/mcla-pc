@@ -77,7 +77,10 @@ bool App::Initialize() {
     m_dispatcher = std::make_unique<FunctionDispatcher>();
     if (m_dispatcher) {
         mcla_ApplyPatches(m_dispatcher.get());
-        mcla::cvar::CVarSystem::Instance().SetString("renderer_mode", "native");
+        // renderer_mode now comes solely from the CVar system (cache/mcla.toml,
+        // default "legacy" — golden rule 10). The previous hard-coded
+        // SetString("renderer_mode","native") forced every boot into native and
+        // made both the cache config and the manifest moot.
         mcla::native::InstallNativeRenderer(m_dispatcher.get());
     }
 

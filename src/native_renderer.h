@@ -10,18 +10,12 @@ namespace mcla::native {
 
 void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher);
 
-using DrawCaptureCallback = void(*)(::MclaGpuContext* gpuCtx,
-                                    uint32_t drawType,
-                                    uint32_t drawFlags);
-
-void SetDrawCaptureCallback(DrawCaptureCallback cb);
+// (GetLastDrawType/GetLastDrawFlags/SetDrawCaptureCallback removed 2026-09-09:
+// zero callers — dead API deleted with the S1–S3 dual-owner hook sweep.)
 
 void WriteGpuContextToRegisterFile(::MclaGpuContext* gpuCtx);
 void RestoreRegisterFileToContext(::MclaGpuContext* gpuCtx);
 void ForwardRegisterToBackend(uint32_t regIndex, uint32_t value);
-
-uint32_t GetLastDrawType();
-uint32_t GetLastDrawFlags();
 
 void IssueNativeDraw(::MclaGpuContext* gpuCtx);
 void StartHostFrameTrace();

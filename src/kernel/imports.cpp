@@ -303,7 +303,17 @@ uint32_t XamUserGetSigninInfo(uint32_t userIndex, uint32_t flags,
   return 0x00000525; // ERROR_NO_SUCH_USER
 }
 
-void XamShowSigninUI() { LOG_UTILITY("!!! STUB !!!"); }
+void XamShowSigninUI() {
+  static std::atomic<uint32_t> s_census{0};
+  const uint32_t n = s_census.fetch_add(1) + 1;
+  if (n <= 20 || (n % 100) == 0) {
+    MCLA_LOG_INFO("XAM-CENSUS[SigninUI] #{:04} lr={:08X}", n,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  // Auto-success: skip sign-in UI, return immediately
+  MCLA_LOG_INFO("XamShowSigninUI: auto-bypass (lr={:08X})",
+                static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+}
 
 uint32_t XamShowDeviceSelectorUI(uint32_t userIndex, uint32_t contentType,
                                  uint32_t contentFlags, uint64_t totalRequested,
@@ -349,9 +359,16 @@ void XamResetInactivity() {
 }
 
 uint32_t XamShowMessageBoxUIEx(uint32_t userIndex, uint32_t flags, void *title,
-                               void *text, uint32_t buttons,
-                               uint32_t defaultButton, uint32_t *result,
-                               XXOVERLAPPED *overlapped) {
+                                void *text, uint32_t buttons,
+                                uint32_t defaultButton, uint32_t *result,
+                                XXOVERLAPPED *overlapped) {
+  static std::atomic<uint32_t> s_census{0};
+  const uint32_t n = s_census.fetch_add(1) + 1;
+  if (n <= 20 || (n % 100) == 0) {
+    MCLA_LOG_INFO("XAM-CENSUS[MsgBoxUIEx] #{:04} user={} flags=0x{:X} lr={:08X}", n,
+                  userIndex, flags,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
   (void)userIndex;
   (void)flags;
   (void)title;
@@ -425,6 +442,16 @@ uint32_t NtCreateFile(be<uint32_t> *FileHandle, uint32_t DesiredAccess,
                       XIO_STATUS_BLOCK *IoStatusBlock, uint64_t *AllocationSize,
                       uint32_t FileAttributes, uint32_t ShareAccess,
                       uint32_t CreateDisposition, uint32_t CreateOptions) {
+  // NtCreateFile census
+  {
+    static std::atomic<uint32_t> s_census{0};
+    const uint32_t n = s_census.fetch_add(1) + 1;
+    if (n <= 20 || (n % 100) == 0) {
+      MCLA_LOG_INFO("NFS-CENSUS[Create] #{:04} disp={} opts=0x{:X} lr={:08X}", n,
+                    CreateDisposition, CreateOptions,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
   (void)DesiredAccess;
   (void)FileAttributes;
   (void)ShareAccess;
@@ -987,6 +1014,17 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
                     uint32_t apcContext, XIO_STATUS_BLOCK *ioStatus,
                     void *buffer, uint32_t length, be<uint64_t> *byteOffset,
                     uint32_t *key) {
+  // NtReadFile census
+  {
+    static std::atomic<uint32_t> s_census{0};
+    const uint32_t n = s_census.fetch_add(1) + 1;
+    if (n <= 20 || (n % 100) == 0) {
+      MCLA_LOG_INFO("NFS-CENSUS[Read] #{:04} h={:08X} len={} off={:#x} lr={:08X}", n,
+                    handle, length,
+                    byteOffset ? byteOffset->get() : 0,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
   (void)event;
   (void)apcRoutine;
   (void)apcContext;
@@ -1974,8 +2012,10 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   }
   const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
-  // DWELL HISTOGRAM CENSUS: measure actual wait dwell time vs timeout class.
+  // DWELL HISTOGRAM + TYPE CENSUS: measure actual wait dwell time vs timeout class + resolution
   const auto waitStart = std::chrono::steady_clock::now();
+  const char* waitResolution = "unknown";
+
   auto LogDwellHistogram = [&](uint32_t status) {
     static std::atomic<uint32_t> s_dwellLogs{0};
     const uint32_t n = s_dwellLogs.fetch_add(1) + 1;
@@ -1996,31 +2036,26 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
       uint32_t objAddr =
           mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
       MCLA_LOG_INFO(
-          "DWELL[KWFSO] #{:05} obj={:08X} class={} status={:08X} dwell={}us bucket={} lr={:08X}",
-          n, objAddr, timeoutClass, status, dwellUs, bucket,
+          "DWELL[KWFSO] #{:05} obj={:08X} class={} status={:08X} dwell={}us bucket={} res={} lr={:08X}",
+          n, objAddr, timeoutClass, status, dwellUs, bucket, waitResolution,
           static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
   };
 
   uint8_t type = Object->Type;
 
-  // TYPE CENSUS: obj VA | header Type | call-site {wait|release} | resolution {map-hit|fallback|create}
+  // TYPE CENSUS (type only, at entry)
   {
     static std::atomic<uint32_t> s_typeLogs{0};
     const uint32_t n = s_typeLogs.fetch_add(1) + 1;
     if (n <= 60 || (n % 5000) == 0) {
-      const char* site = "wait";
-      const char* resolution = "pending";
-      MCLA_LOG_INFO("TYPE-CENSUS[KWFSO] #{:04} obj={:08X} type={:02X} site={} res={} timeout={:08X} lr={:08X}",
+      MCLA_LOG_INFO("TYPE-CENSUS[KWFSO] #{:04} obj={:08X} type={:02X} timeout={:08X} lr={:08X}",
                     n,
                     static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)),
-                    type, site, resolution, timeout,
+                    type, timeout,
                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
   }
-
-  // Resolution tracker for type census
-  const char* waitResolution = "unknown";
 
   // Return the real wait result. Previously this hooked call returned
   // STATUS_SUCCESS unconditionally, which starved guest workers that branch
@@ -2070,7 +2105,6 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     return STATUS_TIMEOUT;
   }
   }
-
   {
     static std::atomic<uint32_t> s_wcKwfsR{0};
     const uint32_t n = s_wcKwfsR.fetch_add(1) + 1;

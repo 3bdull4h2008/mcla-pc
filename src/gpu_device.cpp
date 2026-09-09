@@ -1,6 +1,9 @@
 #include "gpu_device.h"
 #include "gpu_cp.h"
 #include "render_queue.h"
+#include "renderer_mode.h"
+#include "renderer_hook_dispatch.h"
+#include "capture_hooks.h"
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "kernel/memory.h"
@@ -639,6 +642,9 @@ const CapturedDrawV1 *mcla_gpu_GetLastCapturedDraw(uint32_t *outTotal) {
 PPC_FUNC_IMPL(__imp__sub_82420BA8);
 static std::atomic<uint32_t> s_h20BA8{0};
 PPC_FUNC(sub_82420BA8) {
+  // Single owner of the draw-builder seam (S1–S3 consolidation). The removed
+  // native_renderer dual-owner hook folded its duties in here.
+  mcla::renderer::RecordDrawBuild();
   const uint32_t n = s_h20BA8.fetch_add(1) + 1;
   const uint32_t dev = ctx.r3.u32;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -750,6 +756,16 @@ PPC_FUNC(sub_82420BA8) {
     }
   }
 
+  // Trace feed (folded from the removed native_renderer dual-owner hook).
+  // The accumulator no-ops unless capture mode enabled it via
+  // SetCaptureEnabled; the MclaGpuContext overlay is the pre-existing
+  // capture-path pattern (S4 inventory — refactor with checked reads when
+  // capture_hooks grows a checked-read API).
+  if (dev != 0) {
+    mcla::native::GetDrawAccumulator()->OnDrawBuild(
+        reinterpret_cast<::MclaGpuContext*>(base + dev), ctx);
+  }
+
   __imp__sub_82420BA8(ctx, base);
 }
 
@@ -837,6 +853,15 @@ PPC_FUNC_IMPL(__imp__sub_8241BD08);
 static std::atomic<uint32_t> s_h1BD08{0};
 PPC_FUNC(sub_8241BD08) {
   const uint32_t n = s_h1BD08.fetch_add(1) + 1;
+  // Single owner of the submit seam (S1–S3 consolidation): frame counters +
+  // submit observers folded in from the removed native_renderer hook.
+  mcla::renderer::RecordSubmit();
+  mcla::renderer::hooks::DispatchBeforeSubmit(ctx, base);
+  const uint32_t dev1BD08 = ctx.r3.u32;
+  if (dev1BD08 != 0 && dev1BD08 >= 0x1000u) {
+    mcla::native::GetDrawAccumulator()->OnSubmit(
+        reinterpret_cast<::MclaGpuContext*>(base + dev1BD08), ctx.r4.u32);
+  }
   if (n <= 12 || (n % 1000) == 0)
     MCLA_LOG_INFO("SUBMIT-census sub_8241BD08(flush) #{} dev={:08X} r4={:08X}",
                   n, ctx.r3.u32, ctx.r4.u32);
