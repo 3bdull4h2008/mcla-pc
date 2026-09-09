@@ -1,4 +1,4 @@
-﻿#include <stdafx.h>
+#include <stdafx.h>
 #include <cpu/ppc_context.h>
 #include <cpu/guest_thread.h>
 #include <apu/audio.h>
@@ -1619,18 +1619,6 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
                       head[5], head[6], head[7], wbVal,
                       mcla::gpu::CpDrainCount(), mcla::gpu::CpSwapCount());
 }
-  // Log type census with resolution
-  {
-    static std::atomic<uint32_t> s_typeLogs2{0};
-    const uint32_t n = s_typeLogs2.fetch_add(1) + 1;
-    if (n <= 60 || (n % 5000) == 0) {
-      uint32_t objAddr =
-          mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
-      MCLA_LOG_INFO("TYPE-CENSUS[KWFSO] #{:04} obj={:08X} type={:02X} site=wait res={} timeout={:08X} lr={:08X}",
-                    n, objAddr, type, waitResolution, timeout,
-                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    }
-  }
               }
             }
           }
@@ -2573,6 +2561,21 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
     }
   }
 
+  // TYPE CENSUS (release side): obj VA | header Type | site=release | resolution
+  {
+    static std::atomic<uint32_t> s_typeRelLogs{0};
+    const uint32_t n = s_typeRelLogs.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      const uint32_t hdrAddr = static_cast<uint32_t>(
+          reinterpret_cast<const uint8_t *>(&Handle->Header) -
+          mcla::kernel::g_memory.base);
+      const uint8_t hdrType = Handle->Header.Type;
+      MCLA_LOG_INFO("TYPE-CENSUS[REL] #{:04} obj={:08X} type={:02X} site=release res=QueryKernelObject(Semaphore) lr={:08X}",
+                    n, hdrAddr, hdrType,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
+
   Semaphore *sem = QueryKernelObject<Semaphore>(Handle->Header);
 
   uint32_t previousCount;
@@ -2913,6 +2916,21 @@ extern "C" uint32_t KeReleaseSemaphore(XKSEMAPHORE *semaphore, uint32_t incremen
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(semaphore)),
           increment, adjustment,
           static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
+
+  // TYPE CENSUS (release side): obj VA | header Type | site=release | resolution
+  {
+    static std::atomic<uint32_t> s_typeRelLogs2{0};
+    const uint32_t n = s_typeRelLogs2.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      const uint32_t hdrAddr = static_cast<uint32_t>(
+          reinterpret_cast<const uint8_t *>(&semaphore->Header) -
+          mcla::kernel::g_memory.base);
+      const uint8_t hdrType = semaphore->Header.Type;
+      MCLA_LOG_INFO("TYPE-CENSUS[REL] #{:04} obj={:08X} type={:02X} site=release res=QueryKernelObject(Semaphore) lr={:08X}",
+                    n, hdrAddr, hdrType,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
   }
 
