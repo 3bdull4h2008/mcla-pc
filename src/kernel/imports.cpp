@@ -585,10 +585,37 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
   }
   uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
+  // DWELL HISTOGRAM CENSUS
+  const auto waitStart = std::chrono::steady_clock::now();
+  auto LogDwellHistogramNT = [&](uint32_t status) {
+    static std::atomic<uint32_t> s_dwellLogs{0};
+    const uint32_t n = s_dwellLogs.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      const auto dwellUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - waitStart)
+                               .count();
+      const char* timeoutClass =
+          (timeout == 0)      ? "poll"
+          : (timeout == INFINITE) ? "inf"
+          : "finite";
+      const char* bucket =
+          (dwellUs < 100)       ? "<100us"
+          : (dwellUs < 1000)    ? "<1ms"
+          : (dwellUs < 30000)   ? "<30ms"
+          : (dwellUs < 1000000) ? "<1s"
+          : ">=1s";
+      MCLA_LOG_INFO(
+          "DWELL[NTWFSO] #{:05} h={:08X} class={} status={:08X} dwell={}us bucket={} lr={:08X}",
+          n, Handle, timeoutClass, status, dwellUs, bucket,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  };
+
   if (IsKernelObject(Handle)) {
     auto* obj = GetKernelObject(Handle);
     if (!obj) { g_ppcContext->r3.u32 = STATUS_INVALID_HANDLE; return STATUS_INVALID_HANDLE; }
     const uint32_t st = obj->Wait(timeout);
+    LogDwellHistogramNT(st);
     {
       static std::atomic<uint32_t> s_wcNtwR{0};
       const uint32_t n = s_wcNtwR.fetch_add(1) + 1;
@@ -604,6 +631,7 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
     assert(false && "Unrecognized handle value.");
   }
 
+  LogDwellHistogramNT(STATUS_TIMEOUT);
   return STATUS_TIMEOUT;
 }
 
@@ -1590,7 +1618,19 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
                       p0, p1, head[0], head[1], head[2], head[3], head[4],
                       head[5], head[6], head[7], wbVal,
                       mcla::gpu::CpDrainCount(), mcla::gpu::CpSwapCount());
-                }
+}
+  // Log type census with resolution
+  {
+    static std::atomic<uint32_t> s_typeLogs2{0};
+    const uint32_t n = s_typeLogs2.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      uint32_t objAddr =
+          mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
+      MCLA_LOG_INFO("TYPE-CENSUS[KWFSO] #{:04} obj={:08X} type={:02X} site=wait res={} timeout={:08X} lr={:08X}",
+                    n, objAddr, type, waitResolution, timeout,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
               }
             }
           }
@@ -1946,21 +1986,53 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   }
   const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
+  // DWELL HISTOGRAM CENSUS: measure actual wait dwell time vs timeout class.
+  const auto waitStart = std::chrono::steady_clock::now();
+  auto LogDwellHistogram = [&](uint32_t status) {
+    static std::atomic<uint32_t> s_dwellLogs{0};
+    const uint32_t n = s_dwellLogs.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      const auto dwellUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - waitStart)
+                               .count();
+      const char* timeoutClass =
+          (timeout == 0)      ? "poll"
+          : (timeout == INFINITE) ? "inf"
+          : "finite";
+      const char* bucket =
+          (dwellUs < 100)       ? "<100us"
+          : (dwellUs < 1000)    ? "<1ms"
+          : (dwellUs < 30000)   ? "<30ms"
+          : (dwellUs < 1000000) ? "<1s"
+          : ">=1s";
+      uint32_t objAddr =
+          mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
+      MCLA_LOG_INFO(
+          "DWELL[KWFSO] #{:05} obj={:08X} class={} status={:08X} dwell={}us bucket={} lr={:08X}",
+          n, objAddr, timeoutClass, status, dwellUs, bucket,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  };
+
   uint8_t type = Object->Type;
 
-  // TYPE CENSUS: track all incoming types to confirm the default path theory.
+  // TYPE CENSUS: obj VA | header Type | call-site {wait|release} | resolution {map-hit|fallback|create}
   {
-    static std::atomic<uint32_t> s_typeLogs{};
+    static std::atomic<uint32_t> s_typeLogs{0};
     const uint32_t n = s_typeLogs.fetch_add(1) + 1;
-    if (n <= 20 || (n % 500) == 0) {
-      MCLA_LOG_INFO("KWFSO type-census #{:04} type={:02X} obj={:08X} "
-                    "timeout={:08X} lr={:08X}",
-                    n, type,
+    if (n <= 60 || (n % 5000) == 0) {
+      const char* site = "wait";
+      const char* resolution = "pending";
+      MCLA_LOG_INFO("TYPE-CENSUS[KWFSO] #{:04} obj={:08X} type={:02X} site={} res={} timeout={:08X} lr={:08X}",
+                    n,
                     static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)),
-                    timeout,
+                    type, site, resolution, timeout,
                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
   }
+
+  // Resolution tracker for type census
+  const char* waitResolution = "unknown";
 
   // Return the real wait result. Previously this hooked call returned
   // STATUS_SUCCESS unconditionally, which starved guest workers that branch
@@ -1978,8 +2050,10 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     // creating a mismatched Event wrapper.
     Semaphore *sem = TryQueryKernelObject<Semaphore>(*Object);
     if (sem) {
+      waitResolution = "map-hit(sem)";
       waitStatus = sem->Wait(timeout);
     } else {
+      waitResolution = "fallback(event)";
       Event *ev = QueryKernelObject<Event>(*Object);
       waitStatus = ev->Wait(timeout);
     }
@@ -1987,12 +2061,14 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   }
 
   case 5: {
+    waitResolution = "map-hit(sem)";
     Semaphore *sem = QueryKernelObject<Semaphore>(*Object);
     waitStatus = sem->Wait(timeout);
     break;
   }
 
   default: {
+    waitResolution = "default-timeout";
     static std::atomic<uint32_t> s_typeCensus{};
     const uint32_t n = s_typeCensus.fetch_add(1) + 1;
     if (n <= 20 || (n % 500) == 0) {
@@ -2018,6 +2094,7 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
                     GetCurrentThreadId(), waitStatus, lr);
     }
   }
+  LogDwellHistogram(waitStatus);
   return waitStatus;
 }
 
