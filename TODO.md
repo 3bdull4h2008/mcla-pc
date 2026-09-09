@@ -42,7 +42,8 @@
 | P4.5′ | Render Thread & Queues | ✅ DONE (S58) | Copy queue + frame pacing + queue depth |
 | P5′ | Real Draws via Device Boundary | ✅ CODE DONE (S60-62) | Full shader→PSO pipeline wired; runtime test next |
 | P5.5′ | Offline Shader Cache | ❌ NOT STARTED | Blocked on P5′ |
-| P6′ | Native Default | ❌ NOT STARTING | Blocked on all above |
+| P6′ | Native Default | ❌ NOT STARTED | Blocked on all above |
+| P7′–P9′ | Build env, codegen config, kernel surface | ❌ NOT STARTED | Blocked on P6′ |
 
 ---
 
@@ -96,7 +97,8 @@
 
 ## 📝 HANDOFF PROTOCOL (Before Context Pressure)
 
-1. **Run `memory-steward`** to persist decisions, assumptions, open questions
+1. **Persist decisions/evidence** to the file ledger: `.clinerules/memory/memories-*.md`
+   (canonical; `second-brain` skill — there is no `memory-steward` MCP/mode in Cline)
 2. **Write lossless handoff** to `docs/handoffs/YYYY-MM-DD-session-XX.md` with:
    - Exact addresses, offsets, evidence
    - Census output samples
@@ -147,4 +149,4 @@ build\backend_validator.exe
 
 ---
 
-*Last updated by Cline agent — Session 59 (P5′ first draw wired, PSO cache next)*
+*Last updated by Cline agent — Session 65 (full rescan, 67 bugs fixed; doc resync 2026-09-09)*

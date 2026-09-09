@@ -19,9 +19,9 @@ revised ladder (P4'-P9') lives in docs/MCLA_REBUILD_PLAN.md. legacy mode stays d
 | 1 | abi migration | move everything onto the ppc_func abi with checked guest memory access | done |
 | 2 | kernel framework | rebuild the kernel layer to match unleashedrecomp exactly - identity handles, typed arg hooks, lazy wrap | done (13/13 tests) |
 | 3 | critical imports | implement the imports boot needs to reach a real present call | passed 2026-08-22 - boots, archives load, vsync 60fps |
-| 4' | device-boundary takeover | hook the game's own d3d-class device methods (create/present/state/draw), enqueue render commands | in progress - steps 1-2 done |
-| 4.5' | render thread & queues | blocking command queue + copy queue, render thread owns all d3d12 calls | pending |
-| 5' | real draws via device boundary | vb/ib/format/shader capture from redirected device methods, pixel-hash parity | pending |
+| 4' | device-boundary takeover | hook the game's own d3d-class device methods (create/present/state/draw), enqueue render commands | done (steps 1-3) |
+| 4.5' | render thread & queues | blocking command queue + copy queue, render thread owns all d3d12 calls | done |
+| 5' | real draws via device boundary | vb/ib/format/shader capture from redirected device methods, pixel-hash parity | code done - runtime test pending |
 | 5.5' | offline shader cache | offline translate 1,264+ ucode corpus to zstd-embedded dxil keyed by hash | pending |
 | 6' | native default | renderer_mode=native default, legacy cp path retired | pending |
 | 7'-9' | build env, codegen config, kernel surface | cmake presets, midasm decision, xam surface | pending |
@@ -35,15 +35,17 @@ plan summary: each phase has a hard gate with an offline validator proving it be
 - d3d12 backend with pso cache
 - offline validators for every phase gate
 - boot gets through init into the game main loop
-- device-method capture hooks live (P4' steps 1-2: create-hook + packet capture v2), armed and waiting on the boot blocker
+- device-method capture hooks live + render thread owns all d3d12 (P4'/P4.5' done)
+- P5' shader->PSO pipeline wired: PipelineCache + async DXC worker, root signature, grcFvf input layout (runtime test pending)
 
-## current blocker (2026-09-03)
+## current status (2026-09-09)
 
-intermittent OOM fatal ~T+15s from the guest churn heap (heap struct 0x82830CD8,
-46.5MB fixed cap, no grow path) - prime suspect is the class allocator
-sub_821DE9D8 returning 0 on an inconsistent slab header. kernel-role work only
-(freeze line: no PM4, no manual seeding, no opcode expansion). see
-docs/BOOT_HANDOFF.md + docs/handoffs/ for the live trail.
+guest park blocker CLOSED (session 64: spinlock seed 1->0 in VdInitializeEngines
++ host-side kernel-wrapper identity map). game runs 10+ min in loading screens,
+zero crashes. active front: P5' runtime validation (pixel-hash parity), then
+P4.6' resource model. kernel-role work only (freeze line: no PM4, no manual
+seeding, no opcode expansion). see docs/BOOT_HANDOFF.md + docs/handoffs/ for
+the live trail.
 
 ## building
 
@@ -61,7 +63,7 @@ build\mcla.exe
 - `src/renderer` - xenos decode, shader translation, texture/vertex decoding, caches
 - `src/` root - boot host, device-boundary hooks, d3d12 backend, render thread/queue, vfs
 - `generated/` - recompiler output, input only, never edited by hand
-- `third_party/` - sdl3, fmt, spdlog, toml++, dxc, simde
+- `third_party/` - sdl3, fmt, spdlog, toml++, dxc, o1heap, xxhash
 - `config/` - cmake/xenonrecomp/manifest tomls
 
 ## legal

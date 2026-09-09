@@ -88,7 +88,6 @@ subtask with `new_task`). Definitions live in `.clinerules/custom-modes.json`.
 | `research-scout` | subagent | External reference research (Xenia, XenosRecomp, UnleashedRecomp) |
 | `node-tooling` | subagent | Manifest/database and node tooling side |
 | `gate-cracker` | subagent | GPU progress-gate decoding: wait-primitive exit-condition tables, 'who advances X on hardware', emulation-point ranking (`.clinerules/agent/gate-cracker.md`) |
-| `memory-steward` | subagent | Persistent memory: codebase graph, architecture brainmap, lossless handoffs, context-budget advisor |
 
 ## Routing
 
@@ -99,9 +98,12 @@ subtask with `new_task`). Definitions live in `.clinerules/custom-modes.json`.
   pointer-touching changes, a `security-auditor` pass before claiming done.
 - Offline/headless verification -> `test-engineer`; external lookups ->
   `research-scout`; docs/notes -> `docs-writer`.
-- Memory/graph/context -> `memory-steward`: refresh the architecture brainmap
-  after a phase lands, write lossless handoffs before long sessions end, and get
-  context-budget advice when the window is tight.
+- Memory/graph/context -> the `second-brain` skill + file ledger (there is no
+  `memory-steward` mode in `.clinerules/custom-modes.json`): refresh the
+  architecture brainmap (`docs/ARCHITECTURE.md`) after a phase lands, write
+  lossless handoffs to `docs/handoffs/` before long sessions end, and keep the
+  durable ledger `.clinerules/memory/memories-*.md` current when the window is
+  tight.
   - **Second Brain = file ledger, not MCP.** `second_brain_*` MCP has no Cline
     server (it was plugin-based in opencode). Durable memory lives in
     `.clinerules/memory/memories-*.md` (canonical) and `docs/handoffs/`.

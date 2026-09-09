@@ -3,9 +3,9 @@
 ## Complete Technical Documentation & Implementation Reference
 
 **Author:** Abdullah Atef Alrawashdeh (HTU Student)  
-**Last Updated:** 2026-08-30  
+**Last Updated:** 2026-09-09 (doc-resync: statuses, blockers, third-party, MCP names)  
 **Project Root:** `E:\mcla pc`  
-**Repository Status:** Phase 3 PASSED, Phase 4 IN PROGRESS
+**Repository Status:** P3 PASSED · P4′/P4.5′ DONE · P5′ code done (runtime test pending)
 
 ---
 
@@ -135,15 +135,15 @@ No game code or assets are included in the repository. Users must provide their 
 
 ## 2.2 Data Flow
 
-1. **Boot**: `mcla.exe` → SDL3_Init → GuestMemory_Init → Boot Host (ReXGlue/XenonRecomp)
+1. **Boot**: `mcla.exe` → SDL3_Init → GuestMemory_Init → Boot Host (XenonRecomp — no ReXGlue)
 2. **PPC Start**: Guest entry at `0x821322B8` (_xstart) → game initialization
 3. **Kernel Imports**: NtCreateEvent, ExCreateThread, NtQueryInformationFile, etc.
 4. **VFS/RPF**: Load `xarchive_*.rpf` packfiles via RPF3 VFS
 5. **GPU Context Init**: `sub_82413588` creates XGPU context, initializes command buffer
 6. **VSync**: `VdSetGraphicsInterruptCallback` fires at 60fps
 7. **CP Drain (FROZEN legacy)**: doorbell→ring→rptr writeback chain live but frozen — no opcode expansion, retired at P6′
-8. **Capture Boundary (P4′ IN PROGRESS)**: device-method hooks live (create @sub_82413588, packet capture v2 @sub_82411640 — steps 1-2 done); idle until the boot OOM blocker closes
-9. **D3D12 Present**: Native renderer produces frames via swap chain
+8. **Capture Boundary (P4′ DONE)**: device-method hooks live (create @sub_82413588, packet capture v2 @sub_82411640); guest park blocker closed in session 64
+9. **D3D12 Present**: Native renderer produces frames via swap chain (render thread owns all D3D12)
 
 ## 2.3 Key Design Decisions
 
@@ -160,15 +160,16 @@ Kernel objects use identity handles where the handle value IS the pointer to the
 All import hooks use typed C++ function signatures instead of manual `ctx.rN` register reads. Example:
 ```cpp
 // WRONG (old pattern):
-GUEST_FUNCTION_HOOK(sub_82XXXXXX) {
-    uint32_t param1 = ctx.r3;
-    uint32_t param2 = ctx.r4;
+uint32_t Foo(PPCContext& ctx, uint8_t* base) {
+    uint32_t handle = ctx.r3.u32;
+    uint32_t info_class = ctx.r4.u32;
 }
 
-// CORRECT (typed-arg pattern):
-GUEST_FUNCTION_HOOK(sub_82XXXXXX, uint32_t handle, uint32_t info_class) {
-    // Use handle and info_class directly
+// CORRECT (typed-arg pattern): strongly-typed host function + ONE registration line
+uint32_t NtQueryInformationFile(be<uint32_t>* fileHandle, void* info, uint32_t length, uint32_t infoClass) {
+    // args auto-translated from r3-r10 / f1-f13 / stack by HostToGuestFunction
 }
+GUEST_FUNCTION_HOOK(__imp__NtQueryInformationFile, NtQueryInformationFile); // ONE LINE
 ```
 
 ---
@@ -299,10 +300,12 @@ The CMakeLists.txt (505 lines) defines:
 - `generated/ppc_xenon/ppc_recomp.0..178.cpp`
 - `generated/ppc_xenon/ppc_func_mapping.cpp` (46,029 lines)
 
-**Third-Party** (3 files):
-- `third_party/xxhash.c`
-- `third_party/lzxd.c` (LZX decompression)
-- `third_party/aes.c` (AES decryption)
+**Third-Party** (vendored under `third_party/` + referenced from `.research/`):
+- `third_party/xxhash.h` (header-only xxHash)
+- `third_party/o1heap.h` (+ `src/kernel/o1heap.c`)
+- AES: `.research/XenonRecomp/thirdparty/tiny-AES-c/aes.c` (compiled via CMakeLists.txt)
+- LZX/XMem decompression is NOT vendored — the RPF3 VFS synthesizes stored
+  (uncompressed) segments; `tools/xcompress32.dll` is a standalone tool only
 
 ### Validator Targets (8):
 | Target | Purpose |
@@ -500,12 +503,11 @@ The kernel framework emulates the Xbox 360 kernel API, providing:
 
 ### Rule 1: Identity Handles
 ```cpp
-// CORRECT: Handle IS the pointer
-void* handle = new KernelObject();
-// handle == 0x12345678 (the object's address)
-// Return handle as the "handle" to the guest
+// CORRECT: Handle IS the guest VA of the object header in the guest physical heap
+// (allocated via g_userHeap.AllocPhysical<T>(); GetKernelObject(handle) = Translate(handle))
+uint32_t handle = GetKernelHandle(CreateKernelObject<Event>(manualReset, initialState));
 
-// WRONG: Handle is an index into a table
+// WRONG: Handle is an index into a host-heap table
 uint32_t handle = g_handleTable.Allocate(object);
 ```
 
@@ -519,15 +521,15 @@ KernelObject* obj = QueryKernelObject(handle);
 
 ### Rule 3: Typed-Argument Hooks
 ```cpp
-// CORRECT: Strongly-typed parameters
-GUEST_FUNCTION_HOOK(sub_82413588, uint32_t device_type, uint32_t flags) {
-    // device_type and flags are automatically extracted from ctx.r3, ctx.r4
+// CORRECT: Strongly-typed host function + ONE registration line
+uint32_t NtCreateEvent(be<uint32_t>* handle, void* objAttr, uint32_t eventType, uint32_t initialState) {
+    // args auto-translated from r3-r10 / f1-f13 / stack
 }
+GUEST_FUNCTION_HOOK(__imp__NtCreateEvent, NtCreateEvent);
 
 // WRONG: Manual register extraction
-GUEST_FUNCTION_HOOK(sub_82413588) {
-    uint32_t device_type = ctx.r3;
-    uint32_t flags = ctx.r4;
+uint32_t NtCreateEvent(PPCContext& ctx, uint8_t* base) {
+    uint32_t eventType = ctx.r3.u32;   // hand-read registers
 }
 ```
 
@@ -654,11 +656,9 @@ NTSTATUS NtWaitForSingleObject(HANDLE handle, BOOLEAN alertable, PLARGE_INTEGER 
 
 ### Guest Memory Layout
 ```
-0x00000000 - 0x0FFFFFFF: Guest virtual memory (256MB)
+0x00000000 - 0xFFFFFFFF: 4 GiB flat guest window (host-allocated at 0x100000000)
   0x00000000 - 0x00000FFF: NOACCESS guard page
-  0x00001000 - 0x0FFFFFFF: Guest usable memory
-0x82000000 - 0x89FFFFFF: PPC image base
-  0x82130000 - 0x89FFFFFF: Code section (~6.8MB)
+  0x82000000 - 0x827CD054: PPC image / code section (PPC_CODE_SIZE 0x69D054 ~6.9MB)
 ```
 
 ### Memory Access Functions
@@ -738,7 +738,7 @@ GUEST_FUNCTION_HOOK(sub_82413588) {
 // We redirect these to our capture functions
 ```
 
-### Step 3: Render Thread & Queues (P4.5' - PENDING)
+### Step 3: Render Thread & Queues (P4.5' - DONE)
 ```cpp
 // Create a dedicated render thread
 class RenderThread {
@@ -1126,7 +1126,7 @@ The game boots into its main loop and RUNS. VSync callback fires at 60fps contin
 - Render thread processes commands asynchronously
 - D3D12 commands submitted on render thread only
 
-## 8.6 Phase 5': Real Draws via Device Boundary ⏳ PENDING
+## 8.6 Phase 5': Real Draws via Device Boundary ✅ CODE DONE (runtime test pending)
 
 **Goal:** Capture actual draw calls and replay as D3D12.
 
@@ -1210,7 +1210,7 @@ The project uses 14 specialized AI agents:
 | `docs-writer` | Documentation |
 | `research-scout` | External references (read-only) |
 | `node-tooling` | Node.js/better-sqlite3 tooling |
-| `memory-steward` | Architecture brainmap |
+| `gate-cracker` | GPU progress-gate decode, wait-primitive exit conditions |
 
 ## 9.2 Agent Permissions
 
@@ -1562,7 +1562,8 @@ non_volatile_as_local = true
 ### ppc_context.h (740 lines)
 - Memory access macros route through `mcla::native::ReadGuestU32()`
 - Function signature: `PPC_FUNC(x) = void x(PPCContext& ctx, uint8_t* base)`
-- SIMDE helpers for PPC-specific SIMD operations
+- PPC GPR/FPR/VMX register types as plain unions/structs — the generated header
+  has no simde dependency (simde exists only under `.research/XenonRecomp/thirdparty/`)
 
 ### ppc_func_mapping.cpp (46,029 lines)
 ```cpp
@@ -1669,54 +1670,15 @@ uint32_t PPC_MMIO_READ(uint32_t address) {
 ## 13.2 Debug Tools
 
 ### D3D12 Debug Layer
-```cpp
-// Enable in config.json or opencode.json
-{
-    "gpu": {
-        "d3d12_debug_layer": true
-    }
-}
-```
+The debug layer is enabled automatically by `src/d3d12_backend.cpp`
+(`D3D12GetDebugInterface` + `DXGI_CREATE_FACTORY_DEBUG`) — no JSON/config toggle.
+Treat debug-layer warnings as errors in `RelWithDebInfo`.
 
-### PIX Integration
-```bash
-# Start PIX capture
-start_ghidra_mcp.bat
-
-# Or configure in opencode.json
-{
-    "mcp_servers": {
-        "pix": {
-            "command": "pix_server.exe",
-            "args": ["--port", "31337"]
-        }
-    }
-}
-```
-
-### RenderDoc Integration
-```json
-{
-    "mcp_servers": {
-        "renderdoc": {
-            "command": "renderdoc_server.exe",
-            "args": ["--port", "31338"]
-        }
-    }
-}
-```
-
-### Ghidra Integration
-```json
-{
-    "mcp_servers": {
-        "ghidra": {
-            "command": "ghidra_mcp_server.exe",
-            "args": ["--project", "E:\\mcla pc\\.research\\findings\\ghidra"]
-        }
-    }
-}
-```
+### PIX / RenderDoc / Ghidra / IDA MCP
+Do not hand-wire servers. The actual MCP commands live in `.clinerules/gpu-tooling-mcp.md`,
+`.clinerules/ghidra-mcp.md`, and `.clinerules/ida-mcp.md`
+(`bridge-mcp-ghidra.exe`, `ida-pro-mcp.exe`, `renderdoc-mcp.exe`, `pix-mcp.exe`
+with `PIXTOOL_PATH`). Captures go to `build/captures/`.
 
 ## 13.3 Logging
 
@@ -1747,19 +1709,15 @@ RIP=0x7FF9B7261B78 RSP=0xC0E09FDE90
 
 ## 13.4 Performance Profiling
 
-### Tracy Integration
-```cpp
-#include <tracy/Tracy.hpp>
+### Tracy is BANNED
+Per the No-ReXGlue Mandate (`docs/MCLA_REBUILD_PLAN.md`): the project does not
+use Tracy (no source references; no TRACY_* compile definitions). Do not add
+`#include <tracy/Tracy.hpp>` or `-DTRACY_ENABLE`.
 
-ZoneScopedN("RenderFrame");
-// ... render code
-FrameMark;
-```
-
-### Build with Profiling
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTRACY_ENABLE=ON
-```
+### Profiling instead
+- GPU: PIX / RenderDoc captures via the MCP servers (`.clinerules/gpu-tooling-mcp.md`),
+  dumps under `build/captures/`
+- CPU: debug-layer logs + gate-report metrics (`build/gates/*.json`)
 
 ---
 
@@ -1780,7 +1738,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTRACY_ENABLE=ON
 
 - **Language:** C++23
 - **Compiler:** clang-cl
-- **Exceptions:** Disabled (`/EHsc`)
+- **Exceptions:** Disabled (`/EHs-c-` — note `/EHsc` would ENABLE them)
 - **RTTI:** Disabled (`/GR-`)
 - **Logging:** spdlog + fmt
 - **Formatting:** clang-format (LLVM style)
@@ -1798,11 +1756,12 @@ ghidra_get_instructions(address=0x82XXXXXX)
 
 ### Step 2: Understand Parameters
 ```cpp
-// Check Xenia or reverse-engineer manually
 // Xbox 360 calling convention: r3-r10 for first 8 params
-GUEST_FUNCTION_HOOK(sub_82XXXXXX, uint32_t param1, uint32_t param2) {
-    // param1 = ctx.r3, param2 = ctx.r4
+// Typed-arg hook: write a host function, register it with ONE line
+uint32_t MyHook(be<uint32_t> handle, be<uint32_t> info_class) {
+    // handle/info_class auto-translated from ctx.r3/ctx.r4 by HostToGuestFunction
 }
+GUEST_FUNCTION_HOOK(__imp__MyHook, MyHook);
 ```
 
 ### Step 3: Implement Hook
@@ -1888,7 +1847,7 @@ docs/MCLA_REBUILD_PLAN.md
 
 ## Appendix A: File Inventory
 
-### Source Files (51 files)
+### Source Files (101 in src/ — key files below)
 | File | Lines | Purpose |
 |------|-------|---------|
 | src/main.cpp | ~200 | Entry point |
@@ -1943,16 +1902,14 @@ docs/MCLA_REBUILD_PLAN.md
 - `docs/PHASE2_IMPLEMENTATION_PLAN.md` (335 lines)
 - `docs/ARCHITECTURE.md`
 - `docs/MCLA_RPF3_Technical_Reference.txt` (591 lines)
-- `docs/handoffs/*.md` (6 files)
+- `docs/handoffs/*.md` (8 files)
 - `.clinerules/memory/memories-*.md` (durable ledger, canonical)
 
 ## Appendix B: Config Files
 
 ### opencode.json
-- 10 plugins
-- 14 agents
-- 4 MCP servers (Ghidra, IDA, RenderDoc, PIX)
-- 3 LSP servers (clangd, pyright, pylsp)
+- LEGACY opencode-era config (disabled in Cline; Cline uses `.clinerules/`)
+- 14 agents, 4 MCP servers (Ghidra, IDA, RenderDoc, PIX)
 - Compaction disabled (mandatory context discipline)
 
 ### mcla_manifest.toml
@@ -2018,6 +1975,8 @@ docs/MCLA_REBUILD_PLAN.md
 | 2026-08-22-ur-vs-mcla-full-diff.md | 2026-08-22 | UR vs MCLA comparison |
 | 2026-08-23-session4-packet-capture.md | 2026-08-23 | Packet capture, shader corpus |
 | 2026-08-24-blocker-trace-investigation.md | 2026-08-24 | Stall diagnosis, RAGE recon |
+| 2026-09-06-session61-p5-shader-pipeline-and-park.md | 2026-09-06 | P5′ shader→PSO pipeline, park blocker |
+| 2026-09-06-session64-vsync-deadlock-fix.md | 2026-09-06 | VSYNC-ISR deadlock fix, park CLOSED |
 
 ---
 
@@ -2053,9 +2012,10 @@ AGENTS.md                 # Agent rules
 
 ## Current Phase
 - **Phase 3:** PASSED (2026-08-22)
-- **Phase 4':** IN PROGRESS (Steps 1-2 done; hooks armed, idle pending boot blocker)
-- **Blocker:** intermittent OOM fatal in guest churn heap (see docs/BOOT_HANDOFF.md)
-- **Next:** Session 38 — run gate soak → analyze POOL-CENSUS FAIL# → root-cause slab corruption → render thread (P4.5')
+- **Phase 4'/4.5':** DONE (device-boundary takeover steps 1-3; render thread owns all D3D12)
+- **Phase 5':** CODE DONE — shader→PSO pipeline wired (PipelineCache, DXC worker, grcFvf layout); runtime test pending
+- **Blocker:** none — guest park blocker CLOSED in session 64 (spinlock seed 1→0 + host-side wrapper identity map)
+- **Next:** P5′ runtime validation (pixel-hash parity), then P4.6′ resource model
 
 ---
 

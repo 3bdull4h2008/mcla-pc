@@ -126,5 +126,5 @@ Two root causes, both fixed (full evidence:
 - generated/default is a STALE second regen - only generated/ppc_xenon is
   compiled (CMakeLists). Do not decode from generated/default.
 - Freeze line: no PM4, no manual GPU seeding, no opcode expansion.
-- Worktree has uncommitted census work in patches.cpp (sessions 37-56).
-  Commit checkpoint recommended before further surgery.
+- Census work in patches.cpp (sessions 37-56) was committed as part of the
+  session-65 rescan checkpoint; no outstanding patches.cpp edits expected.

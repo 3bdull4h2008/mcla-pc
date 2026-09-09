@@ -91,8 +91,8 @@ No active blockers. Full codebase rescan completed with 67 bug fixes across 4 se
 - generated/default is a STALE second regen - only generated/ppc_xenon is compiled
   (CMakeLists). Do not decode from generated/default.
 - Freeze line: no PM4, no manual GPU seeding, no opcode expansion.
-- Worktree has ~1183 lines UNCOMMITTED in patches.cpp (sessions 37-51 census work
-  + chain rebuild). Commit checkpoint recommended before further surgery.
+- Census work in patches.cpp (sessions 37-56) was committed with the session-65
+  rescan checkpoint; the worktree is clean except in-flight kernel edits.
 
 External recon (web-verified 2026-09-03 — research round: ~18 sources):
 
@@ -204,12 +204,29 @@ work), but RT64's patterns materially improve P4.6′/P5′/P5.5′ design choic
 and moodycamel is a proven P4.5′ dependency candidate. Re-scan when RT64's
 emulator-plugin or path-tracing code lands.
 
-## SOURCE-vs-PLAN AUDIT (2026-09-03) — documented conflicts, NOT yet fixed
+## SOURCE-vs-PLAN AUDIT (2026-09-03) — partially resolved, re-verified 2026-09-09
 
-Full grep sweep of `src/**` against the golden rules and gates. Findings are
-recorded here with file:line evidence; **none have been fixed** — each needs an
-owner and run-receipt discipline when picked up. Re-run this audit after any
-hook/guest-memory change.
+Full grep sweep of `src/**` against the golden rules and gates. Re-verified
+2026-09-09: **S8 RESOLVED** (hook-registration rule amended to name
+`src/patches.cpp` in `.clinerules/coding-standards.md`) and **S5 RESOLVED**
+(`vfs_rpf.cpp` hook signatures now take `uint32_t buffer_guest_addr` +
+`GuestMemoryView`, no host-pointer cast — see LOGIC_MAP.md fixes #2/#6).
+**S1-S4, S6, S7 remain OPEN** — each needs an owner and run-receipt discipline
+when picked up. Re-run this audit after any hook/guest-memory change.
+
+> **Re-verification 2026-09-09 (S1–S3 wording correction):** the "dead code /
+> dispatcher map never consulted" premise is now STALE — `app.cpp`'s
+> `FunctionDispatcher::SetFunction` was fixed to also call
+> `g_memory.InsertFunction` (see the DESIGN NOTE in `app.cpp:308-338`), so the
+> `dispatcher->SetFunction(...)` calls at `native_renderer.cpp:653/668/676/682`
+> install LIVE hooks into the real dispatch table. The conflict on
+> `0x8241BD08` / `0x82420BA8` is therefore **two live owners per seam**
+> (gpu_device.cpp P4′ weak-alias capture vs native_renderer.cpp
+> DrawAccumulator hooks), not dead-vs-live. Golden Rule 1 (one hook owner per
+> address) is still violated; the fix direction is to CONSOLIDATE to a single
+> owner per seam and delete only the losing duplicate capture path — the
+> native renderer itself (render thread, D3D12 backend, PSO cache, P5′ draw
+> path) is the destination architecture and is NOT a deletion candidate.
 
 ### S1 · HIGH — Dual capture systems on `sub_82420BA8` (Golden Rule 1)
 - Owner A: `gpu_device.cpp:643` — `PPC_FUNC(sub_82420BA8)` weak-alias override,
@@ -389,8 +406,11 @@ Laws adopted from B2S (`E:\top secret\docs\milestones.md`):
    corpus. Finding real `.fxc` containers inside RPF archives / `.xrsc` resources
    stays an open RECON item, not a gate dependency.
 
-Enforced set today: G-BUILD · G-VALIDATORS · G-PHASE0 (13/13) · G-BOOT-SOAK ·
-G-VSYNC-CHAIN · G-P4-CREATE-HOOK. Tracked: G-CORPUS-* (×3) · G-P4-RS-THUNK-HITS ·
+Enforced set today (per `tools/run_phase_gates.ps1`, corpus gates enforced
+since 2026-08-23): G-BUILD · G-VALIDATORS · G-CORPUS-XENOS-DECODE ·
+G-XENOS-DECODE-CLEAN · G-CORPUS-shader_pipeline · G-CORPUS-phase3 ·
+G-PHASE0 (13/13) · G-BOOT-SOAK · G-VSYNC-CHAIN · G-P4-CREATE-HOOK.
+Tracked: G-P4-RS-THUNK-HITS · G-P4-PACKET-CAPTURE · G-P4-SUBMIT-FAMILY-HITS ·
 G-P6-PM4FREE-FRAMES. New gates join the runner as phases start; perf-style metrics
 use baseline-then-delta targets instead of guessed absolutes.
 
@@ -556,6 +576,9 @@ non-critical paths. Do not implement until boot path demands it.
 
 ## Current State (2026-08-19, Post-Regression)
 
+> ⚠️ HISTORICAL SNAPSHOT (2026-08-19). Superseded by CURRENT STATUS (2026-09-07,
+> Session 65) at the top of this file — kept for the Investigation Record.
+
 - **ABI migration: largely complete.** Host sources compile clean (44/44
   targets). `mcla.exe` links generated PPC TUs, installs 46,041 `PPCFuncMappings`,
   installs kernel import stubs, boots on worker thread under SEH.
@@ -657,6 +680,11 @@ vcvars64 + Ninja + clang-cl + RelWithDebInfo; `renderer_mode` stays `legacy`.
 
 ### Phase 2 — Kernel Framework Foundation (CANONICAL FRAMEWORK)
 
+> ✅ **COMPLETED 2026-08-21/22** (see `docs/PHASE2_IMPLEMENTATION_PLAN.md`; gate
+> re-verified 2026-09-03, phase0_validator 13/13). The per-step statuses below
+> are the PRE-IMPLEMENTATION snapshot kept for the audit trail — every step
+> marked PARTIAL/NOT DONE landed.
+
 **Goal:** Build the **exact** UnleashedRecomp kernel framework. Replace ALL
 hand-written stubs, host-heap handle table, and manual register reads.
 
@@ -677,7 +705,11 @@ handles). Build clean with clang-cl 19.1.7 + Ninja.
 
 ---
 
-### Phase 3 — Critical Import Implementations (Boot Path) — ACTIVE
+### Phase 3 — Critical Import Implementations (Boot Path) — ✅ PASSED 2026-08-22
+
+> ✅ **GATE PASSED 2026-08-22 (`39ebebf`)** — boots into main loop, archives
+> load, VSync present chain 60fps. The ❌ statuses below are the PRE-REWRITE
+> snapshot kept for the audit trail.
 
 **Goal:** Implement/fix the imports needed for boot to reach `VdSwap` **on the
 canonical framework**. Each import = typed host function + one `GUEST_FUNCTION_HOOK`
@@ -711,7 +743,7 @@ line, audited against 360 semantics (UnleashedRecomp + Xenia).
 | `XamNotifyCreateListener` | Low | ❌ STUB | Notification listener. |
 | `XexGetModuleHandle` | Low | ❌ STUB | Module lookup. |
 
-**Immediate Execution Order (2026-08-19, Authorized):**
+**Immediate Execution Order (2026-08-19, Authorized) — ✅ ALL COMPLETED (P0-P3 done; see CURRENT STATUS at top of file):**
 
 1. **P0-FixA:** ✅ DONE — `ctx.gpr[N]` → named `ctx.rN` (232 sites) + `static_assert` layout guard in `ppc_context.h`.
 2. **P0-FixB:** ✅ DONE — `GuestMemoryHeap::Adopt(base, size)` wired from `boot::LoadAndPrepare`.
@@ -721,7 +753,7 @@ line, audited against 360 semantics (UnleashedRecomp + Xenia).
    - Then: `ExCreateThread` (GuestThread pattern), `KeWaitForMultipleObjects` (generation counter), `VdInitializeRingBuffer`, `VdEnableRingBufferRPtrWriteBack`, `VdInitializeEngines`, `VdSetGraphicsInterruptCallback`, `VdQueryVideoMode`, `VdQueryVideoFlags`.
 5. **P3 (Dead Import Resolution):** Remove ~37 dead/shadowed imports — one handle space, no inline stubs in `kernel_stubs_body.inc`. Delete invented GPU-context seeding.
 
-**Gate 3:** ❌ **NOT MET** — Boot does not yet reach `VdSwap` on canonical framework. Crash/gate evidence recorded in Investigation Record.
+**Gate 3:** ✅ **PASSED 2026-08-22** — boot reaches present chain on the canonical framework (earlier ❌ NOT MET evidence preserved in Investigation Record).
 
 ---
 

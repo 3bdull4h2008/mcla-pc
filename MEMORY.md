@@ -4,8 +4,8 @@
 - **Phase 1 (ABI Migration):** ✅ DONE
 - **Phase 2 (Kernel Framework):** ✅ DONE (13/13 tests passing — verified live 2026-09-03)
 - **Phase 3 (Critical Imports):** ✅ PASSED (2026-08-22) — Game boots, archives load, VSync 60fps
-- **Phase 4' (Device-Boundary Takeover):** ✅ DONE (all hooks active, 67 bugs fixed)
-- **Phase 4.5'–9':** ⏳ PENDING (see revised ladder in `docs/MCLA_REBUILD_PLAN.md`)
+- **Phase 4' (Device-Boundary Takeover):** ✅ DONE (steps 1-3; hooks active)
+- **Phase 4.5' (Render Thread & Queues):** ✅ DONE — P5' code complete, runtime test pending (see revised ladder in `docs/MCLA_REBUILD_PLAN.md`)
 
 ## Architecture Summary
 - **Goal:** Replace Xbox 360 Xenos GPU command processor with native D3D12 renderer
@@ -15,7 +15,7 @@
 - **Image Base:** `0x82000000`, Code Base: `0x82130000`, Code Size: `~6.8MB`
 
 ## Key Decisions
-1. Identity handles (handle = pointer to KernelObject)
+1. Identity handles (handle = guest VA of the object header; `GetKernelObject = Translate`)
 2. Typed-argument hooks (no manual ctx.rN reads)
 3. No PM4 in native rendering path
 4. Device-method boundary override (not packet parsing)

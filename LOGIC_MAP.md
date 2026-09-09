@@ -8,7 +8,7 @@
 
 - **Goal**: Native D3D12 renderer for Midnight Club: Los Angeles (Xbox 360), replacing the Xenos GPU command processor
 - **Stack**: C++23, CMake 3.25+, Ninja + clang-cl, D3D12, SDL3, XenonRecomp (46K+ PPC functions)
-- **102 source files** across 6 directories (49 .cpp, 51 .h, 1 .c, 1 other)
+- **101 source files** across 6 directories (49 .cpp, 51 .h, 1 .c)
 - **179 recompilation TUs** in the build
 - **Image Base**: `0x82000000`, **Code Base**: `0x82130000`
 - **Entry Point**: `_xstart` at guest address `0x821322B8`
