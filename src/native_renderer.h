@@ -10,6 +10,11 @@ namespace mcla::native {
 
 void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher);
 
+// R1 (2026-09-10): native present is driven by the game's PresentKick
+// (sub_824294E0), not the kernel VdSwap import. Call from the single-owner
+// PresentKick hook when renderer_mode=native.
+void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr);
+
 // (GetLastDrawType/GetLastDrawFlags/SetDrawCaptureCallback removed 2026-09-09:
 // zero callers — dead API deleted with the S1–S3 dual-owner hook sweep.)
 

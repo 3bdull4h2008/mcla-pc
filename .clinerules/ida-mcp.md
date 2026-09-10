@@ -11,11 +11,25 @@ evidence sources and cross-check before claiming a decode.
 - **Plugin** (`mcp-plugin.py`, stdlib-only): runs INSIDE IDA, serves JSON-RPC
   over HTTP at `127.0.0.1:13337` (scans up to +9 ports if occupied).
 - **Proxy** (`ida-pro-mcp.exe`, venv `C:\Users\abdul\.local\share\mcp\idamcp-venv`):
-  stdio MCP <-> HTTP bridge; this is what opencode launches. Dependency pin:
+  stdio MCP <-> HTTP bridge; this is what MiMo Desktop launches. Dependency pin:
   `ida-pro-mcp==1.4.0` with `mcp>=1.9,<2` (SDK 2.x removed
   `mcp.server.fastmcp` - do not blindly upgrade).
-- **IDA**: Professional 9.3 at `C:\Program Files\IDA Professional 9.3`;
-  IDAPython = Python 3.14.6 via vendor `idapyswitch` default.
+- **IDA**: Professional **9.4** at `C:\Program Files\IDA Professional 9.4`
+  (docs previously said 9.3; install is 9.4).
+- **Headless JSON-RPC server (current, preferred):**
+  `C:\Users\abdul\.local\share\mcp\idamcp-venv\Scripts\idalib_jsonrpc_server.py`
+  opens `build\cache\mcla_pe.bin` via idalib and reuses the plugin's
+  `JSONRPCRequestHandler` on port **8745**. Start with
+  `powershell -File tools\start_idalib_mcp.ps1`.
+  Engine config already points the proxy at `--ida-rpc http://127.0.0.1:8745`.
+- **Do NOT use `idalib_server.py` SSE/streamable-http with this proxy.**
+  Stock `idalib_server.py` serves FastMCP SSE at `/sse` (or streamable-http
+  at `/mcp` needing MCP Accept headers). The proxy POSTs plain JSON-RPC to
+  `/mcp` and gets 404/406. The JSON-RPC launcher is the compatible path.
+- **Headless Qt patch (required on IDA 9.4):** `is_window_active()` in
+  `mcp-plugin.py` must catch `Exception`, not just `ImportError`. IDA 9.4's
+  PyQt5 shim raises `NotImplementedError("Can't import PySide6...")` under
+  idalib; without the patch every `decompile_function` crashes.
 
 ## Headless mode (preferred for autonomous work)
 No GUI, no manual arming. One-time prerequisites (DONE on this machine):
@@ -24,11 +38,15 @@ No GUI, no manual arming. One-time prerequisites (DONE on this machine):
 - Decrypted/decompressed PE image extracted:
   `build\cache\mcla_pe.bin` (from `game_data\default.xex` via
   `.research/360tools/tools/extract_pe.py`; stock IDA cannot parse XEX).
-Start the server (long-lived):
-  `idamcp-venv\Scripts\idalib-mcp.exe --host 127.0.0.1 --port 8745
-   "E:\mcla pc\build\cache\mcla_pe.bin"`
-Then point the proxy at it - opencode.json `mcp.ida.command` args must include
-  `["...\\ida-pro-mcp.exe", "--ida-rpc", "http://127.0.0.1:8745"]`
+Start the server (long-lived) — quote the PE path (space in `mcla pc`):
+```powershell
+Start-Process "C:\Users\abdul\.local\share\mcp\idamcp-venv\Scripts\idalib-mcp.exe" `
+  -ArgumentList '--host','127.0.0.1','--port','8745','"E:\mcla pc\build\cache\mcla_pe.bin"'
+```
+Expect: `Uvicorn running on http://127.0.0.1:8745`.
+Then point the proxy at it — engine config `~/.config/mimocode/mimocode.jsonc`
+`mcp.ida-pro.command` args include `["...\\ida-pro-mcp.exe", "--ida-rpc", "http://127.0.0.1:8745"]`
+with `environment.PYTHONPATH=""`.
 (first analysis of the 10 MB PPC image takes minutes; the .i64 lands next to
 the .bin and subsequent starts are fast).
 
@@ -64,8 +82,12 @@ as session-local until the IDB is saved deliberately.
    confirmed by TWO sources (generated TU text, Ghidra, or IDA) - never one.
 
 ## Best Practices
-- Start the plugin BEFORE spawning heavy opencode subagents (reverser/debugger)
-  so they don't burn turns on connection errors.
+- Start the JSON-RPC server BEFORE spawning heavy subagents:
+  `powershell -File tools\start_idalib_mcp.ps1`. Verify with `check_connection`.
+- **Function starts on this raw PPC image are unreliable in IDA.** Auto-analysis
+  splits/merges functions (e.g. real `sub_821447B8` drain body was cut at
+  `0x821447f8`). Prefer generated TUs + Ghidra as ground truth; use IDA for
+  xref sweeps and Hex-Rays only after confirming bounds against generated.
 - Prefer `decompile_function` over raw disasm for control-flow questions;
   fall back to `disassemble_function` for PPC idioms Hex-Rays mangles.
 - Export durable findings to `.research/findings/ida/` (same discipline as

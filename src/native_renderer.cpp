@@ -93,49 +93,43 @@ PPC_FUNC_IMPL(Hooked_Sub8241ABB8) {
 void IssueNativeDraw(::MclaGpuContext* gpuCtx) {
     (void)gpuCtx;
     MCLA_LOG_WARN("IssueNativeDraw: legacy command processor path not available in standalone mode");
-    // Native draws are now issued through the VdSwap hook -> D3D12Backend render graph
 }
 
-// VdSwap hook - native present path
+// R1 (2026-09-10): native present is owned by PresentKick (sub_824294E0).
+// VdSwap is a kernel import that UR also stubs; MCLA only logs if it fires.
+void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
+    if (mcla::renderer::GetRendererMode() != mcla::renderer::RendererMode::Native) {
+        return;
+    }
+    mcla::native::RenderCommand cmd;
+    cmd.type = mcla::native::RenderCommand::PRESENT;
+    auto& present = cmd.data.emplace<mcla::native::PresentCommand>();
+    present.frameNumber = frameNumber;
+    present.obj = obj;
+    present.swapInfo = fbAddr;
+    mcla::native::g_commandQueue.push(cmd);
+    if (frameNumber <= 8 || (frameNumber % 120) == 0) {
+        MCLA_LOG_INFO("NATIVE-PRESENT #{} obj={:08X} fb={:08X} q={}",
+                      frameNumber, obj, fbAddr, mcla::native::g_commandQueue.size());
+    }
+}
 
-
+// VdSwap import hook — INERT for frame production (R1).
+// Guest frame-end (sub_82419E90/199B0) may still call VdSwap; log only.
 PPC_FUNC_IMPL(Hooked_VdSwap) {
-    uint32_t obj        = ctx.r3.u32;
-    uint32_t swap_info  = ctx.r4.u32;
+    uint32_t obj       = ctx.r3.u32;
+    uint32_t swap_info = ctx.r4.u32;
 
     static int swapCount = 0;
     swapCount++;
-    if (swapCount <= 5) {
-        MCLA_LOG_INFO("VdSwap[{}] obj=0x{:08X} swap_info=0x{:08X} mode={}",
-                    swapCount, obj, swap_info,
-                    mcla::renderer::RendererModeName(mcla::renderer::GetRendererMode()));
+    if (swapCount <= 8 || (swapCount % 200) == 0) {
+        MCLA_LOG_INFO("VdSwap[{}] obj=0x{:08X} swap_info=0x{:08X} (INERT — "
+                      "present owned by PresentKick 0x824294E0)",
+                    swapCount, obj, swap_info);
     }
-
-    GetDrawAccumulator()->OnFrameEnd();
-
-    if (mcla::renderer::GetRendererMode() == mcla::renderer::RendererMode::Native) {
-        static uint64_t s_nativeFrameCount = 0;
-        s_nativeFrameCount++;
-
-        mcla::native::RenderCommand cmd;
-        cmd.type = mcla::native::RenderCommand::PRESENT;
-        auto& present = cmd.data.emplace<mcla::native::PresentCommand>();
-        present.frameNumber = static_cast<uint32_t>(s_nativeFrameCount);
-        present.obj = obj;
-        present.swapInfo = swap_info;
-        mcla::native::g_commandQueue.push(cmd);
-
-        if (s_nativeFrameCount % 120 == 0) {
-            MCLA_LOG_INFO("VdSwap[{}] enqueued PRESENT #{} (queue size: {})",
-                        swapCount, s_nativeFrameCount, mcla::native::g_commandQueue.size());
-        }
-    } else {
-        // Legacy / Capture mode - chain to original if needed for game logic
-        // In standalone mode, there's no original SDK VdSwap to chain to
-        // The game's VSync/swap logic runs in the PPC thread
-    }
-
-    mcla::renderer::RecordFramePresented();
+    // Do NOT enqueue PRESENT here and do NOT RecordFramePresented —
+    // double-present if both VdSwap and PresentKick fire from the same
+    // guest frame-end (verified in ppc_recomp.79.cpp sub_82419E98).
 }
 
 void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher) {
@@ -209,7 +203,8 @@ void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher) {
     }
 
     dispatcher->SetFunction(0x827BD6E4, Hooked_VdSwap);
-    MCLA_LOG_INFO("Native renderer: VdSwap hooked");
+    MCLA_LOG_INFO("Native renderer: VdSwap registered INERT (present owned by "
+                  "PresentKick sub_824294E0 / frame-end sub_82419E90)");
 }
 
 } // namespace mcla::native

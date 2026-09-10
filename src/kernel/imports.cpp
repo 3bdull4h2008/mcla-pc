@@ -2592,7 +2592,33 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
     }
   }
 
-  Semaphore *sem = QueryKernelObject<Semaphore>(Handle->Header);
+  Semaphore *sem = nullptr;
+
+  // SESSION 72 WAKE-LOSS: NtCreateSemaphore mints an identity handle =
+  // MapVirtual(host Semaphore*). Wait (NtWaitForSingleObjectEx) resolves via
+  // GetKernelObject → that same host object. Release used QueryKernelObject
+  // on the header, which MINTED A FRESH wrapper (create never registers in
+  // WrapperIdentityMap) — Release landed on a different Semaphore and the
+  // waiter slept forever. Ring-B consumers parked on C5000280 after PUSH
+  // "released" it; main then waited on C6009F80 completion.
+  //
+  // Resolve Release the same way Wait does when the handle is an identity
+  // handle. Fall back to QueryKernelObject for raw guest XKSEMAPHORE structs.
+  {
+    const uint32_t guestHandle =
+        static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
+                              mcla::kernel::g_memory.base);
+    if (IsKernelObject(guestHandle)) {
+      auto *obj = GetKernelObject(guestHandle);
+      sem = dynamic_cast<Semaphore *>(obj);
+      if (sem) {
+        // Shared host object with Wait — this is the identity-handle path.
+      }
+    }
+  }
+  if (!sem) {
+    sem = QueryKernelObject<Semaphore>(Handle->Header);
+  }
 
   uint32_t previousCount;
   sem->Release(ReleaseCount, &previousCount);

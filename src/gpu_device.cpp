@@ -4,6 +4,7 @@
 #include "renderer_mode.h"
 #include "renderer_hook_dispatch.h"
 #include "capture_hooks.h"
+#include "native_renderer.h"
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "kernel/memory.h"
@@ -776,6 +777,11 @@ PPC_FUNC(sub_82420BA8) {
 // (r3=dev, r4=fbAddr); sub_82429570 = vsync-aware flip picker (backbuffer
 // idx dev[+0x5498], count [+0x5494], base [+0x548c]). Both emit PM4 flip +
 // 0xDEADBEEF fence consumed by ISR 0x82411478.
+//
+// R1 (2026-09-10): THIS is the native present owner. Guest frame-end
+// (sub_82419E90 -> sub_82419E98) calls PresentKick and VdSwap from the same
+// path (ppc_recomp.79.cpp:12387/12532). Native mode presents here; VdSwap
+// is inert (see native_renderer.cpp Hooked_VdSwap).
 // ---------------------------------------------------------------------------
 static std::atomic<uint32_t> s_presentKickCount{0};
 static std::atomic<uint32_t> s_lastFbAddr{0};
@@ -791,13 +797,33 @@ PPC_FUNC_IMPL(__imp__sub_824294E0);
 PPC_FUNC(sub_824294E0) {
   const uint32_t n = s_presentKickCount.fetch_add(1) + 1;
   s_lastFbAddr.store(ctx.r4.u32, std::memory_order_relaxed);
-  // P5' (B8): present kick = frame boundary. Keep the frame counter aligned
-  // for native renderer state consumers.
-  mcla::gpu::g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+  // P5' (B8) / R1: present kick = frame boundary. Advance frame counter and
+  // enqueue host present in native mode (single owner — not VdSwap).
+  const uint32_t frame =
+      mcla::gpu::g_frameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
   if (n <= 8 || (n % 500) == 0)
     MCLA_LOG_INFO("P4'-PRESENT kick #{} dev={:08X} fb={:08X}", n, ctx.r3.u32,
                   ctx.r4.u32);
+
+  mcla::native::GetDrawAccumulator()->OnFrameEnd();
+  mcla::native::EnqueueNativePresent(frame, ctx.r3.u32, ctx.r4.u32);
+  mcla::renderer::RecordFramePresented();
+
   __imp__sub_824294E0(ctx, base);
+}
+
+// R1 census: high-level frame-end entry. sub_82419E90(r3=dev) forwards to
+// sub_824199B0 which runs the flip picker + PresentKick + VdSwap sequence.
+// Fires only when the guest actually presents — first hit is the present
+// milestone (currently absent through pool-OOM-era boots).
+PPC_FUNC_IMPL(__imp__sub_82419E90);
+static std::atomic<uint32_t> s_h19E90{0};
+PPC_FUNC(sub_82419E90) {
+  const uint32_t n = s_h19E90.fetch_add(1) + 1;
+  if (n <= 8 || (n % 200) == 0)
+    MCLA_LOG_INFO("FRAME-END sub_82419E90 #{} dev={:08X} lr={:08X}", n,
+                  ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_82419E90(ctx, base);
 }
 
 namespace mcla::gpu {
@@ -1090,6 +1116,26 @@ PPC_FUNC(sub_82419718) {
 }
 
 // ---------------------------------------------------------------------------
+// SLEEP-HELPER census (2026-09-10 KDELAY stall): sub_82460270(ms=r3,
+// alertable=r4) is the ONLY body that contains the lr=0x824602C4 site.
+// sub_8244FEC0(ms) is a tail-call with r4=0 (single Sleep). Main thread
+// parks forever at 10ms — outer poll loop re-enters this helper. Log
+// (ms, alertable, caller LR) so the outer loop is named.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82460270);
+static std::atomic<uint32_t> s_h60270{0};
+PPC_FUNC(sub_82460270) {
+  const uint32_t n = s_h60270.fetch_add(1) + 1;
+  const uint32_t ms = ctx.r3.u32;
+  const uint32_t alertable = ctx.r4.u32 & 0xFF;
+  const uint32_t callerLr = static_cast<uint32_t>(ctx.lr);
+  if (n <= 40 || (n % 200) == 0)
+    MCLA_LOG_INFO("SLEEP60270 #{} ms={} al={} callerLR={:08X}", n, ms,
+                  alertable, callerLr);
+  __imp__sub_82460270(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
 // WAIT-HELPER census: sub_82135DC0(handle=r3, timeoutMs=r4, alertable=r5)
 // wraps NtWaitForSingleObjectEx in a retry-on-timeout loop
 // (ppc_recomp.0.cpp:18590-18654). PARK-SAMPLE caught the main thread parked
@@ -1145,6 +1191,44 @@ PPC_FUNC(sub_821C90C0) {
   __imp__sub_821C90C0(ctx, base);
 }
 
+// Task-join table (generated ppc_recomp.15.cpp sub_821BD220):
+//   r30 = 0x8283D1AC  (lis -32124 → 0x82840000, addi -11860)
+//   count   = *(u32*)(r30-4)  = 0x8283D1A8   // slot count; mask = count-1
+//   entries = *(u32*)(r30+24) = 0x8283D1C4
+//   idx     = (count-1) & tag
+//   entry   = entries + idx * 28
+//   entry+0 = key, entry+12 = in-progress flag (join wait word)
+constexpr uint32_t kTaskJoinCountAddr = 0x8283D1A8u;
+constexpr uint32_t kTaskJoinEntriesAddr = 0x8283D1C4u;
+constexpr uint32_t kTaskJoinStride = 28u;
+
+// Clear task_entry+12 for `tag` if the slot is live and still marked busy.
+// Used by FENCE-SC: GPU work is already done synchronously, but the join
+// in sub_821BD220 would spin forever on a flag the frozen CP never clears.
+static bool ClearTaskJoinBusy(uint32_t tag) {
+  if (tag == 0xFFFFFFFFu)
+    return false;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t count = 0, entries = 0;
+  if (!mem.ReadU32BE(kTaskJoinCountAddr, &count) ||
+      !mem.ReadU32BE(kTaskJoinEntriesAddr, &entries) || entries == 0)
+    return false;
+  const uint32_t mask = (count == 0) ? 0u : (count - 1u);
+  const uint32_t idx = tag & mask;
+  const uint32_t entry = entries + idx * kTaskJoinStride;
+  uint32_t key = 0, busy = 0;
+  if (!mem.ReadU32BE(entry + 0, &key) || !mem.ReadU32BE(entry + 12, &busy))
+    return false;
+  if (key != tag)
+    return false;
+  if (busy == 0)
+    return true;
+  (void)mem.WriteU32BE(entry + 12, 0);
+  MCLA_LOG_INFO("TASKJOIN-SC tag={:08X} idx={} entry={:08X} busy {:08X}->0", tag,
+                idx, entry, busy);
+  return true;
+}
+
 // FENCE-WAIT (TU21:4085): sub_821E5640(obj=r3, blocking=r4, release=r5)
 // waits INFINITE on the embedded completion event [obj+8]. Dump the object
 // tag/state so the pending async-job TYPE becomes visible; caller LR names
@@ -1164,6 +1248,7 @@ PPC_FUNC(sub_821E5640) {
   const uint32_t n = s_h5640.fetch_add(1) + 1;
   const uint32_t obj = ctx.r3.u32;
   const uint32_t blocking = ctx.r4.u32 & 0xFF;
+  const uint32_t releaseFlag = ctx.r5.u32 & 0xFF;
   uint32_t tag = 0, state = 0, evt = 0;
   {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -1185,9 +1270,14 @@ PPC_FUNC(sub_821E5640) {
   // on the wrong object.  With GetKernelObject fixed (session 70c) to route
   // through QueryKernelObject, both Release and Wait now operate on the same
   // host wrapper.
+  //
+  // TASKJOIN-SC (session 72): after the semaphore pre-release, also clear
+  // task_entry+12 for this tag. Probe soak proved main then entered
+  // sub_821BD220's 10ms join on a busy flag the reinitialized CP never
+  // publishes. Same "work IS done" honesty as E98/KDELAY-SC.
   if (blocking == 1 && evt != 0) {
-    MCLA_LOG_INFO("FENCE-SC #{} obj={:08X} tag={:08X} ev={:08X} lr={:08X}",
-                  n, obj, tag, evt, ctx.lr);
+    MCLA_LOG_INFO("FENCE-SC #{} obj={:08X} tag={:08X} ev={:08X} rel={} lr={:08X}",
+                  n, obj, tag, evt, releaseFlag, ctx.lr);
     const uint32_t sr3 = ctx.r3.u32, sr4 = ctx.r4.u32, sr5 = ctx.r5.u32;
     ctx.r3.u32 = evt;
     ctx.r4.u32 = 1;
@@ -1196,6 +1286,8 @@ PPC_FUNC(sub_821E5640) {
     ctx.r3.u32 = sr3;
     ctx.r4.u32 = sr4;
     ctx.r5.u32 = sr5;
+    if (releaseFlag != 0)
+      (void)ClearTaskJoinBusy(tag);
   }
 
   if (n <= 24 || (n % 500) == 0)
@@ -1203,6 +1295,128 @@ PPC_FUNC(sub_821E5640) {
                   "ev={:08X} blk={} lr={:08X}",
                   n, obj, tag, state, evt, blocking, ctx.lr);
   __imp__sub_821E5640(ctx, base);
+}
+
+// TASK-JOIN census + short-circuit (session 72): sub_821BD220(tag) joins a
+// 28-byte task-table slot, spinning Sleep(10) while entry+12 != 0. Probe
+// pinned callerLR=0x821BD334 on the main-thread KDELAY flood. When the slot
+// is already known-done (FENCE-SC / TASKJOIN-SC), force busy=0 so the join
+// exits. Scoped to main thread to avoid side effects on real worker joins.
+PPC_FUNC_IMPL(__imp__sub_821BD220);
+static std::atomic<uint32_t> s_hBD220{0};
+PPC_FUNC(sub_821BD220) {
+  const uint32_t n = s_hBD220.fetch_add(1) + 1;
+  const uint32_t tag = ctx.r3.u32;
+  uint32_t count = 0, entries = 0, entry = 0, key = 0, busy = 0, idx = 0;
+  {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(kTaskJoinCountAddr, &count);
+    (void)mem.ReadU32BE(kTaskJoinEntriesAddr, &entries);
+    if (entries != 0 && count != 0) {
+      idx = tag & (count - 1u);
+      entry = entries + idx * kTaskJoinStride;
+      (void)mem.ReadU32BE(entry + 0, &key);
+      (void)mem.ReadU32BE(entry + 12, &busy);
+    }
+  }
+  if (n <= 32 || (n % 200) == 0)
+    MCLA_LOG_INFO("TASKJOIN sub_821BD220 #{} tag={:08X} count={} idx={} "
+                  "entry={:08X} key={:08X} busy={:08X} lr={:08X}",
+                  n, tag, count, idx, entry, key, busy, ctx.lr);
+
+  // Honest short-circuit: if this is the main-thread join on a slot that is
+  // still marked busy, force busy=0 so the 10ms spin can exit. GPU work for
+  // FENCE-SC tags is already done synchronously.
+  if (busy != 0 && key == tag) {
+    const uint32_t mainId = g_mainGuestThreadId.load();
+    if (mainId != 0 && GetCurrentThreadId() == mainId) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      MCLA_LOG_INFO("TASKJOIN-SC #{} tag={:08X} entry={:08X} busy {:08X}->0 "
+                    "(main)",
+                    n, tag, entry, busy);
+      (void)mem.WriteU32BE(entry + 12, 0);
+    }
+  }
+  __imp__sub_821BD220(ctx, base);
+}
+
+// INFLATE-BEGIN pass-through (session 72): zlibInflater::InflateBegin
+// (sub_821D5E10) fatals unless the stream starts with XCompress magic
+// 0x0FF512EF. Our VFS serves already-extracted raw files (vfs_rpf.h),
+// so the magic check fires on every named resource (meshtextures, …).
+// Honest short-circuit: if the stream does not carry the magic, copy the
+// remaining input to the output as uncompressed and advance the state —
+// same shape as the post-decompress pointer update in generated.
+//
+// state (r4) layout from ppc_recomp.19.cpp sub_821D5E10:
+//   +0  remaining input bytes
+//   +4  input pointer
+//   +8  bytes consumed/produced so far (0 at stream start)
+//   +12 expected total output (from XCompress header+4)
+//   +16 remaining output space
+//   +20 output pointer
+//   +24 total produced
+constexpr uint32_t kXCompressMagic = 0x0FF512EFu;
+PPC_FUNC_IMPL(__imp__sub_821D5E10);
+static std::atomic<uint32_t> s_h5E10{0};
+static std::atomic<uint32_t> s_h5E10pt{0};
+PPC_FUNC(sub_821D5E10) {
+  const uint32_t n = s_h5E10.fetch_add(1) + 1;
+  const uint32_t st = ctx.r4.u32;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t inLeft = 0, inPtr = 0, consumed = 0, expected = 0;
+  uint32_t outLeft = 0, outPtr = 0, produced = 0;
+  (void)mem.ReadU32BE(st + 0, &inLeft);
+  (void)mem.ReadU32BE(st + 4, &inPtr);
+  (void)mem.ReadU32BE(st + 8, &consumed);
+  (void)mem.ReadU32BE(st + 12, &expected);
+  (void)mem.ReadU32BE(st + 16, &outLeft);
+  (void)mem.ReadU32BE(st + 20, &outPtr);
+  (void)mem.ReadU32BE(st + 24, &produced);
+
+  uint32_t magic = 0;
+  if (consumed == 0 && inLeft >= 4 && inPtr != 0)
+    (void)mem.ReadU32BE(inPtr, &magic);
+
+  // Session 72: empty input — nothing to inflate. The guest re-enters with
+  // in=0 consumed=0xFFFFFFF4 forever (INFLATE #286600+). Mark the stream
+  // fully consumed so the caller's progress check exits; do not call the
+  // original (it would spin or AV on a corrupt state).
+  if (inLeft == 0) {
+    static std::atomic<uint32_t> s_h5E10empty{0};
+    const uint32_t e = s_h5E10empty.fetch_add(1) + 1;
+    if (e <= 8 || (e % 1000) == 0)
+      MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} (bail)", e, st,
+                    consumed);
+    // Normalize state: no input left, consumed covers all, expected=0.
+    (void)mem.WriteU32BE(st + 0, 0);
+    (void)mem.WriteU32BE(st + 8, 0);
+    (void)mem.WriteU32BE(st + 12, 0);
+    return;
+  }
+
+  if (n <= 16 || (n % 200) == 0)
+    MCLA_LOG_INFO("INFLATE #{} st={:08X} in={} out={} consumed={} magic={:08X} "
+                  "lr={:08X}",
+                  n, st, inLeft, outLeft, consumed, magic, ctx.lr);
+
+  if (consumed == 0 && inLeft >= 4 && magic != kXCompressMagic &&
+      inPtr != 0 && outPtr != 0) {
+    // Session 72: do NOT copy unknown-magic bytes into the output. A
+    // 525DE064 stream was pass-through'd raw and the guest parser produced
+    // wild pointer 0x7E780000 → AV in sub_821DEE40. Skip the XCompress
+    // fatal, consume the stream, emit nothing. Guest sees empty output.
+    (void)mem.WriteU32BE(st + 0, 0);       // inLeft = 0
+    (void)mem.WriteU32BE(st + 8, inLeft);  // consumed = all input
+    (void)mem.WriteU32BE(st + 12, 0);      // expected = 0
+    const uint32_t pt = s_h5E10pt.fetch_add(1) + 1;
+    if (pt <= 16 || (pt % 50) == 0)
+      MCLA_LOG_WARN("INFLATE-SKIP #{} magic={:08X} in={} out={} (no XCompress "
+                    "header — skip fatal, emit 0)",
+                    pt, magic, inLeft, outLeft);
+    return;
+  }
+  __imp__sub_821D5E10(ctx, base);
 }
 
 // TASK-COMPLETE census: sub_8244EE00 runs after every pool-worker task
@@ -1315,15 +1529,31 @@ PPC_FUNC(sub_821BC868) {
   // leaked increment and executed a stale zeroed slot.
   if (n <= 16 || (n % 2000) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t wIdx = 0, pIdx = 0, cnt = 0;
+    uint32_t wIdx = 0, pIdx = 0, cnt = 0, relH = 0;
     const bool okW = mem.ReadU32BE(q + 0x6160, &wIdx);
     const bool okP = mem.ReadU32BE(q + 0x6164, &pIdx);
     const bool okC = mem.ReadU32BE(q + 0x6168, &cnt);
+    const bool okR = mem.ReadU32BE(q + 0x616C, &relH);
     MCLA_LOG_INFO(
-        "PUSH sub_821BC868 #{} q={:08X} wIdx={}{} pIdx={}{} cnt={}{} lr={:08X}",
+        "PUSH sub_821BC868 #{} q={:08X} wIdx={}{} pIdx={}{} cnt={}{} "
+        "relH={:08X}{} lr={:08X}",
         n, q, wIdx, okW ? "" : "?", pIdx, okP ? "" : "?", cnt, okC ? "" : "?",
-        ctx.lr);
+        relH, okR ? "" : "?", ctx.lr);
   }
+}
+
+// RELEASE-HANDLE census (session 72): sub_821C9108(h) → sub_8244ED10(h,1,0).
+// Ring-B PUSH should release queue+0x616C to wake the consumer parked on
+// C5000300. That SIGNAL never appeared. Dump every release handle.
+PPC_FUNC_IMPL(__imp__sub_821C9108);
+static std::atomic<uint32_t> s_hC9108{0};
+PPC_FUNC(sub_821C9108) {
+  const uint32_t n = s_hC9108.fetch_add(1) + 1;
+  const uint32_t h = ctx.r3.u32;
+  if (n <= 40 || (n % 500) == 0)
+    MCLA_LOG_INFO("RELSEMA sub_821C9108 #{} h={:08X} lr={:08X}", n, h,
+                  static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821C9108(ctx, base);
 }
 
 // ---------------------------------------------------------------------------

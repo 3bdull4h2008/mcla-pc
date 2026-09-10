@@ -3,9 +3,48 @@
 #include "memory.h"
 #include "function.h"
 #include "logging.h"
+#include <atomic>
 
 constexpr size_t RESERVED_BEGIN = 0x7FEA0000;
 constexpr size_t RESERVED_END = 0xA0000000;
+
+// SEH-safe o1heap allocate: must be a C-style function with no C++ objects
+// that require unwinding — clang-cl crashes compiling __try in a C++ method
+// that holds std::lock_guard.
+#if defined(_MSC_VER)
+    void* SehO1Allocate(O1HeapInstance* heap, size_t amount)
+    {
+        void* ptr = nullptr;
+        __try
+        {
+            ptr = o1heapAllocate(heap, amount);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ptr = nullptr;
+        }
+        return ptr;
+    }
+    void SehO1Free(O1HeapInstance* heap, void* ptr)
+    {
+        __try
+        {
+            o1heapFree(heap, ptr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            static std::atomic<uint32_t> s_freeSeh{0};
+            const uint32_t n = s_freeSeh.fetch_add(1) + 1;
+            if (n <= 8 || (n % 100) == 0)
+                MCLA_LOG_ERROR("o1heapFree SEH catch #{} ptr={:p}", n, ptr);
+        }
+    }
+#define MCLA_O1_ALLOC(heap, amount) SehO1Allocate((heap), (amount))
+#define MCLA_O1_FREE(heap, ptr) SehO1Free((heap), (ptr))
+#else
+#define MCLA_O1_ALLOC(heap, amount) o1heapAllocate((heap), (amount))
+#define MCLA_O1_FREE(heap, ptr) o1heapFree((heap), (ptr))
+#endif
 
 // Mirrors o1heap.c FragmentHeader layout (private there): next@0, prev@8,
 // size@16, used@24. O1HEAP_ALIGNMENT=32, FRAGMENT_SIZE_MIN=64.
@@ -125,24 +164,97 @@ void* Heap::Alloc(size_t size)
 {
     std::lock_guard lock(mutex);
 
-    return o1heapAllocate(heap, std::max<size_t>(1, size));
+    if (heap == nullptr)
+        return nullptr;
+    if (!o1heapDoInvariantsHold(heap))
+    {
+        static std::atomic<uint32_t> s_badMain{0};
+        const uint32_t n = s_badMain.fetch_add(1) + 1;
+        if (n <= 8 || (n % 200) == 0)
+            MCLA_LOG_ERROR("Alloc: o1heap invariants FAIL #{} size={:#x}", n,
+                           size);
+        return nullptr;
+    }
+    void* ptr = MCLA_O1_ALLOC(heap, std::max<size_t>(1, size));
+    if (ptr == nullptr)
+    {
+        static std::atomic<uint32_t> s_nullMain{0};
+        const uint32_t n = s_nullMain.fetch_add(1) + 1;
+        if (n <= 8 || (n % 100) == 0)
+            MCLA_LOG_ERROR("Alloc: o1heapAllocate returned null #{} size={:#x}",
+                           n, size);
+    }
+    return ptr;
 }
 
 void* Heap::AllocPhysical(size_t size, size_t alignment)
 {
     size = std::max<size_t>(1, size);
     alignment = alignment == 0 ? 0x1000 : std::max<size_t>(16, alignment);
+    // Session 72: guest can pass non-pow2 (observed 0x404). The
+    // `& ~(alignment-1)` mask is only valid for pow2 — a non-pow2 alignment
+    // produced a misaligned user pointer and the bookkeeping words written
+    // below it corrupted o1heap fragment headers (AV in o1heapAllocate).
+    {
+        size_t p2 = 16;
+        while (p2 < alignment)
+            p2 <<= 1;
+        alignment = p2;
+    }
 
     std::lock_guard lock(physicalMutex);
+
+    if (physicalHeap == nullptr)
+        return nullptr;
+
+    // Session 72: post-present AV inside o1heapAllocate walking a corrupted
+    // free list (CDCDCDCD class). Refuse the alloc instead of AVing the
+    // process so the guest can take its own OOM path.
+    if (!o1heapDoInvariantsHold(physicalHeap))
+    {
+        static std::atomic<uint32_t> s_badHeap{0};
+        const uint32_t n = s_badHeap.fetch_add(1) + 1;
+        if (n <= 8 || (n % 200) == 0)
+        {
+            const auto d = o1heapGetDiagnostics(physicalHeap);
+            MCLA_LOG_ERROR("AllocPhysical: o1heap invariants FAIL #{} size={:#x} "
+                           "align={:#x} cap={} peak={}",
+                           n, size, alignment, d.capacity, d.peak_allocated);
+        }
+        // First failure: dump a few fragment headers so we can see what
+        // overwrote the free list (CDCDCDCD / wild next ptr).
+        if (n == 1 && physArenaBase != nullptr)
+        {
+            const uint8_t* p = physArenaBase;
+            // O1HeapInstance is at arena start; fragment headers follow.
+            // Dump first 8 qwords of the instance + first fragment area.
+            uint64_t words[16] = {};
+            std::memcpy(words, p, sizeof(words));
+            MCLA_LOG_ERROR("o1heap arena[0..127]: {:016X} {:016X} {:016X} {:016X}",
+                           words[0], words[1], words[2], words[3]);
+            MCLA_LOG_ERROR("o1heap arena[32..]: {:016X} {:016X} {:016X} {:016X}",
+                           words[4], words[5], words[6], words[7]);
+        }
+        return nullptr;
+    }
 
     // Extra head-room guarantees the aligned user pointer sits at least one
     // O1HEAP_ALIGNMENT above the raw o1heap user pointer, so the two
     // bookkeeping words written below it can never overlap the o1heap
     // fragment header (next@-32, prev@-24, size@-16, used@-8). Overlapping it
     // destroyed the pow2-size/used invariants IsLiveAllocation checks.
-    void* ptr = o1heapAllocate(physicalHeap, size + alignment + O1HEAP_ALIGNMENT);
+    //
+    void* ptr = MCLA_O1_ALLOC(physicalHeap, size + alignment + O1HEAP_ALIGNMENT);
     if (ptr == nullptr)
+    {
+        static std::atomic<uint32_t> s_nullPtr{0};
+        const uint32_t n = s_nullPtr.fetch_add(1) + 1;
+        if (n <= 8 || (n % 100) == 0)
+            MCLA_LOG_ERROR("AllocPhysical: o1heapAllocate returned null #{} "
+                           "size={:#x} align={:#x}",
+                           n, size, alignment);
         return nullptr;
+    }
 
     uintptr_t aligned = ((uintptr_t)ptr + alignment) & ~(alignment - 1);
     if (aligned < (uintptr_t)ptr + O1HEAP_ALIGNMENT)
@@ -177,7 +289,7 @@ void Heap::Free(void* ptr)
                           (void*)(physArenaBase + physArenaSize));
             return;
         }
-        o1heapFree(physicalHeap, rawPtr);
+        MCLA_O1_FREE(physicalHeap, rawPtr);
     }
     else
     {
@@ -192,7 +304,7 @@ void Heap::Free(void* ptr)
                           (void*)(heapArenaBase + heapArenaSize));
             return;
         }
-        o1heapFree(heap, ptr);
+        MCLA_O1_FREE(heap, ptr);
     }
 }
 

@@ -1,4 +1,4 @@
-﻿#include "patches.h"
+#include "patches.h"
 #include "app.h"
 #include "cpu/ppc_context.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
@@ -1128,6 +1128,21 @@ uint32_t OomCensusReadU32(uint32_t addr, bool *ok = nullptr) {
   return val;
 }
 
+// Live free-path writes (lr≈0x821DEB0C) fill freed 16-byte elements with
+// 0xCDCDCDCD; older census assumed 0xDDDDDDDD. Accept both.
+bool LooksLikeFreeFill(uint32_t word) {
+  return word == 0xCDCDCDCDu || word == 0xDDDDDDDDu;
+}
+
+bool ElementLooksFree(uint32_t elemAddr, uint32_t elemsize) {
+  for (uint32_t b = 4; b < elemsize; b += 4) {
+    if (!LooksLikeFreeFill(OomCensusReadU32(elemAddr + b))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool RepairCorruptedTinySlabFreeList(uint32_t classHead) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t headWord = OomCensusReadU32(classHead + 4);
@@ -1160,14 +1175,7 @@ bool RepairCorruptedTinySlabFreeList(uint32_t classHead) {
 
       for (uint32_t i = 0; i < nodesPerSlab; ++i) {
         const uint32_t elemAddr = curSlab + slabDataStart + (i * elemsize);
-        bool looksFree = true;
-        for (uint32_t b = 4; b < elemsize; b += 4) {
-          if (OomCensusReadU32(elemAddr + b) != 0xDDDDDDDDu) {
-            looksFree = false;
-            break;
-          }
-        }
-        if (looksFree) {
+        if (ElementLooksFree(elemAddr, elemsize)) {
           (void)mem.WriteU32BE(elemAddr + 0, newHead);
           newHead = elemAddr;
           ++newCount;
@@ -1175,6 +1183,8 @@ bool RepairCorruptedTinySlabFreeList(uint32_t classHead) {
         }
       }
 
+      // Honest empty: zero the stale count so DE9D8 takes the refill path
+      // instead of returning 0 from a phantom freeCount.
       if (!foundAny) {
         (void)mem.WriteU32BE(curSlab + 12, 0);
         (void)mem.WriteU32BE(curSlab + 8, 0);
@@ -1194,6 +1204,30 @@ bool RepairCorruptedTinySlabFreeList(uint32_t classHead) {
   }
   return repaired;
 }
+
+void LogDe9D8Oom(uint32_t classHead, uint32_t heap) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t cap = 0, carved = 0, free = 0;
+  (void)mem.ReadU32BE(heap + 76, &cap);
+  (void)mem.ReadU32BE(heap + 84, &carved);
+  (void)mem.ReadU32BE(heap + 152, &free);
+  MCLA_LOG_ERROR("DE9D8-OOM: classHead={:08X} heap={:08X} cap={} carved={} "
+                 "free={}",
+                 classHead, heap, cap, carved, free);
+  uint32_t curSlab = OomCensusReadU32(classHead + 0);
+  int idx = 0;
+  while (curSlab != 0 && idx < 8) {
+    const uint32_t newer = OomCensusReadU32(curSlab + 0);
+    const uint32_t older = OomCensusReadU32(curSlab + 4);
+    const uint32_t count = OomCensusReadU32(curSlab + 8);
+    const uint32_t head = OomCensusReadU32(curSlab + 12);
+    MCLA_LOG_ERROR("  slab[{}] @ {:08X}: newer={:08X} older={:08X} "
+                   "freeCount={} head={:08X}",
+                   idx, curSlab, newer, older, count, head);
+    curSlab = older;
+    ++idx;
+  }
+}
 } // namespace
 
 PPC_FUNC_IMPL(__imp__sub_821C29A0);
@@ -1212,7 +1246,24 @@ PPC_FUNC(sub_821C29A0) {
   }
 
   if constexpr (!kPool16CensusEnabled) {
+    const uint32_t self = ctx.r3.u32;
+    const uint32_t reqSize = ctx.r4.u32;
+    const uint32_t reqAlign = ctx.r5.u32;
+    const uint32_t callerLr = static_cast<uint32_t>(ctx.lr);
     __imp__sub_821C29A0(ctx, base);
+    // Lightweight OOM diagnostic: only logs when allocation fails
+    if (ctx.r3.u32 == 0 && self != 0) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      uint32_t cap = 0, carved = 0, free = 0, flags = 0;
+      (void)mem.ReadU32BE(self + 76, &cap);
+      (void)mem.ReadU32BE(self + 84, &carved);
+      (void)mem.ReadU32BE(self + 152, &free);
+      (void)mem.ReadU32BE(self + 196, &flags);
+      MCLA_LOG_ERROR("POOL16-OOM: alloc failed size={} align={} lr={:08X} "
+                     "heap={:08X} cap={} carved={} free={} flags={:08X}",
+                     reqSize, reqAlign, callerLr,
+                     self, cap, carved, free, flags);
+    }
     return;
   }
 
@@ -1330,7 +1381,20 @@ thread_local uint32_t t_arenaDepth = 0;
 PPC_FUNC_IMPL(__imp__sub_821C1BB0);
 PPC_FUNC(sub_821C1BB0) {
   if constexpr (!kPool16CensusEnabled) {
+    const uint32_t heap = ctx.r3.u32;
+    const uint32_t size = ctx.r4.u32;
+    const uint32_t align = ctx.r5.u32;
     __imp__sub_821C1BB0(ctx, base);
+    if (ctx.r3.u32 == 0 && heap != 0) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      uint32_t cap = 0, carved = 0, free = 0;
+      (void)mem.ReadU32BE(heap + 76, &cap);
+      (void)mem.ReadU32BE(heap + 84, &carved);
+      (void)mem.ReadU32BE(heap + 152, &free);
+      MCLA_LOG_ERROR("ARENA-OOM: sub_821C1BB0 failed size={} align={} heap={:08X} "
+                     "cap={} carved={} free={}",
+                     size, align, heap, cap, carved, free);
+    }
     return;
   }
 
@@ -1584,7 +1648,24 @@ thread_local uint32_t t_lastSlabAddr =
 PPC_FUNC_IMPL(__imp__sub_821DE9D8);
 PPC_FUNC(sub_821DE9D8) {
   if constexpr (!kPool16CensusEnabled) {
+    const uint32_t classHead = ctx.r3.u32;
+    const uint32_t heap = ctx.r4.u32;
+    // Live boot failure (2026-09-10 slab dump): freeCount=629, head=0 on
+    // slab A0014000 while arena still had ~45 MiB free. Repair the phantom
+    // freelist BEFORE the original allocator so it takes the refill path.
+    if (classHead != 0) {
+      (void)RepairCorruptedTinySlabFreeList(classHead);
+    }
     __imp__sub_821DE9D8(ctx, base);
+    // Safety net: if it still failed, dump state and try one more repair+retry.
+    if (ctx.r3.u32 == 0 && classHead != 0) {
+      LogDe9D8Oom(classHead, heap);
+      if (RepairCorruptedTinySlabFreeList(classHead)) {
+        ctx.r3.u32 = classHead;
+        ctx.r4.u32 = heap;
+        __imp__sub_821DE9D8(ctx, base);
+      }
+    }
     return;
   }
 
@@ -1686,14 +1767,7 @@ PPC_FUNC(sub_821DE9D8) {
 
             for (uint32_t i49 = 0; i49 < cap49; i49++) {
               const uint32_t eAddr49 = curSlab49 + 32 + i49 * es49;
-              bool looksFree49 = true;
-              for (uint32_t b49 = 4; b49 < es49; b49 += 4) {
-                if (OomCensusReadU32(eAddr49 + b49) != 0xDDDDDDDD) {
-                  looksFree49 = false;
-                  break;
-                }
-              }
-              if (looksFree49) {
+              if (ElementLooksFree(eAddr49, es49)) {
                 (void)mem49.WriteU32BE(eAddr49 + 0, newHead49);
                 newHead49 = eAddr49;
                 newCount49++;
@@ -2379,12 +2453,27 @@ inline void RecordDispatch(const DispatchRecord &rec) {
 // (0x821782AC from a memset call) propagates through tail-call chains.
 PPC_FUNC_IMPL(__imp__sub_82177EB0);
 PPC_FUNC(sub_82177EB0) {
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+
+  __imp__sub_82177EB0(ctx, base);
+
+  // Session 72: callers treat r3<0 as "Unable to create backup texture for
+  // depth/rendertarget" and fatal. In native mode the legacy Xenos backup
+  // texture is unused (D3D12 owns RTs). Force success so boot continues.
+  if (static_cast<int32_t>(ctx.r3.u32) < 0) {
+    static std::atomic<uint32_t> s_createFail{0};
+    const uint32_t n = s_createFail.fetch_add(1) + 1;
+    if (n <= 16 || (n % 100) == 0)
+      MCLA_LOG_WARN("TEXCREATE-SC #{} lr={:08X} r3={:08X} -> 0 (legacy backup "
+                    "unused in native)",
+                    n, lr, ctx.r3.u32);
+    ctx.r3.u32 = 0;
+  }
+
   if constexpr (!kPool16CensusEnabled) {
-    __imp__sub_82177EB0(ctx, base);
     return;
   }
 
-  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   const uint32_t r3 = ctx.r3.u32;
   const uint32_t r4 = ctx.r4.u32;
   const uint32_t r5 = ctx.r5.u32;
@@ -2394,8 +2483,6 @@ PPC_FUNC(sub_82177EB0) {
   const uint32_t r9 = ctx.r9.u32;
   const uint32_t r10 = ctx.r10.u32;
 
-  // Log if r3 looks like a pointer (>= 0x1000 and in guest address range)
-  // or if any register looks like a heap pointer in the 0xC9xxxxxx range
   const bool r3LooksLikePointer = r3 >= 0x1000u && r3 < 0xC0000000u;
   const bool anyRegInCrashRange =
       (r3 | r4 | r5 | r6 | r7 | r8 | r9 | r10) >= 0xC9000000u &&
@@ -2406,8 +2493,6 @@ PPC_FUNC(sub_82177EB0) {
                   "r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X}",
                   lr, r3, r4, r5, r6, r7, r8, r9, r10);
   }
-
-  __imp__sub_82177EB0(ctx, base);
 }
 
 PPC_FUNC_IMPL(__imp__sub_8218CC70);

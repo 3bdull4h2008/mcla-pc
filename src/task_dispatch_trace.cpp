@@ -319,6 +319,38 @@ PPC_FUNC(sub_8260B510)
 }
 
 // ---------------------------------------------------------------------------
+// Session 72: pointer-rebase via sub_821B5A60(&addr) → sub_8217D890(group,*addr).
+// Probe: id=0xCDCDCDCD (uninitialized object field) → lookup miss → fatal
+// "Resource 'meshtextures'". Caller lr=0x821B5AB4. Honest short-circuit:
+// poison is not a valid guest pointer — take the same *param=0 path the
+// function already uses on membership miss. Do NOT invent a resource size.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_821B5A60);
+static std::atomic<uint32_t> s_hB5A60{0};
+static std::atomic<uint32_t> s_hB5A60poison{0};
+PPC_FUNC(sub_821B5A60)
+{
+    const uint32_t n = s_hB5A60.fetch_add(1) + 1;
+    const uint32_t param = ctx.r3.u32;
+    uint32_t val = 0;
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(param, &val);
+    }
+    if ((val & 0xFFu) == 0xCDu)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        const uint32_t p = s_hB5A60poison.fetch_add(1) + 1;
+        MCLA_LOG_WARN("REBASE-POISON #{:05} n={} param={:08X} val={:08X} -> 0 "
+                      "lr={:08X} (skip D890 fatal)",
+                      p, n, param, val, static_cast<uint32_t>(ctx.lr));
+        (void)mem.WriteU32BE(param, 0);
+        return;
+    }
+    __imp__sub_821B5A60(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
 // P5: relocation-resolver census. The container build pass
 // (FDBF8 -> A830) rebases node pointers via primary lookup sub_8217D828;
 // misses fall back to named resolver sub_821D2378. Runtime fact: one node's
@@ -335,10 +367,11 @@ PPC_FUNC(sub_8217D828)
     const uint32_t a4 = ctx.r4.u32;
     const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
     __imp__sub_8217D828(ctx, base);
-    if (n <= 16 || (n % 20000) == 0)
+    const bool poison = (a4 & 0xFFu) == 0xCDu;
+    if (n <= 16 || (n % 20000) == 0 || poison)
     {
-        MCLA_LOG_INFO("P5-LOOKUP #{:06} r3={:08X} r4={:08X} -> {:08X} lr={:08X}",
-                      n, a3, a4, ctx.r3.u32, lrIn);
+        MCLA_LOG_INFO("P5-LOOKUP #{:06} r3={:08X} r4={:08X} -> {:08X} lr={:08X}{}",
+                      n, a3, a4, ctx.r3.u32, lrIn, poison ? " POISON" : "");
     }
 }
 
@@ -373,27 +406,55 @@ PPC_FUNC(sub_8217D890)
     const uint32_t n = s_h17D890.fetch_add(1) + 1;
     const uint32_t group = ctx.r3.u32;
     const uint32_t oldAddr = ctx.r4.u32;
+    const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
+
+    // Session 72: log BEFORE passthrough. On id=0xCDCDCDCD the original
+    // body calls sub_821D2378 which fatals and never returns — post-call
+    // census stays silent. Pre-call log names the caller.
+    if ((oldAddr & 0xFFu) == 0xCDu || oldAddr == 0xFFFFFFFFu)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t tablePtr = 0;
+        (void)mem.ReadU32BE(group, &tablePtr);
+        MCLA_LOG_WARN("P10-PRE #{:06} id={:08X} group={:08X} table={:08X} "
+                      "lr={:08X}",
+                      n, oldAddr, group, tablePtr, lrIn);
+        // Skip the original body: it fatals on this id. Return 0 (same as
+        // the miss path after fatal) without invoking the fatal dispatcher.
+        ctx.r3.u32 = 0;
+        return;
+    }
 
     __imp__sub_8217D890(ctx, base);
 
     const int32_t res = static_cast<int32_t>(ctx.r3.u32);
     const bool watched =
         (oldAddr & 0xFFFF0000u) == 0x50070000u || oldAddr == 0x50035E50u;
-    if (res != -1 && !watched)
+    // Session 72: resource-miss path returns 0 (after fatal) with id=0xCDCDCDCD.
+    // Dump those plus the historic -1/watch cases.
+    const bool poisonId = (oldAddr & 0xFFu) == 0xCDu;
+    if (res != -1 && res != 0 && !watched && !poisonId)
     {
         return; // healthy rebase - silent
     }
 
     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t regions = 0;
-    (void)mem.ReadU32BE(group, &regions);
+    uint32_t tablePtr = 0, g0 = 0, g4 = 0, g8 = 0;
+    (void)mem.ReadU32BE(group, &tablePtr);
+    (void)mem.ReadU32BE(group + 0, &g0);
+    (void)mem.ReadU32BE(group + 4, &g4);
+    (void)mem.ReadU32BE(group + 8, &g8);
+    uint32_t regions = tablePtr;
     uint16_t cntA = 0, cntB = 0;
-    (void)mem.ReadU16BE(regions + 0, &cntA);
-    (void)mem.ReadU16BE(regions + 2, &cntB);
-    MCLA_LOG_WARN("P10-D890 #{:06} {} group={:08X} regions={:08X} counts={}/{} "
-                  "old={:08X} -> {:08X} lr={:08X}",
-                  n, res == -1 ? "MISS" : "WATCH", group, regions, cntA, cntB,
-                  oldAddr, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+    if (regions != 0)
+    {
+        (void)mem.ReadU16BE(regions + 0, &cntA);
+        (void)mem.ReadU16BE(regions + 2, &cntB);
+    }
+    MCLA_LOG_WARN("P10-D890 #{:06} {} group={:08X} table={:08X} counts={}/{} "
+                  "id={:08X} -> {:08X} lr={:08X} g+4={:08X} g+8={:08X}",
+                  n, res == -1 ? "MISS" : (res == 0 && poisonId ? "POISON" : "WATCH"),
+                  group, regions, cntA, cntB, oldAddr, ctx.r3.u32, lrIn, g4, g8);
     if (regions != 0)
     {
         constexpr uint32_t kMaxDump = 24;
@@ -440,6 +501,21 @@ PPC_FUNC(sub_821DEE40)
     {
         MCLA_LOG_INFO("P11-DEE40 #{:05} r3={:08X} kind={} lr={:08X}", n,
                       ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+    }
+    // Session 72 AV: dump the worker-router object so we can see which
+    // field becomes 0x7E780000 (unmapped guest VA).
+    if (n <= 8)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t w[16] = {};
+        for (int i = 0; i < 16; ++i)
+            (void)mem.ReadU32BE(ctx.r3.u32 + i * 4, &w[i]);
+        MCLA_LOG_INFO("DEE40-OBJ #{:05} r3={:08X} +0..+60 = {:08X} {:08X} "
+                      "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                      "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                      n, ctx.r3.u32, w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                      w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14],
+                      w[15]);
     }
     __imp__sub_821DEE40(ctx, base);
 }
