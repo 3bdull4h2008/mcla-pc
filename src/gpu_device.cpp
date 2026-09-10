@@ -796,6 +796,7 @@ static std::atomic<uint32_t> g_frameCounter{0};
 PPC_FUNC_IMPL(__imp__sub_824294E0);
 PPC_FUNC(sub_824294E0) {
   const uint32_t n = s_presentKickCount.fetch_add(1) + 1;
+  const uint32_t dev = ctx.r3.u32; // clobbered by the guest body — capture now
   s_lastFbAddr.store(ctx.r4.u32, std::memory_order_relaxed);
   // P5' (B8) / R1: present kick = frame boundary. Advance frame counter and
   // enqueue host present in native mode (single owner — not VdSwap).
@@ -805,11 +806,40 @@ PPC_FUNC(sub_824294E0) {
     MCLA_LOG_INFO("P4'-PRESENT kick #{} dev={:08X} fb={:08X}", n, ctx.r3.u32,
                   ctx.r4.u32);
 
+  __imp__sub_824294E0(ctx, base);
+
+  // SESSION 73: HW side of the swap-table handshake. The guest reserves two
+  // slots per kick by writing ZERO into dev[10896] table at ((queued&7)+16)
+  // and ((queued+1&7)+16) (ppc_recomp.79.cpp: r24=0 before both stwx). On HW
+  // the display engine later fills the slots with flip timestamps; the
+  // completion processor (sub_824286A0) advances dev[+21624] only when the
+  // slot at (completed+1&7)+16 is non-zero (lwbrx = little-endian). Without
+  // those writes the queue drains never and the >=6 gate at loc_82419FD8
+  // stops all kicks after 6 presents. Write a monotonic 64-bit timebase
+  // value into both reserved slots, little-endian, like HW.
+  {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t tableBase = 0, queued = 0;
+    if (dev != 0 && mem.ReadU32BE(dev + 10896, &tableBase) &&
+        tableBase != 0 && mem.ReadU32BE(dev + 21628, &queued)) {
+      const uint64_t ts = mcla::native::QueryGuestTimebase();
+      for (uint32_t k = 0; k < 2; ++k) {
+        const uint32_t off = (((queued + k) & 7u) + 16u) * 4u;
+        const uint32_t lo = static_cast<uint32_t>(ts & 0xFFFFFFFFu);
+        const uint32_t hi = static_cast<uint32_t>(ts >> 32);
+        // lwbrx interprets the slot bytes little-endian: store bswapped.
+        (void)mem.WriteU32BE(tableBase + off, __builtin_bswap32(lo));
+        (void)mem.WriteU32BE(tableBase + off + 4, __builtin_bswap32(hi));
+      }
+      if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("SWAP-FILL #{} table={:08X} queued={} ts={:016X}", n,
+                      tableBase, queued, ts);
+    }
+  }
+
   mcla::native::GetDrawAccumulator()->OnFrameEnd();
   mcla::native::EnqueueNativePresent(frame, ctx.r3.u32, ctx.r4.u32);
   mcla::renderer::RecordFramePresented();
-
-  __imp__sub_824294E0(ctx, base);
 }
 
 // R1 census: high-level frame-end entry. sub_82419E90(r3=dev) forwards to
@@ -824,6 +854,84 @@ PPC_FUNC(sub_82419E90) {
     MCLA_LOG_INFO("FRAME-END sub_82419E90 #{} dev={:08X} lr={:08X}", n,
                   ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_82419E90(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// SESSION 73 census: swap-completion processor. Advances dev[+21624] when
+// the swap table (dev[10896]) holds non-zero entries at the completed index.
+// Reads are lwbrx (little-endian) — the entries are HW-side bytes. Dump the
+// table window around the completed index to see why the advance stalls.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_824286A0);
+static std::atomic<uint32_t> s_h86A0{0};
+PPC_FUNC(sub_824286A0) {
+  const uint32_t n = s_h86A0.fetch_add(1) + 1;
+  const uint32_t dev = ctx.r3.u32;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t completed = 0, queued = 0, tableBase = 0;
+  if (dev != 0) {
+    (void)mem.ReadU32BE(dev + 21624, &completed);
+    (void)mem.ReadU32BE(dev + 21628, &queued);
+    (void)mem.ReadU32BE(dev + 10896, &tableBase);
+  }
+  __imp__sub_824286A0(ctx, base);
+  if (n <= 24 || (n % 500) == 0) {
+    uint32_t after = 0;
+    (void)mem.ReadU32BE(dev + 21624, &after);
+    MCLA_LOG_WARN(
+        "SWAP-COMP #{} dev={:08X} completed={}->{} queued={} table={:08X}",
+        n, dev, completed, after, queued, tableBase);
+    if (tableBase != 0) {
+      // dump the 8 entry slots (idx 16..23 of the table, 4B each)
+      for (uint32_t i = 0; i < 8; ++i) {
+        uint32_t v = 0;
+        (void)mem.ReadU32BE(tableBase + (16 + i) * 4, &v);
+        MCLA_LOG_WARN("  SWAP-COMP slot[{}] = {:08X}", i, v);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SESSION 73: swap-completion status. The guest stops kicking presents once
+// dev[+21628] (queued) - dev[+21624] (completed) >= 6 (gate decoded at
+// ppc_recomp.79.cpp loc_82419FD8). Completions advance only when the
+// per-frame check sub_82428FD8 sees bit26 of sub_82458030() set — that fn
+// reads [0x820007E8]=0x10059 then *(u32*)0x10059, a low-memory block the
+// 360 kernel populates and our emu never writes (always 0 -> return 0 ->
+// completions never advance -> presents stop after 6 kicks).
+//
+// Single caller (sub_82428FD8), no other hook owner. Additive emulation
+// point: pass the original through when it yields a status; otherwise
+// report bit26 from the device's real queue state so the completion
+// processor drains the swap table exactly like HW.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82458030);
+static std::atomic<uint32_t> s_h58030{0};
+PPC_FUNC(sub_82458030) {
+  const uint32_t n = s_h58030.fetch_add(1) + 1;
+  __imp__sub_82458030(ctx, base);
+  if (ctx.r3.u32 != 0)
+    return; // guest resolved its own status object — trust it
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t dev = 0;
+  (void)mem.ReadU32BE(0x82839254, &dev);
+  if (dev == 0)
+    return;
+  uint32_t queued = 0, completed = 0;
+  (void)mem.ReadU32BE(dev + 21628, &queued);
+  (void)mem.ReadU32BE(dev + 21624, &completed);
+  const uint32_t gap = queued - completed;
+  if (gap != 0) {
+    // rlwinm r11,r3,0,26,26 == r3 & 0x20: PPC bit 26 is value bit 5.
+    ctx.r3.u32 = 0x20u; // swap pending — run the completion processor
+    if (n <= 16 || (n % 1000) == 0)
+      MCLA_LOG_WARN("SWAP-STATUS #{} dev={:08X} queued={} completed={} gap={} "
+                    "-> bit26 (emu status; guest chain [0x820007E8]->0x10059 "
+                    "reads 0)",
+                    n, dev, queued, completed, gap);
+  }
 }
 
 namespace mcla::gpu {

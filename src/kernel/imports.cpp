@@ -1878,11 +1878,37 @@ uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size,
   void *ptr = g_userHeap.AllocPhysical(size, alignment);
   if (!ptr) {
     static std::atomic<uint32_t> s_allocFails{0};
-    if (s_allocFails.fetch_add(1) < 50)
-      MCLA_LOG_WARN("MmAllocatePhysicalMemoryEx: FAILED size={:#x} align={:#x} "
-                    "(count={})",
-                    size, alignment, s_allocFails.load());
+    if (s_allocFails.fetch_add(1) < 50) {
+      // Session 73: full arena diagnostics on failure — distinguishes a
+      // genuine OOM (peak ~ capacity) from a leak (allocated >> freed).
+      const auto d = o1heapGetDiagnostics(g_userHeap.physicalHeap);
+      MCLA_LOG_WARN(
+          "MmAllocatePhysicalMemoryEx: FAILED size={:#x} align={:#x} "
+          "(count={}) cap={} allocated={} peak={} oomCount={} lr={:08X}",
+          size, alignment, s_allocFails.load(), d.capacity, d.allocated,
+          d.peak_allocated, d.oom_count,
+          GetPPCContext() ? static_cast<uint32_t>(GetPPCContext()->lr) : 0);
+    }
     return 0;
+  }
+  {
+    // Session 73: cumulative physical usage census — find what fills the
+    // 1.6GB arena during load.
+    static std::atomic<uint64_t> s_totalBytes{0};
+    static std::atomic<uint32_t> s_totalAllocs{0};
+    const uint64_t bytes =
+        s_totalBytes.fetch_add(size + 0x420, std::memory_order_relaxed) +
+        size + 0x420; // + o1heap header + alignment head-room approximation
+    const uint32_t allocs = s_totalAllocs.fetch_add(1) + 1;
+    if (allocs <= 32 || (allocs % 2000) == 0 || bytes > (200ull << 20))
+      MCLA_LOG_WARN("PHYS-CENSUS #{} size={:#x} total={:.1f}MB lr={:08X}",
+                    allocs, size,
+                    static_cast<double>(bytes) / (1024.0 * 1024.0),
+                    GetPPCContext()
+                        ? static_cast<uint32_t>(GetPPCContext()->lr)
+                        : 0);
+    if (bytes > (200ull << 20))
+      s_totalBytes.store(0, std::memory_order_relaxed); // re-arm bucket log
   }
   uint32_t guestAddr =
       mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(ptr);
