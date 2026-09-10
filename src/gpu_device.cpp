@@ -13,6 +13,8 @@
 #include <atomic>
 #include <iterator>
 
+extern std::atomic<uint32_t> g_mainGuestThreadId;
+
 static std::atomic<uint32_t> s_rsRealThunkHits{0};
 static std::atomic<uint32_t> s_rsLogOnlyThunkHits{0};
 void HostRsRealPassthrough(PPCContext &__restrict ctx, uint8_t *base);
@@ -1019,6 +1021,39 @@ PPC_FUNC(sub_82411E98) {
                   n, dev, needed, put, pub0, flag13232 != 0, flags,
                   waitsAtEntry ? 1 : 0, arg5, pcBlk, pcVal);
   }
+
+  // KDELAY-SC (session 70c): Short-circuit the GPU progress polling loop on the
+  // main thread.  When the CP is frozen the consumed-count (pub0 at subctx+0)
+  // can never advance to match `needed`, so the generated wait-loop in this
+  // function spins forever (polling KeDelayExecutionThread(10ms) which
+  // returns STATUS_USER_APC immediately, creating a tight CPU-burning loop).
+  //
+  // The GPU work was already processed synchronously by the CP doorbell handler
+  // before the fence was created (proven in session 69).  pub0 is a formality
+  // the frozen CP cannot satisfy.  Forcing it is the honest short-circuit:
+  // the work IS done, the counter just can't reflect it.
+  //
+  // Scoped to main thread only (g_mainGuestThreadId) to prevent side effects
+  // on worker threads.  The write uses checked guest memory access and will be
+  // harmless once the CP is deleted at P6'.
+  if (waitsAtEntry && subctx != 0) {
+    const uint32_t mainId = g_mainGuestThreadId.load();
+    if (mainId != 0 && GetCurrentThreadId() == mainId) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      MCLA_LOG_INFO("KDELAY-SC #{} E98 stall: tid={:08X} need={:08X} pub={:08X} "
+                    "put={:08X} -> forcing pub0={:08X}",
+                    n, mainId, needed, pub0, put, needed);
+      (void)mem.WriteU32BE(subctx + 0, needed);
+      // Also advance the per-thread progress counter (pcBlk+88) so that
+      // sub_82412F98's >=5000 delta check is satisfied.
+      if (pcBlk != 0) {
+        (void)mem.WriteU32BE(pcBlk + 88, pcVal + 6000);
+      }
+      ctx.r3.u32 = 0;  // STATUS_SUCCESS — wait completed
+      return;
+    }
+  }
+
   __imp__sub_82411E98(ctx, base);
   const uint32_t d = s_h11E98done.fetch_add(1) + 1;
   if (d <= 16 || (d % 500) == 0)
@@ -1114,7 +1149,16 @@ PPC_FUNC(sub_821C90C0) {
 // waits INFINITE on the embedded completion event [obj+8]. Dump the object
 // tag/state so the pending async-job TYPE becomes visible; caller LR names
 // the submitter (async wrapper sub_821E5FD0 family).
+//
+// KERNEL SHORT-CIRCUIT (session 69): When blocking=1, pre-release the
+// semaphore before calling the original. The GPU work is already done
+// (processed synchronously in the CP doorbell handler), so the fence is
+// effectively complete. The worker thread that would normally release it
+// is parked on its own semaphore and never runs. Pre-releasing lets the
+// original WaitForObject return immediately; the original cleanup
+// (close handle, zero fields, optional release-flag work) runs normally.
 PPC_FUNC_IMPL(__imp__sub_821E5640);
+PPC_FUNC_IMPL(__imp__sub_8244ED10);
 static std::atomic<uint32_t> s_h5640{0};
 PPC_FUNC(sub_821E5640) {
   const uint32_t n = s_h5640.fetch_add(1) + 1;
@@ -1127,6 +1171,33 @@ PPC_FUNC(sub_821E5640) {
     (void)mem.ReadU32BE(obj + 4, &state);
     (void)mem.ReadU32BE(obj + 8, &evt);
   }
+
+  // KERNEL SHORT-CIRCUIT (session 69/70c): When blocking=1, pre-release the
+  // semaphore before calling the original. The GPU work is already done
+  // (processed synchronously in the CP doorbell handler), so the fence is
+  // effectively complete. The worker thread that would normally release it
+  // is parked on its own semaphore and never runs. Pre-releasing lets the
+  // original WaitForObject return immediately; the original cleanup
+  // (close handle, zero fields, optional release-flag work) runs normally.
+  //
+  // v1 failed because GetKernelObject(handle) returned raw guest memory
+  // instead of the canonical WrapperIdentityMap wrapper — Wait() saw count=0
+  // on the wrong object.  With GetKernelObject fixed (session 70c) to route
+  // through QueryKernelObject, both Release and Wait now operate on the same
+  // host wrapper.
+  if (blocking == 1 && evt != 0) {
+    MCLA_LOG_INFO("FENCE-SC #{} obj={:08X} tag={:08X} ev={:08X} lr={:08X}",
+                  n, obj, tag, evt, ctx.lr);
+    const uint32_t sr3 = ctx.r3.u32, sr4 = ctx.r4.u32, sr5 = ctx.r5.u32;
+    ctx.r3.u32 = evt;
+    ctx.r4.u32 = 1;
+    ctx.r5.u32 = 0;
+    __imp__sub_8244ED10(ctx, base);
+    ctx.r3.u32 = sr3;
+    ctx.r4.u32 = sr4;
+    ctx.r5.u32 = sr5;
+  }
+
   if (n <= 24 || (n % 500) == 0)
     MCLA_LOG_INFO("FENCE sub_821E5640 #{} obj={:08X} tag={:08X} st={} "
                   "ev={:08X} blk={} lr={:08X}",

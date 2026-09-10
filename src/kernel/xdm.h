@@ -57,7 +57,21 @@ template<typename T = KernelObject>
 inline T* GetKernelObject(uint32_t handle)
 {
     assert(handle != GUEST_INVALID_HANDLE_VALUE);
-    return reinterpret_cast<T*>(mcla::kernel::GuestMemoryHeap::Instance().Translate(handle));
+    // SESSION 70c: The old path did Translate(handle) → raw guest memory →
+    // reinterpret_cast<KernelObject*>.  This bypassed WrapperIdentityMap and
+    // returned a pointer to the raw guest dispatcher struct whose vtable and
+    // atomic fields are garbage — Wait() on it was undefined behavior.
+    // Look up the canonical host wrapper first.  If a prior QueryKernelObject
+    // call (e.g. from NtCreateSemaphore/NtReleaseSemaphore) already minted a
+    // wrapper for this header address, return it so Wait/Release share state.
+    // Fall back to the raw cast when no wrapper exists yet (handles for
+    // non-dispatcher objects, or pre-init callers).
+    void* raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(handle);
+    if (!raw) return nullptr;
+    auto* hdr = reinterpret_cast<XDISPATCHER_HEADER*>(raw);
+    auto* wrapper = TryQueryKernelObject<T>(*hdr);
+    if (wrapper) return wrapper;
+    return reinterpret_cast<T*>(raw);
 }
 
 uint32_t GetKernelHandle(KernelObject* obj);

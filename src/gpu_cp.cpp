@@ -1494,37 +1494,6 @@ uint64_t CpDrainCount() { return g_drainCount.load(std::memory_order_relaxed); }
 void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   static std::atomic<uint32_t> s_watchWrites{0};
   const uint32_t n = s_watchWrites.fetch_add(1) + 1;
-  if (guestAddr >= 0xA0000000u && guestAddr < 0xA1000000u) {
-    uint32_t lr = 0;
-    uint32_t sp = 0;
-    uint32_t r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0;
-    uint32_t r8 = 0, r9 = 0, r10 = 0;
-    if (const PPCContext *c = GetPPCContext()) {
-      lr = static_cast<uint32_t>(c->lr);
-      sp = c->r1.u32;
-      r3 = c->r3.u32;
-      r4 = c->r4.u32;
-      r5 = c->r5.u32;
-      r6 = c->r6.u32;
-      r7 = c->r7.u32;
-      r8 = c->r8.u32;
-      r9 = c->r9.u32;
-      r10 = c->r10.u32;
-    }
-    MCLA_LOG_WARN(
-      "POOL16-WRITE #{} @ {:08X} = {:08X} lr={:08X} sp={:08X} "
-        "r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} "
-        "r9={:08X} r10={:08X}",
-        n, guestAddr, value, lr, sp, r3, r4, r5, r6, r7, r8, r9, r10);
-    spdlog::default_logger()->flush();
-  }
-  if (guestAddr >= 0x82839254u && guestAddr < 0x82839280u) {
-    uint32_t lr = 0;
-    if (const PPCContext *c = GetPPCContext())
-      lr = static_cast<uint32_t>(c->lr);
-    MCLA_LOG_WARN("CONFIG-WRITE WATCH @ {:08X} = {:08X} lr={:08X}", guestAddr,
-                  value, lr);
-  }
   if (n <= 16) {
     uint32_t lr = 0;
     if (const PPCContext *c = GetPPCContext())

@@ -583,7 +583,19 @@ uint32_t NtSetInformationFile(uint32_t handle, XIO_STATUS_BLOCK *ioStatus,
 uint32_t FscSetCacheElementCount() { return 0; }
 
 uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
-                                 uint32_t Alertable, be<int64_t> *Timeout) {
+                                  uint32_t Alertable, be<int64_t> *Timeout) {
+  // PARK-SAMPLE: census ALL threads at wait entry
+  {
+    static std::atomic<uint32_t> s_waitCensus{0};
+    const uint32_t n = s_waitCensus.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+      const char* tclass = (timeout == 0) ? "poll" : (timeout == INFINITE) ? "inf" : "finite";
+      MCLA_LOG_INFO("PARK-CENSUS[NTWFSO] #{:04} tid={:08X} h={:08X} class={} lr={:08X}",
+                    n, GetCurrentThreadId(), Handle, tclass,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
   // PRODUCER-DEATH CENSUS: see KeWaitForSingleObject note.
   {
     static std::atomic<uint32_t> s_wcNtw{0};
@@ -612,31 +624,11 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
   }
   uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
-  // DWELL HISTOGRAM CENSUS
+  // DISABLED per bisect Run A: DWELL histogram probe
+  // const auto waitStart = std::chrono::steady_clock::now();
+  // auto LogDwellHistogramNT = ...
   const auto waitStart = std::chrono::steady_clock::now();
-  auto LogDwellHistogramNT = [&](uint32_t status) {
-    static std::atomic<uint32_t> s_dwellLogs{0};
-    const uint32_t n = s_dwellLogs.fetch_add(1) + 1;
-    if (n <= 60 || (n % 5000) == 0) {
-      const auto dwellUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                               std::chrono::steady_clock::now() - waitStart)
-                               .count();
-      const char* timeoutClass =
-          (timeout == 0)      ? "poll"
-          : (timeout == INFINITE) ? "inf"
-          : "finite";
-      const char* bucket =
-          (dwellUs < 100)       ? "<100us"
-          : (dwellUs < 1000)    ? "<1ms"
-          : (dwellUs < 30000)   ? "<30ms"
-          : (dwellUs < 1000000) ? "<1s"
-          : ">=1s";
-      MCLA_LOG_INFO(
-          "DWELL[NTWFSO] #{:05} h={:08X} class={} status={:08X} dwell={}us bucket={} lr={:08X}",
-          n, Handle, timeoutClass, status, dwellUs, bucket,
-          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    }
-  };
+  auto LogDwellHistogramNT = [&](uint32_t status) { (void)status; (void)waitStart; };
 
   if (IsKernelObject(Handle)) {
     auto* obj = GetKernelObject(Handle);
@@ -913,6 +905,18 @@ uint32_t RtlUnicodeToMultiByteN(char *MultiByteString,
 
 uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable,
                                 be<int64_t> *Timeout) {
+  // PARK-SAMPLE: census ALL threads at wait entry
+  {
+    static std::atomic<uint32_t> s_waitCensus{0};
+    const uint32_t n = s_waitCensus.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+      const char* tclass = (timeout == 0) ? "poll" : (timeout == INFINITE) ? "inf" : "finite";
+      MCLA_LOG_INFO("PARK-CENSUS[KDELAY] #{:04} tid={:08X} class={} lr={:08X}",
+                    n, GetCurrentThreadId(), tclass,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
   // We don't do async file reads.
   if (Alertable)
     return STATUS_USER_APC;
@@ -2016,31 +2020,9 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   const auto waitStart = std::chrono::steady_clock::now();
   const char* waitResolution = "unknown";
 
-  auto LogDwellHistogram = [&](uint32_t status) {
-    static std::atomic<uint32_t> s_dwellLogs{0};
-    const uint32_t n = s_dwellLogs.fetch_add(1) + 1;
-    if (n <= 60 || (n % 5000) == 0) {
-      const auto dwellUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                               std::chrono::steady_clock::now() - waitStart)
-                               .count();
-      const char* timeoutClass =
-          (timeout == 0)      ? "poll"
-          : (timeout == INFINITE) ? "inf"
-          : "finite";
-      const char* bucket =
-          (dwellUs < 100)       ? "<100us"
-          : (dwellUs < 1000)    ? "<1ms"
-          : (dwellUs < 30000)   ? "<30ms"
-          : (dwellUs < 1000000) ? "<1s"
-          : ">=1s";
-      uint32_t objAddr =
-          mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
-      MCLA_LOG_INFO(
-          "DWELL[KWFSO] #{:05} obj={:08X} class={} status={:08X} dwell={}us bucket={} res={} lr={:08X}",
-          n, objAddr, timeoutClass, status, dwellUs, bucket, waitResolution,
-          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    }
-  };
+  // DISABLED per bisect Run A: DWELL histogram probe
+  // auto LogDwellHistogram = [&](uint32_t status) { ... };
+  auto LogDwellHistogram = [&](uint32_t status) { (void)status; (void)waitStart; (void)waitResolution; };
 
   uint8_t type = Object->Type;
 
@@ -2850,6 +2832,21 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count,
                                   uint32_t WaitType, uint32_t WaitReason,
                                   uint32_t WaitMode, uint32_t Alertable,
                                   be<int64_t> *Timeout) {
+  // PARK-SAMPLE: census ALL threads at wait entry
+  {
+    static std::atomic<uint32_t> s_waitCensus{0};
+    const uint32_t n = s_waitCensus.fetch_add(1) + 1;
+    if (n <= 60 || (n % 5000) == 0) {
+      const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
+      const char* tclass = (timeout == 0) ? "poll" : (timeout == INFINITE) ? "inf" : "finite";
+      uint32_t obj0 = Objects ? static_cast<uint32_t>(
+                                  reinterpret_cast<uintptr_t>(Objects[0].get()))
+                            : 0;
+      MCLA_LOG_INFO("PARK-CENSUS[KWFMULTI] #{:04} tid={:08X} cnt={} obj0={:08X} class={} lr={:08X}",
+                    n, GetCurrentThreadId(), Count, obj0, tclass,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
   const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
   assert(timeout == INFINITE || timeout == 0);
 

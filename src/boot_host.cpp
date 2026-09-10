@@ -520,6 +520,66 @@ void BootWorker(uint32_t entryGuest)
         DWORD nInfo = ExceptionInfo->ExceptionRecord->NumberParameters;
         const uintptr_t pc = (uintptr_t)addr;
         const uintptr_t rva = (g_moduleBase != 0 && pc >= g_moduleBase) ? pc - g_moduleBase : pc;
+
+        // Write crash dump to file immediately (in case log doesn't flush)
+        FILE* crashFile = nullptr;
+        fopen_s(&crashFile, "crash_dump.txt", "w");
+        if (crashFile) {
+            fprintf(crashFile, "Exception: code=0x%08X addr=0x%p rva=0x%X flags=0x%X nParams=%u thread=%lu\n",
+                    code, addr, rva, flags, nInfo, GetCurrentThreadId());
+            for (DWORD i = 0; i < nInfo; ++i) {
+                fprintf(crashFile, "  Param[%u]=0x%p\n", i, (PVOID)info[i]);
+            }
+            
+            // PPC context
+            if (const PPCContext* fc = g_faultCtx) {
+                fprintf(crashFile, "  ppc r1=%08X lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r13=%08X\n",
+                        fc->r1.u32, (uint32_t)fc->lr, fc->r3.u32, fc->r4.u32, fc->r5.u32,
+                        fc->r6.u32, fc->r7.u32, fc->r8.u32, fc->r9.u32, fc->r10.u32, fc->r13.u32);
+            }
+            
+            // Host registers
+            if (code == 0xC0000005 && ExceptionInfo->ContextRecord) {
+                const CONTEXT* c = ExceptionInfo->ContextRecord;
+                fprintf(crashFile, "  host regs rip=%p rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p r8=%p r9=%p r10=%p r11=%p rsp=%p\n",
+                        (PVOID)c->Rip, (PVOID)c->Rax, (PVOID)c->Rbx, (PVOID)c->Rcx, (PVOID)c->Rdx,
+                        (PVOID)c->Rsi, (PVOID)c->Rdi, (PVOID)c->R8, (PVOID)c->R9,
+                        (PVOID)c->R10, (PVOID)c->R11, (PVOID)c->Rsp);
+            }
+            
+            // Stack trace
+            if (code == 0xC0000005 || code == 0x80000003 || code == 0xE06D7363) {
+                static std::once_flag symOnce;
+                std::call_once(symOnce, [] {
+                    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+                });
+                void* frames[32] = {};
+                const USHORT nFrames = CaptureStackBackTrace(0, 32, frames, nullptr);
+                fprintf(crashFile, "Stack trace (%hu frames):\n", nFrames);
+                char symBuf[sizeof(SYMBOL_INFO) + 160] = {};
+                auto* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+                sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                sym->MaxNameLen = 159;
+                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+                for (USHORT i = 0; i < 32 && i < (USHORT)nFrames; ++i) {
+                    DWORD64 disp = 0;
+                    char symBuf2[sizeof(SYMBOL_INFO) + 160] = {};
+                    auto* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf2);
+                    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                    sym->MaxNameLen = 159;
+                    if (SymFromAddr(GetCurrentProcess(), reinterpret_cast<DWORD64>(frames[i]), nullptr, sym)) {
+                        fprintf(crashFile, "  [%02u] %s\n", i, sym->Name);
+                    } else {
+                        fprintf(crashFile, "  [%02u] ??? 0x%p\n", i, frames[i]);
+                    }
+                }
+            }
+            fflush(crashFile);
+            fclose(crashFile);
+        }
+        
         MCLA_LOG_ERROR("Vectored exception: code=0x{:08X} addr=0x{:p} rva=0x{:X} flags=0x{:X} nParams={} thread={}",
                        code, addr, rva, flags, nInfo, GetCurrentThreadId());
         for (DWORD i = 0; i < nInfo; ++i) {

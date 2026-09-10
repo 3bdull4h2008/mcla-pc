@@ -916,7 +916,17 @@ PPC_FUNC_IMPL(hk_sub_82554E20) {
 // The authoritative decode lives in .clinerules/memory/ and
 // docs/BOOT_HANDOFF.md.
 
+// MASTER SWITCH: disable all census overhead (slab walks, file I/O,
+// snapshot scans, per-alloc logging).  All corruption detections were false
+// positives (Session 56).  Set to true to re-enable diagnostics.
+static constexpr bool kPool16CensusEnabled = false;
+
 PPC_FUNC_IMPL(hk_sub_824569C8) {
+  if constexpr (!kPool16CensusEnabled) {
+    if (g_orig_sub_824569C8)
+      g_orig_sub_824569C8(ctx, base);
+    return;
+  }
   MCLA_LOG_WARN("WORKER-ENTRY sub_824569C8 called: r3={:08X} r4={:08X} "
                 "r5={:08X} r13={:08X} lr={:08X}",
                 ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r13.u32,
@@ -1188,19 +1198,6 @@ bool RepairCorruptedTinySlabFreeList(uint32_t classHead) {
 
 PPC_FUNC_IMPL(__imp__sub_821C29A0);
 PPC_FUNC(sub_821C29A0) {
-  const uint32_t n = s_oomAllocCensus.fetch_add(1) + 1;
-
-  // SESSION 47/49: capture entry state for failure diagnosis
-  const uint32_t self = ctx.r3.u32;
-  const uint32_t sizeEntry = ctx.r4.u32;
-  const uint32_t alignEntry = ctx.r5.u32;
-  const uint32_t callerLr = static_cast<uint32_t>(ctx.lr);
-
-  // Pre-call heap state (for comparison with post-call)
-  const uint32_t preCap = OomCensusReadU32(self + 76);
-  const uint32_t preCarved = OomCensusReadU32(self + 84);
-  const uint32_t preFree = OomCensusReadU32(self + 152);
-
   // SESSION 39 FIX: handle zero-size allocations (legitimate degenerate
   // requests from the game). Standard allocator semantics: malloc(0) returns
   // a valid minimum-size allocation. Session-37 used size=4 (elemsize==4
@@ -1208,15 +1205,29 @@ PPC_FUNC(sub_821C29A0) {
   // elemsize==4 slab header — bypassing DE908 — corrupting the freelist.
   // Fix: route to the size class matching the requested alignment instead,
   // avoiding the elemsize==4 slab entirely. When align=0, fall back to 16.
-  uint32_t effectiveSize = sizeEntry;
+  uint32_t effectiveSize = ctx.r4.u32;
   if (effectiveSize == 0) {
-    effectiveSize = (alignEntry > 0) ? alignEntry : 16;
-    ctx.r4.u32 = effectiveSize; // pass corrected size to original
+    effectiveSize = (ctx.r5.u32 > 0) ? ctx.r5.u32 : 16;
+    ctx.r4.u32 = effectiveSize;
   }
+
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_821C29A0(ctx, base);
+    return;
+  }
+
+  const uint32_t n = s_oomAllocCensus.fetch_add(1) + 1;
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t sizeEntry = effectiveSize;
+  const uint32_t alignEntry = ctx.r5.u32;
+  const uint32_t callerLr = static_cast<uint32_t>(ctx.lr);
+
+  const uint32_t preCap = OomCensusReadU32(self + 76);
+  const uint32_t preCarved = OomCensusReadU32(self + 84);
+  const uint32_t preFree = OomCensusReadU32(self + 152);
 
   __imp__sub_821C29A0(ctx, base);
 
-  // Post-call: check for failure (return value == 0)
   const uint32_t ret = ctx.r3.u32;
   if (ret == 0) {
     static std::atomic<uint32_t> s_heapOomCount{0};
@@ -1226,7 +1237,6 @@ PPC_FUNC(sub_821C29A0) {
     const uint32_t postFree = OomCensusReadU32(self + 152);
     const uint32_t flagsWord = OomCensusReadU32(self + 196);
 
-    // Walk bucket 15 (head = heap+72): blocks >=240 bytes
     uint32_t b15Count = 0, b15Sum = 0;
     {
       uint32_t cur = OomCensusReadU32(self + 72);
@@ -1250,7 +1260,6 @@ PPC_FUNC(sub_821C29A0) {
         (flagsWord & 0xFFu));
   }
 
-  // Periodic census (first 32 + every 2000th)
   if (n <= 32 || n % 2000 == 0) {
     const uint32_t cap = OomCensusReadU32(self + 76);
     const uint32_t freeB = OomCensusReadU32(self + 84);
@@ -1266,6 +1275,11 @@ PPC_FUNC(sub_821C29A0) {
 
 PPC_FUNC_IMPL(__imp__sub_82130B50);
 PPC_FUNC(sub_82130B50) {
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_82130B50(ctx, base);
+    return;
+  }
+
   const uint32_t n = s_physAllocCensus.fetch_add(1) + 1;
   const uint32_t sizeArg = ctx.r3.u32;
   const uint32_t flagsArg = ctx.r4.u32;
@@ -1315,6 +1329,11 @@ thread_local uint32_t t_arenaDepth = 0;
 
 PPC_FUNC_IMPL(__imp__sub_821C1BB0);
 PPC_FUNC(sub_821C1BB0) {
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_821C1BB0(ctx, base);
+    return;
+  }
+
   const uint32_t heap = ctx.r3.u32;
   const uint32_t sizeArg = ctx.r4.u32;
   const uint32_t alignArg = ctx.r5.u32;
@@ -1564,6 +1583,11 @@ thread_local uint32_t t_lastSlabAddr =
 
 PPC_FUNC_IMPL(__imp__sub_821DE9D8);
 PPC_FUNC(sub_821DE9D8) {
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_821DE9D8(ctx, base);
+    return;
+  }
+
   const uint32_t classHead = ctx.r3.u32;
   const uint32_t heap = ctx.r4.u32;
   const uint32_t depthBefore = t_arenaDepth;
@@ -2039,6 +2063,11 @@ std::atomic<uint32_t> s_poolFreeAnomalies{0};
 
 PPC_FUNC_IMPL(__imp__sub_821DE908);
 PPC_FUNC(sub_821DE908) {
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_821DE908(ctx, base);
+    return;
+  }
+
   const uint32_t slab = ctx.r3.u32;
   const uint32_t node = ctx.r4.u32;
   const uint32_t caller_lr = static_cast<uint32_t>(ctx.lr);
@@ -2220,6 +2249,11 @@ std::atomic<uint32_t> s_routerCensus{0};
 
 PPC_FUNC_IMPL(__imp__sub_821C09C8);
 PPC_FUNC(sub_821C09C8) {
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_821C09C8(ctx, base);
+    return;
+  }
+
   const uint32_t heap = ctx.r3.u32;
   const uint32_t node = ctx.r4.u32;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
@@ -2345,6 +2379,11 @@ inline void RecordDispatch(const DispatchRecord &rec) {
 // (0x821782AC from a memset call) propagates through tail-call chains.
 PPC_FUNC_IMPL(__imp__sub_82177EB0);
 PPC_FUNC(sub_82177EB0) {
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_82177EB0(ctx, base);
+    return;
+  }
+
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   const uint32_t r3 = ctx.r3.u32;
   const uint32_t r4 = ctx.r4.u32;
@@ -2373,6 +2412,11 @@ PPC_FUNC(sub_82177EB0) {
 
 PPC_FUNC_IMPL(__imp__sub_8218CC70);
 PPC_FUNC(sub_8218CC70) {
+  if constexpr (!kPool16CensusEnabled) {
+    __imp__sub_8218CC70(ctx, base);
+    return;
+  }
+
   // RAW ENTRY LOG — write directly to file, no spdlog, no formatting
   // Use _write (POSIX) which is more crash-resilient than fprintf+fflush
   {
