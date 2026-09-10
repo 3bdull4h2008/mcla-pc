@@ -1493,6 +1493,46 @@ uint64_t CpDrainCount() { return g_drainCount.load(std::memory_order_relaxed); }
 // at guest 0x50000000 - called from GuestMemoryView checked accessors.
 void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   static std::atomic<uint32_t> s_watchWrites{0};
+
+  // SESSION 73: 0xCDCDCDCD store census. Static decode says the guest fills
+  // memory with 0xCD in exactly these places: sub_821DE9D8's fill-on-alloc
+  // tail (memset return addr 0x821DEB0C) and two startup fills of the
+  // 1352-byte global at 0x8283C5E0 (memset returns 0x8218C9D4/0x8218CCCC).
+  // The guest memset is a leaf (never saves LR), so ctx.lr at store time is
+  // the memset CALLER - any LR outside the set above is a new fill site.
+  if (value == 0xCDCDCDCDu) {
+    static std::atomic<uint32_t> s_cdcdStores{0};
+    const uint32_t n = s_cdcdStores.fetch_add(1) + 1;
+    if (n <= 24 || (n % 20000) == 0) {
+      uint32_t lr = 0;
+      if (const PPCContext *c = GetPPCContext())
+        lr = static_cast<uint32_t>(c->lr);
+      MCLA_LOG_WARN("CDCD-FILL #{:09} @ {:08X} = CDCDCDCD lr={:08X}", n,
+                    guestAddr, lr);
+    }
+    return;
+  }
+
+  // SESSION 73 probe: the un-attributed poison-param regions (REBASE-POISON
+  // params A01064B4/524/594/604/66D4 stride 0x70, and A0197Exx stride 0x70)
+  // saw ZERO 0xCDCDCDCD value-watch hits, so either their fill bypasses the
+  // checked accessors or they were never guest-written this run. These
+  // ranges are registered as watch ranges in boot_host, so any guest store
+  // here lands on this probe. Capped logging.
+  if ((guestAddr >= 0xA0106000u && guestAddr < 0xA0107000u) ||
+      (guestAddr >= 0xA0197E00u && guestAddr < 0xA0197F00u)) {
+    static std::atomic<uint32_t> s_paramProbe{0};
+    const uint32_t pn = s_paramProbe.fetch_add(1) + 1;
+    if (pn <= 400 || (pn % 5000) == 0) {
+      uint32_t lr = 0;
+      if (const PPCContext *c = GetPPCContext())
+        lr = static_cast<uint32_t>(c->lr);
+      MCLA_LOG_WARN("PARAM-STORE #{:06} @ {:08X} = {:08X} lr={:08X}", pn,
+                    guestAddr, value, lr);
+    }
+    return;
+  }
+
   const uint32_t n = s_watchWrites.fetch_add(1) + 1;
   if (n <= 16) {
     uint32_t lr = 0;

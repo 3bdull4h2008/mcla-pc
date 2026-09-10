@@ -221,6 +221,11 @@ bool GuestMemoryView::WriteU8(uint32_t guestAddr, uint8_t val) const {
     if (!ptr) return false;
     __try { *ptr = val; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    // Session 73: byte-wide 0xCD fills bypassed the value watch entirely.
+    // Route them into the watch (synthetic word value) so registered ranges
+    // get LR attribution for byte fill loops (memset alignment head etc.).
+    if (val == 0xCDu && PageWatchHit(guestAddr))
+        mcla::gpu::PageWatchOnWrite(guestAddr, 0xCDCDCDCDu);
     return true;
 }
 
@@ -233,6 +238,9 @@ bool GuestMemoryView::WriteU16BE(uint32_t guestAddr, uint16_t val) const {
         std::memcpy(ptr, &be, sizeof(be));
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    // Session 73: same as WriteU8 — halfword 0xCDCD stores were unwatched.
+    if (val == 0xCDCDu && PageWatchHit(guestAddr))
+        mcla::gpu::PageWatchOnWrite(guestAddr, 0xCDCDCDCDu);
     return true;
 }
 

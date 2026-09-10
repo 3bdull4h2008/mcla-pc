@@ -1230,6 +1230,49 @@ void LogDe9D8Oom(uint32_t classHead, uint32_t heap) {
 }
 } // namespace
 
+// ---------------------------------------------------------------------------
+// SESSION 73: tiny-slab fill-on-alloc attribution (slim census, all classes).
+//
+// Static decode (ppc_recomp.20.cpp sub_821DE9D8 loc_821DEAFC): the common
+// tail of this allocator runs memset(node, 0xCD, elemsize) before returning
+// the element — on the freelist-pop path AND the fresh-slab refill path.
+// Two more guest fills exist (startup memsets of the 1352-byte global at
+// 0x8283C5E0, ppc_recomp.10.cpp sub_8218C9D4/sub_8218CCB0). Conclusion: a
+// 0xCDCDCDCD field seen at a use-site is a field the element's owner never
+// initialized — same fill runs on retail HW, where producers always init
+// before consumers read. Our poison therefore points at a producer step the
+// emulation skips, not at a hostile writer.
+//
+// This census records (element, caller LR, elemsize) for every allocation in
+// a small ring so poison use-sites (REBASE-POISON / P10-PRE in
+// task_dispatch_trace.cpp) can resolve the producer via mcla_SlimTslabFind.
+// Logging is sampled: es==16 (pool16) sparsely, other classes densely for
+// the first 20000 allocs (the poison window is early boot).
+// ---------------------------------------------------------------------------
+namespace {
+std::atomic<uint32_t> s_tslabAllocs{0};
+struct TslabRecord {
+  std::atomic<uint32_t> elem{0};
+  std::atomic<uint32_t> lr{0};
+  std::atomic<uint32_t> es{0};
+};
+constexpr uint32_t kTslabRecords = 8192;
+TslabRecord g_tslabRecords[kTslabRecords];
+std::atomic<uint32_t> g_tslabRecIdx{0};
+
+// Owner-level ring: element -> the guest code that called the RAGE heap
+// small-alloc front-end (sub_821C29A0). Recorded in that wrapper; preferred
+// over the allocator-level lr (which is always 0x821C2A3C for this path).
+std::atomic<uint32_t> s_tslabOwners{0};
+struct TslabOwnerRecord {
+  std::atomic<uint32_t> elem{0};
+  std::atomic<uint32_t> lr{0};
+  std::atomic<uint32_t> es{0};
+};
+TslabOwnerRecord g_tslabOwners[kTslabRecords];
+std::atomic<uint32_t> g_tslabOwnerIdx{0};
+} // namespace
+
 PPC_FUNC_IMPL(__imp__sub_821C29A0);
 PPC_FUNC(sub_821C29A0) {
   // SESSION 39 FIX: handle zero-size allocations (legitimate degenerate
@@ -1263,6 +1306,35 @@ PPC_FUNC(sub_821C29A0) {
                      "heap={:08X} cap={} carved={} free={} flags={:08X}",
                      reqSize, reqAlign, callerLr,
                      self, cap, carved, free, flags);
+    }
+    // Session 73: record the owner of the returned element so poison
+    // use-sites can name the guest code that received it. Verify the element
+    // really came from the small-path slab (slab->owner == the size-class
+    // head the front-end picks) and take the true elemsize from that head.
+    if (ctx.r3.u32 != 0) {
+      auto &mem73 = mcla::kernel::GuestMemoryHeap::Instance();
+      const uint32_t elem = ctx.r3.u32;
+      const uint32_t slotOff = (effectiveSize <= 4)   ? 208
+                               : (effectiveSize <= 8) ? 216
+                               : (effectiveSize <= 16)   ? 224
+                               : (effectiveSize <= 32)   ? 232
+                                                         : 240;
+      const uint32_t slab = elem & ~0x3FFFu;
+      uint32_t slabOwner = 0;
+      uint16_t es16 = 0;
+      (void)mem73.ReadU32BE(slab + 16, &slabOwner);
+      if (slabOwner == self + slotOff)
+        (void)mem73.ReadU16BE(self + slotOff + 4, &es16);
+      const uint32_t orec = g_tslabOwnerIdx.fetch_add(1) % kTslabRecords;
+      g_tslabOwners[orec].elem.store(elem, std::memory_order_relaxed);
+      g_tslabOwners[orec].lr.store(callerLr, std::memory_order_relaxed);
+      g_tslabOwners[orec].es.store(es16, std::memory_order_relaxed);
+      const uint32_t oidx = s_tslabOwners.fetch_add(1) + 1;
+      if (oidx <= 200u || (oidx % 64u) == 0u) {
+        MCLA_LOG_WARN("TSLAB-OWNER #{:09} size={} align={} elem={:08X} "
+                      "es={} lr={:08X} heap={:08X}",
+                      oidx, reqSize, reqAlign, elem, es16, callerLr, self);
+      }
     }
     return;
   }
@@ -1645,11 +1717,52 @@ thread_local uint32_t t_lastSlabAddr =
 #endif
 } // namespace
 
+bool mcla_SlimTslabFind(uint32_t addr, uint32_t *outElem,
+                        uint32_t *outCallerLr, uint32_t *outElemsize) {
+  // Owner ring first: the sub_821C29A0 caller is the interesting producer.
+  for (uint32_t i = 0; i < kTslabRecords; ++i) {
+    const uint32_t elem =
+        g_tslabOwners[i].elem.load(std::memory_order_relaxed);
+    if (elem == 0 || addr < elem)
+      continue;
+    const uint32_t es = g_tslabOwners[i].es.load(std::memory_order_relaxed);
+    if (addr < elem + es) {
+      if (outElem)
+        *outElem = elem;
+      if (outCallerLr)
+        *outCallerLr = g_tslabOwners[i].lr.load(std::memory_order_relaxed);
+      if (outElemsize)
+        *outElemsize = es;
+      return true;
+    }
+  }
+  for (uint32_t i = 0; i < kTslabRecords; ++i) {
+    const uint32_t elem =
+        g_tslabRecords[i].elem.load(std::memory_order_relaxed);
+    if (elem == 0 || addr < elem)
+      continue;
+    const uint32_t es = g_tslabRecords[i].es.load(std::memory_order_relaxed);
+    if (addr < elem + es) {
+      if (outElem)
+        *outElem = elem;
+      if (outCallerLr)
+        *outCallerLr =
+            g_tslabRecords[i].lr.load(std::memory_order_relaxed);
+      if (outElemsize)
+        *outElemsize = es;
+      return true;
+    }
+  }
+  return false;
+}
+
 PPC_FUNC_IMPL(__imp__sub_821DE9D8);
 PPC_FUNC(sub_821DE9D8) {
   if constexpr (!kPool16CensusEnabled) {
     const uint32_t classHead = ctx.r3.u32;
     const uint32_t heap = ctx.r4.u32;
+    // Session 73: caller LR at entry = the guest code asking for the element.
+    const uint32_t tslabLr = static_cast<uint32_t>(ctx.lr);
     // Live boot failure (2026-09-10 slab dump): freeCount=629, head=0 on
     // slab A0014000 while arena still had ~45 MiB free. Repair the phantom
     // freelist BEFORE the original allocator so it takes the refill path.
@@ -1664,6 +1777,27 @@ PPC_FUNC(sub_821DE9D8) {
         ctx.r3.u32 = classHead;
         ctx.r4.u32 = heap;
         __imp__sub_821DE9D8(ctx, base);
+      }
+    }
+    // Session 73 slim census: record who received which element.
+    if (ctx.r3.u32 != 0 && classHead != 0) {
+      const uint32_t node = ctx.r3.u32;
+      uint16_t es16 = 0;
+      mcla::kernel::GuestMemoryHeap::Instance().ReadU16BE(classHead + 4,
+                                                          &es16);
+      const uint32_t es = es16;
+      const uint32_t idx = s_tslabAllocs.fetch_add(1) + 1;
+      const uint32_t rec = g_tslabRecIdx.fetch_add(1) % kTslabRecords;
+      g_tslabRecords[rec].elem.store(node, std::memory_order_relaxed);
+      g_tslabRecords[rec].lr.store(tslabLr, std::memory_order_relaxed);
+      g_tslabRecords[rec].es.store(es, std::memory_order_relaxed);
+      const bool log = (es == 16)   ? (idx <= 100u || (idx % 4096u) == 0)
+                       : (es <= 512u) ? (idx <= 20000u || (idx % 64u) == 0)
+                                      : (idx <= 200u || (idx % 8u) == 0);
+      if (log) {
+        MCLA_LOG_WARN(
+            "TSLAB-ALLOC #{:09} es={} elem={:08X} lr={:08X} ch={:08X}", idx,
+            es, node, tslabLr, classHead);
       }
     }
     return;

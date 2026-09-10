@@ -16,6 +16,7 @@
 #include "logging.h"
 #include "guest_memory.h"
 #include "kernel/memory.h"
+#include "patches.h"
 
 #include <atomic>
 #include <vector>
@@ -341,9 +342,31 @@ PPC_FUNC(sub_821B5A60)
     {
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
         const uint32_t p = s_hB5A60poison.fetch_add(1) + 1;
+        // Session 73: name the producer. The element was 0xCD-filled on
+        // alloc; the ring census knows who received it.
+        uint32_t elem = 0, prodLr = 0, esz = 0;
+        const bool known = mcla_SlimTslabFind(param, &elem, &prodLr, &esz);
         MCLA_LOG_WARN("REBASE-POISON #{:05} n={} param={:08X} val={:08X} -> 0 "
-                      "lr={:08X} (skip D890 fatal)",
-                      p, n, param, val, static_cast<uint32_t>(ctx.lr));
+                      "lr={:08X} (skip D890 fatal) prod={} elem={:08X} es={} "
+                      "prodLr={:08X}",
+                      p, n, param, val, static_cast<uint32_t>(ctx.lr),
+                      known ? "Y" : "N", elem, esz, prodLr);
+        // Session 73: dump the surrounding record so the poison scope is
+        // visible (one 0x70-stride field vs a fully uninit element).
+        if (p <= 3)
+        {
+            const uint32_t base = param & ~0xFu;
+            for (uint32_t row = 0; row < 8; ++row)
+            {
+                uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                (void)mem.ReadU32BE(base + row * 16 + 0, &w0);
+                (void)mem.ReadU32BE(base + row * 16 + 4, &w1);
+                (void)mem.ReadU32BE(base + row * 16 + 8, &w2);
+                (void)mem.ReadU32BE(base + row * 16 + 12, &w3);
+                MCLA_LOG_WARN("  POISON-DUMP {:08X}: {:08X} {:08X} {:08X} {:08X}",
+                              base + row * 16, w0, w1, w2, w3);
+            }
+        }
         (void)mem.WriteU32BE(param, 0);
         return;
     }

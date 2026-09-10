@@ -693,6 +693,15 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // free list and AV in o1heapAllocate. Arm page-watch on the header.
     mcla::native::RegisterGuestWatchRange(0xA0000000u, 0xA0000200u);
 
+    // Session 73: attribute every 0xCDCDCDCD store. Static decode: the guest
+    // fills tiny-slab elements with 0xCD on alloc (sub_821DE9D8 tail) — the
+    // watch confirms the fill source and catches any OTHER fill site live.
+    mcla::native::RegisterGuestWatchValue(0xCDCDCDCDu);
+
+    // Session 73 probe: poison-param regions (see gpu_cp.cpp PARAM-STORE).
+    mcla::native::RegisterGuestWatchRange(0xA0106000u, 0xA0107000u);
+    mcla::native::RegisterGuestWatchRange(0xA0197E00u, 0xA0197F00u);
+
     // Kernel heaps must exist before any guest import allocates. Skipping this
     // left heap==physicalHeap==nullptr and the first allocation crashed inside
     // o1heapAllocate reading handle->diagnostics.capacity at instance+0x208.
