@@ -1,6 +1,6 @@
 # BOOT HANDOFF - updated 2026-09-10 (see HANDOFF_NEXT_AGENT.md)
 
-## Session 73 — CDCDCDCD ROOT CAUSE (item closed)
+## Session 73 — CDCDCDCD ROOT CAUSE + inflate spin closed
 There is no corruptor. The guest image **fills every tiny-slab allocation
 with 0xCD on alloc** (`sub_821DE9D8` common tail, `memset(elem,0xCD,elemsize)`
 at loc_821DEAFC; watch-confirmed LR 0x821DEB0C) and free-fills 0xDD. Same
@@ -11,6 +11,10 @@ objects (vtable 0x820131A4, ctor writes vtable only). Fix path = real
 inflate + real texture registration, not zeroing. Full writeup + new
 TSLAB/CDCD-FILL/PARAM-STORE instrumentation: see HANDOFF_NEXT_AGENT.md.
 Soak evidence: `boot_stdout_cdcd74/75/76.log`.
+
+Inflate spin also closed: caller loop key is `state+16` (outLeft);
+INFLATE-EMPTY bail now zeroes it → 1663 → 8 entries
+(`boot_stdout_infout.log`).
 
 ## Current state
 - **Closed this session:** KDELAY join · meshtextures poison · semaphore

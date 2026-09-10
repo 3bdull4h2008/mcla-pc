@@ -109,32 +109,24 @@ The rest are boot-life support until `CDCDCDCD` is killed.
 
 ## Next steps (priority order — updated session 73)
 
-### 1. Inflate caller loop (T-carry)
-- `INFLATE-EMPTY` still fires (1663× on `st=006D8F20`, `in=0
-  consumed=0xFFFFFFF4`) in `boot_stdout_cdcd76.log`.
-- Decode caller `sub_821BC380` (`ppc_recomp.15.cpp`) — what field makes it
-  re-enter? May need a "done" bit in the object, not just the inflate state.
-- This is also the fix path for poison family A: real inflate = real texture
-  data = resource ids get assigned.
-
-### 2. Continuous presents
+### 1. Continuous presents
 - `EnqueueNativePresent` logs only `frameNumber<=8` or `%120==0`. Count
   FRAME-END vs actual enqueue (add a raw counter). Flip queue / render
   queue depth at present #6.
 
-### 3. Real draws (P5')
+### 2. Real draws (P5')
 - `SUBMIT-census sub_82420BA8` has `r5=0` (VB/IB empty). Find who fills
   `r5`/`r6` in the device-boundary path. `DRAW_INDEXED` must go >0.
 - Then pixel-hash validator (`phase3_validator`).
 
-### 4. Heap AV storm (separate from CDCDCDCD)
+### 3. Heap AV storm (separate from CDCDCDCD)
 - This run AVs at rva `0xF3868` (before: `0xF0A98`/`0xEF328`) inside
   o1heapAllocate, ~1/sec after ~20s; SEH converts to null allocs and the
   process still dies (~75-100s). Dump first-fail arena words (that path is
   NOT firing — AV is inside o1heap after invariants pass). Consider a
   canary at `physArenaBase+0x200` and a periodic walk.
 
-### 5. Poison family B (lower priority, now understood)
+### 4. Poison family B (lower priority, now understood)
 - The 112-byte vtable objects (`vtable 0x820131A4`) get their body from a
   loader that never runs. Use `TSLAB-OWNER`/`PARAM-STORE` in a soak to find
   who allocates them (owner LR) once the inflate path is fixed; the

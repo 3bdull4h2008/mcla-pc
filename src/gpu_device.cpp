@@ -1382,16 +1382,31 @@ PPC_FUNC(sub_821D5E10) {
   // in=0 consumed=0xFFFFFFF4 forever (INFLATE #286600+). Mark the stream
   // fully consumed so the caller's progress check exits; do not call the
   // original (it would spin or AV on a corrupt state).
+  //
+  // Session 73 decode of the caller loop (ppc_recomp.15.cpp, LR 0x821BC380):
+  //   loc_821BC2D4: if (state.inLeft != 0) goto InflateStep;
+  //                 ... async input refill (Sleep(100)-paced) ...
+  //   loc_821BC374: InflateStep(state);
+  //                 if (state.outLeft /*[r1+112]=state+16*/ != 0) goto 2D4;
+  //               exit per stream when outLeft == 0
+  // The caller refills input BEFORE re-entering InflateStep, so InflateStep
+  // never sees inLeft==0 on a live stream — reaching here means the stream
+  // is dead/empty. Zeroing outLeft is the caller's own "stream complete"
+  // key (same path a descriptor with expected==0 takes); without it the
+  // guest spins on the loop forever (INFLATE-EMPTY x1663).
   if (inLeft == 0) {
     static std::atomic<uint32_t> s_h5E10empty{0};
     const uint32_t e = s_h5E10empty.fetch_add(1) + 1;
     if (e <= 8 || (e % 1000) == 0)
-      MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} (bail)", e, st,
-                    consumed);
-    // Normalize state: no input left, consumed covers all, expected=0.
+      MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} (bail, clear "
+                    "outLeft — caller loop key)",
+                    e, st, consumed);
+    // Normalize state: no input left, consumed covers all, expected=0,
+    // outLeft=0 (caller loop exit key).
     (void)mem.WriteU32BE(st + 0, 0);
     (void)mem.WriteU32BE(st + 8, 0);
     (void)mem.WriteU32BE(st + 12, 0);
+    (void)mem.WriteU32BE(st + 16, 0);
     return;
   }
 
