@@ -109,22 +109,38 @@ The rest are boot-life support until `CDCDCDCD` is killed.
 
 ## Next steps (priority order — updated session 73)
 
-### 1. Continuous presents
-- `EnqueueNativePresent` logs only `frameNumber<=8` or `%120==0`. Count
-  FRAME-END vs actual enqueue (add a raw counter). Flip queue / render
-  queue depth at present #6.
+### 1. Heap AV storm / physical-arena corruption (THE remaining blocker)
+The present-handshake fix pushed the run far past the old ceilings — and it
+now dies in the o1heap corruption sooner (~1.4s of frame loop instead of
+~75s), because the load advances much faster. Signature: o1heapAllocate
+AVs on corrupted bins, `SehO1Allocate` converts to null; arena shows
+`allocated=720MB cap=1.6GB oomCount=0` (NOT a genuine OOM — a free-list
+walk AVs). AV rvas seen: 0xF4B58 / 0xF3868 / 0xF0A98 / 0xEF328.
+Unifier hypothesis: uninitialized resource ids (CDCD story) → loader
+computes wild addresses → wild writes corrupt o1heap fragment headers /
+bins. Fix order: (a) catch the guest write that lands on o1heap headers —
+value watch + `IsLiveAllocation` probes over the arena; the poison
+producers named above are the likely source of the bad pointers;
+(b) the guest AVs on failed allocs without null-checks (lr=821325D4
+`MmAllocatePhysicalMemoryEx: FAILED` then AV) — the faithful fix is making
+the allocations succeed, i.e. (a).
 
 ### 2. Real draws (P5')
 - `SUBMIT-census sub_82420BA8` has `r5=0` (VB/IB empty). Find who fills
   `r5`/`r6` in the device-boundary path. `DRAW_INDEXED` must go >0.
 - Then pixel-hash validator (`phase3_validator`).
 
-### 3. Heap AV storm (separate from CDCDCDCD)
-- This run AVs at rva `0xF3868` (before: `0xF0A98`/`0xEF328`) inside
-  o1heapAllocate, ~1/sec after ~20s; SEH converts to null allocs and the
-  process still dies (~75-100s). Dump first-fail arena words (that path is
-  NOT firing — AV is inside o1heap after invariants pass). Consider a
-  canary at `physArenaBase+0x200` and a periodic walk.
+### 3. Continuous presents — mechanically closed, blocked by (1)
+- Root cause decoded and fixed this session (commit `079f94a`): the
+  6-present wall was the swap-table handshake — dev+21624/21628 counters,
+  2 slots reserved per kick (guest writes ZERO, HW fills timestamps LE),
+  completion processor `sub_824286A0` advances only when slot
+  `(completed+1&7)+16` is non-zero, gated by rlwinm-bit26 of
+  `sub_82458030` (kernel-populated status chain our emu never wrote).
+  Both emulation points live in gpu_device.cpp (`SWAP-STATUS` /
+  `SWAP-FILL` / `SWAP-COMP` log lines).
+- Presents now continue while the load runs; the run dies in (1) before a
+  long soak is possible. Re-verify continuous presents after (1).
 
 ### 4. Poison family B (lower priority, now understood)
 - The 112-byte vtable objects (`vtable 0x820131A4`) get their body from a
