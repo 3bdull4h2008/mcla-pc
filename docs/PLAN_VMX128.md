@@ -351,25 +351,55 @@ Four things were verified by execution. Three of them **correct §4 above.**
    (`build/game_data/default.xex` and `.research/.../jump_tables.toml` both exist
    and are correct relative to the repo root.)
 
-4. **The header argument is copied VERBATIM into `ppc_context.h`, and the obvious
-   source file is NOT the right one.** `recompiler.cpp:2583-2596` emits
+4. **RESOLVED (session 74c): the project's own context header does not exist on
+   disk — reconstruct it, mechanically.** `recompiler.cpp:2583-2596` emits
    `#pragma once` + `#include "ppc_config.h"` + a blank line, then splices in the
-   entire contents of `headerFilePath` and saves it as `ppc_context.h`.
-   `.research/XenonRecomp/XenonUtils/ppc_context.h` (703 lines) does **not** match
-   the generated `ppc_context.h` (739 lines, body differs after stripping the
-   4-line prefix). So the project uses its **own** modified context header, whose
-   location is **not yet found**. Until it is, a baseline regeneration cannot be
-   byte-compared.
-   **To locate it:** search the repo (excluding `generated/` and `.research/`) for a
-   file whose first lines are `#pragma once` / `#include "ppc_config.h"` and which
-   is ~735 lines — or diff candidates against
-   `tail -n +5 generated/ppc_xenon/ppc_context.h`. Alternatively reconstruct the
-   input mechanically with that same `tail -n +5`, which guarantees byte-exactness
-   without knowing the original path.
+   entire contents of `headerFilePath` verbatim and saves it as `ppc_context.h`.
+
+   Search results, all negative:
+   - `src/ppc_context.h` — **does not exist**. It is named only in
+     `docs/MCLA_REBUILD_PLAN.md:741`, and that very row is marked
+     `⚠️ OPEN` ("Run with `src/ppc_context.h`"). The doc was aspirational, not a
+     record of a file. Do not go looking again.
+   - `.research/XenonRecomp/XenonUtils/ppc_context.h` (703 lines) — wrong, but
+     informative: the real header is **703 + 33 lines of MCLA-specific ABI
+     additions**. That delta is the "full ABI, not 38-byte stub" the rebuild plan
+     wanted, and it lives *only* inside the generated output.
+
+   **Verified recipe.** The prefix is **3** lines, not 4 (the earlier `tail -n +5`
+   note was off by one):
+   ```sh
+   tail -n +4 generated/ppc_xenon/ppc_context.h > src/ppc_context.h   # 736 lines
+   ```
+   Round-trip proven byte-for-byte (`cmp` clean):
+   ```sh
+   { printf '#pragma once\n#include "ppc_config.h"\n\n'; cat src/ppc_context.h; } \
+     | cmp - generated/ppc_xenon/ppc_context.h
+   ```
+   Note the reconstructed header itself *begins* with its own
+   `#pragma once` / `#include "ppc_config.h"` / blank — so the generated file shows
+   those three lines twice. That duplication is faithful, not a bug; preserve it.
+
+5. **A baseline config and output dir already exist — reuse, don't recreate.**
+   `config/mcla_xenonrecomp_baseline.toml` (57 lines, untracked) is a copy of the
+   authoritative `config/mcla_xenonrecomp.toml` with **exactly one** line changed:
+   `out_directory_path = "build/xr_baseline"` instead of `"generated/ppc_xenon"`.
+   `diff` confirms nothing else differs. `build/xr_baseline/` exists but is
+   **empty** — a prior run created the directory and produced no output, i.e. the
+   invocation failed (almost certainly the item-3 cwd/path issue, or the missing
+   header from item 4). Do not re-derive this config; fix the invocation.
+   Per item 3 it must be run as a **bare filename from the repo root**.
 
 **Net effect on the plan:** Route A gets cheaper (no tool build, vector registers
-confirmed). Route B's reproducibility gate (§4 step 3) is **still blocked** on
-finding the context header from item 4 — that is the single next action.
+confirmed). Route B's reproducibility gate (§4 step 3) is **UNBLOCKED** — item 4
+gives a byte-exact header recipe and item 5 an already-correct config. Remaining
+steps for the gate: materialize `src/ppc_context.h` with the `tail -n +4` recipe,
+then from the repo root run the unmodified tool as
+`XenonRecomp.exe <bare-config-filename> src/ppc_context.h` and
+`diff -rq build/xr_baseline generated/ppc_xenon`, confirming the TU count is still
+**179** (`CMakeLists.txt:228+` hardcodes `ppc_recomp.0..178.cpp` — a regen that
+changes the count breaks the build). Still unverified: that a midasm hook's
+`jump_address` actually bypasses a `__builtin_debugtrap()` — test on one site first.
 
 ## 8. Reference locations
 

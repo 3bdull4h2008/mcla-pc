@@ -323,6 +323,13 @@ midasm-hook vs host override) are in **SESSION 74** above and in the plan. Seman
 `0x821B3814`), then re-triage; only reach for the 94 FLOAT16_4 sites if the
 boot gets as far as `0x822Fxxxx`.
 **Prove regen reproducibility before regenerating** (plan §4 Route B step 3).
+That gate is **unblocked as of session 74c** — plan §7b items 4 and 5 give a
+byte-exact `src/ppc_context.h` reconstruction recipe (`tail -n +4
+generated/ppc_xenon/ppc_context.h`, round-trip `cmp`-clean) and note that
+`config/mcla_xenonrecomp_baseline.toml` already exists and is correct (one line
+differs from the authoritative config). `build/xr_baseline/` is **empty** — a
+prior run failed to produce output; fix the invocation (bare config filename from
+the repo root), do not re-derive the config or hunt for the header again.
 
 ### 2. Real draws (P5')
 - `SUBMIT-census sub_82420BA8` has `r5=0` (VB/IB empty). Find who fills
