@@ -66,6 +66,17 @@ build\mcla.exe
 **RE tools:** IDA MCP on `127.0.0.1:8745` (preferred) · Ghidra on `:8089` ·
 generated TUs are the decompiled game code (never edit `generated/`).
 
+**AUTHORITATIVE ARCHIVE DOC:** `docs/MCLA_RPF3_Technical_Reference.txt`
+- MCLA uses **RPF3** exclusively (same struct as RPFv0)
+- Header at `0x800`, TOC at `0x1000`, 16-byte entries, BE integers
+- File entries: `name_off|flags, data_offset, compressed_size, uncompressed_size`
+- **Compression = XMem LZX** (XDK `XMemDecompress`), NOT zlib. Optional
+  raw-zlib fallback. Decision: `file_size == uncompressed` → stored.
+- VFS extracted cache serves files as **stored** (no LZX on our side).
+  Real `.rpf` opens serve the packfile bytes; **guest** XMem-decodes entries.
+- Our `zlibInflater` (`sub_821D5E10`) hook is a **different** path from
+  RPF XMem — do not conflate them.
+
 ---
 
 ## SESSION 75E — IDA MCP UP; DICTIONARY REGISTER RUNS BUT LOOKUPS STILL MISS
