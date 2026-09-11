@@ -2101,10 +2101,27 @@ PPC_FUNC(sub_821D5E10) {
       if (retries == 1) {
         uint32_t credits = 0;
         (void)mem.ReadU32BE(0x827D74E0u, &credits);
-        MCLA_LOG_WARN("INFLATE-PENDING #{} st={:08X} in=0 produced={} "
-                      "outPtr={:08X} outLeft={} retries=1 credits={:08X} "
-                      "(awaiting async refill — state untouched)",
-                      n, st, produced, outPtr, outLeft, retries, credits);
+        // lr=1 is bogus — walk the stack instead (recompiler frames:
+        // [sp]=back, [back-8]=saved lr).
+        uint32_t inPtr = 0;
+        mem.ReadU32BE(st + 4, &inPtr);
+        char chain[120] = {0};
+        size_t off = 0;
+        uint32_t sp = ctx.r1.u32;
+        for (int f = 0; f < 4 && sp != 0 && off + 12 < sizeof(chain); ++f) {
+          uint32_t back = 0, lr2 = 0;
+          if (!mem.ReadU32BE(sp, &back) || back == 0 || back <= sp) break;
+          mem.ReadU32BE(back - 8, &lr2);
+          off += static_cast<size_t>(snprintf(chain + off, sizeof(chain) - off,
+                                              " f%d=%08X", f, lr2));
+          sp = back;
+        }
+        MCLA_LOG_WARN("INFLATE-PENDING #{} st={:08X} in=0 inPtr={:08X} "
+                      "produced={} outPtr={:08X} outLeft={} retries=1 "
+                      "credits={:08X} lr={:08X} r1={:08X} chain[{}]",
+                      n, st, inPtr, produced, outPtr, outLeft, retries,
+                      credits, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                      chain);
         // Session 75q: dump the join table — entry+8 = the source stream
         // object whose vtable+28 read returns 0 for this batch.
         uint32_t jcount = 0, jentries = 0;
@@ -2120,23 +2137,21 @@ PPC_FUNC(sub_821D5E10) {
             if (obj != 0 && obj != 0xCDCDCDCDu) {
               mem.ReadU32BE(obj, &vt);
               if (vt != 0) mem.ReadU32BE(vt + 28, &rd);
-              // 75q: the readFn is a wrapper over [obj+32] — dump the
-              // wrapper fields (position/size candidates) + the inner
-              // stream's vtable and read slot.
-              uint32_t f[8] = {0}, inner = 0, ivt = 0, ird = 0;
-              for (int fi = 0; fi < 8; ++fi)
+              // 75r: wrapper fields +0..+44 (incl. +36 lookup base) and the
+              // join entry's own +16/+20/+24 (the request params).
+              uint32_t f[12] = {0}, jf[3] = {0};
+              for (int fi = 0; fi < 12; ++fi)
                 mem.ReadU32BE(obj + 4u * fi, &f[fi]);
-              mem.ReadU32BE(obj + 32, &inner);
-              if (inner != 0 && inner != 0xCDCDCDCDu) {
-                mem.ReadU32BE(inner, &ivt);
-                if (ivt != 0) mem.ReadU32BE(ivt + 28, &ird);
-              }
+              mem.ReadU32BE(eBase + 16, &jf[0]);
+              mem.ReadU32BE(eBase + 20, &jf[1]);
+              mem.ReadU32BE(eBase + 24, &jf[2]);
               MCLA_LOG_WARN("JOIN[{}] key={:08X} obj={:08X} vt={:08X} "
                             "rd={:08X} objf=[{:08X} {:08X} {:08X} {:08X} "
-                            "{:08X} {:08X} {:08X} {:08X}] inner={:08X} "
-                            "ivt={:08X} ird={:08X}",
+                            "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                            "{:08X} {:08X}] joinf=[{:08X} {:08X} {:08X}]",
                             ji, key, obj, vt, rd, f[0], f[1], f[2], f[3],
-                            f[4], f[5], f[6], f[7], inner, ivt, ird);
+                            f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
+                            jf[0], jf[1], jf[2]);
               continue;
             }
             MCLA_LOG_WARN("JOIN[{}] @ {:08X} key={:08X} obj={:08X} "
@@ -2547,4 +2562,19 @@ PPC_FUNC(sub_822CC5E0) {
     MCLA_LOG_INFO("IOCRED-B sub_822CC5E0 #{} a0={:08X} a1={:08X} lr={:08X}",
                   n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_822CC5E0(ctx, base);
+}
+
+// Session 75r: page/descriptor lookup census. The executor calls
+// vtable+8 = sub_821CC570(obj, join+24, &out) per request; returns -1 when
+// the vtable+144 find fails (suspected batch-2 stall point).
+PPC_FUNC_IMPL(__imp__sub_821CC570);
+static std::atomic<uint32_t> s_hCC570{0};
+PPC_FUNC(sub_821CC570) {
+  const uint32_t n = s_hCC570.fetch_add(1) + 1;
+  __imp__sub_821CC570(ctx, base);
+  if (n <= 32 || (n % 200) == 0)
+    MCLA_LOG_WARN("PGLOOKUP sub_821CC570 #{} obj={:08X} key={:08X} "
+                  "out={:08X} -> ret={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r3.u32,
+                  static_cast<uint32_t>(ctx.lr));
 }
