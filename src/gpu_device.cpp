@@ -13,6 +13,8 @@
 
 #include <atomic>
 #include <fstream>
+#include <mutex>
+#include <unordered_map>
 #include <iterator>
 #include <string>
 
@@ -2037,6 +2039,7 @@ constexpr uint32_t kXCompressMagic = 0x0FF512EFu;
 PPC_FUNC_IMPL(__imp__sub_821D5E10);
 static std::atomic<uint32_t> s_h5E10{0};
 static std::atomic<uint32_t> s_h5E10pt{0};
+static std::atomic<uint32_t> s_h5E10empty{0};
 PPC_FUNC(sub_821D5E10) {
   const uint32_t n = s_h5E10.fetch_add(1) + 1;
   const uint32_t st = ctx.r4.u32;
@@ -2072,12 +2075,68 @@ PPC_FUNC(sub_821D5E10) {
   // key (same path a descriptor with expected==0 takes); without it the
   // guest spins on the loop forever (INFLATE-EMPTY x1663).
   if (inLeft == 0) {
-    static std::atomic<uint32_t> s_h5E10empty{0};
+    // Session 73: empty input — original code spun forever (INFLATE
+    // x286600+) on a stream whose refill never delivered, so we bailed by
+    // zeroing outLeft (the caller loop's exit key).
+    //
+    // Session 75p CORRECTION: the boot init enqueues batches of streams and
+    // calls InflateStep BEFORE the async input refill delivers. Killing
+    // those (produced=0, sequential outPtrs, all in one burst) aborted the
+    // boot's next load batch — the emu has been stalling itself. Distinguish:
+    //  - fresh/pending stream (no real progress yet): return WITHOUT touching
+    //    state; the caller's own refill pacing re-polls until data arrives.
+    //  - genuinely dead (no input after ~20s of paced retries, or the -12
+    //    EOF artifact after partial consumption): bail as before.
+    static std::mutex s_emptyMtx;
+    static std::unordered_map<uint32_t, uint32_t> s_emptyRetries;
+    const bool fresh = (consumed == 0 || consumed == 0xFFFFFFF4u) &&
+                       produced == 0;
+    uint32_t &retries = [&]() -> uint32_t & {
+      std::lock_guard<std::mutex> lk(s_emptyMtx);
+      return s_emptyRetries[st];
+    }();
+    if (inPtr != 0 && outPtr != 0 && outLeft != 0 &&
+        retries < 200 /* ~20s at 100ms pacing */) {
+      retries++;
+      if (retries == 1 || (retries % 50) == 0) {
+        uint32_t credits = 0, obj = 0, vt = 0, rd = 0;
+        (void)mem.ReadU32BE(0x827D74E0u, &credits);
+        // r28 (callee-saved, live at this call) = executor stream context;
+        // [ctx+8] = source stream object, [obj+0] = vtable, [vt+28] = read.
+        (void)mem.ReadU32BE(ctx.r28.u32 + 8, &obj);
+        if (obj != 0) {
+          (void)mem.ReadU32BE(obj, &vt);
+          if (vt != 0) (void)mem.ReadU32BE(vt + 28, &rd);
+        }
+        MCLA_LOG_WARN("INFLATE-PENDING #{} st={:08X} in=0 produced={} "
+                      "outPtr={:08X} outLeft={} retries={} credits={:08X} "
+                      "srcObj={:08X} vt={:08X} readFn={:08X} "
+                      "(awaiting async refill — state untouched)",
+                      n, st, produced, outPtr, outLeft, retries, credits, obj,
+                      vt, rd);
+      }
+      return;
+    }
+    retries = 0;
     const uint32_t e = s_h5E10empty.fetch_add(1) + 1;
-    if (e <= 8 || (e % 1000) == 0)
-      MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} (bail, clear "
-                    "outLeft — caller loop key)",
-                    e, st, consumed);
+    if (e <= 16) {
+      uint32_t outPtr2 = 0, produced2 = 0, h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+      (void)mem.ReadU32BE(st + 20, &outPtr2);
+      (void)mem.ReadU32BE(st + 24, &produced2);
+      if (outPtr2 != 0) {
+        (void)mem.ReadU32BE(outPtr2 + 0, &h0);
+        (void)mem.ReadU32BE(outPtr2 + 4, &h1);
+        (void)mem.ReadU32BE(outPtr2 + 8, &h2);
+        (void)mem.ReadU32BE(outPtr2 + 12, &h3);
+      }
+      MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} produced={} "
+                    "outPtr={:08X} head=[{:08X} {:08X} {:08X} {:08X}] "
+                    "(bail, clear outLeft — caller loop key)",
+                    e, st, consumed, produced2, outPtr2, h0, h1, h2, h3);
+    } else if ((e % 1000) == 0) {
+      MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} (bail)", e, st,
+                    consumed);
+    }
     // Normalize state: no input left, consumed covers all, expected=0,
     // outLeft=0 (caller loop exit key).
     (void)mem.WriteU32BE(st + 0, 0);
@@ -2435,4 +2494,27 @@ PPC_FUNC(sub_821E5FD0) {
                   static_cast<uint32_t>(ctx.lr), chain);
   }
   __imp__sub_821E5FD0(ctx, base);
+}
+
+// Session 75p: IO-credit census. The streamer refill waits while
+// [0x82757500] <= 0 (Sleep 100ms) before issuing its virtual read — an
+// async-IO credit/deepth limit. These two TU45 functions are the credit
+// consumers/producers; log them to see whether credits ever flow.
+PPC_FUNC_IMPL(__imp__sub_822CBE30);
+static std::atomic<uint32_t> s_hCBE30{0};
+PPC_FUNC(sub_822CBE30) {
+  const uint32_t n = s_hCBE30.fetch_add(1) + 1;
+  if (n <= 16 || (n % 200) == 0)
+    MCLA_LOG_INFO("IOCRED-A sub_822CBE30 #{} a0={:08X} a1={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822CBE30(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822CC5E0);
+static std::atomic<uint32_t> s_hCC5E0{0};
+PPC_FUNC(sub_822CC5E0) {
+  const uint32_t n = s_hCC5E0.fetch_add(1) + 1;
+  if (n <= 16 || (n % 200) == 0)
+    MCLA_LOG_INFO("IOCRED-B sub_822CC5E0 #{} a0={:08X} a1={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822CC5E0(ctx, base);
 }

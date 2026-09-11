@@ -1098,6 +1098,28 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     ioStatus->Status.set(ok ? STATUS_SUCCESS : 0xC000000D);
     ioStatus->Information.set(static_cast<uint64_t>(bytesRead));
   }
+
+  // Session 75p FIX: async-read completion. The streamer refill submits
+  // overlapped reads with a completion event and polls it; we performed the
+  // read synchronously but never signaled the event, so inLeft stayed 0
+  // forever (session-73 "infinite spin", later killed by INFLATE-EMPTY,
+  // which aborted the boot's second load batch). Signal the event now —
+  // X360 NtReadFile signals it on IO completion.
+  if (event != 0) {
+    if (auto *obj = GetKernelObject(event)) {
+      if (auto *evt = dynamic_cast<Event *>(obj)) {
+        evt->Set();
+        static std::atomic<uint32_t> s_rdEvt{0};
+        const uint32_t en = s_rdEvt.fetch_add(1) + 1;
+        if (en <= 20 || (en % 500) == 0)
+          MCLA_LOG_INFO("NtReadFile: signaled completion event h={:08X} "
+                        "(async read {} bytes, #{})",
+                        event, bytesRead, en);
+      } else {
+        DestroyKernelObject(obj);
+      }
+    }
+  }
   return ok ? STATUS_SUCCESS : 0xC000000D;
 }
 

@@ -1161,15 +1161,16 @@ void CpVblankDrainToWptr() {
     // predicate sub_821342F8 (== "flag != 0 && device-poll >= 2"); the whole
     // streamables path never activates, so watch it + neighbors.
     if ((vdN % 100) == 1) {
-      uint32_t flag = 0, g1 = 0, g2 = 0, g3 = 0;
+      uint32_t flag = 0, g1 = 0, g2 = 0, g3 = 0, ioCredits = 0;
       auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
       memP.ReadU32BE(0x828309A0u, &flag);
       memP.ReadU32BE(0x8283099Cu, &g1);
       memP.ReadU32BE(0x828309A4u, &g2);
       memP.ReadU32BE(0x828309A8u, &g3);
+      memP.ReadU32BE(0x827D74E0u, &ioCredits);
       MCLA_LOG_INFO("GATE-PROBE #{:04X} [828309A0]={:08X} [A4]={:08X} "
-                    "[A8]={:08X} [9C]={:08X}",
-                    vdN, flag, g2, g3, g1);
+                    "[A8]={:08X} [9C]={:08X} IOCREDITS[827D74E0]={:08X}",
+                    vdN, flag, g2, g3, g1, ioCredits);
     }
   }
   // Deferred-consumption experiment: credit submitted-but-unconsumed
