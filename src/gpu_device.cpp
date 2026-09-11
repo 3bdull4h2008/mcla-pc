@@ -1033,6 +1033,17 @@ PPC_FUNC(sub_8244FF20) {
   }
 }
 
+// Session 75l: streamables loader itself (now a recompiled entry after
+// TOML explicit function 0x82216B98 size 0x2B4).
+PPC_FUNC_IMPL(__imp__sub_82216B98);
+static std::atomic<uint32_t> s_h216B98{0};
+PPC_FUNC(sub_82216B98) {
+  const uint32_t n = s_h216B98.fetch_add(1) + 1;
+  MCLA_LOG_INFO("STREAMTEX-LOADER sub_82216B98 #{} lr={:08X}",
+                n, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_82216B98(ctx, base);
+}
+
 // Session 75i: UI streamables / blank-texture loader caller.
 // 82216B98 refs "$/resources/ui/textures/streamables" and "$/textures/blank".
 // Not in func map; mapped callers: 821FD6B0, 821FD640, 822012E8.

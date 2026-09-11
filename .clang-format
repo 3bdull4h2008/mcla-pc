@@ -42,7 +42,6 @@ BreakInheritanceList: BeforeComma
 BreakStringLiterals: true
 CommentPragmas: '^ IWYU pragma:'
 CompactNamespaces: false
-ConstructorInitializerAllOnOneLineOrOnePerLine: true
 FixNamespaceComments: true
 IncludeBlocks: Preserve
 IncludeCategories:
@@ -63,7 +62,6 @@ IndentCaseLabels: true
 IndentCaseBlocks: false
 IndentGotoLabels: true
 IndentPPDirectives: AfterHash
-IndentWidth: 4
 IndentWrappedFunctionNames: false
 JavaScriptQuotes: Leave
 JavaScriptWrapImports: true
@@ -85,7 +83,6 @@ PenaltyBreakTemplateDeclaration: 10
 PenaltyExcessCharacter: 1000000
 PenaltyReturnTypeOnItsOwnLine: 60
 PenaltyIndentedWhitespace: 0
-PointerAlignment: Right
 ReflowComments: true
 SortIncludes: CaseSensitive
 SortUsingDeclarations: true
@@ -106,6 +103,3 @@ SpacesInCStyleCastParentheses: false
 SpacesInParentheses: false
 SpacesInSquareBrackets: false
 StatementMacros: []
-TabWidth: 4
-UseTab: Never
----

@@ -6,7 +6,6 @@
 /build-standalone/
 
 # ── Derived / regenerable ───────────────────────────────────
-/generated/
 /docs/
 /game_data/
 /mcla extracted cache/
@@ -55,6 +54,7 @@ cache/
 .vscode/
 
 # ── Local config ────────────────────────────────────────────
+/opencode.json
 /config/opencode.json
 /config/config.json
 

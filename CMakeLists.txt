@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
 
-# Disable clang's -nostartfiles -nostdlib on Windows by setting these BEFORE project()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_SYSTEM_NAME STREQUAL "Windows")
     set(CMAKE_CXX_FLAGS_INIT "")
     set(CMAKE_C_FLAGS_INIT "")
@@ -16,44 +15,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# Local cmake dir for our own configs
 list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-# Find SDL3, fmt, spdlog (vendored third-party configs in ./cmake)
 find_package(SDL3 REQUIRED)
-
-# Find fmt and spdlog (header-only via local configs)
 find_package(fmt REQUIRED)
 find_package(spdlog REQUIRED)
 
-# Additional UnleashedRecomp game-agnostic libraries (via vcpkg - install with vcpkg if needed)
-# find_package(freetype REQUIRED)
-# find_package(curl REQUIRED)
-# find_package(nlohmann_json REQUIRED)
-# find_package(unordered_dense REQUIRED)
-# find_package(magic_enum REQUIRED)
-# find_package(msdf-atlas-gen REQUIRED)
-# find_package(ddspp REQUIRED)
-# find_package(nativefiledialog REQUIRED)
-# find_package(zstd REQUIRED)
-# find_package(xxhash REQUIRED)
-# find_package(plume REQUIRED)
-# find_package(concurrentqueue REQUIRED)
-# find_package(stb REQUIRED)
-
-# DXC headers (for shader compilation)
 find_path(DXC_INCLUDE_DIR dxc/dxcapi.h PATHS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/inc" NO_DEFAULT_PATH)
 
-# XenosRecomp shader cache generator (P5.5')
-# Dependencies: zstd, xxHash, smol-v, DXC (from .research/XenosRecomp/thirdparty)
+# XenosRecomp shader cache generator
 set(XENOS_RECOMP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/XenosRecomp")
 set(XENOS_RECOMP_THIRDPARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/thirdparty")
 
-# Build third-party dependencies for XenosRecomp
 add_subdirectory(${XENOS_RECOMP_THIRDPARTY_DIR}/zstd/build/cmake zstd_build)
 add_subdirectory(${XENOS_RECOMP_THIRDPARTY_DIR}/xxHash/cmake_unofficial xxhash_build)
 
-# Create smol-v static library (header-only wrapper + implementation)
 add_library(smol-v STATIC
     ${XENOS_RECOMP_THIRDPARTY_DIR}/smol-v/source/smolv.cpp
 )
@@ -62,10 +38,6 @@ target_include_directories(smol-v PUBLIC
 )
 target_compile_definitions(smol-v PRIVATE _CRT_SECURE_NO_WARNINGS)
 
-# DXC libraries are loaded dynamically at runtime by XenosRecomp (LoadLibrary)
-# No link-time dependency needed
-
-# XenosRecomp executable for shader cache generation
 add_executable(XenosRecomp
     ${XENOS_RECOMP_SOURCE_DIR}/main.cpp
     ${XENOS_RECOMP_SOURCE_DIR}/shader_recompiler.cpp
@@ -84,9 +56,6 @@ target_compile_definitions(XenosRecomp PRIVATE
     NOMINMAX
     _CRT_SECURE_NO_WARNINGS
 )
-# Force include minimal standard headers needed by XenosRecomp
-# Using /FI for clang-cl with path in build directory (no spaces)
-# Escape the path for CMake's argument parsing
 target_compile_options(XenosRecomp PRIVATE
     "/FI${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp_include/force_include.h"
 )
@@ -97,43 +66,19 @@ target_link_libraries(XenosRecomp PRIVATE
     user32.lib advapi32.lib
 )
 
-# P5.5': Offline shader cache generation (DISABLED - XenosRecomp has bugs with .fxc files)
-# Run XenosRecomp at build time on the game's shader corpus to produce an embedded C++ cache
-# set(SHADER_CORPUS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_data/xarchive_cache/shaders")
-# set(SHADER_COMMON_HEADER "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp_include/empty_common.hlsl")
-# set(SHADER_CACHE_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/shader_cache.cpp")
-#
-# add_custom_command(
-#     OUTPUT ${SHADER_CACHE_OUTPUT}
-#     COMMAND XenosRecomp
-#         ${SHADER_CORPUS_DIR}
-#         ${SHADER_CACHE_OUTPUT}
-#         ${SHADER_COMMON_HEADER}
-#     DEPENDS XenosRecomp ${SHADER_COMMON_HEADER}
-#     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-#     COMMENT "Generating offline shader cache from Xenos microcode corpus"
-#     VERBATIM
-# )
-
-# Add the generated shader cache to the main executable
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CXX_KNOWN_TARGETS mcla)
 list(APPEND MCLA_GENERATED_SOURCES ${SHADER_CACHE_OUTPUT})
 
-# MSVC toolset path (VS 2022 BuildTools has both headers and libraries; VS 2026 BuildTools is minimal)
+# MSVC toolset + Windows SDK paths
 set(MSVC_TOOLSET_PATH "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207")
 set(MSVC_INCLUDE_PATH "${MSVC_TOOLSET_PATH}/include")
 set(MSVC_LIB_PATH "${MSVC_TOOLSET_PATH}/lib/x64")
 
-# Windows SDK library paths
 set(WINDOWS_SDK_PATH "C:/Program Files (x86)/Windows Kits/10")
 set(WINDOWS_SDK_VERSION "10.0.26100.0")
 set(WINDOWS_SDK_UM_LIB_PATH "${WINDOWS_SDK_PATH}/Lib/${WINDOWS_SDK_VERSION}/um/x64")
 set(WINDOWS_SDK_UCRT_LIB_PATH "${WINDOWS_SDK_PATH}/Lib/${WINDOWS_SDK_VERSION}/ucrt/x64")
 
-# Override the default MSVC include path to use VS 2022 toolset.
-# NOTE: _INIT variables are only consumed by project(); writing them afterwards
-# is dead code. SYSTEM directory includes are emitted as quoted -imsvc args,
-# so they survive paths containing spaces (unlike raw compiler-flag strings).
 include_directories(AFTER SYSTEM
     "${MSVC_INCLUDE_PATH}"
     "${WINDOWS_SDK_PATH}/Include/${WINDOWS_SDK_VERSION}/ucrt"
@@ -199,7 +144,6 @@ add_executable(mcla
     src/boot_host.cpp
     src/boot_host.h
     src/boot_log.cpp
-    
     src/logging.h
     src/cvar.h
     src/renderer/xenos_microcode.cpp
@@ -439,24 +383,11 @@ target_link_libraries(mcla PRIVATE
     SDL3::SDL3
     fmt::fmt
     spdlog::spdlog_header_only
-    # freetype::freetype
-    # CURL::libcurl
-    # nlohmann_json::nlohmann_json
-    # magic_enum::magic_enum
-    # msdf-atlas-gen::msdf-atlas-gen
-    # nativefiledialog::nfd
-    # ddspp::ddspp
-    # zstd::libzstd_static
-    # xxhash::xxhash
-    # plume::plume
-    # concurrentqueue::concurrentqueue
-    # stb::stb
     kernel32.lib user32.lib gdi32.lib winmm.lib imm32.lib ole32.lib oleaut32.lib
     version.lib uuid.lib advapi32.lib setupapi.lib shell32.lib hid.lib dinput8.lib
     ws2_32.lib dbghelp.lib dxgi.lib dxguid.lib d3d12.lib
 )
 
-# Add SDL3 library directory
 target_link_directories(mcla PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL3/lib")
 
 target_compile_definitions(mcla PRIVATE
@@ -469,7 +400,6 @@ target_compile_definitions(mcla PRIVATE
     _HAS_CXX23=0
 )
 
-# Disable debug info for RelWithDebInfo to avoid clang-cl SEH crash
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/MT /O2 /Ob1 /DNDEBUG")
 set(CMAKE_C_FLAGS_RELWITHDEBINFO "/MT /O2 /Ob1 /DNDEBUG")
 
@@ -477,10 +407,7 @@ target_compile_options(mcla PRIVATE /GS- /EHa)
 target_link_options(mcla PRIVATE /OPT:NOREF)
 target_compile_definitions(mcla PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
 
-# ---------------------------------------------------------------------------
-# Offline validators (headless; no SDL/window). Built by `cmake --build build`.
-# Each is a standalone console tool over the shared renderer TUs.
-# ---------------------------------------------------------------------------
+# Offline validators
 set(RENDERER_IR_TUS
     src/renderer/xenos_microcode.cpp
     src/renderer/xenos_shader_ir.cpp
@@ -490,7 +417,6 @@ set(RENDERER_IR_TUS
     src/renderer/pipeline_cache.cpp
 )
 
-# Shared flags for all validator targets (clang-cl).
 set(VALIDATOR_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -504,34 +430,28 @@ set(VALIDATOR_INCLUDE_DIRS
 )
 set(VALIDATOR_COMPILE_DEFS NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS MCLA_STANDALONE _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH _HAS_CXX23=0)
 
-# shader_pipeline_validator: Phase 4/5 gate — parse + translate every shader
-# container, fail (exit 1) if any unknown/unsupported opcode or empty HLSL.
 add_executable(shader_pipeline_validator
     src/renderer/shader_pipeline_validator.cpp ${RENDERER_IR_TUS})
 target_include_directories(shader_pipeline_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(shader_pipeline_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
-# xenos_decode_validator: raw Xenos microcode decode over the shader corpus.
 add_executable(xenos_decode_validator
     src/renderer/xenos_decode_validator.cpp ${RENDERER_IR_TUS})
 target_include_directories(xenos_decode_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(xenos_decode_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
-# phase3_validator: vertex fetch + resource/texture decode unit checks.
 add_executable(phase3_validator
     src/renderer/phase3_validator.cpp ${RENDERER_IR_TUS}
     src/renderer/vertex_decode.cpp src/renderer/grc_fvf_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
 target_include_directories(phase3_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(phase3_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
-# texture_decode_test: tiled/Xenos texture decode vs oracle.
 add_executable(texture_decode_test
     src/renderer/texture_decode_test.cpp
     src/renderer/texture_decode.cpp src/renderer/resource_cache.cpp)
 target_include_directories(texture_decode_test PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(texture_decode_test PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
-# capture_dump_validator: cross-checks captured DrawPacket stream vs raw guest memory.
 add_executable(capture_dump_validator
     src/renderer/capture_dump_validator.cpp src/frame_trace.cpp src/frame_trace.h
     src/renderer/vertex_decode.cpp)
@@ -542,12 +462,10 @@ target_compile_definitions(capture_dump_validator PRIVATE
 target_link_libraries(capture_dump_validator PRIVATE
     fmt::fmt spdlog::spdlog_header_only)
 
-# xtr_dump_validator: standalone capture dumps.
 add_executable(xtr_dump_validator src/renderer/xtr_dump_validator.cpp)
 target_include_directories(xtr_dump_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(xtr_dump_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
-# backend_validator: D3D12 device + PSO smoke test (mirrors CreateTestPipeline).
 add_executable(backend_validator
     src/renderer/backend_validator.cpp
     src/renderer/vertex_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
@@ -555,7 +473,6 @@ target_include_directories(backend_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(backend_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 target_link_libraries(backend_validator PRIVATE d3d12.lib dxgi.lib dxguid.lib)
 
-# phase0_validator: kernel framework unit tests (memory, handles, hooks, kernel objects).
 add_executable(phase0_validator
     src/kernel/phase0_validator.cpp
     src/kernel/memory.cpp
