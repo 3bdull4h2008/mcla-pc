@@ -1088,33 +1088,73 @@ PPC_FUNC_IMPL(__imp__sub_8218BF20);
 static std::atomic<uint32_t> s_h18BF20{0};
 PPC_FUNC(sub_8218BF20) {
   const uint32_t n = s_h18BF20.fetch_add(1) + 1;
-  if (n <= 16 || (n % 50) == 0) {
+  if (n <= 48 || (n % 100) == 0) {
     // r4 is the deserialization stream the dict is built from:
-    // +8 buffer ptr, +24 read cursor, +28 end (decoded from the TU).
-    // Empty dict <=> cursor==end at build time; dump the range + head bytes.
+    // +8 buffer ptr, +24 read cursor, +28 end. Entry format proven in 75l:
+    // u8 nameLen + name + u32 hash. Dump the pending name at the cursor.
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t buf = 0, pos = 0, end = 0;
     mem.ReadU32BE(ctx.r4.u32 + 8, &buf);
     mem.ReadU32BE(ctx.r4.u32 + 24, &pos);
     mem.ReadU32BE(ctx.r4.u32 + 28, &end);
-    char head[65] = {0};
+    char name[80] = {0};
+    uint8_t len = 0;
     if (end > pos && buf != 0) {
-      const uint32_t avail = end - pos;
-      const uint32_t nread = avail < 16 ? avail : 16;
-      for (uint32_t i = 0; i < nread; ++i) {
-        uint8_t b = 0;
-        if (mem.ReadU8(buf + pos + i, &b))
-          snprintf(head + i * 4, 5, "%02X ", b);
+      const uint8_t *p =
+          static_cast<const uint8_t *>(mcla::kernel::MmGetHostAddress(buf + pos));
+      if (p) {
+        len = p[0];
+        if (len > 0 && len < 70) {
+          for (uint32_t i = 0; i < len; ++i)
+            name[i] = (p[1 + i] >= 32 && p[1 + i] < 127) ? static_cast<char>(p[1 + i]) : '.';
+        }
       }
     }
     MCLA_LOG_INFO("DICTFACT-census sub_8218BF20 #{} r3={:08X} r4={:08X} "
                   "r5={:08X} lr={:08X} stream buf={:08X} pos={:08X} end={:08X} "
-                  "left={} head='{}'",
+                  "left={} name[{}]='{}'",
                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
                   static_cast<uint32_t>(ctx.lr), buf, pos, end,
-                  end > pos ? end - pos : 0, head);
+                  end > pos ? end - pos : 0, len, name);
   }
   __imp__sub_8218BF20(ctx, base);
+}
+
+// Session 75l: stream slot allocator (fixed 40-byte slot array @0x82860C18,
+// per-slot 4KB buffers @0x82860DF8+i*0x1000). Args r4/r5 identify the data
+// source feeding the dict deserialization streams.
+PPC_FUNC_IMPL(__imp__sub_821BDDE8);
+static std::atomic<uint32_t> s_h1BDDE8{0};
+PPC_FUNC(sub_821BDDE8) {
+  const uint32_t n = s_h1BDDE8.fetch_add(1) + 1;
+  if (n <= 32 || (n % 100) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    char a[48] = {0}, b[48] = {0};
+    auto dumpstr = [&](uint32_t addr, char *out, size_t cap) {
+      if (addr < 0x82000000 || addr > 0x82AD3000) {
+        snprintf(out, cap, "%08X", addr);
+        return;
+      }
+      const char *p =
+          static_cast<const char *>(mcla::kernel::MmGetHostAddress(addr));
+      if (!p) {
+        snprintf(out, cap, "%08X?", addr);
+        return;
+      }
+      size_t i = 0;
+      for (; i < 40 && p[i]; ++i)
+        out[i] = (static_cast<unsigned char>(p[i]) >= 32 &&
+                  static_cast<unsigned char>(p[i]) < 127)
+                     ? p[i]
+                     : '.';
+      out[i] = 0;
+    };
+    dumpstr(ctx.r4.u32, a, sizeof(a));
+    dumpstr(ctx.r5.u32, b, sizeof(b));
+    MCLA_LOG_INFO("DICTSLOT-ALLOC sub_821BDDE8 #{} r4='{}' r5='{}' lr={:08X}",
+                  n, a, b, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821BDDE8(ctx, base);
 }
 
 // Session 75j: insert linker called from texture ctor 82185648.
