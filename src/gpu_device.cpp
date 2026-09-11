@@ -2608,3 +2608,21 @@ PPC_FUNC(sub_821CC570) {
                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r3.u32,
                   static_cast<uint32_t>(ctx.lr));
 }
+
+// Session 75t: read-wrapper census. The executor's refill loop calls
+// vtable+28 = sub_821CC6F0 per refill; if the page-cache copy smashes the
+// executor stack, r1 flips bad across this call.
+PPC_FUNC_IMPL(__imp__sub_821CC6F0);
+static std::atomic<uint32_t> s_hCC6F0{0};
+PPC_FUNC(sub_821CC6F0) {
+  const uint32_t n = s_hCC6F0.fetch_add(1) + 1;
+  const uint32_t r1in = ctx.r1.u32;
+  __imp__sub_821CC6F0(ctx, base);
+  const bool saneIn = r1in < 0x82130000u;
+  const bool saneOut = ctx.r1.u32 < 0x82130000u;
+  if ((!saneIn || !saneOut) || n <= 8 || (n % 500) == 0)
+    MCLA_LOG_WARN("READWRAP sub_821CC6F0 #{} r1in={:08X}{} r1out={:08X}{} "
+                  "lr={:08X}",
+                  n, r1in, saneIn ? "" : "!", ctx.r1.u32,
+                  saneOut ? "" : "!", static_cast<uint32_t>(ctx.lr));
+}
