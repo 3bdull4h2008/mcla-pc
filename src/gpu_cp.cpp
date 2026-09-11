@@ -1171,6 +1171,27 @@ void CpVblankDrainToWptr() {
       MCLA_LOG_INFO("GATE-PROBE #{:04X} [828309A0]={:08X} [A4]={:08X} "
                     "[A8]={:08X} [9C]={:08X} IOCREDITS[827D74E0]={:08X}",
                     vdN, flag, g2, g3, g1, ioCredits);
+      // Session 75q: dump the first join-table entries — entry+8 is the
+      // stream object whose vtable+28 read returns 0 for batch-2 streams.
+      uint32_t jcount = 0, jentries = 0;
+      memP.ReadU32BE(0x8283D1A8u, &jcount);
+      memP.ReadU32BE(0x8283D1C4u, &jentries);
+      if (jentries != 0 && jcount != 0) {
+        for (uint32_t ji = 0; ji < 6 && ji < jcount; ++ji) {
+          uint32_t eBase = jentries + ji * 28u;
+          uint32_t key = 0, obj = 0, busy = 0, vt = 0, rd = 0;
+          memP.ReadU32BE(eBase + 0, &key);
+          memP.ReadU32BE(eBase + 8, &obj);
+          memP.ReadU32BE(eBase + 12, &busy);
+          if (obj != 0) {
+            memP.ReadU32BE(obj, &vt);
+            if (vt != 0) memP.ReadU32BE(vt + 28, &rd);
+          }
+          MCLA_LOG_INFO("JOIN[{}] @ {:08X} key={:08X} obj={:08X} busy={:08X} "
+                        "vt={:08X} readFn={:08X}",
+                        ji, eBase, key, obj, busy, vt, rd);
+        }
+      }
     }
   }
   // Deferred-consumption experiment: credit submitted-but-unconsumed

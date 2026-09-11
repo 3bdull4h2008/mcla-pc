@@ -2098,22 +2098,52 @@ PPC_FUNC(sub_821D5E10) {
     if (inPtr != 0 && outPtr != 0 && outLeft != 0 &&
         retries < 200 /* ~20s at 100ms pacing */) {
       retries++;
-      if (retries == 1 || (retries % 50) == 0) {
-        uint32_t credits = 0, obj = 0, vt = 0, rd = 0;
+      if (retries == 1) {
+        uint32_t credits = 0;
         (void)mem.ReadU32BE(0x827D74E0u, &credits);
-        // r28 (callee-saved, live at this call) = executor stream context;
-        // [ctx+8] = source stream object, [obj+0] = vtable, [vt+28] = read.
-        (void)mem.ReadU32BE(ctx.r28.u32 + 8, &obj);
-        if (obj != 0) {
-          (void)mem.ReadU32BE(obj, &vt);
-          if (vt != 0) (void)mem.ReadU32BE(vt + 28, &rd);
-        }
         MCLA_LOG_WARN("INFLATE-PENDING #{} st={:08X} in=0 produced={} "
-                      "outPtr={:08X} outLeft={} retries={} credits={:08X} "
-                      "srcObj={:08X} vt={:08X} readFn={:08X} "
+                      "outPtr={:08X} outLeft={} retries=1 credits={:08X} "
                       "(awaiting async refill — state untouched)",
-                      n, st, produced, outPtr, outLeft, retries, credits, obj,
-                      vt, rd);
+                      n, st, produced, outPtr, outLeft, retries, credits);
+        // Session 75q: dump the join table — entry+8 = the source stream
+        // object whose vtable+28 read returns 0 for this batch.
+        uint32_t jcount = 0, jentries = 0;
+        mem.ReadU32BE(0x8283D1A8u, &jcount);
+        mem.ReadU32BE(0x8283D1C4u, &jentries);
+        if (jentries != 0 && jcount != 0) {
+          for (uint32_t ji = 0; ji < 8 && ji < jcount; ++ji) {
+            uint32_t eBase = jentries + ji * 28u;
+            uint32_t key = 0, obj = 0, busy = 0, vt = 0, rd = 0;
+            mem.ReadU32BE(eBase + 0, &key);
+            mem.ReadU32BE(eBase + 8, &obj);
+            mem.ReadU32BE(eBase + 12, &busy);
+            if (obj != 0 && obj != 0xCDCDCDCDu) {
+              mem.ReadU32BE(obj, &vt);
+              if (vt != 0) mem.ReadU32BE(vt + 28, &rd);
+              // 75q: the readFn is a wrapper over [obj+32] — dump the
+              // wrapper fields (position/size candidates) + the inner
+              // stream's vtable and read slot.
+              uint32_t f[8] = {0}, inner = 0, ivt = 0, ird = 0;
+              for (int fi = 0; fi < 8; ++fi)
+                mem.ReadU32BE(obj + 4u * fi, &f[fi]);
+              mem.ReadU32BE(obj + 32, &inner);
+              if (inner != 0 && inner != 0xCDCDCDCDu) {
+                mem.ReadU32BE(inner, &ivt);
+                if (ivt != 0) mem.ReadU32BE(ivt + 28, &ird);
+              }
+              MCLA_LOG_WARN("JOIN[{}] key={:08X} obj={:08X} vt={:08X} "
+                            "rd={:08X} objf=[{:08X} {:08X} {:08X} {:08X} "
+                            "{:08X} {:08X} {:08X} {:08X}] inner={:08X} "
+                            "ivt={:08X} ird={:08X}",
+                            ji, key, obj, vt, rd, f[0], f[1], f[2], f[3],
+                            f[4], f[5], f[6], f[7], inner, ivt, ird);
+              continue;
+            }
+            MCLA_LOG_WARN("JOIN[{}] @ {:08X} key={:08X} obj={:08X} "
+                          "busy={:08X} vt={:08X} readFn={:08X}",
+                          ji, eBase, key, obj, busy, vt, rd);
+          }
+        }
       }
       return;
     }
