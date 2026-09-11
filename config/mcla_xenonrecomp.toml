@@ -55,3 +55,39 @@ size = 0x80
 [[main.functions]]
 address = 0x821DEE40
 size = 0x17A0
+
+
+# ---- Session 75: missing VMX128 vpkd3d128 type-2 (SH=2 MB=1 ME=0) packs.
+# Host impl: src/vmx128_pack.cpp (mcla_Vpkd3d128_type2).
+# jump_address = trap+4 skips the __builtin_debugtrap() the recompiler emits
+# for this mode. Same host function is reused at all 4 sites.
+# Semantics: Xenia PACK_TYPE_UINT_2101010 (IEEE-bits-near-3.0, not raw floats).
+# Plan: docs/PLAN_VMX128.md §2.1 / §4 Route A.
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B3814
+registers = ["v63", "v0"]
+after_instruction = false
+jump_address = 0x821B3818
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B3C2C
+registers = ["v54", "v0"]
+after_instruction = false
+jump_address = 0x821B3C30
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B3E90
+registers = ["v63", "v0"]
+after_instruction = false
+jump_address = 0x821B3E94
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B4788
+registers = ["v52", "v0"]
+after_instruction = false
+jump_address = 0x821B478C

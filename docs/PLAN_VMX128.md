@@ -1,8 +1,13 @@
 # PLAN — implement the missing VMX128 D3D pack/unpack ops
 
-**Status:** PLANNING ONLY. Nothing in this document has been executed.
-**Author:** session 74 (2026-09-11). Read `docs/HANDOFF_NEXT_AGENT.md` §SESSION 74 first.
-**Blocks:** handoff priority #1 (boot dies on host `int3`) and #2 (`DRAW_INDEXED`=0).
+**Status (session 75):** Stage 1 DONE. Type-2 pack implemented via Route A
+(midasm hooks + `src/vmx128_pack.cpp`). Semantics corrected (3.0 IEEE-bits,
+not raw floats). Regen is near-reproducible (181/183; keep hand safety
+patch in `ppc_recomp.10.cpp` `sub_8218CC70`). No `0x80000003` in 180s soak.
+`VMX128-PACK` counter has not yet fired — path not reached this session.
+**Author:** session 74/75. Read `docs/HANDOFF_NEXT_AGENT.md` §SESSION 75 first.
+**Blocks:** handoff priority #1 (boot dies on host `int3`) is closed;
+priority #2 (`DRAW_INDEXED`=0) remains.
 
 ---
 

@@ -1,8 +1,84 @@
 # HANDOFF — next agent, read this first
 
-**Date:** 2026-09-11 (session 74 addendum)  
+**Date:** 2026-09-11 (session 75)  
 **Goal:** Midnight Club LA native D3D12 renderer — working game with visible frames.  
 **Repo:** `E:\mcla pc` (do not delete; overlay notes in `audit-clean/`).
+
+---
+
+## SESSION 75 — VMX128 TYPE-2 PACK LANDED (trap no longer kills boot)
+
+### What was implemented (Route A, plan `docs/PLAN_VMX128.md`)
+
+`vpkd3d128` SH=2 MB=1 ME=0 (PACK_TYPE_UINT_2101010) is now handled by
+midasm hooks + a host function, not by XenonRecomp's `__builtin_debugtrap()`.
+
+| Piece | Where |
+|---|---|
+| TOML hooks (4 sites) | `config/mcla_xenonrecomp.toml` `[[midasm_hook]]` @ `0x821B3814`, `0x821B3C2C`, `0x821B3E90`, `0x821B4788` |
+| Host impl | `src/vmx128_pack.cpp` `mcla_Vpkd3d128_type2` |
+| CMake | `CMakeLists.txt` adds `src/vmx128_pack.cpp` |
+| Reconstructed header | `src/ppc_context.h` (`tail -n +4` recipe, roundtrip `cmp`-clean) |
+
+**Semantics (corrected from plan §2.1).** Type 2 does **not** take raw
+[-1,1] floats. The guest pre-biases into the IEEE bits of a value near 3.0
+(constant vectors at `0x820100F0` = `{3,3,3,3}` and `0x82010100` =
+`{-2^-13,-2^-13,-2^-13,-3*2^-22}`; `vnmsubfp v0,v12,v13,v0`). Xenia's
+`EmitUINT_2101010` clamps those bits to
+`[0x403FFE01, 0x404001FF]` (XYZ) / `[0x40400000, 0x40400003]` (W) and ANDs
+with `0x3FF` / `0x3`. Host lane order is reversed (D3DCOLOR convention):
+`host.f32[0]=W, [1]=Z, [2]=Y, [3]=X`. Consumer after the trap
+(`stvx128` + `lwz 156(r1)` through `VectorMaskL`) reads **`vD.u32[0]`** —
+ME=0 write is sufficient.
+
+**Emitted shape** (verified in `build/xr_hooks/ppc_recomp.14.cpp`):
+```
+mcla_Vpkd3d128_type2(v63, ctx.v0);
+goto loc_821B3818;          // skips the dead __builtin_debugtrap()
+```
+
+### Regen reproducibility (plan §4 Route B step 3 — DONE)
+
+Unmodified tool `.research/XenonRecomp/build-clang/XenonRecomp/XenonRecomp.exe`,
+bare config filename from repo root, header `src/ppc_context.h`:
+- **181/183** files byte-identical to `generated/ppc_xenon/`.
+- `ppc_context.h`: trailing newline only.
+- `ppc_recomp.10.cpp`: **hand safety patch inside `sub_8218CC70`**
+  (indirect-branch targetFn/basePtr validation) that the recompiler does
+  not emit. **Do not full-replace that file** or the session-38 null-dispatch
+  AV returns.
+
+Surgical install used: regen with hooks into `build/xr_hooks`, copy **only**
+`ppc_recomp.14.cpp` over `generated/ppc_xenon/`. Everything else untouched.
+
+### Soak evidence (session 75)
+
+| Run | Result |
+|---|---|
+| `boot_stdout_vmx1.log` | exit ~35s on **new** early fatal `Resource '%s': %s` `legals/legals` (poison family B, lr=`825EF1DC`). **Not deterministic.** |
+| `boot_stdout_vmx2.log` | 90s soak, still running when killed. FRAME-END=3 NATIVE-PRESENT=4 SWAP-COMP=9. **No `0x80000003`.** |
+| `boot_stdout_vmx3.log` | 180s soak, still running. Same present counts. DRAW_INDEXED=0. No VMX128 trap. |
+
+**Gate: no `0x80000003` in any session-75 soak.** The session-74 terminal
+event is gone.
+
+**NOT yet proven executed:** `VMX128-PACK` counter stayed 0 — the
+vertex-fetch format-10 path was never reached. Hypothesis: in the session-74
+guard run that trap was reached *because* of the fmtEnum=0 blit overrun
+chain; with `BLIT-OOB-GUARD`=0 this run never enters that path. The hooks
+are in the binary and will fire when it does. Do not claim the pack is
+runtime-validated until a soak contains a `VMX128-PACK` line.
+
+### Still open after this session
+
+1. **`DRAW_INDEXED`=0** — still the real frontier. SUBMIT r5 empty; likely
+   gated on loaders actually initializing surfaces (CDCDCDCD → use-sites).
+2. **Poison family B** — `legals/legals` fatal at `825EF1DC` (soak1). Same
+   class as meshtextures; `P5-MISSFIX` logs but does not skip this site.
+3. **Type-2 unpack / type-5 unpack / vcmpbfp128** — still unimplemented;
+   only needed if those paths are reached.
+4. Continuous present soak past 4 — SWAP-COMP=9 matches the s74 baseline;
+   not independently re-verified for more presents.
 
 ---
 
