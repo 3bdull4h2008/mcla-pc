@@ -8,7 +8,7 @@
 
 native d3d12 renderer rebuild for midnight club LA
 
-the recompiled ppc game code keeps running untouched, we capture render intent at the high level draw boundary n replay it as real d3d12 instead of letting the xenos command processor handle the gpu. legacy mode stays default until every gate passes.
+the recompiled ppc game code keeps running untouched, we capture render intent at the high level draw boundary and replay it as real d3d12 instead of letting the xenos command processor handle the gpu. legacy mode stays default until every gate passes.
 
 **not rexglue based.** no emulation layer, no sdk wrapper. the game recompiles to native c++ and runs as native code on your pc. this means native performance, not the overhead you get from rexglue's translation layer.
 
@@ -57,7 +57,7 @@ open a pr or open an issue. dont be shy.
 
 ## legal
 
-zero game code or assets live in this repo. u bring ur own legally dumped copy of midnight club la (xbox 360) n the toolchain consumes that. nothing from the disc is hosted or distributed here, same rules xenia n unleashedrecomp play by.
+zero game code or assets live in this repo. bring your own legally dumped copy of midnight club la (xbox 360) and the toolchain consumes that. nothing from the disc is hosted or distributed here, same rules xenia and unleashedrecomp play by.
 
 ## credits / influence
 
