@@ -90,6 +90,20 @@ generated TUs are the decompiled game code (never edit `generated/`).
 loads. Next: find which RPF entries / which caller should produce
 `pgDictionary<grcTexture>` with a name table.
 
+### Empty-dict factory vs real loader (session 75i)
+
+| Addr | Role | Mapped? | Soak |
+|---|---|---|---|
+| `sub_8218BF20` | **zeros** dict fields then `8218B000` register | yes | runs (via 8218B000) |
+| `sub_82216B98` | refs `$/resources/ui/textures/streamables` + `$/textures/blank` | **no** | — |
+| `sub_821FD6B0` | mapped caller of 82216B98 | yes | **STREAMTEX ×0** |
+| `sub_8233DE48` | refs `textures/global/cars/globaltex` | **no** | — |
+| `sub_82185468` | named INSERT → `0x82839E2C` | no | TEXINSERT ×0 |
+
+So what registers is an **empty-shell factory**, not an RSC load. The
+streamables/globaltex loaders never run (or are only reached via unmapped
+code). INSERT still dead.
+
 ---
 
 ## SESSION 75E — IDA MCP UP; DICTIONARY REGISTER RUNS BUT LOOKUPS STILL MISS

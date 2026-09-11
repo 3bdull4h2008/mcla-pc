@@ -977,6 +977,22 @@ PPC_FUNC(sub_8244FF20) {
   }
 }
 
+// Session 75i: UI streamables / blank-texture loader caller.
+// 82216B98 refs "$/resources/ui/textures/streamables" and "$/textures/blank".
+// Not in func map; 821FD6B0 is a mapped caller.
+PPC_FUNC_IMPL(__imp__sub_821FD6B0);
+static std::atomic<uint32_t> s_h1FD6B0{0};
+PPC_FUNC(sub_821FD6B0) {
+  const uint32_t n = s_h1FD6B0.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("STREAMTEX-census sub_821FD6B0 #{} r3={:08X} r4={:08X} "
+                  "r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821FD6B0(ctx, base);
+}
+
 // ---------------------------------------------------------------------------
 // P4' CAPTURE: PresentKick frame boundary. sub_824294E0 = raw kick
 // (r3=dev, r4=fbAddr); sub_82429570 = vsync-aware flip picker (backbuffer
