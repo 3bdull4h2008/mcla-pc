@@ -18,7 +18,7 @@ frames on your GPU. It does **not** draw the actual 3D world yet.
 
 **What's still broken (in order):**
 1. **Textures never finish loading.** The game opens "texture dictionaries"
-   (packs of named images) but the packs are empty. Every lookup like
+   (packs of named images) but never *fills* them. Every lookup like
    `"car_paint"` misses and falls back to a dummy 32×32 texture with no ID.
    That's the `0xCDCDCDCD` spam in the logs.
 2. Because assets never finish, the game **stays on loading screens** and
@@ -26,15 +26,18 @@ frames on your GPU. It does **not** draw the actual 3D world yet.
 3. Only dummy HUD draws run (`sub_8217B7B0`). The real draw path
    (`82227428` with type `0x20000000`) never fires.
 
-**What to work on next:** Find the function that fills a loaded texture
-dictionary with names + image objects after decompress. Register already
-runs (`TEXDICT-CALLER` ×10); contents are empty.
+**What to work on next:** Make named-texture INSERT run.
+- Insert = `sub_82185468` → hash table `0x82839E2C`
+- `sub_82185A40` reads `globaltex.list` (file **exists** on disk, 575 bytes)
+  and inserts each name — **not in the function map**, so no `PPC_FUNC` hook
+- Mapped insert caller `sub_821FB1C8` census: **0 hits** in soak
+- Register (`TEXDICT-CALLER`) already runs ×10 — containers exist, contents empty
 
 **How to run / check:**
 ```bat
 ninja_build.bat
 build\mcla.exe
-:: logs in boot_stdout_*.log — look for TEXDICT, REBASE-POISON, DRAW_INDEXED
+:: logs in boot_stdout_*.log — look for TEXINSERT, TEXDICT, REBASE-POISON, DRAW_INDEXED
 ```
 **RE tools:** IDA MCP on `127.0.0.1:8745` (preferred) · Ghidra on `:8089` ·
 generated TUs are the decompiled game code (never edit `generated/`).

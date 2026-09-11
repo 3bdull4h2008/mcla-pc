@@ -904,6 +904,21 @@ PPC_FUNC(sub_8218B000) {
   __imp__sub_8218B000(ctx, base);
 }
 
+// Session 75f (IDA): named-registry INSERT callers.
+// sub_82185468 is the hash-table insert into 0x82839E2C. Mapped caller.
+PPC_FUNC_IMPL(__imp__sub_821FB1C8);
+static std::atomic<uint32_t> s_h1FB1C8{0};
+PPC_FUNC(sub_821FB1C8) {
+  const uint32_t n = s_h1FB1C8.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("TEXINSERT-CALLER sub_821FB1C8 #{} r3={:08X} r4={:08X} "
+                  "r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821FB1C8(ctx, base);
+}
+
 // ---------------------------------------------------------------------------
 // P4' CAPTURE: PresentKick frame boundary. sub_824294E0 = raw kick
 // (r3=dev, r4=fbAddr); sub_82429570 = vsync-aware flip picker (backbuffer
