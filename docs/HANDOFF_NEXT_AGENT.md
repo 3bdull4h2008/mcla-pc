@@ -309,13 +309,20 @@ The rest are boot-life support until `CDCDCDCD` is killed.
 ## Next steps (priority order — updated session 74)
 
 ### 1. Unimplemented VMX128 ops (THE remaining blocker)
+> **A full execution plan is written and ready: [`docs/PLAN_VMX128.md`](PLAN_VMX128.md).**
+> It resolves the instruction semantics (against Xenia), censuses every trap
+> site, ranks three implementation routes and lays out staged soak gates.
+> Start there — do not re-derive the semantics.
+
 The guest dies on a host `int3` from `__builtin_debugtrap()`. Full census,
 field layout, trap address and the three route options (patch-and-regen vs
-host override) are in **SESSION 74** above. Start with `vupkd3d128 SH=5`
-(94 sites, almost certainly float16_4 unpack — the counterpart of the
-already-implemented `vpkd3d128 SH=5` float16_4 pack), then `vpkd3d128 SH=2`
-(the one that actually kills the current boot, at `0x821B3814`).
-**Prove regen reproducibility before regenerating.**
+midasm-hook vs host override) are in **SESSION 74** above and in the plan. Semantics are now **confirmed**, not conjectural: the mode selector is
+`type = IMM >> 2`, so `vpkd3d128 SH=2` is a **2_10_10_10 pack** and
+`vupkd3d128 UIMM=20` is a **FLOAT16_4 unpack**. Fix order is
+`vpkd3d128 SH=2` first (4 sites — this is what actually kills the boot, at
+`0x821B3814`), then re-triage; only reach for the 94 FLOAT16_4 sites if the
+boot gets as far as `0x822Fxxxx`.
+**Prove regen reproducibility before regenerating** (plan §4 Route B step 3).
 
 ### 2. Real draws (P5')
 - `SUBMIT-census sub_82420BA8` has `r5=0` (VB/IB empty). Find who fills
