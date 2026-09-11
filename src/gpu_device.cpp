@@ -2262,12 +2262,44 @@ PPC_FUNC(sub_821BC868) {
     const bool okP = mem.ReadU32BE(q + 0x6164, &pIdx);
     const bool okC = mem.ReadU32BE(q + 0x6168, &cnt);
     const bool okR = mem.ReadU32BE(q + 0x616C, &relH);
+    // Session 75o: walk the guest stack to name the boot requester above
+    // the push wrapper. Recompiler convention saves LR at [back-8]; plain
+    // ABI frames save it at [back+4] — try both, log both.
+    char chain[160] = {0};
+    size_t off = 0;
+    uint32_t sp = ctx.r1.u32;
+    for (int f = 0; f < 5 && sp != 0 && off + 16 < sizeof(chain); ++f) {
+      uint32_t back = 0, lrA = 0, lrB = 0;
+      if (!mem.ReadU32BE(sp, &back) || back == 0 || back <= sp) break;
+      (void)mem.ReadU32BE(back - 8, &lrA);
+      (void)mem.ReadU32BE(back + 4, &lrB);
+      off += static_cast<size_t>(snprintf(chain + off, sizeof(chain) - off,
+                                          " f%d=%08X/%08X", f, lrA, lrB));
+      sp = back;
+    }
     MCLA_LOG_INFO(
         "PUSH sub_821BC868 #{} q={:08X} wIdx={}{} pIdx={}{} cnt={}{} "
-        "relH={:08X}{} lr={:08X}",
+        "relH={:08X}{} lr={:08X} chain[{}]",
         n, q, wIdx, okW ? "" : "?", pIdx, okP ? "" : "?", cnt, okC ? "" : "?",
-        relH, okR ? "" : "?", ctx.lr);
+        relH, okR ? "" : "?", ctx.lr, chain);
   }
+}
+
+// Session 75o: completion dispatcher census. The transfer executor
+// (sub_821BC140) tail calls sub_821C31B8(slot+1544, slot+8, slot+1552,
+// slot+1548) when slot+1540 != 0 — the per-transfer completion, which then
+// issues a virtual call (vtable+88). If this never runs after the 3 boot
+// transfers, the init sequence never advances.
+PPC_FUNC_IMPL(__imp__sub_821C31B8);
+static std::atomic<uint32_t> s_hC31B8{0};
+PPC_FUNC(sub_821C31B8) {
+  const uint32_t n = s_hC31B8.fetch_add(1) + 1;
+  if (n <= 16 || (n % 500) == 0)
+    MCLA_LOG_INFO("COMPLETE sub_821C31B8 #{} a0={:08X} a1={:08X} a2={:08X} "
+                  "a3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821C31B8(ctx, base);
 }
 
 // RELEASE-HANDLE census (session 72): sub_821C9108(h) → sub_8244ED10(h,1,0).
@@ -2357,4 +2389,50 @@ PPC_FUNC(sub_82412F98) {
         dev, tlsBlock, tlsCp, tlsFence);
   }
   ctx.r3.u64 = 0; // return 0 = "fence satisfied, proceed"
+}
+
+// Session 75o: THE request entry census. sub_821E5F48 is called by 31
+// subsystems (incl. streamables loader 82216B98, UI-adjacent 82201B30) to
+// push a load request + create a task join. Log every request with its
+// caller so a soak shows who requested the boot batch and whether anyone
+// ever requests again.
+PPC_FUNC_IMPL(__imp__sub_821E5F48);
+static std::atomic<uint32_t> s_h5F48{0};
+PPC_FUNC(sub_821E5F48) {
+  const uint32_t n = s_h5F48.fetch_add(1) + 1;
+  if (n <= 48 || (n % 200) == 0)
+    MCLA_LOG_INFO("REQ sub_821E5F48 #{} a0={:08X} a1={:08X} a2={:08X} "
+                  "a3={:08X} a4={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  ctx.r7.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821E5F48(ctx, base);
+}
+
+// Session 75o: async-request wrapper census + dispatcher hunt. Boot loads
+// arrive here via message 0x40003803 (table entry 0x821071B0). Walk the
+// stack (both LR-slot conventions) to identify the message dispatcher.
+PPC_FUNC_IMPL(__imp__sub_821E5FD0);
+static std::atomic<uint32_t> s_h5FD0{0};
+PPC_FUNC(sub_821E5FD0) {
+  const uint32_t n = s_h5FD0.fetch_add(1) + 1;
+  if (n <= 12 || (n % 200) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    char chain[160] = {0};
+    size_t off = 0;
+    uint32_t sp = ctx.r1.u32;
+    for (int f = 0; f < 6 && sp != 0 && off + 16 < sizeof(chain); ++f) {
+      uint32_t back = 0, lrA = 0, lrB = 0;
+      if (!mem.ReadU32BE(sp, &back) || back == 0 || back <= sp) break;
+      (void)mem.ReadU32BE(back - 8, &lrA);
+      (void)mem.ReadU32BE(back + 4, &lrB);
+      off += static_cast<size_t>(snprintf(chain + off, sizeof(chain) - off,
+                                          " f%d=%08X/%08X", f, lrA, lrB));
+      sp = back;
+    }
+    MCLA_LOG_INFO("ASYNC-REQ sub_821E5FD0 #{} a0={:08X} a1={:08X} "
+                  "a2={:08X} a3={:08X} lr={:08X} chain[{}]",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  static_cast<uint32_t>(ctx.lr), chain);
+  }
+  __imp__sub_821E5FD0(ctx, base);
 }
