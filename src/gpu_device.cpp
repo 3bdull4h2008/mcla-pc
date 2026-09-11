@@ -1015,6 +1015,56 @@ PPC_FUNC(sub_822012E8) {
   __imp__sub_822012E8(ctx, base);
 }
 
+// Session 75j: the empty-dict factory itself (mapped). Requesters 8218D120/
+// 8218CB10 never run — this is reached via indirect/vtable from unmapped code.
+PPC_FUNC_IMPL(__imp__sub_8218BF20);
+static std::atomic<uint32_t> s_h18BF20{0};
+PPC_FUNC(sub_8218BF20) {
+  const uint32_t n = s_h18BF20.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("DICTFACT-census sub_8218BF20 #{} r3={:08X} r4={:08X} "
+                  "r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8218BF20(ctx, base);
+}
+
+// Session 75j: insert linker called from texture ctor 82185648.
+PPC_FUNC_IMPL(__imp__sub_821854C8);
+static std::atomic<uint32_t> s_h1854C8{0};
+PPC_FUNC(sub_821854C8) {
+  const uint32_t n = s_h1854C8.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("TEXINSERT2-census sub_821854C8 #{} r3={:08X} r4={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821854C8(ctx, base);
+}
+
+// Session 75j: requesters into the empty-dict factory (8218BEB0→8218BF20).
+PPC_FUNC_IMPL(__imp__sub_8218D120);
+static std::atomic<uint32_t> s_h18D120{0};
+PPC_FUNC(sub_8218D120) {
+  const uint32_t n = s_h18D120.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("DICTREQ-census sub_8218D120 #{} r3={:08X} r4={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8218D120(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8218CB10);
+static std::atomic<uint32_t> s_h18CB10{0};
+PPC_FUNC(sub_8218CB10) {
+  const uint32_t n = s_h18CB10.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("DICTREQ2-census sub_8218CB10 #{} r3={:08X} r4={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8218CB10(ctx, base);
+}
+
 // ---------------------------------------------------------------------------
 // P4' CAPTURE: PresentKick frame boundary. sub_824294E0 = raw kick
 // (r3=dev, r4=fbAddr); sub_82429570 = vsync-aware flip picker (backbuffer

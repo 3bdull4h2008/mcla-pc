@@ -1,6 +1,6 @@
 # HANDOFF — next agent, read this first
 
-**Date:** 2026-09-11 (session 75e — IDA MCP)  
+**Date:** 2026-09-11 (session 75j — continuous RE)  
 **Goal:** Midnight Club LA native D3D12 renderer — working game with visible frames.  
 **Repo:** `E:\mcla pc` (do not delete; overlay notes in `audit-clean/`).
 
@@ -8,36 +8,28 @@
 
 ## PLAIN STATUS (vibe-coder summary)
 
-**Where we are:** The game boots, shows loading screens, and can present
-frames on your GPU. It does **not** draw the actual 3D world yet.
+**Where we are:** Game boots, loading screens present on GPU. **No 3D world.**
 
-**What got fixed this week:**
-1. A crash that killed the process on a missing CPU vector instruction
-   (`vpkd3d128`) — implemented, trap is gone.
-2. Heap corruption storm from a bad blit — already closed last session.
+**Fixed this week:** VMX128 int3 crash · blit heap storm (prior).
 
-**What's still broken (in order):**
-1. **Textures never finish loading.** The game opens "texture dictionaries"
-   (packs of named images) but never *fills* them. Every lookup like
-   `"car_paint"` misses and falls back to a dummy 32×32 texture with no ID.
-   That's the `0xCDCDCDCD` spam in the logs.
-2. Because assets never finish, the game **stays on loading screens** and
-   never binds vertex buffers → `DRAW_INDEXED` stays 0 → no world geometry.
-3. Only dummy HUD draws run (`sub_8217B7B0`). The real draw path
-   (`82227428` with type `0x20000000`) never fires.
+**Still broken:**
+1. Texture packs register **empty**; named INSERT never runs → `CDCDCDCD`
+2. Stay on loading screens → no vertex bind → `DRAW_INDEXED=0`
+3. Real draw dispatcher `82227428` never sees type `0x20000000`
 
-**What to work on next:** Named-texture INSERT never runs.
-- Insert = `sub_82185468` → hash `0x82839E2C`
-- `globaltex.list` exists on disk (cars, 575 bytes) but preload
-  (`82185A40`) is **not a recompiled entry** — IDA put it inside
-  `sub_82185648`, but the TU has no `loc_82185A40` label (not a branch
-  target). That whole file-preload path is unreachable from compiled code.
-- `sub_82185648` **does** run (TEXLOAD ×3) but only as individual creates:
-  `"Not Implemented"`, `"uiOverlay"`, `"uiOverlayDepth"` — not the bulk list.
-- Dictionary objects after register (`TEXDICT-OBJ` dump) are **empty shells**
-  (`[0,0,0,1,0,0,0,0]` etc). Some later ones have a small linked pointer.
-- So: containers open, contents never filled. Next is the `.xtd` / RSC
-  parse that should write the name table into the dict before register.
+**Pipeline map (session 75h–j):**
+```text
+Empty factory 8218BF20     RUNS  → empty dicts
+Real loaders 82216B98      DEAD  (streamables/globaltex; unmapped)
+Mapped UI parents          DEAD  (STREAMTEX/UILOAD x0)
+XMem LZX 8244FF20          WORKS (14x ret=0; not texture dicts)
+Named INSERT 82185468      DEAD  (TEXINSERT x0)
+```
+
+**Next:** census factory requesters `8218D120` / `8218CB10`; find gate that
+should trigger streamables load.
+
+**Tools:** IDA `:8745` · Ghidra `:8089` · `docs/MCLA_RPF3_Technical_Reference.txt`
 
 ### RSC5 / XCompress layout (session 75g addendum)
 
@@ -108,6 +100,23 @@ Callers of the factory (`8218BEB0` → `8218BF20`): mapped
 `8218C3F8` (unmapped), `8218CB10` (task ENQ family), `8218D120`.
 Census `8218D120` / `8218CB10` next — those are the request side.
 UI streamables parents `821FD640` / `822012E8` also **STREAMTEX/UILOAD ×0**.
+
+### Session 75j soak (`boot_stdout_ins2.log`)
+
+| Marker | Hits | Notes |
+|---|---|---|
+| `DICTFACT` `8218BF20` | 18 | factory via `lr=8218C614` in `sub_8218C1C0` / `sub_8218C760` |
+| `DICTREQ` `8218D120`/`8218CB10` | **0** | those mapped requesters never run |
+| `TEXINSERT2` `821854C8` | **5** | insert **works** when ctor `82185648` runs |
+| Names inserted | `"Not Implemented"`, `"uiOverlay"`, `"uiOverlayDepth"` + 2 GPU-ptr "names" | only 3 real names |
+| `STREAMTEX`/`UILOAD` | 0 | bulk loaders still dead |
+| `REBASE-POISON` | 32 | everything else still misses |
+
+**Insert is not broken.** Only three named textures are ever constructed.
+`82185648` ctor → `821854C8` insert is the working path. Need the bulk
+streamables/globaltex loaders (or more `82185648` calls) to fire.
+
+Factory parent: `sub_8218C760` (mapped) → `sub_8218C1C0` → `8218BF20`.
 
 ---
 
