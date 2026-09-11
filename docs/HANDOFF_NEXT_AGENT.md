@@ -39,6 +39,24 @@ frames on your GPU. It does **not** draw the actual 3D world yet.
 - So: containers open, contents never filled. Next is the `.xtd` / RSC
   parse that should write the name table into the dict before register.
 
+### RSC5 / XCompress layout (session 75g addendum)
+
+Sample `vnyl_tears_05.xtd` (1227 bytes):
+```
+0000: 05 43 53 52          version 5 + "CSR"  (= RSC5)
+0004: 00 00 00 09 c8 08 00 10
+000c: 0f f5 12 ef          XCompress magic 0x0FF512EF
+```
+XCompress payload starts at **+0xC**. The inflate caller already does
+`inLeft = bytesRead - 12` (header skip). INFLATE #1 sees real magic and
+passes through. After a small file is consumed, the next refill returns 0
+→ `inLeft = -12` → we INFLATE-SKIP (that part is EOF, not a format bug).
+
+`.xtd` files are **never opened by path** in soak — only RPF packfiles
+(`xarchive_audlo.rpf`, `xarchive_cache.rpf`). Texture data comes from
+inside those archives. Empty dicts are whatever `8218B000` registers,
+not necessarily a finished `.xtd` load.
+
 **How to run / check:**
 ```bat
 ninja_build.bat
