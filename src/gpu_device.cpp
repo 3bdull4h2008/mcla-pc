@@ -947,6 +947,36 @@ PPC_FUNC(sub_82185648) {
   __imp__sub_82185648(ctx, base);
 }
 
+// Session 75h: XMemDecompress (RPF3 LZX) — the real unsquish for archive
+// entries. Doc: docs/MCLA_RPF3_Technical_Reference.txt §8.
+// 8244FF20 = XMemDecompress dispatcher (codec must be 1/LZX).
+// 82460420 = maps inner result to HRESULT.
+PPC_FUNC_IMPL(__imp__sub_8244FF20);
+static std::atomic<uint32_t> s_h44FF20{0};
+PPC_FUNC(sub_8244FF20) {
+  const uint32_t n = s_h44FF20.fetch_add(1) + 1;
+  const uint32_t ctxp = ctx.r3.u32;
+  const uint32_t dest = ctx.r4.u32;
+  const uint32_t destSz = ctx.r5.u32;
+  const uint32_t src = ctx.r6.u32;
+  const uint32_t srcSz = ctx.r7.u32;
+  __imp__sub_8244FF20(ctx, base);
+  const uint32_t ret = ctx.r3.u32;
+  if (n <= 16 || (n % 100) == 0) {
+    MCLA_LOG_INFO("XMEM #{} ctx={:08X} dest={:08X} destSz={} src={:08X} "
+                  "srcSz={} ret={:08X} lr={:08X}",
+                  n, ctxp, dest, destSz, src, srcSz, ret,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  if (n <= 6 && ret == 0 && dest != 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t head = 0;
+    if (mem.IsValid(dest, 4))
+      (void)mem.ReadU32BE(dest, &head);
+    MCLA_LOG_INFO("XMEM-OUT #{} dest={:08X} head={:08X}", n, dest, head);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // P4' CAPTURE: PresentKick frame boundary. sub_824294E0 = raw kick
 // (r3=dev, r4=fbAddr); sub_82429570 = vsync-aware flip picker (backbuffer

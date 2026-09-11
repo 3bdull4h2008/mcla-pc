@@ -77,6 +77,19 @@ generated TUs are the decompiled game code (never edit `generated/`).
 - Our `zlibInflater` (`sub_821D5E10`) hook is a **different** path from
   RPF XMem — do not conflate them.
 
+### XMem census (session 75h, `boot_stdout_xmem2.log`)
+
+| Marker | Hits | Meaning |
+|---|---|---|
+| `XMEM #` `sub_8244FF20` | **14**, all `ret=0` | LZX decompress **succeeds** |
+| Caller | `lr=821D5EBC` (inside `InflateBegin`) | same path we already pass through when magic is XCompress |
+| `XMEM-OUT` heads | `44365500`, `00019249`, … | **not** RSC5 (`05435352`) — these blobs are not texture dicts |
+| `TEXINSERT` | 0 | named registry still never filled |
+
+**Unsquish works.** The successful XMem calls are not the texture-dictionary
+loads. Next: find which RPF entries / which caller should produce
+`pgDictionary<grcTexture>` with a name table.
+
 ---
 
 ## SESSION 75E — IDA MCP UP; DICTIONARY REGISTER RUNS BUT LOOKUPS STILL MISS
