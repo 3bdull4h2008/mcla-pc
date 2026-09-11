@@ -6,90 +6,58 @@
 /build-standalone/
 
 # ── Derived / regenerable ───────────────────────────────────
-# Recompilation output (never editable; regenerated from game)
 /generated/
 /docs/
-# Node tooling install + lock-backed deps
-/node_modules/
-/.opencode/node_modules/
-npm-debug.log*
-
-# ── Large / copyrighted third-party data (do not version) ────
-# Extracted game content / shader corpus
-/mcla extracted cache/
-# Extracted game content under game_data (art/city test .loc stubs, etc.)
 /game_data/
-# Reference recomp projects and research notes
+/mcla extracted cache/
 /.research/
-# Archived reference source
 /_archive/
-# Vendored SDK hier (binaries + headers)
-/rexglue-sdk/
 
-# ── Downloaded installers / binaries ─────────────────────────
+# ── Binaries / downloaded ──────────────────────────────────
 /SDL3.zip
 /SDL3_extract/
+/tools/
+rexglue-sdk/
+*.exe
+*.dll
 
-# ── Misc ─────────────────────────────────────────────────────
-*.tracy
-*.dmp
+# ── Logs / dumps / crash artifacts ─────────────────────────
 *.log
-Thumbs.db
-.DS_Store
+*.dmp
+*.tracy
+crash_dump.txt
+crash_log_early.txt
+boot_stderr*.log
+boot_stdout*.log
+boot_test_capture.png
+
+# ── Build artifacts ────────────────────────────────────────
 *.obj
 *.d
+*.pid
+*.err
 ninja_out.txt
 ninja_err.txt
 build_s74.txt
 build_log.txt
 build_err.txt
-crash_dump.txt
-crash_log_early.txt
 build_out.txt
-*.pid
-*.err
 cache/
 
-# ── Local-only config (archived references) ─────────────────
-/config/opencode.json
-/config/config.json
-
-# ── Old debug/duplicate wrapper scripts ─────────────────────
-/cmake_config.bat
-/cmake_config_debug.bat
-/cmake_debug.bat
-/cmake_debug2.bat
-/cmake_debug_final.bat
-/cmake_final.bat
-/reconfig.bat
-/build_main.bat
-/build_mcla.bat
-/build_mcla_test.bat
-/build_boot.bat
-/build_env.bat
-/build_env_vs2022.bat
-/build_env_vs2026.bat
-/build_phase0.bat
-/build_phase0_release.bat
-/build_phase0_test.bat
-/rebuild.bat
-/check_lib_vs2022.bat
-/run_silent.bat
-/run_test.bat
-
-flutter_windows_*
-*_b.cmd
+# ── AI tooling (local only) ─────────────────────────────────
+.opencode/
+.clinerules/
+.mcp.json
 
 # ── Local tooling / caches ──────────────────────────────────
 .cache/
 .freebuff/
 .vscode/
-crash_log_early.txt
-build_out.txt
 
-# ── Third-party binaries in tools/ ──────────────────────────
-tools/*.exe
-tools/*.dll
+# ── Local config ────────────────────────────────────────────
+/config/opencode.json
+/config/config.json
 
-# ── AI tooling (local only) ─────────────────────────────────
-.opencode/
+# ── OS / editor ─────────────────────────────────────────────
+Thumbs.db
+.DS_Store
