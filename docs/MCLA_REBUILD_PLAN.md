@@ -14,7 +14,7 @@
 ## Table of Contents
 
 1. [⭐ UR-Succession Revision (golden rules 11–14, CP freeze line)](#-ur-succession-revision-2026-08-22--authoritative-for-all-gpurender-work)
-2. [Current Status (2026-09-07, Session 65)](#current-status-2026-09-07-session-65)
+2. [Current Status (2026-09-10, Session 71)](#current-status-2026-09-10-session-71)
 3. [External Recon (web-verified 2026-09-03)](#external-recon-web-verified-2026-09-03--research-round-18-sources)
 4. [Revised Phase Ladder (P4′–P9′) + Automated Phase Gates](#revised-phase-ladder)
 5. [Source-vs-Plan Audit (documented conflicts, unfixed)](#source-vs-plan-audit-2026-09-03--documented-conflicts-unfixed)
@@ -82,8 +82,35 @@ execution). That rebuilds the superseded Phase-4 CP emulator. Effective now:
 5. Asset access (RPF VFS + 1,264-file ucode corpus) feeds the takeover's
    shader/resource needs per golden rules 12/14 - no from-scratch engine.
 
-### CURRENT STATUS (2026-09-07, Session 65)
-No active blockers. Full codebase rescan completed with 67 bug fixes across 4 sessions. All phases through P4.5' complete. P5' code complete (shader→PSO pipeline wired, grcFvf decode, vertex input layout). Runtime test pending.
+### CURRENT STATUS (2026-09-10, Session 71)
+
+**Boot: past stall and past pool16 OOM fatals.** Census bypass + KDELAY-SC
+(`9429523`, S70c) cut boot 5+ min → ~15s. Pool16 freelist repair (S71) stops
+the guest "Not enough memory" fatal: two independent 45s soaks repaired slab
+`A0014000` (`oldCount=632 newCount=377 freeHeadWas=A0015840`) with zero
+fatals and DRAW-SEAM hits. Overflow root-cause still open (mitigation only).
+
+**Phases:** P1–P3 done · P4′ steps 1–3 done · P4.5′ done · P5′ code complete
+(PSO/root-sig/grcFvf/DRAW_INDEXED wired). Runtime: native mode, VdSwap not
+yet called, frames not yet produced. Next critical path = longer soak →
+loading/start-menu reachability → VdSwap/frame production (P6′ D6).
+
+Details + run receipts: `docs/BOOT_HANDOFF.md`.
+
+### Research-derived actions (2026-09-10, native-only)
+
+Ordered by current critical path. All items are **host-native** (no ReXGlue,
+no GPU/input emulation).
+
+| # | Action | Why (source) | Ladder |
+|---|---|---|---|
+| R1 | **Locate MCLA's real present entry** (not `VdSwap`). Hook it host-side; keep `VdSwap`/ring imports inert unless a waiter blocks. | UR: present = `Video::Present` on game hook, `Vd*` stubs | P4′/P6′ |
+| R2 | **Defer guest-buffer frees per frame** (`g_tempResources[N]` pattern) on any host path that frees guest GPU memory. | UR: UAF otherwise looks like freelist corruption | P4.6′ / pool16 |
+| R3 | Keep pool16 repair; **do not grow RSC5 past ~82 KB tail slack** without a staged probe (size → repoint → counts). | LARecomp modloader + S71 OOM | follow-up |
+| R4 | **Dual O1Heap layout** already matches UR user/physical split — verify physical top-down + alignment header on `MmAllocatePhysicalMemoryEx`. | UR heap.cpp; Xenia top_down, 512 MB phys | P3/P9′ |
+| R5 | When frames land: `timeBeginPeriod(1)` + vsync off + wall-clock limiter; vblank rate census ~1010/s healthy. | LARecomp pacing + ISR storm | P4′ soak gate |
+| R6 | P5.5′: XXH3-64 embedded `.cpp` DXIL cache + DXIL-library spec-const link; audit corpus for memexport / point size / int consts / dyn idx. | XenosRecomp README | P5.5′ |
+| R7 | P8′ survey can use LARecomp's 112-hook / 24k-hint scale as a **size bound**, not a copy target. | LARecomp config scale | P8′ |
 
 ### Warnings / Freeze Line
 - stash@{0} 'session33-audlo-forensics-gpu_device-capture-hardening' REGRESSES
@@ -91,71 +118,103 @@ No active blockers. Full codebase rescan completed with 67 bug fixes across 4 se
 - generated/default is a STALE second regen - only generated/ppc_xenon is compiled
   (CMakeLists). Do not decode from generated/default.
 - Freeze line: no PM4, no manual GPU seeding, no opcode expansion.
-- Census work in patches.cpp (sessions 37-56) was committed with the session-65
-  rescan checkpoint; the worktree is clean except in-flight kernel edits.
+- Census work in patches.cpp (sessions 37-56) is committed; in-flight S71
+  pool16 freelist repair lives in `src/patches.cpp` (uncommitted until
+  user asks to commit).
 
-External recon (web-verified 2026-09-03 — research round: ~18 sources):
+External recon (re-verified 2026-09-10, research round 19 — webfetch of
+UnleashedRecomp / LARecomp / XenosRecomp / Xenia / RT64 primary sources):
 
-**LARecomp (`github.com/mzzvxm/larecomp`) — successor of BadassBaboon/midnightclub,
-runs THIS game to gameplay via ReXGlue 0.9.0. Proves our blockers are solvable.
-Verified transferable intel:**
-- **30 Hz fixed-timestep unlock (for later perf work):** game locks simulation to
-  30 Hz; the Xenia patch makes it run double-speed. Correct fix = real measured
-  frame delta injected via hooks on BOTH fixed-step paths (@0x821BDB58 /
-  loc_821BDB90) PLUS the timer reset guard the Xenia patch skips — dropping the
-  guard caused an audio blowout upstream.
-- **Frame pacing:** frame times collapse onto a 15.625 ms grid = Windows timer
-  resolution; fix = `timeBeginPeriod(1)` + vsync off + wall-clock limiter
-  (deliberately NOT vblank-based).
-- **vblank interrupt storm** diagnosed as the cause of long-session frame-rate
-  collapse upstream — direct warning for our vsync ISR / interrupt-callback path
-  (guest callback @0x82411478): add a long-session soak + interrupt-rate census
-  before P4′ sign-off.
-- **Guest data-patch gotcha:** patching a constant that lives in an
-  `.rdata`-mapped guest page (e.g. flt_8201E7EC) throws AV once the page is
-  actually populated read-only — unprotect the page first. Applies to any future
-  constant patch in `patches.cpp`.
-- **SDL3 input:** Win32 `PeekMessageW` never drains SDL3's queue — all message
-  pumping must go through SDL3 once windowing moves.
-- **Hook placement:** tuning hooks must sit on the constructor epilogue
-  (0x826F5CA0 for ambient density) — post-parse code paths may never execute.
-- Their remaining rendering issue is dithered alpha only (ReXGlue-side fixes
-  covered car reflections + HUD glitches) — a known-issues checklist for P5′.
+> **FILTER RULE (user, 2026-09-10):** Do **not** adopt ReXGlue. It ships a
+> GPU/input **emulation** layer. MCLA's goal is a **native renderer** (device-
+> boundary capture → host D3D12). From LARecomp / BadassBaboon, steal *facts*
+> (addresses, timing, quirks) only — never their ReXGlue architecture, rex::
+> APIs, or runtime. Canonical SDK if ever needed for citation only:
+> `github.com/rexglue/rexglue-sdk` (867★; NOT `rexglue/rexglue`).
 
-**XenosRecomp (`github.com/hedge-dev/XenosRecomp`) — P5.5′ blueprint, verified:**
-- Directory-scan mode converts a whole shader corpus and **exports the cache as
-  a `.cpp` file for direct embedding into the executable**; runtime lookup =
-  **64-bit XXH3 hash** of the shader binary. DXIL compressed as-is (pair with
-  zstd), SPIR-V pre-compressed with smol-v.
-- Specialization constants (alpha-test flag, R11G11B10 NORMAL/TANGENT/BINORMAL
-  unpack) implemented as declared-but-unimplemented functions resolved by
-  compiling a tiny library at runtime and LINKING it with the shader — DXIL has
-  no native specialization constants. Relevant if MCLA needs either behavior.
-- Unimplemented upstream: memory export (memexport), point size — audit MCLA's
-  ucode corpus for these before trusting P5.5′ coverage numbers.
-- DXIL signing: the public validator **verifies and signs** DXIL (per
-  DirectXShaderCompiler DXIL.rst); offline toolchain must run dxc + dxil.dll at
-  build time so embedded blobs stay signed — unsigned DXIL is rejected by the
-  D3D12 runtime.
+### LARecomp (`github.com/mzzvxm/larecomp`) — SAME GAME, technique facts only
+They run MCLA to gameplay on ReXGlue 0.10.0 (unpublished custom build for
+remaining GPU fixes). **We do not copy that stack.** Transferable guest facts:
 
-**Upstream layout correction:** UR render-thread references are
-`UnleashedRecomp/gpu/video.cpp` (with `gpu/cache/`, `gpu/shader/`); the kernel is
-`UnleashedRecomp/kernel/` = `imports.cpp`, `xdm.cpp/h`, `heap.cpp/h`,
-`memory.cpp/h`, `xam.cpp/h`, `xdbf.h`, `io/`, `function.h`, `freelist.h`. The
-`video.cpp:1006/315/5249` line cites in golden rule 13 stay valid against that
-path (re-diff line numbers before quoting them).
+- **Timer object fixed at `0x827D7500`:** frame delta `+0x08`, unscaled `+0x58`,
+  ceiling 0.1s `+0x24`, floor 1e-4 `+0x28`, reset flag `+0x38`. Guest TB =
+  **49.875 MHz** (not 50M).
+- **30 Hz unlock:** **two** fixed-step overwrite paths `0x821BDB58` +
+  `0x821BDB90`. Patching one leaves 2× speed. Keep `[r3+56]` reset guard or
+  garbage delta → audio blowout. Present interval field `0x82419AA0` is PM4
+  (2→1), not dt.
+- **Frame pacing:** 15.625 ms grid = Windows timer granularity. Fix =
+  `timeBeginPeriod(1)` **AND** vsync off + wall-clock limiter (not vblank).
+- **Vblank ISR storm:** SDK unsigned underflow in catch-up → ~1k/s healthy vs
+  multi-M/s collapse. Clamp backward steps + cap catch-up. With vsync off,
+  healthy vblank ≈ **1 ms (~1010/s)**.
+- **RSC5 segment growth slack:** grown buffers must end **~82 KB short** of
+  segment end (16 KB short → holes). 127-chunk is not a hard cap (driver 233).
+- **Hook placement:** constructor epilogue only (`0x826F5CA0` ambient density);
+  post-parse paths may never run.
+- **Guest `.rdata` patch gotcha:** unprotect page before writing constants.
+- **Dithered alpha** still unfixed upstream — P5′ known-issue checklist.
+- Scale of their config: 112 mid-asm hooks, 155 settings, 24,927 named
+  function hints. Useful as a **survey size** for P8′, not as a template.
 
-**Xenia CP semantics (src/xenia/gpu/command_processor.cc, master) — validation
-oracle for the frozen legacy CP:** worker thread model; gamma ramp initialized
-from `VdGetCurrentDisplayGamma` sRGB=1 defaults; TYPE-3 draw =
-`VGT_DRAW_INITIATOR` with `source_select` kDMA (indexed: `VGT_DMA_BASE`/`SIZE`,
-index endianness = `swap_mode`, 16/32-bit via `index_size`), kAutoIndex, and
-kImmediate (UPSTREAM-UNSUPPORTED — do not emulate either).
+### UnleashedRecomp (`hedge-dev/UnleashedRecomp`) — native-render blueprint
+This is the **native** cousin (no GPU emulation). Re-checked 2026-09-10:
 
-**BadassBaboon/midnightclub** (the predecessor fork): boot-blocker-free on
-rexglue; 0x825F0000–0x8260AFFF hole empty there too; ~1.7M-address stub sweep at
-startup; guest facts bank (timebase 49,875,000 Hz; `clear_memory_page_state`
-load-bearing; resolution_scale corrupts frustum aspects) remains valid.
+- **Present is NOT `VdSwap`.** Almost all `Vd*` imports are stubs (ring,
+  swap, interrupt cb, engines). Frame production = host `Video::Present`
+  hooked from the game's own present entry (`sub_82BDA8C0` on SWA), not the
+  kernel swap import. **MCLA action:** find MCLA's real present caller; keep
+  `VdSwap` inert unless the title blocks on it. Do not implement faithful
+  PM4_XE_SWAP for frames.
+- **Render path:** guest calls enqueue into
+  `moodycamel::BlockingConcurrentQueue<RenderCommand>`; dedicated render
+  thread records into `g_commandLists[g_frame]`; present stays on the calling
+  thread (`g_presentThreadId`). NUM_FRAMES=2 + waitable swapchain + per-frame
+  fences. Ownership pin: commit #1486.
+- **Heaps:** dual O1Heap inside guest VA — user `[0x20000, 0x7FEA0000)`,
+  physical `[0xA0000000, 0x100000000)`; `AllocPhysical` stores raw ptr/size
+  just below the aligned address. `MmAllocatePhysicalMemoryEx` → user/physical
+  heap + `MapVirtual`.
+- **Deferred GPU destroy:** `g_tempResources[NUM_FRAMES]` — prevents GPU UAF
+  from looking like guest freelist corruption. Directly relevant to pool16.
+- **No upstream pool16 freelist fix.** Their `freelist.h` is a *host* index
+  pool for kernel objects only. Guest title freelists are left alone.
+- Guest Device/Surface live **in guest heap** so guest pointers stay valid.
+- Renderer extras (skip for now): bindless, shader specialization via DXIL
+  library-link, skip obsolete GPU quirks, parallel transfer queues for
+  streaming, waitable swapchain latency.
+
+### XenosRecomp (`hedge-dev/XenosRecomp`) — P5.5′ blueprint (re-read 2026-09-10)
+- Dir-scan → DXIL/SPIR-V → **export `.cpp` for EXE embed**; runtime **64-bit
+  XXH3** of shader binary; DXIL zstd as-is, SPIR-V smol-v then zstd.
+- Spec-constants: DXIL has none — declare stub fn, compile tiny impl library,
+  **link** at runtime (MJP article). Flags used: alpha-test, R11G11B10 unpack.
+- Constants: VS 4096 B / PS 3584 B root CBs from shader reflection; missing
+  reflection ⇒ recompiler will not function (fallback: full float4 array).
+- Integer constants **unimplemented**; dynamic register indexing unimplemented
+  (would need register-as-array). Audit MCLA ucode before trusting coverage.
+- Unimplemented: memexport, point size. Mini vertex fetch unimplemented.
+- Vertex fetch via native input layout (not SRV permutation) — game-specific
+  instancing hack on SWA (`POSITION1` = IB); MCLA must decode its own FVF.
+- 16-bit vertex endian swap swizzles YXWZ — fix via per-TEXCOORD bits.
+- Not generic out of the box (`UNLEASHED_RECOMP` macros). Fork/adapt.
+
+### Xenia memory / Vd* semantics (xenia-project + canary, 2026-09-10)
+Physical is **512 MB** (phys 0–0x1FFFFFFF); views `0xA0000000` (64K),
+`0xC0000000` (16MB), `0xE0000000` (4K) alias it. GPU sees **physical**, not VA
+(0xA0000000 ≡ phys 0). Heaps: `v00000000` 4K user, `v40000000` 64K
+(`X_MEM_LARGE_PAGES`), XEX 64K/4K, physical. `MmAllocatePhysicalMemoryEx`
+always **top_down**, min/max are **physical**, returns **0** on failure (no
+growth). Exhaustion = contiguous-64K scarcity, not total size. `VdSwap` (if
+implemented) consumes **64 dwords** in the primary ring; fetch ptr is guest VA
+→ phys; asserts `8_8_8_8` or `2_10_10_10`. Interrupt callback: `(0, userdata)`
+on vblank from CPU 2. **Do not** treat `MmQueryStatistics` free-page counts as
+truthful for budgeting.
+
+### RT64 / Zelda64 / N64Recomp (unchanged 2026-09-03 scan)
+Ubershaders · contiguous VB/IB + compute vertex semantics · bindless texture
+array · `moodycamel::ConcurrentQueue` · linker-priority weak-alias overrides ·
+LiveRecomp/toml hooks as P8′ midasm reference only.
 
 ### NEW TECH SCAN (2026-09-03, round 2) — transferable technology found
 
@@ -451,10 +510,14 @@ achievements) · Vulkan/RHI consideration.
 
 ---
 
-## No-ReXGlue Mandate (2026-08-20)
+## No-ReXGlue Mandate (2026-08-20; **reaffirmed by user 2026-09-10**)
 
 **The project must not depend on the ReXGlue SDK.** UnleashedRecomp ships no such
 SDK; it uses standard third-party packages (SDL3, fmt, spdlog, etc. via vcpkg).
+**User reason (2026-09-10):** ReXGlue ships a **GPU and input emulation layer**.
+MCLA's goal is a **native renderer** — capture guest rendering intent at the
+device boundary and execute it as host D3D12. No GPU/input emulation layer.
+
 Therefore:
 
 1. **No `rexglue-sdk/` directory.** Delete it. Vendored third-party dependencies
@@ -470,6 +533,10 @@ Therefore:
    and `src/logging.h` are removed; call sites use `MCLA_CVAR_*` / `MCLA_LOG_*`.
 6. Golden Rule: hooks and kernel code must not depend on any rexglue type or
    runtime symbol.
+7. **From LARecomp / BadassBaboon: steal guest facts only** (addresses, timer
+   fields, 30 Hz sites, vblank rates, RSC5 slack). Do not copy their
+   ReXGlue-based architecture, midasm config as a dependency, or GPU/input
+   emulation. Their stack is evidence the game is portable — not our template.
 
 ## Purpose
 
@@ -576,8 +643,9 @@ non-critical paths. Do not implement until boot path demands it.
 
 ## Current State (2026-08-19, Post-Regression)
 
-> ⚠️ HISTORICAL SNAPSHOT (2026-08-19). Superseded by CURRENT STATUS (2026-09-07,
-> Session 65) at the top of this file — kept for the Investigation Record.
+> ⚠️ HISTORICAL SNAPSHOT (2026-08-19). Superseded by CURRENT STATUS
+> (2026-09-10, Session 71) at the top of this file — kept for the
+> Investigation Record.
 
 - **ABI migration: largely complete.** Host sources compile clean (44/44
   targets). `mcla.exe` links generated PPC TUs, installs 46,041 `PPCFuncMappings`,

@@ -12,6 +12,46 @@ constexpr size_t RESERVED_END = 0xA0000000;
 // that require unwinding — clang-cl crashes compiling __try in a C++ method
 // that holds std::lock_guard.
 #if defined(_MSC_VER)
+    // Session 73: capture the faulting address so the corrupted o1heap
+    // fragment can be identified. The filter runs while the exception
+    // context is live; keep it C-style (no unwinding objects).
+    static long SehO1Filter(EXCEPTION_POINTERS *info)
+    {
+        if (info && info->ExceptionRecord &&
+            info->ExceptionRecord->ExceptionCode == 0xC0000005 &&
+            info->ExceptionRecord->NumberParameters >= 2)
+        {
+            const void *faultAddr =
+                (const void *)info->ExceptionRecord->ExceptionInformation[1];
+            MCLA_LOG_ERROR("o1heap AV fault-addr={:p} (op={} )", faultAddr,
+                           (unsigned long long)
+                               info->ExceptionRecord->ExceptionInformation[0]);
+            const uint8_t *gbase =
+                static_cast<const uint8_t *>(
+                    mcla::kernel::g_memory.Translate(0));
+            const uintptr_t fault = (uintptr_t)faultAddr;
+            const uintptr_t lo = (uintptr_t)gbase;
+            // Unsigned offset test — `fault + 64 < lo + 4GB` wraps and passes
+            // for wild pointers like 0xFFFFFFFFFFFFFFFF, and the dump below
+            // then faulted *inside* this filter (2 cascading AVs per real one).
+            const uintptr_t off = fault - lo;
+            if (gbase != nullptr && fault >= lo && off < 0x100000000ull)
+            {
+                MCLA_LOG_ERROR("o1heap AV guest-addr={:08X}",
+                               static_cast<uint32_t>(off));
+                if (off >= 32 && off + 40 <= 0x100000000ull)
+                {
+                    const uint64_t *p = (const uint64_t *)(fault & ~7ull);
+                    MCLA_LOG_ERROR("  [fa-32]={:016X}:{:016X} [fa-16]={:016X}:{:016X}",
+                                   p[-4], p[-3], p[-2], p[-1]);
+                    MCLA_LOG_ERROR("  [fa+00]={:016X} [fa+08]={:016X}", p[0], p[1]);
+                    MCLA_LOG_ERROR("  [fa+16]={:016X} [fa+24]={:016X}", p[2], p[3]);
+                }
+            }
+        }
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
     void* SehO1Allocate(O1HeapInstance* heap, size_t amount)
     {
         void* ptr = nullptr;
@@ -19,7 +59,7 @@ constexpr size_t RESERVED_END = 0xA0000000;
         {
             ptr = o1heapAllocate(heap, amount);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (SehO1Filter(GetExceptionInformation()))
         {
             ptr = nullptr;
         }

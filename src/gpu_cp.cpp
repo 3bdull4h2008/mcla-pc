@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace mcla::gpu {
@@ -1510,6 +1511,39 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
       MCLA_LOG_WARN("CDCD-FILL #{:09} @ {:08X} = CDCDCDCD lr={:08X}", n,
                     guestAddr, lr);
     }
+    // SESSION 73 overrun probe: a 0xCD store inside the physical arena that
+    // no handed-out allocation covers is writing o1heap metadata / free
+    // space — the AV-storm corruptor. Page-granular check cache; the scan
+    // only runs once per 4KB page.
+    if (guestAddr >= 0xA0000000u) {
+      static std::mutex s_pgMtx;
+      static std::unordered_set<uint32_t> s_checkedPages;
+      const uint32_t page = guestAddr >> 12;
+      bool report = false;
+      {
+        std::lock_guard<std::mutex> lock(s_pgMtx);
+        report = s_checkedPages.insert(page).second;
+      }
+      if (report) {
+        if (!mcla::kernel::MclaPhysRangeEverAllocated(guestAddr)) {
+          static std::atomic<uint32_t> s_overruns{0};
+          const uint32_t ov = s_overruns.fetch_add(1) + 1;
+          if (ov <= 64) {
+            uint32_t lr = 0;
+            if (const PPCContext *c = GetPPCContext())
+              lr = static_cast<uint32_t>(c->lr);
+            uint32_t nb = 0, ns = 0;
+            const bool haveNb =
+                mcla::kernel::MclaPhysNearestAllocBelow(guestAddr, &nb, &ns);
+            MCLA_LOG_WARN("PHYS-OVERRUN #{:03} @ {:08X} = CDCDCDCD lr={:08X} "
+                          "nearestAlloc={} size={:#x} gap={:#x}",
+                          ov, guestAddr, lr,
+                          haveNb ? nb : 0u, haveNb ? ns : 0u,
+                          haveNb ? (guestAddr - (nb + ns)) : 0u);
+          }
+        }
+      }
+    }
     return;
   }
 
@@ -1528,6 +1562,22 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
       if (const PPCContext *c = GetPPCContext())
         lr = static_cast<uint32_t>(c->lr);
       MCLA_LOG_WARN("PARAM-STORE #{:06} @ {:08X} = {:08X} lr={:08X}", pn,
+                    guestAddr, value, lr);
+    }
+    return;
+  }
+
+  // SESSION 73 probe: the o1heap instance + first physical fragments
+  // (A0000000..A0000800). The instance is host-only memory — ANY guest
+  // store here is the heap corruptor. Logged with guest LR attribution.
+  if (guestAddr < 0xA0000800u && guestAddr >= 0xA0000000u) {
+    static std::atomic<uint32_t> s_heapHdrStores{0};
+    const uint32_t hn = s_heapHdrStores.fetch_add(1) + 1;
+    if (hn <= 200 || (hn % 5000) == 0) {
+      uint32_t lr = 0;
+      if (const PPCContext *c = GetPPCContext())
+        lr = static_cast<uint32_t>(c->lr);
+      MCLA_LOG_WARN("HEAPHDR-STORE #{:05} @ {:08X} = {:08X} lr={:08X}", hn,
                     guestAddr, value, lr);
     }
     return;

@@ -688,10 +688,12 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // TU83 spawn pointer scanner (Lead 1) — runs once after guest memory is adopted
     mcla::native::kernel::ScanGuestMemoryForTU83SpawnPointers();
 
-    // Session 72: physical o1heap lives at guest 0xA0000000 (RESERVED_END).
-    // Guest stores into the instance header / first fragments corrupt the
-    // free list and AV in o1heapAllocate. Arm page-watch on the header.
-    mcla::native::RegisterGuestWatchRange(0xA0000000u, 0xA0000200u);
+    // Session 72/73: physical o1heap lives at guest 0xA0000000. The instance
+    // is 576 bytes (64 bins x8 + mask + diagnostics) then fragments follow.
+    // Guest stores here are the heap-corruption vector — the session-72
+    // 0x200 window saw nothing, but that run never reached the load stage
+    // where the corruption fires. Watch the instance + first fragments.
+    mcla::native::RegisterGuestWatchRange(0xA0000000u, 0xA0000800u);
 
     // Session 73: attribute every 0xCDCDCDCD store. Static decode: the guest
     // fills tiny-slab elements with 0xCD on alloc (sub_821DE9D8 tail) — the

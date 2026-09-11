@@ -2485,6 +2485,9 @@ void DbgBreakPoint() { LOG_UTILITY("!!! STUB !!!"); }
 
 // Track physical allocations for MmQueryAllocationSize
 static std::unordered_map<uint32_t, uint32_t> s_allocSizeMap;
+// Session 74: guest LR that requested each tracked allocation, so an overrun
+// can be attributed to the site that under-allocated the buffer.
+static std::unordered_map<uint32_t, uint32_t> s_allocLrMap;
 static std::mutex s_allocSizeMutex;
 
 uint32_t MmQueryAllocationSize(uint32_t guestAddress) {
@@ -2515,9 +2518,74 @@ uint32_t MmQueryAllocationSize(uint32_t guestAddress) {
 
 // Called when allocating physical memory to track sizes
 void MmTrackAllocationSize(uint32_t guestAddress, uint32_t size) {
+  const uint32_t lr =
+      GetPPCContext() ? static_cast<uint32_t>(GetPPCContext()->lr) : 0;
   std::lock_guard<std::mutex> lock(s_allocSizeMutex);
   s_allocSizeMap[guestAddress] = size;
+  s_allocLrMap[guestAddress] = lr;
 }
+
+// Session 73: coverage probe for the 0xCD-fill overrun census. True when
+// `addr` falls inside any physical allocation handed out this boot
+// (historical — frees are not erased). A guest 0xCD fill landing outside
+// every handed-out range is writing o1heap metadata / never-issued arena —
+// that is the heap corruptor.
+namespace mcla::kernel {
+bool MclaPhysRangeEverAllocated(uint32_t addr) {
+  std::lock_guard<std::mutex> lock(s_allocSizeMutex);
+  for (const auto &kv : s_allocSizeMap) {
+    if (addr - kv.first < kv.second) // unsigned wrap-safe membership test
+      return true;
+  }
+  return false;
+}
+
+bool MclaPhysNearestAllocBelow(uint32_t addr, uint32_t *outBase,
+                               uint32_t *outSize) {
+  std::lock_guard<std::mutex> lock(s_allocSizeMutex);
+  const auto *best = static_cast<const std::pair<const uint32_t, uint32_t> *>(nullptr);
+  for (const auto &kv : s_allocSizeMap) {
+    if (kv.first <= addr && (best == nullptr || kv.first > best->first))
+      best = &kv;
+  }
+  if (best == nullptr)
+    return false;
+  if (outBase)
+    *outBase = best->first;
+  if (outSize)
+    *outSize = best->second;
+  return true;
+}
+
+bool MclaPhysAllocInfo(uint32_t addr, uint32_t *outBase, uint32_t *outSize,
+                       uint32_t *outLr, bool *outExact) {
+  std::lock_guard<std::mutex> lock(s_allocSizeMutex);
+  const std::pair<const uint32_t, uint32_t> *best = nullptr;
+  bool exact = false;
+  for (const auto &kv : s_allocSizeMap) {
+    if (addr - kv.first < kv.second) { // unsigned wrap-safe membership test
+      best = &kv;
+      exact = true;
+      break;
+    }
+    if (kv.first <= addr && (best == nullptr || kv.first > best->first))
+      best = &kv;
+  }
+  if (best == nullptr)
+    return false;
+  if (outBase)
+    *outBase = best->first;
+  if (outSize)
+    *outSize = best->second;
+  if (outExact)
+    *outExact = exact;
+  if (outLr) {
+    const auto it = s_allocLrMap.find(best->first);
+    *outLr = (it != s_allocLrMap.end()) ? it->second : 0u;
+  }
+  return true;
+}
+} // namespace mcla::kernel
 
 uint32_t NtClearEvent(uint32_t handle, uint32_t *previousState) {
   if (auto* obj = GetKernelObject(handle)) {

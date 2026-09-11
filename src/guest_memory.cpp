@@ -107,6 +107,30 @@ inline bool PageWatchHit(uint32_t guestAddr)
     return false;
 }
 
+// Session 73: bulk copies must be checked by RANGE overlap, not endpoints —
+// a memset/memcpy spanning a watched region (start before it, end after)
+// previously slipped through with only the first/last dword probes.
+inline bool RangeOverlapsWatch(uint32_t guestAddr, uint32_t size)
+{
+    const uint32_t e = guestAddr + size;
+    if (size != 0 &&
+        (guestAddr & 0xFFFFF000u) == kWatchPage)
+    {
+        return true;
+    }
+    const uint32_t n = g_watchRangeCount.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const uint32_t s = g_watchRanges[i].start.load(std::memory_order_relaxed);
+        const uint32_t r = g_watchRanges[i].end.load(std::memory_order_relaxed);
+        if (guestAddr < r && s < e)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 namespace mcla::native {
 
 GuestMemoryView::GuestMemoryView() = default;
@@ -298,15 +322,17 @@ bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t s
     if (size >= 4)
     {
         // Watch coverage for bulk copies of ANY size: check first + last
-        // dword against range and value watches (asset blobs carry stale
-        // pointers mid-buffer; a hit logs LR attribution for the copy).
+        // dword against range and value watches, AND overlap of the whole
+        // span against watched ranges (session 73 — a copy spanning a
+        // watched region previously evaded both endpoint probes).
         uint32_t vFirst = 0, vLast = 0;
         std::memcpy(&vFirst, ptr, sizeof(vFirst));
         std::memcpy(&vLast, ptr + size - sizeof(uint32_t), sizeof(vLast));
         vFirst = Swap32(vFirst);
         vLast = Swap32(vLast);
         const bool rangeHit = PageWatchHit(guestAddr) ||
-                              PageWatchHit(guestAddr + size - 4);
+                              PageWatchHit(guestAddr + size - 4) ||
+                              RangeOverlapsWatch(guestAddr, size);
         const bool valueHit =
             WatchValueHit(vFirst) || WatchValueHit(vLast);
         if (rangeHit || valueHit)

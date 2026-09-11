@@ -4,9 +4,11 @@
 Provides integration with GPU debugging and profiling tools (RenderDoc, PIX) for D3D12 capture analysis and performance optimization.
 
 ## RenderDoc MCP
-- **Command**: `renderdoc-mcp.exe` (from `rdmcp-venv\Scripts\`)
+- **Command**: `C:\Users\abdul\.local\share\mcp\rdmcp-venv\Scripts\renderdoc-mcp.exe`
 - **Timeout**: 30s
-- **Enabled**: true
+- **Enabled**: true (engine config `~/.config/mimocode/mimocode.jsonc` → `mcp.renderdoc`)
+- **QRenderDoc bridge extension** installed under
+  `%APPDATA%\qrenderdoc\extensions\renderdoc_mcp_bridge\`
 
 ### Available Tools (renderdoc_*)
 | Tool | Description |

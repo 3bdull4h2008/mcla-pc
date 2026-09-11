@@ -3,10 +3,30 @@
 ## Purpose
 Provides programmatic access to Ghidra for reverse-engineering Xbox 360 (PPC) binaries, Xenos microcode, and ReXGlue recompilation output.
 
+## Architecture (verified 2026-09-10)
+- **Ghidra install:** `E:\ghidra_12.1.2_PUBLIC` (not `C:\Program Files\Ghidra`, which is empty).
+- **Extension:** GhidraMCP 6.0.0 + XEXLoaderWV installed under
+  `%APPDATA%\ghidra\ghidra_12.1.2_PUBLIC\Extensions\` and
+  `E:\ghidra_12.1.2_PUBLIC\Extensions\`.
+- **Headless HTTP server:** `com.xebyte.headless.GhidraMCPHeadlessServer`
+  launched via Ghidra's `support\launch.bat` (needs Ghidra classloader —
+  raw `java -cp GhidraMCP.jar` fails with `ClassNotFoundException: ghidra.GhidraLaunchable`).
+- **Launcher:** `C:\Users\abdul\.config\opencode\ghidra-mcp\run-ghidra-mcp-headless.bat`
+  → HTTP `127.0.0.1:8089`. Keep this process running for RE work.
+- **MCP client:** `bridge-mcp-ghidra.exe` (stdio) registered in
+  `~/.config/mimocode/mimocode.jsonc` as `mcp.ghidra`. Talks to :8089.
+
 ## MCP Server
-- **Command**: `bridge-mcp-ghidra.exe --lazy --default-groups listing,function,program,xref,analysis,documentation`
+- **Command**: `C:\Users\abdul\.local\bin\bridge-mcp-ghidra.exe --lazy --default-groups listing,function,program,xref,analysis,documentation`
 - **Timeout**: 30s
-- **Enabled**: true
+- **Enabled**: true (engine config; requires new conversation after edit)
+
+## Start the headless backend
+```bat
+C:\Users\abdul\.config\opencode\ghidra-mcp\run-ghidra-mcp-headless.bat
+```
+Expect: `HTTP server started on 127.0.0.1:8089` / `Registered 245 REST API endpoints`.
+Load `E:\mcla pc\game_data\default.xex` via tools if not preloaded.
 
 ## Available Tools (ghidra_*)
 | Tool | Description |

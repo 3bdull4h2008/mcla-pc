@@ -822,17 +822,17 @@ PPC_FUNC(sub_824294E0) {
     uint32_t tableBase = 0, queued = 0;
     if (dev != 0 && mem.ReadU32BE(dev + 10896, &tableBase) &&
         tableBase != 0 && mem.ReadU32BE(dev + 21628, &queued)) {
-      const uint64_t ts = mcla::native::QueryGuestTimebase();
+      const uint32_t ts = static_cast<uint32_t>(
+          mcla::native::QueryGuestTimebase() & 0xFFFFFFFFu) | 1u;
+      // The table is 4-BYTE slots (idx 16..23). Write exactly one slot per
+      // entry — an 8-byte write here spilled into subctx+96 whenever
+      // (queued&7)+16 == 23. lwbrx interprets the bytes little-endian.
       for (uint32_t k = 0; k < 2; ++k) {
         const uint32_t off = (((queued + k) & 7u) + 16u) * 4u;
-        const uint32_t lo = static_cast<uint32_t>(ts & 0xFFFFFFFFu);
-        const uint32_t hi = static_cast<uint32_t>(ts >> 32);
-        // lwbrx interprets the slot bytes little-endian: store bswapped.
-        (void)mem.WriteU32BE(tableBase + off, __builtin_bswap32(lo));
-        (void)mem.WriteU32BE(tableBase + off + 4, __builtin_bswap32(hi));
+        (void)mem.WriteU32BE(tableBase + off, __builtin_bswap32(ts));
       }
       if (n <= 8 || (n % 500) == 0)
-        MCLA_LOG_WARN("SWAP-FILL #{} table={:08X} queued={} ts={:016X}", n,
+        MCLA_LOG_WARN("SWAP-FILL #{} table={:08X} queued={} ts={:08X}", n,
                       tableBase, queued, ts);
     }
   }
@@ -854,6 +854,155 @@ PPC_FUNC(sub_82419E90) {
     MCLA_LOG_INFO("FRAME-END sub_82419E90 #{} dev={:08X} lr={:08X}", n,
                   ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_82419E90(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// SESSION 74 census: tiled 2D surface blit (d3d9-style copy-rect, generated
+// impl ppc_recomp.80.cpp:37005). PROVEN corruptor path — its two memcpy call
+// sites (guest lr 0x82431C5C / 0x82431D18) write 0xCDCDCDCD into the physical
+// arena at the allocation frontier (PHYS-OVERRUN @ CAEC5004..CAF04004), which
+// clobbers o1heap free-fragment headers: header.size / next_free read back as
+// 0xCDCDCDCDCDCDCDCD, unbin() dereferences it, SehO1Allocate swallows the AV
+// and returns null -> E_OUTOFMEMORY -> TEXCREATE-SC fakes success -> guest
+// null-deref fatal. Capture the inputs to find which one is garbage.
+// r3=dst base  r4=width  r5=height  r6=src origin{x,y} (0 => {0,0})
+// r7=src base  r8=src pitch  r9=dst rect{x0,y0,x1,y1} (0 => {0,0,r4,r5})
+// r10=format/tiling descriptor (bpp + log2 tile shifts)
+// Census only: no behaviour change, no D3D12 calls.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_82431A40);
+static std::atomic<uint32_t> s_h31A40{0};
+PPC_FUNC(sub_82431A40) {
+  const uint32_t n = s_h31A40.fetch_add(1) + 1;
+  const uint32_t dst = ctx.r3.u32;
+  const uint32_t w = ctx.r4.u32;
+  const uint32_t h = ctx.r5.u32;
+  const uint32_t srcOrigin = ctx.r6.u32;
+  const uint32_t src = ctx.r7.u32;
+  const uint32_t pitch = ctx.r8.u32;
+  const uint32_t rectPtr = ctx.r9.u32;
+  const uint32_t fmt = ctx.r10.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  const bool log = (n <= 1024) || (n % 256) == 0;
+
+  uint32_t x0 = 0, y0 = 0, x1 = w, y1 = h;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (rectPtr != 0) {
+    (void)mem.ReadU32BE(rectPtr + 0, &x0);
+    (void)mem.ReadU32BE(rectPtr + 4, &y0);
+    (void)mem.ReadU32BE(rectPtr + 8, &x1);
+    (void)mem.ReadU32BE(rectPtr + 12, &y1);
+  }
+
+  // Source descriptor: good mip-chain blits carry a real one; a garbage or
+  // uninitialized descriptor is the other candidate root cause.
+  uint32_t sd[8] = {};
+  if (log && src != 0) {
+    for (uint32_t i = 0; i < 8; ++i)
+      (void)mem.ReadU32BE(src + i * 4, &sd[i]);
+  }
+
+  const bool dstPhys = (dst >= 0xA0000000u);
+  uint32_t aBase = 0, aSize = 0, aLr = 0;
+  bool exact = false;
+  const bool haveAlloc =
+      dstPhys &&
+      mcla::kernel::MclaPhysAllocInfo(dst, &aBase, &aSize, &aLr, &exact);
+  // The copy extent is RECT-driven: rows = y1-y0, per-row = x1-x0, so the
+  // blit writes w*h BYTES. The format/bpp (r10) only sizes an internal
+  // staging alloc and is never multiplied into the copy size.
+  const uint32_t rectW = (x1 > x0) ? (x1 - x0) : 0u;
+  const uint32_t rectH = (y1 > y0) ? (y1 - y0) : 0u;
+  const uint64_t need = static_cast<uint64_t>(rectW) * rectH;
+  const bool overrun = haveAlloc && exact && need > aSize;
+
+  if (log)
+    MCLA_LOG_WARN("BLIT-CAP #{} dst={:08X} src={:08X} pitch={:#x} fmt={:08X} "
+                  "rect=[{},{},{},{}] wh={}x{} srcOrigin={:08X} lr={:08X} "
+                  "alloc={} size={:#x} allocLr={:08X} exact={} need={:#x} "
+                  "overrunBy={:#x}",
+                  n, dst, src, pitch, fmt, x0, y0, x1, y1, w, h, srcOrigin, lr,
+                  haveAlloc ? aBase : 0u, haveAlloc ? aSize : 0u,
+                  haveAlloc ? aLr : 0u, exact, need,
+                  overrun ? static_cast<uint32_t>(need - aSize) : 0u);
+  if (log)
+    MCLA_LOG_WARN("BLIT-SRC #{} src={:08X} [{:08X} {:08X} {:08X} {:08X}] "
+                  "[{:08X} {:08X} {:08X} {:08X}]",
+                  n, src, sd[0], sd[1], sd[2], sd[3], sd[4], sd[5], sd[6], sd[7]);
+
+  // SESSION 74 GUARD: refuse a provably out-of-bounds blit. Blit #8 is handed
+  // a 512x640 RECT against a 0xA000 destination and writes 0x46000 bytes of
+  // copied 0xCD straight over o1heap free-fragment headers at the arena
+  // frontier — that is the AV storm, the E_OUTOFMEMORY cascade and the fatal
+  // null-deref. On hardware the surface dims and the buffer always agree; here
+  // the source descriptor is uninitialized (fmtEnum=0, flag=1 direct-copy
+  // path), so the two disagree. Skipping only when the allocation match is
+  // exact leaves every legitimate blit (all #1-#7 fit) untouched. r3 keeps the
+  // dst pointer, matching the flag=1 path which applies no dst-base adjust.
+  if (overrun) {
+    static std::atomic<uint32_t> s_blitGuards{0};
+    const uint32_t g = s_blitGuards.fetch_add(1) + 1;
+    if (g <= 64 || (g % 500) == 0)
+      MCLA_LOG_ERROR("BLIT-OOB-GUARD #{} SKIPPED dst={:08X} size={:#x} "
+                     "need={:#x} overrunBy={:#x} rect=[{},{},{},{}] fmt={:08X} "
+                     "src={:08X} lr={:08X} allocLr={:08X}",
+                     g, dst, aSize, need, static_cast<uint32_t>(need - aSize),
+                     x0, y0, x1, y1, fmt, src, lr, aLr);
+    return;
+  }
+
+  __imp__sub_82431A40(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// SESSION 74 census: sub_824321E0 — the copy-rect wrapper, sole caller of the
+// blit sub_82431A40 (call site guest 0x82432428). Capturing ITS parameters is
+// what separates "destination under-allocated" from "RECT is garbage":
+//   r3=dstW r4=dstH (the true surface dims) r5=log2 tile shift
+//   r6=src D3DFORMAT enum (0 = invalid/uninitialized; falls through the
+//      decoder sub_8240F2A8 to the 1x1-block default)
+//   r7=flag bit (0 => tile-adjust path via sub_82432D30, fills a real origin;
+//      1 => direct-copy path, leaves origin = caller r9 = 0)
+//   r8=dst base/pitch  r9=origin ptr  r10=src base
+// Its only caller is sub_82182FA0 (surface copy/update), which also appears in
+// the fatal crash stack under the texture placeholder factory sub_82184F58.
+// Census only: no behaviour change.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_824321E0);
+static std::atomic<uint32_t> s_h321E0{0};
+PPC_FUNC(sub_824321E0) {
+  const uint32_t n = s_h321E0.fetch_add(1) + 1;
+  const uint32_t dstW = ctx.r3.u32;
+  const uint32_t dstH = ctx.r4.u32;
+  const uint32_t tileShift = ctx.r5.u32;
+  const uint32_t fmtEnum = ctx.r6.u32;
+  const uint32_t flag = ctx.r7.u32;
+  const uint32_t dstBase = ctx.r8.u32;
+  const uint32_t origin = ctx.r9.u32;
+  const uint32_t src = ctx.r10.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+
+  if (n <= 1024 || (n % 256) == 0) {
+    uint32_t aBase = 0, aSize = 0, aLr = 0;
+    bool exact = false;
+    const bool haveAlloc =
+        (dstBase >= 0xA0000000u) &&
+        mcla::kernel::MclaPhysAllocInfo(dstBase, &aBase, &aSize, &aLr, &exact);
+    // What the surface dims imply vs what was actually allocated.
+    const uint64_t need =
+        static_cast<uint64_t>(dstW) * static_cast<uint64_t>(dstH);
+    MCLA_LOG_WARN("BLITWRAP #{} dstW={} dstH={} tileShift={} fmtEnum={:#x} "
+                  "flag={} dstBase={:08X} origin={:08X} src={:08X} lr={:08X} "
+                  "alloc={} size={:#x} exact={} need={:#x} overrunBy={:#x}",
+                  n, dstW, dstH, tileShift, fmtEnum, flag, dstBase, origin, src,
+                  lr, haveAlloc ? aBase : 0u, haveAlloc ? aSize : 0u, exact,
+                  need,
+                  (haveAlloc && exact && need > aSize)
+                      ? static_cast<uint32_t>(need - aSize)
+                      : 0u);
+  }
+
+  __imp__sub_824321E0(ctx, base);
 }
 
 // ---------------------------------------------------------------------------

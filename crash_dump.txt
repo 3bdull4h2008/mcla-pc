@@ -1,0 +1,34 @@
+Exception: code=0x80000003 addr=0x00007FF7D344E2AB rva=0x4BE2AB flags=0x0 nParams=1 thread=6588
+  Param[0]=0x0000000000000000
+  ppc r1=8EFF1A20 lr=821B37F4 r3=0000000C r4=00000003 r5=00000004 r6=00000001 r7=8200C0A0 r8=A02B6DB0 r9=00000003 r10=8EFF1AB0 r13=8F200000
+Stack trace (30 frames):
+  [00] mcla::boot::`anonymous namespace'::BootWorker::<lambda_2>::__invoke
+  [01] RtlWow64GetCurrentMachine
+  [02] RtlWow64GetCurrentMachine
+  [03] KiUserExceptionDispatcher
+  [04] __imp__sub_821B3548
+  [05] __imp__sub_821A0800
+  [06] __imp__sub_821917A8
+  [07] __imp__sub_82192150
+  [08] __imp__sub_82192448
+  [09] __imp__sub_82612B00
+  [10] __imp__sub_826137A0
+  [11] __imp__sub_82613970
+  [12] __imp__sub_82611738
+  [13] __imp__sub_8249CC00
+  [14] __imp__sub_821C3048
+  [15] __imp__sub_82614588
+  [16] __imp__sub_82611448
+  [17] __imp__sub_82611018
+  [18] __imp__sub_826113A8
+  [19] __imp__sub_82379C68
+  [20] __imp__sub_823047D8
+  [21] __imp__sub_822C2EA8
+  [22] __imp__sub_82131508
+  [23] __imp__sub_82131790
+  [24] __imp__sub_821BD7C0
+  [25] __imp___xstart
+  [26] mcla::boot::`anonymous namespace'::BootWorker
+  [27] mcla::boot::`anonymous namespace'::BootThreadProc
+  [28] BaseThreadInitThunk
+  [29] RtlUserThreadStart

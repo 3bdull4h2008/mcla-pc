@@ -179,4 +179,21 @@ struct Memory {
 extern "C" void* MmGetHostAddress(uint32_t ptr);
 extern Memory g_memory;
 
+// Session 73: true when `addr` falls inside any physical allocation handed
+// out this boot (historical registry — frees are not erased). Used by the
+// 0xCD-fill overrun census to flag writes into o1heap metadata space.
+bool MclaPhysRangeEverAllocated(uint32_t addr);
+
+// Highest tracked physical allocation base at or below `addr`. Lets the
+// overrun census name the buffer a wild write ran past, and the gap to it.
+bool MclaPhysNearestAllocBelow(uint32_t addr, uint32_t *outBase,
+                               uint32_t *outSize);
+
+// Resolve `addr` to its owning physical allocation (exact membership first,
+// nearest-below fallback). Reports base, size, the guest LR that requested it,
+// and whether the match was exact. Used by the blit-overrun census to name the
+// site that under-allocated a destination buffer.
+bool MclaPhysAllocInfo(uint32_t addr, uint32_t *outBase, uint32_t *outSize,
+                       uint32_t *outLr, bool *outExact);
+
 } // namespace mcla::kernel
