@@ -14,6 +14,7 @@
 #include <atomic>
 #include <fstream>
 #include <mutex>
+#include <dbghelp.h>
 #include <unordered_map>
 #include <iterator>
 #include <string>
@@ -2101,6 +2102,35 @@ PPC_FUNC(sub_821D5E10) {
       if (retries == 1) {
         uint32_t credits = 0;
         (void)mem.ReadU32BE(0x827D74E0u, &credits);
+        // Session 75s: capture the HOST callstack to name the caller that
+        // drives these calls with a garbage context (lr=1, r1=code).
+        static std::atomic<uint32_t> s_btCount{0};
+        if (s_btCount.fetch_add(1) < 2) {
+          SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+          static std::once_flag symOnce;
+          std::call_once(symOnce, []() {
+            SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+          });
+          void *frames[14] = {};
+          const USHORT nCap = CaptureStackBackTrace(0, 14, frames, nullptr);
+          for (USHORT fi2 = 0; fi2 < nCap; ++fi2) {
+            alignas(8) char scratch[sizeof(SYMBOL_INFO) + 128];
+            SYMBOL_INFO *si = (SYMBOL_INFO *)scratch;
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 127;
+            DWORD64 disp = 0;
+            char nameBuf[160];
+            const char *name = "???";
+            if (SymFromAddr(GetCurrentProcess(), (DWORD64)frames[fi2], &disp,
+                            si)) {
+              snprintf(nameBuf, sizeof(nameBuf), "%s+0x%llx", si->Name,
+                       (unsigned long long)disp);
+              name = nameBuf;
+            }
+            MCLA_LOG_WARN("BT[{}] frame {:02d} {} {}", n, fi2,
+                          (void *)frames[fi2], name);
+          }
+        }
         // lr=1 is bogus — walk the stack instead (recompiler frames:
         // [sp]=back, [back-8]=saved lr).
         uint32_t inPtr = 0;
