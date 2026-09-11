@@ -979,7 +979,7 @@ PPC_FUNC(sub_8244FF20) {
 
 // Session 75i: UI streamables / blank-texture loader caller.
 // 82216B98 refs "$/resources/ui/textures/streamables" and "$/textures/blank".
-// Not in func map; 821FD6B0 is a mapped caller.
+// Not in func map; mapped callers: 821FD6B0, 821FD640, 822012E8.
 PPC_FUNC_IMPL(__imp__sub_821FD6B0);
 static std::atomic<uint32_t> s_h1FD6B0{0};
 PPC_FUNC(sub_821FD6B0) {
@@ -991,6 +991,28 @@ PPC_FUNC(sub_821FD6B0) {
                   static_cast<uint32_t>(ctx.lr));
   }
   __imp__sub_821FD6B0(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821FD640);
+static std::atomic<uint32_t> s_h1FD640{0};
+PPC_FUNC(sub_821FD640) {
+  const uint32_t n = s_h1FD640.fetch_add(1) + 1;
+  if (n <= 8) {
+    MCLA_LOG_INFO("STREAMTEX-PARENT sub_821FD640 #{} lr={:08X}",
+                  n, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821FD640(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_822012E8);
+static std::atomic<uint32_t> s_h2012E8{0};
+PPC_FUNC(sub_822012E8) {
+  const uint32_t n = s_h2012E8.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("UILOAD-census sub_822012E8 #{} r3={:08X} r4={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_822012E8(ctx, base);
 }
 
 // ---------------------------------------------------------------------------

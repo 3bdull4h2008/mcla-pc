@@ -104,6 +104,11 @@ So what registers is an **empty-shell factory**, not an RSC load. The
 streamables/globaltex loaders never run (or are only reached via unmapped
 code). INSERT still dead.
 
+Callers of the factory (`8218BEB0` → `8218BF20`): mapped
+`8218C3F8` (unmapped), `8218CB10` (task ENQ family), `8218D120`.
+Census `8218D120` / `8218CB10` next — those are the request side.
+UI streamables parents `821FD640` / `822012E8` also **STREAMTEX/UILOAD ×0**.
+
 ---
 
 ## SESSION 75E — IDA MCP UP; DICTIONARY REGISTER RUNS BUT LOOKUPS STILL MISS
