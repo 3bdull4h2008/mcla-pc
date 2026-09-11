@@ -897,11 +897,23 @@ PPC_FUNC_IMPL(__imp__sub_8218B000);
 static std::atomic<uint32_t> s_h18B000{0};
 PPC_FUNC(sub_8218B000) {
   const uint32_t n = s_h18B000.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
   if (n <= 16 || (n % 50) == 0) {
     MCLA_LOG_INFO("TEXDICT-CALLER sub_8218B000 #{} r3={:08X} r4={:08X} lr={:08X}",
-                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+                  n, obj, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
   }
   __imp__sub_8218B000(ctx, base);
+  if (n <= 12) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t w[8] = {};
+    if (obj != 0 && mem.IsValid(obj, 32)) {
+      for (int i = 0; i < 8; ++i)
+        (void)mem.ReadU32BE(obj + i * 4, &w[i]);
+    }
+    MCLA_LOG_INFO("TEXDICT-OBJ #{} @{:08X} [{:08X} {:08X} {:08X} {:08X} "
+                  "{:08X} {:08X} {:08X} {:08X}]",
+                  n, obj, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+  }
 }
 
 // Session 75f (IDA): named-registry INSERT callers.
@@ -917,6 +929,22 @@ PPC_FUNC(sub_821FB1C8) {
                   static_cast<uint32_t>(ctx.lr));
   }
   __imp__sub_821FB1C8(ctx, base);
+}
+
+// Session 75g: parent of the globaltex.list preload (82185A40 is a label
+// inside this large function). If this never runs, named textures never
+// get INSERTED into 0x82839E2C.
+PPC_FUNC_IMPL(__imp__sub_82185648);
+static std::atomic<uint32_t> s_h185648{0};
+PPC_FUNC(sub_82185648) {
+  const uint32_t n = s_h185648.fetch_add(1) + 1;
+  if (n <= 8) {
+    MCLA_LOG_INFO("TEXLOAD-census sub_82185648 #{} r3={:08X} r4={:08X} "
+                  "r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_82185648(ctx, base);
 }
 
 // ---------------------------------------------------------------------------

@@ -26,12 +26,18 @@ frames on your GPU. It does **not** draw the actual 3D world yet.
 3. Only dummy HUD draws run (`sub_8217B7B0`). The real draw path
    (`82227428` with type `0x20000000`) never fires.
 
-**What to work on next:** Make named-texture INSERT run.
-- Insert = `sub_82185468` → hash table `0x82839E2C`
-- `sub_82185A40` reads `globaltex.list` (file **exists** on disk, 575 bytes)
-  and inserts each name — **not in the function map**, so no `PPC_FUNC` hook
-- Mapped insert caller `sub_821FB1C8` census: **0 hits** in soak
-- Register (`TEXDICT-CALLER`) already runs ×10 — containers exist, contents empty
+**What to work on next:** Named-texture INSERT never runs.
+- Insert = `sub_82185468` → hash `0x82839E2C`
+- `globaltex.list` exists on disk (cars, 575 bytes) but preload
+  (`82185A40`) is **not a recompiled entry** — IDA put it inside
+  `sub_82185648`, but the TU has no `loc_82185A40` label (not a branch
+  target). That whole file-preload path is unreachable from compiled code.
+- `sub_82185648` **does** run (TEXLOAD ×3) but only as individual creates:
+  `"Not Implemented"`, `"uiOverlay"`, `"uiOverlayDepth"` — not the bulk list.
+- Dictionary objects after register (`TEXDICT-OBJ` dump) are **empty shells**
+  (`[0,0,0,1,0,0,0,0]` etc). Some later ones have a small linked pointer.
+- So: containers open, contents never filled. Next is the `.xtd` / RSC
+  parse that should write the name table into the dict before register.
 
 **How to run / check:**
 ```bat
