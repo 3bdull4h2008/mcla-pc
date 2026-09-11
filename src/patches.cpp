@@ -2873,3 +2873,18 @@ PPC_FUNC(sub_8218CC70) {
     }
   }
 }
+
+// Session 75l: the committed generated tree references 0x8221D9D0 in the
+// mapping table but no TU defines a body for it (linker: undefined symbol).
+// No recompiled guest code calls it directly (indirect dispatch only).
+// Provide a log-once census body so the table links; a hit means the game
+// dispatches here and the real semantics must be recovered.
+PPC_FUNC(sub_8221D9D0) {
+  static std::atomic<uint32_t> s_h8221D9D0{0};
+  const uint32_t n = s_h8221D9D0.fetch_add(1) + 1;
+  if (n <= 8 || (n % 500) == 0) {
+    MCLA_LOG_WARN("MISSING-BODY sub_8221D9D0 #{} r3={:08X} r4={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  ctx.r3.u32 = 0;
+}

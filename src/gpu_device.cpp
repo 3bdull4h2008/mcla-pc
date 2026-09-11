@@ -1089,10 +1089,30 @@ static std::atomic<uint32_t> s_h18BF20{0};
 PPC_FUNC(sub_8218BF20) {
   const uint32_t n = s_h18BF20.fetch_add(1) + 1;
   if (n <= 16 || (n % 50) == 0) {
+    // r4 is the deserialization stream the dict is built from:
+    // +8 buffer ptr, +24 read cursor, +28 end (decoded from the TU).
+    // Empty dict <=> cursor==end at build time; dump the range + head bytes.
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t buf = 0, pos = 0, end = 0;
+    mem.ReadU32BE(ctx.r4.u32 + 8, &buf);
+    mem.ReadU32BE(ctx.r4.u32 + 24, &pos);
+    mem.ReadU32BE(ctx.r4.u32 + 28, &end);
+    char head[65] = {0};
+    if (end > pos && buf != 0) {
+      const uint32_t avail = end - pos;
+      const uint32_t nread = avail < 16 ? avail : 16;
+      for (uint32_t i = 0; i < nread; ++i) {
+        uint8_t b = 0;
+        if (mem.ReadU8(buf + pos + i, &b))
+          snprintf(head + i * 4, 5, "%02X ", b);
+      }
+    }
     MCLA_LOG_INFO("DICTFACT-census sub_8218BF20 #{} r3={:08X} r4={:08X} "
-                  "r5={:08X} lr={:08X}",
+                  "r5={:08X} lr={:08X} stream buf={:08X} pos={:08X} end={:08X} "
+                  "left={} head='{}'",
                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
-                  static_cast<uint32_t>(ctx.lr));
+                  static_cast<uint32_t>(ctx.lr), buf, pos, end,
+                  end > pos ? end - pos : 0, head);
   }
   __imp__sub_8218BF20(ctx, base);
 }
