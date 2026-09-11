@@ -313,6 +313,64 @@ record the new top blocker, add the soak logs to the evidence table.
   note on how to build the tool and regenerate).
 - `docs/HANDOFF_NEXT_AGENT.md` updated.
 
+## 7b. SPIKE FINDINGS (session 74b) — corrections, do not re-derive
+
+Four things were verified by execution. Three of them **correct §4 above.**
+
+1. **The XenonRecomp binary DOES exist.** §4 Route B step 2 is wrong — my earlier
+   `find -maxdepth 3` only looked in `build/` and `build-msvc/`. The working exe is
+   `.research/XenonRecomp/build-clang/XenonRecomp/XenonRecomp.exe`
+   (`rebuild_clang.bat` → `ninja: no work to do`, exit 0, already up to date).
+   `build-clang/XenonAnalyse/XenonAnalyse.exe` exists too. **No tool build needed.**
+
+2. **`midasm_hook` DOES accept vector registers — Route A is viable.** Confirmed
+   from UnleashedRecomp's shipped config
+   `.research/UnleashedRecomp/UnleashedRecompLib/config/SWA.toml`, e.g. line 943:
+   ```toml
+   [[midasm_hook]]
+   name = "WorldMapProjectionMidAsmHook"
+   address = 0x82574E00
+   registers = ["v63", "v62"]
+   ```
+   Other examples use `["v127","f24"]`, `["r30","v61"]`, `["v63","v62"]`,
+   `["f0","v62"]`, `["v62"]`. So `v63`/`v0` for our trap site is fine. Note these
+   examples set **no** `jump_address` / `after_instruction` — those keys are parsed
+   (`recompiler_config.cpp:114-132`) but unproven against a `__builtin_debugtrap()`.
+   **Still unverified: that `jump_address` actually skips the trap** rather than
+   falling through to it. Test that on one site before writing all four.
+
+3. **The config path must be a BARE FILENAME, run from the repo root.**
+   `recompiler_config.cpp:5` does
+   `directoryPath = configFilePath.substr(0, configFilePath.find_last_of("\\/") + 1)`.
+   If the path contains a separator, `directoryPath` becomes e.g. `config/`, and
+   line 74 then resolves the switch table as
+   `config/.research/XenonRecomp/XenonAnalyse/jump_tables.toml` — which does not
+   exist. Passing a bare filename makes `find_last_of` return `npos`, so
+   `substr(0, npos+1)` == `substr(0,0)` == `""`, and every relative path resolves
+   against the cwd. **So: copy the temp config into the repo root, not `config/`.**
+   (`build/game_data/default.xex` and `.research/.../jump_tables.toml` both exist
+   and are correct relative to the repo root.)
+
+4. **The header argument is copied VERBATIM into `ppc_context.h`, and the obvious
+   source file is NOT the right one.** `recompiler.cpp:2583-2596` emits
+   `#pragma once` + `#include "ppc_config.h"` + a blank line, then splices in the
+   entire contents of `headerFilePath` and saves it as `ppc_context.h`.
+   `.research/XenonRecomp/XenonUtils/ppc_context.h` (703 lines) does **not** match
+   the generated `ppc_context.h` (739 lines, body differs after stripping the
+   4-line prefix). So the project uses its **own** modified context header, whose
+   location is **not yet found**. Until it is, a baseline regeneration cannot be
+   byte-compared.
+   **To locate it:** search the repo (excluding `generated/` and `.research/`) for a
+   file whose first lines are `#pragma once` / `#include "ppc_config.h"` and which
+   is ~735 lines — or diff candidates against
+   `tail -n +5 generated/ppc_xenon/ppc_context.h`. Alternatively reconstruct the
+   input mechanically with that same `tail -n +5`, which guarantees byte-exactness
+   without knowing the original path.
+
+**Net effect on the plan:** Route A gets cheaper (no tool build, vector registers
+confirmed). Route B's reproducibility gate (§4 step 3) is **still blocked** on
+finding the context header from item 4 — that is the single next action.
+
 ## 8. Reference locations
 
 | What | Where |
