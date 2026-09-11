@@ -8,6 +8,7 @@
 # ── Derived / regenerable ───────────────────────────────────
 # Recompilation output (never editable; regenerated from game)
 /generated/
+/docs/
 # Node tooling install + lock-backed deps
 /node_modules/
 /.opencode/node_modules/
@@ -39,6 +40,15 @@ Thumbs.db
 *.d
 ninja_out.txt
 ninja_err.txt
+build_s74.txt
+build_log.txt
+build_err.txt
+crash_dump.txt
+crash_log_early.txt
+build_out.txt
+*.pid
+*.err
+cache/
 
 # ── Local-only config (archived references) ─────────────────
 /config/opencode.json
