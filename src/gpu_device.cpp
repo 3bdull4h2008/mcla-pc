@@ -705,11 +705,21 @@ PPC_FUNC(sub_82420BA8) {
       (void)mem.ReadU32BE(ctx.r6.u32 + 8, &r6w2);
       (void)mem.ReadU32BE(ctx.r6.u32 + 12, &r6w3);
     }
-    MCLA_LOG_INFO("SUBMIT-census sub_82420BA8 #{} dev={:08X} flags={:X} "
+    uint32_t streamCount = 0, vb0base = 0, vb0stride = 0, vb0size = 0;
+    if (dev != 0 && mem.IsValid(dev + 12748, 16)) {
+      (void)mem.ReadU32BE(dev + 12748, &streamCount);
+      (void)mem.ReadU32BE(dev + 12756, &vb0base);
+      (void)mem.ReadU32BE(dev + 12760, &vb0stride);
+      (void)mem.ReadU32BE(dev + 12764, &vb0size);
+    }
+    MCLA_LOG_INFO("SUBMIT-census sub_82420BA8 #{} dev={:08X} flags={:X} lr={:08X} "
+                  "streams={} vb0=[{:08X},{:08X},{:08X}] "
                   "r5={:08X} [{:08X} {:08X} {:08X} {:08X}] "
                   "r6={:08X} [{:08X} {:08X} {:08X} {:08X}] "
                   "r7={:08X} r8={:08X} r9={:08X} r10={:08X}",
-                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, r5w0, r5w1, r5w2, r5w3,
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr),
+                  streamCount, vb0base, vb0stride, vb0size,
+                  ctx.r5.u32, r5w0, r5w1, r5w2, r5w3,
                   ctx.r6.u32, r6w0, r6w1, r6w2, r6w3, ctx.r7.u32, ctx.r8.u32,
                   ctx.r9.u32, ctx.r10.u32);
   }
@@ -770,6 +780,128 @@ PPC_FUNC(sub_82420BA8) {
   }
 
   __imp__sub_82420BA8(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// Session 75b census (log-only, no behavior change): who binds streams and
+// who enters the real draw wrapper. DRAW_INDEXED stays 0 because the
+// 20BA8 hook only sees dummy li-r5=0 submits. Real chain (TU-mapped):
+//   sub_8217A470 -> sub_8241BE78 (SetStreams, writes dev+12748 count +
+//   VB descs at dev+12756) -> sub_8241C308 (r6 must be IB) -> sub_82420BA8
+// ---------------------------------------------------------------------------
+
+PPC_FUNC_IMPL(__imp__sub_8241BE78);
+static std::atomic<uint32_t> s_h41BE78{0};
+PPC_FUNC(sub_8241BE78) {
+  const uint32_t n = s_h41BE78.fetch_add(1) + 1;
+  if (n <= 16 || (n % 200) == 0) {
+    MCLA_LOG_INFO("SETSTREAMS-census sub_8241BE78 #{} dev={:08X} count={:08X} "
+                  "vbArray={:08X} extra={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8241BE78(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8241C308);
+static std::atomic<uint32_t> s_h41C308{0};
+PPC_FUNC(sub_8241C308) {
+  const uint32_t n = s_h41C308.fetch_add(1) + 1;
+  if (n <= 16 || (n % 200) == 0) {
+    MCLA_LOG_INFO("DRAWWRAP-census sub_8241C308 #{} dev={:08X} flags={:08X} "
+                  "r5={:08X} r6={:08X} r7={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  ctx.r7.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8241C308(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8217A470);
+static std::atomic<uint32_t> s_h17A470{0};
+PPC_FUNC(sub_8217A470) {
+  const uint32_t n = s_h17A470.fetch_add(1) + 1;
+  if (n <= 16 || (n % 200) == 0) {
+    MCLA_LOG_INFO("SETSTREAMS-CALLER sub_8217A470 #{} r3={:08X} r4={:08X} "
+                  "r5={:08X} r6={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8217A470(ctx, base);
+}
+
+// Session 75c: real-draw dispatcher gate. sub_82227428 only reaches
+// sub_8217A470 (SetStreams) when its dispatch dword == 0x20000000
+// (explore mapping of the three bl sites). Loading-screen HUD uses the
+// dummy path instead. Census r4 so we can see what type values actually
+// arrive.
+PPC_FUNC_IMPL(__imp__sub_82227428);
+static std::atomic<uint32_t> s_h227428{0};
+PPC_FUNC(sub_82227428) {
+  const uint32_t n = s_h227428.fetch_add(1) + 1;
+  if (n <= 32 || (n % 200) == 0) {
+    MCLA_LOG_INFO("DRAWDISP-census sub_82227428 #{} r3={:08X} r4={:08X} "
+                  "r5={:08X} r6={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_82227428(ctx, base);
+}
+
+// Session 75c: first gate inside the SetStreams caller path.
+PPC_FUNC_IMPL(__imp__sub_82178F38);
+static std::atomic<uint32_t> s_h178F38{0};
+PPC_FUNC(sub_82178F38) {
+  __imp__sub_82178F38(ctx, base);
+  const uint32_t n = s_h178F38.fetch_add(1) + 1;
+  if (n <= 16 || (n % 200) == 0) {
+    MCLA_LOG_INFO("LOADGATE-census sub_82178F38 #{} ret={} lr={:08X}",
+                  n, ctx.r3.s32, static_cast<uint32_t>(ctx.lr));
+  }
+}
+
+// Session 75d (Ghidra): texture-registry special-name init.
+// FUN_82180A30 creates the "none" / "nonresident" fallback objects that
+// FUN_821811C0 special-cases by string compare. Called only from 82177248.
+PPC_FUNC_IMPL(__imp__sub_82180A30);
+static std::atomic<uint32_t> s_h180A30{0};
+PPC_FUNC(sub_82180A30) {
+  const uint32_t n = s_h180A30.fetch_add(1) + 1;
+  MCLA_LOG_INFO("TEXINIT-census sub_82180A30 #{} lr={:08X}",
+                n, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_82180A30(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82177248);
+static std::atomic<uint32_t> s_h177248{0};
+PPC_FUNC(sub_82177248) {
+  const uint32_t n = s_h177248.fetch_add(1) + 1;
+  MCLA_LOG_INFO("TEXINIT-CALLER sub_82177248 #{} lr={:08X}",
+                n, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_82177248(ctx, base);
+}
+
+// Graphics/resource init bundle that calls 82177248 (none/nonresident tex init).
+PPC_FUNC_IMPL(__imp__sub_82177948);
+static std::atomic<uint32_t> s_h177948{0};
+PPC_FUNC(sub_82177948) {
+  const uint32_t n = s_h177948.fetch_add(1) + 1;
+  MCLA_LOG_INFO("GFXINIT-census sub_82177948 #{} lr={:08X}",
+                n, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_82177948(ctx, base);
+}
+
+// Session 75e (IDA): pgDictionary load/register caller.
+// sub_82197598 links the dict into active list 0x82839ED0 (not a
+// recompiled entry — no __imp__). Census its mapped caller instead.
+PPC_FUNC_IMPL(__imp__sub_8218B000);
+static std::atomic<uint32_t> s_h18B000{0};
+PPC_FUNC(sub_8218B000) {
+  const uint32_t n = s_h18B000.fetch_add(1) + 1;
+  if (n <= 16 || (n % 50) == 0) {
+    MCLA_LOG_INFO("TEXDICT-CALLER sub_8218B000 #{} r3={:08X} r4={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8218B000(ctx, base);
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,14 +1810,22 @@ PPC_FUNC(sub_821D5E10) {
     // 525DE064 stream was pass-through'd raw and the guest parser produced
     // wild pointer 0x7E780000 → AV in sub_821DEE40. Skip the XCompress
     // fatal, consume the stream, emit nothing. Guest sees empty output.
+    uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+    (void)mem.ReadU32BE(inPtr + 0, &b0);
+    if (inLeft >= 16) {
+      (void)mem.ReadU32BE(inPtr + 4, &b1);
+      (void)mem.ReadU32BE(inPtr + 8, &b2);
+      (void)mem.ReadU32BE(inPtr + 12, &b3);
+    }
     (void)mem.WriteU32BE(st + 0, 0);       // inLeft = 0
     (void)mem.WriteU32BE(st + 8, inLeft);  // consumed = all input
     (void)mem.WriteU32BE(st + 12, 0);      // expected = 0
     const uint32_t pt = s_h5E10pt.fetch_add(1) + 1;
     if (pt <= 16 || (pt % 50) == 0)
-      MCLA_LOG_WARN("INFLATE-SKIP #{} magic={:08X} in={} out={} (no XCompress "
+      MCLA_LOG_WARN("INFLATE-SKIP #{} magic={:08X} in={} out={} inPtr={:08X} "
+                    "head=[{:08X} {:08X} {:08X} {:08X}] (no XCompress "
                     "header — skip fatal, emit 0)",
-                    pt, magic, inLeft, outLeft);
+                    pt, magic, inLeft, outLeft, inPtr, b0, b1, b2, b3);
     return;
   }
   __imp__sub_821D5E10(ctx, base);

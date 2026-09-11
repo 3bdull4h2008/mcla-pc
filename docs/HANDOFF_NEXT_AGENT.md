@@ -1,8 +1,216 @@
 # HANDOFF — next agent, read this first
 
-**Date:** 2026-09-11 (session 75)  
+**Date:** 2026-09-11 (session 75e — IDA MCP)  
 **Goal:** Midnight Club LA native D3D12 renderer — working game with visible frames.  
 **Repo:** `E:\mcla pc` (do not delete; overlay notes in `audit-clean/`).
+
+---
+
+## PLAIN STATUS (vibe-coder summary)
+
+**Where we are:** The game boots, shows loading screens, and can present
+frames on your GPU. It does **not** draw the actual 3D world yet.
+
+**What got fixed this week:**
+1. A crash that killed the process on a missing CPU vector instruction
+   (`vpkd3d128`) — implemented, trap is gone.
+2. Heap corruption storm from a bad blit — already closed last session.
+
+**What's still broken (in order):**
+1. **Textures never finish loading.** The game opens "texture dictionaries"
+   (packs of named images) but the packs are empty. Every lookup like
+   `"car_paint"` misses and falls back to a dummy 32×32 texture with no ID.
+   That's the `0xCDCDCDCD` spam in the logs.
+2. Because assets never finish, the game **stays on loading screens** and
+   never binds vertex buffers → `DRAW_INDEXED` stays 0 → no world geometry.
+3. Only dummy HUD draws run (`sub_8217B7B0`). The real draw path
+   (`82227428` with type `0x20000000`) never fires.
+
+**What to work on next:** Find the function that fills a loaded texture
+dictionary with names + image objects after decompress. Register already
+runs (`TEXDICT-CALLER` ×10); contents are empty.
+
+**How to run / check:**
+```bat
+ninja_build.bat
+build\mcla.exe
+:: logs in boot_stdout_*.log — look for TEXDICT, REBASE-POISON, DRAW_INDEXED
+```
+**RE tools:** IDA MCP on `127.0.0.1:8745` (preferred) · Ghidra on `:8089` ·
+generated TUs are the decompiled game code (never edit `generated/`).
+
+---
+
+## SESSION 75E — IDA MCP UP; DICTIONARY REGISTER RUNS BUT LOOKUPS STILL MISS
+
+### IDA setup (now live)
+```powershell
+# already listening on 127.0.0.1:8745, proxy connected
+ida-pro_check_connection  # OK, mcla_pe.bin base 0x82000000
+```
+Start script: `tools/start_idalib_mcp.ps1` (or `idalib_jsonrpc_server.py`).
+Use IDA for xrefs/Hex-Rays; generated TUs remain ground truth when bounds are wrong.
+
+### Texture dictionary path (IDA Hex-Rays)
+
+| Addr | Role |
+|---|---|
+| `sub_821849C0` | named lookup: `"none"` → `0x82839CF0`; else hash `sub_82183E80(&0x82839E2C)`; else walk dict list `0x82839ED0`; miss → fatal `"Unable to find texture '%s' in any active texture dictionary!"` @ `0x82009E20` |
+| `sub_82197598` | **pgDictionary register** — `*(entry+8)=oldHead; head=entry` into `0x82839ED0` |
+| `sub_8218B000` | mapped caller of 82197598 (census hook) |
+| RTTI | `rage::pgDictionary<rage::grcTexture>` @ `0x827DC77C` |
+
+`sub_82197598` is **not** in `ppc_func_mapping.cpp` (no `__imp__`) — cannot `PPC_FUNC` it.
+Census lives on `sub_8218B000`.
+
+### Soak `boot_stdout_c75f.log` (70s)
+
+| Marker | Hits |
+|---|---|
+| `TEXDICT-CALLER` `8218B000` | **10** (r4 always `82860C18`, r3 = pool16 A0110xxx) |
+| `TEXINIT` / `GFXINIT` | 2 / 1 (none/nonresident specials still OK) |
+| `REBASE-POISON` | 12 (named textures still miss) |
+| `DRAWDISP` / `DRAW_INDEXED` | 0 / 0 |
+
+**Dictionaries register.** Named lookups still miss → dictionary *contents*
+are empty (inflate never filled the pgDictionary body), not a register bug.
+
+### Next (ranked)
+1. Who should populate a loaded `pgDictionary<grcTexture>` (name table +
+   texture objects) after inflate — likely another `8218Bxxx` / `8219xxxx`
+   sibling once the RSC body is valid.
+2. Confirm inflate of the **texture** archive (not audlo) actually produces
+   non-empty output.
+3. Still no world draws (`82227428` dispatch `0x20000000`).
+
+---
+
+## SESSION 75D — TEXINIT RUNS; NAMED REGISTRY FILL STILL MISSING
+
+### Ghidra MCP (live on :8089, program `mcla_pe.bin` base `0x82000000`)
+
+Workflow that works on this raw image:
+1. `ghidra_load_program` with `PowerPC:BE:64:default`
+2. `ghidra_set_image_base 0x82000000`
+3. **Clear `no-return` on ABI thunks** `0x823D91E4/EC/F0/F4/F8/FC` (savegprlr family) — without this the decompiler truncates every function at the prologue
+4. `ghidra_clear_flow_and_repair` on the range, then `decompile_function`
+
+### Texture registry (decoded)
+
+| Addr | Role |
+|---|---|
+| `sub_821811C0` | name lookup: special-string compare vs `"none"` @ `0x82009E18`, else hash `sub_82180680(table=0x82839E2C)` + linked list walk |
+| `sub_82180680` | hash find (`FUN_821C95A0` / `FUN_823DB730`) |
+| `sub_82180A30` | **init**: memset `0x82839D08`, creates `"none"`/`"nonresident"` objects into `0x82839CF0/CF4` |
+| `sub_82177248` | sole caller of `82180A30` |
+| `sub_82177948` | graphics-init bundle (`82177248` + more) |
+
+Strings at `0x82009DFC`: `"Not Implemented"` / `"nonresident"` / `"none"` / `"Unable to find texture '%s'"`.
+
+### Soak `boot_stdout_c75e.log` (80s)
+
+| Marker | Hits |
+|---|---|
+| `GFXINIT-census` `82177948` | **1** |
+| `TEXINIT-CALLER` `82177248` | **1** |
+| `TEXINIT-census` `82180A30` | **1** |
+| `REBASE-POISON` | 32 (named textures still miss) |
+| `DRAWDISP` `82227428` | **0** |
+| `DRAW_INDEXED` | 0 |
+
+**Special-name init DOES run.** Fallbacks for `none`/`nonresident` exist. Named
+textures still miss the hash table → 64-byte CDCDCDCD objects → REBASE-POISON.
+
+### Still open
+1. **Who inserts into hash table `0x82839E2C`?** (named .xtd load → register)
+2. Why `82227428` never sees dispatch `0x20000000` (world draws).
+3. Do not add more short-circuits.
+
+### Census in tree
+SETSTREAMS / DRAWWRAP / DRAWDISP / LOADGATE / TEXINIT / GFXINIT +
+SUBMIT lr/streams/vb0 + INFLATE-SKIP head dump.
+
+---
+
+## SESSION 75C — LOADING GATE MAPPED (still no world draws)
+
+### New census (log-only, soak `boot_stdout_c75d.log`)
+
+| Marker | Hits | Meaning |
+|---|---|---|
+| `DRAWDISP-census` `sub_82227428` | **0** | real-draw dispatcher **never entered** |
+| `LOADGATE-census` `sub_82178F38` | **0** | first gate inside SetStreams path **never entered** |
+| `SETSTREAMS` / `DRAWWRAP` | 0 | bind + draw wrap dead (as 75b) |
+| `sub_82420BA8` | 2 | dummy only (`lr=8217BB10`, streams=0) |
+| `FRAME-END` / `NATIVE-PRESENT` | 3 / 4 | loading-screen HUD path healthy |
+
+**Conclusion:** the process never leaves the loading-screen render path.
+World-geometry submission (`82227428` → `0x20000000` branch → `8217A470`) is
+unreached. Presents work because loading HUD uses the dummy submit.
+
+### Inflate `-12` / magic `525DE064` (NOT the geometry gate)
+
+Explore + soak (`INFLATE-SKIP` with `inPtr`/`head=` dump):
+- Caller `sub_821BC140` sets `inLeft = bytesRead - 12` (header skip).
+- Short/zero async read on `xarchive_audlo.rpf` (LO-res **audio**, 1.3GB)
+  → `inLeft = -12` → we peek OOB and see random bytes (`525DE064…`).
+- `525DE064` is **not** a format magic (0 hits in src/ + generated/).
+- Do **not** treat INFLATE-SKIP as the root gate. The 8242FC1C wait is
+  the healthy GPU-worker tick (`40004D7C`), not a load stall.
+
+### What still blocks a working game
+
+1. **Complete resource registration** so lookups stop creating CDCDCDCD
+   64-byte texture objects (`prodLr=821853AC` / `8218542C`). That is the
+   session-73 root: loaders never run, not a corruptor.
+2. Only after that will `82227428` see the `0x20000000` dispatch type and
+   stream bind can run → `DRAW_INDEXED` can go >0.
+3. Optional later: short-read on audio archive (`821BC334`) if audlo load
+   actually matters for boot completion.
+
+### Ranked next probes
+
+1. Texture registry fill: who should write obj+4 after `sub_82184F58`
+   fallback create — find the loader that never runs (inflate/XCompress
+   resource body → register).
+2. Census `sub_825F48E8` (other SetStreams site) + `sub_82312FEC` mode/`0x1000` bit.
+3. Do not add more short-circuits.
+
+### Census left in tree
+`SETSTREAMS`/`DRAWWRAP`/`SETSTREAMS-CALLER`/`DRAWDISP`/`LOADGATE` +
+`SUBMIT` lr/streams/vb0 + richer `INFLATE-SKIP` head dump.
+Ghidra/IDA MCP still optional; TUs + explore are enough for this path.
+
+---
+
+## SESSION 75B — DRAW_INDEXED MAPPED (still 0, but now we know why)
+
+### Real vs dummy draw paths (TU-mapped + soak-proven)
+
+| Path | Chain | Status |
+|---|---|---|
+| **Real geometry** | `sub_8217A470` → `sub_8241BE78` SetStreams (writes `dev+12748` count + VB descs at `dev+12756`) → `sub_8241C308` (needs r6=IB) → `sub_82420BA8` | **NEVER RUNS** (0 hits on all three) |
+| **Dummy/HUD** | `sub_8217B7B0` (lr=`8217BB10`) → `sub_82420BA8` with **r5=0, streams=0** | the only 20BA8 hits in soak |
+
+Evidence: `boot_stdout_c75.log` — `SETSTREAMS-census`=0, `DRAWWRAP-census`=0,
+`SETSTREAMS-CALLER`=0, `SUBMIT-census #1/#2 lr=8217BB10 streams=0 vb0=[0,0,0]`.
+Presents still land (FRAME-END=3, NATIVE-PRESENT=4). Still in loading.
+
+**Conclusion:** `DRAW_INDEXED=0` is a **symptom of never leaving loading /
+ never binding streams**, not a draw-builder bug. Next work is the loader
+ path (inflate / resource init / CDCDCDCD initializers), not more GPU hooks.
+
+### Census left in tree (log-only)
+- `SUBMIT-census` now logs `lr=` + `streams=` + `vb0=[base,stride,size]` (`dev+12748/12756`)
+- `SETSTREAMS-census` `sub_8241BE78`
+- `DRAWWRAP-census` `sub_8241C308`
+- `SETSTREAMS-CALLER` `sub_8217A470`
+
+### Workflow notes (token-efficient RE)
+- Generated TUs are ground truth; Ghidra/IDA MCP are optional xref tools.
+- Ghidra headless launcher: `C:\Users\abdul\.config\opencode\ghidra-mcp\run-ghidra-mcp-headless.bat`
+  (not running this session). IDA needs Edit→Plugins→MCP.
+- Explore subagent for caller mapping; keep main window for decisions + edits.
 
 ---
 
