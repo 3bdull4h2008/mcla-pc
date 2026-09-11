@@ -12,7 +12,9 @@
 #include <cpu/ppc_context.h>
 
 #include <atomic>
+#include <fstream>
 #include <iterator>
+#include <string>
 
 extern std::atomic<uint32_t> g_mainGuestThreadId;
 
@@ -864,11 +866,65 @@ PPC_FUNC(sub_82178F38) {
 // FUN_821811C0 special-cases by string compare. Called only from 82177248.
 PPC_FUNC_IMPL(__imp__sub_82180A30);
 static std::atomic<uint32_t> s_h180A30{0};
+// Session 75k BOOT LIFE-SUPPORT (not a short-circuit of a guest gate):
+// After TEXINIT creates the real "none" object at 0x82839CF0, insert
+// names from globaltex.list into the named registry via the guest's own
+// insert linker (821854C8). Lookups then HIT the none fallback instead of
+// missing and minting CDCDCDCD 64-byte objects. Removes names once a real
+// loader fills them (replace on re-insert).
+PPC_FUNC_IMPL(__imp__sub_821854C8);
+static void MclaBootstrapGlobaltexNames(uint8_t *base) {
+  static std::atomic<bool> s_done{false};
+  if (s_done.exchange(true))
+    return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t noneObj = 0;
+  (void)mem.ReadU32BE(0x82839CF0, &noneObj);
+  if (noneObj == 0) {
+    MCLA_LOG_WARN("GLOBTEX-BOOT skipped: none object not ready");
+    return;
+  }
+  const char *paths[] = {
+      "build/game_data/xarchive_cache/textures/global/cars/globaltex.list",
+      "build/game_data/xarchive_cache/textures/global/city/globaltex.list",
+  };
+  int inserted = 0;
+  for (const char *path : paths) {
+    std::ifstream in(path);
+    if (!in)
+      continue;
+    std::string line;
+    while (std::getline(in, line)) {
+      // format: "<name> <file>" — first token is the registry name
+      const auto sp = line.find_first_of(" \t\r");
+      std::string name = (sp == std::string::npos) ? line : line.substr(0, sp);
+      while (!name.empty() && (name.back() == '\r' || name.back() == '\n'))
+        name.pop_back();
+      if (name.empty() || name[0] == '#')
+        continue;
+      const uint32_t nameAddr =
+          mem.Alloc(static_cast<size_t>(name.size()) + 1, 16);
+      if (nameAddr == 0)
+        continue;
+      (void)mem.WriteBytes(nameAddr, name.c_str(),
+                           static_cast<uint32_t>(name.size()) + 1);
+      PPCContext tmp{};
+      tmp.r3.u32 = noneObj;
+      tmp.r4.u32 = nameAddr;
+      __imp__sub_821854C8(tmp, base);
+      ++inserted;
+    }
+  }
+  MCLA_LOG_INFO("GLOBTEX-BOOT inserted={} noneObj={:08X}", inserted, noneObj);
+}
+
 PPC_FUNC(sub_82180A30) {
   const uint32_t n = s_h180A30.fetch_add(1) + 1;
   MCLA_LOG_INFO("TEXINIT-census sub_82180A30 #{} lr={:08X}",
                 n, static_cast<uint32_t>(ctx.lr));
   __imp__sub_82180A30(ctx, base);
+  if (n == 1)
+    MclaBootstrapGlobaltexNames(base);
 }
 
 PPC_FUNC_IMPL(__imp__sub_82177248);
