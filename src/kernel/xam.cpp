@@ -202,6 +202,12 @@ uint32_t XamContentClose(const char* szRootName, XXOVERLAPPED* pOverlapped)
 
 uint32_t XamContentGetDeviceData(uint32_t DeviceID, XDEVICE_DATA* pDeviceData)
 {
+    static std::atomic<uint32_t> s_cdd{0};
+    const uint32_t n = s_cdd.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("XamContentGetDeviceData[{}] DeviceID={:08X} out={:08X} "
+                      "(fills nothing — guest sees zeros)",
+                      n, DeviceID, reinterpret_cast<uintptr_t>(pDeviceData));
     return 0;
 }
 
@@ -214,6 +220,12 @@ uint32_t XamContentCreateEnumerator(
     be<uint32_t>* pcbBuffer,
     be<uint32_t>* phEnum)
 {
+    static std::atomic<uint32_t> s_cce{0};
+    const uint32_t n = s_cce.fetch_add(1) + 1;
+    MCLA_LOG_WARN("XamContentCreateEnumerator[{}] user={} dev={:08X} "
+                  "type={:08X} flags={:08X} cItem={}",
+                  n, dwUserIndex, DeviceID, dwContentType, dwContentFlags,
+                  cItem);
     return 0;
 }
 
@@ -225,6 +237,11 @@ uint32_t XamEnumerate(
     be<uint32_t>* pcItemsReturned,
     XXOVERLAPPED* pOverlapped)
 {
+    static std::atomic<uint32_t> s_cen{0};
+    const uint32_t n = s_cen.fetch_add(1) + 1;
+    MCLA_LOG_WARN("XamEnumerate[{}] hEnum={:08X} flags={:08X} cb={} "
+                  "(returns 0 items)",
+                  n, hEnum, dwFlags, cbBuffer);
     return 0;
 }
 

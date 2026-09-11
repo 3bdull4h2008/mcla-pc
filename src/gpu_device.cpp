@@ -2087,10 +2087,25 @@ PPC_FUNC(sub_821D5E10) {
     return;
   }
 
-  if (n <= 16 || (n % 200) == 0)
+  if (n <= 16 || (n % 200) == 0) {
+    // Session 75n: guest stack walk. Recompiler frame convention:
+    // mflr r12; stw r12,-8(r1); stwu r1,-X(r1)  ⇒  saved LR of the function
+    // owning this frame sits at [back_chain - 8]. Walk back chains upward.
+    char chain[160] = {0};
+    size_t off = 0;
+    uint32_t sp = ctx.r1.u32;
+    for (int f = 0; f < 6 && sp != 0 && off + 12 < sizeof(chain); ++f) {
+      uint32_t back = 0, lr = 0;
+      if (!mem.ReadU32BE(sp, &back) || back == 0 || back <= sp) break;
+      if (!mem.ReadU32BE(back - 8, &lr)) break;
+      off += static_cast<size_t>(
+          snprintf(chain + off, sizeof(chain) - off, " f%d=%08X", f, lr));
+      sp = back;
+    }
     MCLA_LOG_INFO("INFLATE #{} st={:08X} in={} out={} consumed={} magic={:08X} "
-                  "lr={:08X}",
-                  n, st, inLeft, outLeft, consumed, magic, ctx.lr);
+                  "lr={:08X} chain[{}]",
+                  n, st, inLeft, outLeft, consumed, magic, ctx.lr, chain);
+  }
 
   if (consumed == 0 && inLeft >= 4 && magic != kXCompressMagic &&
       inPtr != 0 && outPtr != 0) {
@@ -2164,19 +2179,32 @@ PPC_FUNC(sub_821BC140) {
   // no early vtable dispatch - safe to pre-read).
   if (n <= 8) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t node = 0;
-    if (mem.ReadU32BE(ctx.r3.u32 + 4, &node)) {
-      for (int i = 0; i < 3 && node != 0; ++i) {
-        uint32_t w0 = 0, fn = 0, nx = 0;
-        const bool ok0 = mem.ReadU32BE(node + 0, &w0);
-        const bool okf = mem.ReadU32BE(node + 4, &fn);
-        const bool okn = mem.ReadU32BE(node + 12, &nx);
-        MCLA_LOG_INFO("NODE[{}] @ {:08X} w0={:08X}{} fn={:08X}{} next={:08X}{}",
-                      i, node, w0, ok0 ? "" : "?", fn, okf ? "" : "?", nx,
-                      okn ? "" : "?");
-        node = nx;
+    // Session 75n: these descriptors are the streamer request slots (queue
+    // + 0x614 per slot). Dump the header dwords + attempt an ASCII name so
+    // we know WHAT the 3 boot requests load and which callback they carry.
+    uint32_t d[16] = {0};
+    for (int i = 0; i < 16; ++i)
+      (void)mem.ReadU32BE(ctx.r3.u32 + static_cast<uint32_t>(i * 4), &d[i]);
+    char name[48] = {0};
+    for (int nofs = 8; nofs <= 64 && name[0] == 0; nofs += 4) {
+      const char *p = static_cast<const char *>(
+          mcla::kernel::MmGetHostAddress(ctx.r3.u32 + static_cast<uint32_t>(nofs)));
+      if (!p) break;
+      size_t j = 0;
+      for (; j < 40; ++j) {
+        const unsigned char c = static_cast<unsigned char>(p[j]);
+        if (c == 0) break;
+        name[j] = (c >= 32 && c < 127) ? static_cast<char>(c) : '?';
       }
+      name[j] = 0;
+      if (j < 4) name[0] = 0; // too short to be a path — keep scanning
     }
+    MCLA_LOG_INFO("REQDUMP #{} a0={:08X} name='{}' d=[{:08X} {:08X} {:08X} "
+                  "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                  "{:08X} {:08X} {:08X} {:08X} {:08X}]",
+                  n, ctx.r3.u32, name, d[0], d[1], d[2], d[3], d[4], d[5],
+                  d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14],
+                  d[15]);
   }
   __imp__sub_821BC140(ctx, base);
 }
