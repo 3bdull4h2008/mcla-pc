@@ -2898,3 +2898,31 @@ PPC_FUNC(sub_82363990) {
                   n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_82363990(ctx, base);
 }
+
+// Session 76i: registry-state census at fiDevice::GetDevice entry.
+// Registry header 0x82860844: [0]=array, [4]=count(u16), stride 264.
+PPC_FUNC_IMPL(__imp__sub_821CB488);
+static std::atomic<uint32_t> s_hCB488{0};
+PPC_FUNC(sub_821CB488) {
+  const uint32_t n = s_hCB488.fetch_add(1) + 1;
+  if (n <= 8 || (n % 200) == 0) {
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t arr = 0, cnt = 0;
+    memR.ReadU32BE(0x82860844u, &arr);
+    memR.ReadU32BE(0x82860848u, &cnt);
+    cnt &= 0xFFFF;
+    char ents[160] = {0};
+    size_t off = 0;
+    for (uint32_t e = 0; e < cnt && e < 6 && off + 20 < sizeof(ents); ++e) {
+      uint32_t w0 = 0, w1 = 0;
+      memR.ReadU32BE(arr + e * 264u, &w0);
+      memR.ReadU32BE(arr + e * 264u + 4u, &w1);
+      off += static_cast<size_t>(snprintf(ents + off, sizeof(ents) - off,
+                                          " [%08X %08X]", w0, w1));
+    }
+    MCLA_LOG_WARN("GETDEV sub_821CB488 #{} path={:08X} arr={:08X} cnt={} "
+                  "entries{}",
+                  n, ctx.r3.u32, arr, cnt, ents);
+  }
+  __imp__sub_821CB488(ctx, base);
+}

@@ -775,6 +775,10 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // — the boot init reads it before anything fills it (BOOTPATH crash).
     mcla::native::RegisterGuestWatchRange(0x827D7770u, 0x827D7790u);
 
+    // Session 76i: watch the device-registry header (0x82860844: array ptr
+    // + count) — catch WHO registers devices and when.
+    mcla::native::RegisterGuestWatchRange(0x82860844u, 0x82860850u);
+
     // Kernel heaps must exist before any guest import allocates. Skipping this
     // left heap==physicalHeap==nullptr and the first allocation crashed inside
     // o1heapAllocate reading handle->diagnostics.capacity at instance+0x208.
