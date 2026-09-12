@@ -2768,14 +2768,18 @@ PPC_FUNC(sub_82187820) {
       memP.ReadU32BE(ctx.r4.u32 + i * 4u, &f[i]);
     char path[48] = {0};
     for (int cand = 0; cand < 24 && path[0] == 0; ++cand) {
-      const char *p = static_cast<const char *>(
-          mcla::kernel::MmGetHostAddress(f[cand % 6] + (cand / 6) * 4u));
-      if (!p) continue;
+      const uint32_t addr = f[cand % 6] + (cand / 6) * 4u;
+      // Session 76x: descriptor fields can be NULL/garbage — read through the
+      // checked accessor only (a raw MmGetHostAddress + deref AV'd at guest 0).
+      if (addr < 0x1000)
+        continue;
+      unsigned char raw[41] = {0};
+      if (!memP.ReadBytes(addr, raw, 40))
+        continue;
       size_t j = 0;
       for (; j < 40; ++j) {
-        unsigned char ch = (unsigned char)p[j];
-        if (ch == 0) break;
-        path[j] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+        if (raw[j] == 0) break;
+        path[j] = (raw[j] >= 32 && raw[j] < 127) ? (char)raw[j] : '?';
       }
       path[j] = 0;
       if (j < 3) path[0] = 0;
@@ -2934,6 +2938,27 @@ PPC_FUNC(sub_821CB488) {
     (void)memR.ReadU32BE(0x82855A0Cu, &lockFlag);
     MCLA_LOG_WARN("GETDEV #{} path='{}' arr={:08X} cnt={} cap={} lockFlag={:08X}",
                   n, path, arr, cnt, cap, lockFlag);
+    if (n <= 3) {
+      // Session 76j: heap-arena layout dump. Default allocs route to
+      // m_Allocators[1] = sysMemDualBuddyAllocator (sub_821C08F8 uses
+      // [reg+(r6+1)*4]); if a buddy arena intersects the simple allocator's
+      // registered pool range, the two allocators hand out the same bytes.
+      auto dumpHeap = [&](const char *tag, uint32_t base) {
+        uint32_t f0 = 0, f4 = 0, c76 = 0, f152 = 0, f248 = 0;
+        (void)memR.ReadU32BE(base + 0u, &f0);
+        (void)memR.ReadU32BE(base + 4u, &f4);
+        (void)memR.ReadU32BE(base + 76u, &c76);
+        (void)memR.ReadU32BE(base + 152u, &f152);
+        (void)memR.ReadU32BE(base + 248u, &f248);
+        MCLA_LOG_WARN("HEAP76 {} @{:08X} vt={:08X} +4={:08X} +76={:08X} "
+                      "+152={:08X} +248={:08X}",
+                      tag, base, f0, f4, c76, f152, f248);
+      };
+      dumpHeap("simple", 0x82830CD8u);
+      dumpHeap("buddyA", 0x82830C10u);
+      dumpHeap("buddyB", 0x82830B50u);
+      dumpHeap("dual  ", 0x82830B40u);
+    }
     for (uint32_t e = 0; arr != 0 && e < 2 && e <= cnt; ++e) {
       const uint32_t eb = arr + e * 276u;
       uint16_t flag = 0, len = 0, dcnt = 0, dcap = 0;

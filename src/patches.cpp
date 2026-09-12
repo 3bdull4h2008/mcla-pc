@@ -1450,6 +1450,142 @@ std::atomic<uint32_t> s_arenaFailures{0};
 thread_local uint32_t t_arenaDepth = 0;
 } // namespace
 
+// Session 76j: general-allocator free (sysMemSimpleAllocator::Free slow path,
+// sub_821C2AB8 → sub_821C22D0(self=heap, ptr)). Log ptr + the 16-byte block
+// header it trusts ([ptr-16]=self, [ptr-12]=size, [ptr-8]=phys-prev,
+// [ptr-4]=flags) so a bogus/interior free that poisons the free buckets
+// names itself. Volume-capped: first 40 always, size>=512, or window hits.
+// Session 76j: sysMemDualBuddyAllocator Allocate/Free (the registry's default
+// alloc bank: sub_821C08F8 dispatches to m_Allocators[(r6+1)*4], i.e. the
+// dual buddy for r6=0). The checkerboard pixel buffer's write landed at
+// A0018028 — inside the SIMPLE allocator's slab region — while buddyA's
+// arena base is A4001000. Log every buddy alloc/free to catch the block that
+// escaped its arena.
+PPC_FUNC_IMPL(__imp__sub_82130010);
+static std::atomic<uint32_t> s_buddyAlloc{0};
+PPC_FUNC(sub_82130010) {
+  const uint32_t n = s_buddyAlloc.fetch_add(1) + 1;
+  const uint32_t size = ctx.r4.u32;
+  __imp__sub_82130010(ctx, base);
+  if (n <= 60 || size >= 1024) {
+    MCLA_LOG_WARN("BUDDY76-ALLOC #{} dual={:08X} size={:#x} ret={:08X} lr={:08X}",
+                  n, ctx.r3.u32, size, ctx.r3.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+}
+
+PPC_FUNC_IMPL(__imp__sub_82130048);
+static std::atomic<uint32_t> s_buddyFree{0};
+PPC_FUNC(sub_82130048) {
+  const uint32_t n = s_buddyFree.fetch_add(1) + 1;
+  const uint32_t ptr = ctx.r4.u32;
+  __imp__sub_82130048(ctx, base);
+  if (n <= 60 || (ptr >= 0xA0000000u && ptr < 0xA4000000u)) {
+    MCLA_LOG_WARN("BUDDY76-FREE #{} ptr={:08X} lr={:08X}{}", n, ptr,
+                  static_cast<uint32_t>(ctx.lr),
+                  (ptr >= 0xA0000000u && ptr < 0xA4000000u) ? " LOWPOOL" : "");
+  }
+}
+
+// Session 76j: texture-object ctor (sub_8218DE38) — dump the returned object,
+// its pixel-buffer pointer (+16) and pitch (+12). The checkerboard fill wrote
+// through [obj+16] at A0018028 (inside the simple allocator's 8-byte slab
+// region) while every buddy allocation returns B7xxxxxx — this shows what
+// [obj+16] actually held.
+// Session 76j: sub_8218DCE8 = texture pitch computation. The recompiler
+// failed on its jump-table switch (all cases emitted as ERROR stubs that just
+// return), so [obj+12] was never written — the grcTextureXenon ctor then
+// sized the pixel buffer from garbage (pitch=1 → 32-byte buffer) and the
+// 32x32 checkerboard fallback fill wrote 4096 bytes over the heap, trashing
+// the device-registry holder (crash: GetDevice on FF00FF00 Device*).
+// Reconstructed 1:1 from the raw image: jump table @0x8218DD14, case bodies
+// @0x8218DD6C-0x8218DE30 (all sth u16 at [obj+12]).
+//   fmt 1,14,15,16,17,19 -> w*4     fmt 11,18,22 -> w*8
+//   fmt 12,13            -> w*16    fmt 20       -> w*2
+//   fmt 9,10,21          -> no store (case = plain blr)
+//   fmt 2                -> 2       (addi 4 >> srawi 1, literal)
+//   fmt 3..8             -> (w >= 4) ? fmt : 4
+PPC_FUNC_IMPL(__imp__sub_8218DCE8);
+PPC_FUNC(sub_8218DCE8) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = ctx.r3.u32;
+  uint32_t fmtWord = 0;
+  if (!obj || !mem.ReadU32BE(obj + 4u, &fmtWord)) {
+    __imp__sub_8218DCE8(ctx, base);
+    return;
+  }
+  const uint32_t fmt = fmtWord & 0x7FFFFFFFu;
+  const uint32_t idx = fmt - 1;
+  uint16_t w = 0;
+  (void)mem.ReadU16BE(obj + 0u, &w);
+  uint32_t pitch = 0;
+  bool store = true;
+  if (idx > 21) {
+    store = false; // bgtlr: pitch untouched
+  } else if (fmt == 2) {
+    pitch = 2;
+  } else if (fmt >= 3 && fmt <= 8) {
+    pitch = (w >= 4) ? fmt : 4u;
+  } else if (fmt == 9 || fmt == 10 || fmt == 21) {
+    store = false;
+  } else if (fmt == 11 || fmt == 18 || fmt == 22) {
+    pitch = static_cast<uint32_t>(w) << 3;
+  } else if (fmt == 12 || fmt == 13) {
+    pitch = static_cast<uint32_t>(w) << 4;
+  } else if (fmt == 20) {
+    pitch = static_cast<uint32_t>(w) << 1;
+  } else { // 1, 14, 15, 16, 17, 19
+    pitch = static_cast<uint32_t>(w) << 2;
+  }
+  if (store && obj) {
+    (void)mem.WriteU16BE(obj + 12u, static_cast<uint16_t>(pitch));
+  }
+  __imp__sub_8218DCE8(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8218DE38);
+static std::atomic<uint32_t> s_texCtor{0};
+PPC_FUNC(sub_8218DE38) {
+  const uint32_t w = ctx.r3.u32, h = ctx.r4.u32;
+  const uint32_t fmt = ctx.r6.u32;
+  __imp__sub_8218DE38(ctx, base);
+  const uint32_t n = s_texCtor.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  if (obj && n <= 60) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t pitch = 0, buf = 0;
+    (void)mem.ReadU32BE(obj + 12u, &pitch);
+    (void)mem.ReadU32BE(obj + 16u, &buf);
+    MCLA_LOG_WARN("TEXCTOR #{} obj={:08X} w={} h={} fmt={:08X} pitch={:08X} "
+                  "buf={:08X} lr={:08X}",
+                  n, obj, w, h, fmt, pitch, buf,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+}
+
+PPC_FUNC_IMPL(__imp__sub_821C22D0);
+static std::atomic<uint32_t> s_genFree{0};
+PPC_FUNC(sub_821C22D0) {
+  const uint32_t n = s_genFree.fetch_add(1) + 1;
+  const uint32_t ptr = ctx.r4.u32;
+  uint32_t hdr0 = 0, hdr1 = 0, hdr2 = 0, hdr3 = 0;
+  if (ptr) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(ptr - 16, &hdr0);
+    (void)mem.ReadU32BE(ptr - 12, &hdr1);
+    (void)mem.ReadU32BE(ptr - 8, &hdr2);
+    (void)mem.ReadU32BE(ptr - 4, &hdr3);
+  }
+  const bool windowHit = ptr >= 0xA0017F00u && ptr <= 0xA0018100u;
+  if (n <= 40 || hdr1 >= 512 || windowHit) {
+    MCLA_LOG_WARN("GEN76-FREE #{} heap={:08X} ptr={:08X} hdr=[{:08X} {:08X} "
+                  "{:08X} {:08X}] lr={:08X}{}",
+                  n, ctx.r3.u32, ptr, hdr0, hdr1, hdr2, hdr3,
+                  static_cast<uint32_t>(ctx.lr), windowHit ? " WINDOW" : "");
+  }
+  __imp__sub_821C22D0(ctx, base);
+}
+
 PPC_FUNC_IMPL(__imp__sub_821C1BB0);
 PPC_FUNC(sub_821C1BB0) {
   if constexpr (!kPool16CensusEnabled) {
@@ -1466,6 +1602,19 @@ PPC_FUNC(sub_821C1BB0) {
       MCLA_LOG_ERROR("ARENA-OOM: sub_821C1BB0 failed size={} align={} heap={:08X} "
                      "cap={} carved={} free={}",
                      size, align, heap, cap, carved, free);
+    }
+    // Session 76j: the checkerboard placeholder's 4096-byte buffer (general
+    // allocator) landed on the live device-holder (8B slab element). Log every
+    // big allocation so the free-block history of that region is reconstructable.
+    if (ctx.r3.u32 != 0 && size >= 4096) {
+      static std::atomic<uint32_t> s_genBig{0};
+      const uint32_t gn = s_genBig.fetch_add(1) + 1;
+      if (gn <= 150) {
+        MCLA_LOG_WARN("GEN76-ALLOC #{} heap={:08X} size={:#x} align={:#x} "
+                      "ret={:08X} lr={:08X}",
+                      gn, heap, size, align, ctx.r3.u32,
+                      static_cast<uint32_t>(ctx.lr));
+      }
     }
     return;
   }
