@@ -1543,15 +1543,6 @@ PPC_FUNC(sub_8218DCE8) {
   __imp__sub_8218DCE8(ctx, base);
 }
 
-// Session 77: the jump-table-fixed regen registers { 0x8226B450, sub_8226B450 }
-// in ppc_func_mapping.cpp but emits no body for it — link fails on an undefined
-// symbol while 29 guest branch sites target it. Transcribed 1:1 from
-// build/cache/mcla_pe.bin offset 0x26B450: `38600001 4E800020` = li r3,1; blr.
-// Its sibling sub_8226B46C (li r3,-1; blr) was emitted normally.
-PPC_FUNC(sub_8226B450) {
-  ctx.r3.s64 = 1;
-}
-
 PPC_FUNC_IMPL(__imp__sub_8218DE38);
 static std::atomic<uint32_t> s_texCtor{0};
 PPC_FUNC(sub_8218DE38) {

@@ -99,6 +99,7 @@ add_executable(mcla
     src/app.h
     src/patches.cpp
     src/vmx128_pack.cpp
+    src/dispatch_guard.cpp
     src/patches.h
     src/gpu_mmio.cpp
     src/gpu_mmio.h

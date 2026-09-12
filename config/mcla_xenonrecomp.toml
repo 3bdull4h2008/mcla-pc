@@ -66,3 +66,192 @@ address = 0x821B4788
 registers = ["v52", "v0"]
 after_instruction = false
 jump_address = 0x821B478C
+
+# Dispatch guard for sub_8218CC70 (see src/dispatch_guard.cpp): replaces the
+# SAFETY block a previous session hand-patched into generated/ppc_recomp.9.cpp,
+# which regens silently dropped. Same address + after_instruction placement.
+[[midasm_hook]]
+name = "mcla_DispatchGuard_8218CC94"
+address = 0x8218CC94
+registers = ["r3", "r8"]
+after_instruction = true
+return_on_true = true
+
+
+
+# Session 78 stub-cleanup spans. The recompiler under-measured 19 functions so
+# their exit blocks landed outside the body; every branch to those blocks became
+# a silent-return ERROR stub (30 targets / 91 sites). Parent-extension spans
+# below widen each function to its real end (next mapping entry - start).
+[[main.functions]]
+address = 0x82134350
+size = 0x4FC
+
+[[main.functions]]
+address = 0x82135B2C
+size = 0x140
+
+[[main.functions]]
+address = 0x82135C6C
+size = 0x24
+
+[[main.functions]]
+address = 0x821794F0
+size = 0x98
+
+[[main.functions]]
+address = 0x821D9AE8
+size = 0x194
+
+[[main.functions]]
+address = 0x8226B3DC
+size = 0x90
+
+[[main.functions]]
+address = 0x8226B46C
+size = 0x1CC
+
+[[main.functions]]
+address = 0x8227D57C
+size = 0x64
+
+[[main.functions]]
+address = 0x8227D730
+size = 0x64
+
+[[main.functions]]
+address = 0x8227DB50
+size = 0x64
+
+[[main.functions]]
+address = 0x8238800C
+size = 0x40
+
+[[main.functions]]
+address = 0x82397F60
+size = 0xB4
+
+[[main.functions]]
+address = 0x823DEF0C
+size = 0x34
+
+[[main.functions]]
+address = 0x823E2B88
+size = 0x34
+
+[[main.functions]]
+address = 0x824E9038
+size = 0xDC
+
+[[main.functions]]
+address = 0x824E9118
+size = 0xC4
+
+[[main.functions]]
+address = 0x824E9204
+size = 0x30
+
+[[main.functions]]
+address = 0x8255FB60
+size = 0x204
+
+[[main.functions]]
+address = 0x825F4C24
+size = 0x28
+
+[[main.functions]]
+address = 0x8264B2B0
+size = 0xF0
+
+
+# Self spans: exit blocks that even the widened parents don't contain (shared
+# 2-instruction thunks branched into from many sites). Declaring them as their
+# own functions turns every ERROR stub into a real call or tail call.
+[[main.functions]]
+address = 0x82134368
+size = 0x8
+[[main.functions]]
+address = 0x8213437C
+size = 0x8
+[[main.functions]]
+address = 0x82135B44
+size = 0x8
+[[main.functions]]
+address = 0x82135C28
+size = 0x8
+[[main.functions]]
+address = 0x82135C30
+size = 0x8
+[[main.functions]]
+address = 0x82135C5C
+size = 0x8
+[[main.functions]]
+address = 0x82135C78
+size = 0x8
+[[main.functions]]
+address = 0x82135C88
+size = 0x8
+[[main.functions]]
+address = 0x8226B3E0
+size = 0x8
+[[main.functions]]
+address = 0x8226B450
+size = 0x8
+[[main.functions]]
+address = 0x8226B474
+size = 0x8
+[[main.functions]]
+address = 0x8226B4B0
+size = 0x8
+[[main.functions]]
+address = 0x8226B50C
+size = 0x8
+[[main.functions]]
+address = 0x8227D580
+size = 0x8
+[[main.functions]]
+address = 0x8227D734
+size = 0x8
+[[main.functions]]
+address = 0x8227DB54
+size = 0x8
+[[main.functions]]
+address = 0x8238802C
+size = 0x8
+[[main.functions]]
+address = 0x82388030
+size = 0x8
+[[main.functions]]
+address = 0x823DEF34
+size = 0x8
+[[main.functions]]
+address = 0x823DEF38
+size = 0x8
+[[main.functions]]
+address = 0x823E2BA8
+size = 0x8
+[[main.functions]]
+address = 0x824E9140
+size = 0x8
+[[main.functions]]
+address = 0x824E9204
+size = 0x8
+[[main.functions]]
+address = 0x824E9208
+size = 0x8
+[[main.functions]]
+address = 0x824E9224
+size = 0x8
+[[main.functions]]
+address = 0x825F4C28
+size = 0x8
+
+
+# Second-round self spans found by the fixed-point loop.
+
+[[main.functions]]
+address = 0x82134378
+size = 0x4
+[[main.functions]]
+address = 0x824E91FC
+size = 0x8

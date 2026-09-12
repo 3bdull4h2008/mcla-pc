@@ -1,6 +1,68 @@
 # HANDOFF — next agent, read this first
 
-## READ ME FIRST — CURRENT STATE (2026-09-12, end of session 77; newer than everything below)
+## READ ME FIRST — CURRENT STATE (2026-09-12, end of session 78; newer than everything below)
+
+**BROKEN-STUB CENSUS IS NOW ZERO (91 → 0).** The last 30 distinct stub targets /
+91 sites from session 77 are gone. They were one defect repeated: the
+recompiler under-measured 19 functions, orphaning their exit blocks, plus a
+tool limitation — the `bctr` switch-case emitter could only `goto` in-span
+labels or print `// ERROR`, never call an out-of-span declared function.
+
+What landed (all three pieces were required):
+1. **20 parent-extension spans + 28 self-spans** appended to the canonical
+   config `config/mcla_xenonrecomp.toml` (with explanatory comments in place).
+   Parent spans widen under-measured functions to "next mapping entry - start";
+   self-spans declare 2-instruction shared thunks as their own functions.
+2. **Tool patch `JTS-TAILCALL`** in `.research/XenonRecomp` `recompiler.cpp`
+   (~line 770): an out-of-span switch-case label now emits a tail call
+   (`sub_XXXX(ctx, base); return;`) when the target has a function symbol,
+   else `// ERROR`. The source edit was found uncompiled on disk (18:31) —
+   the binary was rebuilt (verify: the exe contains the string `JTS-TAILCALL`).
+   Build via `.research/XenonRecomp/rebuild_clang.bat`.
+3. **Dispatch guard as a config hook.** The regen exposed that an earlier
+   session had hand-edited the *committed generated output* — a SAFETY guard in
+   `sub_8218CC70` (dispatcher trampoline that ends in `bctr` through the
+   function-pointer table; a NULL/unmapped slot = hard crash). Any regen
+   silently dropped it. It now lives in `src/dispatch_guard.cpp` +
+   `[[midasm_hook]]` at `0x8218CC94` (after `lwz r8,64(r9)`,
+   `return_on_true`) in the canonical config, so regens keep it. The
+   hand-written `sub_8226B450` stub in `src/patches.cpp` was removed — the
+   tool now emits it correctly (`li r3,1; blr`).
+
+**Regen mechanics (learned the hard way):** run the tool with the config as a
+**bare filename in repo root** (`cp config/mcla_xenonrecomp.toml .` first if
+needed) — a path like `config/...` or `build/...` fails silently (exit 127,
+empty log). `mcla_jts_regen.toml` (root) is now historical; the canonical
+config regenerates straight into `generated/ppc_xenon`.
+
+**Verification done before landing (don't redo):**
+- Per-function body diff vs the committed tree: 27 new bodies (the self-spans),
+  27 changed bodies (every one a former stub site → real call/label), plus the
+  guard hook. 0 removed. File *names* unchanged (176 TUs; CMakeLists unchanged
+  for TUs — only `src/dispatch_guard.cpp` added).
+- 44,707 mapping entries, 0 without bodies (link-safe by construction).
+- 219 "Unrecognized instruction" tool warnings — identical count to session 77.
+- Boot soak PASS: same `star_glow` fatal, fatal message/aux/chain byte-identical
+  to `boot_stdout_76y.log`, identical steady-state counts (TSLAB-ALLOC 2125,
+  PARAM-STORE 401, EVENT-CREATE 256), and *more* forward progress
+  (VSYNC-ISR ×120 vs 0, PRESENT #2). One new log line class:
+  `Vectored exception code=0x406D1388` — that is the benign Windows
+  SetThreadName exception from host code, not guest. Evidence:
+  `build/boot_stdout_78.log`.
+
+**Method scripts kept for reference:** `fix_stubs_iter.py` (parent-span
+fixed-point loop) and `fix_stubs_self.py` (self-span fixed-point loop). The
+intermediate scratch TOMLs they generated were deleted; their final state is in
+the canonical config. Scratch regens remain under `build/xr_*` for diffing.
+
+VMX128 note: no doc correction was needed — Route A (4 `vpkd3d128` type-2
+hook sites) was already correctly recorded as landed in the session-75 block
+below. Zero `debugtrap` in the soak is because those sites are hooked, not
+because the path is unreached.
+
+---
+
+## READ ME FIRST — SUPERSEDED session-77 block (kept for context, 2026-09-12)
 
 **THE SYSTEMIC JUMP-TABLE DEFECT IS FIXED AND LANDED (commit `b3d7dab`).** The
 session-76y block below still describes it as open — that text is now stale.
