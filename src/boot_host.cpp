@@ -779,6 +779,12 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // + count) — catch WHO registers devices and when.
     mcla::native::RegisterGuestWatchRange(0x82860844u, 0x82860850u);
 
+    // Session 76j: entry0's device-vector fields (arr+268..276: holder ptr,
+    // device count/cap) and the holder array contents themselves. The crash
+    // reads holder[i] = FF00FF00 at the match call; catch the writer live.
+    mcla::native::RegisterGuestWatchRange(0xA008261Cu, 0xA0082624u);
+    mcla::native::RegisterGuestWatchRange(0xA0018028u, 0xA0018030u);
+
     // Kernel heaps must exist before any guest import allocates. Skipping this
     // left heap==physicalHeap==nullptr and the first allocation crashed inside
     // o1heapAllocate reading handle->diagnostics.capacity at instance+0x208.

@@ -1381,7 +1381,21 @@ uint32_t RtlInitializeCriticalSection(XRTL_CRITICAL_SECTION *cs) {
   cs->LockCount = -1;
   cs->RecursionCount = 0;
   cs->OwningThread = 0;
+  // Session 76j: the guest's allocator guard (sub_821C8FE0) reads the DWORD
+  // at cs+0 and SKIPS locking entirely when it is zero. On HW the kernel init
+  // leaves that word nonzero (LockCount=-1 semantics) so the global allocator
+  // critical section 0x82855A0C actually serializes the sysMemSimpleAllocator
+  // across threads. Leaving it 0 ran the heap unlocked → freelist overlap →
+  // the checkerboard placeholder fill landed on live allocations.
+  cs->Header.Lock = 0xFFFFFFFFu;
 
+  static std::atomic<uint32_t> s_csInitCount{0};
+  const uint32_t n = s_csInitCount.fetch_add(1) + 1;
+  if (n <= 40) {
+    const uint32_t guestCs = mcla::kernel::g_memory.MapVirtual(cs);
+    MCLA_LOG_INFO("RtlInitializeCriticalSection #{} cs={:p} guest={:08X}", n,
+                  (void *)cs, guestCs);
+  }
   return 0;
 }
 
@@ -2415,6 +2429,9 @@ void RtlInitializeCriticalSectionAndSpinCount(XRTL_CRITICAL_SECTION *cs,
   cs->LockCount = -1;
   cs->RecursionCount = 0;
   cs->OwningThread = 0;
+  // Session 76j: same guest-visible lock-word requirement as
+  // RtlInitializeCriticalSection — see the comment there.
+  cs->Header.Lock = 0xFFFFFFFFu;
 }
 
 void _vswprintf_x() { LOG_UTILITY("!!! STUB !!!"); }

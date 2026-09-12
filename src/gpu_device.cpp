@@ -2930,8 +2930,10 @@ PPC_FUNC(sub_821CB488) {
     memR.ReadU32BE(0x82860844u, &arr);
     memR.ReadU16BE(0x82860848u, &cnt);
     memR.ReadU16BE(0x8286084Au, &cap);
-    MCLA_LOG_WARN("GETDEV #{} path='{}' arr={:08X} cnt={} cap={}", n, path, arr,
-                  cnt, cap);
+    uint32_t lockFlag = 0;
+    (void)memR.ReadU32BE(0x82855A0Cu, &lockFlag);
+    MCLA_LOG_WARN("GETDEV #{} path='{}' arr={:08X} cnt={} cap={} lockFlag={:08X}",
+                  n, path, arr, cnt, cap, lockFlag);
     for (uint32_t e = 0; arr != 0 && e < 2 && e <= cnt; ++e) {
       const uint32_t eb = arr + e * 276u;
       uint16_t flag = 0, len = 0, dcnt = 0, dcap = 0;

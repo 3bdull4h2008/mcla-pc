@@ -1,5 +1,8 @@
 #include "gpu_cp.h"
 
+#include <windows.h>
+#include <dbghelp.h>
+
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "guest_memory.h"
 #include "kernel/memory.h"
@@ -1581,6 +1584,40 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
       }
     }
     return;
+  }
+
+  // SESSION 76j: the device-registry holder (A0018028..30) and entry0's
+  // device-vector (A008261C..24) get scribbled with the kernel "uninitialized"
+  // pattern FF00FF00 right before the GetDevice crash. The guest LR here is
+  // misleading (slab-wrapper return site), so capture the HOST callstack once.
+  if (value == 0xFF00FF00u &&
+      ((guestAddr >= 0xA0018028u && guestAddr < 0xA0018030u) ||
+       (guestAddr >= 0xA008261Cu && guestAddr < 0xA0082624u))) {
+    static std::atomic<uint32_t> s_ffbt{0};
+    if (s_ffbt.fetch_add(1) < 1) {
+      SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+      static std::once_flag symOnce76j;
+      std::call_once(symOnce76j, []() {
+        SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+      });
+      void *frames[16] = {};
+      const USHORT nCap = CaptureStackBackTrace(0, 16, frames, nullptr);
+      for (USHORT fi = 0; fi < nCap; ++fi) {
+        alignas(8) char scratch[sizeof(SYMBOL_INFO) + 160];
+        SYMBOL_INFO *si = (SYMBOL_INFO *)scratch;
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 159;
+        DWORD64 disp = 0;
+        char nameBuf[200];
+        const char *name = "???";
+        if (SymFromAddr(GetCurrentProcess(), (DWORD64)frames[fi], &disp, si)) {
+          snprintf(nameBuf, sizeof(nameBuf), "%s+0x%llx", si->Name,
+                   (unsigned long long)disp);
+          name = nameBuf;
+        }
+        MCLA_LOG_WARN("FFBT frame {:02d} {} {}", fi, (void *)frames[fi], name);
+      }
+    }
   }
 
   // SESSION 73 probe: the un-attributed poison-param regions (REBASE-POISON

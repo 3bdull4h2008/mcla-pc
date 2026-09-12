@@ -4,9 +4,25 @@
 #include "function.h"
 #include "logging.h"
 #include <atomic>
+#include <unordered_set>
+#include <windows.h>
+#include <dbghelp.h>
 
 constexpr size_t RESERVED_BEGIN = 0x7FEA0000;
 constexpr size_t RESERVED_END = 0xA0000000;
+
+// Session 76j: exact-allocation registry for the physical arena. The guest
+// frees sub-blocks carved from ITS OWN pools via RtlFreeHeap/XFreeMem; a raw
+// o1heapFree on such a pointer releases a region that still contains live
+// data (observed: the device-registry holder shared bytes with a live guest
+// slab element → the texture ctor scribbled FF00FF00 over it → GetDevice
+// called a poisoned Device* → AV at the first uncommitted page). Only
+// pointers this allocator actually returned may be freed.
+static std::unordered_set<void *> &LivePhysAllocs()
+{
+    static std::unordered_set<void *> set;
+    return set;
+}
 
 // SEH-safe o1heap allocate: must be a C-style function with no C++ objects
 // that require unwinding — clang-cl crashes compiling __try in a C++ method
@@ -303,6 +319,24 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     *((void**)aligned - 1) = ptr;
     *((size_t*)aligned - 2) = size + O1HEAP_ALIGNMENT;
 
+    LivePhysAllocs().insert((void*)aligned);
+
+    // Session 76j: full ownership history of the overlap window (the holder
+    // vs guest-slab-element collision). Log every alloc landing here.
+    {
+        const uintptr_t g = mcla::kernel::g_memory.MapVirtual((void*)aligned);
+        if (g >= 0xA0017FE0u && g < 0xA0018060u)
+        {
+            static std::atomic<uint32_t> s_winAlloc{0};
+            const uint32_t n = s_winAlloc.fetch_add(1) + 1;
+            uint32_t lr = 0;
+            if (const PPCContext *c = GetPPCContext())
+                lr = static_cast<uint32_t>(c->lr);
+            MCLA_LOG_WARN("WIN76-ALLOC #{} guest={:08X} size={:#x} align={:#x} "
+                          "lr={:08X}",
+                          n, g, size, alignment, lr);
+        }
+    }
     return (void*)aligned;
 }
 
@@ -317,6 +351,56 @@ void Heap::Free(void* ptr)
         // pointer: *(ptr-8)=raw o1heap frag ptr, *(ptr-16)=size+32. Validate
         // the RAW pointer before touching o1heap bins.
         std::lock_guard lock(physicalMutex);
+
+        // Session 76j: enforce the exact-allocation contract first. Guest
+        // sub-block frees must not reach o1heap even when the bytes below
+        // them happen to look like a valid fragment header.
+        if (LivePhysAllocs().erase(ptr) == 0)
+        {
+            static std::atomic<uint32_t> s_bogusFree{0};
+            const uint32_t n = s_bogusFree.fetch_add(1) + 1;
+            if (n <= 16)
+            {
+                uint32_t guestLr = 0;
+                if (const PPCContext *c = GetPPCContext())
+                    guestLr = static_cast<uint32_t>(c->lr);
+                MCLA_LOG_WARN("Heap::Free: rejected NON-EXACT physical free "
+                              "#{} ptr={:p} lr={:08X}",
+                              n, ptr, guestLr);
+                if (n == 1)
+                {
+                    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                    static std::once_flag symOnce76j;
+                    std::call_once(symOnce76j, []() {
+                        SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+                    });
+                    void *frames[16] = {};
+                    const USHORT nCap =
+                        CaptureStackBackTrace(0, 16, frames, nullptr);
+                    for (USHORT fi = 0; fi < nCap; ++fi)
+                    {
+                        alignas(8) char scratch[sizeof(SYMBOL_INFO) + 160];
+                        SYMBOL_INFO *si = (SYMBOL_INFO *)scratch;
+                        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+                        si->MaxNameLen = 159;
+                        DWORD64 disp = 0;
+                        char nameBuf[200];
+                        const char *name = "???";
+                        if (SymFromAddr(GetCurrentProcess(),
+                                        (DWORD64)frames[fi], &disp, si))
+                        {
+                            snprintf(nameBuf, sizeof(nameBuf), "%s+0x%llx",
+                                     si->Name, (unsigned long long)disp);
+                            name = nameBuf;
+                        }
+                        MCLA_LOG_WARN("BOGUSFREE frame {:02d} {} {}", fi,
+                                      (void *)frames[fi], name);
+                    }
+                }
+            }
+            return;
+        }
+
         void* rawPtr = *((void**)ptr - 1);
 
         LiveProbe probe;
@@ -328,6 +412,21 @@ void Heap::Free(void* ptr)
                           probe.size, probe.used, (void*)physArenaBase,
                           (void*)(physArenaBase + physArenaSize));
             return;
+        }
+        // Session 76j: log frees releasing any part of the overlap window.
+        {
+            const uintptr_t g = mcla::kernel::g_memory.MapVirtual(ptr);
+            const uintptr_t gsz = *((size_t*)ptr - 2);
+            if (g + gsz >= 0xA0017FE0u && g < 0xA0018060u)
+            {
+                static std::atomic<uint32_t> s_winFree{0};
+                const uint32_t n = s_winFree.fetch_add(1) + 1;
+                uint32_t lr = 0;
+                if (const PPCContext *c = GetPPCContext())
+                    lr = static_cast<uint32_t>(c->lr);
+                MCLA_LOG_WARN("WIN76-FREE #{} guest={:08X} size={:#x} lr={:08X}",
+                              n, g, gsz, lr);
+            }
         }
         MCLA_O1_FREE(physicalHeap, rawPtr);
     }
