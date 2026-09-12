@@ -2146,12 +2146,13 @@ PPC_FUNC(sub_821D5E10) {
                                               " f%d=%08X", f, lr2));
           sp = back;
         }
-        MCLA_LOG_WARN("INFLATE-PENDING #{} st={:08X} in=0 inPtr={:08X} "
-                      "produced={} outPtr={:08X} outLeft={} retries=1 "
-                      "credits={:08X} lr={:08X} r1={:08X} chain[{}]",
-                      n, st, inPtr, produced, outPtr, outLeft, retries,
-                      credits, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
-                      chain);
+        MCLA_LOG_WARN(
+            "INFLATE-PENDING #{} | st={:08X} inPtr={:08X} produced={} "
+            "outPtr={:08X} outLeft={} credits={:08X} | lr={:08X} r1={:08X} "
+            "hostTid={:08X} | chain='{}'",
+            n, st, inPtr, produced, outPtr, outLeft, credits,
+            static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId(),
+            chain);
         // Session 75q: dump the join table — entry+8 = the source stream
         // object whose vtable+28 read returns 0 for this batch.
         uint32_t jcount = 0, jentries = 0;
@@ -2237,8 +2238,10 @@ PPC_FUNC(sub_821D5E10) {
       sp = back;
     }
     MCLA_LOG_INFO("INFLATE #{} st={:08X} in={} out={} consumed={} magic={:08X} "
-                  "lr={:08X} chain[{}]",
-                  n, st, inLeft, outLeft, consumed, magic, ctx.lr, chain);
+                  "lr={:08X} r1={:08X} tid={:08X} chain[{}]",
+                  n, st, inLeft, outLeft, consumed, magic,
+                  static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                  GetCurrentThreadId(), chain);
   }
 
   if (consumed == 0 && inLeft >= 4 && magic != kXCompressMagic &&
@@ -2305,8 +2308,11 @@ static std::atomic<uint32_t> s_hBC140{0};
 PPC_FUNC(sub_821BC140) {
   const uint32_t n = s_hBC140.fetch_add(1) + 1;
   if (n <= 16 || (n % 2000) == 0)
-    MCLA_LOG_INFO("INLINE-EXEC sub_821BC140 #{} a0={:08X} a1={:08X} lr={:08X}",
-                  n, ctx.r3.u32, ctx.r4.u32, ctx.lr);
+    MCLA_LOG_INFO("INLINE-EXEC sub_821BC140 #{} a0={:08X} a1={:08X} "
+                  "lr={:08X} r1={:08X} tid={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32,
+                  static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                  GetCurrentThreadId());
   // NODE-CHAIN DUMP (session 19): the dispatched fnptr was ZERO. Walk the
   // list head a0 -> [a0+4]=node {node[0] ?, node[4]=fnptr, node[12]=next}
   // up to 3 nodes with checked reads (body starts with plain guest loads,
@@ -2354,8 +2360,9 @@ static std::atomic<uint32_t> s_hBC910out{0};
 PPC_FUNC(sub_821BC910) {
   const uint32_t n = s_hBC910in.fetch_add(1) + 1;
   if (n <= 8)
-    MCLA_LOG_INFO("RINGB-CONSUMER sub_821BC910 ENTER #{} arg={:08X}", n,
-                  ctx.r3.u32);
+    MCLA_LOG_INFO("RINGB-CONSUMER sub_821BC910 ENTER #{} arg={:08X} "
+                  "r1={:08X} tid={:08X}",
+                  n, ctx.r3.u32, ctx.r1.u32, GetCurrentThreadId());
   __imp__sub_821BC910(ctx, base);
   const uint32_t d = s_hBC910out.fetch_add(1) + 1;
   // Counters for BOTH consumer queues (arg 0 -> base+0, arg 1 -> +0x6174).
@@ -2622,7 +2629,8 @@ PPC_FUNC(sub_821CC6F0) {
   const bool saneOut = ctx.r1.u32 < 0x82130000u;
   if ((!saneIn || !saneOut) || n <= 8 || (n % 500) == 0)
     MCLA_LOG_WARN("READWRAP sub_821CC6F0 #{} r1in={:08X}{} r1out={:08X}{} "
-                  "lr={:08X}",
+                  "lr={:08X} tid={:08X}",
                   n, r1in, saneIn ? "" : "!", ctx.r1.u32,
-                  saneOut ? "" : "!", static_cast<uint32_t>(ctx.lr));
+                  saneOut ? "" : "!", static_cast<uint32_t>(ctx.lr),
+                  GetCurrentThreadId());
 }
