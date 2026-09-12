@@ -608,6 +608,32 @@ bool RpfVirtualFileSystem::ReadFile(OpenFileHandle& file, void* buffer, uint64_t
     return result != FALSE;
 }
 
+bool RpfVirtualFileSystem::ReadFileAt(OpenFileHandle& file, uint64_t offset,
+                                      void* buffer, uint64_t size,
+                                      uint64_t& bytes_read) {
+    // unique_lock: the fallback path re-enters ReadFile (which locks
+    // m_mutex itself) — std::mutex is non-recursive, so release first.
+    std::unique_lock<std::mutex> lock(m_mutex);
+    bytes_read = 0;
+    if (file.handle) {
+        // positional read on the real packfile (OVERLAPPED, no seek)
+        if (size == 0) return true;
+        OVERLAPPED ov{};
+        ov.Offset = static_cast<DWORD>(offset);
+        ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+        DWORD got = 0;
+        if (!::ReadFile(static_cast<HANDLE>(file.handle), buffer,
+                        static_cast<DWORD>(size), &got, &ov))
+            return false;
+        bytes_read = got;
+        return got == size;
+    }
+    // fallback: shared-position path (virtual rpf / pseudo files)
+    lock.unlock();
+    file.position = offset;
+    return ReadFile(file, buffer, size, bytes_read);
+}
+
 bool RpfVirtualFileSystem::CloseFile(OpenFileHandle& file) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (file.handle) {

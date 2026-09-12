@@ -71,6 +71,10 @@ public:
 
     bool OpenFile(const std::string& virtual_path, OpenFileHandle& out_file);
     bool ReadFile(OpenFileHandle& file, void* buffer, uint64_t size, uint64_t& bytes_read);
+    // Session 76d: positional read — no shared file position, safe for
+    // concurrent NtReadFile callers (seek+read race served wrong bytes).
+    bool ReadFileAt(OpenFileHandle& file, uint64_t offset, void* buffer,
+                    uint64_t size, uint64_t& bytes_read);
     bool CloseFile(OpenFileHandle& file);
     bool SeekFile(OpenFileHandle& file, int64_t offset, int whence);
     bool ListDirectory(const std::string& virtual_path, std::vector<std::string>& entries) const;

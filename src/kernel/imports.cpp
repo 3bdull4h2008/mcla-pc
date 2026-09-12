@@ -1076,15 +1076,18 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
     uint64_t offset = 0;
     if (byteOffset) {
+      // Session 76d: positional read — concurrent NtReadFile callers on the
+      // same handle raced the shared seek position and served wrong bytes
+      // (garbage pointers downstream: 0xFF00FF00 used as an object).
       offset = byteOffset->get();
-      vfs.SeekFile(fileObj->fileHandle, static_cast<int64_t>(offset),
-                   0 /* FILE_BEGIN */);
+      ok = vfs.ReadFileAt(fileObj->fileHandle, offset, hostPtr, length,
+                          bytesRead);
     } else {
       offset = fileObj->fileHandle.position;
-    }
-    ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
-    if (ok) {
-      fileObj->fileHandle.position += bytesRead;
+      ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
+      if (ok) {
+        fileObj->fileHandle.position += bytesRead;
+      }
     }
     MCLA_LOG_DEBUG("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes", handle,
                    offset, length, bytesRead);
