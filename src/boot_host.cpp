@@ -751,6 +751,10 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     mcla::native::RegisterGuestWatchRange(0xA0106000u, 0xA0107000u);
     mcla::native::RegisterGuestWatchRange(0xA0197E00u, 0xA0197F00u);
 
+    // Session 76f: watch the "ui" preload-list global (0x827D7770, 32 bytes)
+    // — the boot init reads it before anything fills it (BOOTPATH crash).
+    mcla::native::RegisterGuestWatchRange(0x827D7770u, 0x827D7790u);
+
     // Kernel heaps must exist before any guest import allocates. Skipping this
     // left heap==physicalHeap==nullptr and the first allocation crashed inside
     // o1heapAllocate reading handle->diagnostics.capacity at instance+0x208.
