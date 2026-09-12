@@ -2153,6 +2153,37 @@ PPC_FUNC(sub_821D5E10) {
             n, st, inPtr, produced, outPtr, outLeft, credits,
             static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId(),
             chain);
+        // Session 75v: dump the inner stream's 3 page-cache slots
+        // (inner+296/336/356) — the fill reads land in page buffers but the
+        // buffered reader never matches, so watch the slot state.
+        {
+          uint32_t inner = 0;
+          // 75v fix: the inner object lives at wrapper+32; the wrapper is
+          // join_entry+8 (A007D810 in every soak). Do not deref the object
+          // to get its vtable — we want the OBJECT itself.
+          uint32_t wrapper = 0;
+          mem.ReadU32BE(0xA0121560u + 8, &wrapper);
+          if (wrapper != 0 && wrapper != 0xCDCDCDCDu)
+            mem.ReadU32BE(wrapper + 32, &inner);
+          if (inner == 0) inner = 0xA0083660u;
+          if (inner >= 0xA0000000u && inner != 0xCDCDCDCDu) {
+            for (int slot = 0; slot < 3; ++slot) {
+              uint32_t sBase = inner + 296u + slot * 40u;
+              uint32_t w[9] = {0};
+              for (int wi = 0; wi < 9; ++wi)
+                mem.ReadU32BE(sBase + wi * 4u, &w[wi]);
+              MCLA_LOG_WARN("PAGESLOT[{}] @ {:08X} = [{:08X} {:08X} {:08X} "
+                            "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                            slot, sBase, w[0], w[1], w[2], w[3], w[4], w[5],
+                            w[6], w[7], w[8]);
+            }
+            uint32_t i48 = 0, i296 = 0;
+            mem.ReadU32BE(inner + 48, &i48);
+            mem.ReadU32BE(inner + 296, &i296);
+            MCLA_LOG_WARN("INNER {:08X}: [48]={:08X} [296]={:08X}", inner,
+                          i48, i296);
+          }
+        }
         // Session 75q: dump the join table — entry+8 = the source stream
         // object whose vtable+28 read returns 0 for this batch.
         uint32_t jcount = 0, jentries = 0;
@@ -2633,4 +2664,19 @@ PPC_FUNC(sub_821CC6F0) {
                   n, r1in, saneIn ? "" : "!", ctx.r1.u32,
                   saneOut ? "" : "!", static_cast<uint32_t>(ctx.lr),
                   GetCurrentThreadId());
+}
+
+// Session 75v: kernel read-submit census. sub_8244F4C0 is the kernel-layer
+// read that produced the batch-1 NFS reads. If batch-2 never hits it, the
+// fetch is never even attempted upstream.
+PPC_FUNC_IMPL(__imp__sub_8244F4C0);
+static std::atomic<uint32_t> s_hF4C0{0};
+PPC_FUNC(sub_8244F4C0) {
+  const uint32_t n = s_hF4C0.fetch_add(1) + 1;
+  if (n <= 24 || (n % 200) == 0)
+    MCLA_LOG_INFO("RD-SUBMIT sub_8244F4C0 #{} a0={:08X} a1={:08X} "
+                  "a2={:08X} a3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  __imp__sub_8244F4C0(ctx, base);
 }
