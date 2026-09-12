@@ -561,6 +561,7 @@ void BootWorker(uint32_t entryGuest)
                         {0x00600000, 0x00800000, "stacks"},
                         {0x50000000, 0x60000000, "inflate-out"},
                         {0xA0000000, 0xB0000000, "phys-heap"},
+                        {0x82000000, 0x82AD3000, "image+bss"},
                     };
                     uint8_t* guestBase = (uint8_t*)mcla::kernel::g_memory.base;
                     int hits = 0;
