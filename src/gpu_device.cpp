@@ -2787,3 +2787,114 @@ PPC_FUNC(sub_82187820) {
   }
   __imp__sub_82187820(ctx, base);
 }
+
+// Session 76g: census of the 13 preload-list global users — which runs?
+// (the global 0x827D7770 is never populated before the boot init reads it)
+PPC_FUNC_IMPL(__imp__sub_8268A828);
+static std::atomic<uint32_t> s_h8268A828{0};
+PPC_FUNC(sub_8268A828) {
+  const uint32_t n = s_h8268A828.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_8268A828 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_8268A828(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_826DB370);
+static std::atomic<uint32_t> s_h826DB370{0};
+PPC_FUNC(sub_826DB370) {
+  const uint32_t n = s_h826DB370.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_826DB370 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_826DB370(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_8226D638);
+static std::atomic<uint32_t> s_h8226D638{0};
+PPC_FUNC(sub_8226D638) {
+  const uint32_t n = s_h8226D638.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_8226D638 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_8226D638(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822C79A0);
+static std::atomic<uint32_t> s_h822C79A0{0};
+PPC_FUNC(sub_822C79A0) {
+  const uint32_t n = s_h822C79A0.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_822C79A0 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822C79A0(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822DA210);
+static std::atomic<uint32_t> s_h822DA210{0};
+PPC_FUNC(sub_822DA210) {
+  const uint32_t n = s_h822DA210.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_822DA210 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822DA210(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822DC388);
+static std::atomic<uint32_t> s_h822DC388{0};
+PPC_FUNC(sub_822DC388) {
+  const uint32_t n = s_h822DC388.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_822DC388 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822DC388(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822E9398);
+static std::atomic<uint32_t> s_h822E9398{0};
+PPC_FUNC(sub_822E9398) {
+  const uint32_t n = s_h822E9398.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_822E9398 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822E9398(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822ED628);
+static std::atomic<uint32_t> s_h822ED628{0};
+PPC_FUNC(sub_822ED628) {
+  const uint32_t n = s_h822ED628.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_822ED628 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822ED628(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822F8718);
+static std::atomic<uint32_t> s_h822F8718{0};
+PPC_FUNC(sub_822F8718) {
+  const uint32_t n = s_h822F8718.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_822F8718 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822F8718(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_822F9268);
+static std::atomic<uint32_t> s_h822F9268{0};
+PPC_FUNC(sub_822F9268) {
+  const uint32_t n = s_h822F9268.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_822F9268 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822F9268(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_82300928);
+static std::atomic<uint32_t> s_h82300928{0};
+PPC_FUNC(sub_82300928) {
+  const uint32_t n = s_h82300928.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_82300928 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_82300928(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_82363990);
+static std::atomic<uint32_t> s_h82363990{0};
+PPC_FUNC(sub_82363990) {
+  const uint32_t n = s_h82363990.fetch_add(1) + 1;
+  if (n <= 2)
+    MCLA_LOG_INFO("PLUSER sub_82363990 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_82363990(ctx, base);
+}

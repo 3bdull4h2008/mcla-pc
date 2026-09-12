@@ -593,6 +593,26 @@ void BootWorker(uint32_t entryGuest)
                         fprintf(crashFile, "  needle %08X: no occurrences in scanned regions\n", needle);
                 }
             }
+
+            // Session 76g: dump the device-list neighborhood around the
+            // faulting ppc r6 (the device object whose name ptr = garbage).
+            if (code == 0xC0000005 && g_faultCtx) {
+                const uint32_t r6v = g_faultCtx->r6.u32;
+                if (r6v >= 0xA0000000u && r6v < 0xB0000000u) {
+                    uint8_t* guestBase = (uint8_t*)mcla::kernel::g_memory.base;
+                    uint8_t* p = guestBase + (r6v & ~0xFu) - 0x40;
+                    fprintf(crashFile, "  device dump around r6=%08X:\n", r6v);
+                    for (int row = 0; row < 12; ++row) {
+                        fprintf(crashFile, "   %08X:", (r6v & ~0xFu) - 0x40 + row*16);
+                        for (int w = 0; w < 4; ++w) {
+                            uint32_t v;
+                            memcpy(&v, p + row*16 + w*4, 4);
+                            fprintf(crashFile, " %08X", v);
+                        }
+                        fprintf(crashFile, "\n");
+                    }
+                }
+            }
             
             // Stack trace
             if (code == 0xC0000005 || code == 0x80000003 || code == 0xE06D7363) {
