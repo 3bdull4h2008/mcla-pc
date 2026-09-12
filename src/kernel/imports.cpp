@@ -1023,9 +1023,10 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     static std::atomic<uint32_t> s_census{0};
     const uint32_t n = s_census.fetch_add(1) + 1;
     if (n <= 20 || (n % 100) == 0) {
-      MCLA_LOG_INFO("NFS-CENSUS[Read] #{:04} h={:08X} len={} off={:#x} lr={:08X}", n,
-                    handle, length,
-                    byteOffset ? byteOffset->get() : 0,
+      MCLA_LOG_INFO("NFS-CENSUS[Read] #{:04} h={:08X} len={} off={:#x} "
+                    "evt={:08X} apc={:08X} lr={:08X}",
+                    n, handle, length,
+                    byteOffset ? byteOffset->get() : 0, event, apcRoutine,
                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
   }
@@ -1105,10 +1106,12 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
   // forever (session-73 "infinite spin", later killed by INFLATE-EMPTY,
   // which aborted the boot's second load batch). Signal the event now —
   // X360 NtReadFile signals it on IO completion.
+  bool signaled = false;
   if (event != 0) {
     if (auto *obj = GetKernelObject(event)) {
       if (auto *evt = dynamic_cast<Event *>(obj)) {
         evt->Set();
+        signaled = true;
         static std::atomic<uint32_t> s_rdEvt{0};
         const uint32_t en = s_rdEvt.fetch_add(1) + 1;
         if (en <= 20 || (en % 500) == 0)
@@ -1119,6 +1122,16 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
         DestroyKernelObject(obj);
       }
     }
+  }
+  // Session 75w FIX: async-contract. The kernel read wrapper
+  // (sub_8244F4C0) presets ioStatus to STATUS_PENDING (259) and branches
+  // on our return: 259 → async path (page finalized via the completion
+  // event), 0 → "done now" path the page-cache submitter never finalizes
+  // (slots stuck state=1 → the boot's second load batch starves). With an
+  // event/APC present the caller expects true async semantics: do the read
+  // inline (already done above) but return STATUS_PENDING.
+  if (ok && signaled && ioStatus) {
+    return 259; // STATUS_PENDING
   }
   return ok ? STATUS_SUCCESS : 0xC000000D;
 }

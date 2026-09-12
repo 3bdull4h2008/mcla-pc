@@ -2680,3 +2680,28 @@ PPC_FUNC(sub_8244F4C0) {
                   static_cast<uint32_t>(ctx.lr));
   __imp__sub_8244F4C0(ctx, base);
 }
+
+// Session 75w: slot-ready fix. sub_821CBE18(slot) waits on the slot's
+// event while [slot+12]==1 (read in flight). Our NtReadFile completes all
+// reads synchronously with no event signal, so pending slots would block
+// forever on data that is already in their buffers. Flip state 1→2 before
+// the wait: the IO has in fact completed.
+PPC_FUNC_IMPL(__imp__sub_821CBE18);
+static std::atomic<uint32_t> s_hCBE18{0};
+PPC_FUNC(sub_821CBE18) {
+  const uint32_t n = s_hCBE18.fetch_add(1) + 1;
+  const uint32_t slot = ctx.r3.u32;
+  uint32_t state = 0;
+  auto &memS = mcla::kernel::GuestMemoryHeap::Instance();
+  if (slot != 0 && slot != 0xCDCDCDCDu) {
+    (void)memS.ReadU32BE(slot + 12, &state);
+    if (state == 1) {
+      (void)memS.WriteU32BE(slot + 12, 2);
+      if (n <= 32 || (n % 500) == 0)
+        MCLA_LOG_INFO("SLOT-READY sub_821CBE18 #{} slot={:08X} state 1->2 "
+                      "(read completed synchronously)",
+                      n, slot);
+    }
+  }
+  __imp__sub_821CBE18(ctx, base);
+}
