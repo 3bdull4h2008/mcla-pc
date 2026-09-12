@@ -546,6 +546,52 @@ void BootWorker(uint32_t entryGuest)
                         (PVOID)c->Rsi, (PVOID)c->Rdi, (PVOID)c->R8, (PVOID)c->R9,
                         (PVOID)c->R10, (PVOID)c->R11, (PVOID)c->Rsp);
             }
+
+            // Session 76b: locate the faulting value in guest memory —
+            // find which structure carries the garbage pointer.
+            if (code == 0xC0000005 && nInfo >= 2) {
+                const uint32_t needle = (uint32_t)(uintptr_t)info[1];
+                if (needle != 0) {
+                    uint8_t pat[4] = {(uint8_t)(needle >> 24),
+                                      (uint8_t)(needle >> 16),
+                                      (uint8_t)(needle >> 8),
+                                      (uint8_t)needle};
+                    struct Range { uint32_t lo, hi; const char* name; };
+                    const Range ranges[] = {
+                        {0x00600000, 0x00800000, "stacks"},
+                        {0x50000000, 0x60000000, "inflate-out"},
+                        {0xA0000000, 0xB0000000, "phys-heap"},
+                    };
+                    uint8_t* guestBase = (uint8_t*)mcla::kernel::g_memory.base;
+                    int hits = 0;
+                    for (const auto& r : ranges) {
+                        uint8_t* p = guestBase + r.lo;
+                        const size_t len = r.hi - r.lo;
+                        for (size_t i = 0; i + 4 <= len && hits < 8; ++i) {
+                            if (p[i] == pat[0] && p[i+1] == pat[1] &&
+                                p[i+2] == pat[2] && p[i+3] == pat[3]) {
+                                const uint32_t va = r.lo + (uint32_t)i;
+                                fprintf(crashFile,
+                                        "  needle %08X @ guest %08X (%s): ",
+                                        needle, va, r.name);
+                                for (int k = -16; k < 16; k += 4) {
+                                    if ((int)i + k >= 0) {
+                                        uint32_t w;
+                                        memcpy(&w, p + i + k, 4);
+                                        fprintf(crashFile, "%08X ", w);
+                                    }
+                                }
+                                fprintf(crashFile, "\n");
+                                ++hits;
+                                i += 4;
+                            }
+                        }
+                        if (hits >= 8) break;
+                    }
+                    if (hits == 0)
+                        fprintf(crashFile, "  needle %08X: no occurrences in scanned regions\n", needle);
+                }
+            }
             
             // Stack trace
             if (code == 0xC0000005 || code == 0x80000003 || code == 0xE06D7363) {
