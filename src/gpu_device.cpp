@@ -2899,30 +2899,136 @@ PPC_FUNC(sub_82363990) {
   __imp__sub_82363990(ctx, base);
 }
 
-// Session 76i: registry-state census at fiDevice::GetDevice entry.
-// Registry header 0x82860844: [0]=array, [4]=count(u16), stride 264.
+// Session 76j: registry-state census at fiDevice::GetDevice entry.
+// Registry header 0x82860844: {Device** array@+0, u16 count@+4, u16 capacity@+6}.
+// Entry (276 bytes): name[262], flag@262, nameLen@264,
+//   device vector {Device** arr@268, u16 cnt@272, u16 cap@274}.
+namespace {
+void MclaSanitizePath(char *buf, size_t cap) {
+  buf[cap - 1] = 0;
+  for (size_t i = 0; i + 1 < cap; ++i) {
+    unsigned char c = static_cast<unsigned char>(buf[i]);
+    if (c == 0) break;
+    if (c < 0x20 || c > 0x7E) {
+      buf[i] = 0;
+      break;
+    }
+  }
+}
+} // namespace
 PPC_FUNC_IMPL(__imp__sub_821CB488);
 static std::atomic<uint32_t> s_hCB488{0};
 PPC_FUNC(sub_821CB488) {
   const uint32_t n = s_hCB488.fetch_add(1) + 1;
-  if (n <= 8 || (n % 200) == 0) {
+  if (n <= 200 || (n % 100) == 0) {
     auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t arr = 0, cnt = 0;
+    char path[68] = {0};
+    memR.ReadBytes(ctx.r3.u32, path, 64);
+    MclaSanitizePath(path, sizeof(path));
+    uint32_t arr = 0;
+    uint16_t cnt = 0, cap = 0;
     memR.ReadU32BE(0x82860844u, &arr);
-    memR.ReadU32BE(0x82860848u, &cnt);
-    cnt &= 0xFFFF;
-    char ents[160] = {0};
-    size_t off = 0;
-    for (uint32_t e = 0; e < cnt && e < 6 && off + 20 < sizeof(ents); ++e) {
-      uint32_t w0 = 0, w1 = 0;
-      memR.ReadU32BE(arr + e * 264u, &w0);
-      memR.ReadU32BE(arr + e * 264u + 4u, &w1);
-      off += static_cast<size_t>(snprintf(ents + off, sizeof(ents) - off,
-                                          " [%08X %08X]", w0, w1));
+    memR.ReadU16BE(0x82860848u, &cnt);
+    memR.ReadU16BE(0x8286084Au, &cap);
+    MCLA_LOG_WARN("GETDEV #{} path='{}' arr={:08X} cnt={} cap={}", n, path, arr,
+                  cnt, cap);
+    for (uint32_t e = 0; arr != 0 && e < 2 && e <= cnt; ++e) {
+      const uint32_t eb = arr + e * 276u;
+      uint16_t flag = 0, len = 0, dcnt = 0, dcap = 0;
+      uint32_t hold = 0, d0 = 0, d1 = 0, vt0 = 0, vt1 = 0;
+      char name[17] = {0};
+      memR.ReadBytes(eb, name, 16);
+      MclaSanitizePath(name, sizeof(name));
+      memR.ReadU16BE(eb + 262u, &flag);
+      memR.ReadU16BE(eb + 264u, &len);
+      memR.ReadU32BE(eb + 268u, &hold);
+      memR.ReadU16BE(eb + 272u, &dcnt);
+      memR.ReadU16BE(eb + 274u, &dcap);
+      if (hold) {
+        memR.ReadU32BE(hold, &d0);
+        memR.ReadU32BE(hold + 4u, &d1);
+        memR.ReadU32BE(d0, &vt0);
+        memR.ReadU32BE(d1, &vt1);
+      }
+      uint32_t d0pfx = 0, d1pfx = 0;
+      if (d0) (void)memR.ReadU32BE(d0 + 36u, &d0pfx);
+      if (d1) (void)memR.ReadU32BE(d1 + 36u, &d1pfx);
+      MCLA_LOG_WARN(
+          "GETDEV-E{} [name='{}' flag={:x} len={} hold={:08X} dcnt={:04X} "
+          "dcap={:04X} d0={:08X} vt0={:08X} pfx0={:08X} d1={:08X} vt1={:08X} "
+          "pfx1={:08X}]",
+          e, name, flag, len, hold, dcnt, dcap, d0, vt0, d0pfx, d1, vt1, d1pfx);
     }
-    MCLA_LOG_WARN("GETDEV sub_821CB488 #{} path={:08X} arr={:08X} cnt={} "
-                  "entries{}",
-                  n, ctx.r3.u32, arr, cnt, ents);
   }
   __imp__sub_821CB488(ctx, base);
+}
+
+// Session 76j: fiDevice::Mount census — every device registration with its
+// device pointer and vtable sanity (crash = garbage Device* in the holder).
+PPC_FUNC_IMPL(__imp__sub_821CB9D8);
+static std::atomic<uint32_t> s_hMnt{0};
+PPC_FUNC(sub_821CB9D8) {
+  const uint32_t n = s_hMnt.fetch_add(1) + 1;
+  if (n <= 40) {
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    char path[68] = {0};
+    memR.ReadBytes(ctx.r3.u32, path, 64);
+    MclaSanitizePath(path, sizeof(path));
+    const uint32_t dev = ctx.r4.u32;
+    uint32_t vt = 0;
+    memR.ReadU32BE(dev, &vt);
+    MCLA_LOG_WARN("MOUNT76 #{} path='{}' dev={:08X} vt={:08X} flag={:x} lr={:08X}",
+                  n, path, dev, vt, ctx.r5.u32 & 0xFFu,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821CB9D8(ctx, base);
+}
+
+// Session 76j: the "embedded:" device method (sub_821CB070) — crash RIP was
+// inside its inlined strrchr/strlen (AV at first uncommitted page below the
+// scan). Log its args to separate garbage-device vs non-terminated string.
+PPC_FUNC_IMPL(__imp__sub_821CB070);
+static std::atomic<uint32_t> s_hCB070{0};
+PPC_FUNC(sub_821CB070) {
+  const uint32_t n = s_hCB070.fetch_add(1) + 1;
+  if (n <= 12) {
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    char p3[40] = {0}, p4[40] = {0};
+    memR.ReadBytes(ctx.r3.u32, p3, 32);
+    MclaSanitizePath(p3, sizeof(p3));
+    memR.ReadBytes(ctx.r4.u32, p4, 32);
+    MclaSanitizePath(p4, sizeof(p4));
+    uint32_t vt = 0;
+    (void)memR.ReadU32BE(ctx.r3.u32, &vt);
+    MCLA_LOG_WARN("EMB76 #{} r3={:08X} [vt={:08X} s3='{}'] r4={:08X} s4='{}' lr={:08X}",
+                  n, ctx.r3.u32, vt, p3, ctx.r4.u32, p4,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821CB070(ctx, base);
+}
+
+// Session 76j: packfile TOC lookup (vtable+144, sub_821CBFC0). Returns 0
+// immediately when [obj+8]==0 — a phantom not-found here sends GetDevice to
+// the NEXT device in the holder (the audlo packfile) whose state may be
+// uninitialized → the 0x7E780000 AV.
+PPC_FUNC_IMPL(__imp__sub_821CBFC0);
+static std::atomic<uint32_t> s_hTOC{0};
+PPC_FUNC(sub_821CBFC0) {
+  const uint32_t n = s_hTOC.fetch_add(1) + 1;
+  if (n <= 60) {
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    char path[68] = {0};
+    memR.ReadBytes(ctx.r4.u32, path, 64);
+    MclaSanitizePath(path, sizeof(path));
+    uint32_t inner = 0;
+    (void)memR.ReadU32BE(ctx.r3.u32 + 8u, &inner);
+    MCLA_LOG_WARN("TOC76 #{} obj={:08X} inner={:08X} path='{}' lr={:08X}", n,
+                  ctx.r3.u32, inner, path, static_cast<uint32_t>(ctx.lr));
+  }
+  uint32_t ret = 0;
+  __imp__sub_821CBFC0(ctx, base);
+  if (n <= 60) {
+    ret = ctx.r3.u32;
+    MCLA_LOG_WARN("TOC76-RET #{} ret={:08X}", n, ret);
+  }
 }
