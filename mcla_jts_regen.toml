@@ -1,0 +1,65 @@
+[main]
+file_path = "build/game_data/default.xex"
+out_directory_path = "build/xr_jts"
+switch_table_file_path = ".research/XenonRecomp/XenonAnalyse/jump_tables.toml"
+
+savegprlr_14_address = 0x823D91C0
+restgprlr_14_address = 0x823D9210
+savefpr_14_address = 0x823DB9A0
+restfpr_14_address = 0x823DB9EC
+savevmx_14_address = 0x823DD2C0
+restvmx_14_address = 0x823DD558
+savevmx_64_address = 0x823DD354
+restvmx_64_address = 0x823DD5EC
+
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = true
+non_volatile_as_local = true
+
+[[main.functions]]
+address = 0x825FDA90
+size = 0xA0
+
+[[main.functions]]
+address = 0x8260B588
+size = 0x80
+
+[[main.functions]]
+address = 0x821DEE40
+size = 0x17A0
+
+# Session 75l: UI streamables texture-list loader.
+[[main.functions]]
+address = 0x82216B98
+size = 0x2B4
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B3814
+registers = ["v63", "v0"]
+after_instruction = false
+jump_address = 0x821B3818
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B3C2C
+registers = ["v54", "v0"]
+after_instruction = false
+jump_address = 0x821B3C30
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B3E90
+registers = ["v63", "v0"]
+after_instruction = false
+jump_address = 0x821B3E94
+
+[[midasm_hook]]
+name = "mcla_Vpkd3d128_type2"
+address = 0x821B4788
+registers = ["v52", "v0"]
+after_instruction = false
+jump_address = 0x821B478C

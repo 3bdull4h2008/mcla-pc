@@ -347,9 +347,6 @@ add_executable(mcla
     generated/ppc_xenon/ppc_recomp.173.cpp
     generated/ppc_xenon/ppc_recomp.174.cpp
     generated/ppc_xenon/ppc_recomp.175.cpp
-    generated/ppc_xenon/ppc_recomp.176.cpp
-    generated/ppc_xenon/ppc_recomp.177.cpp
-    generated/ppc_xenon/ppc_recomp.178.cpp
     .research/XenonRecomp/XenonUtils/xex.cpp
     .research/XenonRecomp/XenonUtils/image.cpp
     .research/XenonRecomp/XenonUtils/xex_patcher.cpp
