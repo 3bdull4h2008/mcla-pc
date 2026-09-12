@@ -1099,6 +1099,21 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     ioStatus->Status.set(ok ? STATUS_SUCCESS : 0xC000000D);
     ioStatus->Information.set(static_cast<uint64_t>(bytesRead));
   }
+  // Session 75x: surface failed / short reads — the game now reaches its
+  // disc-streaming phase and fatals with 'Fatal disc error'; find the
+  // failing read.
+  if (!ok || bytesRead < length) {
+    static std::atomic<uint32_t> s_rdFail{0};
+    const uint32_t fn = s_rdFail.fetch_add(1) + 1;
+    if (fn <= 32 || (fn % 200) == 0)
+      MCLA_LOG_WARN(
+          "NtReadFile: {} h={:08X} off={:#x} len={} got={} status={:08X} "
+          "lr={:08X} (#{})",
+          ok ? "SHORT" : "FAIL", handle,
+          byteOffset ? byteOffset->get() : 0, length, bytesRead,
+          ok ? 0u : 0xC000000Du,
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0), fn);
+  }
 
   // Session 75p FIX: async-read completion. The streamer refill submits
   // overlapped reads with a completion event and polls it; we performed the

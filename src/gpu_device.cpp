@@ -2705,3 +2705,32 @@ PPC_FUNC(sub_821CBE18) {
   }
   __imp__sub_821CBE18(ctx, base);
 }
+
+// Session 75x: disc-error check census. sub_821CC1E0 fatals with
+// 'Fatal disc error' when [dev+12] bit30/31 (error/media flags) are set.
+// Log the device object and flag word to find who sets them.
+PPC_FUNC_IMPL(__imp__sub_821CC1E0);
+static std::atomic<uint32_t> s_hCC1E0{0};
+PPC_FUNC(sub_821CC1E0) {
+  const uint32_t n = s_hCC1E0.fetch_add(1) + 1;
+  const uint32_t strm = ctx.r4.u32;
+  // Session 75z: ack BEFORE the original — the fatal fires inside it.
+  // The check passes only when bit30 (error flag) is clear OR bit31
+  // (handled) is set; our emu misses the step that sets bit31.
+  {
+    auto &memD = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t dev = 0, flags = 0;
+    memD.ReadU32BE(strm + 0, &dev);
+    if (dev != 0 && dev != 0xCDCDCDCDu) {
+      memD.ReadU32BE(dev + 12, &flags);
+      if ((flags & 0x40000000u) != 0 && (flags & 0x80000000u) == 0) {
+        (void)memD.WriteU32BE(dev + 12, flags | 0x80000000u);
+        if (n <= 16 || (n % 200) == 0)
+          MCLA_LOG_WARN("DISCCHK #{} dev={:08X} flags {:08X} -> ack (bit31 "
+                        "set before check)",
+                        n, dev, flags);
+      }
+    }
+  }
+  __imp__sub_821CC1E0(ctx, base);
+}
