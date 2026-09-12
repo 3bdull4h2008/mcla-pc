@@ -2671,6 +2671,18 @@ PPC_FUNC(sub_821CC6F0) {
 // fetch is never even attempted upstream.
 PPC_FUNC_IMPL(__imp__sub_8244F4C0);
 static std::atomic<uint32_t> s_hF4C0{0};
+// Session 76a: completed-read tracking. Our NtReadFile finishes reads
+// synchronously; record the destination buffers so SLOT-READY only marks
+// slots whose buffer really received a completed read (a flip without a
+// read serves garbage — the 0x7E780000 guest AV).
+constexpr size_t kDoneBufCap = 64;
+static std::atomic<uint32_t> g_doneBufs[kDoneBufCap];
+static std::atomic<uint32_t> g_doneBufIdx{0};
+static bool BufferReadDone(uint32_t buf) {
+  for (size_t i = 0; i < kDoneBufCap; ++i)
+    if (g_doneBufs[i].load(std::memory_order_acquire) == buf) return true;
+  return false;
+}
 PPC_FUNC(sub_8244F4C0) {
   const uint32_t n = s_hF4C0.fetch_add(1) + 1;
   if (n <= 24 || (n % 200) == 0)
@@ -2679,6 +2691,10 @@ PPC_FUNC(sub_8244F4C0) {
                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                   static_cast<uint32_t>(ctx.lr));
   __imp__sub_8244F4C0(ctx, base);
+  if (ctx.r4.u32 != 0 && ctx.r4.u32 != 0xCDCDCDCDu) {
+    const uint32_t idx = g_doneBufIdx.fetch_add(1) % kDoneBufCap;
+    g_doneBufs[idx].store(ctx.r4.u32, std::memory_order_release);
+  }
 }
 
 // Session 75w: slot-ready fix. sub_821CBE18(slot) waits on the slot's
@@ -2695,12 +2711,14 @@ PPC_FUNC(sub_821CBE18) {
   auto &memS = mcla::kernel::GuestMemoryHeap::Instance();
   if (slot != 0 && slot != 0xCDCDCDCDu) {
     (void)memS.ReadU32BE(slot + 12, &state);
-    if (state == 1) {
+    uint32_t buf = 0;
+    memS.ReadU32BE(slot + 8, &buf);
+    if (state == 1 && BufferReadDone(buf)) {
       (void)memS.WriteU32BE(slot + 12, 2);
       if (n <= 32 || (n % 500) == 0)
-        MCLA_LOG_INFO("SLOT-READY sub_821CBE18 #{} slot={:08X} state 1->2 "
-                      "(read completed synchronously)",
-                      n, slot);
+        MCLA_LOG_INFO("SLOT-READY sub_821CBE18 #{} slot={:08X} buf={:08X} "
+                      "state 1->2 (read completed synchronously)",
+                      n, slot, buf);
     }
   }
   __imp__sub_821CBE18(ctx, base);
