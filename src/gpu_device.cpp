@@ -2752,3 +2752,38 @@ PPC_FUNC(sub_821CC1E0) {
   }
   __imp__sub_821CC1E0(ctx, base);
 }
+
+// Session 76e: boot-init path census. sub_82187820(descriptor) runs in the
+// boot task and reaches fiDevice::GetDevice(path) — the crash showed the
+// path pointer itself = garbage (0xFF00FF00). Log the descriptor + the
+// path string at entry to find which field is unwritten.
+PPC_FUNC_IMPL(__imp__sub_82187820);
+static std::atomic<uint32_t> s_h87820{0};
+PPC_FUNC(sub_82187820) {
+  const uint32_t n = s_h87820.fetch_add(1) + 1;
+  if (n <= 8 || (n % 100) == 0) {
+    auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t f[6] = {0};
+    for (int i = 0; i < 6; ++i)
+      memP.ReadU32BE(ctx.r4.u32 + i * 4u, &f[i]);
+    char path[48] = {0};
+    for (int cand = 0; cand < 24 && path[0] == 0; ++cand) {
+      const char *p = static_cast<const char *>(
+          mcla::kernel::MmGetHostAddress(f[cand % 6] + (cand / 6) * 4u));
+      if (!p) continue;
+      size_t j = 0;
+      for (; j < 40; ++j) {
+        unsigned char ch = (unsigned char)p[j];
+        if (ch == 0) break;
+        path[j] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+      }
+      path[j] = 0;
+      if (j < 3) path[0] = 0;
+    }
+    MCLA_LOG_WARN("BOOTPATH sub_82187820 #{} r3={:08X} r4={:08X} "
+                  "desc=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] path='{}'",
+                  n, ctx.r3.u32, ctx.r4.u32, f[0], f[1], f[2], f[3], f[4],
+                  f[5], path);
+  }
+  __imp__sub_82187820(ctx, base);
+}
