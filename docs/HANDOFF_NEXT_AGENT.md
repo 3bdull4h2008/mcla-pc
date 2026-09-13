@@ -1,5 +1,38 @@
 # HANDOFF — next agent, read this first
 
+## READ ME FIRST — PHASE 1 (2026-09-13): star_glow still fatal; "memory mount" is the real P0
+
+**Hydration did NOT kill star_glow permanently.** Commit `3c8744e` only
+hydrates the 10 factory shader names (draw/Copy/…). When boot actually
+proceeds, star_glow still fatals via INSERT (`build/boot_stdout_p1b.log`).
+
+**The p0d1 "hang at policecam TOC76 #22" was flaky.** Current binary returns
+TOC76 #22 in 0 ms and continues to the same star_glow fatal as baseline 78.
+The hang had been stopping the boot *before* star_glow.
+
+**The 0x40004D7C wait loop is the GPU driver poller** (`sub_8242FB88`) —
+normal 30 ms cadence with successful wakes. Not an IO slot. See ledger
+F-030..F-033 and `docs/PHASE1_EXECUTION_LOG.md`.
+
+**Gate (proven):** inflated preload dictionaries are never registered as a
+`memory:`/`embedded:` device. GETDEV(`embedded:/…`) hits empty E1
+(dcnt=0/CDCDCDCD). INSERT falls through to archive paths that lack star_glow.
+
+**Post-inflate callback is NOT a mount:** `sub_821BC548` → `sub_821C9108` →
+semaphore release on the archive device (`RELSEMA h=C98B9800`).
+
+**Only 3 Mount call sites:** archive wrapper (fires 2×), `sub_821399E0`
+(0 xrefs), `sub_82139BE0` (via `sub_82135E48`, gated — never runs in logs).
+
+**Next (T4a before any device code):** census `sub_82135E48` / `sub_8213AB78`
+to prove which fork holds — (1) host-missing gate so guest can Mount,
+(2) guest reaches Mount but device must pre-exist, or (3) registration is
+constructor-based / dead code → retarget census at fiDeviceMemory ctors.
+Do NOT GETDEV-redirect (F-027). Acceptance: MOUNT76>2 or ctor census,
+EMB76>0, star_glow loads from RAM device without hydration, two boots.
+
+---
+
 ## READ ME FIRST — CURRENT STATE (2026-09-12, end of session 78; newer than everything below)
 
 **BROKEN-STUB CENSUS IS NOW ZERO (91 → 0).** The last 30 distinct stub targets /

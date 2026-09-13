@@ -12,6 +12,8 @@
 #include <cpu/ppc_context.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <dbghelp.h>
@@ -20,6 +22,20 @@
 #include <string>
 
 extern std::atomic<uint32_t> g_mainGuestThreadId;
+
+// Used by several later censuses (CBSETUP/GETDEV/MOUNT/TOC76); defined here
+// so it is visible at every use site.
+static void MclaSanitizePath(char *buf, size_t cap) {
+  buf[cap - 1] = 0;
+  for (size_t i = 0; i + 1 < cap; ++i) {
+    unsigned char c = static_cast<unsigned char>(buf[i]);
+    if (c == 0) break;
+    if (c < 0x20 || c > 0x7E) {
+      buf[i] = 0;
+      break;
+    }
+  }
+}
 
 static std::atomic<uint32_t> s_rsRealThunkHits{0};
 static std::atomic<uint32_t> s_rsLogOnlyThunkHits{0};
@@ -2407,6 +2423,58 @@ PPC_FUNC(sub_821D5E10) {
   __imp__sub_821D5E10(ctx, base);
 }
 
+// POST-INFLATE CACHE FLUSH census: sub_821D5510 (dcbf/dcbst loop).
+// Called after each inflate step completes. Logs r3 (base addr), r4 (size),
+// r5 (flags), lr.
+PPC_FUNC_IMPL(__imp__sub_821D5510);
+static std::atomic<uint32_t> s_h5510{0};
+PPC_FUNC(sub_821D5510) {
+  const uint32_t n = s_h5510.fetch_add(1) + 1;
+  if (n <= 64 || (n % 200) == 0) {
+    MCLA_LOG_INFO("FLUSH sub_821D5510 #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821D5510(ctx, base);
+}
+
+// POST-INFLATE CLEANUP census: sub_821CE100 (atomic decrement).
+// Called twice at loc_821BC4CC for cleanup. Logs r3 (object), lr.
+PPC_FUNC_IMPL(__imp__sub_821CE100);
+static std::atomic<uint32_t> s_hCE100{0};
+PPC_FUNC(sub_821CE100) {
+  const uint32_t n = s_hCE100.fetch_add(1) + 1;
+  if (n <= 64 || (n % 200) == 0) {
+    MCLA_LOG_INFO("CLEANUP sub_821CE100 #{} r3={:08X} lr={:08X}",
+                  n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821CE100(ctx, base);
+}
+
+// CALLBACK SETUP census: sub_8268B960 (find-or-create by name).
+// Returns the callback pointer stored at [ctx+1548] and the archive device
+// stored at [ctx+1552]. Logs which string lookup produced which function.
+PPC_FUNC_IMPL(__imp__sub_8268B960);
+static std::atomic<uint32_t> s_h68B960{0};
+PPC_FUNC(sub_8268B960) {
+  const uint32_t n = s_h68B960.fetch_add(1) + 1;
+  if (n <= 16 || (n % 200) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    char name[68] = {0};
+    mem.ReadBytes(ctx.r5.u32, name, 64);
+    MclaSanitizePath(name, sizeof(name));
+    uint32_t ret = 0;
+    __imp__sub_8268B960(ctx, base);
+    ret = ctx.r3.u32;
+    MCLA_LOG_WARN("CBSETUP sub_8268B960 #{} pool={:08X} idx={:08X} name='{}' "
+                  "flags={:08X} -> ret={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, name, ctx.r6.u32, ret,
+                  static_cast<uint32_t>(ctx.lr));
+  } else {
+    __imp__sub_8268B960(ctx, base);
+  }
+}
+
 // TASK-COMPLETE census: sub_8244EE00 runs after every pool-worker task
 // execution (TU16:15473, sysTaskExecutor pool proc 821C4528). If tasks ever
 // execute, this fires - and its release chain should wake the parked fence.
@@ -2482,7 +2550,35 @@ PPC_FUNC(sub_821BC140) {
                   d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14],
                   d[15]);
   }
+  // POST-INFLATE CALLBACK TRACE: read context fields before execution.
+  // r26 (ctx.r3) is the preload context. Key offsets:
+  // +1540: stream count
+  // +1544: inflated size
+  // +1548: callback function pointer
+  // +1552: archive device
+  // +8: buffer/data pointer
+  if (n <= 16 || (n % 500) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t ctxBase = ctx.r3.u32;
+    uint32_t cbPtr = 0, arcDev = 0, bufPtr = 0, streamCnt = 0, inflSize = 0;
+    mem.ReadU32BE(ctxBase + 1540, &streamCnt);
+    mem.ReadU32BE(ctxBase + 1544, &inflSize);
+    mem.ReadU32BE(ctxBase + 1548, &cbPtr);
+    mem.ReadU32BE(ctxBase + 1552, &arcDev);
+    mem.ReadU32BE(ctxBase + 8, &bufPtr);
+    MCLA_LOG_WARN("PRELOAD-CTX #{} base={:08X} streamCnt={} inflSize={} "
+                  "cbPtr={:08X} arcDev={:08X} bufPtr={:08X}",
+                  n, ctxBase, streamCnt, inflSize, cbPtr, arcDev, bufPtr);
+  }
   __imp__sub_821BC140(ctx, base);
+  // POST-EXEC: re-read to see if callback fired (state changes)
+  if (n <= 16 || (n % 500) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t ctxBase = ctx.r3.u32;
+    uint32_t streamCnt2 = 0;
+    mem.ReadU32BE(ctxBase + 1540, &streamCnt2);
+    MCLA_LOG_INFO("POST-EXEC sub_821BC140 #{} streamCnt={}", n, streamCnt2);
+  }
 }
 
 // RING-B CONSUMER census: threads #14/#15 run Function_821BC910(arg=0/1).
@@ -3012,19 +3108,6 @@ PPC_FUNC(sub_82363990) {
 // Registry header 0x82860844: {Device** array@+0, u16 count@+4, u16 capacity@+6}.
 // Entry (276 bytes): name[262], flag@262, nameLen@264,
 //   device vector {Device** arr@268, u16 cnt@272, u16 cap@274}.
-namespace {
-void MclaSanitizePath(char *buf, size_t cap) {
-  buf[cap - 1] = 0;
-  for (size_t i = 0; i + 1 < cap; ++i) {
-    unsigned char c = static_cast<unsigned char>(buf[i]);
-    if (c == 0) break;
-    if (c < 0x20 || c > 0x7E) {
-      buf[i] = 0;
-      break;
-    }
-  }
-}
-} // namespace
 PPC_FUNC_IMPL(__imp__sub_821CB488);
 static std::atomic<uint32_t> s_hCB488{0};
 PPC_FUNC(sub_821CB488) {
@@ -3143,24 +3226,44 @@ PPC_FUNC(sub_821CB070) {
 // immediately when [obj+8]==0 — a phantom not-found here sends GetDevice to
 // the NEXT device in the holder (the audlo packfile) whose state may be
 // uninitialized → the 0x7E780000 AV.
+// PHASE1 T3: hang census. p0d1 ends with TOC76 #22 (lr=821CC44C) entered and
+// no RET — dump TOC bounds + elapsed so a spin/corrupt-search is visible.
 PPC_FUNC_IMPL(__imp__sub_821CBFC0);
 static std::atomic<uint32_t> s_hTOC{0};
 PPC_FUNC(sub_821CBFC0) {
   const uint32_t n = s_hTOC.fetch_add(1) + 1;
-  if (n <= 60) {
-    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-    char path[68] = {0};
-    memR.ReadBytes(ctx.r4.u32, path, 64);
-    MclaSanitizePath(path, sizeof(path));
-    uint32_t inner = 0;
-    (void)memR.ReadU32BE(ctx.r3.u32 + 8u, &inner);
-    MCLA_LOG_WARN("TOC76 #{} obj={:08X} inner={:08X} path='{}' lr={:08X}", n,
-                  ctx.r3.u32, inner, path, static_cast<uint32_t>(ctx.lr));
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t pathPtr = ctx.r4.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+  char path[68] = {0};
+  memR.ReadBytes(pathPtr, path, 64);
+  MclaSanitizePath(path, sizeof(path));
+  const bool hot =
+      (n <= 80) || (path[0] && std::strstr(path, "policecam") != nullptr);
+  uint32_t inner = 0, tStart = 0, tCount = 0, e0 = 0, e4 = 0, e8 = 0, e12 = 0;
+  if (hot) {
+    (void)memR.ReadU32BE(obj + 8u, &inner);
+    if (inner) {
+      (void)memR.ReadU32BE(inner + 8u, &tStart);
+      (void)memR.ReadU32BE(inner + 12u, &tCount);
+      (void)memR.ReadU32BE(inner + 0u, &e0);
+      (void)memR.ReadU32BE(inner + 4u, &e4);
+      (void)memR.ReadU32BE(inner + 16u, &e8);
+      (void)memR.ReadU32BE(inner + 20u, &e12);
+    }
+    MCLA_LOG_WARN(
+        "TOC76 #{} obj={:08X} inner={:08X} start={:08X} cnt={:08X} "
+        "e0={:08X} e4={:08X} e8={:08X} e12={:08X} path='{}' lr={:08X}",
+        n, obj, inner, tStart, tCount, e0, e4, e8, e12, path, lr);
   }
-  uint32_t ret = 0;
+  const auto t0 = std::chrono::steady_clock::now();
   __imp__sub_821CBFC0(ctx, base);
-  if (n <= 60) {
-    ret = ctx.r3.u32;
-    MCLA_LOG_WARN("TOC76-RET #{} ret={:08X}", n, ret);
+  if (hot) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    MCLA_LOG_WARN("TOC76-RET #{} ret={:08X} dt={}ms lr={:08X}", n, ctx.r3.u32,
+                  ms, lr);
   }
 }
