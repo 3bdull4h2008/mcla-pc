@@ -949,14 +949,113 @@ PPC_FUNC(sub_82177948) {
   __imp__sub_82177948(ctx, base);
 }
 
+// ===========================================================================
+// Stage C: Shader dictionary hash-table hydration
+//
+// ROOT CAUSE (refined): Factory sub_8218BF20 runs 10x creating entries that
+// are linked into the active list at 0x82839ED0. The hash table at 0x82839F70
+// (256 slots x 4 bytes) is NEVER populated. When sub_82189438 calls
+// sub_82189138 (lookup-or-insert), it scans the empty hash table, tries to
+// INSERT via sub_82188E50, which calls sub_8218C760 -> sub_821BDF20 to
+// resolve the name as a file resource. sub_821BDF20 calls sub_821CB488
+// (resource handler lookup) which returns NULL, causing the INSERT to fail.
+//
+// FIX: After factory completes (10 TEXDICT-CALLER hits), populate the hash
+// table with pointers to the factory-created entries. This way sub_82189138
+// finds the entries during its linear scan without needing the INSERT path.
+// ===========================================================================
+
+// Hash table hydration: populate 0x82839F70 from factory-created entries.
+static uint32_t s_factoryEntryPtrs[256] = {};
+static std::atomic<uint32_t> s_factoryEntryCount{0};
+
+static void HydrateShaderHashTable() {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  constexpr uint32_t TABLE = 0x82839F70;
+  constexpr uint32_t SLOT_COUNT = 256;
+
+  uint32_t count = s_factoryEntryCount.load();
+  uint32_t inserted = 0;
+
+  for (uint32_t i = 0; i < count && inserted < SLOT_COUNT; ++i) {
+    uint32_t entry = s_factoryEntryPtrs[i];
+    if (entry == 0 || !mem.IsValid(entry, 112))
+      continue;
+
+    uint32_t slot = 0;
+    for (; slot < SLOT_COUNT; ++slot) {
+      uint32_t val = 0;
+      mem.ReadU32BE(TABLE + slot * 4, &val);
+      if (val == 0)
+        break;
+    }
+    if (slot >= SLOT_COUNT)
+      break;
+
+    mem.WriteU32BE(TABLE + slot * 4, entry);
+    ++inserted;
+
+    uint32_t w[4] = {};
+    for (int j = 0; j < 4; ++j)
+      (void)mem.ReadU32BE(entry + j * 4, &w[j]);
+    MCLA_LOG_INFO("DICT-HYDRATE slot={} entry={:08X} [{:08X} {:08X} {:08X} "
+                  "{:08X}]",
+                  slot, entry, w[0], w[1], w[2], w[3]);
+  }
+
+  MCLA_LOG_INFO("DICT-HYDRATE done: {}/{} entries -> hash table @0x{:08X}",
+                inserted, count, TABLE);
+}
+
+// Census on sub_82189138 (hash-table lookup-or-insert).
+// Scans 256 slots at 0x82839F70 comparing entry+4 hash with target.
+// On miss: tries sub_82188E50 (INSERT) twice, then falls to fatal path.
+PPC_FUNC_IMPL(__imp__sub_82189138);
+static std::atomic<uint32_t> s_h189138{0};
+PPC_FUNC(sub_82189138) {
+  const uint32_t n = s_h189138.fetch_add(1) + 1;
+  const uint32_t name = ctx.r3.u32;
+
+  char nameStr[80] = {0};
+  if (name != 0 && name >= 0x82000000 && name < 0x82AD3000) {
+    const char *p =
+        static_cast<const char *>(mcla::kernel::MmGetHostAddress(name));
+    if (p) {
+      for (int i = 0; i < 79 && p[i]; ++i)
+        nameStr[i] = (p[i] >= 32 && p[i] < 127) ? p[i] : '.';
+    }
+  }
+
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+
+  __imp__sub_82189138(ctx, base);
+
+  const int32_t result = static_cast<int32_t>(ctx.r3.s32);
+
+  if (result == -1) {
+    MCLA_LOG_WARN("DICTLOOKUP-MISS #{} name='{}' ({:08X}) lr={:08X}",
+                  n, nameStr, name, lr);
+  } else if (n <= 32 || (n % 50) == 0) {
+    MCLA_LOG_INFO("DICTLOOKUP-OK #{} name='{}' ({:08X}) slot={} lr={:08X}",
+                  n, nameStr, name, result, lr);
+  }
+}
+
 // Session 75e (IDA): pgDictionary load/register caller.
 // sub_82197598 links the dict into active list 0x82839ED0 (not a
 // recompiled entry — no __imp__). Census its mapped caller instead.
+// Stage C: collect entry pointers for hash table hydration.
 PPC_FUNC_IMPL(__imp__sub_8218B000);
 static std::atomic<uint32_t> s_h18B000{0};
 PPC_FUNC(sub_8218B000) {
   const uint32_t n = s_h18B000.fetch_add(1) + 1;
   const uint32_t obj = ctx.r3.u32;
+
+  // Collect entry pointer for hash table hydration (Stage C)
+  if (obj != 0 && s_factoryEntryCount.load() < 256) {
+    s_factoryEntryPtrs[s_factoryEntryCount.fetch_add(1)] = obj;
+  }
+
   if (n <= 16 || (n % 50) == 0) {
     MCLA_LOG_INFO("TEXDICT-CALLER sub_8218B000 #{} r3={:08X} r4={:08X} lr={:08X}",
                   n, obj, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
@@ -972,6 +1071,12 @@ PPC_FUNC(sub_8218B000) {
     MCLA_LOG_INFO("TEXDICT-OBJ #{} @{:08X} [{:08X} {:08X} {:08X} {:08X} "
                   "{:08X} {:08X} {:08X} {:08X}]",
                   n, obj, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+  }
+
+  // Stage C: after factory completes all 10 entries, hydrate the hash table
+  if (n == 10) {
+    MCLA_LOG_INFO("TEXDICT-CALLER #10 reached — triggering hash table hydration");
+    HydrateShaderHashTable();
   }
 }
 
