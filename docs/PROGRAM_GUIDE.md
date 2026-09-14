@@ -370,10 +370,10 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
   `idalib_server.py` with the proxy. Useful tools: `get_function_by_address`,
   `decompile_function`, `disassemble_function`, `get_xrefs_to`,
   `list_strings_filter`, `read_memory_bytes`, `data_read_string`.
-- **Ghidra MCP** on `:8089` — raw-image recipe: load `PowerPC:BE:64:default`,
-  set image base `0x82000000`, **clear `no-return` on the ABI thunks**
-  `0x823D91E4/EC/F0/F4/F8/FC` (savegprlr family) or the decompiler truncates
-  every function at its prologue, then clear-flow-and-repair.
+- **Ghidra MCP: RETIRED.** IDA Pro (idalib JSON-RPC, `:8745`) is the only RE
+  backend. (Historical note: the old Ghidra recipe on `:8089` required
+  clearing `no-return` on ABI thunks `0x823D91E4/EC/F0/F4/F8/FC` before
+  decompiling — no longer relevant.)
 - Generated TUs are ground truth for bodies; IDA function starts are
   unreliable on this raw bin; IDA xrefs must be bl-scan-verified (§4).
 - Host crash attribution: llvm-symbolizer + PDB for host RVAs; `FFBT` census
