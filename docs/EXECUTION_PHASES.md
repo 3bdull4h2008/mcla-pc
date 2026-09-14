@@ -1346,3 +1346,166 @@ cap@274 — F-025 layout) and is called from MOUNT76 code.
 **`sub_821CB740` / `sub_821CB760` callers and any ctor that writes a
 non-archive vtable into a fresh device**, then report before T4b host-device
 code. Do not implement a memory: device yet.
+---
+---
+
+# PHASE 2 — De-park the boot: CDCD fill marathon, executor fetch, TLS truth
+
+## PHASE 2 §A — EXECUTION TASK (written 2026-09-14, t24d analysis session; NO code changes made yet)
+
+**Executor:** you. **Prerequisite reading:** Phase 0 §A/§1 hard rules and §8
+anti-cheat — ALL still in force (diagnose before fixing; no `generated/` edits;
+raw-byte rule F-023; one new log name per experiment; kill mcla.exe before
+building). Ledger = `ROOT_CAUSE_VALIDATION.md` Part 3, append F-036+.
+
+**Mission in one line:** the t24c boot is NOT idle-parked — the main thread is
+grinding through a gigantic 0xCDCDCDCD debug-fill loop at ~1.5–4 MB/s while 11
+stream-executor threads starve; find whether the marathon terminates, why the
+executors never get fed, and what the TLS truth actually is — then de-park.
+
+### §0 GROUND TRUTH CAPSULE (all log/raw-verified 2026-09-14; do NOT re-derive)
+
+**The "park" decoded (t24c, `build/boot_stdout_t24c.log`):**
+
+| Fact | Evidence |
+|---|---|
+| Main thread is in a guest **0xCDCDCDCD fill loop**, not idle | PARK-SAMPLE during steady state: `lr=821BE3BC r13=8F200000 tls0=8F201000`, interleaved with `Heap::AllocPhysical+0x578` (18:49:51.428) and our own logging (ZwWriteFile/spdlog mutex) |
+| Fill volume is enormous and still climbing at soak end | `CDCD-FILL #135,640,000 @ AC8EE8C4` at 18:52:07 (~138s in); started `#1 @ A0024020 lr=821DEB0C` 18:49:49; address frontier walked A0024020→AC8Exxxx (~210 MB span; ~542 MB of dword stores incl. overwrites) at ~1.5 MB/s frontier rate |
+| The fill site is NEW | census comment in `src/gpu_cp.cpp` (~line 1540): known static fill sites are only `0x821DEB0C` (sub_821DE9D8 fill-on-alloc tail) + two startup fills (`8218C9D4/8218CCCC`); **`lr=821BE3BC` is a runtime-discovered new site** |
+| `0x821BE3BC` lies inside `sub_821BE250` | `tools/ida_funcs.txt` ground-truth bounds: last function start ≤ 0x821BE3BC is `0x821BE250` — the SAME function we host-serve dead-stream reads from (`MemoryStreamServeRead`, landed t24c). Verify the memset call at BE3BC and why the original body still runs — with the sticky-LR caveat (memset is a leaf, LR = caller of the memset) |
+| The marathon allocates while it fills | park sample inside `Heap::AllocPhysical+0x578`; AllocPhysical census counters climb alongside CDCD-FILL |
+| Our census may be the biggest slowdown | the CDCD store watcher (`src/gpu_cp.cpp` ~1535, SESSION-73 probe) runs for **every guest store ≥0xA0000000** — exactly where the whole marathon lives — with a mutex + page-cache + once-per-4KB-page allocation scan. Instrumentation could be a 10–100× tax on a loop that would be native memset speed on Xbox |
+| One `-1` size still leaks | `AllocPhysical: o1heapAllocate returned null #1 size=0xffffffff align=0x10` fires ONCE per boot at fill-storm start (t24c 18:49:49.179; t24b 18:40:16.029). No o1heap invariants FAIL in t24c (the t24b 18:42:15 one preceded the D30E8 crash, since fixed) |
+| **Streaming is half-alive in t24c** | NFS reads DO fire at thread-creation time (`NFS-CENSUS[Create]/[Read]` from 18:49:44.697, `h=C60ABC00 len=1024 off=0x800 evt=00000000 apc=00000000` — note **evt=0/apc=0**: the 75w synchronous-completion / dormant pending-slot issue); 16 GETDEV/TOC76 lines after 18:49:44; **INFLATE/READWRAP/XMEM = 0 hits** — decompression never starts |
+| 13 threads: 11 executors + 2 GPU ticks | THREAD-CREATE #1–11 `start=821C91C8` (stream executor — see 75u decode below), #12–13 `start=8242FB88` (GPU tick worker, healthy 30ms cadence on 0x40004D7C) |
+| Executor starvation mechanism (75u decode, still the best theory) | executor's inner stream = 3-slot 32KB page cache; on miss it serves **0 bytes and contains NO fetch call**; batch-1's pages WERE fetched via NFS (`lr=8244F548 → sub_8244F4C0`); later batches never trigger that fetch. Who arms the fetch = the open gate |
+| GPU ring never written | `VDRAIN-CENSUS: doorbells=1 drains=0 swaps=0 primaryWptr=FFFFFFFF`, `VSYNC flips=0/0` — nothing submits, so presentation cannot happen yet |
+
+**TLS story CORRECTED (this session's most important finding):**
+
+| Claim in the t24c handoff block | Actual evidence |
+|---|---|
+| "boot-armed TLS block 0x8F200000 gets WIPED at runtime" | **UNPROVEN at the level checked.** `[r13]` (tls0) = `8F201000` (the armed value) in EVERY park sample of t23b/t23c/t24a/t24b/t24c. `tls0=00000000` appears ONLY in `boot_stdout_t22a.log` (pre-guard era). The `ATARRAY-TLSDEAD` guard path (fires when `[r13]` unreadable/zero) **never fired once** in any log (0 hits across t23b→t24c) |
+| "find who wipes TLS" as task #1 | **Retarget.** What actually broke and got fixed: (a) atArray ctors received POISONED count/cap args (0xFFFF from BE250 dead-stream reads returning −1 — now host-served, `ATARRAY-CLAMP` fired 3–4× per boot), (b) XTL alloc thunks crashed on an ABI bug (stale r4 used as size — t24a storm, fixed t24b), (c) `sub_821D30E8` realloc crashed on a **wiped stream-OBJECT block** (`+8` block ptr zeroed — object-field corruption, not TLS), (d) new guest threads get a **zeroed TLS table** by design (`src/kernel/guest_thread.cpp:20–35` allocates PCR+TLS+TEB+STACK, memsets 0, sets only `[r13]=tls-ptr`, TEB, cpu, one quirky `TLS+0x10=0xFFFFFFFF`) — any ORIGINAL thunk body run on a worker thread reads zeroed allocator slots |
+| Deep TLS slots state | **NEVER observed.** boot_host arms only the slot-28 chain (`TableBase+28 → Descriptor → FuncBlock → +8/+12`); **slot +12** (atArray 16B-family allocator) and **FuncBlock+16** (realloc, D30E8) are armed by NOBODY in host code. If guest CRT init would have armed them on Xbox, it never ran here (host jumps at game entry — same family as the CRT embed-seed skip). A first-use AV through a never-armed slot looks IDENTICAL to a wipe |
+
+**Why the blockers block (the causal chain, plain terms):** the game's
+memory-manager init wants to allocate + debug-fill a huge arena. On Xbox that
+is seconds of native memset; here it is hundreds of millions of instrumented
+recompiled word-stores. While the main thread grinds, it does not queue
+streaming work; the 11 executors sit on semaphores; the CP never gets a
+submission; no flips. Separately, even when reads DO happen (NFS layer), the
+executor's page-cache has no fetch-on-miss path (75u), so inflates never start.
+The `-1` alloc and the TLS guards are real but SMALL (one instance / a few
+clamps per boot) — they are cleanup, not the gate.
+
+### §1 TASKS (in order; each ends with a gate before the next)
+
+**T1 — Long-soak the marathon (cheapest, do FIRST).**
+Run 15–20 min: `timeout 1200 ./build/mcla.exe > build/boot_stdout_p2a.log 2> build/boot_stderr_p2a.log`.
+Track per-minute: last `CDCD-FILL` counter + address frontier, AllocPhysical
+count, GETDEV/TOC76/NFS/INFLATE counts, THREAD/WAIT state, first
+LOADGATE/SUBMIT/DRAWDISP/EMB76/TEXDICT hits, any Vectored/[error].
+**Gate A (three-way fork, all outcomes are progress):**
+- frontier CONVERGES (address stops climbing / alloc count plateaus) and boot
+  reaches a NEW marker class → marathon is finite init; document the new
+  frontier and go to T5;
+- frontier keeps climbing past ~1 GB span → estimate ETA; consider T2 first
+  (the fill may be pathologically large or re-filling freed memory);
+- same pages RE-FILLED cyclically (address range loops) → infinite thrash;
+  log the loop bounds and go to T2 immediately.
+**Allowed optimization to make T1 affordable (log it as instrumentation, not a
+fix):** cheapen the CDCD watcher's ≥0xA0000000 page scan (e.g. check once per
+64 pages instead of every page, or put the overrun probe behind a
+`mcla_patch_groups` gate) — it is diagnostic scaffolding, and it may be the
+dominant cost of the marathon. If the cheapened watcher changes behavior, that
+itself is a finding (ledger it).
+
+**T2 — Decode the fill site 0x821BE3BC.**
+Raw-verify (`offset = VA − 0x82000000` in `mcla_pe.bin`) the function
+`sub_821BE250` around +0x16C: find the memset/fill call, its size-argument
+source, and the gating branch. Questions to answer with evidence:
+1. Is this the RAGE/XTL debug-heap fill-on-alloc family (the known sibling:
+   sub_821DE9D8 → memset ret 0x821DEB0C), or a different initializer?
+2. What arms it — is a debug/checked flag set that retail Xbox would not set,
+   possibly by one of OUR kernel imports returning a dev-unit value?
+3. Is sub_821BE250's ORIGINAL body running despite the MemoryStreamServeRead
+   host hook? Read the hook (`src/gpu_device.cpp`, BE250) — which paths still
+   fall through to `__imp__`.
+4. Is the fill target always fresh allocations (append-only init) or does it
+   re-cover freed memory (thrash)? Join CDCD-FILL addresses against the
+   exact-allocation registry if cheap, else sample.
+**Gate B:** one sentence — "the marathon is <finite init of X MB | thrash of
+the same region | debug-mode fill that retail would skip>" with evidence.
+
+**T3 — Trace the single −1 alloc.**
+Add a TEMPORARY census (log-only, no semantic change) at the
+`AllocPhysical size=0xffffffff` site: dump lr + r3–r6 + host backtrace, and
+the caller's preceding reads (the −1 leaked from a failed read upstream —
+same family as the pre-BE250-fix poisons; likely a sibling wrapper read the
+current MemoryStreamServeRead does not cover). Boot ×1 → `boot_stdout_p2c.log`.
+**Gate C:** name the function that produced −1 and the read that failed.
+
+**T4 — TLS truth probe (replaces the old "who wipes TLS" hunt).**
+1. One-shot dumper (log-only): at thread-create, at first ATARRAY-CLAMP, at
+   first XTLIMPORT, and at soak end, log the deep chain words:
+   `[8F201000+0xC]`, `[8F201000+0x1C]`, `[0x8F202000]`, `[0x8F203008]`,
+   `[0x8F20300C]`, `[0x8F203010]` (slot 12, slot 28, Descriptor+0,
+   FuncBlock+8/+12/+16), plus the same offsets on ONE worker thread's r13
+   block.
+2. Decision fork:
+   - slot 12 / FuncBlock+16 are zero AND NEVER flip → they were **never
+     armed**: find the guest arming code that never ran (CRT-init family —
+     xref writes to TLS slot 12 in the image; consider a faithful replay like
+     the embed-seed). THEN the guard family can be retired for the real path.
+   - any slot flips armed→zero at runtime → a real wiper exists: write-watch
+     exactly that word (host watchpoint or PAGE_GUARD on the page), catch the
+     writer, ledger it. Only this branch justifies the old hunt.
+3. Keep all existing guards in place until the fork resolves.
+**Gate D:** the fork verdict, one line, with the dump table.
+
+**T5 — Executor fetch gate (the 11 starved workers).**
+Only after T1 says the main thread finishes (or is proven not the gate):
+1. Confirm the 75u mechanism still holds in the current regime: are there
+   executor refill loops (INFLATE-PENDING family / wait-credits hot loops)
+   with page-cache misses serving 0? Add tid to the relevant censuses if
+   missing.
+2. Decode what triggered batch-1's NFS fetch (`sub_8244F4C0` path) and why
+   later batches don't fire it. Census the fetch armer. Prime suspects from
+   the trail: the evt=0/apc=0 synchronous NtReadFile completion leaving the
+   guest's async bookkeeping dormant (75w family — check whether SLOT-READY
+   or an equivalent is still in tree and firing for these reads).
+3. Gate sentence: "batch N never fetches because ___."
+**Gate E:** the gate named with static + runtime evidence (Phase 0 Stage B
+standard).
+
+**T6 — After de-park: first submission.**
+When threads get fed, watch for LOADGATE/SUBMIT/DRAWDISP/VDRAIN swaps>0 /
+VSYNC flips>0. Document the NEW frontier precisely (address, message,
+timestamp). Expect the renderer-era families to wake (DRAW_INDEXED=0,
+82227428 dispatch 0x20000000, STREAMTEX/UILOAD=0, REBASE-POISON) — census,
+do not pre-fix.
+
+### §2 ESCALATE (stop + log) if
+- The marathon is proven to re-fill the same region forever AND the fill-site
+  decode (T2) shows it is guest-correct behavior → the divergence is upstream
+  (what keeps freeing/allocating) — escalate with the loop bounds; do not
+  hack the fill away.
+- Any T4 dump shows armed→zero transitions you cannot attribute within ~30 min.
+- T5's fetch armer turns out to be generated-code semantics (class A/B) —
+  stop; do not compensate host-side (same rule as Phase 0 E3).
+- Anything requires touching `generated/`, `config/`, or `.research/`.
+
+### §3 DELIVERABLES
+- [ ] Phase 2 §B log: one block per task, gate sentences in BOLD
+- [ ] Ledger F-036+ for every new proven fact (esp. the TLS fork verdict and
+      the marathon classification — these CORRECT the current handoff)
+- [ ] `docs/HANDOFF_NEXT_AGENT.md` new top block: corrected facts + new
+      frontier (this file's §0 already contains the corrections — cite it)
+- [ ] One commit when a gate lands a real fix: `phase2: <fix> — boot
+      advances to <frontier>`
+- [ ] Tree clean except new logs
+
+## PHASE 2 §B — EXECUTION LOG (executor fills this in)
+
+(none yet)

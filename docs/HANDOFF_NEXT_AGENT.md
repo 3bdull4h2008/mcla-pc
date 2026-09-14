@@ -9,6 +9,65 @@
 > `CHEAP_MODEL_EXECUTION_PLAN.md`, `PHASE0_*`, `PHASE1_*` were merged into
 > those; references to them in the older trail now point at the merged docs.
 
+## READ ME FIRST — ANALYSIS PASS (2026-09-14, post-t24c): "PARKED" IS ACTUALLY A CDCD FILL MARATHON; TLS "WIPE" STORY CORRECTED
+
+> No code changed in this pass. This block CORRECTS three claims in the
+> t24c block below and hands off a ready-to-run task brief:
+> **Phase 2 in `docs/EXECUTION_PHASES.md` (§0 capsule + T1–T6 + gates).**
+> Work Phase 2; everything below this block is context.
+
+### Correction 1 — the boot is not parked, it is GRINDING
+
+The t24c "13 threads parked with swaps=0" reading misses what the main thread
+does. Steady-state PARK-SAMPLEs show it inside a guest **0xCDCDCDCD fill
+loop**: `CDCD-FILL #135,640,000 @ AC8EE8C4` at soak end (~138s), frontier
+walked A0024020→AC8Exxxx (~210 MB) at ~1.5 MB/s, allocating as it goes. The
+fill lr `821BE3BC` sits inside **`sub_821BE250`** (tools/ida_funcs.txt
+ground-truth bounds) — the same function whose dead-stream reads we now
+host-serve; its ORIGINAL body still runs and fills. On Xbox this is seconds
+of native memset; here every store walks our SESSION-73 CDCD watcher
+(mutex + page-cache + overrun scan on every ≥0xA0000000 store), so our own
+instrumentation may be the dominant cost. **First move: T1 long-soak (15–20
+min) to classify the marathon: finite init / runaway size / cyclic thrash.**
+
+### Correction 2 — the TLS block is NOT (proven) wiped; the real disease is per-thread + never-armed slots
+
+- `tls0` (`[r13]`) = `8F201000` (armed value) in EVERY park sample of
+  t23b/t23c/t24a/t24b/t24c. `tls0=00000000` exists only in `t22a.log`
+  (pre-guard era). `ATARRAY-TLSDEAD` (the "TLS wiped" guard path) fired **0
+  times** across all of those logs.
+- What actually bit, in order: poisoned atArray ctor args (0xFFFF from BE250
+  dead-stream −1 reads — fixed by MemoryStreamServeRead, `ATARRAY-CLAMP` 3–4×
+  per boot), the XTL thunk ABI bug (stale r4 as size — fixed t24b), and the
+  D30E8 crash on a wiped stream-OBJECT block (object fields, not TLS).
+- New guest threads get a **zeroed TLS table by design**
+  (`src/kernel/guest_thread.cpp:20–35` memsets the whole PCR+TLS+TEB+STACK
+  block and arms nothing). And boot_host arms ONLY the slot-28 alloc chain —
+  **TLS slot +12** (atArray 16B family) and **FuncBlock+16** (realloc) are
+  armed by nobody. A first-use AV through a never-armed slot is
+  indistinguishable from a wipe. Phase 2 T4 (deep-slot dumper + fork:
+  never-armed → faithful replay vs armed→zero → real wiper) settles this.
+
+### Correction 3 — streaming is half-alive; the executor fetch gate is the real starvation
+
+t24c DOES do NFS file reads at thread-spawn time
+(`NFS-CENSUS[Read] h=C60ABC00 len=1024 off=0x800 evt=00000000 apc=00000000` —
+note evt=0/apc=0, the 75w synchronous-completion/dormant-pending-slot issue),
+but **INFLATE/READWRAP/XMEM = 0**. The 75u decode still stands: the executor's
+3-slot 32KB page cache serves 0 bytes on a miss and contains NO fetch call;
+batch-1's fetches went through `sub_8244F4C0` and later batches never arm it.
+Phase 2 T5 hunts the fetch armer once the marathon is classified.
+
+### Where to work
+
+1. `docs/EXECUTION_PHASES.md` → **PHASE 2** (new, at bottom): §0 capsule with
+   all evidence, tasks T1–T6, gates A–E, escalation rules. Follow it.
+2. Ledger: append F-036+ in `docs/ROOT_CAUSE_VALIDATION.md`.
+3. Golden rules unchanged: no `generated/` edits, raw-byte rule F-023, one
+   new log name per experiment, census-before-fix, `timeout` every boot.
+
+---
+
 ## READ ME FIRST â€” T5 SOLVED (2026-09-14, t24c): boot is PARKED, threads live, 0 AVs
 
 ### Where we are in the boot stack (plain terms)
