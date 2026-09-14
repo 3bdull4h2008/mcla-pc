@@ -29,6 +29,7 @@ crash_log_early.txt
 boot_stderr*.log
 boot_stdout*.log
 boot_test_capture.png
+/_logs/
 
 # ── Build artifacts ────────────────────────────────────────
 *.obj

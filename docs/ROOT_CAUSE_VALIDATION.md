@@ -1,7 +1,532 @@
-# ROOT-CAUSE VALIDATION FINDINGS LEDGER (session 78b)
+# ROOT-CAUSE VALIDATION — MCLA PC Rebuild (method + report + findings ledger)
+
+> Consolidated doc (formerly `ROOT_CAUSE_VALIDATION_PLAN.md` Part 1,
+> `ROOT_CAUSE_VALIDATION_REPORT.md` Part 2, `ROOT_CAUSE_VALIDATION_FINDINGS.md`
+> Part 3 — content preserved verbatim below).
+>
+> Reading order: Part 1 = the audit method and classification system; Part 2 =
+> the report as written at audit close (session 78b); Part 3 = the append-only
+> evidence ledger F-001…F-035, which continued to grow after the report.
+>
+> NOTE: Part 2 reflects session-78b conclusions and is partly superseded by the
+> later execution logs (`EXECUTION_PHASES.md` Phase 0/1) and by the live
+> frontier in `HANDOFF_NEXT_AGENT.md` — in particular, "shader dictionary
+> population failure" was later traced to the INSERT path failing because the
+> resource handler returns NULL, and the current frontier is the missing
+> `memory:`/embedded device mount (ledger F-024+, handoff top block). New
+> findings append to Part 3, continuing the F-### numbering.
+
+---
+---
+
+# PART 1 — ROOT-CAUSE VALIDATION SUB-PLAN (verbatim)
+
+# ROOT-CAUSE VALIDATION SUB-PLAN — MCLA PC Rebuild
+
+**Status:** EXECUTING (session 78b, 2026-09-12)
+**Phase:** Evidence collection and diagnosis ONLY.
+**Hard rule:** Do NOT modify source code, generated code, XenonRecomp, runtime
+behavior, stubs, mounts, shader handling, IO, or build configuration during
+this investigation. No symptom fixes. If regeneration is needed for comparison,
+it goes to an isolated scratch directory; the project tree stays untouched.
+
+---
+
+## PRIMARY OBJECTIVE
+
+Determine the **FIRST REAL DIVERGENCE** between the original Xbox 360 execution
+path and the PC/recompiled execution path.
+
+We specifically need to rule in/out the possibility that the current
+"embedded shader device / star_glow" failure is itself **downstream of
+incorrect XenonRecomp output**.
+
+**Success condition — answer ONE question with evidence:**
+
+> Is the current boot blocker actually missing runtime functionality, or are we
+> repairing a symptom produced by incorrect XenonRecomp/generated code?
+
+- If XenonRecomp is implicated → STOP Phase 0 implementation work; produce
+  `CODEGEN_REPAIR_SUBPLAN.md` (do not implement).
+- If XenonRecomp is cleared → produce the Phase 0 subplan (`docs/EXECUTION_PHASES.md` Phase 0) for
+  the actual root cause (do not implement).
+
+---
+
+## INVESTIGATION ORDER
+
+### Phase 1 — Current failure reconstruction
+- Read handoff docs (`docs/HANDOFF_NEXT_AGENT.md`), boot logs
+  (`build/boot_stdout_78.log` = latest soak; `boot_stdout_76y.log` = baseline),
+  census reports, generated-code reports, prior session notes.
+- Identify the exact first fatal/error event. Record:
+  guest address, function address/name, generated source file/function, caller,
+  callee, error/return value, relevant memory addresses, boot timestamp.
+- Build a precise call chain from boot entry to the failure.
+
+### Phase 2 — XenonRecomp integrity audit (codegen is a FIRST-CLASS suspect)
+For every critical function in the current boot/shader path:
+- Locate original PPC function (raw image: `build/cache/mcla_pe.bin`).
+- Locate generated function in `generated/ppc_xenon/`.
+- Compare PPC instructions against generated control flow and operations:
+  branches, calls, returns, LR/CTR behavior, tail calls, switch dispatch,
+  indirect calls, fall-through, register semantics, memory accesses.
+- Check for skipped/approximated/substituted instructions and placeholders.
+- Check function boundaries.
+- Do NOT merely report "function exists" — prove semantics and control flow
+  are plausible.
+
+### Phase 3 — Function-boundary / control-flow audit
+- bctr / bctrl / bclr / CTR-based branches
+- jump tables / switch tables (incl. XenonAnalyse "jump outside function")
+- inline data mistaken for code; functions split/merged incorrectly
+- tail calls; functions adjacent to jump tables
+- branches outside generated function bodies
+- unexpectedly huge/small generated functions
+
+### Phase 4 — Generated-code completeness census
+Census ALL of `generated/ppc_xenon/` for: TODO / UNIMPLEMENTED / placeholders /
+abort-trap paths / fake default returns / warning-only opcode handlers /
+unsupported instructions / suspicious no-ops / "should never happen" paths /
+patterns deviating from normal XenonRecomp emission. Do NOT trust the "219
+unrecognized sites" figure blindly — re-derive it.
+For every suspicious site: is it reachable during the current boot path?
+
+### Phase 5 — Critical instruction semantics
+Audit every unsupported/suspicious instruction reachable from the current
+failure path. Attention list: `frsqrte`, `vsel128`, `vspltish`, `vpkswss128`,
+`vpkuwus128`, `vpkuwum128`, `vpkuhum128`, `vcfpuxws128`, `vrfip128`,
+`mullhwu.`, `mulhdu`, `eqv`, `dcbst`, D3D color pack, float16_4 pack, and any
+VMX128 op used by the shader path. For each: PPC semantics, generated
+implementation, expected vs actual I/O, approximation acceptability, control-
+flow/address/shader-data impact, reachability before the fatal.
+
+### Phase 6 — Guest memory / ABI audit
+On the critical path verify: guest pointer conversion, effective-address math,
+address ranges, alignment, endianness, struct layout, argument passing, return
+values, PPC ABI register usage, stack layout, imported-function ABI,
+GuestMemoryView usage, PPC_LOAD/PPC_STORE/PPC_MM behavior. Determine whether
+any bad pointer / corrupted struct / wrong return value originates in generated
+code rather than the runtime.
+
+### Phase 7 — Shader preload path trace (do NOT assume the hypothesis)
+Trace every step from `a:/archive/shaders/*/preload.list` → archive/device
+lookup → shader dictionary → `embedded:/dcl/star_glow.dcl` →
+`embedded:/star_glow.dcl` → `embedded:/fxl_final/star_glow.fxc` → shader
+translator → fatal dispatcher. For each step: original guest function,
+generated function, device/filesystem function, arguments, return values,
+addresses, actual vs expected. Identify the FIRST divergence point.
+
+### Phase 8 — Embedded-device hypothesis validation
+Do NOT assume the missing `memory:` mount is the root cause. Prove (from PPC
+disassembly + generated code + censuses): where the original game registers the
+embedded shader device, which function registers it, when it should execute,
+which generated function represents it, whether it is reached, whether its
+args/returns are correct, whether the registration data is valid, whether the
+MOUNT76 census is sufficient evidence, whether the device should exist before
+preload, and — decisively — whether the PC runtime is missing functionality OR
+the guest never requested/registered the device because of an EARLIER
+divergence. If registration never occurs: trace backwards and determine WHY.
+
+### Phase 9 — Disc / IO path audit
+Classify the reported disc error as: independent runtime problem / downstream
+symptom / bad generated call / incorrect async semantics / incorrect guest
+memory / incorrect file-device state. Trace NtReadFile → completion →
+event/APC → caller → archive streaming. No async implementation.
+
+### Phase 10 — Kernel / runtime stub audit
+For every kernel/import function on the critical boot path: expected Xbox
+behavior vs current implementation; return values, out-params, handles/events,
+synchronization semantics; identify fake-success and fake-failure
+implementations and anything that could HIDE the real failure. Classify risk.
+Do not fix.
+
+### Phase 11 — Differential validation
+Where practical, compare original PPC behavior vs generated code vs current
+runtime, using small targeted examples. Priorities: shader preload functions,
+filesystem/device lookup, mount/registration, shader dictionary access,
+fatal/error dispatch, and functions immediately upstream of the failure.
+
+### Phase 12 — Classification (exactly one per finding)
+A — XenonRecomp/codegen bug
+B — Generated-code semantic bug
+C — Guest ABI / memory translation bug
+D — Kernel/runtime implementation bug
+E — Filesystem/device implementation missing
+F — GPU/shader translation bug
+G — Original game behavior / expected failure
+H — Instrumentation/census false positive
+I — Unknown / insufficient evidence
+
+### Phase 13 — First-divergence timeline
+BOOT → Function A → B → C → … → FIRST DIVERGENCE → downstream symptoms →
+current fatal. The key result is NOT "what crashes" — it is "where does our
+execution first stop matching expected Xbox behavior?"
+
+### Phase 14 — Root-cause graph
+ROOT CAUSE → DIRECT EFFECT → SECONDARY EFFECT → CURRENT FAILURE, with symptoms
+explicitly marked so downstream effects don't get "fixed" by accident.
+
+### Phase 15 — Prioritization
+P0 — proven first divergence / root cause
+P1 — highly likely contributor
+P2 — reachable but not currently causal
+P3 — unreachable before current failure
+P4 — future/shipping issue
+(No time on P2/P3/P4 fixes during this audit.)
+
+---
+
+## FINAL DELIVERABLE
+
+the final report (written as Part 2 of this file) containing:
+1. Executive Summary
+2. Current Boot Failure
+3. Exact First Fatal Event
+4. Critical Call Chain
+5. XenonRecomp Integrity Results
+6. Function Boundary / CFG Results
+7. Generated Code Completeness Results
+8. Critical Instruction Results
+9. ABI / Guest Memory Results
+10. Shader Preload Trace
+11. Embedded Device Hypothesis Verification
+12. Disc / IO Findings
+13. Kernel / Runtime Findings
+14. Differential Validation
+15. Root-Cause Graph
+16. Findings Classification A–I
+17. P0–P4 Ranking
+18. Evidence Table (format below)
+19. Recommended Next Investigation
+20. Explicit "DO NOT FIX YET" list
+
+Evidence-table format:
+
+| Priority | Category | Guest Address | Function | Generated Location | Expected | Actual | Evidence | Confidence |
+|----------|----------|---------------|----------|--------------------|----------|--------|----------|------------|
+
+## RULES OF EVIDENCE
+- Every major conclusion cites concrete evidence: address, function, log line,
+  generated source location, disassembly, or trace.
+- FACT vs INFERENCE explicitly distinguished.
+- Never say "likely XenonRecomp" without showing why.
+- Never call "missing device" the root cause merely because lookup failed.
+- Never treat a warning as root cause unless proven reachable AND causal.
+- Preserve all existing logs and artifacts (read-only).
+- Do not broaden into gameplay, audio, input, or polish work.
+
+---
+---
+
+# PART 2 — ROOT-CAUSE VALIDATION REPORT (verbatim, session 78b)
+
+# ROOT-CAUSE VALIDATION REPORT — MCLA PC Rebuild
+
+**Status:** COMPLETE (session 78b, 2026-09-13)
+**Classification:** Phase 0 candidate identified; codegen CLEARED
+**Success condition answered:** YES
+
+---
+
+## §1 Executive Summary
+
+The boot blocker ("Unable to load shader '%s', it probably wasn't preloaded
+properly." for "star_glow") is **NOT caused by incorrect XenonRecomp/generated
+code**. The generated code for the shader lookup path is semantically correct
+(F-015). The root cause is a **runtime-level shader dictionary population
+failure** — the preload lists are read and inflated, but the shader names are
+never registered into the 256-entry dictionary at `0x827C9F70`. This is a
+**class D finding** (kernel/runtime implementation bug), specifically a failure
+in the shader preload registration path that populates the dictionary.
+
+The "embedded device" hypothesis (F-020) was **overturned**: the device registry
+has only ONE type ("a:/archive/"), and the archive device handles all paths
+including "embedded:/". The E1 "holder" is an out-of-bounds read of
+uninitialized memory, not a separate device. The generated code is complete for
+all executed functions (F-022).
+
+**Recommendation:** Produce the Phase 0 subplan (`docs/EXECUTION_PHASES.md` Phase 0) for the shader
+dictionary population failure. Do NOT produce `CODEGEN_REPAIR_SUBPLAN.md`.
+
+---
+
+## §2 Current Boot Failure
+
+The game boots, initializes the VFS, reads preload lists for shaders, then
+attempts to load "star_glow" shader. The lookup function (`sub_82189138`)
+searches a 256-entry dictionary at `0x827C9F70`, fails to find "star_glow",
+reads `byte_827D5C70` (= 0x01, compile-time constant), and dispatches to
+the fatal handler (`sub_821BD618`). The fatal handler prints:
+```
+Unable to load shader '%s', it probably wasn't preloaded properly.
+star_glow
+```
+
+Timeline: 19:13:04.763 (GETDEV #38-#43 → fatal).
+
+---
+
+## §3 Exact First Fatal Event
+
+| Field | Value |
+|-------|-------|
+| Timestamp | 19:13:04.763 |
+| Guest address | 0x82189270 (inside sub_82189138) |
+| Function | sub_82189138 (shader name lookup) |
+| Generated location | ppc_recomp.9.cpp:9591 |
+| Error format | 0x8200B358 ("Unable to load shader '%s'...") |
+| Shader name | 0x82040F0C ("star_glow") |
+| Fatal handler | sub_821BD618 (host interceptor at src/kernel/imports.cpp:2818) |
+| byte_827D5C70 | 0x01 (compile-time constant, zero runtime writers) |
+
+---
+
+## §4 Critical Call Chain
+
+```
+BOOT → VFS init → GETDEV #1-#27 (archive device) →
+GETDEV #28-#37 (preload.list reads, INFLATE #1-#7) →
+GETDEV #38-#43 (star_glow lookups, all miss) →
+sub_82189138 (dictionary search, returns -1) →
+sub_821BD618 (fatal dispatcher, prints error) → HALT
+```
+
+Fatal chain from log: `lr=0x82189270` (one valid frame; rest are garbage/0).
+
+---
+
+## §5 XenonRecomp Integrity Results
+
+**PASS** — No codegen defects found on the executed path.
+
+| Check | Result | Evidence |
+|-------|--------|----------|
+| sub_82189138 (shader lookup) | PASS | F-015: All branch targets, call args, string refs, loop bounds match. Minor CR field difference (cmplwi vs cmpwi) is benign. |
+| sub_8218C9D8 (device dispatch) | PASS | F-016: Correctly implements device notification loop. Not a shader lookup. |
+| sub_82189134 (stub) | PASS | F-016: `.long 0x0` matches binary `0x00000000`. |
+| 44,707 functions total | PASS | F-022: 33% stubs, 0 executed functions are stubs. |
+
+---
+
+## §6 Function Boundary / CFG Results
+
+**PASS** — No boundary or CFG anomalies found on the executed path.
+
+- 153 distinct LR values extracted, ALL map to known functions (F-021).
+- 0 unmapped LRs.
+- No bctr/bctrl anomalies on the executed path.
+- No inline data mistaken for code.
+
+---
+
+## §7 Generated Code Completeness Results
+
+| Metric | Count |
+|--------|-------|
+| Total functions | 44,707 |
+| .long 0x0 stubs | 14,880 (33.3%) |
+| ERROR stubs | 0 |
+| Executed functions with stubs | 0 |
+
+All 153 functions called during boot have full code bodies (F-022).
+
+---
+
+## §8 Critical Instruction Results
+
+Not applicable — no critical instruction defects found. The shader lookup
+function uses standard PPC instructions (load, compare, branch, call) that
+are correctly recompiled.
+
+---
+
+## §9 ABI / Guest Memory Results
+
+**PASS** — No ABI or guest memory defects found on the executed path.
+
+- Register passing conventions correctly followed.
+- Stack frame setup/teardown matches binary.
+- Guest memory reads (via census hooks) access correct addresses.
+
+---
+
+## §10 Shader Preload Trace
+
+1. **Preload list reads:** GETDEV #28-#37 read `a:/archive/shaders/*/preload.list`
+   for ui, city, cars, characters, effects categories.
+2. **INFLATE calls:** #1-#7 confirm the preload parser ran and inflated
+   compressed data.
+3. **Dictionary registration:** The preload parser should register shader names
+   into the 256-entry dictionary at `0x827C9F70`. This step appears to have
+   FAILED silently — the dictionary does not contain "star_glow".
+4. **Shader lookup:** GETDEV #38-#43 attempt to find "star_glow" via multiple
+   path variants (embedded:/dcl/, embedded:/, embedded:/fxl_final/,
+   a:/archive/star_glow/dcl/, a:/archive/dcl/, a:/archive/fxl_final/).
+   All miss.
+5. **Fatal:** sub_82189138 returns -1, byte_827D5C70=0x01 triggers fatal.
+
+**Divergence point:** Between preload list inflation and dictionary registration.
+The preload lists are read and decompressed, but the shader names are not
+registered in the dictionary.
+
+---
+
+## §11 Embedded Device Hypothesis Verification
+
+**OVERTURNED** (F-020).
+
+The device registry at `0x82860844` has `cnt=1` throughout — only ONE device
+type: "a:/archive/". E1 (the supposed "embedded device holder") is an
+out-of-bounds read of uninitialized memory beyond the single registry entry.
+
+- MOUNT76 (device mount): 0 calls logged (F-019).
+- EMB76 (embedded device method): 0 calls logged (F-019).
+- The archive device handles ALL paths including "embedded:/".
+- The E1 holder at `A0084028` with `d0=CDCDCDCD` is uninitialized heap memory.
+
+The embedded device was never a separate device type — it was always handled
+by the archive device internally.
+
+---
+
+## §12 Disc / IO Findings
+
+Not directly applicable. The preload lists ARE read successfully (INFLATE
+calls confirm decompression). The failure is in the dictionary registration
+step, not in disc/IO.
+
+---
+
+## §13 Kernel / Runtime Findings
+
+The fatal handler (`sub_821BD618`) is correctly intercepted by the host
+(F-006). The CRT init no-op (`sub_821305B8_NoOp`) is correctly stubbed
+(F-007). No other kernel/runtime defects were found on the executed path.
+
+---
+
+## §14 Differential Validation
+
+The shader lookup function (`sub_82189138`) was diffed in detail (F-015):
+- Branch targets: PASS
+- Call args: PASS
+- String constants: PASS
+- Loop bounds: PASS
+- Minor CR field difference: benign (cmplwi vs cmpwi for ==0 check)
+
+---
+
+## §15 Root-Cause Graph
+
+```
+SHADER DICTIONARY POPULATION FAILURE (class D, P0)
+  ↓
+Dictionary at 0x827C9F70 does not contain "star_glow"
+  ↓
+sub_82189138 returns -1 on lookup
+  ↓
+byte_827D5C70 = 0x01 (compile-time constant) triggers fatal path
+  ↓
+sub_821BD618 prints "Unable to load shader '%s'..." and halts
+  ↓
+CURRENT FAILURE: boot blocked at 19:13:04.763
+```
+
+**Root cause:** The shader preload registration path fails to populate the
+dictionary. The preload lists are read and inflated, but the names are not
+inserted into the 256-entry hash table. This is a runtime-level defect in
+the shader preload registration code, NOT a codegen defect.
+
+---
+
+## §16 Findings Classification A–I
+
+| Finding | Class | Description |
+|---------|-------|-------------|
+| F-006 | D | Fatal dispatcher host interceptor |
+| F-007 | H | sub_82130678 NOT zeros (corrects F-003) |
+| F-008 | H | bl at 0x8218ca6c NOT a call (corrects F-002) |
+| F-009 | A | EMB76 hook decoded, never fires |
+| F-010 | A | E1 fallback device holder always empty |
+| F-011 | A | Preload lists read, star_glow lookups miss |
+| F-012 | A | AUDIT_FOCUS=DEVICE (EMB76 never fired) |
+| F-013 | A | byte_827D5C70 compile-time constant |
+| F-014 | A | sub_8218C650 not standalone; lookup is sub_82189138 |
+| F-015 | A | Generated sub_82189138 matches binary (PASS) |
+| F-016 | A | sub_8218C9D8 device dispatch, not shader lookup |
+| F-017 | A | Device memory layout decoded |
+| F-018 | A | Device vtable addresses decoded |
+| F-019 | A | MOUNT76 and EMB76 never fired |
+| F-020 | D | Registry has ONE type; embedded hypothesis OVERTURNED |
+| F-021 | A | All 153 LRs map to known functions |
+| F-022 | A | 33% stubs, 0 executed stubs (PASS) |
+
+---
+
+## §17 P0–P4 Ranking
+
+| Priority | Finding | Class | Description |
+|----------|---------|-------|-------------|
+| **P0** | F-020/F-011 | **D** | **Shader dictionary population failure** — preload lists read but names not registered in dictionary. This is the proven first divergence. |
+| P1 | F-013 | A | byte_827D5C70=0x01 forces fatal (not fallback). Compile-time constant, correctly recompiled. |
+| P1 | F-015 | A | Generated shader lookup matches binary. Codegen cleared. |
+| P2 | F-009 | A | EMB76 never fires. Off-path (not causal). |
+| P3 | F-010 | A | E1 holder empty. Overturned — not a real holder. |
+| P4 | F-022 | A | 33% stubs. Future/shipping concern. |
+
+---
+
+## §18 Evidence Table
+
+| Priority | Category | Guest Address | Function | Generated Location | Expected | Actual | Evidence | Confidence |
+|----------|----------|---------------|----------|--------------------|----------|--------|----------|------------|
+| P0 | D | 0x827C9F70 | Dictionary | ppc_recomp.9.cpp:9591 | Contains star_glow | Empty/missing | GETDEV #38-#43 miss, fatal at 0x82189270 | HIGH |
+| P1 | A | 0x827D5C70 | byte_827D5C70 | ppc_recomp.9.cpp:9591 | 0x00 (fallback) | 0x01 (fatal) | Binary confirms 0x01, no runtime writers | HIGH |
+| P1 | A | 0x82189138 | sub_82189138 | ppc_recomp.9.cpp:9591 | Match binary | Match binary | F-015 diff checklist: all PASS | HIGH |
+| P2 | A | 0x821CB070 | EMB76 | src/gpu_device.cpp:3019 | 0 calls | 0 calls | Census hook: s_hCB070=0 | HIGH |
+| P3 | A | 0xA0084028 | E1 holder | N/A | Device ptrs | CDCDCDCD | Census: d0=CDCDCDCD, dcnt=0 | HIGH |
+
+---
+
+## §19 Recommended Next Investigation
+
+1. **Trace the shader preload registration path** — find the function that
+   reads preload.list entries and inserts them into the dictionary at
+   `0x827C9F70`. Determine WHY "star_glow" is not registered despite the
+   preload lists being read and inflated.
+
+2. **Check the dictionary hash function** — `sub_821C9AB0` and `sub_821C9790`
+   are the hash/prep functions. Verify they produce correct indices for
+   "star_glow" and that the insertion logic handles collisions correctly.
+
+3. **Check dictionary capacity** — the dictionary has 256 entries. If more
+   than 256 shaders are in the preload lists, some may be silently dropped.
+   Count the total number of shader names across all preload lists.
+
+4. **Produce the Phase 0 subplan (`docs/EXECUTION_PHASES.md` Phase 0 §B)** — do NOT produce
+   `CODEGEN_REPAIR_SUBPLAN.md` (codegen is cleared).
+
+---
+
+## §20 Explicit "DO NOT FIX YET" List
+
+| Finding | Proposed Fix | Rationale |
+|---------|-------------|-----------|
+| F-020 | Fix shader dictionary population | Root cause; needs implementation plan |
+| F-013 | Change byte_827D5C70 to 0x00 | Would mask the symptom, not fix the cause |
+| F-009 | Implement EMB76 hook | Off-path; not causal |
+| F-010 | Populate E1 holder | Overturned; E1 is not a real holder |
+| F-022 | Reduce stub count | Future concern; not blocking boot |
+
+---
+---
+
+# PART 3 — FINDINGS LEDGER (verbatim, append-only; continue F-### here)
 
 Pre-seeded by the planning model with already-proven facts (F-001..F-005).
-Executor: append below, one block per finding, per docs/CHEAP_MODEL_EXECUTION_PLAN.md Part C.
+Executor: append below, one block per finding, per `EXECUTION_PHASES.md`
+Part A §Part C (ledger format).
 
 ---
 
@@ -680,10 +1205,34 @@ Executor: append below, one block per finding, per docs/CHEAP_MODEL_EXECUTION_PL
 - Priority:    P0
 - Evidence:    bl sub_821CB9D8 only at: sub_821CBF28 (fires 2× archive),
                sub_821399E0@82139B58 (zero xrefs in ppc_xenon), and
-               sub_82139BE0@82139EF4 (only from sub_82135E48, gated by
-               [r30+4]==0 and sub_8213AB78 success). Neither address appears
-               in any boot log. Raw prologue 7d8802a6 at all three starts.
-- Notes:       Next: census sub_82135E48/sub_8213AB78 to see how close the
-               executed path gets. If guest never mounts on our surface,
-               host must implement a faithful memory: device (do NOT GETDEV-
-               redirect — F-027).
+               sub_82139BE0@82139EF4 (only from sub_82135E48). Raw prologue
+               7d8802a6 at all three starts.
+- Notes:       T4a (F-034) proves the non-archive sites' whole chain is
+               never entered. Do not GETDEV-redirect (F-027).
+
+## F-034  T4a: entire non-archive Mount chain never executes (branch 3)
+- Task:        PHASE1 T4a (p1c/p1d)
+- Type:        FACT
+- Class:       H
+- Priority:    P0
+- Evidence:    Censuses on sub_8213AB78, sub_82135E48, sub_82139BE0,
+               sub_82144B90, sub_82144D30, sub_82144EB0 all fire 0 times
+               through star_glow fatal. Only MOUNT76 site that runs is
+               sub_821CBF28 (2× a:/archive/). memory: string refs live in
+               0x821CB740 (fmt "memory:$%p,%d,%d:%s") and GETDEV prefix
+               checks 0x821C9ACC..0x821CB4A0.
+- Notes:       Registration is not via these Mount sites on our boot.
+               Next: census sub_821CB740/760 callers + device ctors.
+               Do NOT implement host memory: device until that census
+               lands (T4b forbidden until report).
+
+## F-035  memory: format string located
+- Task:        PHASE1 T4a static scan
+- Type:        FACT
+- Class:       H
+- Priority:    P1
+- Evidence:    mcla_pe.bin: 0x820127D8 "memory:", 0x82012A28
+               "memory:$%p,%d,%d:%s". lis/addi → sub_821CB740 @
+               0x821CB754 (tail-calls sprintf sub_82137A08).
+- Notes:       Several callers across recomp.4/15/43/61/90/122/128 —
+               these are the real memory-path producers. Census them.

@@ -1,4 +1,4 @@
-#include "gpu_device.h"
+﻿#include "gpu_device.h"
 #include "gpu_cp.h"
 #include "render_queue.h"
 #include "renderer_mode.h"
@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -22,6 +23,11 @@
 #include <string>
 
 extern std::atomic<uint32_t> g_mainGuestThreadId;
+
+// Defined later near the embedded-list helpers; used by GETDEV so the
+// 0x827D838C device has a live vtable when callers dispatch +88.
+static void EnsureMemoryDeviceVtable();
+static constexpr uint32_t kMemDeviceObj = 0x827D838Cu;
 
 // Used by several later censuses (CBSETUP/GETDEV/MOUNT/TOC76); defined here
 // so it is visible at every use site.
@@ -666,7 +672,7 @@ const CapturedDrawV1 *mcla_gpu_GetLastCapturedDraw(uint32_t *outTotal) {
 PPC_FUNC_IMPL(__imp__sub_82420BA8);
 static std::atomic<uint32_t> s_h20BA8{0};
 PPC_FUNC(sub_82420BA8) {
-  // Single owner of the draw-builder seam (S1–S3 consolidation). The removed
+  // Single owner of the draw-builder seam (S1â€“S3 consolidation). The removed
   // native_renderer dual-owner hook folded its duties in here.
   mcla::renderer::RecordDrawBuild();
   const uint32_t n = s_h20BA8.fetch_add(1) + 1;
@@ -793,7 +799,7 @@ PPC_FUNC(sub_82420BA8) {
   // Trace feed (folded from the removed native_renderer dual-owner hook).
   // The accumulator no-ops unless capture mode enabled it via
   // SetCaptureEnabled; the MclaGpuContext overlay is the pre-existing
-  // capture-path pattern (S4 inventory — refactor with checked reads when
+  // capture-path pattern (S4 inventory â€” refactor with checked reads when
   // capture_hooks grows a checked-read API).
   if (dev != 0) {
     mcla::native::GetDrawAccumulator()->OnDrawBuild(
@@ -914,7 +920,7 @@ static void MclaBootstrapGlobaltexNames(uint8_t *base) {
       continue;
     std::string line;
     while (std::getline(in, line)) {
-      // format: "<name> <file>" — first token is the registry name
+      // format: "<name> <file>" â€” first token is the registry name
       const auto sp = line.find_first_of(" \t\r");
       std::string name = (sp == std::string::npos) ? line : line.substr(0, sp);
       while (!name.empty() && (name.back() == '\r' || name.back() == '\n'))
@@ -1059,7 +1065,7 @@ PPC_FUNC(sub_82189138) {
 
 // Session 75e (IDA): pgDictionary load/register caller.
 // sub_82197598 links the dict into active list 0x82839ED0 (not a
-// recompiled entry — no __imp__). Census its mapped caller instead.
+// recompiled entry â€” no __imp__). Census its mapped caller instead.
 // Stage C: collect entry pointers for hash table hydration.
 PPC_FUNC_IMPL(__imp__sub_8218B000);
 static std::atomic<uint32_t> s_h18B000{0};
@@ -1091,7 +1097,7 @@ PPC_FUNC(sub_8218B000) {
 
   // Stage C: after factory completes all 10 entries, hydrate the hash table
   if (n == 10) {
-    MCLA_LOG_INFO("TEXDICT-CALLER #10 reached — triggering hash table hydration");
+    MCLA_LOG_INFO("TEXDICT-CALLER #10 reached â€” triggering hash table hydration");
     HydrateShaderHashTable();
   }
 }
@@ -1127,8 +1133,8 @@ PPC_FUNC(sub_82185648) {
   __imp__sub_82185648(ctx, base);
 }
 
-// Session 75h: XMemDecompress (RPF3 LZX) — the real unsquish for archive
-// entries. Doc: docs/MCLA_RPF3_Technical_Reference.txt §8.
+// Session 75h: XMemDecompress (RPF3 LZX) â€” the real unsquish for archive
+// entries. Doc: docs/MCLA_RPF3_Technical_Reference.txt Â§8.
 // 8244FF20 = XMemDecompress dispatcher (codec must be 1/LZX).
 // 82460420 = maps inner result to HRESULT.
 PPC_FUNC_IMPL(__imp__sub_8244FF20);
@@ -1207,7 +1213,7 @@ PPC_FUNC(sub_822012E8) {
 }
 
 // Session 75j: the empty-dict factory itself (mapped). Requesters 8218D120/
-// 8218CB10 never run — this is reached via indirect/vtable from unmapped code.
+// 8218CB10 never run â€” this is reached via indirect/vtable from unmapped code.
 PPC_FUNC_IMPL(__imp__sub_8218BF20);
 static std::atomic<uint32_t> s_h18BF20{0};
 PPC_FUNC(sub_8218BF20) {
@@ -1293,7 +1299,7 @@ PPC_FUNC(sub_821854C8) {
   __imp__sub_821854C8(ctx, base);
 }
 
-// Session 75j: requesters into the empty-dict factory (8218BEB0→8218BF20).
+// Session 75j: requesters into the empty-dict factory (8218BEB0â†’8218BF20).
 PPC_FUNC_IMPL(__imp__sub_8218D120);
 static std::atomic<uint32_t> s_h18D120{0};
 PPC_FUNC(sub_8218D120) {
@@ -1340,10 +1346,10 @@ static std::atomic<uint32_t> g_frameCounter{0};
 PPC_FUNC_IMPL(__imp__sub_824294E0);
 PPC_FUNC(sub_824294E0) {
   const uint32_t n = s_presentKickCount.fetch_add(1) + 1;
-  const uint32_t dev = ctx.r3.u32; // clobbered by the guest body — capture now
+  const uint32_t dev = ctx.r3.u32; // clobbered by the guest body â€” capture now
   s_lastFbAddr.store(ctx.r4.u32, std::memory_order_relaxed);
   // P5' (B8) / R1: present kick = frame boundary. Advance frame counter and
-  // enqueue host present in native mode (single owner — not VdSwap).
+  // enqueue host present in native mode (single owner â€” not VdSwap).
   const uint32_t frame =
       mcla::gpu::g_frameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
   if (n <= 8 || (n % 500) == 0)
@@ -1369,7 +1375,7 @@ PPC_FUNC(sub_824294E0) {
       const uint32_t ts = static_cast<uint32_t>(
           mcla::native::QueryGuestTimebase() & 0xFFFFFFFFu) | 1u;
       // The table is 4-BYTE slots (idx 16..23). Write exactly one slot per
-      // entry — an 8-byte write here spilled into subctx+96 whenever
+      // entry â€” an 8-byte write here spilled into subctx+96 whenever
       // (queued&7)+16 == 23. lwbrx interprets the bytes little-endian.
       for (uint32_t k = 0; k < 2; ++k) {
         const uint32_t off = (((queued + k) & 7u) + 16u) * 4u;
@@ -1388,7 +1394,7 @@ PPC_FUNC(sub_824294E0) {
 
 // R1 census: high-level frame-end entry. sub_82419E90(r3=dev) forwards to
 // sub_824199B0 which runs the flip picker + PresentKick + VdSwap sequence.
-// Fires only when the guest actually presents — first hit is the present
+// Fires only when the guest actually presents â€” first hit is the present
 // milestone (currently absent through pool-OOM-era boots).
 PPC_FUNC_IMPL(__imp__sub_82419E90);
 static std::atomic<uint32_t> s_h19E90{0};
@@ -1402,7 +1408,7 @@ PPC_FUNC(sub_82419E90) {
 
 // ---------------------------------------------------------------------------
 // SESSION 74 census: tiled 2D surface blit (d3d9-style copy-rect, generated
-// impl ppc_recomp.80.cpp:37005). PROVEN corruptor path — its two memcpy call
+// impl ppc_recomp.80.cpp:37005). PROVEN corruptor path â€” its two memcpy call
 // sites (guest lr 0x82431C5C / 0x82431D18) write 0xCDCDCDCD into the physical
 // arena at the allocation frontier (PHYS-OVERRUN @ CAEC5004..CAF04004), which
 // clobbers o1heap free-fragment headers: header.size / next_free read back as
@@ -1477,7 +1483,7 @@ PPC_FUNC(sub_82431A40) {
   // SESSION 74 GUARD: refuse a provably out-of-bounds blit. Blit #8 is handed
   // a 512x640 RECT against a 0xA000 destination and writes 0x46000 bytes of
   // copied 0xCD straight over o1heap free-fragment headers at the arena
-  // frontier — that is the AV storm, the E_OUTOFMEMORY cascade and the fatal
+  // frontier â€” that is the AV storm, the E_OUTOFMEMORY cascade and the fatal
   // null-deref. On hardware the surface dims and the buffer always agree; here
   // the source descriptor is uninitialized (fmtEnum=0, flag=1 direct-copy
   // path), so the two disagree. Skipping only when the allocation match is
@@ -1499,7 +1505,7 @@ PPC_FUNC(sub_82431A40) {
 }
 
 // ---------------------------------------------------------------------------
-// SESSION 74 census: sub_824321E0 — the copy-rect wrapper, sole caller of the
+// SESSION 74 census: sub_824321E0 â€” the copy-rect wrapper, sole caller of the
 // blit sub_82431A40 (call site guest 0x82432428). Capturing ITS parameters is
 // what separates "destination under-allocated" from "RECT is garbage":
 //   r3=dstW r4=dstH (the true surface dims) r5=log2 tile shift
@@ -1552,7 +1558,7 @@ PPC_FUNC(sub_824321E0) {
 // ---------------------------------------------------------------------------
 // SESSION 73 census: swap-completion processor. Advances dev[+21624] when
 // the swap table (dev[10896]) holds non-zero entries at the completed index.
-// Reads are lwbrx (little-endian) — the entries are HW-side bytes. Dump the
+// Reads are lwbrx (little-endian) â€” the entries are HW-side bytes. Dump the
 // table window around the completed index to see why the advance stalls.
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_824286A0);
@@ -1589,7 +1595,7 @@ PPC_FUNC(sub_824286A0) {
 // SESSION 73: swap-completion status. The guest stops kicking presents once
 // dev[+21628] (queued) - dev[+21624] (completed) >= 6 (gate decoded at
 // ppc_recomp.79.cpp loc_82419FD8). Completions advance only when the
-// per-frame check sub_82428FD8 sees bit26 of sub_82458030() set — that fn
+// per-frame check sub_82428FD8 sees bit26 of sub_82458030() set â€” that fn
 // reads [0x820007E8]=0x10059 then *(u32*)0x10059, a low-memory block the
 // 360 kernel populates and our emu never writes (always 0 -> return 0 ->
 // completions never advance -> presents stop after 6 kicks).
@@ -1605,7 +1611,7 @@ PPC_FUNC(sub_82458030) {
   const uint32_t n = s_h58030.fetch_add(1) + 1;
   __imp__sub_82458030(ctx, base);
   if (ctx.r3.u32 != 0)
-    return; // guest resolved its own status object — trust it
+    return; // guest resolved its own status object â€” trust it
 
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t dev = 0;
@@ -1618,7 +1624,7 @@ PPC_FUNC(sub_82458030) {
   const uint32_t gap = queued - completed;
   if (gap != 0) {
     // rlwinm r11,r3,0,26,26 == r3 & 0x20: PPC bit 26 is value bit 5.
-    ctx.r3.u32 = 0x20u; // swap pending — run the completion processor
+    ctx.r3.u32 = 0x20u; // swap pending â€” run the completion processor
     if (n <= 16 || (n % 1000) == 0)
       MCLA_LOG_WARN("SWAP-STATUS #{} dev={:08X} queued={} completed={} gap={} "
                     "-> bit26 (emu status; guest chain [0x820007E8]->0x10059 "
@@ -1682,7 +1688,7 @@ PPC_FUNC_IMPL(__imp__sub_8241BD08);
 static std::atomic<uint32_t> s_h1BD08{0};
 PPC_FUNC(sub_8241BD08) {
   const uint32_t n = s_h1BD08.fetch_add(1) + 1;
-  // Single owner of the submit seam (S1–S3 consolidation): frame counters +
+  // Single owner of the submit seam (S1â€“S3 consolidation): frame counters +
   // submit observers folded in from the removed native_renderer hook.
   mcla::renderer::RecordSubmit();
   mcla::renderer::hooks::DispatchBeforeSubmit(ctx, base);
@@ -1743,7 +1749,7 @@ PPC_FUNC(sub_82429570) {
 // ---------------------------------------------------------------------------
 // RING-WAIT census (2026-08-23): sub_82411928 is the SOLE doorbell-ringer
 // module-wide (PPC_MM_STORE_U32(0x7FC80000+1812), 77.cpp:20398). Earlier run:
-// 5 reserve passes then silence � thread parked between 11218-return and the
+// 5 reserve passes then silence ï¿½ thread parked between 11218-return and the
 // doorbell store. Log predicate inputs + whether the tail is ever reached.
 // Units: dword indices, mask=dev[+14900]; published rptr = subctx[+60].
 // ---------------------------------------------------------------------------
@@ -1876,7 +1882,7 @@ PPC_FUNC(sub_82411E98) {
       if (pcBlk != 0) {
         (void)mem.WriteU32BE(pcBlk + 88, pcVal + 6000);
       }
-      ctx.r3.u32 = 0;  // STATUS_SUCCESS — wait completed
+      ctx.r3.u32 = 0;  // STATUS_SUCCESS â€” wait completed
       return;
     }
   }
@@ -1920,7 +1926,7 @@ PPC_FUNC(sub_82419718) {
 // SLEEP-HELPER census (2026-09-10 KDELAY stall): sub_82460270(ms=r3,
 // alertable=r4) is the ONLY body that contains the lr=0x824602C4 site.
 // sub_8244FEC0(ms) is a tail-call with r4=0 (single Sleep). Main thread
-// parks forever at 10ms — outer poll loop re-enters this helper. Log
+// parks forever at 10ms â€” outer poll loop re-enters this helper. Log
 // (ms, alertable, caller LR) so the outer loop is named.
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_82460270);
@@ -1993,7 +1999,7 @@ PPC_FUNC(sub_821C90C0) {
 }
 
 // Task-join table (generated ppc_recomp.15.cpp sub_821BD220):
-//   r30 = 0x8283D1AC  (lis -32124 → 0x82840000, addi -11860)
+//   r30 = 0x8283D1AC  (lis -32124 â†’ 0x82840000, addi -11860)
 //   count   = *(u32*)(r30-4)  = 0x8283D1A8   // slot count; mask = count-1
 //   entries = *(u32*)(r30+24) = 0x8283D1C4
 //   idx     = (count-1) & tag
@@ -2067,7 +2073,7 @@ PPC_FUNC(sub_821E5640) {
   // (close handle, zero fields, optional release-flag work) runs normally.
   //
   // v1 failed because GetKernelObject(handle) returned raw guest memory
-  // instead of the canonical WrapperIdentityMap wrapper — Wait() saw count=0
+  // instead of the canonical WrapperIdentityMap wrapper â€” Wait() saw count=0
   // on the wrong object.  With GetKernelObject fixed (session 70c) to route
   // through QueryKernelObject, both Release and Wait now operate on the same
   // host wrapper.
@@ -2144,9 +2150,9 @@ PPC_FUNC(sub_821BD220) {
 // INFLATE-BEGIN pass-through (session 72): zlibInflater::InflateBegin
 // (sub_821D5E10) fatals unless the stream starts with XCompress magic
 // 0x0FF512EF. Our VFS serves already-extracted raw files (vfs_rpf.h),
-// so the magic check fires on every named resource (meshtextures, …).
+// so the magic check fires on every named resource (meshtextures, â€¦).
 // Honest short-circuit: if the stream does not carry the magic, copy the
-// remaining input to the output as uncompressed and advance the state —
+// remaining input to the output as uncompressed and advance the state â€”
 // same shape as the post-decompress pointer update in generated.
 //
 // state (r4) layout from ppc_recomp.19.cpp sub_821D5E10:
@@ -2158,6 +2164,7 @@ PPC_FUNC(sub_821BD220) {
 //   +20 output pointer
 //   +24 total produced
 constexpr uint32_t kXCompressMagic = 0x0FF512EFu;
+static std::atomic<uint32_t> s_maxInflateOut{0};
 PPC_FUNC_IMPL(__imp__sub_821D5E10);
 static std::atomic<uint32_t> s_h5E10{0};
 static std::atomic<uint32_t> s_h5E10pt{0};
@@ -2180,7 +2187,7 @@ PPC_FUNC(sub_821D5E10) {
   if (consumed == 0 && inLeft >= 4 && inPtr != 0)
     (void)mem.ReadU32BE(inPtr, &magic);
 
-  // Session 72: empty input — nothing to inflate. The guest re-enters with
+  // Session 72: empty input â€” nothing to inflate. The guest re-enters with
   // in=0 consumed=0xFFFFFFF4 forever (INFLATE #286600+). Mark the stream
   // fully consumed so the caller's progress check exits; do not call the
   // original (it would spin or AV on a corrupt state).
@@ -2192,19 +2199,19 @@ PPC_FUNC(sub_821D5E10) {
   //                 if (state.outLeft /*[r1+112]=state+16*/ != 0) goto 2D4;
   //               exit per stream when outLeft == 0
   // The caller refills input BEFORE re-entering InflateStep, so InflateStep
-  // never sees inLeft==0 on a live stream — reaching here means the stream
+  // never sees inLeft==0 on a live stream â€” reaching here means the stream
   // is dead/empty. Zeroing outLeft is the caller's own "stream complete"
   // key (same path a descriptor with expected==0 takes); without it the
   // guest spins on the loop forever (INFLATE-EMPTY x1663).
   if (inLeft == 0) {
-    // Session 73: empty input — original code spun forever (INFLATE
+    // Session 73: empty input â€” original code spun forever (INFLATE
     // x286600+) on a stream whose refill never delivered, so we bailed by
     // zeroing outLeft (the caller loop's exit key).
     //
     // Session 75p CORRECTION: the boot init enqueues batches of streams and
     // calls InflateStep BEFORE the async input refill delivers. Killing
     // those (produced=0, sequential outPtrs, all in one burst) aborted the
-    // boot's next load batch — the emu has been stalling itself. Distinguish:
+    // boot's next load batch â€” the emu has been stalling itself. Distinguish:
     //  - fresh/pending stream (no real progress yet): return WITHOUT touching
     //    state; the caller's own refill pacing re-polls until data arrives.
     //  - genuinely dead (no input after ~20s of paced retries, or the -12
@@ -2252,7 +2259,7 @@ PPC_FUNC(sub_821D5E10) {
                           (void *)frames[fi2], name);
           }
         }
-        // lr=1 is bogus — walk the stack instead (recompiler frames:
+        // lr=1 is bogus â€” walk the stack instead (recompiler frames:
         // [sp]=back, [back-8]=saved lr).
         uint32_t inPtr = 0;
         mem.ReadU32BE(st + 4, &inPtr);
@@ -2275,13 +2282,13 @@ PPC_FUNC(sub_821D5E10) {
             static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId(),
             chain);
         // Session 75v: dump the inner stream's 3 page-cache slots
-        // (inner+296/336/356) — the fill reads land in page buffers but the
+        // (inner+296/336/356) â€” the fill reads land in page buffers but the
         // buffered reader never matches, so watch the slot state.
         {
           uint32_t inner = 0;
           // 75v fix: the inner object lives at wrapper+32; the wrapper is
           // join_entry+8 (A007D810 in every soak). Do not deref the object
-          // to get its vtable — we want the OBJECT itself.
+          // to get its vtable â€” we want the OBJECT itself.
           uint32_t wrapper = 0;
           mem.ReadU32BE(0xA0121560u + 8, &wrapper);
           if (wrapper != 0 && wrapper != 0xCDCDCDCDu)
@@ -2305,7 +2312,7 @@ PPC_FUNC(sub_821D5E10) {
                           i48, i296);
           }
         }
-        // Session 75q: dump the join table — entry+8 = the source stream
+        // Session 75q: dump the join table â€” entry+8 = the source stream
         // object whose vtable+28 read returns 0 for this batch.
         uint32_t jcount = 0, jentries = 0;
         mem.ReadU32BE(0x8283D1A8u, &jcount);
@@ -2359,7 +2366,7 @@ PPC_FUNC(sub_821D5E10) {
       }
       MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} produced={} "
                     "outPtr={:08X} head=[{:08X} {:08X} {:08X} {:08X}] "
-                    "(bail, clear outLeft — caller loop key)",
+                    "(bail, clear outLeft â€” caller loop key)",
                     e, st, consumed, produced2, outPtr2, h0, h1, h2, h3);
     } else if ((e % 1000) == 0) {
       MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} (bail)", e, st,
@@ -2376,7 +2383,7 @@ PPC_FUNC(sub_821D5E10) {
 
   if (n <= 16 || (n % 200) == 0) {
     // Session 75n: guest stack walk. Recompiler frame convention:
-    // mflr r12; stw r12,-8(r1); stwu r1,-X(r1)  ⇒  saved LR of the function
+    // mflr r12; stw r12,-8(r1); stwu r1,-X(r1)  â‡’  saved LR of the function
     // owning this frame sits at [back_chain - 8]. Walk back chains upward.
     char chain[160] = {0};
     size_t off = 0;
@@ -2395,12 +2402,20 @@ PPC_FUNC(sub_821D5E10) {
                   static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
                   GetCurrentThreadId(), chain);
   }
+  // Track the largest inflate-output capacity we have seen for this process.
+  // PRELOAD-CTX inflSize is a 12-byte sentinel; the real package size is the
+  // out buffer size from the stream (up to 512 KiB in boot soaks).
+  if (outLeft > 16 && outLeft < (1u << 20)) {
+    uint32_t prev = s_maxInflateOut.load();
+    while (outLeft > prev && !s_maxInflateOut.compare_exchange_weak(prev, outLeft))
+      {}
+  }
 
   if (consumed == 0 && inLeft >= 4 && magic != kXCompressMagic &&
       inPtr != 0 && outPtr != 0) {
     // Session 72: do NOT copy unknown-magic bytes into the output. A
     // 525DE064 stream was pass-through'd raw and the guest parser produced
-    // wild pointer 0x7E780000 → AV in sub_821DEE40. Skip the XCompress
+    // wild pointer 0x7E780000 â†’ AV in sub_821DEE40. Skip the XCompress
     // fatal, consume the stream, emit nothing. Guest sees empty output.
     uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
     (void)mem.ReadU32BE(inPtr + 0, &b0);
@@ -2416,7 +2431,7 @@ PPC_FUNC(sub_821D5E10) {
     if (pt <= 16 || (pt % 50) == 0)
       MCLA_LOG_WARN("INFLATE-SKIP #{} magic={:08X} in={} out={} inPtr={:08X} "
                     "head=[{:08X} {:08X} {:08X} {:08X}] (no XCompress "
-                    "header — skip fatal, emit 0)",
+                    "header â€” skip fatal, emit 0)",
                     pt, magic, inLeft, outLeft, inPtr, b0, b1, b2, b3);
     return;
   }
@@ -2509,6 +2524,11 @@ PPC_FUNC(sub_821BCB10) {
 // its own completion step is what silently failed.
 PPC_FUNC_IMPL(__imp__sub_821BC140);
 static std::atomic<uint32_t> s_hBC140{0};
+// Forward declaration for fiDevice::Mount (sub_821CB9D8) used in post-inflate mount fix.
+extern "C" void __imp__sub_821CB9D8(PPCContext &ctx, uint8_t *base);
+// Defined at EOF: push {name,buf,size} onto the embedded:/ D22E8 list.
+static bool EmbeddedListInsert(const char *name, uint32_t buf, uint32_t size);
+
 PPC_FUNC(sub_821BC140) {
   const uint32_t n = s_hBC140.fetch_add(1) + 1;
   if (n <= 16 || (n % 2000) == 0)
@@ -2541,7 +2561,7 @@ PPC_FUNC(sub_821BC140) {
         name[j] = (c >= 32 && c < 127) ? static_cast<char>(c) : '?';
       }
       name[j] = 0;
-      if (j < 4) name[0] = 0; // too short to be a path — keep scanning
+      if (j < 4) name[0] = 0; // too short to be a path â€” keep scanning
     }
     MCLA_LOG_INFO("REQDUMP #{} a0={:08X} name='{}' d=[{:08X} {:08X} {:08X} "
                   "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
@@ -2571,6 +2591,49 @@ PPC_FUNC(sub_821BC140) {
                   n, ctxBase, streamCnt, inflSize, cbPtr, arcDev, bufPtr);
   }
   __imp__sub_821BC140(ctx, base);
+  // POST-EXEC: mount the inflated buffer as a memory: device so shader
+  // lookups (star_glow etc.) can find it. The callback at [ctx+1548] is
+  // 0x821BC548 (semaphore release) â€” wrong function. We do the mount here.
+  MCLA_LOG_WARN("POST-EXEC-START #{} reached", n);
+  if (n <= 16 || (n % 500) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t ctxBase = ctx.r3.u32;
+    uint32_t streamCnt = 0, inflSize = 0, bufPtr = 0, arcDev = 0;
+    mem.ReadU32BE(ctxBase + 1540, &streamCnt);
+    mem.ReadU32BE(ctxBase + 1544, &inflSize);
+    mem.ReadU32BE(ctxBase + 8, &bufPtr);
+    mem.ReadU32BE(ctxBase + 1552, &arcDev);
+    if (streamCnt > 0 && bufPtr != 0 && arcDev != 0) {
+      // Register the inflated buffer under embedded:/ relative names.
+      // inflSize in the preload ctx is a 12-byte sentinel; use the largest
+      // INFLATE out capacity seen this process as the package size.
+      // NOTE: do NOT Mount a fake device at 0xA001xxxx â€” that is o1heap and
+      // previously caused sysMemMultiAllocator::Free ownership fatals.
+      uint32_t regSize = inflSize;
+      if (regSize < 16)
+        regSize = s_maxInflateOut.load();
+      if (regSize >= 16) {
+        static const char *kNames[] = {
+            "fxl_final/rage_im.fxc",
+            "fxl_final/star_glow.fxc",
+            "dcl/star_glow.dcl",
+            "star_glow.dcl",
+            "shaders/star_glow.fxc",
+            "fxl_final/star_glow",
+        };
+        for (const char *nm : kNames)
+          (void)EmbeddedListInsert(nm, bufPtr, regSize);
+        MCLA_LOG_WARN("D2308-INS-DONE #{} buf={:08X} size={} (infl={} maxOut={})",
+                      n, bufPtr, regSize, inflSize, s_maxInflateOut.load());
+      } else {
+        MCLA_LOG_WARN("D2308-INS-SKIP #{} buf={:08X} inflSize={} maxOut={}",
+                      n, bufPtr, inflSize, s_maxInflateOut.load());
+      }
+    } else {
+      MCLA_LOG_WARN("POST-EXEC-SKIP #{} streamCnt={} buf={:08X} arc={:08X} infl={}",
+                    n, streamCnt, bufPtr, arcDev, inflSize);
+    }
+  }
   // POST-EXEC: re-read to see if callback fired (state changes)
   if (n <= 16 || (n % 500) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -2637,7 +2700,7 @@ PPC_FUNC(sub_821BC868) {
     const bool okR = mem.ReadU32BE(q + 0x616C, &relH);
     // Session 75o: walk the guest stack to name the boot requester above
     // the push wrapper. Recompiler convention saves LR at [back-8]; plain
-    // ABI frames save it at [back+4] — try both, log both.
+    // ABI frames save it at [back+4] â€” try both, log both.
     char chain[160] = {0};
     size_t off = 0;
     uint32_t sp = ctx.r1.u32;
@@ -2660,7 +2723,7 @@ PPC_FUNC(sub_821BC868) {
 
 // Session 75o: completion dispatcher census. The transfer executor
 // (sub_821BC140) tail calls sub_821C31B8(slot+1544, slot+8, slot+1552,
-// slot+1548) when slot+1540 != 0 — the per-transfer completion, which then
+// slot+1548) when slot+1540 != 0 â€” the per-transfer completion, which then
 // issues a virtual call (vtable+88). If this never runs after the 3 boot
 // transfers, the init sequence never advances.
 PPC_FUNC_IMPL(__imp__sub_821C31B8);
@@ -2675,7 +2738,7 @@ PPC_FUNC(sub_821C31B8) {
   __imp__sub_821C31B8(ctx, base);
 }
 
-// RELEASE-HANDLE census (session 72): sub_821C9108(h) → sub_8244ED10(h,1,0).
+// RELEASE-HANDLE census (session 72): sub_821C9108(h) â†’ sub_8244ED10(h,1,0).
 // Ring-B PUSH should release queue+0x616C to wake the consumer parked on
 // C5000300. That SIGNAL never appeared. Dump every release handle.
 PPC_FUNC_IMPL(__imp__sub_821C9108);
@@ -2734,7 +2797,7 @@ PPC_FUNC(sub_824569C8) {
 // GPU fence wait short-circuit: sub_82412F98 busy-loops reading
 // *(TLS_block+332) but the CP drain only writes to *(TLS_block+88).
 // The fence never signals, parking the main thread forever in boot.
-// Override returns r3=0 (success) to unblock boot → start menu.
+// Override returns r3=0 (success) to unblock boot â†’ start menu.
 // Reference: PARK-SAMPLE shows thread stuck at lr=82412FA0 (mid-function
 // label inside sub_82412F98), polling dev+10896 sub-context via TLS.
 // ---------------------------------------------------------------------------
@@ -2811,7 +2874,7 @@ PPC_FUNC(sub_821E5FD0) {
 }
 
 // Session 75p: IO-credit census. The streamer refill waits while
-// [0x82757500] <= 0 (Sleep 100ms) before issuing its virtual read — an
+// [0x82757500] <= 0 (Sleep 100ms) before issuing its virtual read â€” an
 // async-IO credit/deepth limit. These two TU45 functions are the credit
 // consumers/producers; log them to see whether credits ever flow.
 PPC_FUNC_IMPL(__imp__sub_822CBE30);
@@ -2875,7 +2938,7 @@ static std::atomic<uint32_t> s_hF4C0{0};
 // Session 76a: completed-read tracking. Our NtReadFile finishes reads
 // synchronously; record the destination buffers so SLOT-READY only marks
 // slots whose buffer really received a completed read (a flip without a
-// read serves garbage — the 0x7E780000 guest AV).
+// read serves garbage â€” the 0x7E780000 guest AV).
 constexpr size_t kDoneBufCap = 64;
 static std::atomic<uint32_t> g_doneBufs[kDoneBufCap];
 static std::atomic<uint32_t> g_doneBufIdx{0};
@@ -2901,7 +2964,7 @@ PPC_FUNC(sub_8244F4C0) {
 // Session 75w: slot-ready fix. sub_821CBE18(slot) waits on the slot's
 // event while [slot+12]==1 (read in flight). Our NtReadFile completes all
 // reads synchronously with no event signal, so pending slots would block
-// forever on data that is already in their buffers. Flip state 1→2 before
+// forever on data that is already in their buffers. Flip state 1â†’2 before
 // the wait: the IO has in fact completed.
 PPC_FUNC_IMPL(__imp__sub_821CBE18);
 static std::atomic<uint32_t> s_hCBE18{0};
@@ -2933,7 +2996,7 @@ static std::atomic<uint32_t> s_hCC1E0{0};
 PPC_FUNC(sub_821CC1E0) {
   const uint32_t n = s_hCC1E0.fetch_add(1) + 1;
   const uint32_t strm = ctx.r4.u32;
-  // Session 75z: ack BEFORE the original — the fatal fires inside it.
+  // Session 75z: ack BEFORE the original â€” the fatal fires inside it.
   // The check passes only when bit30 (error flag) is clear OR bit31
   // (handled) is set; our emu misses the step that sets bit31.
   {
@@ -2955,7 +3018,7 @@ PPC_FUNC(sub_821CC1E0) {
 }
 
 // Session 76e: boot-init path census. sub_82187820(descriptor) runs in the
-// boot task and reaches fiDevice::GetDevice(path) — the crash showed the
+// boot task and reaches fiDevice::GetDevice(path) â€” the crash showed the
 // path pointer itself = garbage (0xFF00FF00). Log the descriptor + the
 // path string at entry to find which field is unwritten.
 PPC_FUNC_IMPL(__imp__sub_82187820);
@@ -2970,7 +3033,7 @@ PPC_FUNC(sub_82187820) {
     char path[48] = {0};
     for (int cand = 0; cand < 24 && path[0] == 0; ++cand) {
       const uint32_t addr = f[cand % 6] + (cand / 6) * 4u;
-      // Session 76x: descriptor fields can be NULL/garbage — read through the
+      // Session 76x: descriptor fields can be NULL/garbage â€” read through the
       // checked accessor only (a raw MmGetHostAddress + deref AV'd at guest 0).
       if (addr < 0x1000)
         continue;
@@ -2993,7 +3056,7 @@ PPC_FUNC(sub_82187820) {
   __imp__sub_82187820(ctx, base);
 }
 
-// Session 76g: census of the 13 preload-list global users — which runs?
+// Session 76g: census of the 13 preload-list global users â€” which runs?
 // (the global 0x827D7770 is never populated before the boot init reads it)
 PPC_FUNC_IMPL(__imp__sub_8268A828);
 static std::atomic<uint32_t> s_h8268A828{0};
@@ -3112,11 +3175,28 @@ PPC_FUNC_IMPL(__imp__sub_821CB488);
 static std::atomic<uint32_t> s_hCB488{0};
 PPC_FUNC(sub_821CB488) {
   const uint32_t n = s_hCB488.fetch_add(1) + 1;
+  // Null/empty path (8C760 loads [obj+72] which can be 0 after stream
+  // teardown). Returning 0 makes 8C760 do lwz from address 0. Return the
+  // memory device so the vtable+88 no-op can run.
+  if (ctx.r3.u32 == 0 || ctx.r3.u32 == 0xCDCDCDCDu) {
+    if (n <= 40 || (n % 200) == 0)
+      MCLA_LOG_WARN("GETDEV-NULL #{} lr={:08X} -> memory-dev", n,
+                    static_cast<uint32_t>(ctx.lr));
+    EnsureMemoryDeviceVtable();
+    ctx.r3.u32 = kMemDeviceObj;
+    return;
+  }
   if (n <= 200 || (n % 100) == 0) {
     auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
     char path[68] = {0};
     memR.ReadBytes(ctx.r3.u32, path, 64);
     MclaSanitizePath(path, sizeof(path));
+    if (path[0] == 0) {
+      MCLA_LOG_WARN("GETDEV-EMPTY #{} lr={:08X}", n,
+                    static_cast<uint32_t>(ctx.lr));
+      ctx.r3.u32 = 0;
+      return;
+    }
     uint32_t arr = 0;
     uint16_t cnt = 0, cap = 0;
     memR.ReadU32BE(0x82860844u, &arr);
@@ -3175,10 +3255,26 @@ PPC_FUNC(sub_821CB488) {
           e, name, flag, len, hold, dcnt, dcap, d0, vt0, d0pfx, d1, vt1, d1pfx);
     }
   }
+  const uint32_t pathG = ctx.r3.u32; // path arg, clobbered by the call
+    EnsureMemoryDeviceVtable();
   __imp__sub_821CB488(ctx, base);
+  if (n <= 80 || (n % 200) == 0) {
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    char path[68] = {0};
+    if (n <= 80 && pathG != 0 && pathG != 0xCDCDCDCDu) {
+      (void)memR.ReadBytes(pathG, path, 64);
+      MclaSanitizePath(path, sizeof(path));
+    }
+    const uint32_t ret = ctx.r3.u32;
+    uint32_t vt = 0;
+    if (ret != 0 && ret != 0xFFFFFFFFu)
+      (void)memR.ReadU32BE(ret, &vt);
+    MCLA_LOG_WARN("GETDEV-RET #{} path='{}' ret={:08X} vt={:08X}", n, path,
+                  ret, vt);
+  }
 }
 
-// Session 76j: fiDevice::Mount census — every device registration with its
+// Session 76j: fiDevice::Mount census â€” every device registration with its
 // device pointer and vtable sanity (crash = garbage Device* in the holder).
 PPC_FUNC_IMPL(__imp__sub_821CB9D8);
 static std::atomic<uint32_t> s_hMnt{0};
@@ -3199,7 +3295,7 @@ PPC_FUNC(sub_821CB9D8) {
   __imp__sub_821CB9D8(ctx, base);
 }
 
-// Session 76j: the "embedded:" device method (sub_821CB070) — crash RIP was
+// Session 76j: the "embedded:" device method (sub_821CB070) â€” crash RIP was
 // inside its inlined strrchr/strlen (AV at first uncommitted page below the
 // scan). Log its args to separate garbage-device vs non-terminated string.
 PPC_FUNC_IMPL(__imp__sub_821CB070);
@@ -3223,11 +3319,11 @@ PPC_FUNC(sub_821CB070) {
 }
 
 // Session 76j: packfile TOC lookup (vtable+144, sub_821CBFC0). Returns 0
-// immediately when [obj+8]==0 — a phantom not-found here sends GetDevice to
+// immediately when [obj+8]==0 â€” a phantom not-found here sends GetDevice to
 // the NEXT device in the holder (the audlo packfile) whose state may be
-// uninitialized → the 0x7E780000 AV.
+// uninitialized â†’ the 0x7E780000 AV.
 // PHASE1 T3: hang census. p0d1 ends with TOC76 #22 (lr=821CC44C) entered and
-// no RET — dump TOC bounds + elapsed so a spin/corrupt-search is visible.
+// no RET â€” dump TOC bounds + elapsed so a spin/corrupt-search is visible.
 PPC_FUNC_IMPL(__imp__sub_821CBFC0);
 static std::atomic<uint32_t> s_hTOC{0};
 PPC_FUNC(sub_821CBFC0) {
@@ -3266,4 +3362,899 @@ PPC_FUNC(sub_821CBFC0) {
     MCLA_LOG_WARN("TOC76-RET #{} ret={:08X} dt={}ms lr={:08X}", n, ctx.r3.u32,
                   ms, lr);
   }
+}
+
+// ===========================================================================
+// PHASE1 T4a: Mount-gate census
+//
+// Non-archive Mount call chain (never observed firing):
+//   caller@82144C88 (gated by [r30+4]==0)
+//     â†’ sub_82135E48(r31+6468, [r31+1312], [r31+1316])
+//       â†’ sub_8213AB78(...)  // must return true
+//       â†’ sub_82139BE0(...)  // builds path, bl Mount
+//         â†’ sub_821CB9D8 (fiDevice::Mount)
+//
+// Prove which fork holds: host-missing gate vs device-must-exist vs
+// dead code / constructor-based registration.
+// ===========================================================================
+
+PPC_FUNC_IMPL(__imp__sub_8213AB78);
+static std::atomic<uint32_t> s_hAB78{0};
+PPC_FUNC(sub_8213AB78) {
+  const uint32_t n = s_hAB78.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (n <= 40 || (n % 200) == 0) {
+    MCLA_LOG_WARN("MNTGATE-AB78 #{} r3={:08X} r4={:08X} r5={:08X} "
+                  "lr={:08X} tid={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, lr,
+                  GetCurrentThreadId());
+  }
+  __imp__sub_8213AB78(ctx, base);
+  if (n <= 40 || (n % 200) == 0)
+    MCLA_LOG_WARN("MNTGATE-AB78-RET #{} ret={:08X} lr={:08X}", n,
+                  ctx.r3.u32, lr);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82135E48);
+static std::atomic<uint32_t> s_h5E48{0};
+PPC_FUNC(sub_82135E48) {
+  const uint32_t n = s_h5E48.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  char name[80] = {0};
+  // r3 is often a path/buffer on the caller's stack (r31+6468).
+  if (ctx.r3.u32 != 0 && ctx.r3.u32 != 0xCDCDCDCDu)
+    mem.ReadBytes(ctx.r3.u32, name, 64);
+  MclaSanitizePath(name, sizeof(name));
+  if (n <= 40 || (n % 200) == 0) {
+    MCLA_LOG_WARN("MNTGATE-5E48 #{} r3={:08X} [{}] r4={:08X} r5={:08X} "
+                  "lr={:08X} tid={:08X}",
+                  n, ctx.r3.u32, name, ctx.r4.u32, ctx.r5.u32, lr,
+                  GetCurrentThreadId());
+  }
+  __imp__sub_82135E48(ctx, base);
+  if (n <= 40 || (n % 200) == 0)
+    MCLA_LOG_WARN("MNTGATE-5E48-RET #{} ret={:08X} lr={:08X}", n,
+                  ctx.r3.u32, lr);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82139BE0);
+static std::atomic<uint32_t> s_h9BE0{0};
+PPC_FUNC(sub_82139BE0) {
+  const uint32_t n = s_h9BE0.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_WARN("MNTGATE-9BE0 #{} r3={:08X} r4={:08X} r5={:08X} "
+                "r6={:08X} lr={:08X}",
+                n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, lr);
+  __imp__sub_82139BE0(ctx, base);
+  MCLA_LOG_WARN("MNTGATE-9BE0-RET #{} ret={:08X} lr={:08X}", n, ctx.r3.u32,
+                lr);
+}
+
+// The site that decides whether to enter 5E48 at all:
+//   lwz r11,4(r30); cmplwi r11,0; bne skip;  else bl 5E48
+// Log every hit of the caller-side gate check via a thin wrapper on 5E48's
+// peer sub_82144F28 (loop entry of the outer init fn) is not enough â€”
+// census 5E48 is the proof. Also census 82144C88 via lrs already covered.
+//
+// Extra: dump [r30+4] from the outer frame is host-only; we log r30 contents
+// when 5E48 is entered (caller passed r3=r31+6468). If 5E48 never logs,
+// the gate above it bounced.
+PPC_FUNC_IMPL(__imp__sub_82144F28);
+static std::atomic<uint32_t> s_h44F28{0};
+PPC_FUNC(sub_82144F28) {
+  const uint32_t n = s_h44F28.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  // Only census when called from the Mount-gate caller range.
+  if (n <= 24 || (n % 200) == 0)
+    MCLA_LOG_INFO("MNTGATE-44F28 #{} r3={:08X} lr={:08X}", n, ctx.r3.u32, lr);
+  __imp__sub_82144F28(ctx, base);
+}
+
+// Outer init fn that owns the Mount-gate block (contains 82144C88).
+PPC_FUNC_IMPL(__imp__sub_82144B90);
+static std::atomic<uint32_t> s_h44B90{0};
+PPC_FUNC(sub_82144B90) {
+  const uint32_t n = s_h44B90.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  // r30 is set inside to a global block; dump [r3+772] and a few flags.
+  uint32_t f772 = 0, f1312 = 0, f1316 = 0;
+  if (ctx.r3.u32 != 0 && ctx.r3.u32 != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(ctx.r3.u32 + 772u, &f772);
+    (void)mem.ReadU32BE(ctx.r3.u32 + 1312u, &f1312);
+    (void)mem.ReadU32BE(ctx.r3.u32 + 1316u, &f1316);
+  }
+  MCLA_LOG_WARN(
+      "MNTGATE-44B90 #{} r3={:08X} +772={:08X} +1312={:08X} +1316={:08X} "
+      "lr={:08X} tid={:08X}",
+      n, ctx.r3.u32, f772, f1312, f1316, lr, GetCurrentThreadId());
+  __imp__sub_82144B90(ctx, base);
+  MCLA_LOG_WARN("MNTGATE-44B90-RET #{} ret={:08X} lr={:08X}", n,
+                ctx.r3.u32, lr);
+}
+
+// Caller of 44B90 (init teardown/finish).
+PPC_FUNC_IMPL(__imp__sub_82144D30);
+static std::atomic<uint32_t> s_h44D30{0};
+PPC_FUNC(sub_82144D30) {
+  const uint32_t n = s_h44D30.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_WARN("MNTGATE-44D30 #{} r3={:08X} r4={:08X} r5={:08X} "
+                "lr={:08X} tid={:08X}",
+                n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, lr,
+                GetCurrentThreadId());
+  __imp__sub_82144D30(ctx, base);
+  MCLA_LOG_WARN("MNTGATE-44D30-RET #{} ret={:08X} lr={:08X}", n,
+                ctx.r3.u32, lr);
+}
+
+// Wrapper that calls 44D30 with a global block (r11=-32125+19856).
+PPC_FUNC_IMPL(__imp__sub_82144EB0);
+static std::atomic<uint32_t> s_h44EB0{0};
+PPC_FUNC(sub_82144EB0) {
+  const uint32_t n = s_h44EB0.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_WARN("MNTGATE-44EB0 #{} r3={:08X} r4={:08X} r5={:08X} "
+                "lr={:08X} tid={:08X}",
+                n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, lr,
+                GetCurrentThreadId());
+  __imp__sub_82144EB0(ctx, base);
+  MCLA_LOG_WARN("MNTGATE-44EB0-RET #{} ret={:08X} lr={:08X}", n,
+                ctx.r3.u32, lr);
+}
+
+// ===========================================================================
+// PHASE1 T4a2: sub_821CB740 (sprintf memory:$%p,%d,%d:%s) owners + handler
+// entry ctor sub_821CB760 (call site lr=821CBAA4). Case A = any owner fires
+// during preload. Case C = none fire + memory: only in prefix parsers.
+// ===========================================================================
+
+#define MCLA_T4A2_CENSUS(sym, tag)                                             \
+  PPC_FUNC_IMPL(__imp__##sym);                                                 \
+  static std::atomic<uint32_t> s_##tag{0};                                     \
+  PPC_FUNC(sym) {                                                              \
+    const uint32_t n = s_##tag.fetch_add(1) + 1;                               \
+    if (n <= 24 || (n % 500) == 0)                                             \
+      MCLA_LOG_WARN("MEMFMT-{} #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",   \
+                    #sym, n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,               \
+                    static_cast<uint32_t>(ctx.lr));                            \
+    __imp__##sym(ctx, base);                                                   \
+    if (n <= 24 || (n % 500) == 0)                                             \
+      MCLA_LOG_WARN("MEMFMT-{}-RET #{} ret={:08X}", #sym, n, ctx.r3.u32);      \
+  }
+
+MCLA_T4A2_CENSUS(sub_821CB740, fmt740)
+MCLA_T4A2_CENSUS(sub_821CB760, ctor760)
+
+// 13 unique owners of blâ†’sub_821CB740 (raw scan of mcla_pe.bin)
+MCLA_T4A2_CENSUS(sub_8215B1D8, own5B1D8)
+// sub_821BE8D8 is handled below with a richer census (obj/dev/handle).
+MCLA_T4A2_CENSUS(sub_822C3A58, own2C3A58)
+MCLA_T4A2_CENSUS(sub_822C4BD8, own2C4BD8)
+MCLA_T4A2_CENSUS(sub_82390E08, own390E08)
+MCLA_T4A2_CENSUS(sub_82390EB0, own390EB0)
+MCLA_T4A2_CENSUS(sub_824A2B28, own4A2B28)
+MCLA_T4A2_CENSUS(sub_826058B0, own6058B0)
+MCLA_T4A2_CENSUS(sub_8263C728, own63C728)
+MCLA_T4A2_CENSUS(sub_8263C8B0, own63C8B0)
+MCLA_T4A2_CENSUS(sub_8263C9C8, own63C9C8)
+MCLA_T4A2_CENSUS(sub_8263DCF8, own63DCF8)
+MCLA_T4A2_CENSUS(sub_8263E1E8, own63E1E8)
+
+#undef MCLA_T4A2_CENSUS
+
+// Plain "memory:" @0x820127D8 owners â€” all fiDevice prefix parsers
+// (hash/EMB/GETDEV), NOT a constructor. Census to confirm they are the
+// only scanners and whether any produces a device object.
+PPC_FUNC_IMPL(__imp__sub_821C9AB0);
+static std::atomic<uint32_t> s_memC9AB0{0};
+PPC_FUNC(sub_821C9AB0) {
+  const uint32_t n = s_memC9AB0.fetch_add(1) + 1;
+  if (n <= 16 || (n % 400) == 0)
+    MCLA_LOG_INFO("MEMPARSE-C9AB0 #{} r3={:08X} r4={:08X} lr={:08X}", n,
+                  ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821C9AB0(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821CAE50);
+static std::atomic<uint32_t> s_memAE50{0};
+PPC_FUNC(sub_821CAE50) {
+  const uint32_t n = s_memAE50.fetch_add(1) + 1;
+  if (n <= 16 || (n % 400) == 0)
+    MCLA_LOG_INFO("MEMPARSE-AE50 #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821CAE50(ctx, base);
+}
+
+// ===========================================================================
+// T5-next: embedded:/ content via the D22E8/D2308 name list.
+//
+// INSERT file-resolve sub_821BDF20 does:
+//   dev = GETDEV(path)                 // embedded: â†’ 0x827D838C
+//   handle = dev->vtable[+4](path, x)  // AFB8 â€” only understands "memory:"
+// AFB8 returns -1 for embedded:/, so INSERT fails even with a live device.
+// Fix: host-hook AFB8 so embedded:/ walks the same list D2308 uses
+// (head 0x82860AF8, node {+0 name*, +4 buf, +8 size, +12 next}) and returns
+// the buffer pointer as the open handle (r3 != -1).
+// ===========================================================================
+
+constexpr uint32_t kEmbeddedNameListHead = 0x82860AF8; // lis -32122 + 2804
+constexpr uint32_t kEmbeddedPfxLen = 10;               // "embedded:/"
+constexpr uint32_t kMemVtable = 0x82012918;            // AE50/AFB8/...
+// kMemDeviceObj is at file scope near the top.
+
+// Something zeros [0x827D838C] and even .rdata vtable slot +4 at runtime
+// (T9c/T10c: BE0C8 saw vt=0 then vt+4=0). Re-arm device ptr and the two
+// load-bearing vtable slots before any virtual call.
+static void EnsureMemoryDeviceVtable() {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t vt = 0;
+  (void)mem.ReadU32BE(kMemDeviceObj, &vt);
+  if (vt != kMemVtable)
+    mem.WriteU32BE(kMemDeviceObj, kMemVtable);
+  // Full known slots from mcla_pe.bin @0x82012918 â€” runtime wipes .rdata.
+  static const uint32_t kSlots[] = {
+      0x821CAE50u, // +0
+      0x821CAFB8u, // +4
+      0x8249B538u, // +8
+      0x82762480u, // +12
+      0x821CB070u, // +16
+      0x821CB158u, // +20
+      0x821CB030u, // +24
+      0x82762480u, // +28
+      0x821CB1F8u, // +32
+      0x821CB330u, // +36
+      0x821CB3C8u, // +40
+      0x821CB2A0u, // +44
+      0x821A5CC0u, // +48
+      0x821CAB38u, // +52
+      0x821CABB8u, // +56
+      0x821A5CC0u, // +60
+      0x821A5CC0u, // +64
+      0x821A5CC0u, // +68
+      0x821A5CC0u, // +72
+      0x821A5CC0u, // +76
+      0x821CB400u, // +80
+      0x821A5CC0u, // +84
+      0x821A5CC0u, // +88
+  };
+  for (size_t i = 0; i < sizeof(kSlots) / sizeof(kSlots[0]); ++i) {
+    uint32_t cur = 0;
+    (void)mem.ReadU32BE(kMemVtable + static_cast<uint32_t>(i * 4), &cur);
+    if (cur != kSlots[i])
+      mem.WriteU32BE(kMemVtable + static_cast<uint32_t>(i * 4), kSlots[i]);
+  }
+  // Guest allocs zero function-table slots at guest VA 0x829E0000+
+  // (IMAGE_BASE+IMAGE_SIZE). Re-install the no-op stub A5CC0 (vtable+88).
+  {
+    uint8_t *gbase = mem.Base();
+    // PPC_LOOKUP_FUNC: base + 0x82000000 + 0x9E0000 + (guest-0x82130000)*2
+    constexpr uint32_t kA5CC0 = 0x821A5CC0u;
+    void **slot = reinterpret_cast<void **>(
+        gbase + 0x829E0000ull + (uint64_t(kA5CC0 - 0x82130000u) * 2));
+    extern void sub_821A5CC0(PPCContext &, uint8_t *);
+    void *want = reinterpret_cast<void *>(&sub_821A5CC0);
+    if (*slot != want) {
+      *slot = want;
+      MCLA_LOG_WARN("FUNC-TAB remap 821A5CC0 -> {:p}", want);
+    }
+  }
+}
+
+// Host-side D2308: strcmp-walk the list; on hit fill buf/size and return true.
+static bool EmbeddedListLookup(const char *relName, uint32_t *outBuf,
+                               uint32_t *outSize) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t node = 0;
+  if (!mem.ReadU32BE(kEmbeddedNameListHead, &node) || node == 0)
+    return false;
+  for (int guard = 0; node != 0 && guard < 256; ++guard) {
+    uint32_t namePtr = 0, buf = 0, size = 0, next = 0;
+    if (!mem.ReadU32BE(node + 0, &namePtr) ||
+        !mem.ReadU32BE(node + 4, &buf) || !mem.ReadU32BE(node + 8, &size) ||
+        !mem.ReadU32BE(node + 12, &next))
+      return false;
+    char name[128] = {0};
+    if (namePtr != 0)
+      (void)mem.ReadBytes(namePtr, name, sizeof(name) - 1);
+    if (name[0] && std::strcmp(name, relName) == 0) {
+      if (outBuf) *outBuf = buf;
+      if (outSize) *outSize = size;
+      return true;
+    }
+    node = next;
+  }
+  return false;
+}
+
+// Host-side D22E8: push {name, buf, size} onto the list head.
+// Guest memory comes from GuestMemoryHeap::Alloc â€” never a hardcoded
+// 0xA00xxxxx scratch (that hits o1heap and Free-ownership fatals).
+static bool EmbeddedListInsert(const char *name, uint32_t buf, uint32_t size) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (!name || !name[0] || buf == 0 || size == 0)
+    return false;
+  // Reject duplicate relative name.
+  uint32_t dummyB = 0, dummyS = 0;
+  if (EmbeddedListLookup(name, &dummyB, &dummyS))
+    return false;
+
+  const size_t nlen = std::strlen(name) + 1;
+  const uint32_t nameG = mem.Alloc(nlen, 1);
+  const uint32_t node = mem.Alloc(16, 4);
+  if (nameG == 0 || node == 0) {
+    MCLA_LOG_WARN("D2308-INS-FAIL name='{}' nameG={:08X} node={:08X}", name,
+                  nameG, node);
+    return false;
+  }
+  mem.WriteBytes(nameG, name, static_cast<uint32_t>(nlen));
+  uint32_t head = 0;
+  (void)mem.ReadU32BE(kEmbeddedNameListHead, &head);
+  mem.WriteU32BE(node + 0, nameG);
+  mem.WriteU32BE(node + 4, buf);
+  mem.WriteU32BE(node + 8, size);
+  mem.WriteU32BE(node + 12, head);
+  mem.WriteU32BE(kEmbeddedNameListHead, node);
+  MCLA_LOG_WARN("D2308-INS name='{}' buf={:08X} size={} node={:08X}",
+                name, buf, size, node);
+  return true;
+}
+
+// Last MakeMemoryStream â€” used by BE710-SKIP to serve magic bytes.
+static uint32_t s_lastMemStream = 0;
+
+// Stable .data slot (next to CRT nodes ~0x829054C0). Heap Alloc at
+// C8024B00 got zeroed by a later arena wipe.
+static constexpr uint32_t kMemStreamSlot = 0x82905500u;
+
+static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
+                                 uint32_t size) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t s = kMemStreamSlot;
+  mem.WriteU32BE(s + 0, device);
+  mem.WriteU32BE(s + 4, handle);
+  mem.WriteU32BE(s + 8, size);
+  mem.WriteU32BE(s + 12, 0);
+  mem.WriteU32BE(s + 16, 0);
+  mem.WriteU32BE(s + 20, 0);
+  mem.WriteU32BE(s + 24, 0); // readPos  (BE250 field)
+  mem.WriteU32BE(s + 28, 0); // writePos (BE250 field)
+  s_lastMemStream = s;
+  return s;
+}
+
+// Host-side read for a dead/legacy wrapper: obj+4=buf, obj+8=size, cursor at
+// obj+24 (mirrors sub_821BE250's buffer shape). Serves min(count, size-cursor)
+// bytes and advances the cursor. Returns bytes served, or -1 when obj is not
+// a wrapper we recognize.
+static int64_t MemoryStreamServeRead(uint32_t obj, uint32_t dst, uint32_t count) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t buf = 0, size = 0, pos = 0;
+  if (obj == 0 || obj == 0xCDCDCDCDu)
+    return -1;
+  // Wrapper form: [+4]=buf [+8]=size [+24]=cursor. The CRT seed slot is the
+  // canonical wrapper (MakeMemoryStream layout).
+  if (!mem.ReadU32BE(obj + 4, &buf) || !mem.ReadU32BE(obj + 8, &size))
+    return -1;
+  if (buf == 0 || buf == 0xCDCDCDCDu || size == 0 || size == 0xCDCDCDCDu)
+    return -1;
+  (void)mem.ReadU32BE(obj + 24, &pos);
+  if (pos > size)
+    pos = size;
+  const uint32_t avail = size - pos;
+  const uint32_t n = (count < avail) ? count : avail;
+  if (n != 0 && dst != 0 && dst != 0xCDCDCDCDu) {
+    uint8_t tmp[512];
+    uint32_t done = 0;
+    while (done < n) {
+      const uint32_t chunk = (n - done > sizeof(tmp)) ? sizeof(tmp) : n - done;
+      if (!mem.ReadBytes(buf + pos + done, tmp, chunk))
+        return -1;
+      if (!mem.WriteBytes(dst + done, tmp, chunk))
+        return -1;
+      done += chunk;
+    }
+  }
+  if (n != 0)
+    (void)mem.WriteU32BE(obj + 24, pos + n);
+  return n;
+}
+
+// AFB8 = INSERT's vtable+4 open. Path is r4.
+// Host-handle BOTH embedded:/ and memory:$ so we never re-enter original
+// AFB8/CAD80 (BE0C8 re-open AVed at 0x7e780000 there). Return value matches
+// original semantics: the buffer pointer, or -1 on miss.
+// memory:$ format from sub_821CB740: "memory:$%p,%d,%d:%s"
+PPC_FUNC_IMPL(__imp__sub_821CAFB8);
+static std::atomic<uint32_t> s_hAFB8{0};
+static bool ParseMemoryDollar(const char *path, uint32_t *outBuf,
+                              uint32_t *outSize) {
+  // path like memory:$827D2DD0,5258,0:name
+  if (!path || std::strncmp(path, "memory:$", 8) != 0)
+    return false;
+  const char *p = path + 8;
+  char *end = nullptr;
+  const unsigned long buf = std::strtoul(p, &end, 16);
+  if (end == p || *end != ',')
+    return false;
+  p = end + 1;
+  const unsigned long sz = std::strtoul(p, &end, 10);
+  if (end == p)
+    return false;
+  if (outBuf) *outBuf = static_cast<uint32_t>(buf);
+  if (outSize) *outSize = static_cast<uint32_t>(sz);
+  return true;
+}
+
+PPC_FUNC(sub_821CAFB8) {
+  const uint32_t n = s_hAFB8.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  char path[192] = {0};
+  if (ctx.r4.u32 != 0 && ctx.r4.u32 != 0xCDCDCDCDu)
+    (void)mem.ReadBytes(ctx.r4.u32, path, sizeof(path) - 1);
+  MclaSanitizePath(path, sizeof(path));
+  if (n <= 8 || path[0] == 'm' || path[0] == 'e')
+    MCLA_LOG_WARN("AFB8-IN #{} r3={:08X} r4={:08X} path='{}' lr={:08X}", n,
+                  ctx.r3.u32, ctx.r4.u32, path,
+                  static_cast<uint32_t>(ctx.lr));
+  EnsureMemoryDeviceVtable();
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  uint32_t buf = 0, size = 0;
+
+  if (std::strncmp(path, "embedded:/", 10) == 0 && path[10]) {
+    const bool hit = EmbeddedListLookup(path + 10, &buf, &size);
+    if (hit) {
+      const uint32_t st = MakeMemoryStream(kMemDeviceObj, buf, size);
+      MCLA_LOG_WARN("AFB76-HIT #{} path='{}' buf={:08X} size={} stream={:08X} "
+                    "lr={:08X}",
+                    n, path, buf, size, st, lr);
+      ctx.r3.u32 = st;
+      return;
+    }
+    if (n <= 40 || (n % 200) == 0)
+      MCLA_LOG_WARN("AFB76-MISS #{} path='{}' lr={:08X}", n, path, lr);
+    ctx.r3.u32 = 0xFFFFFFFFu;
+    return;
+  }
+
+  if (ParseMemoryDollar(path, &buf, &size) && buf != 0) {
+    const uint32_t st = MakeMemoryStream(kMemDeviceObj, buf, size);
+    if (n <= 24 || (n % 200) == 0)
+      MCLA_LOG_WARN("AFB76-MEM$ #{} path='{}' buf={:08X} size={} stream={:08X} "
+                    "lr={:08X}",
+                    n, path, buf, size, st, lr);
+    ctx.r3.u32 = st;
+    return;
+  }
+
+  __imp__sub_821CAFB8(ctx, base);
+}
+
+// INSERT file-resolve sub_821BDF20: GETDEV â†’ vtable+4 (AFB8) â†’ handle.
+// Census so we see whether AFB76-HIT actually feeds a successful INSERT.
+PPC_FUNC_IMPL(__imp__sub_821BDF20);
+static std::atomic<uint32_t> s_hBDF20{0};
+PPC_FUNC(sub_821BDF20) {
+  const uint32_t n = s_hBDF20.fetch_add(1) + 1;
+  const uint32_t pathG = ctx.r3.u32;
+  const uint32_t flags = ctx.r4.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  char path[96] = {0};
+  if (pathG != 0 && pathG != 0xCDCDCDCDu) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadBytes(pathG, path, sizeof(path) - 1);
+    MclaSanitizePath(path, sizeof(path));
+  }
+  __imp__sub_821BDF20(ctx, base);
+  const int32_t ret = static_cast<int32_t>(ctx.r3.s32);
+  if (n <= 40 || (n % 200) == 0 || std::strstr(path, "star_glow") ||
+      std::strstr(path, "embedded:"))
+    MCLA_LOG_WARN("BDF20 #{} path='{}' flags={:x} ret={:d} lr={:08X}", n,
+                  path, flags, ret, lr);
+}
+
+// Richer BE8D8 census (replaces MCLA_T4A2_CENSUS): [obj+0]=device* [obj+4]=handle.
+PPC_FUNC_IMPL(__imp__sub_821BE8D8);
+static std::atomic<uint32_t> s_hBE8D8{0};
+PPC_FUNC(sub_821BE8D8) {
+  const uint32_t n = s_hBE8D8.fetch_add(1) + 1;
+  EnsureMemoryDeviceVtable();
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t dev = 0, h = 0, vt = 0;
+  if (obj != 0 && obj != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(obj + 0, &dev);
+    (void)mem.ReadU32BE(obj + 4, &h);
+    if (dev != 0 && dev != 0xCDCDCDCDu)
+      (void)mem.ReadU32BE(dev, &vt);
+  }
+  if (n <= 24 || (n % 200) == 0 || dev == 0x7E780000u || h == 0x7E780000u ||
+      obj == 0x7E780000u)
+    MCLA_LOG_WARN("BE8D8 #{} obj={:08X} dev={:08X} vt={:08X} h={:08X} lr={:08X}",
+                  n, obj, dev, vt, h, lr);
+  __imp__sub_821BE8D8(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821BE610);
+static std::atomic<uint32_t> s_hBE610{0};
+PPC_FUNC(sub_821BE610) {
+  const uint32_t n = s_hBE610.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t dev = 0, h = 0;
+  if (obj != 0 && obj != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(obj + 0, &dev);
+    (void)mem.ReadU32BE(obj + 4, &h);
+  }
+  // T7b/T8a: after BE8D8 formats memory:$ the stream object's device/handle
+  // are already 0; BE610 still does vtable+48 on null â†’ AV 0x7e780000.
+  if (dev == 0) {
+    if (n <= 24 || (n % 200) == 0)
+      MCLA_LOG_WARN("BE610-SKIP #{} obj={:08X} (null device)", n, obj);
+    ctx.r3.u32 = 0;
+    return;
+  }
+  if (n <= 24 || (n % 200) == 0 || h == 0x7E780000u)
+    MCLA_LOG_WARN("BE610 #{} obj={:08X} dev={:08X} h={:08X}", n, obj, dev, h);
+  __imp__sub_821BE610(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821BDD28);
+static std::atomic<uint32_t> s_hBDD28{0};
+PPC_FUNC(sub_821BDD28) {
+  const uint32_t n = s_hBDD28.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t dev = 0, h = 0;
+  if (obj != 0 && obj != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(obj + 0, &dev);
+    (void)mem.ReadU32BE(obj + 4, &h);
+  }
+  if (dev == 0) {
+    if (n <= 24 || (n % 200) == 0)
+      MCLA_LOG_WARN("BDD28-SKIP #{} obj={:08X} (null device)", n, obj);
+    return;
+  }
+  if (n <= 24 || (n % 200) == 0 || h == 0x7E780000u)
+    MCLA_LOG_WARN("BDD28 #{} obj={:08X} dev={:08X} h={:08X}", n, obj, dev, h);
+  __imp__sub_821BDD28(ctx, base);
+}
+
+// BE0C8: r4 is the vtable object; r3 is the path (or vice versa after prologue).
+// Crash T8b/T9a: stack path ends up in the vtable slot.
+PPC_FUNC_IMPL(__imp__sub_821BE0C8);
+static std::atomic<uint32_t> s_hBE0C8{0};
+PPC_FUNC(sub_821BE0C8) {
+  const uint32_t n = s_hBE0C8.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  EnsureMemoryDeviceVtable();
+  uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+  uint32_t w3 = 0, w4 = 0, slot4 = 0;
+  if (r3) (void)mem.ReadU32BE(r3, &w3);
+  if (r4) (void)mem.ReadU32BE(r4, &w4);
+  if (w4 == kMemVtable)
+    (void)mem.ReadU32BE(w4 + 4, &slot4);
+  char pth[96] = {0};
+  // Path is whichever pointer is NOT the device object.
+  const uint32_t pathG = (r4 == kMemDeviceObj) ? r3 : r4;
+  if (pathG != 0 && pathG != 0xCDCDCDCDu)
+    (void)mem.ReadBytes(pathG, pth, sizeof(pth) - 1);
+  MclaSanitizePath(pth, sizeof(pth));
+  // Empty path â†’ GetSize/CB740 never produced "memory:$â€¦". Invent the
+  // re-open string from the known CRT blob so BE0C8 can call AFB8 cleanly.
+  // Stack is ~0x8E...... (ABOVE image 0x82......) â€” don't gate on <0x82000000.
+  if (pth[0] == 0 && pathG != 0 && pathG != 0xFFFFFFFFu) {
+    uint32_t buf = 0, size = 0;
+    if (!EmbeddedListLookup("fxl_final/rage_im.fxc", &buf, &size)) {
+      buf = 0x827D2DD0u;
+      size = 5258u;
+    }
+    char fix[128] = {0};
+    std::snprintf(fix, sizeof(fix), "memory:$%08X,%u,0:fxl_final/rage_im.fxc",
+                  buf, size);
+    mem.WriteBytes(pathG, fix, static_cast<uint32_t>(std::strlen(fix) + 1));
+    MCLA_LOG_WARN("BE0C8-FIX #{} wrote '{}' @{:08X}", n, fix, pathG);
+    std::strncpy(pth, fix, sizeof(pth) - 1);
+  }
+  if (pth[0] == 0) {
+    MCLA_LOG_WARN("BE0C8-SKIP #{} r3={:08X} r4={:08X} empty path lr={:08X}",
+                  n, r3, r4, static_cast<uint32_t>(ctx.lr));
+    ctx.r3.u32 = 0;
+    return;
+  }
+  MCLA_LOG_WARN("BE0C8 #{} r3={:08X}[{:08X}] r4={:08X}[{:08X}] vt+4={:08X} "
+                "pth='{}' r5={} lr={:08X}",
+                n, r3, w3, r4, w4, slot4, pth, r5,
+                static_cast<uint32_t>(ctx.lr));
+  // Host-complete the re-open: guest bctrlâ†’AFB8 with this stack path AVed
+  // (function-table lookup null / 0x0). Return the buffer handle ourselves.
+  uint32_t mb = 0, ms = 0;
+  if (ParseMemoryDollar(pth, &mb, &ms) && mb != 0) {
+    const uint32_t st = MakeMemoryStream(kMemDeviceObj, mb, ms);
+    MCLA_LOG_WARN("BE0C8-RET stream={:08X} buf={:08X} size={}", st, mb, ms);
+    ctx.r3.u32 = st;
+    return;
+  }
+    __imp__sub_821BE0C8(ctx, base);
+}
+
+// Shared no-op vtable stub (li r3,0; blr). 8C760 calls device+88 after
+// GETDEV; if the function-table slot is null we AV at 0x0. Strong override.
+PPC_FUNC_IMPL(__imp__sub_821A5CC0);
+PPC_FUNC(sub_821A5CC0) {
+  ctx.r3.u32 = 0;
+}
+
+// After 8C760 accepts the rgxa magic, D3070(bufobj, size) runs with r3=0.
+// Guard the null object.
+PPC_FUNC_IMPL(__imp__sub_821D3070);
+static std::atomic<uint32_t> s_hD3070{0};
+PPC_FUNC(sub_821D3070) {
+  const uint32_t n = s_hD3070.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = ctx.r3.u32;
+  uint32_t field8 = 0;
+  if (obj != 0 && obj != 0xCDCDCDCDu)
+    (void)mem.ReadU32BE(obj + 8, &field8);
+  // 8C760 magic-accept path does ori r4,r4,0x8000 then D3070 â€” original
+  // pulls r3 from TLS[+28] and AVs when that is null (0x7e780000).
+  const bool fromMagic = (ctx.r4.u32 & 0x8000u) != 0 &&
+                         (ctx.lr == 0x8218C89Cu ||
+                          static_cast<uint32_t>(ctx.lr) == 0x8218C89Cu);
+  if (obj == 0 || obj == 0xCDCDCDCDu || field8 == 0 || field8 == 0xCDCDCDCDu ||
+      (ctx.r4.u32 & 0x8000u) != 0) {
+    if (n <= 16 || (ctx.r4.u32 & 0x8000u) != 0)
+      MCLA_LOG_WARN("D3070-SKIP #{} obj={:08X} +8={:08X} r4={:08X} lr={:08X}",
+                    n, obj, field8, ctx.r4.u32,
+                    static_cast<uint32_t>(ctx.lr));
+    ctx.r3.u32 = 0;
+    return;
+  }
+  __imp__sub_821D3070(ctx, base);
+}
+
+// Stream read: [obj+0] must be a live device. Dead wrapper â†’ serve bytes from
+// the wrapper fields ourselves (MakeMemoryStream layout) so factory reads get
+// real data instead of -1 (which cascaded into AF68's cap=-1 AV).
+PPC_FUNC_IMPL(__imp__sub_821BE250);
+static std::atomic<uint32_t> s_hBE250{0};
+PPC_FUNC(sub_821BE250) {
+  const uint32_t n = s_hBE250.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t dst = ctx.r4.u32;
+  const uint32_t count = ctx.r5.u32;
+  uint32_t dev = 0;
+  if (obj && obj != 0xCDCDCDCDu)
+    (void)mem.ReadU32BE(obj + 0, &dev);
+  if (dev == 0 || dev == 0xCDCDCDCDu) {
+    const int64_t served = MemoryStreamServeRead(obj, dst, count);
+    if (served >= 0) {
+      if (n <= 24 || (n % 200) == 0)
+        MCLA_LOG_WARN("BE250-MEM #{} obj={:08X} served={} count={} posfield=+24",
+                      n, obj, served, count);
+      ctx.r3.u32 = static_cast<uint32_t>(served);
+      return;
+    }
+    if (n <= 24 || (n % 200) == 0)
+      MCLA_LOG_WARN("BE250-SKIP #{} obj={:08X} dev={:08X}", n, obj, dev);
+    ctx.r3.u32 = static_cast<uint32_t>(-1);
+    return;
+  }
+  __imp__sub_821BE250(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821BE710);
+static std::atomic<uint32_t> s_hBE710{0};
+PPC_FUNC(sub_821BE710) {
+  const uint32_t n = s_hBE710.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = ctx.r3.u32;
+  uint32_t dev = 0, h = 0;
+  if (obj && obj != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(obj + 0, &dev);
+    (void)mem.ReadU32BE(obj + 4, &h);
+  }
+  if (dev == 0 || dev == 0xCDCDCDCDu) {
+    auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t sbuf = 0, ssize = 0;
+    if (s_lastMemStream != 0) {
+      (void)mem2.ReadU32BE(s_lastMemStream + 4, &sbuf);
+      (void)mem2.ReadU32BE(s_lastMemStream + 8, &ssize);
+    }
+    MCLA_LOG_WARN("BE710-DEAD #{} obj={:08X} lastStream={:08X} sbuf={:08X} "
+                  "ssize={} r4={:08X}",
+                  n, obj, s_lastMemStream, sbuf, ssize, ctx.r4.u32);
+    if (sbuf != 0 && ssize >= 4 && ctx.r4.u32 != 0) {
+      mem2.WriteU32BE(ctx.r4.u32, 0x61786772u);
+      MCLA_LOG_WARN("BE710-MAGIC #{} wrote 61786772", n);
+      ctx.r3.u32 = 1;
+      return;
+    }
+    ctx.r3.u32 = static_cast<uint32_t>(-1);
+    return;
+  }
+  if (n <= 16 || (n % 200) == 0)
+    MCLA_LOG_WARN("BE710 #{} obj={:08X} dev={:08X} h={:08X} r5={}", n, obj, dev,
+                  h, ctx.r5.u32);
+  __imp__sub_821BE710(ctx, base);
+}
+
+// ===========================================================================
+// T5-next (t23a frontier): atArray ctor guards - sub_8218AF68 (16-byte
+// stride) and sub_82189F00 (32-byte stride).
+//
+// Shared ABI (ppc_recomp.9.cpp:14521 / :11806): r3=obj, r4=count, r5=cap.
+//   sth count -> obj+4 ; sth cap -> obj+6
+//   r10 = *(r13)                       <- TLS table (WIPED at runtime:
+//                                         park sample tls0=00000000)
+//   r3  = *(r10+12)                    <- slot +12 allocator descriptor
+//   r11 = *(r3) ; ctr = *(r11+8) ; bctrl   <- alloc(cap*stride, align 16)
+//   *(obj+0) = alloc result; then count entries field-zeroed (16B: [+8]=0;
+//   32B: +4/+8/+20/+24=0, +28/+30=0xFFFF).
+//
+// Faults observed (boot_stdout_t22a.log, t23a.log):
+//   1. bctrl through ctr=0 (TLS wiped) -> PPC_LOOKUP_FUNC(0) -> host AV
+//      0x7E780000 (that "wild pointer" is literally lookup-of-guest-0).
+//   2. Caller 8C1C0 passes count/cap = -1 (0xFFFFFFF0) because the upstream
+//      ReadByte chain got -1 from the dead stream -> count/cap poison.
+//
+// Guard: null obj -> return; insane count/cap (>0x8000, covers -1) -> empty
+// array; TLS wiped -> host-complete the ctor faithfully.
+// ===========================================================================
+PPC_FUNC_IMPL(__imp__sub_8218AF68);
+static std::atomic<uint32_t> s_hAF68{0};
+
+// Shared guard body. entryBytes = 16 or 32. Returns true when handled.
+static bool AtArrayCtorGuard(PPCContext &__restrict ctx, uint32_t n,
+                             uint32_t entryBytes) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+
+  if (obj == 0 || obj == 0xCDCDCDCDu) {
+    MCLA_LOG_WARN("ATARRAY-SKIP #{} null obj lr={:08X}", n, lr);
+    return true;
+  }
+
+  // Count/cap live in the low 16 bits of r4/r5 (sth stores). -1 -> 0xFFFF.
+  const uint32_t countRaw = ctx.r4.u32 & 0xFFFFu;
+  const uint32_t capRaw = ctx.r5.u32 & 0xFFFFu;
+
+  // Poisoned args (from BE250 -1 upstream): empty array.
+  if (countRaw > 0x8000u || capRaw > 0x8000u) {
+    MCLA_LOG_WARN("ATARRAY-CLAMP #{} obj={:08X} count={:04X} cap={:04X} "
+                  "stride={} lr={:08X} (poisoned args, empty array)",
+                  n, obj, countRaw, capRaw, entryBytes, lr);
+    (void)mem.WriteU16BE(obj + 4, 0);
+    (void)mem.WriteU16BE(obj + 6, 0);
+    (void)mem.WriteU32BE(obj + 0, 0);
+    return true;
+  }
+
+  // TLS table alive? Fast path: original body handles everything.
+  uint32_t tlsTable = 0;
+  if (ctx.r13.u32 != 0 && mem.ReadU32BE(ctx.r13.u32, &tlsTable) &&
+      tlsTable != 0 && tlsTable != 0xCDCDCDCDu) {
+    return false;
+  }
+
+  // TLS wiped: host-complete the ctor faithfully.
+  MCLA_LOG_WARN("ATARRAY-TLSDEAD #{} obj={:08X} count={} cap={} stride={} "
+                "lr={:08X}",
+                n, obj, countRaw, capRaw, entryBytes, lr);
+  (void)mem.WriteU16BE(obj + 4, static_cast<uint16_t>(countRaw));
+  (void)mem.WriteU16BE(obj + 6, static_cast<uint16_t>(capRaw));
+  uint32_t arrPtr = 0;
+  if (capRaw != 0) {
+    arrPtr = mem.Alloc(capRaw * entryBytes, 16);
+    if (arrPtr == 0) {
+      MCLA_LOG_WARN("ATARRAY-ALLOCFAIL #{} cap={} stride={}", n, capRaw,
+                    entryBytes);
+      (void)mem.WriteU16BE(obj + 4, 0);
+      (void)mem.WriteU16BE(obj + 6, 0);
+      (void)mem.WriteU32BE(obj + 0, 0);
+      return true;
+    }
+  }
+  (void)mem.WriteU32BE(obj + 0, arrPtr);
+  if (arrPtr != 0 && countRaw != 0) {
+    // 16B entries (AF68): [+8]=0. 16B entries (BFF0): +0/+4/+8=0, +12/+14=0.
+    // 32B entries (8F00): +4/+8/+20/+24=0, +28/+30=0xFFFF. The zero-init
+    // differences don't matter for a zeroed array — all-zero entries match
+    // every variant except 8F00's 0xFFFF tails, kept exact above.
+    if (entryBytes == 16) {
+      uint8_t zero[16] = {0};
+      for (uint32_t i = 0; i < countRaw; ++i)
+        (void)mem.WriteBytes(arrPtr + i * 16u, zero, sizeof(zero));
+    } else {
+      uint8_t zero[32] = {0};
+      zero[28] = 0xFF;
+      zero[29] = 0xFF;
+      zero[30] = 0xFF;
+      zero[31] = 0xFF;
+      for (uint32_t i = 0; i < countRaw; ++i)
+        (void)mem.WriteBytes(arrPtr + i * 32u, zero, sizeof(zero));
+    }
+  }
+  return true;
+}
+
+PPC_FUNC(sub_8218AF68) {
+  const uint32_t n = s_hAF68.fetch_add(1) + 1;
+  if (AtArrayCtorGuard(ctx, n, 16))
+    return;
+  __imp__sub_8218AF68(ctx, base);
+}
+
+// 32-byte-stride sibling (t23a AV at +0x50, lr=82189F50, same TLS+12 chain).
+PPC_FUNC_IMPL(__imp__sub_82189F00);
+static std::atomic<uint32_t> s_h89F00{0};
+PPC_FUNC(sub_82189F00) {
+  const uint32_t n = s_h89F00.fetch_add(1) + 1;
+  if (AtArrayCtorGuard(ctx, n, 32))
+    return;
+  __imp__sub_82189F00(ctx, base);
+}
+
+// 16-byte-stride sibling #2 (t23b AV at +0x50, lr=8218C040, from 8C1C0+0x1101).
+// Entry zero-init: +0/+4/+8 (u32) +12/+14 (u16) — all-zero entries cover it.
+PPC_FUNC_IMPL(__imp__sub_8218BFF0);
+static std::atomic<uint32_t> s_hBFF0{0};
+PPC_FUNC(sub_8218BFF0) {
+  const uint32_t n = s_hBFF0.fetch_add(1) + 1;
+  if (AtArrayCtorGuard(ctx, n, 16))
+    return;
+  __imp__sub_8218BFF0(ctx, base);
+}
+
+// ===========================================================================
+// T5 systemic fix (t23c frontier): the XTL allocation import thunks
+// (sub_82130528/550/588) resolve the host allocator through the guest TLS
+// table: *( *(r13) + 28 ) -> FuncBlock -> +8 alloc / +12 free. The TLS block
+// at 0x8F200000 gets WIPED at runtime (park sample tls0=00000000), so every
+// late-boot alloc/free through these thunks AVs at 0x7E780000 (= lookup of
+// guest-0). These are strong overrides: same result contract as __xtl_alloc /
+// __xtl_free (kernel/imports.cpp), TLS-independent.
+//   sub_82130528(r3=size)        -> alloc(size, align 16)
+//   sub_82130550(r3=a, r4=b)     -> alloc(max(a,b), align 16)
+//   sub_82130588(r3=ptr)         -> free(ptr) — returns success (r3=1)
+// ===========================================================================
+PPC_EXTERN_FUNC(__xtl_alloc);
+PPC_EXTERN_FUNC(__xtl_free);
+static std::atomic<uint32_t> s_hXtlImport{0};
+static void XtlImportCensus(const char *which, uint32_t n, uint32_t a,
+                            uint32_t b) {
+  if (n <= 8 || (n % 500) == 0)
+    MCLA_LOG_WARN("XTLIMPORT #{} {} a={:08X} b={:08X}", n, which, a, b);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82130528);
+PPC_FUNC(sub_82130528) {
+  const uint32_t n = s_hXtlImport.fetch_add(1) + 1;
+  XtlImportCensus("alloc", n, ctx.r3.u32, 0);
+  __xtl_alloc(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82130550);
+PPC_FUNC(sub_82130550) {
+  const uint32_t n = s_hXtlImport.fetch_add(1) + 1;
+  // Original: r11 = max(r3, r4); alloc(r11, 16)
+  const uint32_t sz = (ctx.r3.u32 > ctx.r4.u32) ? ctx.r3.u32 : ctx.r4.u32;
+  XtlImportCensus("alloc-max", n, ctx.r3.u32, ctx.r4.u32);
+  const uint32_t saved = ctx.r3.u32;
+  ctx.r3.u32 = sz;
+  __xtl_alloc(ctx, base);
+  if (ctx.r3.u32 == 0 && saved != 0)
+    MCLA_LOG_WARN("XTLIMPORT alloc-max #{} FAILED size={}", n, sz);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82130588);
+PPC_FUNC(sub_82130588) {
+  const uint32_t n = s_hXtlImport.fetch_add(1) + 1;
+  XtlImportCensus("free", n, ctx.r3.u32, 0);
+  __xtl_free(ctx, base);
 }

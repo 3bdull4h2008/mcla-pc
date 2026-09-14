@@ -1,25 +1,25 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "mcpServers": {
+  "mcp": {
     "renderdoc": {
-      "command": "python",
-      "args": ["-m", "renderdoc_mcp"],
-      "cwd": "E:\\mcla pc",
-      "env": {
-        "RENDERDOC_MODULE_PATH": "C:\\Program Files\\RenderDoc"
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "python",
+        "-m",
+        "renderdoc_mcp"
+      ],
+      "environment": {
+        "RENDERDOC_MODULE_PATH": "C:\\Program Files\\RenderDoc",
+        "RENDERDOC_QRENDERDOC_PATH": "C:\\Program Files\\RenderDoc\\qrenderdoc.exe"
       }
     },
-    "ghidra": {
-      "command": "python",
-      "args": ["-m", "ghidra_headless_mcp"],
-      "cwd": "E:\\mcla pc",
-      "env": {
-        "GHIDRA_INSTALL_DIR": "E:\\ghidra_12.1.2_PUBLIC"
-      }
-    },
-    "visualstudio": {
-      "type": "http",
-      "url": "http://localhost:5050"
+    "ida-pro": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "C:\\Users\\abdul\\.local\\share\\mcp\\idamcp-venv\\Scripts\\ida-pro-mcp.exe"
+      ]
     }
   }
 }

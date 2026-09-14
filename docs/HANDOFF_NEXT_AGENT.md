@@ -1,5 +1,525 @@
 # HANDOFF — next agent, read this first
 
+> **Doc set (5 docs, consolidated 2026-09-13).** This file is doc 2: live
+> frontier (below) + the chronological session trail. Companion docs:
+> `PROGRAM_GUIDE.md` (architecture, build/run, tooling, cheat sheets, rules —
+> start there if new), `ROOT_CAUSE_VALIDATION.md` (audit method + report +
+> findings ledger F-001…), `EXECUTION_PHASES.md` (executor protocol + Phase 0/1
+> tasks and logs), `PLAN_VMX128.md`. Former files `ROOT_CAUSE_VALIDATION_*`,
+> `CHEAP_MODEL_EXECUTION_PLAN.md`, `PHASE0_*`, `PHASE1_*` were merged into
+> those; references to them in the older trail now point at the merged docs.
+
+## READ ME FIRST — T5 NEXT (2026-09-14): rgxa magic accepted; AV moved to 8AF68
+
+### Latest (`boot_stdout_t22a.log` 150s)
+
+```
+AFB76-HIT rage_im stream=82905500 (stable .data slot)
+BE710-MAGIC wrote 61786772
+D3070-SKIP r4=8000 (TLS-null path)
+NEW AV 0x7e780000  rva=0x411235
+lr=8218AFB8  r3=0 r4=0xFFFFFFF0
+stack: 8AF68 → 8C1C0 → 8C760
+```
+
+Magic `rgxa` (`0x61786772` after BE710 swap) **accepted**. Next is
+`sub_8218AF68` from factory `8C1C0` with a null object.
+
+### Also this stretch
+
+- Stream wrapper at **0x82905500** (heap Alloc got wiped)
+- Function table base is **0x829E0000** (not 0x8B9E0000); A5CC0 remapped
+- GETDEV-NULL returns memory device; D3070 magic-path skip
+- `build/game_data` restored from `E:\MCLA-Standalone\game_data`
+- Copy `third_party/SDL3/lib/SDL3.dll` into `build/` after reconfigure
+
+### Next
+
+Census/guard `sub_8218AF68` (r3=0 after magic). Factory path `8C1C0` is running.
+
+---
+
+
+### Proven (t15a + t15b)
+
+```
+embed-seed 15 CRT triples, listHead=829054C0
+AFB76-HIT embedded:/fxl_final/rage_im.fxc buf=827D2DD0 size=5258 stream=C8024B00
+Vectored 0   Fatal 0   VSYNC-ISR 120   (both soaks, killed at 120s — still alive)
+```
+
+### What landed
+
+- `MakeMemoryStream(device, buf, size)` — 32-byte wrapper `[0]=dev [4]=handle [8]=size`
+- AFB8 / BE0C8-RET return that stream, not the raw buffer
+- Strong `sub_821A5CC0` no-op; full 23-slot vtable restore
+- Null-device guards: BE610 / BDD28 / BE250 / BE710
+- BE0C8-FIX invents `memory:$…` when stack path is empty
+
+### Still open
+
+- star_glow / TEXDICT / POST-EXEC not reached in 120s (boot is further than the old fatal)
+- Hydration still on (T5) until factory runs clean
+- EMB76 stays 0 — acceptance is AFB76-HIT
+- Next: longer soak for star_glow / title; or trigger shader factory path
+
+---
+
+
+### Proven
+
+- 15 CRT seeds, AFB76-HIT, BE0C8-FIX/RET, full vtable restore (23 slots)
+- Strong override `sub_821A5CC0` (no-op stub used as many memory-vtable slots)
+- GETDEV re-arms vtable before return
+
+### Latest (`t14b` 120s)
+
+```
+AFB76-HIT → BE0C8-FIX → BE0C8-RET buf=827D2DD0
+AV 0x0  lr=8218C82C  r3=827D838C r10=821A5CC0
+```
+
+`8C760` after GETDEV does `device->vtable[+88](device, path)` where +88 is
+`0x821A5CC0` (returns 0). Crash is either a **null function-table slot** for
+A5CC0 (override may not be the entry InstallFunctionTable installed) or the
+next instruction stream (`BE710`) treats the BDF20 handle as a stream object.
+
+### Next
+
+1. Confirm A5CC0 is in `PPCFuncMappings` at runtime (log table slot).
+2. Hook `sub_821BE710` / `sub_821BE250` — return -1/0 when stream device is 0.
+3. After BE0C8-RET, find the stream wrapper (was `82860C18`) and write
+   `[+0]=device [+4]=handle` so later reads have a live object.
+4. Hydration stays; EMB76 stays 0.
+
+---
+
+
+### Latest (`boot_stdout_t13a.log` 120s)
+
+```
+AFB76-HIT rage_im → memory:$827D2DD0,5258,0:fxl_final/rage_im.fxc
+BE610-SKIP (null device on stream 82860C18)
+BE0C8-FIX wrote the path onto the stack buffer
+BE0C8-RET buf=827D2DD0 size=5258          ← host completes re-open
+NEW AV 0x7e780000  rva=0x41630C
+ppc lr=8218C82C r3=827D838C r4=0 r5=7
+stack: 8C760 → 7AC30 → 77330 → 3041E8
+```
+
+### Why BE0C8 is host-completed
+
+Guest `bctrl` → AFB8 from BE0C8 null-derefs (`PPC_CALL_INDIRECT` table lookup
+failed even though vt+4=821CAFB8). Same virtual call from BDF20 works. So we
+parse `memory:$` ourselves and return the buffer as the open handle.
+
+### Next frontier
+
+`sub_8218C760` after a successful open (`lr=8218C82C`) does `strncmp`-like
+work with **r4=0, r5=7** on device `0x827D838C`. Census 8C760 around +0x2AC;
+likely needs a non-null path/name after the host open returns a raw buffer
+instead of a full stream object.
+
+### Still true
+
+- 15 CRT seeds; AFB76-HIT; vtable re-arm
+- EMB76=0; hydration on
+- No heap `0xA00xxxxx` from seed
+
+---
+
+
+### Landed this stretch
+
+- AFB8 host-handles `embedded:/` and `memory:$` (returns buf / -1; no original CAD80)
+- `EnsureMemoryDeviceVtable()`: re-arms `[0x827D838C]=0x82012918` and vtable
+  slots +0/+4 (they get zeroed at runtime — T10c saw `vt+4=0`)
+- Null-device guards on BE610/BDD28
+- **BE0C8-SKIP** when the stack path is empty (GetSize/CB740 produced nothing;
+  bctrl to AFB8 with empty path AVed)
+
+### Latest boot `boot_stdout_t11b.log` (120s)
+
+```
+AFB76-HIT rage_im
+BE610-SKIP (null device)
+BE0C8-SKIP (empty path)
+NEW AV: 0x7e780000  rva=0x1B2764
+ppc lr=8217D7C8  r3=0 r4=0x3E0 r5=0x10
+stack: 82130528 (alloc) → 8217D7B0 → 8217AC30 → 82177330 → 823041E8
+```
+
+Past the memory-device re-open. New frontier is **guest alloc `sub_82130528`**
+called from `8217D7B0` with size `0x3E0` — likely NULL alloc return or
+freelist poison after the empty-path skip left a half-open file.
+
+### Next
+
+1. Census `sub_82130528` / `sub_8217D7B0` — why size 0x3E0 fails.
+2. Decide whether empty-path BE0C8-SKIP should instead invent
+   `memory:$<known-buf>,5258,0:fxl_final/rage_im.fxc` so re-open completes.
+3. Hydration still on; EMB76 still 0 (correct).
+
+---
+
+
+### Proven (reconfirmed T8)
+
+- 15 CRT embed seeds, listHead=`829054C0`
+- AFB8 rewrites embedded → `memory:$buf,size,0:rel` and calls original
+  ```
+  AFB76-HIT … -> 'memory:$827D2DD0,5258,0:fxl_final/rage_im.fxc'
+  BDF20 … ret≠-1
+  BE8D8 #1 obj=82860C18 dev=827D838C vt=82012918 h=827D2DD0
+  ```
+- null-device guard on BE610 works (`BE610-SKIP`)
+
+### Current AV (T8b, ~48s after seed)
+
+```
+BE8D8 → BE610-SKIP (device already 0) → BE0C8 re-open
+Vectored 0xC0000005 Param[1]=0x7e780000
+ppc r3=827D838C r4=8EFFF670 (stack path) lr=821BE0F8
+stack: BE0C8+0xBF → BE8D8
+```
+
+`sub_821BE0C8` does `r4->vtable[+4](r4, r3)` then opens. After the
+prologue, `r28=r4` is used as the object with a vtable. For our re-open the
+path buffer ends up in that slot → `lwz` from `"memo"` → wild ptr `0x7e780000`.
+
+### Next fix (precise)
+
+1. Census `sub_821BE0C8` and `sub_821CAD80` (memory:$ parser).
+2. When BE0C8 is re-opening a `memory:$…` path, ensure the **device**
+   (`0x827D838C`) is the vtable object, not the stack string. Either
+   correct the host AFB8/BE0C8 call contract or host-handle the memory:$
+   open entirely (parse `buf,size` from the path, return CAD80-equivalent
+   handle without the broken virtual call).
+3. Keep BE610/BDD28 null-device guards.
+4. Re-soak 120s: no Vectored, AFB76-HIT, VSYNC, then look for star_glow /
+   TEXDICT.
+
+### Still true
+
+- EMB76 stays 0; use AFB76-HIT + BDF20.
+- No heap `0xA00xxxxx` from seed/MOUNT.
+- Hydration stays until factory runs clean.
+
+---
+
+
+### Proven this session
+
+| Signal | Evidence |
+|---|---|
+| 15 CRT embed seeds | `embed-seed 15 CRT triples, listHead=829054C0` |
+| Memory vtable live | `GETDEV-RET … ret=827D838C vt=82012918` |
+| AFB8 content hit | `AFB76-HIT rage_im buf=827D2DD0 size=5258` |
+| INSERT file-resolve OK | `BDF20 … path='embedded:/fxl_final/rage_im.fxc' ret≠-1` |
+| star_glow fatal | **gone** (0 hits in 90–120s soaks) |
+
+`BDF20` is INSERT’s file-resolve: GETDEV → **vtable+4 (AFB8)** → handle.
+EMB76 (+16) stays 0 forever; acceptance is **AFB76-HIT + BDF20 ret≠-1**.
+
+### New frontier (120s soak `boot_stdout_t7b.log`)
+
+Host AV at ~98s (not the old star_glow fatal):
+
+```
+Vectored 0xC0000005 Param[1]=0x7e780000
+ppc lr=821BDDD4  r3=0 r4=0
+stack: BDD28 → BE610 → BE8D8 → 8C760 → 7AC30 → 77330
+```
+
+`0x7e780000` is the historic wild pointer (session 72 / INFLATE-SKIP). Next:
+trace `sub_821BE8D8` / `sub_8218C760` after a successful AFB76-HIT — the
+handle returned by AFB8 (raw buffer ptr) is likely being treated as a full
+stream object.
+
+### Still not seen in 120s
+
+- star_glow GETDEV / TEXDICT factory / POST-EXEC / D2308-INS  
+  (boot is further along than the old fatal; those paths may need title/UI)
+
+### Do not
+
+- Re-do PE/vtable/CRT seed/AFB8  
+- Write `0xA00xxxxx` from SeedPreBootSlots or MOUNT-FIX (removed)  
+- Remove hydration (T5) until factory runs and INSERT is clean  
+- Treat EMB76 as the success metric
+
+---
+
+### What landed (after T4-final)
+
+1. **GETDEV-RET** census: `embedded:/fxl_final/rage_im.fxc` returns
+   `ret=827D838C vt=82012918` — memory vtable is live on the static device.
+2. **AFB8 host hook** (`sub_821CAFB8` in `gpu_device.cpp`): `embedded:/`
+   paths walk the D22E8/D2308 name list (head `0x82860AF8`) and return the
+   buffer pointer as the open handle. Miss → r3=-1 (same as before).
+3. **AFB76-HIT** (new acceptance signal; **EMB76 stays 0 forever** — INSERT
+   uses vtable+4 not +16):
+   ```
+   AFB76-HIT #1 path='embedded:/fxl_final/rage_im.fxc' buf=827D2DD0 size=5258
+   lr=821BDF5C
+   ```
+   Confirmed on two boots (`boot_stdout_t5c.log`, `t5d.log`).
+4. **CRT embed-seed** in `SeedEmbeddedNameList` (`boot_host.cpp`): our host
+   jumps at game entry so `.CRT$XCU` D22E8 inits never run. Seeded the
+   rage_im triple from CRT init `@0x827A7FB0`:
+   `node 0x828495B8, name 0x820093D4, buf 0x827D2DD0, size 0x148A`.
+5. **Post-inflate D2308-INS** is wired but still skips (`inflSize=12` sentinel
+   on the preload ctx). star_glow is not yet on the list.
+
+### New acceptance signal
+
+| Signal | Meaning |
+|---|---|
+| `AFB76-HIT` | embedded:/ resolved from RAM list |
+| `GETDEV-RET` vt=`82012918` | memory vtable installed |
+| no `Unable to load shader` | INSERT path progressed past AFB8 -1 |
+
+### Next work (do not redo AFB8)
+
+1. **Seed more CRT D22E8 triples** the same way (decode more
+   `b 0x821d22e8` sites under `0x827Axxxx` / `0x827Bxxxx`; each has
+   lis/addi name, buf, node, size). Add them to `SeedEmbeddedNameList`.
+2. **Post-inflate list for star_glow**: PRELOAD-CTX `inflSize=12` is a
+   sentinel — read the real inflated length from the inflate stream / buf
+   header, then call `EmbeddedListInsert("fxl_final/star_glow.fxc", …)`.
+3. Re-observe factory `TEXDICT-CALLER` / hydration; only then consider T5.
+4. Boot ×2 keep: no fatal, AFB76-HIT, VSYNC>0.
+
+---
+
+## READ ME FIRST — T4-FINAL (2026-09-13 late): star_glow fatal GONE; vtable installed; next is EMB76/content
+
+### What landed
+
+1. **PE section table parsed** (`build/cache/mcla_pe.bin`, 13 sections,
+   imagebase `0x82000000`). `mcla_pe.bin` is the **decompressed linear image**:
+   identity map `file_off = VA - 0x82000000` is correct for all sections.
+   PE section *raw* pointers describe the on-disk compressed layout and must
+   NOT be used as file offsets into `mcla_pe.bin`. Confirmed by prologues
+   (`7D8802A6` at every known fn) and by type_info at `0x827D8380`
+   (`?AVfiDeviceMemory@rage@@`).
+
+2. **Memory-device vtable = `0x82012918`** (.rdata). Unique .rdata/.data hits
+   for the four methods:
+   - `+0`  `0x821CAE50` (exists/size, parses `embedded:/` and `memory:`)
+   - `+4`  `0x821CAFB8`
+   - `+16` `0x821CB070` (**open / EMB76 census**)
+   - `+80` `0x821CB400`
+   Old `0x8201219C` is a type_info word, not a method table. Old
+   `0x8201206C` is the **base** fiDevice vtable (open slot = stub `0x82762480`).
+
+3. **GETDEV prefix path returns static Device* `0x827D838C`**
+   (`sub_821CB488`: `lis r11,-32130; addi r3,r11,-31860`). CRT init
+   `sub_827B8B38` wrote base vtable `0x8201206C` there (`stw r11,-31860(r10)`),
+   which is why open was a no-op and EMB76 never fired. Mount("memory:")
+   special path stores Device* into `0x827D8380` (`stw r26,-31872(r11)`).
+
+4. **Host dead-ctor replay** in `src/boot_host.cpp`:
+   - `ReplayDeadMemoryDeviceCtor()` (called from `SeedPreBootSlots`): writes
+     `[0x827D838C]=0x82012918` and `[0x827D8380]=0x827D838C`.
+   - Strong overrides of CRT `sub_827B8B38` / `sub_827B8B20` so CRT cannot
+     clobber the memory vtable with base `0x8201206C`.
+   - **Do not write guest-heap scratch (`0xA00xxxxx`) from this hook** — that
+     produced `sysMemMultiAllocator::Free ... Not owned by any known heap`.
+   - MOUNT-FIX vtable corrected to `0x82012918`.
+
+### Boot evidence (two+ runs)
+
+| log | time | GETDEV | star_glow | fatal | EMB76 | VSYNC |
+|---|---|---|---|---|---|---|
+| `boot_stdout_p1d1.log` (pre-fix) | 22:30 | 43 | YES | YES ~5s | 0 | — |
+| `boot_stdout_t4final2.log` | 30s | 24 | **0** | **0** | 0 | 120 |
+| `boot_stdout_t4final4.log` | 60s | 5 | **0** | **0** | 0 | 120 |
+
+**star_glow fatal is gone without removing hydration.** Factory
+`TEXDICT-CALLER`/`DICT-HYDRATE` did **not** fire in the new boots — the old
+INSERT→fatal path is no longer being taken. First embedded GETDEV seen:
+`embedded:/fxl_final/rage_im.fxc`.
+
+### Acceptance NOT yet met
+
+- EMB76 still 0 — `sub_821CB070` (vtable+16) never called. Open may be a
+  different slot (`+0` = `0x821CAE50` handles `embedded:/` via linked-list
+  lookup `sub_821D2308` at `0x82860AF8`).
+- star_glow has **not been proven to load from RAM** — we only know the
+  fatal is gone and VSYNC runs. Hydration remains in place (cannot prove
+  INSERT-without-hydration yet because factory never ran).
+
+### Next frontier
+
+1. **Confirm which vtable slot is real Open** for `embedded:/dcl/star_glow.dcl`.
+   Census `sub_821CAE50` (+0) the way EMB76 hooks +16. If +0 is Open, EMB76
+   will never fire and the acceptance signal needs retargeting.
+2. **Populate `sub_821D2308` list** (`0x82860AF8` head: `{+0 name*, +4 buf,
+   +8 size, +12 next}`) from the post-inflate hook with the real inflated
+   buffer + names (`dcl/star_glow.dcl`, `fxl_final/star_glow.fxc`, …) so
+   `embedded:/…` lookups resolve to RAM.
+3. **Re-observe factory** `sub_8218B000` / `TEXDICT-CALLER`. If it runs again
+   and INSERT succeeds via the memory device, remove `HydrateShaderHashTable`
+   (task T5 still open on purpose).
+4. **Boot ×2 to title**, watch for new frontier (UI `.xsf` loads in
+   t4final2 already reached `legals.xsf` / `policecam.xsf`).
+
+---
+
+## READ ME FIRST — WEAKER-MODEL EXECUTION PLAN (2026-09-13, T4-final+1)
+
+**Do this next. Do not re-derive. Do not touch PE/vtable/CRT work already landed.**
+
+### Locked facts (do not re-investigate)
+
+| Fact | Value |
+|---|---|
+| PE map | identity `off = VA - 0x82000000` in `build/cache/mcla_pe.bin` |
+| Memory vtable | `0x82012918` |
+| Static Device* (GETDEV prefix return) | `0x827D838C` |
+| Fallback Device* slot | `0x827D8380` |
+| Dead-ctor replay | `src/boot_host.cpp` `ReplayDeadMemoryDeviceCtor` + CRT overrides |
+| INSERT file-resolve | `sub_821BDF20` → GETDEV → **`vtable+4`** |
+| vtable+4 method | `sub_821CAFB8` — **only accepts `memory:`**, returns -1 for `embedded:/` |
+| vtable+0 method | `sub_821CAE50` — accepts `embedded:/` via list lookup |
+| vtable+16 method | `sub_821CB070` — EMB76 census; `memory:$ptr,size,off:name` table insert |
+| Name-buffer list head | `0x82860AF8` |
+| List insert fn | `sub_821D22E8(node, name*, buf, size)` — stores name/buf/size/next, head=node |
+| List lookup fn | `sub_821D2308(name, &buf, &size)` — walk, strcmp, fill out-params |
+| Inflated buffer (post-exec) | `[ctx+8]=bufPtr`, `[ctx+1544]=inflSize` in `sub_821BC140` hook |
+| Heap scratch ban | never write `0xA00xxxxx` from `SeedPreBootSlots` (o1heap corruption) |
+| Hydration | keep `HydrateShaderHashTable` until INSERT proves to work without it |
+
+**EMB76 will stay 0.** INSERT uses +4 (AFB8), not +16 (CB070). Stop treating EMB76 as the acceptance signal. New signal: **AFB8/D2308 hit on `embedded:/…` returning a live buf**, then no `Unable to load shader`.
+
+### Step 0 — one-line diagnostic (do first, 5 min)
+
+In `src/gpu_device.cpp` GETDEV hook (`sub_821CB488`, ~line 3155), after
+`__imp__sub_821CB488(ctx, base);` log `ctx.r3` as `GETDEV-RET`. Confirm
+`embedded:/…` returns `0x827D838C`. Rebuild, boot 30s, grep `GETDEV-RET`.
+
+### Step 1 — make AFB8 resolve `embedded:/` (the actual fix)
+
+`sub_821BDF20` (`ppc_recomp.14.cpp:23563`) does:
+
+```
+dev = GETDEV(path);           // r3
+if (!dev) fail;
+handle = dev->vt[1](path, x); // vtable+4 = AFB8
+if (handle == -1) fail;
+```
+
+AFB8 only strncmp's `"memory:"` (7). `embedded:/fxl_final/rage_im.fxc` → -1.
+
+**Host hook `sub_821CAFB8` in `src/gpu_device.cpp`** (near the existing
+`MEMPARSE-AE50` census ~line 3507):
+
+```cpp
+PPC_FUNC_IMPL(__imp__sub_821CAFB8);
+PPC_FUNC(sub_821CAFB8) {
+  // If path starts with "embedded:/", resolve via D2308(path+10).
+  // D2308: r3=name, r4=&buf, r5=&size; returns 1 on hit else 0.
+  // Call it with a stack/local out-param pair, then return the buf as
+  // the "handle" in r3 (same shape AFB8 uses for memory: hits).
+  // Else: __imp__sub_821CAFB8(ctx, base);
+  // Log: AFB76 path / ret.
+}
+```
+
+Concrete ABI:
+1. Read path string at `ctx.r4` (AFB8's path arg is r4 — verify against
+   recompiled AFB8: `mr r31, r4` then strncmp on r31).
+2. If `strncmp(path, "embedded:/", 10)==0`:
+   - Allocate 8 bytes host stack for buf/size outs.
+   - Set `ctx.r3 = guest path+10`, `ctx.r4 = guest addr of buf out`,
+     `ctx.r5 = guest addr of size out`. Use two scratch guest u32s in
+     `.data` image (NOT heap) — e.g. reuse a fixed pair at `0x827D83F0`
+     / `0x827D83F4` **only after dumping those bytes** and confirming they
+     are unused type_info padding, OR better: call D2308 with host-side
+     fake by writing outs into a known-safe image gap.
+   - Call `__imp__sub_821D2308(ctx, base)`.
+   - If it returns 1, set `ctx.r3 = buf` and return (success).
+   - If 0, set `ctx.r3 = -1` and return (miss — same as today).
+3. Else original AFB8.
+
+### Step 2 — populate the D2308 list from post-inflate
+
+In `src/gpu_device.cpp` `sub_821BC140` post-exec block (~line 2589), after
+you have `bufPtr` / `inflSize`:
+
+- You need the **logical name** inside the inflated container
+  (`fxl_final/star_glow.fxc`, `dcl/star_glow.dcl`, …). It is NOT
+  `memory:/shaders/`. Check PRELOAD-CTX / archive TOC for the original
+  request name; or register under several candidate names.
+- Call `sub_821D22E8` (guest code, already mapped):
+  - `r3` = node pointer — **must be valid guest memory**. Use the inflated
+    buffer itself if there is a 16-byte header you can spare, or a
+    `MmAllocatePhysicalMemoryEx` node. Do **not** invent `0xA0012000`.
+  - `r4` = guest name string (write `"fxl_final/star_glow.fxc"` etc. into
+    the inflated buffer tail or a phys-alloc string).
+  - `r5` = bufPtr, `r6` = inflSize.
+- Log `D2308-INS name buf size`.
+
+**Names that matter** (from pre-fix `boot_stdout_p1d1.log` GETDEV #38–43):
+- `dcl/star_glow.dcl`
+- `star_glow.dcl`
+- `fxl_final/star_glow.fxc`
+- plus `fxl_final/rage_im.fxc` (current first embedded GETDEV)
+
+If the inflate buffer is a multi-file container, one buf/size per logical
+file is wrong — you may need per-entry offsets. First try one node per
+inflate with the most specific name; iterate from logs.
+
+### Step 3 — boot ×2, acceptance
+
+```
+taskkill /F /IM mcla.exe
+ninja_build.bat
+timeout 45 ./build/mcla.exe > build/boot_stdout_t5a.log 2> build/boot_stderr_t5a.log
+timeout 45 ./build/mcla.exe > build/boot_stdout_t5b.log 2> build/boot_stderr_t5b.log
+```
+
+Grep both logs:
+- `dead-ctor replay` present
+- `GETDEV-RET` for embedded paths = `827D838C`
+- `AFB76` / D2308 hit count > 0
+- **no** `Unable to load shader` / `Fatal error`
+- VSYNC-ISR > 0
+
+Only then consider T5 (remove `HydrateShaderHashTable`) — and only if
+`TEXDICT-CALLER` also reappears and INSERT (lookup-or-insert) returns OK
+without the host table poke.
+
+### What NOT to do
+
+- Do not re-parse the PE or hunt another vtable.
+- Do not GETDEV-redirect to archive (F-027, rejected).
+- Do not write `0xA00xxxxx` scratch from `SeedPreBootSlots`.
+- Do not remove hydration in the same change as the AFB8 hook.
+- Do not edit `generated/ppc_xenon/*`.
+- Do not treat EMB76 as success/fail.
+- One owner per guest address (Golden Rule 1) — AFB8 hook replaces the
+  existing `MEMPARSE-AE50`-style pass-through if one exists on AFB8;
+  AE50 census can stay.
+
+### Code map for the implementer
+
+| What | File | Where |
+|---|---|---|
+| Dead-ctor + CRT | `src/boot_host.cpp` | ~245–340 |
+| GETDEV census | `src/gpu_device.cpp` | ~3155 `sub_821CB488` |
+| Post-inflate | `src/gpu_device.cpp` | ~2515 `sub_821BC140` |
+| AE50 census | `src/gpu_device.cpp` | ~3507 |
+| AFB8 (add hook here) | `src/gpu_device.cpp` | next to AE50, or replace if already hooked |
+| INSERT caller | `generated/ppc_xenon/ppc_recomp.14.cpp:23563` | read only |
+| List insert | `generated/ppc_xenon/ppc_recomp.18.cpp:912` `sub_821D22E8` | call, don't edit |
+| List lookup | `generated/ppc_xenon/ppc_recomp.18.cpp:935` `sub_821D2308` | call from AFB8 hook |
+| Best boot log (post-vtable) | `build/boot_stdout_t4final2.log` | 24 GETDEV, 120 VSYNC, no fatal |
+| Pre-fix fatal log | `build/boot_stdout_p1d1.log` | star_glow paths + fatal |
+
+---
+
 ## READ ME FIRST — PHASE 1 (2026-09-13): star_glow still fatal; "memory mount" is the real P0
 
 **Hydration did NOT kill star_glow permanently.** Commit `3c8744e` only
@@ -12,7 +532,7 @@ The hang had been stopping the boot *before* star_glow.
 
 **The 0x40004D7C wait loop is the GPU driver poller** (`sub_8242FB88`) —
 normal 30 ms cadence with successful wakes. Not an IO slot. See ledger
-F-030..F-033 and `docs/PHASE1_EXECUTION_LOG.md`.
+F-030..F-033 and `docs/EXECUTION_PHASES.md` (Phase 1 §B).
 
 **Gate (proven):** inflated preload dictionaries are never registered as a
 `memory:`/`embedded:` device. GETDEV(`embedded:/…`) hits empty E1
@@ -30,6 +550,12 @@ to prove which fork holds — (1) host-missing gate so guest can Mount,
 constructor-based / dead code → retarget census at fiDeviceMemory ctors.
 Do NOT GETDEV-redirect (F-027). Acceptance: MOUNT76>2 or ctor census,
 EMB76>0, star_glow loads from RAM device without hydration, two boots.
+
+**T4a DONE (p1c/p1d, F-034):** **branch 3** — the whole chain
+`82144EB0 → 82144D30 → 82144B90 → 82135E48 → 8213AB78 → 82139BE0 → Mount`
+never fires. Census next on **`sub_821CB740`** (`memory:$%p,%d,%d:%s`
+sprintf) and **`sub_821CB760`** (handler-entry init) callers / device ctors.
+**T4b host memory: device still forbidden until that report.**
 
 ---
 

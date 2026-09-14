@@ -74,6 +74,23 @@ namespace
         PPC_LOOKUP_FUNC(g_base, guest) = host;
     }
 
+    // Re-write one function-table slot from the canonical mapping. Used when
+    // guest allocs (CDCD-FILL @0x8Cxxxxxx) zero entries inside the table
+    // region that lives at guest VA 0x8B9E0000+.
+    void RemapFunctionSlot(uint32_t guest)
+    {
+        if (g_base == nullptr)
+            return;
+        for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
+        {
+            if ((uint32_t)PPCFuncMappings[i].guest == guest)
+            {
+                InsertFunction(guest, PPCFuncMappings[i].host);
+                return;
+            }
+        }
+    }
+
     static uint32_t ReadU32BE(uint8_t* base, uint32_t guestAddr)
     {
         return __builtin_bswap32(*(volatile uint32_t*)(base + guestAddr));
@@ -147,6 +164,21 @@ namespace
             InsertFunction(guest, host);
             g_hostToGuest.emplace((uintptr_t)host, guest);
             inserted++;
+        }
+        // Runtime holes: 8C760 bctrls to vtable+88 = 0x821A5CC0 and AVs
+        // when the table slot is null. Force-map the no-op stub.
+        for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
+        {
+            if ((uint32_t)PPCFuncMappings[i].guest == 0x821A5CC0u)
+            {
+                InsertFunction(0x821A5CC0u, PPCFuncMappings[i].host);
+                char lbuf[128];
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "[boot] force-map 821A5CC0 -> %p",
+                              (void*)PPCFuncMappings[i].host);
+                BootReportInfo(lbuf);
+                break;
+            }
         }
         return inserted;
     }
@@ -242,8 +274,116 @@ namespace
         InsertFunction(FreeFnGuest, &__xtl_free);
     }
 
+    // T4-final: faithful replay of the dead memory-device ctor / Mount("memory:")
+    // special path. GETDEV("memory:"/"embedded:/") returns the static Device*
+    // 0x827D838C (sub_821CB488: lis r11,-32130; addi r3,r11,-31860). The CRT
+    // initializer sub_827B8B38 only installs the BASE vtable 0x8201206C whose
+    // +16 slot is the no-op stub 0x82762480, so EMB76 (open = 0x821CB070 on
+    // vtable 0x82012918+16) never fires. Replay the stores the dead chain
+    // should have produced, before CRT overwrites and before shader preload.
+    //
+    // Field cites (guest store instructions, identity map VA-0x82000000):
+    //   [0x827D838C] = 0x82012918   // vtable: CRT sub_827B8B38 stw r11,-31860(r10)
+    //                                 //   but r11 must be the MEMORY table
+    //                                 //   (scan of .rdata: 82012918 holds
+    //                                 //    AE50/AFB8/CB070/CB400), not base
+    //                                 //   0x8201206C (addi r11,r11,8300).
+    //   [0x827D8380] = 0x827D838C   // fallback Device*: Mount sub_821CB9D8
+    //                                 //   stw r26,-31872(r11) for path=="memory:"
+    //   name "memory:" @ image       // Mount/GETDEV prefix, string 0x820127D8
+    //   276-byte handler link        // Mount general path: sub_821CB760 inits
+    //                                 //   entry+268/272/274; name at +0, flag
+    //                                 //   +262, nameLen +264. GETDEV prefix
+    //                                 //   path does not scan this table, so
+    //                                 //   the link is installed for the
+    //                                 //   fallback/no-prefix path only.
+    // Seed the embedded:/ name list with static .data blobs that the CRT
+    // .CRT$XCU inits would have registered via sub_821D22E8. Our boot host
+    // jumps at the game entry and those inits never run — AFB76 therefore
+    // sees an empty list. Nodes live in image .data (no heap Alloc).
+    // Triples decoded from every `bl 0x821d22e8` under 0x827A/0x827B
+    // (recompiled bodies confirm signed addi).
+    // Format matches D22E8: {name*, buf, size, next} pushed at 0x82860AF8.
+    static void SeedEmbeddedNameList()
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        constexpr uint32_t kListHead = 0x82860AF8;
+
+        struct Seed {
+            uint32_t node, name, buf, size;
+        };
+        // node addresses are the CRT-provided static storage (r3 of D22E8).
+        const Seed seeds[] = {
+            {0x828395B8u, 0x820093D4u, 0x827D2DD0u, 5258u},   // rage_im
+            {0x82839D7Cu, 0x8200A06Cu, 0x827D4458u, 5406u},   // fastmipmap
+            {0x8288B8E0u, 0x820418B0u, 0x827E2CB0u, 10331u},  // spotlightfog
+            {0x828D47A4u, 0x8206ABDCu, 0x827F3C48u, 3187u},   // rage_bink
+            {0x828D4D2Cu, 0x8206DD30u, 0x827F5380u, 3612u},   // rmptfx_default
+            {0x828D4D60u, 0x8206DD50u, 0x827F61A0u, 8133u},   // rmptfx_litsprite
+            {0x828D4D3Cu, 0x8206DD70u, 0x827F8168u, 138u},    // dcl rmptfx_default
+            {0x828D4D1Cu, 0x8206DD88u, 0x827F81F8u, 138u},    // dcl rmptfx_litsprite
+            {0x828D5054u, 0x8206FD38u, 0x827F9CE8u, 32280u},  // atmoscatt_clouds
+            {0x828D5044u, 0x8206FD5Cu, 0x82801B00u, 5713u},   // perlinnoise
+            {0x828D5074u, 0x820700A0u, 0x82803540u, 4564u},   // rmptfx_collision
+            {0x829019ECu, 0x82086280u, 0x82813908u, 5112u},   // shadowcollector
+            {0x829019FCu, 0x820862A4u, 0x82814D00u, 4347u},   // shadowdepth
+            {0x82901A1Cu, 0x82086678u, 0x82815E48u, 18323u},  // blendshadows
+            {0x829054C0u, 0x82089394u, 0x8281BB00u, 48u},     // rage_postfx
+        };
+
+        uint32_t head = 0;
+        mem.ReadU32BE(kListHead, &head);
+        int n = 0;
+        for (const Seed& s : seeds)
+        {
+            mem.WriteU32BE(s.node + 0, s.name);
+            mem.WriteU32BE(s.node + 4, s.buf);
+            mem.WriteU32BE(s.node + 8, s.size);
+            mem.WriteU32BE(s.node + 12, head);
+            head = s.node;
+            ++n;
+        }
+        mem.WriteU32BE(kListHead, head);
+        char lbuf[128];
+        std::snprintf(lbuf, sizeof(lbuf),
+                      "[boot] embed-seed %d CRT triples, listHead=%08X", n,
+                      head);
+        BootReportInfo(lbuf);
+    }
+
+    static void ReplayDeadMemoryDeviceCtor()
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        constexpr uint32_t kMemDeviceObj = 0x827D838C; // GETDEV prefix return
+        constexpr uint32_t kFallbackPtr = 0x827D8380;  // Mount("memory:") slot
+        constexpr uint32_t kMemVtable = 0x82012918;    // AE50/AFB8/B070/B400
+
+        // Only image .data stores. Do NOT write guest heap scratch (0xA00xxxxx)
+        // here — that landed in o1heap fragments and produced
+        // sysMemMultiAllocator::Free "Not owned by any known heap".
+        // [0x827D838C+0] = memory vtable (override CRT's 0x8201206C).
+        mem.WriteU32BE(kMemDeviceObj + 0, kMemVtable);
+        // [0x827D8380] = Device* fallback = the static object itself.
+        mem.WriteU32BE(kFallbackPtr, kMemDeviceObj);
+
+        SeedEmbeddedNameList();
+
+        uint32_t vt = 0, fb = 0, head = 0;
+        mem.ReadU32BE(kMemDeviceObj, &vt);
+        mem.ReadU32BE(kFallbackPtr, &fb);
+        mem.ReadU32BE(0x82860AF8u, &head);
+        char lbuf[192];
+        std::snprintf(lbuf, sizeof(lbuf),
+                      "[boot] dead-ctor replay: vt@%08X=%08X fallback@%08X=%08X "
+                      "listHead=%08X",
+                      kMemDeviceObj, vt, kFallbackPtr, fb, head);
+        BootReportInfo(lbuf);
+    }
+
     void SeedPreBootSlots()
     {
+        ReplayDeadMemoryDeviceCtor();
+
         // The fatal-error dispatcher (Function_821BD618) reads slot 0x8285FEA0
         // and calls it when non-zero. Leave it ZERO so the dispatcher
         // branches straight to its infinite loop (b .) instead of calling
@@ -280,6 +420,34 @@ namespace
             BootReportInfo(lbuf);
         }
     }
+
+} // namespace boot internals (keep NearestFunctionName below in same ns)
+
+// CRT .CRT$XCU initializer that would install the BASE vtable 0x8201206C into
+// the static memory-device object at 0x827D838C. Override so the object keeps
+// the real memory-family vtable 0x82012918 (EMB76 / open = sub_821CB070).
+// Guest stores, cited:
+//   stw r11,-31860(r10)  @0x827B8B38+0x0C  -> [0x827D838C] = vtable
+//   (r11 was addi r11,r11,8300 = 0x8201206C; we write 0x82012918)
+PPC_FUNC_IMPL(__imp__sub_827B8B38);
+PPC_FUNC(sub_827B8B38) {
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    constexpr uint32_t kMemDeviceObj = 0x827D838C;
+    constexpr uint32_t kMemVtable = 0x82012918;
+    mem.WriteU32BE(kMemDeviceObj + 0, kMemVtable);
+    // Mount("memory:") special path: stw r26,-31872(r11) -> [0x827D8380]=dev*
+    mem.WriteU32BE(0x827D8380, kMemDeviceObj);
+}
+
+// Sibling CRT init writes the same base vtable into 0x827D8388. Keep it in
+// sync so neighboring statics stay consistent if anything aliases them.
+PPC_FUNC_IMPL(__imp__sub_827B8B20);
+PPC_FUNC(sub_827B8B20) {
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    mem.WriteU32BE(0x827D8388, 0x82012918);
+}
+
+namespace { // resume file-local helpers
 
     const char* NearestFunctionName(uint64_t hostAddr)
     {
@@ -751,6 +919,29 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     app->GetGuestMemoryView().SetMemoryBase(g_base, GuestMemorySize);
     app->SetPPCBase(g_base);
     mcla::kernel::GuestMemoryHeap::Instance().Adopt(g_base, GuestMemorySize);
+    // Function table lives at guest VA 0x8B9E0000 (g_base + IMAGE_BASE +
+    // IMAGE_SIZE). Guest o1heap/XTL allocs were landing at 0x8Cxxxxxx and
+    // zeroing table slots (A5CC0 → null bctrl AV). Reserve that range.
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        constexpr uint32_t kFTableGuest = 0x829E0000u;
+        constexpr uint32_t kFTableSize = 0x800000u; // 8 MiB covers ~45k slots
+        bool wasCommitted = false;
+        if (!mem.AllocVirtualFixed(kFTableGuest, kFTableSize, true, false,
+                                   &wasCommitted))
+        {
+            char lbuf[160];
+            std::snprintf(lbuf, sizeof(lbuf),
+                          "[boot] WARN: could not reserve func-table "
+                          "0x%08X+0x%X (wasCommitted=%d)",
+                          kFTableGuest, kFTableSize, (int)wasCommitted);
+            BootReportInfo(lbuf);
+        }
+        else
+        {
+            BootReportInfo("[boot] reserved func-table guest 0x8B9E0000 +8MB");
+        }
+    }
 
     // TU83 spawn pointer scanner (Lead 1) — runs once after guest memory is adopted
     mcla::native::kernel::ScanGuestMemoryForTU83SpawnPointers();
@@ -843,6 +1034,26 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     }
 
     InstallGuestImage(image);
+    // One-time cache dump of the decompressed linear image (identity map:
+    // file offset = VA - 0x82000000) so IDA/Ghidra raw-byte lookups work
+    // without a live boot. Skip when already present.
+    {
+        std::error_code ec;
+        const std::filesystem::path pe = "build/cache/mcla_pe.bin";
+        if (!std::filesystem::exists(pe, ec) && image.data != nullptr)
+        {
+            std::FILE* f = std::fopen(pe.string().c_str(), "wb");
+            if (f)
+            {
+                const size_t n = std::fwrite(image.data.get(), 1, image.size, f);
+                std::fclose(f);
+                char lbuf[192];
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "[boot] dumped %zu bytes to build/cache/mcla_pe.bin", n);
+                BootReportInfo(lbuf);
+            }
+        }
+    }
     DumpImageRegion(0x827EB900u, 32);
     mcla::trace::ScanForDispatchVtableWords((uint32_t)image.base, image.size);
     const size_t mapped = InstallFunctionTable();
