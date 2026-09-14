@@ -4236,25 +4236,104 @@ PPC_FUNC_IMPL(__imp__sub_82130528);
 PPC_FUNC(sub_82130528) {
   const uint32_t n = s_hXtlImport.fetch_add(1) + 1;
   XtlImportCensus("alloc", n, ctx.r3.u32, 0);
+  // Original thunk: mr r4,r3; li r5,16; li r6,0 then TLS-slot-28 call.
+  // __xtl_alloc reads r4 (size) and r5 (align) — restore the full ABI.
+  ctx.r4.u32 = ctx.r3.u32;
+  ctx.r5.u32 = 16;
+  ctx.r6.u32 = 0;
   __xtl_alloc(ctx, base);
 }
 
 PPC_FUNC_IMPL(__imp__sub_82130550);
 PPC_FUNC(sub_82130550) {
   const uint32_t n = s_hXtlImport.fetch_add(1) + 1;
-  // Original: r11 = max(r3, r4); alloc(r11, 16)
+  // Original: r11 = max(r3, r4); then mr r4,r11; li r5,16; li r6,0.
   const uint32_t sz = (ctx.r3.u32 > ctx.r4.u32) ? ctx.r3.u32 : ctx.r4.u32;
   XtlImportCensus("alloc-max", n, ctx.r3.u32, ctx.r4.u32);
-  const uint32_t saved = ctx.r3.u32;
-  ctx.r3.u32 = sz;
+  ctx.r4.u32 = sz;
+  ctx.r5.u32 = 16;
+  ctx.r6.u32 = 0;
   __xtl_alloc(ctx, base);
-  if (ctx.r3.u32 == 0 && saved != 0)
+  if (ctx.r3.u32 == 0 && sz != 0)
     MCLA_LOG_WARN("XTLIMPORT alloc-max #{} FAILED size={}", n, sz);
+}
+
+// ===========================================================================
+// T5 (t24b frontier): sub_821D30E8 buffer-Grow via dead TLS FuncBlock+16.
+//
+// ABI (ppc_recomp.18.cpp:3185): r3 = bufobj {+8 blk {ptr@0,size@4}, +4 size,
+// +12 next-cap}. Rounds size up to 16, reallocs via *(TLS slot 28 fn)+16
+// (Realloc slot), stores blk->ptr, mirrors obj+4 -> blk+4, parks obj+12 in
+// TLS[+12], clears obj+12. Crash: lr=821D3134, r3=0 (caller 8C760+0x3FB
+// passed the stream wrapper whose +8 block was wiped).
+// Host-complete: grow via GuestMemoryHeap::Alloc, copy, faithful stores.
+// ===========================================================================
+PPC_FUNC_IMPL(__imp__sub_821D30E8);
+static std::atomic<uint32_t> s_hD30E8{0};
+PPC_FUNC(sub_821D30E8) {
+  const uint32_t n = s_hD30E8.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (obj == 0 || obj == 0xCDCDCDCDu) {
+    MCLA_LOG_WARN("D30E8-SKIP #{} null obj lr={:08X}", n, lr);
+    return;
+  }
+  uint32_t blk = 0, size = 0, oldPtr = 0;
+  (void)mem.ReadU32BE(obj + 8, &blk);
+  (void)mem.ReadU32BE(obj + 4, &size);
+  if (blk != 0 && blk != 0xCDCDCDCDu)
+    (void)mem.ReadU32BE(blk + 0, &oldPtr);
+  // Original rounds the requested size up to 16 (addi 15; rlwinm ... 27).
+  const uint32_t rounded = (size + 15u) & ~15u;
+  (void)mem.WriteU32BE(obj + 4, rounded);
+  // TLS-table alive? Let the original body run (its bctrl uses TLS FuncBlock
+  // +16 Realloc which the boot chain arms).
+  uint32_t tlsTable = 0;
+  if (ctx.r13.u32 != 0 && mem.ReadU32BE(ctx.r13.u32, &tlsTable) &&
+      tlsTable != 0 && tlsTable != 0xCDCDCDCDu) {
+    __imp__sub_821D30E8(ctx, base);
+    return;
+  }
+  // TLS dead: host-complete the grow.
+  MCLA_LOG_WARN("D30E8-TLSDEAD #{} obj={:08X} blk={:08X} size={} old={:08X}",
+                n, obj, blk, rounded, oldPtr);
+  if (blk == 0 || blk == 0xCDCDCDCDu) {
+    // Nothing to grow — mirror the skip path (caller treats size as-is).
+    return;
+  }
+  const uint32_t newPtr = mem.Alloc(rounded ? rounded : 16u, 16);
+  if (newPtr == 0) {
+    MCLA_LOG_WARN("D30E8-ALLOCFAIL #{} size={}", n, rounded);
+    return;
+  }
+  if (oldPtr != 0) {
+    // Preserve prior contents (realloc semantics).
+    uint8_t tmp[512];
+    uint32_t copied = 0;
+    uint32_t oldSize = 0;
+    (void)mem.ReadU32BE(blk + 4, &oldSize);
+    const uint32_t lim = (oldSize < rounded) ? oldSize : rounded;
+    while (copied < lim) {
+      const uint32_t chunk = (lim - copied > sizeof(tmp)) ? sizeof(tmp) : lim - copied;
+      if (!mem.ReadBytes(oldPtr + copied, tmp, chunk) ||
+          !mem.WriteBytes(newPtr + copied, tmp, chunk))
+        break;
+      copied += chunk;
+    }
+  }
+  (void)mem.WriteU32BE(blk + 0, newPtr);
+  (void)mem.WriteU32BE(blk + 4, rounded);
+  // Original: TLS[+12] = obj+12 then obj+12 = 0 — the TLS write is part of
+  // the real contract; keep it best-effort (r13 block is dead anyway).
+  (void)mem.WriteU32BE(obj + 12, 0);
 }
 
 PPC_FUNC_IMPL(__imp__sub_82130588);
 PPC_FUNC(sub_82130588) {
   const uint32_t n = s_hXtlImport.fetch_add(1) + 1;
   XtlImportCensus("free", n, ctx.r3.u32, 0);
+  // Original thunk: r4=r3 then TLS-slot-28 call with FuncBlock+12 (free).
+  ctx.r4.u32 = ctx.r3.u32;
   __xtl_free(ctx, base);
 }
