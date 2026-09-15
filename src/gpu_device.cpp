@@ -7,6 +7,7 @@
 #include "native_renderer.h"
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
+#include "generated/ppc_xenon/ppc_context.h"
 #include "kernel/memory.h"
 #include "logging.h"
 #include <cpu/ppc_context.h>
@@ -247,6 +248,37 @@ void RedirectFirstRealRenderStateSlot(uint32_t dev) {
 // ---------------------------------------------------------------------------
 
 PPC_FUNC_IMPL(__imp__sub_82413588);
+
+// FIX: sub_821873E8 (crash lr=8218741C in BootWorker @19:22:12 P2Q).
+// IDA decompile shows v8 (r31, callee-saved) used uninitialized:
+//   v10[21] = v9;                // v9 (r11) also uninitialized
+//   if (a8 != 0) {
+//     callback(result+120)(...);  // dispatches via *result
+//     return *(uint32_t*)(v8+60); // AV: r31 garbage -> 0x7E780000 (Param[1])
+//   }
+// The caller sub_822FBAF8 is a stub/generated gap that never sets r31.
+// Fix: mirror the PPC callee-saved convention — assume r31 was meant to be
+// the 'result' object itself (matching r3), so *(r31+60) reads a valid field.
+// Log a warning until we reverse the real contract.
+PPC_FUNC_IMPL(__imp__sub_821873E8);
+static std::atomic<uint32_t> s_821873E8_hits{0};
+PPC_FUNC(sub_821873E8) {
+  const uint32_t n = s_821873E8_hits.fetch_add(1) + 1;
+  if (n <= 4 || (n % 500) == 0)
+    MCLA_LOG_INFO("FIX-821873E8 #{} r3={:08X} a8={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_821873E8(ctx, base);
+  // IDA: original returns *(v8+60) where v8=r31 is garbage (caller
+  // sub_822FBAF8 never sets callee-saved r31). Correct contract: return
+  // *(result+60) i.e. *(r3+60). Overwrite ctx.r3 when a8!=0 (the branch
+  // that reads the bad pointer). Guest addr 0x3C (r31=0 case) is also
+  // wrong — read from the real result object instead.
+  if (ctx.r4.u32 != 0) {
+    uint32_t fixed = 0;
+    if (mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(ctx.r3.u32 + 60, &fixed))
+      ctx.r3.u64 = fixed;
+  }
+}
 
 PPC_FUNC(sub_82413588) {
   // r8 is caller-volatile under the recomp ABI - the callee clobbers ctx.r8
