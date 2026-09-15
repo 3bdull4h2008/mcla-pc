@@ -116,13 +116,38 @@ static std::atomic<uint32_t> s_fdb30Calls{0};
 PPC_FUNC(sub_825FDB30)
 {
     const uint32_t n = s_fdb30Calls.fetch_add(1) + 1;
+    const uint32_t container = ctx.r3.u32;
+    const uint32_t task = ctx.r4.u32;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+    // p2f: poison containers (the never-filled preload buffers, e.g.
+    // B7B41000 with vt/arr=CDCDCDCD) made the unchecked pointer math in
+    // both the census below AND the original body read unmapped guest
+    // addresses (entryTable=CDCD + idx<<3) — the vectored-handler AV
+    // storm at 2+ minutes (crash rva=0x121BF5, caught but noisy).
+    // Empty dispatch for poison containers.
+    {
+        uint32_t arr = 0;
+        const bool dead =
+            container == 0 || container == 0xCDCDCDCDu || task == 0 ||
+            task == 0xCDCDCDCDu ||
+            (!mem.ReadU32BE(container + 12, &arr) ||
+             (arr & 0xFFFF0000u) == 0xCDCD0000u);
+        if (dead)
+        {
+            static std::atomic<uint32_t> s_fdb30Dead{0};
+            const uint32_t dn = s_fdb30Dead.fetch_add(1) + 1;
+            if (dn <= 16 || (dn % 500) == 0)
+                MCLA_LOG_WARN("FDB30-DEAD #{:03} cont={:08X} task={:08X} "
+                              "lr={:08X} (poison container — empty dispatch)",
+                              dn, container, task,
+                              static_cast<uint32_t>(ctx.lr));
+            return;
+        }
+    }
+
     if (n <= 64 || n % 500 == 0)
     {
-        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-
-        const uint32_t container = ctx.r3.u32;
-        const uint32_t task = ctx.r4.u32;
-
         uint32_t entryTable = 0;
         uint16_t idx = 0;
         uint8_t verbose = 0;
@@ -581,6 +606,111 @@ PPC_FUNC(sub_8260A830)
             node = next;
         }
     }
+    // p2f: the 825FDBF8 build pass walked 27 CDCD buckets then AV'd inside
+    // this body (lr=825FDC64, r3=CDCDCEA5). An unmapped/poison bucket base
+    // can never be fixed up — the container's [+12] array was never filled
+    // by the preload task. Skip the original on poison, log as FIXWALK-SKIP.
+    if ((bucket & 0xFFFF0000u) == 0xCDCD0000u || bucket == 0 ||
+        bucket == 0xFFFFFFFFu)
+    {
+        MCLA_LOG_WARN("FIXWALK-SKIP #{:03} bucket={:08X} buildCtx={:08X} "
+                      "lr={:08X} (poison bucket - container array unfilled)",
+                      n, bucket, buildCtx, static_cast<uint32_t>(ctx.lr));
+        ctx.r3.u32 = 0;
+        return;
+    }
     __imp__sub_8260A830(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// p2f: sub_825FDBF8 = swf-container build pass (vt 0x8208521C family, the
+// container whose [+12] entry array stays CDCD when the preload task never
+// fills it). Census + poison guard: when the container's own vtable or
+// [+12] array is CDCD poison, the whole build pass is garbage-in — its
+// entry walk would iterate cnt(=0xCDCD)*8 bytes of unmapped memory no
+// matter what 8260A830 does per entry. Skip the original body in that
+// case (census first logged the state as FDBF8-BUILD).
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_825FDBF8);
+static std::atomic<uint32_t> s_hFDBF8{0};
+PPC_FUNC(sub_825FDBF8)
+{
+    const uint32_t n = s_hFDBF8.fetch_add(1) + 1;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t obj = ctx.r3.u32;
+    uint32_t vt = 0, f4 = 0, f8 = 0, arr = 0;
+    uint16_t cnt = 0;
+    bool readable = obj != 0 && obj != 0xCDCDCDCDu;
+    if (readable)
+    {
+        (void)mem.ReadU32BE(obj + 0, &vt);
+        (void)mem.ReadU32BE(obj + 4, &f4);
+        (void)mem.ReadU32BE(obj + 8, &f8);
+        (void)mem.ReadU32BE(obj + 12, &arr);
+        (void)mem.ReadU16BE(obj + 16, &cnt);
+    }
+    const bool poison =
+        !readable || vt == 0xCDCDCDCDu || arr == 0xCDCDCDCDu || cnt == 0xCDCDu;
+    if (n <= 16 || (n % 200) == 0 || poison)
+        MCLA_LOG_WARN("FDBF8-BUILD #{:03} obj={:08X} vt={:08X} +4={:08X} "
+                      "+8={:08X} arr={:08X} cnt={} lr={:08X}{}",
+                      n, obj, vt, f4, f8, arr, cnt,
+                      static_cast<uint32_t>(ctx.lr),
+                      poison ? " POISON-SKIP" : "");
+    if (poison)
+    {
+        // Garbage container: neutralize the walk fields the original body
+        // would consume ([obj+12] array=NULL, [obj+16] count=0) so both the
+        // rebase leg (8217D890) and the entry loop see an empty container.
+        if (readable)
+        {
+            (void)mem.WriteU32BE(obj + 12, 0);
+            (void)mem.WriteU16BE(obj + 16, 0);
+        }
+        return; // skip original build pass entirely
+    }
+    __imp__sub_825FDBF8(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// p2f: sub_825FB0D8 = the swf-container family destructor. Its virtual
+// dispatches ([child]=this -> vtable +68/+16/+20) AV'd when the child is
+// the never-filled preload container (vt=CDCDCDCD, crash r3=B7B41000,
+// lr=825FB14C). Guard: dispatch only when the child's vtable pointer is a
+// plausible guest image address (< image top, non-poison); otherwise skip
+// — same semantics as the function's own [+216]==0 null path.
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_825FB0D8);
+static std::atomic<uint32_t> s_hFB0D8{0};
+PPC_FUNC(sub_825FB0D8)
+{
+    const uint32_t n = s_hFB0D8.fetch_add(1) + 1;
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t obj = ctx.r3.u32;
+    uint32_t child = 0, childVt = 0;
+    bool readable = obj != 0 && obj != 0xCDCDCDCDu;
+    if (readable)
+    {
+        (void)mem.ReadU32BE(obj + 4, &child);
+        if (child != 0 && child != 0xCDCDCDCDu)
+            (void)mem.ReadU32BE(child, &childVt);
+    }
+    const bool poisonVt =
+        !readable || childVt == 0 || childVt == 0xCDCDCDCDu ||
+        (childVt & 0xFFF00000u) != 0x82000000u;
+    if (n <= 12 || poisonVt)
+        MCLA_LOG_WARN("FB0D8-DTOR #{:03} obj={:08X} child={:08X} childVt={:08X} "
+                      "lr={:08X}{}",
+                      n, obj, child, childVt, static_cast<uint32_t>(ctx.lr),
+                      poisonVt ? " POISON-SKIP" : "");
+    if (poisonVt)
+    {
+        // Child is the unfilled container (CDCD vtable): any virtual dtor
+        // dispatch would AV (crash-2, lr=825FB14C). Skip the original body
+        // — the object is host-side neutralized already (FDBF8 POISON-SKIP
+        // nulled its walk fields), so the dtor has nothing real to free.
+        return;
+    }
+    __imp__sub_825FB0D8(ctx, base);
 }
 

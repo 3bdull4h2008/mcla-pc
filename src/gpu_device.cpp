@@ -1,4 +1,4 @@
-﻿#include "gpu_device.h"
+#include "gpu_device.h"
 #include "gpu_cp.h"
 #include "render_queue.h"
 #include "renderer_mode.h"
@@ -2411,6 +2411,29 @@ PPC_FUNC(sub_821D5E10) {
       {}
   }
 
+  // p2q (IDA): 821D5E10 = zlibInflater::InflateBegin ("not in XCompress
+  // format"). Job #2 enters with inLeft=0xFFFFFFD4 (-44) and inPtr on the
+  // guest stack — the pgStreamer Read never filled the buffer. Unsigned
+  // `inLeft >= 4` then treats stack residue (e.g. 525DE064) as a magic.
+  // Corrupt sizes are NOT a format; complete the stream empty so we do
+  // not AV on the original magic-check / decode.
+  if (inLeft >= 0x10000000u) {
+    static std::atomic<uint32_t> s_inCorrupt{0};
+    const uint32_t cn = s_inCorrupt.fetch_add(1) + 1;
+    if (cn <= 32 || (cn % 200) == 0)
+      MCLA_LOG_WARN("INFLATE-CORRUPT #{} in={:#x} (signed {}) inPtr={:08X} "
+                    "out={} outPtr={:08X} consumed={} lr={:08X}",
+                    cn, inLeft, static_cast<int32_t>(inLeft), inPtr, outLeft,
+                    outPtr, consumed,
+                    static_cast<uint32_t>(ctx.lr));
+    (void)mem.WriteU32BE(st + 0, 0);
+    (void)mem.WriteU32BE(st + 8, inLeft);
+    (void)mem.WriteU32BE(st + 12, 0);
+    if (outLeft)
+      (void)mem.WriteU32BE(st + 16, 0);
+    return;
+  }
+
   if (consumed == 0 && inLeft >= 4 && magic != kXCompressMagic &&
       inPtr != 0 && outPtr != 0) {
     // Session 72: do NOT copy unknown-magic bytes into the output. A
@@ -2589,6 +2612,29 @@ PPC_FUNC(sub_821BC140) {
     MCLA_LOG_WARN("PRELOAD-CTX #{} base={:08X} streamCnt={} inflSize={} "
                   "cbPtr={:08X} arcDev={:08X} bufPtr={:08X}",
                   n, ctxBase, streamCnt, inflSize, cbPtr, arcDev, bufPtr);
+    // p2q: dump stream descriptors (12-byte stride at ctx+12). Job #2
+    // (tag 0x8004, streamCnt=17) left inflate with inLeft=-44 reading a
+    // stack buffer — identify which streams have no device/handle yet.
+    if (streamCnt > 0 && streamCnt <= 64) {
+      for (uint32_t si = 0; si < streamCnt && si < 24; ++si) {
+        const uint32_t sAddr = ctxBase + 12 + si * 12;
+        uint32_t w0 = 0, w1 = 0, w2 = 0;
+        (void)mem.ReadU32BE(sAddr + 0, &w0);
+        (void)mem.ReadU32BE(sAddr + 4, &w1);
+        (void)mem.ReadU32BE(sAddr + 8, &w2);
+        uint32_t vt = 0, h = 0, sz = 0, pos = 0;
+        // w0/w1 may be {stream*, size} or {handle, size}; probe both.
+        if (w0 && w0 != 0xCDCDCDCDu) {
+          (void)mem.ReadU32BE(w0 + 0, &vt);
+          (void)mem.ReadU32BE(w0 + 4, &h);
+          (void)mem.ReadU32BE(w0 + 28, &sz);
+          (void)mem.ReadU32BE(w0 + 24, &pos);
+        }
+        MCLA_LOG_WARN("PSTREAM #{} s[{}] @{:08X} w0={:08X} w1={:08X} "
+                      "w2={:08X} vt={:08X} h={:08X} sz={} pos={}",
+                      n, si, sAddr, w0, w1, w2, vt, h, sz, pos);
+      }
+    }
   }
   __imp__sub_821BC140(ctx, base);
   // POST-EXEC: mount the inflated buffer as a memory: device so shader
@@ -3709,9 +3755,49 @@ static uint32_t s_lastMemStream = 0;
 // C8024B00 got zeroed by a later arena wipe.
 static constexpr uint32_t kMemStreamSlot = 0x82905500u;
 
-static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
-                                 uint32_t size) {
+// Phase 2 T3: the guest device API (sub_821CAE50 open family, CB158 read,
+// CB2A0 close/getbuf, BE8D8's vt+56 size fetch) treats an open HANDLE as an
+// index into a 16-entry slot table at 0x82860740 (stride 16: +0 buf, +4
+// size, +8 pos, +12 flag). Returning a raw pointer as the handle made
+// CB2A0's `if (h < 0 || h >= 16) return -1` poison BE8D8's alloc size into
+// 0xffffffff -> the CDCD fill marathon. Register {buf,size} in the REAL
+// guest slot table and return the slot index, matching sub_821CAE50's
+// loc_821CAF50 open path exactly.
+static constexpr uint32_t kGuestSlotTable = 0x82860740u;
+static constexpr uint32_t kGuestSlotCount = 16;
+static std::atomic<uint32_t> s_slotTableFull{0};
+
+static int GuestSlotTableInsert(uint32_t buf, uint32_t size) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  // Slot 0 is reserved: the guest uses `r3 != 0` as the open-success check
+  // (8218C804 after BE8D8), so index 0 is indistinguishable from NULL.
+  for (uint32_t i = 1; i < kGuestSlotCount; ++i) {
+    const uint32_t slot = kGuestSlotTable + i * 16;
+    uint32_t cur = 0;
+    if (!mem.ReadU32BE(slot + 0, &cur))
+      return -1;
+    if (cur == 0) {
+      mem.WriteU32BE(slot + 0, buf);
+      mem.WriteU32BE(slot + 4, size);
+      mem.WriteU32BE(slot + 8, 0);
+      mem.WriteU32BE(slot + 12, 0);
+      return static_cast<int>(i);
+    }
+  }
+  const uint32_t n = s_slotTableFull.fetch_add(1) + 1;
+  if (n <= 8)
+    MCLA_LOG_WARN("SLOT-TABLE-FULL #{} (16/16 in use) — cannot host-register "
+                  "buf={:08X} size={}",
+                  n, buf, size);
+  return -1;
+}
+
+static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
+                                  uint32_t size) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  // Host-side shadow wrapper (BE250 Read() fields: +0 dev, +4 handle,
+  // +8 buf, +16 counter, +24 readPos, +28 end, +32 cap). Kept so
+  // MemoryStreamServeRead and the s_lastMemStream consumers still work.
   const uint32_t s = kMemStreamSlot;
   mem.WriteU32BE(s + 0, device);
   mem.WriteU32BE(s + 4, handle);
@@ -3722,6 +3808,22 @@ static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
   mem.WriteU32BE(s + 24, 0); // readPos  (BE250 field)
   mem.WriteU32BE(s + 28, 0); // writePos (BE250 field)
   s_lastMemStream = s;
+  // Phase 2 T3 fix: the guest treats an open handle as a slot index. Insert
+  // {handle=buf, size} into the real 16-entry slot table and return the
+  // INDEX — the exact contract of sub_821CAE50's open path. The BE8D8
+  // vt+56 size fetch then returns the real buffer, alloc(size) succeeds,
+  // and Read() gets sane counts instead of 0xffffffff.
+  const int slotIdx = GuestSlotTableInsert(handle, size);
+  if (slotIdx >= 0) {
+    static std::atomic<uint32_t> s_slotReg{0};
+    const uint32_t n = s_slotReg.fetch_add(1) + 1;
+    if (n <= 24 || (n % 200) == 0)
+      MCLA_LOG_WARN("SLOT-REG #{} idx={} buf={:08X} size={} (guest slot table "
+                    "@82860740)",
+                    n, slotIdx, handle, size);
+    return static_cast<uint32_t>(slotIdx);
+  }
+  // Table full: legacy behavior (pointer handle) — logged above.
   return s;
 }
 
@@ -3760,6 +3862,54 @@ static int64_t MemoryStreamServeRead(uint32_t obj, uint32_t dst, uint32_t count)
   if (n != 0)
     (void)mem.WriteU32BE(obj + 24, pos + n);
   return n;
+}
+
+// p2d rgxa fix: serve a read directly from a guest slot-table entry
+// ({buf,size,pos,flag} @0x82860740 + h*16 — the exact contract of the
+// original vt+20 slot read 821CB158). The original BE250 machinery can't
+// serve these: BDF20's guest wrapper keeps +8/+24/+28/+32 buffered fields
+// uninitialized for our slot handles, so its refill path yields garbage.
+// wordSwap mirrors the original sub_821BE710 tail loop (821BE73C-768):
+// it byteswaps each full 4-byte word of the destination after the raw
+// copy (the .fxc format is little-endian on disk, PPC host is BE).
+// Returns bytes served (advancing slot pos), or -1 when h is not a live
+// slot or dst is poisoned (pos NOT advanced on failure).
+static int64_t SlotTableServeRead(uint32_t h, uint32_t dst, uint32_t count,
+                                   bool wordSwap = false) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (h == 0 || h >= kGuestSlotCount)
+    return -1;
+  const uint32_t slot = kGuestSlotTable + h * 16;
+  uint32_t sbuf = 0, ssize = 0, spos = 0;
+  if (!mem.ReadU32BE(slot + 0, &sbuf) || !mem.ReadU32BE(slot + 4, &ssize) ||
+      !mem.ReadU32BE(slot + 8, &spos))
+    return -1;
+  if (sbuf == 0 || sbuf == 0xCDCDCDCDu || ssize == 0 || ssize == 0xCDCDCDCDu)
+    return -1;
+  if (spos > ssize)
+    spos = ssize;
+  const uint32_t avail = ssize - spos;
+  const uint32_t nb = (count < avail) ? count : avail;
+  if (nb != 0) {
+    if (dst == 0 || dst == 0xCDCDCDCDu)
+      return -1;
+    uint8_t tmp[512];
+    uint32_t done = 0;
+    while (done < nb) {
+      const uint32_t chunk = (nb - done > sizeof(tmp)) ? sizeof(tmp) : nb - done;
+      if (!mem.ReadBytes(sbuf + spos + done, tmp, chunk))
+        return -1;
+      if (wordSwap) {
+        for (uint32_t o = 0; o + 4 <= chunk; o += 4)
+          std::swap(tmp[o], tmp[o + 3]), std::swap(tmp[o + 1], tmp[o + 2]);
+      }
+      if (!mem.WriteBytes(dst + done, tmp, chunk))
+        return -1;
+      done += chunk;
+    }
+    (void)mem.WriteU32BE(slot + 8, spos + nb);
+  }
+  return nb;
 }
 
 // AFB8 = INSERT's vtable+4 open. Path is r4.
@@ -3856,6 +4006,18 @@ PPC_FUNC(sub_821BDF20) {
 }
 
 // Richer BE8D8 census (replaces MCLA_T4A2_CENSUS): [obj+0]=device* [obj+4]=handle.
+//
+// Phase 2 T3 root-cause fix: sub_821BE8D8 = "load whole embedded file":
+//   size = dev->vt[+56](dev, handle); alloc(size); Read(this, dst, size);
+//   format "memory:$..." (CB740); GetSize (BE610); re-open (BE0C8).
+// On the REAL device this runs against (archive vt=82012BDC), vt+56 =
+// sub_821CD3C8: indexes dev+h*68 entry table, returns [file+4] = size.
+// Our memory-device vt+56 (CABB8 -> 3x vt+44 close) returns -1 by
+// construction -> alloc(0xffffffff) NULL -> Read(NULL, -1) -> the CDCD
+// fill marathon (135M+ stores, PHYS-OVERRUN storm, t24c/p2b).
+// Host-complete the whole flow when the wrapper's handle is one of ours:
+// real size, guest-visible alloc, serve bytes, return a memory:$ stream
+// (the exact contract of the tail's BE0C8-RET path).
 PPC_FUNC_IMPL(__imp__sub_821BE8D8);
 static std::atomic<uint32_t> s_hBE8D8{0};
 PPC_FUNC(sub_821BE8D8) {
@@ -3875,6 +4037,51 @@ PPC_FUNC(sub_821BE8D8) {
       obj == 0x7E780000u)
     MCLA_LOG_WARN("BE8D8 #{} obj={:08X} dev={:08X} vt={:08X} h={:08X} lr={:08X}",
                   n, obj, dev, vt, h, lr);
+  // Host-complete for memory-device wrappers whose handle is a slot index
+  // (0..15) registered by MakeMemoryStream (SLOT-REG). The guest slot table
+  // at 0x82860740 holds {buf, size, pos, flag}.
+  if (dev == kMemDeviceObj && h < kGuestSlotCount) {
+    const uint32_t slot = kGuestSlotTable + h * 16;
+    uint32_t sbuf = 0, ssize = 0;
+    bool have = mem.ReadU32BE(slot + 0, &sbuf) && mem.ReadU32BE(slot + 4, &ssize);
+    if (have && sbuf != 0 && ssize != 0 && ssize != 0xCDCDCDCDu) {
+      // BE8D8 semantics, faithfully: alloc(size) then Read all `ssize` bytes
+      // into it. The tail (memory:$ format + BE610 + BE0C8) exists to re-open
+      // the loaded buffer as a stream; return that stream directly, exactly
+      // like the BE0C8-RET host path does.
+      const uint32_t dst = mem.Alloc(ssize, 16);
+      if (dst != 0) {
+        uint8_t tmp[512];
+        uint32_t done = 0;
+        bool ok = true;
+        while (done < ssize) {
+          const uint32_t chunk =
+              (ssize - done > sizeof(tmp)) ? sizeof(tmp) : ssize - done;
+          if (!mem.ReadBytes(sbuf + done, tmp, chunk) ||
+              !mem.WriteBytes(dst + done, tmp, chunk)) {
+            ok = false;
+            break;
+          }
+          done += chunk;
+        }
+        if (ok) {
+          // Slot consumed (guest close semantics: CB2A0 clears the slot).
+          mem.WriteU32BE(slot + 0, 0);
+          const uint32_t st = MakeMemoryStream(kMemDeviceObj, dst, ssize);
+          MCLA_LOG_WARN("BE8D8-HOST #{} obj={:08X} h={} buf={:08X} size={} "
+                        "dst={:08X} stream={:08X}",
+                        n, obj, h, sbuf, ssize, dst, st);
+          ctx.r3.u32 = st;
+          return;
+        }
+        MCLA_LOG_WARN("BE8D8-HOST #{} copy FAILED buf={:08X} size={}", n, sbuf,
+                      ssize);
+      } else {
+        MCLA_LOG_WARN("BE8D8-HOST #{} alloc FAILED size={} (guest heap)",
+                      n, ssize);
+      }
+    }
+  }
   __imp__sub_821BE8D8(ctx, base);
 }
 
@@ -4027,9 +4234,30 @@ PPC_FUNC(sub_821BE250) {
   const uint32_t obj = ctx.r3.u32;
   const uint32_t dst = ctx.r4.u32;
   const uint32_t count = ctx.r5.u32;
-  uint32_t dev = 0;
-  if (obj && obj != 0xCDCDCDCDu)
+  uint32_t dev = 0, h = 0;
+  if (obj && obj != 0xCDCDCDCDu) {
     (void)mem.ReadU32BE(obj + 0, &dev);
+    (void)mem.ReadU32BE(obj + 4, &h);
+  }
+  // p2d rgxa fix: live memory-device wrapper whose handle is one of our
+  // slot indices — serve from the slot table directly (821CB158 contract).
+  // The original body's buffered-refill path reads uninitialized wrapper
+  // fields (+8/+24/+28/+32) and serves wrong bytes ("Old version" fatal).
+  if (dev == kMemDeviceObj && h != 0 && h < kGuestSlotCount) {
+    const int64_t served = SlotTableServeRead(h, dst, count);
+    if (served >= 0) {
+      if (n <= 24 || (n % 200) == 0)
+        MCLA_LOG_WARN("BE250-SLOT #{} obj={:08X} h={} served={} count={}",
+                      n, obj, h, served, count);
+      ctx.r3.u32 = static_cast<uint32_t>(served);
+      return;
+    }
+    if (n <= 24 || (n % 200) == 0)
+      MCLA_LOG_WARN("BE250-SLOT-MISS #{} obj={:08X} h={} count={}", n, obj, h,
+                    count);
+    ctx.r3.u32 = static_cast<uint32_t>(-1);
+    return;
+  }
   if (dev == 0 || dev == 0xCDCDCDCDu) {
     const int64_t served = MemoryStreamServeRead(obj, dst, count);
     if (served >= 0) {
@@ -4057,6 +4285,25 @@ PPC_FUNC(sub_821BE710) {
   if (obj && obj != 0xCDCDCDCDu) {
     (void)mem.ReadU32BE(obj + 0, &dev);
     (void)mem.ReadU32BE(obj + 4, &h);
+  }
+  // p2d rgxa fix: live memory-device wrapper with a slot-table handle.
+  // Original BE710 shifts r5 by 2 (word count) then tails into BE250's
+  // buffered machinery, which needs initialized wrapper fields we never
+  // set for slot handles — serve from the slot table instead (exact
+  // 821CB158 semantics: copy min(count, size-pos), advance slot pos).
+  if (dev == kMemDeviceObj && h != 0 && h < kGuestSlotCount) {
+    const uint32_t bytes = ctx.r5.u32 * 4u;
+    const int64_t served = SlotTableServeRead(h, ctx.r4.u32, bytes, true);
+    if (served >= 0) {
+      MCLA_LOG_WARN("BE710-SLOT #{} obj={:08X} h={} words={} served={}", n,
+                    obj, h, ctx.r5.u32, served);
+      ctx.r3.u32 = static_cast<uint32_t>(served) / 4u;
+      return;
+    }
+    MCLA_LOG_WARN("BE710-SLOT-MISS #{} obj={:08X} h={} words={}", n, obj, h,
+                  ctx.r5.u32);
+    ctx.r3.u32 = static_cast<uint32_t>(-1);
+    return;
   }
   if (dev == 0 || dev == 0xCDCDCDCDu) {
     auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();

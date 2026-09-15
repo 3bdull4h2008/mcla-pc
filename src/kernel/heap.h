@@ -56,6 +56,15 @@ struct Heap
     [[nodiscard]] bool IsLiveAllocation(uint8_t* arenaBase, size_t arenaSize, void* ptr,
                                         LiveProbe* out = nullptr) const;
 
+    // True when ptr lies inside the physical (AllocPhysical) arena. Used to
+    // distinguish NtCreate* identity handles (host KernelObject*) from
+    // guest-owned dispatcher headers that must be lazy-wrapped.
+    [[nodiscard]] bool IsPhysicalArenaPtr(void* ptr) const {
+        if (!physArenaBase || !ptr) return false;
+        auto *p = static_cast<uint8_t*>(ptr);
+        return p >= physArenaBase && p < physArenaBase + physArenaSize;
+    }
+
     size_t Size(void* ptr);
 
     template<typename T, typename... Args>

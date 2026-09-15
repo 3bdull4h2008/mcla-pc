@@ -66,6 +66,9 @@ inline T* GetKernelObject(uint32_t handle)
     // wrapper for this header address, return it so Wait/Release share state.
     // Fall back to the raw cast when no wrapper exists yet (handles for
     // non-dispatcher objects, or pre-init callers).
+    // p2f NOTE: the raw fallback feeds guest memory to dynamic_cast as a
+    // polymorphic object — UB. Callers that dynamic_cast the result must
+    // null/vptr-check first (see NtReleaseSemaphore p2f guard).
     void* raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(handle);
     if (!raw) return nullptr;
     auto* hdr = reinterpret_cast<XDISPATCHER_HEADER*>(raw);
@@ -108,6 +111,40 @@ inline std::unordered_map<uint32_t, WrapperRecord>& WrapperIdentityMap()
 {
     static std::unordered_map<uint32_t, WrapperRecord> s_map;
     return s_map;
+}
+
+// Register a CreateKernelObject product in WrapperIdentityMap keyed by the
+// guest identity handle (MapVirtual of the host object). NtWaitForSingleObject
+// resolves identity handles via GetKernelObject → Translate → raw host pointer.
+// NtReleaseSemaphore previously fell through to QueryKernelObject, which minted
+// a SECOND host wrapper over the same guest VA — Release landed on the new
+// wrapper while Wait slept on the original (ring-B preload never woke; F-039).
+// Key is the handle itself (object start); Type is stored for guest-header
+// Query paths but identity lookups are type-agnostic.
+template<typename T, typename... Args>
+inline uint32_t CreateRegisteredKernelObject(uint8_t type, Args&&... args)
+{
+    static_assert(std::is_base_of_v<KernelObject, T>);
+    T* obj = CreateKernelObject<T>(std::forward<Args>(args)...);
+    obj->header.Type = type;
+    const uint32_t handle = GetKernelHandle(obj); // MapVirtual(obj)
+    obj->identityHdrAddr = handle;
+    {
+        std::lock_guard guard{ g_kernelLock };
+        WrapperIdentityMap()[handle] = { obj, type };
+    }
+    return handle;
+}
+
+// Type-agnostic identity lookup (NtCreate* products). Returns nullptr when
+// this handle was never registered as an identity object.
+inline KernelObject* LookupIdentityKernelObject(uint32_t handle)
+{
+    std::lock_guard guard{ g_kernelLock };
+    auto it = WrapperIdentityMap().find(handle);
+    if (it == WrapperIdentityMap().end())
+        return nullptr;
+    return it->second.obj;
 }
 
 template<typename T = KernelObject>

@@ -1,6 +1,14 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
+    "ida-pro": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "python",
+        "C:\\Users\\abdul\\.local\\share\\mcp\\ida-bridge.py"
+      ]
+    },
     "renderdoc": {
       "type": "local",
       "enabled": true,
@@ -13,13 +21,6 @@
         "RENDERDOC_MODULE_PATH": "C:\\Program Files\\RenderDoc",
         "RENDERDOC_QRENDERDOC_PATH": "C:\\Program Files\\RenderDoc\\qrenderdoc.exe"
       }
-    },
-    "ida-pro": {
-      "type": "local",
-      "enabled": true,
-      "command": [
-        "C:\\Users\\abdul\\.local\\share\\mcp\\idamcp-venv\\Scripts\\ida-pro-mcp.exe"
-      ]
     }
   }
 }

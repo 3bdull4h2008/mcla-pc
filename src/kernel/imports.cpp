@@ -631,7 +631,11 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
   auto LogDwellHistogramNT = [&](uint32_t status) { (void)status; (void)waitStart; };
 
   if (IsKernelObject(Handle)) {
-    auto* obj = GetKernelObject(Handle);
+    // F-039: prefer the identity map so Wait hits the same object Release
+    // signals (CreateRegisteredKernelObject products).
+    KernelObject *obj = LookupIdentityKernelObject(Handle);
+    if (!obj)
+      obj = GetKernelObject(Handle);
     if (!obj) { g_ppcContext->r3.u32 = STATUS_INVALID_HANDLE; return STATUS_INVALID_HANDLE; }
     const uint32_t st = obj->Wait(timeout);
     LogDwellHistogramNT(st);
@@ -834,8 +838,10 @@ void MmQueryStatistics() { LOG_UTILITY("!!! STUB !!!"); }
 uint32_t NtCreateEvent(be<uint32_t> *handle, void *objAttributes,
                        uint32_t eventType, uint32_t initialState) {
   if (!handle) return STATUS_INVALID_PARAMETER;
-  *handle =
-      GetKernelHandle(CreateKernelObject<Event>(!eventType, !!initialState));
+  // Identity handle (F-039): register so Set/Wait share one Event object.
+  // Event type 0 = Notification (manual reset), 1 = Synchronization.
+  *handle = CreateRegisteredKernelObject<Event>(
+      eventType == 0 ? uint8_t(0) : uint8_t(1), !eventType, !!initialState);
 
   // EVENT-CREATE CENSUS (2026-08-23 session 10): handle -> creation-LR map.
   // The TU83 driver worker waits on event [0x827D3738+52]=C9ADB800; matching
@@ -1126,19 +1132,25 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
   // X360 NtReadFile signals it on IO completion.
   bool signaled = false;
   if (event != 0) {
-    if (auto *obj = GetKernelObject(event)) {
-      if (auto *evt = dynamic_cast<Event *>(obj)) {
-        evt->Set();
-        signaled = true;
-        static std::atomic<uint32_t> s_rdEvt{0};
-        const uint32_t en = s_rdEvt.fetch_add(1) + 1;
-        if (en <= 20 || (en % 500) == 0)
-          MCLA_LOG_INFO("NtReadFile: signaled completion event h={:08X} "
-                        "(async read {} bytes, #{})",
-                        event, bytesRead, en);
-      } else {
-        DestroyKernelObject(obj);
+    Event *evt = nullptr;
+    if (auto *id = LookupIdentityKernelObject(event)) {
+      evt = static_cast<Event *>(id);
+    } else if (IsKernelObject(event)) {
+      void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(event);
+      if (raw) {
+        auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
+        evt = TryQueryKernelObject<Event>(*hdr);
       }
+    }
+    if (evt && evt->IsValid()) {
+      evt->Set();
+      signaled = true;
+      static std::atomic<uint32_t> s_rdEvt{0};
+      const uint32_t en = s_rdEvt.fetch_add(1) + 1;
+      if (en <= 20 || (en % 500) == 0)
+        MCLA_LOG_INFO("NtReadFile: signaled completion event h={:08X} "
+                      "(async read {} bytes, #{})",
+                      event, bytesRead, en);
     }
   }
   // Session 75w FIX: async-contract. The kernel read wrapper
@@ -2658,13 +2670,23 @@ bool MclaPhysAllocInfo(uint32_t addr, uint32_t *outBase, uint32_t *outSize,
 } // namespace mcla::kernel
 
 uint32_t NtClearEvent(uint32_t handle, uint32_t *previousState) {
-  if (auto* obj = GetKernelObject(handle)) {
-    if (auto* evt = dynamic_cast<Event*>(obj)) {
+  if (auto *id = LookupIdentityKernelObject(handle)) {
+    if (auto *evt = static_cast<Event *>(id)) {
       evt->Reset();
       if (previousState) *previousState = 0;
       return 0;
     }
-    DestroyKernelObject(obj);
+  }
+  if (IsKernelObject(handle)) {
+    void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(handle);
+    if (raw) {
+      auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
+      if (auto *evt = TryQueryKernelObject<Event>(*hdr)) {
+        evt->Reset();
+        if (previousState) *previousState = 0;
+        return 0;
+      }
+    }
   }
   return STATUS_INVALID_HANDLE;
 }
@@ -2685,13 +2707,34 @@ uint32_t NtResumeThread(uint32_t hThread, uint32_t *suspendCount) {
 }
 
 uint32_t NtSetEvent(uint32_t handle, uint32_t *previousState) {
-  if (auto* obj = GetKernelObject(handle)) {
-    if (auto* evt = dynamic_cast<Event*>(obj)) {
+  // F-039: resolve via identity map first — same object Wait parks on.
+  // Never dynamic_cast a GetKernelObject raw fallback (guest memory as
+  // polymorphic object; p2f __RTDynamicCast AV).
+  if (auto *id = LookupIdentityKernelObject(handle)) {
+    if (auto *evt = static_cast<Event *>(id)) {
       evt->Set();
       if (previousState) *previousState = 0;
       return 0;
     }
-    DestroyKernelObject(obj);
+  }
+  if (IsKernelObject(handle)) {
+    void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(handle);
+    if (raw) {
+      auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
+      if (auto *evt = TryQueryKernelObject<Event>(*hdr)) {
+        evt->Set();
+        if (previousState) *previousState = 0;
+        return 0;
+      }
+      if (g_userHeap.IsPhysicalArenaPtr(raw)) {
+        auto *host = reinterpret_cast<Event *>(raw);
+        if (host->IsValid()) {
+          host->Set();
+          if (previousState) *previousState = 0;
+          return 0;
+        }
+      }
+    }
   }
   return STATUS_INVALID_HANDLE;
 }
@@ -2699,8 +2742,12 @@ uint32_t NtSetEvent(uint32_t handle, uint32_t *previousState) {
 uint32_t NtCreateSemaphore(be<uint32_t> *Handle,
                            XOBJECT_ATTRIBUTES *ObjectAttributes,
                            uint32_t InitialCount, uint32_t MaximumCount) {
-  Handle->set(GetKernelHandle(
-      CreateKernelObject<Semaphore>(InitialCount, MaximumCount)));
+  // Identity handle: host Semaphore* mapped to a guest VA. Register it in
+  // WrapperIdentityMap so Release resolves the SAME object Wait parks on
+  // (F-039: previously Release minted a second wrapper via QueryKernelObject
+  // and the ring-B preload workers never woke).
+  Handle->set(CreateRegisteredKernelObject<Semaphore>(5, InitialCount,
+                                                      MaximumCount));
 
   // SEMA-CREATE CENSUS (session 10): the main-thread park waits on handle
   // C9ADB800 (NOT an NtCreateEvent product) - identify its creator.
@@ -2758,30 +2805,70 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
 
   Semaphore *sem = nullptr;
 
-  // SESSION 72 WAKE-LOSS: NtCreateSemaphore mints an identity handle =
-  // MapVirtual(host Semaphore*). Wait (NtWaitForSingleObjectEx) resolves via
-  // GetKernelObject → that same host object. Release used QueryKernelObject
-  // on the header, which MINTED A FRESH wrapper (create never registers in
-  // WrapperIdentityMap) — Release landed on a different Semaphore and the
-  // waiter slept forever. Ring-B consumers parked on C5000280 after PUSH
-  // "released" it; main then waited on C6009F80 completion.
+  // SESSION 72 WAKE-LOSS + F-039 (p2o): NtCreateSemaphore mints an identity
+  // handle = MapVirtual(host Semaphore*). Wait (NtWaitForSingleObjectEx)
+  // resolves via GetKernelObject → that same host object. Release used to
+  // fall through to QueryKernelObject, which MINTED A FRESH wrapper (create
+  // never registered in WrapperIdentityMap) — Release landed on a different
+  // Semaphore and the waiter slept forever. Ring-B consumers parked on
+  // C5000280 after PUSH "released" it; preload never ran (INLINE-EXEC=0).
   //
-  // Resolve Release the same way Wait does when the handle is an identity
-  // handle. Fall back to QueryKernelObject for raw guest XKSEMAPHORE structs.
+  // Resolve Release the same way Wait does for identity handles:
+  //  1. type-agnostic identity map hit (NtCreate* registration)
+  //  2. TryQueryKernelObject on the header (guest-owned lazy wraps)
+  //  3. physical-arena host object (legacy creates not yet in the map)
+  // Never QueryKernelObject-mint over an identity handle.
   {
     const uint32_t guestHandle =
         static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
                               mcla::kernel::g_memory.base);
     if (IsKernelObject(guestHandle)) {
-      auto *obj = GetKernelObject(guestHandle);
-      sem = dynamic_cast<Semaphore *>(obj);
-      if (sem) {
-        // Shared host object with Wait — this is the identity-handle path.
+      if (auto *id = LookupIdentityKernelObject(guestHandle)) {
+        sem = static_cast<Semaphore *>(id);
+      } else {
+        void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(
+            guestHandle);
+        if (raw) {
+          auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
+          sem = TryQueryKernelObject<Semaphore>(*hdr);
+          if (!sem && g_userHeap.IsPhysicalArenaPtr(raw)) {
+            // CreateKernelObject product living in the physical arena — the
+            // same pointer Wait's GetKernelObject raw-fallback returns.
+            auto *host = reinterpret_cast<Semaphore *>(raw);
+            if (host->IsValid())
+              sem = host;
+          }
+        }
       }
     }
   }
+  // Guest-owned XKSEMAPHORE headers (KeInitializeSemaphore path). Only mint
+  // a wrapper when we did NOT resolve an identity object above.
   if (!sem) {
     sem = QueryKernelObject<Semaphore>(Handle->Header);
+  }
+
+  // p2f crash-2 guard: the preload completion releases C9B36F00 after the
+  // worker ran its build pass; lazy-wrap can hand back a stale/destroyed
+  // wrapper whose vptr is garbage (observed __RTDynamicCast AV with
+  // Param[1]=-8: vtable read of a null/freed host object right after
+  // NtReleaseSemaphore+0x2A9). A semaphore release that cannot resolve a
+  // live object is a no-op wake — never a host crash. Log and succeed.
+  if (!sem || !sem->IsValid()) {
+    static std::atomic<uint32_t> s_relDead{0};
+    const uint32_t dn = s_relDead.fetch_add(1) + 1;
+    if (dn <= 20 || (dn % 500) == 0) {
+      const uint32_t guestHandle =
+          static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
+                                mcla::kernel::g_memory.base);
+      MCLA_LOG_WARN("RELSEMA-DEAD #{:03} guest={:08X} count={} lr={:08X} "
+                    "(no live wrapper — no-op release)",
+                    dn, guestHandle, ReleaseCount,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+    if (PreviousCount != nullptr)
+      *PreviousCount = 0;
+    return STATUS_SUCCESS;
   }
 
   uint32_t previousCount;

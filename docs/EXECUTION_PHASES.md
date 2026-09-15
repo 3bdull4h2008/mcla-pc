@@ -1508,4 +1508,330 @@ do not pre-fix.
 
 ## PHASE 2 §B — EXECUTION LOG (executor fills this in)
 
-(none yet)
+### p2a — 2026-09-15 static-analysis pass (T2/T3/T5 decoded BEFORE any boot; no code changes yet)
+
+**Method note (biggest tooling finding of this pass):** the IDB
+(`build/cache/mcla_pe.bin.i64`) is **mis-mapped**: IDA honored the stale
+XEX-embedded PE section table (`.text` RawPtr `0x12C800` vs RVA `0x130000`),
+so every IDA content read in .text is shifted **−0x3800** from runtime truth
+(e.g. IDA's `sub_821BE250` region shows the bytes that really live at
+`0x821BABD0`). The dump itself is a **linear identity map** (file offset =
+VA − 0x82000000, proven by `src/boot_host.cpp:1037` dump code + PE section
+table + pattern search cross-check). Two escapes used: (1) read bytes
+straight from `build/cache/mcla_pe.bin` at flat offset, (2) **read the
+XenonRecomp-generated C** (`generated/ppc/ppc_recomp.NN.cpp`) — which is
+authentic runtime semantics and needs no mapping at all. New tool:
+`tools/ppc_disasm.py <hexVA> <nInstr>` (flat-offset PPC disassembler).
+⇒ Any prior IDA-based disassembly claims in the trail are suspect; trust
+generated C + flat-file reads from now on. (Ledger F-036.)
+
+**T2 — GATE B: the marathon is a guest-correct 4 GB `memcpy(dst=NULL-src,
+count=0xFFFFFFFF)` storm, NOT a debug fill and NOT finite init.**
+- `sub_821BE250(this=r3, dst=r4, count=r5)` is the wrapper **Read()**
+  (fields: +0 dev, +4 handle, +8 buf, +16 64-bit total counter, +24 readPos,
+  +28 end, +32 cap). When requested count > buffered avail it memcpys the
+  buffered span (`bl 0x823DA950`, return addr `0x821BE3BC` — hence
+  `lr=821BE3BC` on every 0xCD store: the CDCD watcher samples LR inside the
+  memcpy leaf) then refills via `[[+0]→vt+24]`.
+- The `#1..#16 @ A0024020 lr=821DEB0C` prefix is `sub_821DE9D8`'s
+  fill-on-alloc of a fresh block (16 stores logged then throttled) — the
+  NORMAL debug-heap fill, only a warm-up.
+- The marathon body: **`count = 0xFFFFFFFF`** (see T3) with dst = the NULL
+  returned by the failed alloc — `memcpy(NULL-ish, src, 0xFFFFFFFF)` walking
+  the whole 0xA0000000+ physical arena, overwriting every allocation in
+  its path (PHYS-OVERRUN #001..: fill at A0000000..AC8Exxxx all OUTSIDE any
+  live allocation, gap grows monotonically — append-only walk, no re-fill of
+  freed pages ⇒ **not thrash, one runaway ≈4 GB copy**).
+- Rate math (t24c): 135.64M stores / 132.4 s = ~1.0M stores/s; frontier
+  A0024020→AC8EE8C4 = 2.4 GB span ⇒ ~18 MB/s frontier. At this rate the
+  0xA0000000..0xC0000000 span (~512 MB) is exhausted in ~30 min, then the
+  copy wraps/corrupts — it NEVER terminates on its own. Classification:
+  **runaway infinite (bounded only by memory), host-must-not-patch — the
+  −1 that seeds it is the disease (T3).**
+
+**T3 — GATE C: the −1 comes from `sub_821BE8D8` vt+56 size-fetch reading our
+pointer-handle through a 16-entry SLOT-TABLE API.**
+- Runtime sequence (t24c 18:49:49.176–.179): `AFB76-HIT` returns our host
+  wrapper slot address `stream=82905500` as the open handle → `BE8D8 #1
+  obj=82860C18 dev=827D838C h=82905500` → `AllocPhysical size=0xffffffff`.
+- Static decode of `sub_821BE8D8` (generated C, ppc_recomp.16.cpp:423):
+  `size = dev->vt[+56](dev, handle)` → memory-device vt+56 =
+  `sub_821CABB8` → tail `vt+44` = `sub_821CB2A0`, which does
+  `if (handle < 0 || handle >= 16) return -1;` — **the device API treats
+  `handle` as an index into a 16-entry slot table at 0x82860740**
+  (stride 16: `+0` buf, `+4` size, `+8` pos, `+12` flag). Handle
+  `0x82905500 > 15` ⇒ **−1** ⇒ `alloc(size=−1)` via `sub_82130528` ⇒
+  `AllocPhysical size=0xffffffff align=0x10` NULL (t24c:856) ⇒
+  `Read(this, dst=NULL, count=−1)` ⇒ **the T2 marathon**. One bug, whole
+  storm.
+- The REAL Xbox contract (decoded from `sub_821CAE50` open path,
+  ppc_recomp.18.cpp:250 `loc_821CAF50`): open() scans the 16-slot table for
+  the first `[slot+0]==0`, writes `{buf,size,0,flag}` and **returns the
+  slot INDEX (0..15) as the handle**. All device vtable methods (read
+  `sub_821CB158` +20: memcpy from slot buf+pos, min(count, size−pos), pos+=n;
+  close `sub_821CB2A0` +44: flag-aware free via TLS swap + 30588; getbuf
+  `sub_821CB330` +36-family; `sub_821CB440` +80 path-parse) speak
+  slot-index.
+- **Fix direction (host-side, faithful): `MakeMemoryStream` and every place
+  we return an open-handle (AFB8 embedded:/memory:$, BE0C8-RET, BE710) must
+  INSERT {buf,size,0,flag} into the guest's real slot table at 0x82860740
+  and return the slot index — not a pointer.** Then vt+56 returns the real
+  buf, alloc(realSize) succeeds, Read() serves real bytes, and the marathon
+  never starts. (Retiring MemoryStreamServeRead pointer-wrangling may
+  follow once the slot ABI is proven at runtime.)
+
+**T5 — GATE E (static leg): the executor fetch gate is the evt=0/apc=0
+synchronous-completion bug ALREADY documented as 75w — confirmed in
+`sub_8244F4C0` disasm.**
+- `sub_8244F4C0(req)` presets `[req+0]=0x103` (STATUS_PENDING), issues the
+  read through kernel import `[0x827F39D0]→+16` (NtReadFile), then at +0x88
+  (`lr=8244F548` — exactly the NFS-CENSUS lr) branches on the return:
+  `==0x103` → async path (wait event `[0x827BD034→?]`... actually calls
+  `sub_827BD034` wait-prim), `==0` → "done-now" path that **the page-cache
+  slot state machine never finalizes** (slots stuck state=1 → later batches
+  starve; INFLATE=0).
+- Our `NtReadFile` (src/kernel/imports.cpp:1151) only returns 259 when
+  `event != 0` (signaled) — the 6 observed reads have **evt=0/apc=0**, so we
+  return STATUS_SUCCESS (0) → F4C0 takes the dead path. Runtime leg of T5
+  (confirm slots stuck + which armer is dormant) still to be done after T1,
+  but the mechanism is now statically proven; fix candidate = honor the
+  ioStatus-preset contract: when the caller pre-armed 0x103, return 259 +
+  set the event if any, even with evt=0.
+
+**T4 — static pre-answer:** executor entry `sub_821C91C8` **ARMS its own
+TLS slots** at thread start: `r28=[r13]` then `stwx r11,r28,+12/+32/+28`
+(slot 12, 32, 28) with `r11 = [0x8287058C-global chain]` (821C920C..821C9248)
+before entering the work loop (bctrl through [r31+80]). So worker threads
+SELF-ARM — the "never-armed slot 12" theory needs revision: if slot 12 is
+dead on a worker it is because the arming source (global at 0x8287058C area)
+is dead, not because nobody ran. Runtime dump (T4 runtime leg) will settle
+armed-vs-zero on the main thread + one worker. (Ledger when dumped.)
+
+**T1 — not yet run** (this pass was static-first after the IDA mis-map
+discovery; the marathon is now statically classified as runaway-infinite so
+the soak's role shifts to confirming the walk + timing rather than
+convergence). Next executor: implement the T3 slot-ABI fix (host-side,
+no `generated/` edits), boot, and expect: fill storm gone at the first
+BE8D8, alloc census clean, boot advances past 18:49:49.179 frontier.
+
+### p2b — 2026-09-15 first fix attempt: MakeMemoryStream inserts into guest slot table
+
+**Change:** `MakeMemoryStream` (`src/gpu_device.cpp:~3710`) modified to
+INSERT `{buf,size,0,flag}` into the guest slot table at `0x82860740`
+(stride 16, max 16 entries) and return the slot INDEX instead of the raw
+pointer.
+
+**Result:** Slot index 0 was returned. Guest code (`sub_8218C760`) does
+`cmpli r6,r3,0` — handle == 0 means "failure" on the real device. Boot
+died immediately, **before** the BE8D8 path even ran. The slot-table
+insert worked but index 0 is a invalid handle in this ABI.
+
+**Evidence:** `build/boot_stdout_p2b.log` (truncated — never reached
+BE8D8).
+
+### p2c — 2026-09-15 second fix: BE8D8-HOST path + slot-0 guard
+
+**Changes:**
+1. `GuestSlotTableInsert` scans starting at index 1 (slot 0 reserved so
+   handle 0 is never returned).
+2. New `BE8D8-HOST` path in `sub_821BE8D8` hook: when the wrapper handle
+   is a slot index with host-registered buf, host-completes the
+   size-fetch → alloc → memcpy → returns stream handle.
+3. Census hooks on BE8D8 (obj/dev/vt/h/lr), SLOT-REG (idx/buf/size).
+
+**Boot result (`build/boot_stdout_p2c.log`):**
+```
+SLOT-REG #1 idx=1 buf=827D2DD0 size=5258 (guest slot table @82860740)
+BE8D8 #1 obj=82860C18 dev=827D838C vt=82012918 h=00000001 lr=8218C804
+BE8D8-HOST #1 obj=82860C18 h=1 buf=827D2DD0 size=5258 dst=C81E0900 stream=00000001
+```
+- Alloc census CLEAN: `AllocPhysical` never fires with `size=0xffffffff`.
+- CDCD-FILL: **ZERO hits** — marathon is dead.
+- Boot advanced **~15 seconds** past the 18:49:49 frontier into genuine
+  RAGE game code.
+- Boot reached the real shader-effect loader (`sub_8218C760`) which
+  opened `embedded:/fxl_final/rage_im.fxc`, re-read it, and fired:
+  ```
+  fatal message: '%s: Old version of rage effect found. You need to recompile your shaders!'
+  ```
+- Fatal regs: `lr=0x8218C864 r3=0x8200B768 r4=0xC81E0880`
+
+### p2d — 2026-09-15 rgxa magic check decoded
+
+**Version check decode (`sub_8218C760`):**
+```
+8218C814  bl 821CB488        ; open(path, 1)
+8218C818  vtable +88 call    ; read from opened stream
+8218C83C  bl 821BE710        ; ReadBytes(r4=&stack, r5=1) → reads r5<<2 = 4 bytes
+8218C848  r8 = 0x61786772    ; ASCII "axgr" BE = magic "rgxa" (RAGE effect archive)
+8218C84C  cmpw r7, r8        ; first 4 bytes of file == "rgxa"?
+8218C850  bne → fatal        ; "Old version of rage effect found..."
+```
+The "old version" message is a **red herring** — it is the **RAGE
+shader-archive magic check** (`rgxa`). The first 4 bytes of the opened
+file don't match 0x61786772.
+
+**Static content check (BUILD PASS — NOT YET REBUILT WITH p2d FIX):**
+
+The first 4 bytes at `0x827D2DD0` in `mcla_pe.bin`:
+```
+buf@827D2DD0: 72 67 78 61 03 ff 03 10 ...
+              = "rgxa" + version fields
+as ascii: rgxa....VS_TransformLit......gVi
+name@820093D4: fxl_final/rage_im.fxc
+```
+
+**THE STATIC BLOB IS CORRECT.** The first 4 bytes ARE `rgxa`
+(0x72677861). The name string at `0x820093D4` is `fxl_final/rage_im.fxc`.
+
+**The problem is in the RUNTIME READ PATH.** The `bl 821BE710` at
+`8218C83C` reads 4 bytes from the opened stream, but those 4 bytes are
+NOT `rgxa` — the stream object returned by our host AFB8 hook does not
+serve the correct first 4 bytes on read.
+
+**Hypothesis:** The AFB8 hook creates a MemoryStream from the path
+`memory:$827D2DD0,5258,0:fxl_final/rage_im.fxc`, but the subsequent
+vtable read (+88) or ReadBytes (`sub_821BE710`) reads from a wrong offset,
+or the MemoryStream's read implementation returns wrong/stale data, or
+the vtable +88 read advances the position before ReadBytes reads.
+
+**Root cause candidates:**
+1. Our AFB8 hook creates a MemoryStream whose read function doesn't
+   actually copy from the guest memory at 0x827D2DD0 — it returns dummy
+   data or zeros.
+2. The vtable +88 read (before ReadBytes) already consumed the first 4
+   bytes, so ReadBytes reads from offset 4 (getting "VS_T..." instead of
+   "rgxa").
+3. The stream position is corrupted between open and read.
+
+**Next fix:** Trace the AFB8 MemoryStream creation to ensure the read
+function actually copies from guest memory at the correct offset. Check
+whether vtable +88 advances the position. Then reboot.
+
+
+### p2f (2026-09-15, 07:00) — rgxa FIXED, new frontier 825FDC64
+
+**Analysis (raw-byte, F-023):**
+1. 8218C818 vt+88: raw image vtable @82012918+88 = 0x821A5CC0 =
+   li r3,0; blr — NO-OP, consumes nothing. Previous hypothesis
+   (vt+88 eats 4 bytes) WRONG.
+2. 8218C810 reloads BDF20 wrapper 0x82860C18 {dev=827D838C, h=1};
+   BE710(r4=&stack, r5=1 WORD). Our old hook passed through (dev live)
+   to original BE250 — whose buffered-refill machinery needs wrapper
+   fields +8/+24/+28/+32 we never set for slot handles → garbage bytes
+   → magic compare fail.
+3. Blob 827D2DD0 = 72 67 78 61 (LE "rgxa"); check wants lwz (BE)
+   0x61786772. Original BE710 tail (821BE73C-768, lswi/rlwinm/stw)
+   byteswaps each word after copy — the .fxc is LE on disk.
+
+**Fix (src/gpu_device.cpp):**
+- SlotTableServeRead(h, dst, count, wordSwap) — serve directly from
+  guest slot table ({buf,size,pos} @0x82860740+h*16), exact 821CB158
+  semantics (copy min(count, size-pos), advance pos).
+- BE710 hook: slot handles served with wordSwap=true, r5*4 bytes,
+  return words. BE250 hook: slot handles served plain.
+- First build without swap: served=4 but magic still failed (proved the
+  swap leg). Second build: PASS.
+
+**Result (boot_stdout_p2f.log, 316KB vs 79KB p2d):**
+- "Old version of rage effect found" fatal GONE.
+- Effect parser reads whole 5258-byte rage_im.fxc: 49x BE710-SLOT,
+  25+x BE250-SLOT (served up to 744/744), D3070-SKIP then full parse
+  chain runs.
+- Boot ~55s in. NEW BLOCKER at 07:05:22: worker thread 20892
+  C0000005 (rip rva=0x322CF0D, ppc lr=825FDC64 r3=CDCDCEA5
+  r10=CDCDCDCD) host stack: NtReleaseSemaphore <- HostToGuest
+  <- 8244ED10 <- 821C9108 <- 821BC140(+0x1007) <- 821BC140(+0x663)
+  <- 821BC910(+0xF4). Followed by 0xE06D7363 C++ throw
+  (__RTDynamicCast, lr=825FB14C, r3=B7B41000). REBASE-POISON at
+  821D29A0 fired just before (CDCD -> 0 skips).
+
+**Next fix:** Decode sub_821BC140 +0x663 and the 825FDC64/825FB14C
+context; check T4 TLS poison family (r3=CDCDCEA5 = CDCD base + 0xEA5
+offset pattern). Census before fix.
+
+### p2f-p2o (2026-09-15, 08:00-09:00) — preload crash chain FIXED, boot stable 240s+
+
+**IDA decode of the crash chain (all raw-byte F-023 verified):**
+1. 821BC910 = pool-worker job loop (per-worker ctx at 82859518+idx*24948,
+   sema C9B36F00, jobs via 821BC140).
+2. 821BC140 = preload task: stream-reads .xsf/.xtd from a:/archive/,
+   inflates (14 XCompress chunks, 229KB), completes cb 821BC548->RELSEMA.
+3. Crash site 825FDBF8 = swfC container build pass (vt 0x8208521C):
+   rebase [obj+12] via 8217D890, then walk cnt 8-byte entries calling
+   8260A830 (the 'Invalid fixup, address is neither virtual nor physical'
+   walker). Containers (B7B41000 buddy 0x20000) have CDCD arrays because
+   the preload never filled them (F-036) -> 27+ poison buckets -> AV
+   (r3=CDCDCEA5 = CDCD+0xD8, 27 entries x 8).
+4. Crash-2 825FB0D8/825FB14C = swfC dtor: [child+4]=B7B41000,
+   vt+16 dispatch, child vt=CDCD (later 82085364 after place pass) ->
+   deeper AVs.
+5. Host-side crash: NtReleaseSemaphore dynamic_cast on
+   GetKernelObject raw fallback = guest vtable through __RTDynamicCast
+   (F-037).
+
+**Fixes (4 guards, all in src):**
+- task_dispatch_trace.cpp 825FDBF8 hook: POISON-SKIP + null walk fields
+- task_dispatch_trace.cpp 8260A830 hook: FIXWALK-SKIP on CDCD bucket
+- task_dispatch_trace.cpp 825FB0D8 hook: vt-range guard on child
+- task_dispatch_trace.cpp 825FDB30 hook: FDB30-DEAD empty dispatch
+- imports.cpp NtReleaseSemaphore: TryQueryKernelObject-only resolve
+  (no dynamic_cast on raw fallback)
+- xdm.h GetKernelObject: raw fallback KEPT (file paths need it) but
+  documented; attempted null-fallback REVERTED after 'Cannot load
+  archive' regression at GETDEV #2 (boot died early - proof the file
+  object resolution path depends on the raw cast + IsValid()).
+
+**Result (boot_stdout_p2o.log, 2.2MB, killed only at 240s timeout):**
+- Boot stable 4+ minutes, 9144 KWFSO wait/wake cycles, 112 TOC76,
+  32 SEMA-CREATE, 25 GETDEV, full .fxc + .xsf pipeline.
+- Remaining: 13 caught AVs (sub_825FDB30+0x1C6 deep original-body
+  reads during dtor of place-pass containers) - noisy, non-fatal.
+- INFLATE count=0 this run (vs 14 in p2f) - stream timing shifted;
+  T5 evt=0 archive-read fix is the upstream root cause to pursue.
+
+**Next:**
+1. T5 runtime: evt=0 NtReadFile page-cache census (slots state=1) -
+   make .xsf/.xtd archive reads DELIVER so containers get real entries.
+2. Census the 825EF100 place pass inputs (which stream feeds
+   [r27+24] array) to find where the fill should have come from.
+3. Consider RegisterGuestWatch on B7B41000+12 to catch the writer that
+   SHOULD have filled the array.
+
+### p2p (2026-09-15, 11:20) — F-039 identity-semaphore fix; preload RUNS; GPU frames start
+
+**Root cause (corrects T5 theory from p2o):**
+p2o's "evt=0 NtReadFile never delivers" was a symptom. The actual blocker
+was NtCreateSemaphore identity-handle wake-loss (F-039):
+- Create = CreateKernelObject + GetKernelHandle (MapVirtual of host object)
+- Wait = GetKernelObject → raw host Semaphore* (works)
+- Release = TryQuery miss → QueryKernelObject MINTS second wrapper →
+  Release on phantom; waiter (ring-B consumer) never woke
+- Result: PUSH happened, INLINE-EXEC=0, INFLATE=0, containers CDCD
+
+**Fix:**
+- xdm.h: CreateRegisteredKernelObject / LookupIdentityKernelObject
+- heap.h: IsPhysicalArenaPtr
+- imports.cpp: NtCreateSemaphore/Event register; Release/Set/Clear/Wait/
+  NtReadFile-event resolve identity-first
+
+**Result (boot_stdout_p2p.log, killed at ~60s of runtime after start):**
+- RINGB-CONSUMER WAIT C5000280 → PUSH → INLINE-EXEC #1 same tid
+- PRELOAD-CTX #1 streamCnt=7 buf=A47FD000
+- INFLATE #1-#14 magic=0FF512EF consumed=229356 (full XCompress package)
+- COMPLETE 821C31B8 #1, POST-EXEC-START reached
+- INLINE-EXEC #2 buf=B7B41000, INFLATE-SKIP magic=525DE064 (not XCompress)
+- FDBF8-BUILD #001 B7B41000 still POISON-SKIP (job #2 empty)
+- FRAME-END #1-#2, P4'-PRESENT #1-#3, LOADING-GATE put=9 (was stuck at 7)
+- PKT-CAP: draw_indx=0 (GP packets captured, no index draws yet)
+- Renderer: Phase 1 self-test PASSED; guest memory view self-test FAILED
+- "D3D12 not needed" / legacy-capture mode (no real present surface)
+
+**Next (for a working game):**
+1. Job #2 stream format (525DE064) — not XCompress; decode or host-serve
+   the .xsf payload into B7B41000 so place-pass gets real entries
+2. Native renderer guest-memory self-test FAILED — fix view mapping
+3. Real D3D12 present path (currently INERT / capture mode); draw_indx>0
+4. Input (XamInputGetState thunk detour failed)
+5. Audio (xarchive_audio.rpf opened but not wired)
+6. World/streaming load (city art under game_data/mc4/art)

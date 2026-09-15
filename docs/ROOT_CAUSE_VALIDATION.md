@@ -1236,3 +1236,106 @@ Part A §Part C (ledger format).
                0x821CB754 (tail-calls sprintf sub_82137A08).
 - Notes:       Several callers across recomp.4/15/43/61/90/122/128 —
                these are the real memory-path producers. Census them.
+
+## F-036  p2f: preload .xsf/.xtd stream containers are never filled (CDCD)
+- Task:        PHASE2 p2f
+- Type:        FACT
+- Class:       H
+- Priority:    P0
+- Evidence:    boot_stdout_p2f/p2g logs: BUDDY76-ALLOC A47FD000(0x2000),
+               B7B41000(0x20000) CDCD-filled; ctor 821D2970 writes
+               vtbl 0x820131A4 into [obj+0] only; payload arrays
+               [+12]/[+16] stay CDCDCDCD. The preload task 821BC140
+               inflates 14 XCompress chunks (229KB, magic 0x0FF512EF
+               real) of legals.xsf via streams, completes, RELSEMA
+               C9B36F00 - but the PLACE pass (825EF100 family: calls
+               825FDBF8 build, re-walk via 8217D890/P10, per-entry
+               825FDA90) runs against containers whose entry arrays
+               were never populated. Root suspicion: the archive read
+               path (T5: evt=0 NtReadFile reads, page-cache slots
+               stuck state=1) never delivered the .xsf TOC/data, so
+               the preload copied/inflated partial streams and the
+               container build stage had nothing to insert.
+- Notes:       The vtable 0x8208521C family = swfC (CLIP_FRAME,
+               PlaySound strings nearby, 8211E250 runtime reg table
+               {func,flags}). 8260A830 = 'Invalid fixup' walker.
+
+## F-037  p2f: GetKernelObject raw-cast fallback + dynamic_cast = host AV
+- Task:        PHASE2 p2f
+- Type:        FACT
+- Class:       H
+- Priority:    P0
+- Evidence:    crash-2 (E06D7363 after C0000005 rva=0x322E8AD,
+               __RTDynamicCast+NtReleaseSemaphore+0x2B9): the guest
+               release of sema C9B36F00 hit imports.cpp NtReleaseSemaphore
+               -> GetKernelObject(guestHandle) raw-cast fallback returned
+               guest memory as KernelObject* -> dynamic_cast<Semaphore*>
+               walked a GUEST vtable (rax=0x100000604) -> AV/throw.
+               FIX (final): NtReleaseSemaphore resolves via
+               TryQueryKernelObject ONLY (host wrapper map); no raw
+               casts, no dynamic_cast on fallback objects.
+- Notes:       xdm.h GetKernelObject raw fallback intentionally KEPT
+               (file paths rely on it - reverting it broke NtQueryInfoFile
+               -> 'Cannot load archive' regression, boot died at GETDEV #2).
+               Callers that dynamic_cast must use TryQueryKernelObject.
+
+## F-038  p2f: three-guard neutralization of poison container walks
+- Task:        PHASE2 p2f
+- Type:        FIX
+- Class:       H
+- Priority:    P1
+- Evidence:    boot now runs 240s+ (killed only by timeout), log 2.2MB
+               (vs 79KB at rgxa, 316KB at first fix). Guards added:
+               (1) FDBF8-BUILD POISON-SKIP (825FDBF8 hook): vt/arr=CDCD
+               -> null [+12], zero [+16], skip body.
+               (2) FIXWALK-SKIP (8260A830 hook): CDCD bucket base ->
+               return 0, no body.
+               (3) FB0D8-DTOR guard (825FB0D8 hook): child vtable not
+               in image range -> skip dispatch.
+               (4) FDB30-DEAD (825FDB30 hook): [cont+12]=CDCD ->
+               empty dispatch.
+               Remaining: 13 caught AVs in 4min from deep original-body
+               reads (sub_825FDB30+0x1C6 via FB0D8 vt+16 dispatch on
+               place-pass containers) - noisy but harmless.
+- Notes:       The upstream fix is T5: make the archive reads deliver
+               so containers get REAL entries (INFLATE count=0 in p2o
+               log vs 14 in p2f - timing shifted, the .xsf stream data
+               path needs the evt=0 NtReadFile fix).
+
+## F-039  p2p: NtCreateSemaphore identity handle never registered — Release woke a phantom wrapper (T5 root cause)
+- Task:        PHASE2 p2p
+- Type:        FACT
+- Class:       H
+- Priority:    P0
+- Evidence:    p2o log: RINGB-CONSUMER tid=570C WAIT C5000280 at 08:53:08.460;
+               RELSEMA+SIGNAL C5000280 at 08:53:12.703; PUSH wIdx=1 cnt=1;
+               NO WAKE for tid=570C; INLINE-EXEC 821BC140 count=0;
+               INFLATE count=0; containers stayed CDCD. Root cause:
+               NtCreateSemaphore does CreateKernelObject+GetKernelHandle
+               (identity = MapVirtual(host Semaphore*)) but NEVER registers
+               in WrapperIdentityMap. Wait (NtWaitForSingleObjectEx) uses
+               GetKernelObject → Translate → raw host Semaphore* (correct).
+               Release (NtReleaseSemaphore) TryQueryKernelObject misses
+               (not in map) then QueryKernelObject MINTS a second wrapper
+               over the same guest VA and Release()s THAT — waiter slept
+               forever on the original. Same class as session-72 wake-loss,
+               still present for NtCreate* products.
+- Fix:         CreateRegisteredKernelObject<T>() + LookupIdentityKernelObject()
+               in xdm.h; NtCreateSemaphore/NtCreateEvent register at create;
+               NtReleaseSemaphore/NtSetEvent/NtClearEvent/NtWaitForSingleObjectEx/
+               NtReadFile event-signal resolve identity-first, never mint over
+               an identity handle. Heap::IsPhysicalArenaPtr guards raw-cast
+               fallbacks (no dynamic_cast on guest memory).
+- Evidence after fix (boot_stdout_p2p.log, 90s):
+               WAIT C5000280 → PUSH #1 → INLINE-EXEC #1 SAME tid;
+               PRELOAD-CTX #1 streamCnt=7 buf=A47FD000;
+               INFLATE #1-#14 magic=0FF512EF consumed=229356 (XCompress OK);
+               COMPLETE 821C31B8 #1; POST-EXEC-START reached.
+               INLINE-EXEC #2 buf=B7B41000; INFLATE-SKIP magic=525DE064
+               (job #2 stream not XCompress — next investigation).
+               FRAME-END #1-#2, P4'-PRESENT #1-#3, LOADING-GATE put=9
+               (GPU put advanced 7→9). draw_indx=0 still.
+- Notes:       T5 "evt=0 NtReadFile page-cache" theory was UPSTREAM-SYMPTOM.
+               The real T5 blocker was the ring-B semaphore wake-loss.
+               Archive VFS/TOC/open path was already delivering (TOC76 hits,
+               real packfiles opened).
