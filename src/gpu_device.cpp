@@ -11267,6 +11267,58 @@ PPC_FUNC(sub_8218BFF0) {
 }
 
 // ===========================================================================
+// W36c: sub_8218A008 census — CDCD fill-marathon worker that allocates via
+// TLS slot-12 chain (lr=8218A0E8 crash site). When the TLS allocator chain
+// is broken, the worker thread gets parked by VEH, which prevents GPU
+// completions from being processed, which means the boot worker queue
+// never receives messages and the game stalls.
+//
+// Fix: check the TLS chain at entry. If broken, zero the output struct
+// (count=0, buf=0) and return without calling the original. The caller
+// handles count==0 gracefully.
+// ===========================================================================
+PPC_FUNC_IMPL(__imp__sub_8218A008);
+static std::atomic<uint32_t> s_h8A008{0};
+PPC_FUNC(sub_8218A008) {
+  const uint32_t n = s_h8A008.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  // r3 = output struct [+0]=count [+4]=buf, r4 = stream context
+  const uint32_t outStruct = ctx.r3.u32;
+  // Check TLS chain: r13 -> [r13+0] -> [tlsTable+12] -> [alloc+0] -> [vtable+8]
+  bool chainAlive = false;
+  if (ctx.r13.u32 != 0) {
+    uint32_t tlsTable = 0;
+    if (mem.ReadU32BE(ctx.r13.u32, &tlsTable) &&
+        tlsTable != 0 && tlsTable != 0xCDCDCDCDu) {
+      uint32_t allocator = 0;
+      if (mem.ReadU32BE(tlsTable + 12, &allocator) &&
+          allocator != 0 && allocator != 0xCDCDCDCDu) {
+        uint32_t vtable = 0;
+        if (mem.ReadU32BE(allocator, &vtable) &&
+            vtable != 0 && vtable != 0xCDCDCDCDu) {
+          uint32_t funcPtr = 0;
+          if (mem.ReadU32BE(vtable + 8, &funcPtr) &&
+              funcPtr != 0 && funcPtr != 0xCDCDCDCDu) {
+            chainAlive = true;
+          }
+        }
+      }
+    }
+  }
+  if (!chainAlive) {
+    if (n <= 5 || (n % 200) == 0)
+      MCLA_LOG_WARN("TLS-8A008 #{} chain broken, zeroing out={:08X}", n, outStruct);
+    // Zero the output struct: count=0, buf=0
+    (void)mem.WriteU32BE(outStruct + 0, 0u);
+    (void)mem.WriteU32BE(outStruct + 4, 0u);
+    return;
+  }
+  if (n <= 5 || (n % 200) == 0)
+    MCLA_LOG_WARN("TLS-8A008 #{} chain alive, calling original", n);
+  __imp__sub_8218A008(ctx, base);
+}
+
+// ===========================================================================
 // T5 systemic fix (t23c frontier): the XTL allocation import thunks
 // (sub_82130528/550/588) resolve the host allocator through the guest TLS
 // table: *( *(r13) + 28 ) -> FuncBlock -> +8 alloc / +12 free. The TLS block
