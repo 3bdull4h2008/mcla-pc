@@ -372,7 +372,14 @@ void PublishRptr(RingState &ring) {
   const uint32_t rptr = ring.rptrIndex.load(std::memory_order_relaxed);
   const uint32_t wb = ring.writebackVA.load(std::memory_order_relaxed);
   if (ring.writebackEnabled.load(std::memory_order_acquire) && wb != 0) {
-    (void)mem.WriteU32BE(wb, rptr);
+    // w18: monotonic publish. After an idle REINIT the guest put cursor can
+    // sit above the reset rptr; writing rptr=0 would re-park the KWFSO
+    // rptrWB poll. Never move the published watermark backwards.
+    uint32_t cur = 0;
+    (void)mem.ReadU32BE(wb, &cur);
+    const uint32_t publish = (rptr >= cur) ? rptr : cur;
+    if (publish != cur)
+      (void)mem.WriteU32BE(wb, publish);
   }
 }
 
@@ -890,8 +897,29 @@ void CpInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2) {
     if (quiescent) {
       ring->rptrIndex.store(0, std::memory_order_relaxed);
       ring->lastDoorbellWptr.store(0xFFFFFFFFu, std::memory_order_relaxed);
-      MCLA_LOG_INFO("CP: RING {} REINIT (idle) base={:08X} cap={} - rptr reset",
-                    ring->id, physAddr, capDwords);
+      // w18 CENSUS: guest put (gpuCtx+10908) vs writeback after idle REINIT.
+      // If put > 0 the guest still waits on rptrWB >= put; writeback 0 after
+      // a rptr reset parks that wait forever (primaryWptr=FFFFFFFF stall).
+      uint32_t gpuCtx = 0, guestPut = 0, wbVa = ring->writebackVA.load();
+      auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+      (void)memR.ReadU32BE(0x82839254u, &gpuCtx);
+      if (gpuCtx != 0)
+        (void)memR.ReadU32BE(gpuCtx + 10908u, &guestPut);
+      MCLA_LOG_INFO("CP: RING {} REINIT (idle) base={:08X} cap={} - rptr "
+                    "reset lastRptr={:04X} lastWptr={:08X} guestPut={} "
+                    "wb={:08X}",
+                    ring->id, physAddr, capDwords, rptr, lastWptr, guestPut,
+                    wbVa);
+      // FAITHFUL FIX: if the guest already credited GPU progress (put>0)
+      // before the reinit, publish that watermark to the writeback VA so
+      // sub_82411218's rptrWB poll can exit. New submissions start from
+      // rptr=0; the put cursor is the guest's own count of completed windows.
+      if (guestPut != 0 && wbVa != 0) {
+        (void)memR.WriteU32BE(wbVa, guestPut);
+        MCLA_LOG_WARN("CP: RING {} REINIT writeback {:08X} 0 -> guestPut "
+                      "{} (unpark KWFSO rptrWB poll)",
+                      ring->id, wbVa, guestPut);
+      }
     } else {
       // Phase-5/6: re-init of an ACTIVE ring - retain its state.
       MCLA_LOG_WARN("CP: RING {} REINIT while ACTIVE base={:08X} cap={} "
@@ -928,7 +956,21 @@ void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2) {
   WarnWritebackOverlap(*ring);
 
   if (vaForm != 0) {
-    (void)mcla::kernel::GuestMemoryHeap::Instance().WriteU32BE(vaForm, 0);
+    // w18: after an idle REINIT the guest may still hold put>0 from the
+    // prior phase. Publishing 0 leaves the rptrWB poll parked; publish the
+    // guest put watermark when it is ahead of 0 so the wait can complete.
+    uint32_t guestPut = 0, gpuCtx = 0;
+    auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)memP.ReadU32BE(0x82839254u, &gpuCtx);
+    if (gpuCtx != 0)
+      (void)memP.ReadU32BE(gpuCtx + 10908u, &guestPut);
+    const uint32_t publish = guestPut ? guestPut : 0u;
+    (void)memP.WriteU32BE(vaForm, publish);
+    if (publish != 0) {
+      MCLA_LOG_WARN("CP: RING {} rptr writeback @ {:08X} publish={} "
+                    "(guest put; unpark after reinit)",
+                    ring->id, vaForm, publish);
+    }
   }
   if (vaForm != rptrWritebackAddr) {
     MCLA_LOG_INFO("CP: RING {} rptr writeback raw={:08X} (phys) -> publish @ "

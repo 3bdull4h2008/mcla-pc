@@ -49,6 +49,10 @@ void Start(uint32_t entryGuest);
 
 const BootReport& GetReport();
 
+// W36b: peek at the boot worker thread's live PPCContext (g_faultCtx).
+// Returns register value rN (0-31). Returns 0 if context unavailable.
+uint32_t GetBootWorkerReg(unsigned regIndex);
+
 // Log bridge for the SEH-bearing boot TU. boot_host.cpp contains __try/__except
 // and cannot instantiate spdlog/fmt templates in the same TU (clang 19.1.7
 // ICEs in the X86 assembler); these forward to spdlog from a separate TU.

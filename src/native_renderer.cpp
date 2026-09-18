@@ -8,6 +8,7 @@
 #include "app.h"
 #include "logging.h"
 #include "guest_memory.h"
+#include "kernel/memory.h"
 #include "gpu_mmio.h"
 #include "gpu_device.h"
 #include "render_queue.h"
@@ -19,12 +20,17 @@
 #include "renderer/vertex_decode.h"
 #include "renderer/grc_fvf_decode.h"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+// w31: deep child census hook (defined in gpu_device.cpp).
+void MclaW31OnPresent();
 
 namespace mcla::native {
 
@@ -107,11 +113,48 @@ void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
     present.frameNumber = frameNumber;
     present.obj = obj;
     present.swapInfo = fbAddr;
+    // W7: resolve surface VA when swapInfo is a swap-table slot.
+    present.surfaceVA = mcla::gpu::ResolvedPresentSurfaceVA();
+    // N3a census (F-C in LONG_TODO_MASTER): decode the per-frame swap OBJ
+    // (observed C61D8818/C61D8928/C625894C, ~0x110/0x124 stride) — the last
+    // undecoded present object and the top candidate for holding the real
+    // framebuffer surface pointer. Bounded: first 6 + every 500th.
+    {
+        static std::atomic<uint32_t> s_objCensus{0};
+        const uint32_t on = s_objCensus.fetch_add(1) + 1;
+        if (obj != 0 && (on <= 6 || (on % 500) == 0)) {
+            auto& mem = ::mcla::kernel::GuestMemoryHeap::Instance();
+            auto dumpWords = [&](uint32_t addr, uint32_t words, const char* tag) {
+                if (addr == 0 || !mem.IsValid(addr, words * 4)) return;
+                std::string out;
+                out.reserve(words * 9);
+                for (uint32_t k = 0; k < words; ++k) {
+                    uint32_t v = 0;
+                    (void)mem.ReadU32BE(addr + k * 4, &v);
+                    out += fmt::format("{:08X} ", v);
+                }
+                MCLA_LOG_INFO("OBJ-CENSUS {} @{:08X}: {}", tag, addr, out);
+            };
+            MCLA_LOG_INFO("OBJ-CENSUS #{} obj={:08X} fb={:08X} surf={:08X}",
+                          on, obj, fbAddr, present.surfaceVA);
+            dumpWords(obj, 24, "SWAPOBJ");
+            // Follow one hop for every plausible pointer word in the first 24.
+            for (uint32_t k = 0; k < 24; ++k) {
+                uint32_t v = 0;
+                (void)mem.ReadU32BE(obj + k * 4, &v);
+                if (v >= 0x40000000u && v < 0xE0000000u && mem.IsValid(v, 8))
+                    dumpWords(v, 8, "SWAPOBJ-PTR");
+            }
+        }
+    }
     mcla::native::g_commandQueue.push(cmd);
     if (frameNumber <= 8 || (frameNumber % 120) == 0) {
-        MCLA_LOG_INFO("NATIVE-PRESENT #{} obj={:08X} fb={:08X} q={}",
-                      frameNumber, obj, fbAddr, mcla::native::g_commandQueue.size());
+        MCLA_LOG_INFO("NATIVE-PRESENT #{} obj={:08X} fb={:08X} surf={:08X} q={}",
+                      frameNumber, obj, fbAddr, present.surfaceVA,
+                      mcla::native::g_commandQueue.size());
     }
+    // w31: periodic deep child census + bind (first 6, then every 30th).
+    MclaW31OnPresent();
 }
 
 // VdSwap import hook — INERT for frame production (R1).
@@ -119,6 +162,12 @@ void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
 PPC_FUNC_IMPL(Hooked_VdSwap) {
     uint32_t obj       = ctx.r3.u32;
     uint32_t swap_info = ctx.r4.u32;
+
+    // W7: VdSwap swap_info is a physical-ish address (seen as 0x004E0D30).
+    // Add it as a surface candidate — it may be the real framebuffer.
+    if (swap_info != 0 && swap_info < 0xF0000000u) {
+        mcla_gpu_AddSurfaceCandidate(swap_info, 1280, 720, "vdswap");
+    }
 
     static int swapCount = 0;
     swapCount++;

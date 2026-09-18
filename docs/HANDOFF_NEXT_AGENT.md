@@ -1,4 +1,4 @@
-﻿# HANDOFF â€” next agent, read this first
+# HANDOFF â€” next agent, read this first
 
 > **Doc set (5 docs, consolidated 2026-09-13).** This file is doc 2: live
 > frontier (below) + the chronological session trail. Companion docs:
@@ -8,6 +8,43 @@
 > tasks and logs), `PLAN_VMX128.md`. Former files `ROOT_CAUSE_VALIDATION_*`,
 > `CHEAP_MODEL_EXECUTION_PLAN.md`, `PHASE0_*`, `PHASE1_*` were merged into
 > those; references to them in the older trail now point at the merged docs.
+
+## READ ME FIRST — p3b (2026-09-17): star_glow fatal GONE; preload XCompress works
+
+**Authoritative todo:** `docs/LONG_TODO_MASTER.md`. Work that file in order.
+
+### Landed this session (do not redo)
+
+1. **sub_821873E8 TLS slot-12 host-complete** — 0x 7E780000.
+2. **Guest memory view self-test PASSED** (guard-page addrs >= 0x1000).
+3. **Preload inflate host-serve + RSC5 skip** — guest refill Read returns 0;
+   host-serve 32KB from xarchive_cache.rpf @ 0x60000; head is RSC5
+   (05435352) with XCompress at +12; INFLATE-RSC5 strips 12B;
+   INFLATE #1-#14 XCompress, COMPLETE #1. **Unable to load shader
+   star_glow is gone** (p3b, 120s soak).
+
+### New frontier (p3b)
+
+- Job #2 (swfC, tag 0x8004, dest B7B41000) — host-serve walking the
+  RPF blindly serves wrong bytes (INFLATE-SKIP magic=6655A8B1). Either
+  use the already-filled raw dests from READWRAP #1-#7, or find the real
+  compressed offset for job #2 (STRENT +24 = 0xA0000).
+- Present still INERT (draw_indx=0, picker count=0).
+- Some residual caught AVs on the swfC dtor path.
+
+### Next (in order)
+
+1. Job #2 payload into B7B41000 so FDBF8 place-pass is not POISON-SKIP.
+2. Real D3D12 present + first non-black frame (M3).
+3. Input, audio, world. See LONG_TODO_MASTER.
+
+### Build/run
+
+```
+Stop-Process -Name mcla -Force
+cmd /c ninja_build.bat
+.\build\mcla.exe > build\boot_stdout_p3c.log 2> build\boot_stderr_p3c.log
+```
 
 ## READ ME FIRST — ANALYSIS PASS (2026-09-14, post-t24c): "PARKED" IS ACTUALLY A CDCD FILL MARATHON; TLS "WIPE" STORY CORRECTED
 

@@ -376,7 +376,12 @@ GpuMmioReadFn GetGpuMmioReadHandler() { return g_gpuMmioReadHandler; }
 bool VerifyGuestMemoryViewForTests() {
     GuestMemoryView view;
 
-    uint8_t testMem[1024] = {0};
+    // Guest addr 0 is a NOACCESS guard page (IsValidRange rejects < 0x1000).
+    // Use a buffer large enough that guest addrs 0x1000/0x1004/0x2000 land
+    // inside it — the old test used 0x100/0x200 and always failed after the
+    // guard-page rejection landed (session 73).
+    constexpr uint32_t kBase = 0x1000;
+    uint8_t testMem[0x3000] = {0};
     view.SetMemoryBase(testMem, sizeof(testMem));
 
     if (view.IsValidRange(0, 1)) return false;
@@ -387,23 +392,24 @@ bool VerifyGuestMemoryViewForTests() {
 
     uint32_t scratch = 0;
     if (view.ReadU32BE(0, &scratch)) return false;
+    if (view.ReadU32BE(0x100, &scratch)) return false; // below guard page
 
-    // Test valid reads
-    testMem[0x100] = 0x12;
-    testMem[0x101] = 0x34;
-    testMem[0x102] = 0x56;
-    testMem[0x103] = 0x78;
+    // Test valid reads (host offsets = guestAddr, identity map)
+    testMem[kBase + 0] = 0x12;
+    testMem[kBase + 1] = 0x34;
+    testMem[kBase + 2] = 0x56;
+    testMem[kBase + 3] = 0x78;
 
     uint32_t val32 = 0;
-    if (!view.ReadU32BE(0x100, &val32)) return false;
+    if (!view.ReadU32BE(kBase, &val32)) return false;
     if (val32 != 0x12345678) return false;
 
     uint16_t val16 = 0;
-    if (!view.ReadU16BE(0x100, &val16)) return false;
+    if (!view.ReadU16BE(kBase, &val16)) return false;
     if (val16 != 0x1234) return false;
 
-    if (!view.WriteU16BE(0x200, 0xAABB)) return false;
-    if (testMem[0x200] != 0xAA || testMem[0x201] != 0xBB) return false;
+    if (!view.WriteU16BE(0x2000, 0xAABB)) return false;
+    if (testMem[0x2000] != 0xAA || testMem[0x2001] != 0xBB) return false;
 
     return true;
 }

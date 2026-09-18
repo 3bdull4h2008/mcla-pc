@@ -1835,3 +1835,30 @@ was NtCreateSemaphore identity-handle wake-loss (F-039):
 4. Input (XamInputGetState thunk detour failed)
 5. Audio (xarchive_audio.rpf opened but not wired)
 6. World/streaming load (city art under game_data/mc4/art)
+
+### p2t (2026-09-17) - 821873E8 fixed + self-test PASS; star_glow frontier
+
+**T0.1 DONE - sub_821873E8.** Raw decode (not IDA): alloc72 via TLS
+slot +12. Slot was never-armed (0) on the crashing worker -> AV at the
+bctrl (Param1=0x7E780000). Fix: host-complete alloc72 + zero + call
+82188CF8 when slot12 is dead; pass-through when live.
+Evidence: `FIX-821873E8 #1 TLSDEAD ... slot12=00000000 lr=822FBC28`;
+**0x 7e780000** in `build/boot_stdout_p2t.log`.
+
+**T2.1 DONE - guest memory view self-test.** Root cause: test used
+guest addrs 0x100/0x200 but IsValidRange rejects <0x1000 (guard page).
+Test rewritten to 0x1000/0x2000. Log: `guest memory view self-test PASSED`.
+
+**New frontier (p2t ~75s):** `Unable to load shader 'star_glow'`.
+PSTREAM streams all `vt=0 h=0 sz=0` (never opened) -> INFLATE-CORRUPT
+`in=-12` stack residue -> D2308-INS never runs -> AFB76-MISS star_glow
+(not in the 15 CRT seeds; not in the image). Boot advanced PAST the
+821873E8 crash into the classic preload gap.
+
+**Next executor:**
+1. Census who should open the preload job streams (tag 00000004,
+   dests A47FD000/B7A01000/... at job ctx+12).
+2. Host-open via archive vtable 0x82012BDC +8 when vt==0, or fix the
+   guest gate that skipped open.
+3. Acceptance: INFLATE #1-#14 XCompress, D2308-INS-DONE, AFB76-HIT
+   star_glow, no star_glow fatal, 120s soak.

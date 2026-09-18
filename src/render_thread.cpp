@@ -9,6 +9,7 @@
 #include "d3d12_backend.h"
 #include <chrono>
 #include <unordered_map>
+#include <vector>
 
 namespace mcla::native {
 
@@ -49,6 +50,9 @@ void RenderThread::stop() {
     shouldStop_ = true;
     g_commandQueue.shutdown();
 
+    if (heartbeat_.joinable()) {
+        heartbeat_.join();
+    }
     if (thread_.joinable()) {
         thread_.join();
     }
@@ -75,6 +79,50 @@ void RenderThread::threadMain() {
             backend_.GetPipelineCache().StartWorker(
                 backend_.GetDevice(), backend_.GetRootSignature());
             MCLA_LOG_INFO("RenderThread: PipelineCache worker started");
+            // Vibe: show a visible clear immediately so the window is not black
+            // while waiting for the first guest PresentKick.
+            if (backend_.BeginFrame()) {
+                backend_.ClearAndPresent(0.06f, 0.10f, 0.22f, 1.0f);
+                MCLA_LOG_INFO("RenderThread: initial clear+present (dark blue)");
+            }
+            // W6 one-shot: prove PresentBgra (upload + CopyResource + Present)
+            // with a synthetic gradient so the blit path is verified even if
+            // the guest never fires NATIVE-PRESENT during a short soak.
+            {
+                const uint32_t w = 1280, h = 720;
+                std::vector<uint8_t> grad(static_cast<size_t>(w) * h * 4u);
+                for (uint32_t y = 0; y < h; ++y) {
+                    for (uint32_t x = 0; x < w; ++x) {
+                        uint8_t* p = &grad[(static_cast<size_t>(y) * w + x) * 4u];
+                        p[0] = static_cast<uint8_t>((x * 255u) / (w - 1)); // R
+                        p[1] = static_cast<uint8_t>((y * 255u) / (h - 1)); // G
+                        p[2] = 64;                                         // B
+                        p[3] = 255;
+                    }
+                }
+                if (backend_.PresentBgra(w, h, grad.data())) {
+                    MCLA_LOG_INFO("PRESENT-BLIT-SYNTH ok {}x{} (gradient)", w, h);
+                } else {
+                    MCLA_LOG_WARN("PRESENT-BLIT-SYNTH fail {}x{}", w, h);
+                }
+            }
+            // Heartbeat: ALWAYS enqueue a clear present. Do not skip when the
+            // guest queue is busy — SET_RENDER_STATE traffic otherwise starves
+            // presents and the window flashes once then dies visually.
+            heartbeat_ = std::thread([this]() {
+                using namespace std::chrono_literals;
+                while (!shouldStop_) {
+                    std::this_thread::sleep_for(33ms);
+                    if (shouldStop_ || !d3d12Initialized_) continue;
+                    RenderCommand cmd;
+                    cmd.type = RenderCommand::PRESENT;
+                    auto& p = cmd.data.emplace<PresentCommand>();
+                    p.frameNumber = 0;
+                    p.obj = 0;
+                    p.swapInfo = 0;
+                    g_commandQueue.push(std::move(cmd));
+                }
+            });
         } else {
             MCLA_LOG_ERROR("RenderThread: D3D12 initialization failed on thread start");
         }
@@ -371,10 +419,10 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             static std::atomic<uint32_t> presentCount{0};
             const uint32_t n = presentCount.fetch_add(1) + 1;
             if (n <= 10 || (n % 120) == 0)
-                MCLA_LOG_INFO("RenderThread: PRESENT #{} frame={} obj={:08X}",
-                              n, p.frameNumber, p.obj);
+                MCLA_LOG_INFO("RenderThread: PRESENT #{} frame={} obj={:08X} fb={:08X} surf={:08X}",
+                              n, p.frameNumber, p.obj, p.swapInfo, p.surfaceVA);
 
-            // Frame pacing: wait until target frame interval elapsed
+            // Frame pacing
             using Clock = std::chrono::steady_clock;
             static auto lastPresentTime = Clock::now();
             {
@@ -389,8 +437,105 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                 lastPresentTime = Clock::now();
             }
 
-            if (backend_.BeginFrame()) {
-                backend_.ClearAndPresent(0.0f, 0.0f, 0.02f, 1.0f);
+            // W5: sample average color for logs. W6: full-viewport blit of
+            // the guest framebuffer when swapInfo is a high guest VA.
+            // W7: if swapInfo is a swap-table slot (C71D81xx family or
+            // samples as near-zero), use the resolved surface VA instead.
+            float cr = 0.06f, cg = 0.10f, cb = 0.22f;
+            bool blitOk = false;
+
+            // Determine which VA to blit from.
+            // Heartbeat (swapInfo=0): don't blit, just clear.
+            // Guest present with swap-table swapInfo: use resolved surface.
+            // Guest present with real surface swapInfo: use swapInfo directly.
+            uint32_t blitVA = 0;
+            if (p.swapInfo >= 0x80000000u && p.swapInfo < 0x100000000u) {
+                // Heuristic: swap-table slots are in the C71D81xx family
+                // (table at C71D8180, slots at +0x40..+0x5C).
+                const bool isSwapTable =
+                    (p.swapInfo >= 0xC71D8180u && p.swapInfo < 0xC71D81E0u);
+                if (isSwapTable) {
+                    // Swap-table slot — use resolved surface if available.
+                    blitVA = p.surfaceVA;
+                } else {
+                    // Might be a real surface — try it directly.
+                    blitVA = p.swapInfo;
+                }
+            }
+            // Note: swapInfo=0 (heartbeat) leaves blitVA=0 → clear-only.
+
+            if (blitVA != 0) {
+                auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+                // Prefer full 1280x720 linear 32bpp; fall back to 640x360 if
+                // the larger ReadBytes is not valid (page still uncommitted).
+                static std::vector<uint8_t> fbBuf;
+                constexpr uint32_t kFullW = 1280, kFullH = 720;
+                constexpr uint32_t kHalfW = 640, kHalfH = 360;
+                constexpr uint32_t kFullBytes = kFullW * kFullH * 4;
+                constexpr uint32_t kHalfBytes = kHalfW * kHalfH * 4;
+                if (fbBuf.size() < kFullBytes) fbBuf.resize(kFullBytes);
+
+                uint32_t fbW = 0, fbH = 0;
+                if (mem.ReadBytes(blitVA, fbBuf.data(), kFullBytes)) {
+                    fbW = kFullW;
+                    fbH = kFullH;
+                } else if (mem.ReadBytes(blitVA, fbBuf.data(), kHalfBytes)) {
+                    fbW = kHalfW;
+                    fbH = kHalfH;
+                }
+
+                if (fbW != 0) {
+                    uint64_t sumR = 0, sumG = 0, sumB = 0;
+                    const uint32_t sampleCount = 16 * 16;
+                    for (uint32_t y = 0; y < 16; ++y) {
+                        for (uint32_t x = 0; x < 16; ++x) {
+                            const uint32_t sx = x * (fbW / 16);
+                            const uint32_t sy = y * (fbH / 16);
+                            const uint32_t off = (sy * fbW + sx) * 4;
+                            // LE 32bpp in guest memory: treat as RGBA bytes.
+                            sumR += fbBuf[off + 0];
+                            sumG += fbBuf[off + 1];
+                            sumB += fbBuf[off + 2];
+                        }
+                    }
+                    cr = static_cast<float>(sumR / sampleCount) / 255.0f;
+                    cg = static_cast<float>(sumG / sampleCount) / 255.0f;
+                    cb = static_cast<float>(sumB / sampleCount) / 255.0f;
+                    if (cr + cg + cb < 0.02f) {
+                        cr = 0.06f;
+                        cg = 0.10f;
+                        cb = 0.22f;
+                    }
+                    static std::atomic<uint32_t> presentFbCount{0};
+                    const uint32_t pfn = presentFbCount.fetch_add(1) + 1;
+                    if (pfn <= 16 || (pfn % 60) == 0)
+                        MCLA_LOG_INFO("PRESENT-FB sample rgb=({:.2f},{:.2f},{:.2f}) va={:08X} (fb={:08X}) wh={}x{}",
+                                      cr, cg, cb, blitVA, p.swapInfo, fbW, fbH);
+
+                    if (!backend_.PresentBgra(fbW, fbH, fbBuf.data())) {
+                        static std::atomic<uint32_t> blitFail{0};
+                        const uint32_t fn = blitFail.fetch_add(1) + 1;
+                        if (fn <= 5 || (fn % 120) == 0)
+                            MCLA_LOG_WARN("PRESENT-BLIT fail #{} va={:08X} wh={}x{}",
+                                          fn, blitVA, fbW, fbH);
+                    } else {
+                        blitOk = true;
+                        static std::atomic<uint32_t> blitCount{0};
+                        const uint32_t bn = blitCount.fetch_add(1) + 1;
+                        if (bn <= 10 || (bn % 60) == 0)
+                            MCLA_LOG_INFO("PRESENT-BLIT #{} {}x{} va={:08X} (fb={:08X})",
+                                          bn, fbW, fbH, blitVA, p.swapInfo);
+                    }
+                } else if (n <= 8 || (n % 240) == 0) {
+                    MCLA_LOG_WARN("PRESENT-FB read failed va={:08X} (fb={:08X})",
+                                  blitVA, p.swapInfo);
+                }
+            }
+
+            if (!blitOk) {
+                if (backend_.BeginFrame()) {
+                    backend_.ClearAndPresent(cr, cg, cb, 1.0f);
+                }
             }
             break;
         }

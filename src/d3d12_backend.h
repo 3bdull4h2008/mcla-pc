@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 #include "renderer/resource_cache.h"
 #include "renderer/pipeline_cache.h"
@@ -44,6 +45,13 @@ public:
     // Frame lifecycle
     bool BeginFrame();
     bool ClearAndPresent(float r, float g, float b, float a);
+
+    // W6: full-viewport blit of linear 32bpp host pixels onto the backbuffer.
+    // Uploads through a persistent DEFAULT texture + staging, CopyResource to
+    // the swapchain image, then Present. Nearest-neighbor scales if (w,h) does
+    // not match the current backbuffer. Caller should fall back to
+    // ClearAndPresent when this returns false.
+    bool PresentBgra(uint32_t width, uint32_t height, const uint8_t* pixels);
 
     // Host-side geometry for DrawDynamicMesh. Data is already validated by the
     // caller; the backend never interprets guest layouts — it only uploads and
@@ -356,6 +364,18 @@ public:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_decodedTextureUpload;
     D3D12_GPU_DESCRIPTOR_HANDLE m_decodedTextureSrvGpu = {};
     HRESULT m_lastPresentHr = S_OK;
+
+    // W6 PresentBgra path: persistent blit texture + upload staging.
+    // Texture state after a successful blit is COPY_SOURCE; next blit
+    // transitions it back to COPY_DEST before CopyTextureRegion.
+    bool EnsureFbTexture(uint32_t width, uint32_t height);
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_fbTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_fbUpload;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_fbFootprint = {};
+    uint32_t m_fbTexW = 0;
+    uint32_t m_fbTexH = 0;
+    D3D12_RESOURCE_STATES m_fbTexState = D3D12_RESOURCE_STATE_COPY_DEST;
+    std::vector<uint8_t> m_fbHost;
 
 DrawStats m_stats;
 

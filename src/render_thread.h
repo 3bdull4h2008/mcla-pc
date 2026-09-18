@@ -27,6 +27,7 @@ private:
     void processCommand(const RenderCommand& cmd);
 
     std::thread thread_;
+    std::thread heartbeat_;
     std::atomic<bool> running_;
     std::atomic<bool> shouldStop_;
     std::atomic<bool> d3d12Initialized_{false};

@@ -54,6 +54,9 @@ struct PresentCommand {
     uint32_t frameNumber;
     uint32_t obj;
     uint32_t swapInfo;
+    // W7: resolved surface VA (linear color buffer) when swapInfo is a
+    // swap-table slot rather than pixels. 0 = no resolved surface.
+    uint32_t surfaceVA;
 };
 
 struct SetRenderStateCommand {

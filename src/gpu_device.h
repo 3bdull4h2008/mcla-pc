@@ -17,6 +17,11 @@ constexpr uint32_t kMclaDeviceCreateAddr = 0x82413588;
 // Live device guest VA once creation succeeded; 0 before that.
 uint32_t DeviceGuestAddr();
 
+// W7 surface resolver: best-guess linear color buffer for 1280x720 present.
+// Populated by the flip picker / PresentKick / BLIT-CAP / VdSwap hooks.
+// Returns 0 when no candidate has been validated yet.
+uint32_t ResolvedPresentSurfaceVA();
+
 // Captured draw data for native renderer (V2 - safe VB/IB capture)
 struct CapturedDrawV2
 {
@@ -44,3 +49,7 @@ const CapturedDrawV2* mcla_gpu_GetLastDrawV2();
 uint32_t mcla_gpu_GetFrameCounter();
 
 } // namespace mcla::gpu
+
+// C-linkage wrapper so native_renderer.cpp can add VdSwap candidates.
+extern "C" void mcla_gpu_AddSurfaceCandidate(uint32_t va, uint32_t w,
+                                              uint32_t h, const char* src);

@@ -1606,6 +1606,14 @@ bool D3D12Backend::Resize(uint32_t width, uint32_t height) {
         m_fenceValues[i] = m_fenceValues[m_frameIndex];
     }
 
+    // Blit texture is sized to the backbuffer; recreate on next PresentBgra.
+    m_fbTexture.Reset();
+    m_fbUpload.Reset();
+    m_fbFootprint = {};
+    m_fbTexW = 0;
+    m_fbTexH = 0;
+    m_fbTexState = D3D12_RESOURCE_STATE_COPY_DEST;
+
     HRESULT hr = m_swapChain->ResizeBuffers(kBufferCount, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
     if (FAILED(hr)) {
         MCLA_LOG_ERROR("D3D12Backend: ResizeBuffers failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
@@ -1649,6 +1657,226 @@ bool D3D12Backend::BeginFrame() {
     m_inFrame = true;
     m_uploadOffset = 0;
     return true;
+}
+
+bool D3D12Backend::EnsureFbTexture(uint32_t width, uint32_t height) {
+    if (m_fbTexture && m_fbUpload && m_fbTexW == width && m_fbTexH == height) {
+        return true;
+    }
+
+    m_fbTexture.Reset();
+    m_fbUpload.Reset();
+    m_fbFootprint = {};
+    m_fbTexW = 0;
+    m_fbTexH = 0;
+    m_fbTexState = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    D3D12_HEAP_PROPERTIES defProps = {};
+    defProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    HRESULT hr = m_device->CreateCommittedResource(
+        &defProps, D3D12_HEAP_FLAG_NONE, &texDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr, IID_PPV_ARGS(&m_fbTexture));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: EnsureFbTexture CreateCommittedResource failed hr=0x{:08X}",
+                       static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    UINT64 totalBytes = 0;
+    m_device->GetCopyableFootprints(&texDesc, 0, 1, 0, &m_fbFootprint, nullptr, nullptr, &totalBytes);
+
+    D3D12_HEAP_PROPERTIES upProps = {};
+    upProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bufDesc = {};
+    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufDesc.Width = totalBytes;
+    bufDesc.Height = 1;
+    bufDesc.DepthOrArraySize = 1;
+    bufDesc.MipLevels = 1;
+    bufDesc.SampleDesc.Count = 1;
+    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    hr = m_device->CreateCommittedResource(&upProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                                           D3D12_RESOURCE_STATE_GENERIC_READ,
+                                           nullptr, IID_PPV_ARGS(&m_fbUpload));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: EnsureFbTexture staging failed hr=0x{:08X}",
+                       static_cast<uint32_t>(hr));
+        m_fbTexture.Reset();
+        m_fbFootprint = {};
+        return false;
+    }
+
+    m_fbTexW = width;
+    m_fbTexH = height;
+    m_fbTexState = D3D12_RESOURCE_STATE_COPY_DEST;
+    MCLA_LOG_INFO("D3D12Backend: blit framebuffer texture ready ({}x{}, R8G8B8A8, {} bytes)",
+                  width, height, totalBytes);
+    return true;
+}
+
+bool D3D12Backend::PresentBgra(uint32_t width, uint32_t height, const uint8_t* pixels) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized || !m_device || !pixels || width == 0 || height == 0) return false;
+
+    const uint32_t dstW = m_width;
+    const uint32_t dstH = m_height;
+    if (dstW == 0 || dstH == 0) return false;
+
+    const size_t dstBytes = static_cast<size_t>(dstW) * dstH * 4u;
+    if (m_fbHost.size() < dstBytes) {
+        m_fbHost.resize(dstBytes);
+    }
+
+    if (width == dstW && height == dstH) {
+        std::memcpy(m_fbHost.data(), pixels, dstBytes);
+    } else {
+        // Nearest-neighbor scale into the backbuffer-sized host buffer so a
+        // downsampled guest read still covers the full viewport.
+        for (uint32_t y = 0; y < dstH; ++y) {
+            const uint32_t sy = static_cast<uint32_t>(
+                (static_cast<uint64_t>(y) * height) / dstH);
+            const uint8_t* srcRow = pixels + static_cast<size_t>(sy) * width * 4u;
+            uint8_t* dstRow = m_fbHost.data() + static_cast<size_t>(y) * dstW * 4u;
+            for (uint32_t x = 0; x < dstW; ++x) {
+                const uint32_t sx = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(x) * width) / dstW);
+                std::memcpy(dstRow + static_cast<size_t>(x) * 4u,
+                            srcRow + static_cast<size_t>(sx) * 4u, 4u);
+            }
+        }
+    }
+
+    if (m_fence->GetCompletedValue() < m_currentFenceValue) {
+        if (FAILED(m_fence->SetEventOnCompletion(m_currentFenceValue, m_fenceEvent))) return false;
+        if (WaitForSingleObject(m_fenceEvent, INFINITE) != WAIT_OBJECT_0) return false;
+    }
+    if (!EnsureFbTexture(dstW, dstH)) return false;
+
+    // Fill the upload staging with the properly pitched rows.
+    {
+        void* mapped = nullptr;
+        D3D12_RANGE readRange = {0, 0};
+        HRESULT hr = m_fbUpload->Map(0, &readRange, &mapped);
+        if (FAILED(hr) || !mapped) {
+            MCLA_LOG_WARN("D3D12Backend: PresentBgra staging Map failed hr=0x{:08X}",
+                          static_cast<uint32_t>(hr));
+            return false;
+        }
+        const UINT64 rowPitch = m_fbFootprint.Footprint.RowPitch;
+        auto* dst = static_cast<uint8_t*>(mapped);
+        for (uint32_t y = 0; y < dstH; ++y) {
+            std::memcpy(dst + static_cast<size_t>(y) * rowPitch,
+                        m_fbHost.data() + static_cast<size_t>(y) * dstW * 4u,
+                        static_cast<size_t>(dstW) * 4u);
+        }
+        m_fbUpload->Unmap(0, nullptr);
+    }
+
+    if (!m_inFrame) {
+        if (!BeginFrame()) return false;
+    }
+
+    ID3D12Resource* back = m_renderTargets[m_frameIndex].Get();
+    if (!back) {
+        m_inFrame = false;
+        return false;
+    }
+
+    // staging -> DEFAULT texture
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = m_fbTexture.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = m_fbUpload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint = m_fbFootprint;
+
+    D3D12_RESOURCE_BARRIER barriers[2] = {};
+    UINT barrierCount = 0;
+    if (m_fbTexState != D3D12_RESOURCE_STATE_COPY_DEST) {
+        auto& b = barriers[barrierCount++];
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = m_fbTexture.Get();
+        b.Transition.StateBefore = m_fbTexState;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    {
+        auto& b = barriers[barrierCount++];
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = back;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    if (barrierCount) {
+        m_commandList->ResourceBarrier(barrierCount, barriers);
+    }
+    m_fbTexState = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    m_commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    // texture: COPY_DEST -> COPY_SOURCE; backbuffer: COPY_DEST -> PRESENT
+    barrierCount = 0;
+    {
+        auto& b = barriers[barrierCount++];
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = m_fbTexture.Get();
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_fbTexState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    m_commandList->ResourceBarrier(barrierCount, barriers);
+    m_commandList->CopyResource(back, m_fbTexture.Get());
+    barrierCount = 0;
+    {
+        auto& b = barriers[barrierCount++];
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = back;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    m_commandList->ResourceBarrier(barrierCount, barriers);
+
+    HRESULT hr = m_commandList->Close();
+    if (FAILED(hr)) {
+        MCLA_LOG_WARN("D3D12Backend: PresentBgra Close failed hr=0x{:08X}",
+                      static_cast<uint32_t>(hr));
+        m_inFrame = false;
+        return false;
+    }
+
+    ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
+    m_commandQueue->ExecuteCommandLists(1, ppCommandLists);
+
+    hr = m_swapChain->Present(1, 0);
+    m_lastPresentHr = hr;
+
+    m_currentFenceValue++;
+    m_commandQueue->Signal(m_fence.Get(), m_currentFenceValue);
+    m_fenceValues[m_frameIndex] = m_currentFenceValue;
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    m_inFrame = false;
+
+    m_stats.drawsIssued++;
+    m_stats.uploadsBytes += dstBytes;
+    return SUCCEEDED(hr);
 }
 
 bool D3D12Backend::ClearAndPresent(float r, float g, float b, float a) {
@@ -1753,6 +1981,14 @@ void D3D12Backend::Shutdown() {
     m_staticIndexBuffer.Reset();
     m_decodedTexture.Reset();
     m_decodedTextureUpload.Reset();
+    m_fbTexture.Reset();
+    m_fbUpload.Reset();
+    m_fbFootprint = {};
+    m_fbTexW = 0;
+    m_fbTexH = 0;
+    m_fbTexState = D3D12_RESOURCE_STATE_COPY_DEST;
+    m_fbHost.clear();
+    m_fbHost.shrink_to_fit();
     m_srvHeap.Reset();
     m_decodedTextureSrvGpu = {};
     m_testPipeline.Reset();

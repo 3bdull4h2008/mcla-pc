@@ -8,6 +8,7 @@
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "vfs_rpf.h"
 #include "kernel/memory.h"
+#include "apu/audio.h"
 
 // Forward declaration for GPU context poller (Phase 4)
 void StartGpuContextPoller();
@@ -59,6 +60,10 @@ bool App::Initialize() {
     MCLA_LOG_INFO("Game data root: {}", m_gameDataRoot.string());
     MCLA_LOG_INFO("Cache root: {}", m_cacheRoot.string());
 
+    // M5: open the SDL3 audio stream (48 kHz stereo s16). Failure is non-fatal
+    // — the game must keep booting even with no output device.
+    apu::Init();
+
     // Phase 5 (BOOT_REBUILD_PLAN): load the game image into the 4 GiB guest
     // window and prepare the boot context. Must run after logging + paths (boot
     // diagnostics need a sink) and before mcla_ApplyPatches (guest-memory hooks
@@ -96,18 +101,6 @@ bool App::Initialize() {
 
 m_running = true;
 
-    // Initialize SDL and create window
-    if (!InitSDL()) {
-        MCLA_LOG_ERROR("Failed to initialize SDL");
-        return false;
-    }
-
-    // Initialize D3D12 (must be after window creation for HWND)
-    if (!InitD3D12()) {
-        MCLA_LOG_ERROR("Failed to initialize D3D12");
-        return false;
-    }
-
     // Start GPU context poller (Phase 4) - waits for game to allocate GPU context
     StartGpuContextPoller();
 
@@ -120,8 +113,13 @@ m_running = true;
     // kernel stubs, logging) are up. The worker parks in the game main loop;
     // its outcome is reported in mcla.log by the boot watchdog.
     // NOTE: boot::Start blocks (watchdog loop) — render thread must already be up.
+    // W0: do not block Initialize on the boot watchdog — the SDL main loop
+    // must keep pumping events so the window stays visible even if the guest
+    // hits a fatal and parks.
     if (m_bootEntry != 0) {
-        boot::Start(m_bootEntry);
+        std::thread([entry = m_bootEntry]() {
+            boot::Start(entry);
+        }).detach();
     }
 
     return true;
@@ -135,6 +133,10 @@ void App::Shutdown() {
     if (!m_running && m_window == nullptr) return;
 
     m_running = false;
+
+    // Close audio before tearing down SDL so the stream/device goes away
+    // cleanly and does not race SDL_Quit.
+    apu::Shutdown();
 
     // P4.5': Stop the render thread before tearing down D3D12/window.
     // The render thread owns D3D12 and shuts it down in stop().

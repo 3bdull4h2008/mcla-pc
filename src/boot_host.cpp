@@ -650,7 +650,11 @@ static LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info)
         return EXCEPTION_CONTINUE_SEARCH;
 
     CaptureFaultInfo(info, g_report, false);
-    return EXCEPTION_EXECUTE_HANDLER;
+    // W0: do not let the process die. Park this thread so the window survives.
+    spdlog::default_logger()->flush();
+    for (;;)
+        Sleep(1000);
+    return EXCEPTION_EXECUTE_HANDLER; // unreachable
 }
 
 void BootWorker(uint32_t entryGuest)
@@ -689,7 +693,14 @@ void BootWorker(uint32_t entryGuest)
         const uintptr_t pc = (uintptr_t)addr;
         const uintptr_t rva = (g_moduleBase != 0 && pc >= g_moduleBase) ? pc - g_moduleBase : pc;
 
+        // W0 flood cap: full dump only for the first few exceptions. Later
+        // faults on other threads get a one-liner and still get parked.
+        static std::atomic<uint32_t> s_vehCount{0};
+        const uint32_t vehN = s_vehCount.fetch_add(1, std::memory_order_relaxed);
+        const bool fullDump = (vehN < 3);
+
         // Write crash dump to file immediately (in case log doesn't flush)
+        if (fullDump) {
         FILE* crashFile = nullptr;
         fopen_s(&crashFile, "crash_dump.txt", "w");
         if (crashFile) {
@@ -814,7 +825,12 @@ void BootWorker(uint32_t entryGuest)
             fflush(crashFile);
             fclose(crashFile);
         }
-        
+        } // fullDump
+
+        if (!fullDump) {
+            MCLA_LOG_ERROR("VEH[{}] (capped) code=0x{:08X} addr=0x{:p} nParams={} thread={}",
+                           vehN, code, addr, nInfo, GetCurrentThreadId());
+        } else {
         MCLA_LOG_ERROR("Vectored exception: code=0x{:08X} addr=0x{:p} rva=0x{:X} flags=0x{:X} nParams={} thread={}",
                        code, addr, rva, flags, nInfo, GetCurrentThreadId());
         for (DWORD i = 0; i < nInfo; ++i) {
@@ -864,7 +880,37 @@ void BootWorker(uint32_t entryGuest)
                 }
             }
         }
+        } // fullDump log
         spdlog::default_logger()->flush();
+
+        // W0: park guest (and any recoverable) AVs instead of letting Windows
+        // kill the thread/process via EXCEPTION_CONTINUE_SEARCH.
+        // 0x7E78xxxx = PPC_LOOKUP_FUNC(guest 0) wild-pointer family.
+        // Guest lr set while g_faultCtx is live = fault inside recompiled code.
+        bool wildParam = false;
+        if (code == 0xC0000005 && nInfo >= 2) {
+            const uint32_t p1 = (uint32_t)(uintptr_t)info[1];
+            if (p1 >= 0x7E000000u && p1 < 0x7F000000u)
+                wildParam = true;
+        }
+        const uint32_t glr = g_faultCtx ? (uint32_t)g_faultCtx->lr : 0u;
+        const bool guestLrSet = (g_faultCtx != nullptr) && glr != 0u && glr != 0x00FFFFFFu;
+        const bool guestAv = wildParam || guestLrSet || (g_faultCtx != nullptr && code == 0xC0000005);
+
+        // Park this thread forever for AVs / illegal insn / fp-div0. Never
+        // return to the faulting code. Other threads (window, render,
+        // workers) keep running so the process and HWND stay alive.
+        // W36: also park 0xC000008E (STATUS_FLOAT_DIVIDE_BY_ZERO) which
+        // the atArray allocator chain triggers when the TLS chain is broken.
+        if (code == 0xC0000005 || code == 0xC000001D || code == 0xC000012A ||
+            code == 0xC000008E) {
+            MCLA_LOG_ERROR("VEH W0: parking thread {} code=0x{:08X} guest={} wild={} lr={:08X} "
+                           "— process stays alive",
+                           GetCurrentThreadId(), code, guestAv ? 1 : 0, wildParam ? 1 : 0, glr);
+            spdlog::default_logger()->flush();
+            for (;;)
+                Sleep(1000);
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     });
 
@@ -1279,6 +1325,27 @@ void Start(uint32_t entryGuest)
 const BootReport& GetReport()
 {
     return g_report;
+}
+
+uint32_t GetBootWorkerReg(unsigned regIndex)
+{
+    if (!g_faultCtx) return 0;
+    // Only registers guaranteed to exist in PPCContext are returned
+    // directly. Non-volatile registers (r14-r31) may be compiled out
+    // when PPC_CONFIG_NON_VOLATILE_AS_LOCAL is set.
+    switch (regIndex) {
+    case 1:  return g_faultCtx->r1.u32;
+    case 3:  return g_faultCtx->r3.u32;
+    case 4:  return g_faultCtx->r4.u32;
+    case 5:  return g_faultCtx->r5.u32;
+    case 6:  return g_faultCtx->r6.u32;
+    case 7:  return g_faultCtx->r7.u32;
+    case 8:  return g_faultCtx->r8.u32;
+    case 9:  return g_faultCtx->r9.u32;
+    case 10: return g_faultCtx->r10.u32;
+    case 13: return g_faultCtx->r13.u32;
+    default: return 0;
+    }
 }
 
 } // namespace mcla::boot

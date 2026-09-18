@@ -6,6 +6,7 @@
 #include "heap.h"
 #include "memory.h"
 #include <memory>
+#include <cstring>
 #include "xam.h"
 #include "xdm.h"
 #include "kernel_objects.h"
@@ -2098,12 +2099,18 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
       (void)memC.ReadU32BE(0x82839254u, &gpuCtx);
       if (gpuCtx != 0)
         (void)memC.ReadU32BE(gpuCtx + 10908u, &put);
+      // w18: census the REAL writeback VA (CpEnableRPtrWriteBack publishes
+      // PhysToKernelVA(0x071D81BC)=C71D81BC). The old hard-coded 0xC701C4BC
+      // was a different word and always read 0 — hid the reinit unpark.
+      uint32_t rptrWbReal = 0;
+      (void)memC.ReadU32BE(0xC71D81BCu, &rptrWbReal);
       (void)memC.ReadU32BE(0xC701C4BCu, &rptrWb);
       MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} "
-                    "to={}ms lr={:08X} put={} rptrWB={:04X} pc={:08X}:{}",
+                    "to={}ms lr={:08X} put={} rptrWB={:04X} "
+                    "wb@C71D81BC={:08X} pc={:08X}:{}",
                     n, hot ? "!" : " ", GetCurrentThreadId(), objAddr,
                     WaitReason, GuestTimeoutToMilliseconds(Timeout), lr, put,
-                    rptrWb & 0xFFFF, pcBlk, pc);
+                    rptrWb & 0xFFFF, rptrWbReal, pcBlk, pc);
     }
   }
   // MAIN-THREAD PARK PROBE
@@ -2956,7 +2963,46 @@ void sub_821BD618(PPCContext &ctx, uint8_t *base) {
     sp = nextSp;
   }
   spdlog::default_logger()->flush();
-  ExitProcess(0x80000003); // STATUS_BREAKPOINT
+
+  // W0: NEVER ExitProcess from the guest fatal dispatcher. The host window
+  // + render thread must outlive any guest pause. Log and park this thread.
+  {
+    char msgBuf[192] = {0};
+    if (ctx.r3.u32 >= 0x82000000u && ctx.r3.u32 < 0x83000000u) {
+      if (const void *p = mem.Translate(ctx.r3.u32))
+        std::snprintf(msgBuf, sizeof(msgBuf), "%s",
+                      static_cast<const char *>(p));
+    }
+    MCLA_LOG_WARN("FATAL-SOFT: '{}' lr={:08X} — guest paused, host window stays",
+                  msgBuf, static_cast<uint32_t>(ctx.lr));
+    // w24: Resource fatal from the place-pass walk (lr=8260A8B0 A830→D2378,
+    // lr=82184514 84458→D2378) must soft-park and RETURN so the guest can
+    // retry — the A830/84458 tails already take delta-0 after D2378 returns.
+    // Also soft-park swfOBJECT::Fixup unknown-type (lr=825EF1FC after FDA90)
+    // so EF100 can finish the entry loop and write the real swfC vtable.
+    // Other fatals keep the permanent park (never ExitProcess).
+    const uint32_t lr32 = static_cast<uint32_t>(ctx.lr);
+    const bool resourceFatal =
+        lr32 == 0x8260A8B0u || lr32 == 0x82184514u ||
+        lr32 == 0x821D2378u ||
+        std::strstr(msgBuf, "Resource") != nullptr ||
+        std::strstr(msgBuf, "unknown type") != nullptr ||
+        std::strstr(msgBuf, "Fixup") != nullptr ||
+        lr32 == 0x825EF1FCu || lr32 == 0x825EF1A4u || lr32 == 0x825EF1DCu;
+    spdlog::default_logger()->flush();
+    if (resourceFatal) {
+      static std::atomic<uint32_t> s_resPark{0};
+      const uint32_t pn = s_resPark.fetch_add(1) + 1;
+      MCLA_LOG_WARN("FATAL-SOFT-RESOURCE-PARK #{} lr={:08X} r3={:08X} "
+                    "r5={:08X} — soft-park return (guest retry)",
+                    pn, lr32, ctx.r3.u32, ctx.r5.u32);
+      spdlog::default_logger()->flush();
+      return;
+    }
+    while (true) {
+      Sleep(1000);
+    }
+  }
 }
 
 // CRT init function that unconditionally calls fatal dispatcher - make it a
@@ -3280,27 +3326,39 @@ void XMAReleaseContext() { LOG_UTILITY("!!! STUB !!!"); }
 
 void XMACreateContext() { LOG_UTILITY("!!! STUB !!!"); }
 
-// uint32_t XAudioRegisterRenderDriverClient(be<uint32_t>* callback,
-// be<uint32_t>* driver)
-// {
-//     //printf("XAudioRegisterRenderDriverClient(): %x %x\n");
-//
-//     *driver = apu::RegisterClient(callback[0], callback[1]);
-//     return 0;
-// }
+// XAudio render-driver hooks (M5). Xenia/UnleashedRecomp ABI:
+//   callback_ptr[0] = guest fn, callback_ptr[1] = userdata
+//   samples = be<float> [6 ch * 256], channel-major.
+uint32_t XAudioRegisterRenderDriverClient(be<uint32_t> *callback,
+                                          be<uint32_t> *driver) {
+  if (driver) {
+    if (callback) {
+      *driver = apu::RegisterClient(callback[0], callback[1]);
+    } else {
+      *driver = apu::RegisterClient(0, 0);
+    }
+  }
+  return 0;
+}
 
-// void XAudioUnregisterRenderDriverClient()
-// {
-//     printf("!!! STUB !!! XAudioUnregisterRenderDriverClient\n");
-// }
+uint32_t XAudioUnregisterRenderDriverClient(uint32_t driver) {
+  (void)driver;
+  apu::UnregisterClient();
+  return 0;
+}
 
-// uint32_t XAudioSubmitRenderDriverFrame(uint32_t driver, void* samples)
-// {
-//     // printf("!!! STUB !!! XAudioSubmitRenderDriverFrame\n");
-//     apu::SubmitFrames(samples);
-//
-//     return 0;
-// }
+uint32_t XAudioSubmitRenderDriverFrame(uint32_t driver, void *samples) {
+  (void)driver;
+  apu::SubmitFrames(samples);
+  return 0;
+}
+
+uint32_t XAudioGetSpeakerConfig(be<uint32_t> *config) {
+  if (config) {
+    *config = 0x00010001;
+  }
+  return 0;
+}
 
 GUEST_FUNCTION_HOOK(__imp__XGetVideoMode, VdQueryVideoMode); // XGetVideoMode
 GUEST_FUNCTION_HOOK(__imp__XNotifyGetNext, XNotifyGetNext);
@@ -3660,7 +3718,6 @@ void NtCreateTimer() { LOG_UTILITY("!!! STUB !!!"); }
 void NtDeviceIoControlFile() { LOG_UTILITY("!!! STUB !!!"); }
 void NtReleaseMutant() { LOG_UTILITY("!!! STUB !!!"); }
 void NtSetTimerEx() { LOG_UTILITY("!!! STUB !!!"); }
-void XAudioGetSpeakerConfig() { LOG_UTILITY("!!! STUB !!!"); }
 uint32_t XMsgCancelIORequest(uint32_t App, XXOVERLAPPED *lpOverlapped) {
   (void)App;
   (void)lpOverlapped;
@@ -3748,9 +3805,6 @@ void XexCheckExecutablePages() {
 void _snprintf() { LOG_UTILITY("!!! STUB !!!"); }
 void _vsnprintf() { LOG_UTILITY("!!! STUB !!!"); }
 void sprintf() { LOG_UTILITY("!!! STUB !!!"); }
-void XAudioRegisterRenderDriverClient() { LOG_UTILITY("!!! STUB !!!"); }
-void XAudioUnregisterRenderDriverClient() { LOG_UTILITY("!!! STUB !!!"); }
-void XAudioSubmitRenderDriverFrame() { LOG_UTILITY("!!! STUB !!!"); }
 
 GUEST_FUNCTION_STUB(__imp__XamShowFriendsUI);
 GUEST_FUNCTION_STUB(__imp__XamShowGamerCardUIForXUID);
@@ -3799,7 +3853,7 @@ GUEST_FUNCTION_STUB(__imp__NtCreateTimer);
 GUEST_FUNCTION_STUB(__imp__NtDeviceIoControlFile);
 GUEST_FUNCTION_STUB(__imp__NtReleaseMutant);
 GUEST_FUNCTION_STUB(__imp__NtSetTimerEx);
-GUEST_FUNCTION_STUB(__imp__XAudioGetSpeakerConfig);
+GUEST_FUNCTION_HOOK(__imp__XAudioGetSpeakerConfig, XAudioGetSpeakerConfig);
 GUEST_FUNCTION_STUB(__imp__XMsgCancelIORequest);
 GUEST_FUNCTION_STUB(__imp__XamInputGetKeystrokeEx);
 GUEST_FUNCTION_STUB(__imp__XamParseGamerTileKey);
@@ -3821,6 +3875,9 @@ GUEST_FUNCTION_STUB(__imp__XeKeysConsoleSignatureVerification);
 GUEST_FUNCTION_STUB(__imp___snprintf);
 GUEST_FUNCTION_STUB(__imp___vsnprintf);
 GUEST_FUNCTION_STUB(__imp__sprintf);
-GUEST_FUNCTION_STUB(__imp__XAudioRegisterRenderDriverClient);
-GUEST_FUNCTION_STUB(__imp__XAudioUnregisterRenderDriverClient);
-GUEST_FUNCTION_STUB(__imp__XAudioSubmitRenderDriverFrame);
+GUEST_FUNCTION_HOOK(__imp__XAudioRegisterRenderDriverClient,
+                    XAudioRegisterRenderDriverClient);
+GUEST_FUNCTION_HOOK(__imp__XAudioUnregisterRenderDriverClient,
+                    XAudioUnregisterRenderDriverClient);
+GUEST_FUNCTION_HOOK(__imp__XAudioSubmitRenderDriverFrame,
+                    XAudioSubmitRenderDriverFrame);

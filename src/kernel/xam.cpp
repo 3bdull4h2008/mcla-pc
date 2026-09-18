@@ -262,18 +262,63 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
 {
     static int callCount = 0;
     callCount++;
-    if (callCount <= 20 || (callCount % 1000) == 0) {
-        MCLA_LOG_INFO("XamInputGetState(import)[{}]: userIndex={} flags={} state=0x{:x}",
-                      callCount, userIndex, flags, reinterpret_cast<uintptr_t>(state));
+    if (!state)
+        return 0; // ERROR_EMPTY / not connected
+
+    // W3: map host keyboard → XInput pad so menus can be driven.
+    //   arrows / WASD = dpad+left stick   Enter|Space=A   Esc|Backspace=B
+    //   Tab=START   Q/E=LB/RB   IJKL=right stick   U/O=LT/RT
+    int nkeys = 0;
+    const bool *k = SDL_GetKeyboardState(&nkeys);
+    auto down = [&](SDL_Keycode sym) -> bool {
+        if (!k || nkeys <= 0) return false;
+        const SDL_Scancode sc = SDL_GetScancodeFromKey(sym, nullptr);
+        if (sc == SDL_SCANCODE_UNKNOWN || static_cast<int>(sc) >= nkeys)
+            return false;
+        return k[sc];
+    };
+
+    uint16_t buttons = 0;
+    int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+    uint8_t lt = 0, rt = 0;
+
+    if (down(SDLK_UP) || down(SDLK_W)) { buttons |= XAMINPUT_GAMEPAD_DPAD_UP; ly = 32767; }
+    if (down(SDLK_DOWN) || down(SDLK_S)) { buttons |= XAMINPUT_GAMEPAD_DPAD_DOWN; ly = -32768; }
+    if (down(SDLK_LEFT) || down(SDLK_A)) { buttons |= XAMINPUT_GAMEPAD_DPAD_LEFT; lx = -32768; }
+    if (down(SDLK_RIGHT) || down(SDLK_D)) { buttons |= XAMINPUT_GAMEPAD_DPAD_RIGHT; lx = 32767; }
+    if (down(SDLK_RETURN) || down(SDLK_SPACE)) buttons |= XAMINPUT_GAMEPAD_A;
+    if (down(SDLK_ESCAPE) || down(SDLK_BACKSPACE)) buttons |= XAMINPUT_GAMEPAD_B;
+    if (down(SDLK_TAB)) buttons |= XAMINPUT_GAMEPAD_START;
+    if (down(SDLK_Q)) buttons |= XAMINPUT_GAMEPAD_LEFT_SHOULDER;
+    if (down(SDLK_E)) buttons |= XAMINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if (down(SDLK_I)) ry = 32767;
+    if (down(SDLK_K)) ry = -32768;
+    if (down(SDLK_J)) rx = -32768;
+    if (down(SDLK_L)) rx = 32767;
+    if (down(SDLK_U)) lt = 255;
+    if (down(SDLK_O)) rt = 255;
+
+    // Guest is big-endian PPC — store multi-byte fields swapped.
+    auto bswap16 = [](uint16_t v) -> uint16_t {
+        return static_cast<uint16_t>((v >> 8) | (v << 8));
+    };
+    auto bswap16s = [&](int16_t v) -> int16_t {
+        return static_cast<int16_t>(bswap16(static_cast<uint16_t>(v)));
+    };
+    state->dwPacketNumber = __builtin_bswap32(state->dwPacketNumber + 1);
+    state->Gamepad.wButtons = bswap16(buttons);
+    state->Gamepad.bLeftTrigger = lt;
+    state->Gamepad.bRightTrigger = rt;
+    state->Gamepad.sThumbLX = bswap16s(lx);
+    state->Gamepad.sThumbLY = bswap16s(ly);
+    state->Gamepad.sThumbRX = bswap16s(rx);
+    state->Gamepad.sThumbRY = bswap16s(ry);
+
+    if (callCount <= 8 || (callCount % 2000) == 0) {
+        MCLA_LOG_INFO("XamInputGetState[{}] port={} buttons={:04X} lx={} ly={}",
+                      callCount, userIndex, buttons, lx, ly);
     }
-    if (state)
-    {
-        state->dwPacketNumber = 0;
-        memset(&state->Gamepad, 0, sizeof(state->Gamepad));
-        // Simulate START button pressed
-        state->Gamepad.wButtons = XAMINPUT_GAMEPAD_START;
-    }
-    return 0;
+    return 0; // ERROR_SUCCESS
 }
 
 uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION* vibration)
