@@ -29,7 +29,7 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 #include <dbghelp.h>
 #include <unordered_map>
 
-// Forward declaration for generated code skip flags
+// Skip flag for generated code (defined in generated/ppc_xenon/ppc_recomp.49.cpp)
 extern std::atomic<bool> s_skipSub822FA958;
 
 // UILOAD thread tracking

@@ -28,6 +28,8 @@
 #include <vector>
 
 extern std::atomic<uint32_t> g_mainGuestThreadId;
+// Forward declaration for kernel tick pump (global namespace, defined in imports.cpp)
+void SignalSchedulerTickPublic();
 extern std::atomic<bool> s_inUILoad;
 
 // Defined later near the embedded-list helpers; used by GETDEV so the
@@ -1081,25 +1083,93 @@ PPC_FUNC(sub_821873E8) {
     }
   }
 
-  // After chain init, call UILOAD (sub_822C0980) directly on this thread.
-  // The VEH now handles crashes with patching (no parking for UILOAD).
+  // After chain init, dispatch the REAL boot-gate (sub_82131008) on this thread.
+  // It performs init + event-gate checks and calls UILOAD itself at guest
+  // 0x821310B0 with the correct r3=[0x82830998]. Calling UILOAD directly
+  // (prior rev) bypassed the gates. Per W36 note, preset [0x8212E6F0]=1 to
+  // skip the 823043F8/4348 crash path.
   static std::atomic<uint32_t> s_uiLoadCalled{0};
   if (s_uiLoadCalled.fetch_add(1) == 0) {
-    MCLA_LOG_WARN("FIX-821873E8 calling UILOAD (sub_822C0980) after chain init");
-    constexpr uint32_t kUILoadAddr = 0x822C0980;
-    PPCFunc *uiLoadFn = PPC_LOOKUP_FUNC(base, kUILoadAddr);
-    if (uiLoadFn) {
-      // UILOAD takes r3 = context pointer from [0x82830A00]
-      uint32_t uiLoadParam = 0;
-      auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
-      (void)mem2.ReadU32BE(0x82830A00, &uiLoadParam);
-      ctx.r3.u64 = uiLoadParam;
-      ctx.fpscr.disableFlushModeUnconditional();
-      MCLA_LOG_WARN("UILOAD started on boot worker thread");
+    MCLA_LOG_WARN("FIX-821873E8 dispatching BOOT-GATE (sub_82131008) after chain init");
+    auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
+    // ponytail: real init-done flag is [0x8288E6F0], not code addr 0x8212E6F0
+    uint32_t gateFlag = 0;
+    (void)mem2.ReadU32BE(0x8288E6F0u, &gateFlag);
+    MCLA_LOG_WARN("BOOT-GATE-FLAG [8288E6F0] = {:08X} -> 1", gateFlag);
+    (void)mem2.WriteU32BE(0x8288E6F0u, 1u);
+
+    // ponytail: seed the two 821C0750 event objects the gate checks (r3=82830ACC/AB8)
+    // If null, gate skips them and flows to UILOAD unblocked.
+    (void)mem2.WriteU32BE(0x82830ACCu, 0u);
+    (void)mem2.WriteU32BE(0x82830AB8u, 0u);
+
+    // ponytail: seed 821FC008 counter so it skips the semaphore wait block (sub_82305870)
+    (void)mem2.WriteU32BE(0x82830B14u, 0u);
+
+    // ponytail: pump scheduler tick semaphore (0x40004D7C) now so UILOAD's KeWait
+    // doesn't park forever on an unsignaled semaphore.
+    ::SignalSchedulerTickPublic();
+
+    constexpr uint32_t kBootGateAddr = 0x82131008;
+    if (auto *gateFn = mcla::kernel::g_memory.FindFunction(kBootGateAddr)) {
+      // ponytail: fresh ctx per house style (W32/W34 levers); gate takes no args, propagate stack only
+      PPCContext g{};
+      g.r1.u64 = ctx.r1.u64;
+      g.r13.u64 = ctx.r13.u64;
+      g.fpscr = ctx.fpscr;
+      g.lr = 0x821310BCu;
+      g.fpscr.disableFlushModeUnconditional();
+      MCLA_LOG_WARN("BOOT-GATE started on boot worker thread");
       s_inUILoad.store(true);
-      uiLoadFn(ctx, base);
+      
+      // ponytail: stage the gate calls manually to isolate hang point (per Rank 2 plan)
+      if (auto *fn823043F8 = mcla::kernel::g_memory.FindFunction(0x823043F8)) {
+        MCLA_LOG_WARN("GATE-STAGE init-823043F8");
+        fn823043F8(g, mcla::kernel::g_memory.base);
+      }
+      if (auto *fn82304348 = mcla::kernel::g_memory.FindFunction(0x82304348)) {
+        MCLA_LOG_WARN("GATE-STAGE init-82304348");
+        fn82304348(g, mcla::kernel::g_memory.base);
+      }
+      if (auto *fn821C0750_1 = mcla::kernel::g_memory.FindFunction(0x821C0750)) {
+        MCLA_LOG_WARN("GATE-STAGE event1-821C0750 r3=82830ACC");
+        g.r3.u32 = 0x82830ACCu; g.r4.u32 = g.r1.u32 + 80;
+        fn821C0750_1(g, mcla::kernel::g_memory.base);
+        MCLA_LOG_WARN("GATE-STAGE event1-ret r3={:08X}", g.r3.u32);
+      }
+      if (auto *fn821C0750_2 = mcla::kernel::g_memory.FindFunction(0x821C0750)) {
+        MCLA_LOG_WARN("GATE-STAGE event2-821C0750 r3=82830AB8");
+        g.r3.u32 = 0x82830AB8u; g.r4.u32 = g.r1.u32 + 84;
+        fn821C0750_2(g, mcla::kernel::g_memory.base);
+        MCLA_LOG_WARN("GATE-STAGE event2-ret r3={:08X}", g.r3.u32);
+      }
+      if (auto *fnUILOAD = mcla::kernel::g_memory.FindFunction(0x822C0980)) {
+        MCLA_LOG_WARN("GATE-STAGE UILOAD-enter r3=[82830998]");
+        g.r3.u32 = 0;
+        auto &mem3 = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem3.ReadU32BE(0x82830998, &g.r3.u32);
+        MCLA_LOG_WARN("GATE-STAGE UILOAD-param r3={:08X}", g.r3.u32);
+        fnUILOAD(g, mcla::kernel::g_memory.base);
+        MCLA_LOG_WARN("GATE-STAGE UILOAD-ret");
+      }
+      if (auto *fn821FC008 = mcla::kernel::g_memory.FindFunction(0x821FC008)) {
+        MCLA_LOG_WARN("GATE-STAGE 821FC008");
+        fn821FC008(g, mcla::kernel::g_memory.base);
+      }
+      if (auto *fn82304398 = mcla::kernel::g_memory.FindFunction(0x82304398)) {
+        MCLA_LOG_WARN("GATE-STAGE 82304398");
+        // ponytail: 82304398 does indirect vcall *(*(r3+4)+20)(r3) - guard wild r3
+        if (g.r3.u32 >= 0x82000000u) fn82304398(g, mcla::kernel::g_memory.base);
+        else MCLA_LOG_WARN("GATE-STAGE 82304398 SKIP bad r3={:08X}", g.r3.u32);
+      } else {
+        MCLA_LOG_WARN("GATE-STAGE 82304398 NOT FOUND");
+      }
+      // ponytail: restore stack frame (addi r1,128) and return like original gate epilogue
+      g.r1.u64 = g.r1.u64 + 128;
+      MCLA_LOG_WARN("BOOT-GATE completed on boot worker thread r1={:08X}", g.r1.u32);
       s_inUILoad.store(false);
-      MCLA_LOG_WARN("UILOAD completed on boot worker thread");
+      ctx.r1.u64 = g.r1.u64;
+      MCLA_LOG_WARN("BOOT-GATE completed on boot worker thread r1={:08X}", g.r1.u32);
     }
   }
 

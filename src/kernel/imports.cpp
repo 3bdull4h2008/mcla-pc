@@ -22,11 +22,13 @@
 std::atomic<uint32_t> g_mainGuestThreadId{0};
 
 // Forward declaration for VSync thread's scheduler tick signaling.
-// Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
-// This is the kernel-role duty that the real hardware GPU ISR/vblank path would
-// perform. The game's main thread waits on 0x40004D7C with ~30ms timeout;
-// without this signal, the main thread parks forever.
-static void SignalSchedulerTick();
+    // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
+    // This is the kernel-role duty that the real hardware GPU ISR/vblank path would
+    // perform. The game's main thread waits on 0x40004D7C with ~30ms timeout;
+    // without this signal, the main thread parks forever.
+    static void SignalSchedulerTick();
+    // Non-static wrapper for cross-TU calls (e.g., gpu_device.cpp boot gate).
+    void SignalSchedulerTickPublic() { SignalSchedulerTick(); }
 
 static std::atomic<uint32_t> g_keSetEventGeneration;
 
