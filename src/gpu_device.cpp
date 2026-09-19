@@ -1119,6 +1119,41 @@ PPC_FUNC(sub_821873E8) {
       g.fpscr = ctx.fpscr;
       g.lr = 0x821310BCu;
       g.fpscr.disableFlushModeUnconditional();
+
+      // ponytail: create GFx loader object BEFORE gate stages so it exists even if gate hangs
+      // The ctor 824C6F08 writes vtable 0x820736DC at offset 0 and 0x820736B0 at offset 672.
+      MCLA_LOG_ERROR("GFX-BLOCK: entered pre-gate");
+      uint32_t gfxLoader = mem.Alloc(800, 16); // enough for loader object
+      MCLA_LOG_ERROR("GFX-ALLOC loader={:08X} null={}", gfxLoader, gfxLoader == 0);
+      if (gfxLoader) {
+        for (uint32_t off = 0; off < 800; off += 4)
+          (void)mem.WriteU32BE(gfxLoader + off, 0);
+        if (auto *ctorFn = mcla::kernel::g_memory.FindFunction(0x824C6F08u)) {
+          MCLA_LOG_ERROR("GFX-CTOR-FN found at 824C6F08");
+          PPCContext gfxP{};
+          gfxP.r1.u64 = ctx.r1.u64;
+          gfxP.r13.u64 = ctx.r13.u64;
+          gfxP.fpscr = ctx.fpscr;
+          gfxP.r3.u64 = gfxLoader; // ctor expects object pointer in r3
+          MCLA_LOG_ERROR("GFX-CTOR entering loader={:08X}", gfxLoader);
+          ctorFn(gfxP, mcla::kernel::g_memory.base);
+          uint32_t vt = 0, vt2 = 0;
+          (void)mem.ReadU32BE(gfxLoader, &vt);
+          (void)mem.ReadU32BE(gfxLoader + 672, &vt2);
+          MCLA_LOG_ERROR("GFX-CTOR done loader={:08X} vt0={:08X} vt672={:08X}", gfxLoader, vt, vt2);
+          
+          // ponytail: fix vtable pointers to correct values (recompiler computes wrong addr)
+          // off_820736DC = 0x820736D8, off_820736B0 = 0x820736B8
+          (void)mem.WriteU32BE(gfxLoader, 0x820736D8u);
+          (void)mem.WriteU32BE(gfxLoader + 672, 0x820736B8u);
+          MCLA_LOG_ERROR("GFX-VTABLE-FIXED loader={:08X} vt0=820736D8 vt672=820736B8", gfxLoader);
+        } else {
+          MCLA_LOG_ERROR("GFX-CTOR-FN NOT FOUND at 824C6F08");
+        }
+      } else {
+        MCLA_LOG_ERROR("GFX-ALLOC FAILED");
+      }
+
       MCLA_LOG_WARN("BOOT-GATE started on boot worker thread");
       s_inUILoad.store(true);
       
@@ -5159,9 +5194,9 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
   };
   GfxHit gfx[6];
   int nGfx = 0;
-  static const uint32_t kScanLo[] = {0xA0000000u, 0xC5000000u, 0xC7000000u};
-  static const uint32_t kScanHi[] = {0xA0800000u, 0xC6000000u, 0xC8000000u};
-  for (int band = 0; band < 3 && nGfx < 6; ++band) {
+  static const uint32_t kScanLo[] = {0xA0000000u, 0xC5000000u, 0xC7000000u, 0xCA000000u};
+  static const uint32_t kScanHi[] = {0xA0800000u, 0xC6000000u, 0xC8000000u, 0xCB000000u};
+  for (int band = 0; band < 4 && nGfx < 6; ++band) {
     for (uint32_t a = kScanLo[band]; a < kScanHi[band] && nGfx < 6; a += 0x40) {
       uint32_t w0 = 0;
       if (!mem.ReadU32BE(a, &w0))

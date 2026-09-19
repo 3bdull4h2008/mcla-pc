@@ -494,3 +494,4 @@ target_include_directories(phase0_validator PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenonRecomp/thirdparty/libmspack/libmspack/mspack")
 target_compile_definitions(phase0_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 target_link_libraries(phase0_validator PRIVATE fmt::fmt spdlog::spdlog_header_only)
+
