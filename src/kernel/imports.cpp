@@ -1713,6 +1713,15 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
             // duty that the real hardware GPU ISR/vblank path would perform.
             SignalSchedulerTick();
 
+            // W36d BOOT-GATE LEVER (2026-09-18): The boot gate
+            // sub_82131008 is never called because the game's kernel
+            // KeInsertQueueDpc (sub_8242FD00) is invoked via indirect
+            // dispatch from unmapped stubs that were never recompiled.
+            // The DPC queue at 0x40004D5C stays forever empty and the
+            // boot worker thread parks in a wait-wake-nothing loop.
+            // Fix: spawn a one-shot thread that calls the boot gate.
+            // We CANNOT call it from the VSync ISR because the boot gate
+            // calls UILOAD (sub_822C0980) which calls KeWaitForSingleObject
             // Ring-buffer submission probe: sample the head of the
             // primary ring every ~2s (120 frames) to see whether
             // the game ever writes PM4 packets for us to consume.

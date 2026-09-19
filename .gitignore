@@ -1,18 +1,18 @@
-# ── Build output ─────────────────────────────────────────────
+﻿# Build output
 /build/
 /build_pathb/
 /pathb/
 /build-smoke/
 /build-standalone/
 
-# ── Derived / regenerable ───────────────────────────────────
+# Derived / regenerable
 /docs/
 /game_data/
 /mcla extracted cache/
 /.research/
 /_archive/
 
-# ── Binaries / downloaded ──────────────────────────────────
+# Binaries / downloaded
 /SDL3.zip
 /SDL3_extract/
 /tools/
@@ -20,7 +20,7 @@ rexglue-sdk/
 *.exe
 *.dll
 
-# ── Logs / dumps / crash artifacts ─────────────────────────
+# Logs / dumps / crash artifacts
 *.log
 *.dmp
 *.tracy
@@ -29,9 +29,9 @@ crash_log_early.txt
 boot_stderr*.log
 boot_stdout*.log
 boot_test_capture.png
-/_logs/
+/logs/
 
-# ── Build artifacts ────────────────────────────────────────
+# Build artifacts
 *.obj
 *.d
 *.pid
@@ -44,21 +44,36 @@ build_err.txt
 build_out.txt
 cache/
 
-# ── AI tooling (local only) ─────────────────────────────────
+# Generated / regenerable source
+generated/
+generated/default/mcla_recomp.*.cpp
+generated/default/func_lookup.clixml
+
+# SDL3 binaries
+third_party/SDL3/SDL3-3.2.6/lib/
+third_party/SDL3/lib/
+
+# Archives
+*.tar.gz
+*.tgz
+*.zip
+*.gz
+
+# AI tooling (local only)
 .opencode/
 .clinerules/
 .mcp.json
 
-# ── Local tooling / caches ──────────────────────────────────
+# Local tooling / caches
 .cache/
 .freebuff/
 .vscode/
 
-# ── Local config ────────────────────────────────────────────
+# Local config
 /opencode.json
 /config/opencode.json
 /config/config.json
 
-# ── OS / editor ─────────────────────────────────────────────
+# OS / editor
 Thumbs.db
 .DS_Store

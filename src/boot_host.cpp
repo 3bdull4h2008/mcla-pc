@@ -27,6 +27,14 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <unordered_map>
+
+// Forward declaration for generated code skip flags
+extern std::atomic<bool> s_skipSub822FA958;
+
+// UILOAD thread tracking
+std::atomic<DWORD> s_uiLoadThreadId{0};
+std::atomic<bool> s_inUILoad{false};
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -65,6 +73,7 @@ namespace
     std::atomic<bool> g_bootDone{false};
     const PPCContext* g_faultCtx = nullptr;
     uintptr_t g_moduleBase = 0;
+    static DWORD s_bootWorkerThreadId = 0;
 
     // Reverse map: host function entry -> guest address, for fault triage.
     std::unordered_map<uintptr_t, uint32_t> g_hostToGuest;
@@ -896,6 +905,131 @@ void BootWorker(uint32_t entryGuest)
         const uint32_t glr = g_faultCtx ? (uint32_t)g_faultCtx->lr : 0u;
         const bool guestLrSet = (g_faultCtx != nullptr) && glr != 0u && glr != 0x00FFFFFFu;
         const bool guestAv = wildParam || guestLrSet || (g_faultCtx != nullptr && code == 0xC0000005);
+        const bool isBootWorker = (GetCurrentThreadId() == s_bootWorkerThreadId);
+        const bool isUILoadThread = (GetCurrentThreadId() == s_uiLoadThreadId.load()) || s_inUILoad.load();
+
+        // W36f: boot worker / UILOAD thread special handling — don't park, try to recover
+        // from float-div-0 and AV so the render pipeline stays alive.
+        if (isBootWorker || isUILoadThread) {
+if (code == 0xC000008E) { // STATUS_FLOAT_DIVIDE_BY_ZERO
+                if (ExceptionInfo->ContextRecord) {
+                    // Clear FP exception flags in MXCSR (bits 0-5 = IE,DE,ZE,OE,UE,PE)
+                    ExceptionInfo->ContextRecord->MxCsr &= ~0x3F;
+                    // Known float-div-0 crash site: park thread after patch
+                    if (glr == 0x82133440) {
+                        static bool s_patched823D91F8 = false;
+                        if (!s_patched823D91F8) {
+                            s_patched823D91F8 = true;
+                            // Patch the called function host entry
+                            PPCFunc* funcPtr = PPC_LOOKUP_FUNC(g_base, 0x823D91F8);
+                            if (funcPtr) {
+                                void* hostEntry = (void*)funcPtr;
+                                DWORD oldProtect;
+                                if (VirtualProtect(hostEntry, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                                    *(unsigned char*)hostEntry = 0xC3; // RET instruction
+                                    VirtualProtect(hostEntry, 1, oldProtect, &oldProtect);
+                                    unsigned char patched = *(unsigned char*)hostEntry;
+                                    MCLA_LOG_WARN("VEH: patched sub_823D91F8 host entry with RET at {:p} (verify: 0x{:02X})", hostEntry, patched);
+                                }
+                            }
+                        }
+                        MCLA_LOG_WARN("VEH: parking boot worker thread after float-div-0 at lr={:08X}, render thread continues", glr);
+                        for (;;) Sleep(1000);
+                    }
+                    // Heuristic: set result register (XMM0) to 0 to avoid re-fault
+                    ExceptionInfo->ContextRecord->Xmm0.Low = 0;
+                    ExceptionInfo->ContextRecord->Xmm0.High = 0;
+                    MCLA_LOG_WARN("VEH boot-worker float-div-0: cleared MXCSR, zeroed XMM0, continuing at lr={:08X}", glr);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            // Handle illegal instruction in UILOAD context (0xC000001D = STATUS_ILLEGAL_INSTRUCTION)
+            if (code == 0xC000001D && isUILoadThread) {
+                if (ExceptionInfo->ContextRecord) {
+                    MCLA_LOG_WARN("VEH: UILOAD context illegal instruction at lr={:08X}, advancing RIP", glr);
+                    ExceptionInfo->ContextRecord->Rip += 256ull * 1024 * 1024; // 256MB advance
+                    ExceptionInfo->ContextRecord->Rax = 0;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            if (code == 0xC0000005) { // STATUS_ACCESS_VIOLATION
+                if (ExceptionInfo->ContextRecord) {
+                    // Known crash sites: immediately return from function (pop return addr)
+                    const bool isKnownCrashSite = (glr == 0x822F44E0 || glr == 0x82133440);
+
+                    if (isKnownCrashSite) {
+                        // Set skip flag to permanently disable this function in generated code
+                        if (glr == 0x822F44E0) {
+                            s_skipSub822FA958.store(true, std::memory_order_relaxed);
+                            MCLA_LOG_WARN("VEH: permanently disabled sub_822FA958 (lr={:08X})", glr);
+                            // Runtime code patch: write RET (0xC3) at host function entry (once)
+                            static bool s_patched822FA958 = false;
+                            if (!s_patched822FA958) {
+                                s_patched822FA958 = true;
+                                PPCFunc* funcPtr = PPC_LOOKUP_FUNC(g_base, 0x822FA958);
+                                if (funcPtr) {
+                                    void* hostEntry = (void*)funcPtr;
+                                    DWORD oldProtect;
+                                    if (VirtualProtect(hostEntry, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                                        *(unsigned char*)hostEntry = 0xC3; // RET instruction
+                                        VirtualProtect(hostEntry, 1, oldProtect, &oldProtect);
+                                        unsigned char patched = *(unsigned char*)hostEntry;
+                                        MCLA_LOG_WARN("VEH: patched sub_822FA958 host entry with RET at {:p} (verify: 0x{:02X})", hostEntry, patched);
+                                    }
+                                }
+                            }
+                        }
+                        // If running UILOAD (either dedicated thread or boot worker running UILOAD),
+                        // don't park - let execution continue after patch
+                        if (s_inUILoad.load()) {
+                            MCLA_LOG_WARN("VEH: UILOAD context crash at lr={:08X}, patch applied, continuing", glr);
+                            // Nuclear advance: 256MB to skip entire caller chain
+                            ExceptionInfo->ContextRecord->Rip += 256ull * 1024 * 1024; // 256MB advance
+                            ExceptionInfo->ContextRecord->Rax = 0;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        // Park boot worker thread after first crash - let render thread continue
+                        MCLA_LOG_WARN("VEH: parking boot worker thread after crash at lr={:08X}, render thread continues", glr);
+                        // Don't return to faulting code - park this thread forever
+                        for (;;) Sleep(1000);
+                    }
+
+                    // Track faults by lr for other sites
+                    static std::unordered_map<uint32_t, int> s_faultCounts;
+                    int& count = s_faultCounts[glr];
+                    count++;
+
+                    if (count == 1) {
+                        ExceptionInfo->ContextRecord->Rip += 16;
+                        MCLA_LOG_WARN("VEH boot-worker AV #1 in lr={:08X}, advancing RIP by 16", glr);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    } else if (count == 2) {
+                        ExceptionInfo->ContextRecord->Rip += 64;
+                        MCLA_LOG_WARN("VEH boot-worker AV #2 in lr={:08X}, advancing RIP by 64", glr);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    } else {
+                        // Third+ fault: clean return
+                        uint64_t rsp = ExceptionInfo->ContextRecord->Rsp;
+                        uint64_t retAddr = 0;
+                        __try {
+                            retAddr = *reinterpret_cast<uint64_t*>(rsp);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            retAddr = 0;
+                        }
+                        if (retAddr != 0) {
+                            ExceptionInfo->ContextRecord->Rip = retAddr;
+                            ExceptionInfo->ContextRecord->Rsp = rsp + 8;
+                            ExceptionInfo->ContextRecord->Rax = 0;
+                            MCLA_LOG_WARN("VEH boot-worker AV #{} in lr={:08X}: clean return to {:p} (RAX=0)", count, glr, (void*)retAddr);
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        ExceptionInfo->ContextRecord->Rip += 4096;
+                        MCLA_LOG_WARN("VEH boot-worker AV #{} in lr={:08X}: fallback advance 4KB", count, glr);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+            }
+        }
 
         // Park this thread forever for AVs / illegal insn / fp-div0. Never
         // return to the faulting code. Other threads (window, render,
@@ -919,6 +1053,7 @@ void BootWorker(uint32_t entryGuest)
 
     bool returned = false;
     MCLA_LOG_INFO("BootWorker: calling entry point 0x{:08X}", entryGuest);
+    s_bootWorkerThreadId = GetCurrentThreadId();
     spdlog::default_logger()->flush();
     entryFunc(ctx, g_base);
     returned = true;

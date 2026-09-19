@@ -28,7 +28,6 @@
 #include <vector>
 
 extern std::atomic<uint32_t> g_mainGuestThreadId;
-extern std::atomic<bool> s_inUILoad;
 
 // Defined later near the embedded-list helpers; used by GETDEV so the
 // 0x827D838C device has a live vtable when callers dispatch +88.
@@ -1081,25 +1080,23 @@ PPC_FUNC(sub_821873E8) {
     }
   }
 
-  // After chain init, call UILOAD (sub_822C0980) directly on this thread.
-  // The VEH now handles crashes with patching (no parking for UILOAD).
+  // After chain init, call UILOAD (sub_822C0980) directly to trigger GFx init.
+  // This is what the boot gate (sub_82131008) does unconditionally.
+  // VEH will handle any crashes by skipping.
   static std::atomic<uint32_t> s_uiLoadCalled{0};
   if (s_uiLoadCalled.fetch_add(1) == 0) {
     MCLA_LOG_WARN("FIX-821873E8 calling UILOAD (sub_822C0980) after chain init");
     constexpr uint32_t kUILoadAddr = 0x822C0980;
     PPCFunc *uiLoadFn = PPC_LOOKUP_FUNC(base, kUILoadAddr);
     if (uiLoadFn) {
-      // UILOAD takes r3 = context pointer from [0x82830A00]
+      // UILOAD takes r3 = some context pointer from [0x82830A00]
+      // The boot gate loads r3 from [0x82830A00] before calling UILOAD
       uint32_t uiLoadParam = 0;
       auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
       (void)mem2.ReadU32BE(0x82830A00, &uiLoadParam);
       ctx.r3.u64 = uiLoadParam;
-      ctx.fpscr.disableFlushModeUnconditional();
-      MCLA_LOG_WARN("UILOAD started on boot worker thread");
-      s_inUILoad.store(true);
       uiLoadFn(ctx, base);
-      s_inUILoad.store(false);
-      MCLA_LOG_WARN("UILOAD completed on boot worker thread");
+      MCLA_LOG_WARN("FIX-821873E8 UILOAD returned");
     }
   }
 
