@@ -1205,6 +1205,38 @@ PPC_FUNC(sub_821873E8) {
       s_inUILoad.store(false);
       ctx.r1.u64 = g.r1.u64;
       MCLA_LOG_WARN("BOOT-GATE completed on boot worker thread r1={:08X}", g.r1.u32);
+
+      // ponytail: call factory 82488C98 to create loader WITH movie (takes 4 args)
+      // Factory takes: (dest, unk, unk, unk) - returns loader with movie
+      if (auto *factoryFn = mcla::kernel::g_memory.FindFunction(0x82488C98u)) {
+        MCLA_LOG_ERROR("GFX-FACTORY: calling 82488C98");
+        uint32_t factoryDest = mem.Alloc(800, 16);
+        if (factoryDest) {
+          for (uint32_t off = 0; off < 800; off += 4)
+            (void)mem.WriteU32BE(factoryDest + off, 0);
+          PPCContext fctx{};
+          fctx.r1.u64 = ctx.r1.u64;
+          fctx.r13.u64 = ctx.r13.u64;
+          fctx.fpscr = ctx.fpscr;
+          fctx.r3.u64 = factoryDest;
+          fctx.r4.u64 = 0;
+          fctx.r5.u64 = 0;
+          fctx.r6.u64 = 0;
+          MCLA_LOG_ERROR("GFX-FACTORY: calling 82488C98 dest={:08X}", factoryDest);
+          factoryFn(fctx, mcla::kernel::g_memory.base);
+          uint32_t vt = 0, movie = 0;
+          (void)mem.ReadU32BE(factoryDest, &vt);
+          (void)mem.ReadU32BE(factoryDest + 4, &movie);
+          MCLA_LOG_ERROR("GFX-FACTORY done dest={:08X} vt={:08X} movie={:08X}", factoryDest, vt, movie);
+          
+          // ponytail: if factory created loader with movie, also fix vtable
+          if (vt >= 0x82073000u && vt < 0x82074000u) {
+            (void)mem.WriteU32BE(factoryDest, 0x820736D8u);
+            (void)mem.WriteU32BE(factoryDest + 672, 0x820736B8u);
+            MCLA_LOG_ERROR("GFX-FACTORY-VTABLE-FIXED dest={:08X}", factoryDest);
+          }
+        }
+      }
     }
   }
 
