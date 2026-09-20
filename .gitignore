@@ -69,6 +69,10 @@ third_party/SDL3/lib/
 .opencode/
 .clinerules/
 .mcp.json
+# NOTE: /.qoder/ is deliberately NOT ignored - it holds AGENTS-facing project config
+# (.qoder/settings.json = project MCP servers, .qoder/skills/ = the five workflow skills)
+# that must survive a clone. Only per-machine overrides stay local.
+/.qoder/settings.local.json
 
 # Local tooling / caches
 .cache/
@@ -83,3 +87,8 @@ third_party/SDL3/lib/
 # OS / editor
 Thumbs.db
 .DS_Store
+
+# Python bytecode from tools/*.py (the audit scripts import each other)
+__pycache__/
+*.pyc
+

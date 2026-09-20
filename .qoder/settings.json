@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "ida-pro": {
+      "command": "python",
+      "args": [
+        "C:\\Users\\abdul\\.local\\share\\mcp\\ida-bridge.py"
+      ],
+      "timeout": 120000
+    },
+    "renderdoc": {
+      "command": "python",
+      "args": [
+        "-m",
+        "renderdoc_mcp"
+      ],
+      "env": {
+        "RENDERDOC_MODULE_PATH": "C:\\Program Files\\RenderDoc",
+        "RENDERDOC_QRENDERDOC_PATH": "C:\\Program Files\\RenderDoc\\qrenderdoc.exe"
+      }
+    }
+  }
+}
