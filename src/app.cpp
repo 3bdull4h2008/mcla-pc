@@ -6,7 +6,7 @@
 #include "renderer_mode.h"
 #include "render_thread.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
-#include "vfs_rpf.h"
+#include "fs/vfs_rpf.h"
 #include "kernel/memory.h"
 #include "apu/audio.h"
 

@@ -20,8 +20,8 @@
 //   - PipelineCache insert/find + bounded FIFO eviction.
 // Exit code 0 = clean, 1 = errors found.
 
-#include "shader_translator.h"
-#include "pipeline_cache.h"
+#include "renderer/shader_translator.h"
+#include "renderer/pipeline_cache.h"
 #include "raw_ucode_corpus.h"
 
 #include <cstdint>

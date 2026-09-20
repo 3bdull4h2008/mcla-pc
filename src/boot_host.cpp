@@ -666,6 +666,19 @@ static LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info)
     return EXCEPTION_EXECUTE_HANDLER; // unreachable
 }
 
+// SEH-safe stack-slot read: C-style free function with no C++ objects that
+// require unwinding. clang-cl ICEs compiling __try inside the VEH lambda
+// below (same ICE class as kernel/heap.cpp SehO1Allocate and the note at
+// line 653: SEH + unwinding objects in one function). Callers pass POD only.
+#if defined(_MSC_VER)
+static uint64_t SehReadStackSlot(const uint64_t *p)
+{
+    uint64_t v = 0;
+    __try { v = *p; } __except (EXCEPTION_EXECUTE_HANDLER) { v = 0; }
+    return v;
+}
+#endif
+
 void BootWorker(uint32_t entryGuest)
 {
     // Publish this host thread as the guest "main thread" for park probes.
@@ -994,39 +1007,24 @@ if (code == 0xC000008E) { // STATUS_FLOAT_DIVIDE_BY_ZERO
                         for (;;) Sleep(1000);
                     }
 
-                    // Track faults by lr for other sites
-                    static std::unordered_map<uint32_t, int> s_faultCounts;
-                    int& count = s_faultCounts[glr];
-                    count++;
-
-                    if (count == 1) {
-                        ExceptionInfo->ContextRecord->Rip += 16;
-                        MCLA_LOG_WARN("VEH boot-worker AV #1 in lr={:08X}, advancing RIP by 16", glr);
-                        return EXCEPTION_CONTINUE_EXECUTION;
-                    } else if (count == 2) {
-                        ExceptionInfo->ContextRecord->Rip += 64;
-                        MCLA_LOG_WARN("VEH boot-worker AV #2 in lr={:08X}, advancing RIP by 64", glr);
-                        return EXCEPTION_CONTINUE_EXECUTION;
-                    } else {
-                        // Third+ fault: clean return
-                        uint64_t rsp = ExceptionInfo->ContextRecord->Rsp;
-                        uint64_t retAddr = 0;
-                        __try {
-                            retAddr = *reinterpret_cast<uint64_t*>(rsp);
-                        } __except (EXCEPTION_EXECUTE_HANDLER) {
-                            retAddr = 0;
-                        }
-                        if (retAddr != 0) {
-                            ExceptionInfo->ContextRecord->Rip = retAddr;
-                            ExceptionInfo->ContextRecord->Rsp = rsp + 8;
-                            ExceptionInfo->ContextRecord->Rax = 0;
-                            MCLA_LOG_WARN("VEH boot-worker AV #{} in lr={:08X}: clean return to {:p} (RAX=0)", count, glr, (void*)retAddr);
-                            return EXCEPTION_CONTINUE_EXECUTION;
-                        }
-                        ExceptionInfo->ContextRecord->Rip += 4096;
-                        MCLA_LOG_WARN("VEH boot-worker AV #{} in lr={:08X}: fallback advance 4KB", count, glr);
-                        return EXCEPTION_CONTINUE_EXECUTION;
-                    }
+                    // EXPERIMENT (session 79, user-approved): the recovery removed here
+                    // advanced the host RIP by 16/64/4096 bytes and fabricated returns
+                    // with RAX=0, so the guest executed control flow the PPC binary does
+                    // not describe -- exactly what PLAN_VMX128 risk R5 forbids. It fired
+                    // 703 times at one lr in build/smoke_long2.log. Report the real fault
+                    // and decline instead, so the first divergence is observable.
+                    const ULONG_PTR accessType =
+                        ExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+                    const void* faultAddr = reinterpret_cast<const void*>(
+                        ExceptionInfo->ExceptionRecord->ExceptionInformation[1]);
+                    MCLA_LOG_WARN(
+                        "VEH-NEUTRAL guest AV: lr={:08X} {} host addr {:p} (hostRip={:p}) "
+                        "-- recovery disabled, declining",
+                        glr,
+                        accessType == 0 ? "read of"
+                                        : (accessType == 1 ? "write to" : "exec of"),
+                        faultAddr, (void*)ExceptionInfo->ContextRecord->Rip);
+                    return EXCEPTION_CONTINUE_SEARCH;
                 }
             }
         }

@@ -12,7 +12,7 @@
 #include "kernel/memory.h"
 #include "logging.h"
 #include <cpu/ppc_context.h>
-#include "vfs_rpf.h"
+#include "fs/vfs_rpf.h"
 
 #include <atomic>
 #include <chrono>
@@ -1065,21 +1065,27 @@ PPC_FUNC(sub_821873E8) {
                   n, ctx.r13.u32, tlsTable, slot12,
                   static_cast<uint32_t>(ctx.lr));
 
-// Initialize the TLS chain for this thread's TLS table so future
-  // allocations don't hit this path again.
+// Per-TLS-table chain init (global-once starved thread 2+; heal each dead table).
   if (tlsOk && (slot12 == 0 || slot12 == 0xCDCDCDCDu)) {
-    static std::atomic<uint32_t> s_chainInitDone{0};
-    // Per-TLS-table init: use tlsTable as key. Since we can't easily
-    // track per-table, just init once globally (boot worker runs first).
-    if (s_chainInitDone.fetch_add(1) == 0) {
+    static std::mutex s_tlsChainMtx;
+    static std::unordered_set<uint32_t> s_tlsChainDone;
+    std::lock_guard<std::mutex> lk(s_tlsChainMtx);
+    uint32_t cur = 0;
+    (void)mem.ReadU32BE(tlsTable + 12, &cur);
+    if ((cur == 0 || cur == 0xCDCDCDCDu) && s_tlsChainDone.find(tlsTable) == s_tlsChainDone.end()) {
       MCLA_LOG_WARN("FIX-821873E8 initializing TLS chain for tlsTable={:08X}", tlsTable);
       uint32_t allocatorObj = mem.Alloc(16, 16);
       uint32_t vtable = mem.Alloc(16, 16);
       if (allocatorObj != 0 && vtable != 0) {
+        for (uint32_t o = 0; o < 16; o += 4) {
+          (void)mem.WriteU32BE(vtable + o, 0);
+          (void)mem.WriteU32BE(allocatorObj + o, 0);
+        }
         (void)mem.WriteU32BE(vtable + 8, 0x82130528); // __xtl_alloc
         (void)mem.WriteU32BE(allocatorObj + 0, vtable);
         (void)mem.WriteU32BE(tlsTable + 12, allocatorObj);
       }
+      s_tlsChainDone.insert(tlsTable);
     }
   }
 
@@ -1112,6 +1118,7 @@ PPC_FUNC(sub_821873E8) {
 
     constexpr uint32_t kBootGateAddr = 0x82131008;
     if (auto *gateFn = mcla::kernel::g_memory.FindFunction(kBootGateAddr)) {
+      (void)gateFn; // looked up for presence only; stages run manually below
       // ponytail: fresh ctx per house style (W32/W34 levers); gate takes no args, propagate stack only
       PPCContext g{};
       g.r1.u64 = ctx.r1.u64;
@@ -1123,10 +1130,12 @@ PPC_FUNC(sub_821873E8) {
       // ponytail: create GFx loader object BEFORE gate stages so it exists even if gate hangs
       // The ctor 824C6F08 writes vtable 0x820736DC at offset 0 and 0x820736B0 at offset 672.
       MCLA_LOG_ERROR("GFX-BLOCK: entered pre-gate");
-      uint32_t gfxLoader = mem.Alloc(800, 16); // enough for loader object
+      // 1024B: ctor 824C6F08 writes obj+740+68/+72 (=+808/+812) and 6F70 reads
+      // [obj+816]; Alloc(800) truncated both and corrupted the heap.
+      uint32_t gfxLoader = mem.Alloc(1024, 16);
       MCLA_LOG_ERROR("GFX-ALLOC loader={:08X} null={}", gfxLoader, gfxLoader == 0);
       if (gfxLoader) {
-        for (uint32_t off = 0; off < 800; off += 4)
+        for (uint32_t off = 0; off < 1024; off += 4)
           (void)mem.WriteU32BE(gfxLoader + off, 0);
         if (auto *ctorFn = mcla::kernel::g_memory.FindFunction(0x824C6F08u)) {
           MCLA_LOG_ERROR("GFX-CTOR-FN found at 824C6F08");
@@ -1141,12 +1150,13 @@ PPC_FUNC(sub_821873E8) {
           (void)mem.ReadU32BE(gfxLoader, &vt);
           (void)mem.ReadU32BE(gfxLoader + 672, &vt2);
           MCLA_LOG_ERROR("GFX-CTOR done loader={:08X} vt0={:08X} vt672={:08X}", gfxLoader, vt, vt2);
-          
-          // ponytail: fix vtable pointers to correct values (recompiler computes wrong addr)
-          // off_820736DC = 0x820736D8, off_820736B0 = 0x820736B8
-          (void)mem.WriteU32BE(gfxLoader, 0x820736D8u);
-          (void)mem.WriteU32BE(gfxLoader + 672, 0x820736B8u);
-          MCLA_LOG_ERROR("GFX-VTABLE-FIXED loader={:08X} vt0=820736D8 vt672=820736B8", gfxLoader);
+          // Faithful: ctor 824C6F08 writes vt0=0x820736DC, vt672=0x820736B0
+          // (generated ppc_recomp.94.cpp:3559-3587, single-arg r3 only).
+          // Prior D8/B8 overwrite was off-by-4 (off_820736DC confusion) — verify only.
+          if (vt != 0x820736DCu || vt2 != 0x820736B0u) {
+            MCLA_LOG_ERROR("GFX-CTOR-VT-MISMATCH loader={:08X} got {:08X}/{:08X} want 820736DC/820736B0",
+                           gfxLoader, vt, vt2);
+          }
         } else {
           MCLA_LOG_ERROR("GFX-CTOR-FN NOT FOUND at 824C6F08");
         }
@@ -1156,30 +1166,56 @@ PPC_FUNC(sub_821873E8) {
 
       MCLA_LOG_WARN("BOOT-GATE started on boot worker thread");
       s_inUILoad.store(true);
-      
+      struct UiLoadGuard {
+        ~UiLoadGuard() { s_inUILoad.store(false); }
+      } uiGuard;
+
+      // Reserve 256B guest stack window for event out-params; never reuse the
+      // caller's live frame (prior r1+80/84 overwrote LR-save area).
+      uint32_t stageStack = 0;
+      {
+        auto &mm = mcla::kernel::GuestMemoryHeap::Instance();
+        const uint32_t rs = (g.r1.u32 - 256u) & ~15u;
+        uint32_t probe = 0;
+        if (rs && mm.ReadU32BE(rs, &probe)) {
+          stageStack = rs;
+          g.r1.u32 = rs;
+        } else {
+          MCLA_LOG_WARN("GATE-STAGE no stack reserve, keeping r1={:08X}", g.r1.u32);
+        }
+      }
+      auto freshVolatiles = [&]() {
+        g.r5.u64 = 0; g.r6.u64 = 0; g.r7.u64 = 0; g.r8.u64 = 0;
+        g.r9.u64 = 0; g.r10.u64 = 0;
+      };
       // ponytail: stage the gate calls manually to isolate hang point (per Rank 2 plan)
       if (auto *fn823043F8 = mcla::kernel::g_memory.FindFunction(0x823043F8)) {
         MCLA_LOG_WARN("GATE-STAGE init-823043F8");
+        freshVolatiles();
         fn823043F8(g, mcla::kernel::g_memory.base);
       }
       if (auto *fn82304348 = mcla::kernel::g_memory.FindFunction(0x82304348)) {
         MCLA_LOG_WARN("GATE-STAGE init-82304348");
+        freshVolatiles();
         fn82304348(g, mcla::kernel::g_memory.base);
       }
       if (auto *fn821C0750_1 = mcla::kernel::g_memory.FindFunction(0x821C0750)) {
         MCLA_LOG_WARN("GATE-STAGE event1-821C0750 r3=82830ACC");
-        g.r3.u32 = 0x82830ACCu; g.r4.u32 = g.r1.u32 + 80;
+        freshVolatiles();
+        g.r3.u32 = 0x82830ACCu; g.r4.u32 = stageStack ? stageStack + 80 : g.r1.u32 + 80;
         fn821C0750_1(g, mcla::kernel::g_memory.base);
         MCLA_LOG_WARN("GATE-STAGE event1-ret r3={:08X}", g.r3.u32);
       }
       if (auto *fn821C0750_2 = mcla::kernel::g_memory.FindFunction(0x821C0750)) {
         MCLA_LOG_WARN("GATE-STAGE event2-821C0750 r3=82830AB8");
-        g.r3.u32 = 0x82830AB8u; g.r4.u32 = g.r1.u32 + 84;
+        freshVolatiles();
+        g.r3.u32 = 0x82830AB8u; g.r4.u32 = stageStack ? stageStack + 84 : g.r1.u32 + 84;
         fn821C0750_2(g, mcla::kernel::g_memory.base);
         MCLA_LOG_WARN("GATE-STAGE event2-ret r3={:08X}", g.r3.u32);
       }
       if (auto *fnUILOAD = mcla::kernel::g_memory.FindFunction(0x822C0980)) {
         MCLA_LOG_WARN("GATE-STAGE UILOAD-enter r3=[82830998]");
+        freshVolatiles();
         g.r3.u32 = 0;
         auto &mem3 = mcla::kernel::GuestMemoryHeap::Instance();
         (void)mem3.ReadU32BE(0x82830998, &g.r3.u32);
@@ -1189,54 +1225,33 @@ PPC_FUNC(sub_821873E8) {
       }
       if (auto *fn821FC008 = mcla::kernel::g_memory.FindFunction(0x821FC008)) {
         MCLA_LOG_WARN("GATE-STAGE 821FC008");
+        freshVolatiles();
         fn821FC008(g, mcla::kernel::g_memory.base);
       }
       if (auto *fn82304398 = mcla::kernel::g_memory.FindFunction(0x82304398)) {
-        MCLA_LOG_WARN("GATE-STAGE 82304398");
-        // ponytail: 82304398 does indirect vcall *(*(r3+4)+20)(r3) - guard wild r3
-        if (g.r3.u32 >= 0x82000000u) fn82304398(g, mcla::kernel::g_memory.base);
-        else MCLA_LOG_WARN("GATE-STAGE 82304398 SKIP bad r3={:08X}", g.r3.u32);
+        MCLA_LOG_WARN("GATE-STAGE 82304398 SKIP stale-r3 (needs guest this, not UILOAD ret r3={:08X})",
+                      g.r3.u32);
+        (void)fn82304398;
       } else {
         MCLA_LOG_WARN("GATE-STAGE 82304398 NOT FOUND");
       }
-      // ponytail: restore stack frame (addi r1,128) and return like original gate epilogue
-      g.r1.u64 = g.r1.u64 + 128;
-      MCLA_LOG_WARN("BOOT-GATE completed on boot worker thread r1={:08X}", g.r1.u32);
-      s_inUILoad.store(false);
-      ctx.r1.u64 = g.r1.u64;
-      MCLA_LOG_WARN("BOOT-GATE completed on boot worker thread r1={:08X}", g.r1.u32);
+      // Staged callees manage their own frames; do NOT adjust g.r1/ctx.r1 here
+      // (prior +128 writeback corrupted the caller frame).
+      // Restore caller's SP (we reserved 256B at stageStack) before continuing.
+      if (stageStack)
+        g.r1.u32 = (stageStack + 256u);
+      MCLA_LOG_WARN("BOOT-GATE stages done on boot worker thread r1={:08X}", g.r1.u32);
 
-      // ponytail: call factory 82488C98 to create loader WITH movie (takes 4 args)
-      // Factory takes: (dest, unk, unk, unk) - returns loader with movie
-      if (auto *factoryFn = mcla::kernel::g_memory.FindFunction(0x82488C98u)) {
-        MCLA_LOG_ERROR("GFX-FACTORY: calling 82488C98");
-        uint32_t factoryDest = mem.Alloc(800, 16);
-        if (factoryDest) {
-          for (uint32_t off = 0; off < 800; off += 4)
-            (void)mem.WriteU32BE(factoryDest + off, 0);
-          PPCContext fctx{};
-          fctx.r1.u64 = ctx.r1.u64;
-          fctx.r13.u64 = ctx.r13.u64;
-          fctx.fpscr = ctx.fpscr;
-          fctx.r3.u64 = factoryDest;
-          fctx.r4.u64 = 0;
-          fctx.r5.u64 = 0;
-          fctx.r6.u64 = 0;
-          MCLA_LOG_ERROR("GFX-FACTORY: calling 82488C98 dest={:08X}", factoryDest);
-          factoryFn(fctx, mcla::kernel::g_memory.base);
-          uint32_t vt = 0, movie = 0;
-          (void)mem.ReadU32BE(factoryDest, &vt);
-          (void)mem.ReadU32BE(factoryDest + 4, &movie);
-          MCLA_LOG_ERROR("GFX-FACTORY done dest={:08X} vt={:08X} movie={:08X}", factoryDest, vt, movie);
-          
-          // ponytail: if factory created loader with movie, also fix vtable
-          if (vt >= 0x82073000u && vt < 0x82074000u) {
-            (void)mem.WriteU32BE(factoryDest, 0x820736D8u);
-            (void)mem.WriteU32BE(factoryDest + 672, 0x820736B8u);
-            MCLA_LOG_ERROR("GFX-FACTORY-VTABLE-FIXED dest={:08X}", factoryDest);
-          }
-        }
-      }
+      // Factory 82488C98 DISABLED: generated ppc_recomp.88.cpp:14741 shows
+      // (parent:r3 needs >=11576B for +11572 store, r4 index/flags, r5 ignored,
+      // r6 required config deref [r6+20]/[r6+24] via 82257678; zero calls to
+      // 824C6F08; movie lands at [parent+11572], never dest+4). Calling with
+      // r4=r5=r6=0 + Alloc(800) guarantees early-out/AV + heap overflow, and
+      // reading dest+4 always yields 0. Next: trace a real r6 config from a
+      // 82257678 caller, alloc >=11576, or drive 824C6F70(obj) lifecycle
+      // (824880F8 creates [obj+4] movie) then reuse W34-LOOKUP/PARSE-FLAG.
+      MCLA_LOG_ERROR("GFX-FACTORY-SKIP 82488C98 needs real r6 config + 11576B parent (see ppc_recomp.88)");
+      (void)mem;
     }
   }
 
@@ -5265,11 +5280,71 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
                   "tsize={} buckets={:08X}",
                   n, gfx[i].obj, gfx[i].vt, gfx[i].movie, movTsize[i],
                   movBuck[i]);
+  if (fp4 != 0x82275D88u || fp5 != 0x82275DA8u)
+    MCLA_LOG_WARN("W34-FP-MISMATCH #{} FE20={:08X} FE24={:08X} want 82275D88/82275DA8",
+                  n, fp4, fp5);
+
+  // Lifecycle drive: ctor leaves [obj+12]=0, [obj+28]=0. 824C6F70 cold path
+  // needs [obj+12]=live device to reach 824880F8 and set [obj+28]=1.
+  // Arm dev from OnDeviceCreated, then dispatch guest 824C6F70 once per lever
+  // hit (lever capped at 8). Never invent device internals.
+  {
+    const uint32_t liveDev = mcla::gpu::DeviceGuestAddr();
+    auto *lifeFn = mcla::kernel::g_memory.FindFunction(0x824C6F70u);
+    for (int gi = 0; gi < nGfx; ++gi) {
+      uint32_t st28 = 0, dev12 = 0, fl664 = 0, w816 = 0;
+      (void)mem.ReadU32BE(gfx[gi].obj + 28, &st28);
+      (void)mem.ReadU32BE(gfx[gi].obj + 12, &dev12);
+      (void)mem.ReadU32BE(gfx[gi].obj + 664, &fl664);
+      (void)mem.ReadU32BE(gfx[gi].obj + 816, &w816);
+      if (st28 != 0 || fl664 == 1 || !lifeFn)
+        continue;
+      if (dev12 == 0 && liveDev != 0) {
+        (void)mem.WriteU32BE(gfx[gi].obj + 12, liveDev);
+        (void)mem.ReadU32BE(gfx[gi].obj + 12, &dev12);
+      }
+      if (dev12 == 0 || dev12 == 0xCDCDCDCDu) {
+        MCLA_LOG_WARN("W34-LIFE-SKIP #{} obj={:08X} no live dev (lever dev={:08X})",
+                      n, gfx[gi].obj, liveDev);
+        continue;
+      }
+      PPCContext lc{};
+      lc.r1.u64 = 0x006D8EC0u;
+      lc.r13.u64 = 0x8F200000u;
+      lc.fpscr.disableFlushModeUnconditional();
+      lc.r3.u64 = gfx[gi].obj;
+      MCLA_LOG_WARN("W34-LIFE #{} obj={:08X} st28={} dev={:08X} fl664={:08X} w816={:08X} — dispatch 824C6F70",
+                    n, gfx[gi].obj, st28, dev12, fl664, w816);
+      lifeFn(lc, mcla::kernel::g_memory.base);
+      uint32_t st28b = 0, movieB = 0, tsizeB = 0, buckB = 0;
+      (void)mem.ReadU32BE(gfx[gi].obj + 28, &st28b);
+      (void)mem.ReadU32BE(gfx[gi].obj + 4, &movieB);
+      if (movieB && movieB != 0xCDCDCDCDu) {
+        (void)mem.ReadU32BE(movieB + 92, &tsizeB);
+        (void)mem.ReadU32BE(movieB + 88, &buckB);
+      }
+      MCLA_LOG_WARN("W34-LIFE-POST #{} obj={:08X} st28 {}->{} movie {:08X}->{:08X} tsize={} buckets={:08X}",
+                    n, gfx[gi].obj, st28, st28b, gfx[gi].movie, movieB, tsizeB, buckB);
+      gfx[gi].movie = movieB;
+      if (gi < 6) {
+        movTsize[gi] = tsizeB;
+        movBuck[gi] = buckB;
+      }
+    }
+  }
 
   // If deep scan found a guest-built tag table that W33 missed, bind +24
   // records the same faithful way (guest tags already present) + EF100.
+  // Guarded: p24/obj must be writable guest memory, bound clamped to 8.
   if (tagNv >= 2 && tagBase != 0 && p24 >= 0x80000000u &&
       p24 != 0xCDCDCDCDu) {
+    uint32_t p24probe = 0, objProbe = 0;
+    const bool p24ok = mem.ReadU32BE(p24 + 4, &p24probe);
+    const bool objok = mem.ReadU32BE(obj + 0, &objProbe);
+    if (!p24ok || !objok) {
+      MCLA_LOG_WARN("W34-BIND-SKIP #{} p24/obj unreadable p24={:08X} obj={:08X}",
+                    n, p24, obj);
+    } else {
     int bound = 0;
     for (int i = 1; i < 9; ++i) {
       const uint32_t slot = tagBase + static_cast<uint32_t>((i - 1) * 12);
@@ -5278,7 +5353,9 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
         break;
       if (t < 1u || t > 9u)
         continue;
-      (void)mem.WriteU32BE(p24 + static_cast<uint32_t>(i * 4), slot);
+      const bool wok = mem.WriteU32BE(p24 + static_cast<uint32_t>(i * 4), slot);
+      if (!wok)
+        break;
       ++bound;
     }
     if (bound > 0) {
@@ -5303,6 +5380,7 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
         }
       }
     }
+    } // else p24/obj readable
   }
 
   // Parse-flag lever: if a GFx loader object exists, probe guest 824EAFA0
@@ -5311,9 +5389,16 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
   // (pkg+16=0x0002FFC9 -> 0xFFC9; READWRAP key=0x00008004; pkg+4=0x1B) —
   // never invent; lookup must return a real entry.
   if (nGfx > 0) {
+    // Only FFC9 grounded (low16 of pkg+16 0x2FFC9); 8004 is a PSTREAM tag not a
+    // GFx id, 1B/09/04 ungrounded — lookup must still return a real entry.
     static const uint32_t kCandIds[] = {0x0000FFC9u, 0x00008004u,
                                         0x0000001Bu, 0x00000009u,
                                         0x00000004u};
+    int nMoviesLive = 0;
+    for (int gi = 0; gi < nGfx; ++gi)
+      if (gfx[gi].movie && gfx[gi].movie != 0xCDCDCDCDu &&
+          gfx[gi].movie >= 0x80000000u && gfx[gi].movie < 0xC0000000u)
+        ++nMoviesLive;
     auto *afa0 = mcla::kernel::g_memory.FindFunction(0x824EAFA0u);
     auto *ld = mcla::kernel::g_memory.FindFunction(0x824876E0u);
     for (int gi = 0; gi < nGfx && gi < 3; ++gi) {
@@ -5324,7 +5409,10 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
         continue;
       if (!afa0)
         break;
-      for (uint32_t cid : kCandIds) {
+      // tryId uses the guest itself as oracle (824EAFA0 hash walk:
+      // id16<tize else null; buckets+88/shift+104/mask+108, stride 148).
+      // Returns entry, or 0 when miss. Logs only hits (sweep would flood).
+      auto tryId = [&](uint32_t cid, bool verbose, uint32_t *outEntry) -> uint32_t {
         PPCContext p{};
         p.r1.u64 = 0x006D8EC0u;
         p.r13.u64 = 0x8F200000u;
@@ -5332,11 +5420,45 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
         p.r4.u64 = cid;
         afa0(p, mcla::kernel::g_memory.base);
         const uint32_t entry = p.r3.u32;
-        MCLA_LOG_WARN("W34-LOOKUP #{} movie={:08X} id={:04X} entry={:08X} "
-                      "tsize={}",
-                      n, movie, cid & 0xFFFFu, entry, movTsize[gi]);
-        if (entry != 0 && entry != 0xCDCDCDCDu && entry >= 0x80000000u &&
-            entry < 0xC0000000u && ld) {
+        if (outEntry)
+          *outEntry = entry;
+        const bool hit = (entry != 0 && entry != 0xCDCDCDCDu &&
+                          entry >= 0x80000000u && entry < 0xC0000000u);
+        if (verbose || hit)
+          MCLA_LOG_WARN("W34-LOOKUP #{} movie={:08X} id={:04X} entry={:08X} "
+                        "tsize={}",
+                        n, movie, cid & 0xFFFFu, entry, movTsize[gi]);
+        return hit ? entry : 0;
+      };
+      // Phase 1: dynamic sweep 0..cap-1 via guest oracle. tsize bounds id16
+      // (guest returns null when id16>=tsize), so every hit is a real entry.
+      {
+        const uint32_t tsize = movTsize[gi];
+        const uint32_t buck = movBuck[gi];
+        uint32_t cap = (tsize > 128u) ? 128u : tsize;
+        if (tsize == 0 || tsize > 0x10000u || buck == 0 || buck == 0xCDCDCDCDu)
+          cap = 0;
+        uint32_t hits = 0, firstId = 0, firstEntry = 0;
+        for (uint32_t cid = 0; cid < cap; ++cid) {
+          uint32_t e = 0;
+          if (tryId(cid, false, &e) && ld) {
+            ++hits;
+            if (firstEntry == 0) {
+              firstId = cid;
+              firstEntry = e;
+            }
+          }
+        }
+        if (hits)
+          MCLA_LOG_WARN("W34-SWEEP #{} movie={:08X} tsize={} cap={} hits={} first id={:04X} entry={:08X}",
+                        n, movie, tsize, cap, hits, firstId, firstEntry);
+        else if (cap)
+          MCLA_LOG_WARN("W34-SWEEP #{} movie={:08X} tsize={} cap={} hits=0", n, movie, tsize, cap);
+        if (firstEntry && ld) {
+          const uint32_t cid = firstId;
+          const uint32_t entry = firstEntry;
+          (void)entry;
+          (void)cid;
           // Faithful parse-flag: write the proven id into the loader stream
           // slot and re-dispatch guest 824876E0(loader, stream).
           // Use a host-allocated stream descriptor (64B) — loader reads
@@ -5346,6 +5468,10 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
             s_stream = mem.Alloc(64, 16);
           if (!s_stream)
             break;
+          {
+            uint8_t z[64] = {0};
+            (void)mem.WriteBytes(s_stream, z, sizeof(z));
+          }
           (void)mem.WriteU32BE(s_stream + 0, cid);
           PPCContext lc{};
           lc.r1.u64 = 0x006D8EC0u;
@@ -5367,10 +5493,50 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
           return true;
         }
       }
+      // Phase 2: static fallback candidates (mostly ungrounded; guest oracle
+      // still gates — dispatch only on real entry).
+      for (uint32_t cid : kCandIds) {
+        uint32_t e = 0;
+        if (tryId(cid, true, &e) && ld) {
+          const uint32_t entry = e;
+          static uint32_t s_stream2 = 0;
+          if (s_stream2 == 0)
+            s_stream2 = mem.Alloc(64, 16);
+          if (!s_stream2)
+            break;
+          {
+            uint8_t z[64] = {0};
+            (void)mem.WriteBytes(s_stream2, z, sizeof(z));
+          }
+          (void)mem.WriteU32BE(s_stream2 + 0, cid);
+          PPCContext lc{};
+          lc.r1.u64 = 0x006D8EC0u;
+          lc.r13.u64 = 0x8F200000u;
+          lc.r3.u64 = gfx[gi].obj;
+          lc.r4.u64 = s_stream2;
+          MCLA_LOG_WARN("W34-PARSE-FLAG-FB #{} loader={:08X} stream={:08X} "
+                        "dataId={:04X} movie={:08X} entry={:08X} — "
+                        "dispatch guest 824876E0",
+                        n, gfx[gi].obj, s_stream2, cid & 0xFFFFu, movie,
+                        entry);
+          ld(lc, mcla::kernel::g_memory.base);
+          uint32_t vt2 = 0, p24b = 0;
+          (void)mem.ReadU32BE(obj + 0, &vt2);
+          (void)mem.ReadU32BE(obj + 24, &p24b);
+          MCLA_LOG_WARN("W34-POST #{} vt={:08X} +24={:08X} +50={} tagNv={}",
+                        n, vt2, p24b, cnt50, tagNv);
+          return true;
+        }
+      }
     }
-    MCLA_LOG_WARN("W34-NOLOOKUP #{} nGfx={} — no GFx hash entry for package "
-                  "ids; parse still gated (do not invent)",
-                  n, nGfx);
+    if (nMoviesLive == 0)
+      MCLA_LOG_WARN("W34-NOMOVIE #{} nGfx={} — loaders present but movie==0/poison; "
+                    "factory/lifecycle has not armed [loader+4] (do not invent)",
+                    n, nGfx);
+    else
+      MCLA_LOG_WARN("W34-NOLOOKUP #{} nGfx={} nMoviesLive={} — no GFx hash entry for package "
+                    "ids; parse still gated (do not invent)",
+                    n, nGfx, nMoviesLive);
   } else {
     MCLA_LOG_WARN("W34-NOGFX #{} — no GFx loader objects (vt 0x82073xxx) in "
                   "scan bands; UILOAD/EF220 never armed after inflate",
@@ -11341,8 +11507,9 @@ static bool AtArrayCtorGuard(PPCContext &__restrict ctx, uint32_t n,
   const uint32_t countRaw = ctx.r4.u32 & 0xFFFFu;
   const uint32_t capRaw = ctx.r5.u32 & 0xFFFFu;
 
-  // Poisoned args (from BE250 -1 upstream): empty array.
-  if (countRaw > 0x8000u || capRaw > 0x8000u) {
+  // Poisoned args (from BE250 -1 upstream): empty array. Also require
+  // count<=cap; count>cap with cap-sized alloc is a heap overflow.
+  if (countRaw > 0x8000u || capRaw > 0x8000u || countRaw > capRaw) {
     MCLA_LOG_WARN("ATARRAY-CLAMP #{} obj={:08X} count={:04X} cap={:04X} "
                   "stride={} lr={:08X} (poisoned args, empty array)",
                   n, obj, countRaw, capRaw, entryBytes, lr);

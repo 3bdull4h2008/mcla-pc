@@ -2,7 +2,7 @@
 
 #include "xdm.h"
 #include "xbox.h"
-#include "vfs_rpf.h"
+#include "fs/vfs_rpf.h"
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <cassert>

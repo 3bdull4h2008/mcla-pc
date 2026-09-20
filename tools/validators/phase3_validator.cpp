@@ -13,11 +13,11 @@
 //
 // Exit code 0 = clean, 1 = errors found.
 
-#include "xenos_shader_ir.h"
-#include "vertex_decode.h"
-#include "resource_cache.h"
-#include "test_shaders.h"
-#include "grc_fvf_decode.h"
+#include "renderer/xenos_shader_ir.h"
+#include "renderer/vertex_decode.h"
+#include "renderer/resource_cache.h"
+#include "renderer/test_shaders.h"
+#include "renderer/grc_fvf_decode.h"
 #include "raw_ucode_corpus.h"
 
 #include <cstdint>

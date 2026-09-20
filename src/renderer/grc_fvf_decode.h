@@ -31,7 +31,7 @@
 // which MCLA's vf=0 fetches point at. The union of the two yields a real
 // native input layout.
 
-#include "native_types.h"
+#include "renderer/trace_types.h"
 
 #include <cstdint>
 

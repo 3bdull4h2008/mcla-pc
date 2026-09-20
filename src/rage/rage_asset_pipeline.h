@@ -12,7 +12,7 @@
 #include <memory>
 #include <unordered_map>
 
-#include "vfs_rpf.h"
+#include "fs/vfs_rpf.h"
 
 namespace mcla::rage {
 

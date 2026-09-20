@@ -22,7 +22,7 @@
 // Header-only on purpose: no CMake/target changes, and xenos_decode_validator
 // keeps its own copy (outside this task's modification scope).
 
-#include "xenos_shader_ir.h"
+#include "renderer/xenos_shader_ir.h"
 
 #include <cstddef>
 #include <cstdint>

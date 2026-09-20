@@ -1,6 +1,6 @@
-#include "shader_translator.h"
-#include "dxc_runtime.h"
-#include "xenos_shader_ir.h"
+#include "renderer/shader_translator.h"
+#include "renderer/dxc_runtime.h"
+#include "renderer/xenos_shader_ir.h"
 
 namespace mcla::renderer {
 

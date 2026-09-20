@@ -1,9 +1,7 @@
 # mcla-pc
 
-<!-- hero clip goes here the day we have one. drop docs/hero.gif n uncomment
-<p align="center">
-  <img src="docs/hero.gif" alt="midnight club la running on pc through the native d3d12 pipeline">
-</p>
+<!-- docs/hero.gif goes here the day we have one; uncomment the block below when it exists
+<p align="center"><img src="docs/hero.gif" alt="midnight club la running on pc through the native d3d12 pipeline"></p>
 -->
 
 native d3d12 renderer rebuild for midnight club LA
@@ -22,9 +20,9 @@ the recompiled ppc game code keeps running untouched, we capture render intent a
 - device-method capture hooks live + render thread owns all d3d12
 - shader->PSO pipeline wired: PipelineCache + async DXC worker, root signature, grcFvf input layout
 
-## current status (2026-09-09)
+## current status (2026-09-20)
 
-guest park blocker CLOSED (session 64: spinlock seed 1->0 in VdInitializeEngines + host-side kernel-wrapper identity map). game runs 10+ min in loading screens, zero crashes. see docs/BOOT_HANDOFF.md + docs/handoffs/ for the live trail.
+boot gate complete per W36 commits: TLS allocator stable, VEH recovery, GFx loader wired with the correct vtable, zero crashes (UILOAD execution is commit-claimed, not yet re-verified in a soak). last soak opens the real retail packfiles and runs minutes on the loading path. wip: a module reorg (src/common, src/cpu, src/fs, src/rage, src/hooks, tools/validators) currently breaks the build — docs/LONG_TODO_MASTER.md T37.0 has the verified diagnosis. live frontier: docs/LONG_TODO_MASTER.md · chronological trail: docs/HANDOFF_NEXT_AGENT.md
 
 ## building
 
@@ -38,9 +36,15 @@ build\mcla.exe
 
 ## repo layout
 
-- `src/kernel`, `src/cpu`, `src/apu`, `src/user` - kernel framework n guest runtime
+- `src/` root - boot host, device-boundary hooks (gpu_device, gpu_cp), d3d12 backend, render thread/queue
+- `src/kernel`, `src/apu`, `src/user` - kernel framework n guest runtime (xam.cpp = input)
+- `src/cpu` - vmx128 host hooks, guest thread, ppc context
+- `src/fs` - rpf3 packfile vfs
+- `src/rage` - rage asset pipeline
+- `src/hooks` - ppc_func hook bodies (split from patches.cpp)
+- `src/common` - shared logging/cvar headers
 - `src/renderer` - xenos decode, shader translation, texture/vertex decoding, caches
-- `src/` root - boot host, device-boundary hooks, d3d12 backend, render thread/queue, vfs
+- `tools/validators` - phase-gate validator exes
 - `generated/` - recompiler output, input only, never edited by hand
 - `third_party/` - sdl3, fmt, spdlog, toml++, dxc, o1heap, xxhash
 - `config/` - cmake/xenonrecomp/manifest tomls

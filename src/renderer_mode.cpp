@@ -5,7 +5,7 @@
 #include <atomic>
 #include <string_view>
 
-MCLA_CVAR_STRING(renderer_mode, "legacy", "Renderer", "Renderer mode: legacy | native | capture");
+MCLA_CVAR_STRING(renderer_mode, "native", "Renderer", "Renderer mode: legacy | native | capture");
 
 namespace mcla::renderer {
 namespace {

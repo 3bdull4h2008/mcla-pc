@@ -1,0 +1,161 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 1140511..158a97d 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -266,6 +266,143 @@ void Recompiler::Analyse()
+     }
+ 
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++
++    // Function::Analyze treats unconditional bctr as a terminator and never
++    // follows jump-table case bodies. XenonAnalyse still records the labels
++    // in jump_tables.toml, so extend each switch-parent function to cover
++    // its labels and absorb any linear-scan "functions" that are really
++    // case bodies. Without this every switch case emits an ERROR stub.
++    if (!config.switchTables.empty())
++    {
++        size_t extended = 0, absorbed = 0, unresolved = 0;
++        std::unordered_set<uint32_t> absorbedBases;
++
++        for (auto& [switchBase, table] : config.switchTables)
++        {
++            // Find the function that contains this switch (bctr site).
++            auto it = std::upper_bound(functions.begin(), functions.end(), switchBase,
++                [](uint32_t addr, const Function& fn) { return addr < fn.base; });
++            if (it == functions.begin())
++                continue;
++            --it;
++            if (switchBase < it->base || switchBase >= it->base + it->size)
++            {
++                if (unresolved < 8)
++                    fmt::println("JTSWITCH-MISS: switch@{:X} not in fn_{:X} [{:X}..{:X})",
++                        switchBase, it->base, it->base, it->base + it->size);
++                ++unresolved;
++                continue;
++            }
++
++            // Full label span (may extend before and/or after the function).
++            uint32_t minLabel = static_cast<uint32_t>(it->base);
++            uint32_t maxEnd = static_cast<uint32_t>(it->base + it->size);
++            for (uint32_t label : table.labels)
++            {
++                if (label < minLabel)
++                    minLabel = label;
++                const uint32_t labelEnd = label + 4;
++                if (labelEnd > maxEnd)
++                    maxEnd = labelEnd;
++            }
++
++            const uint32_t oldBase = static_cast<uint32_t>(it->base);
++            const size_t oldSize = it->size;
++            if (minLabel >= oldBase && maxEnd <= oldBase + oldSize)
++                continue;
++
++            if (extended < 8)
++                fmt::println("JTSWITCH-TRY: switch@{:X} fn_{:X} size={:#x} span={:X}..{:X} labels={}",
++                    switchBase, oldBase, oldSize, minLabel, maxEnd, table.labels.size());
++
++            // Absorb preceding functions that overlap [minLabel, oldBase).
++            while (it != functions.begin())
++            {
++                auto prev = it - 1;
++                const uint32_t prevEnd = static_cast<uint32_t>(prev->base + prev->size);
++                if (prevEnd <= minLabel)
++                    break;
++                const uint32_t prevBase = static_cast<uint32_t>(prev->base);
++                const bool isPdataOrConfig =
++                    config.functions.find(prevBase) != config.functions.end();
++                if (isPdataOrConfig)
++                {
++                    minLabel = prevEnd;
++                    break;
++                }
++                absorbedBases.insert(prevBase);
++                it = functions.erase(prev);
++                ++absorbed;
++            }
++
++            // Absorb subsequent functions that sit inside the label span.
++            auto next = it + 1;
++            bool conflict = false;
++            while (next != functions.end() && next->base < maxEnd)
++            {
++                const uint32_t nextBase = static_cast<uint32_t>(next->base);
++                const bool isPdataOrConfig =
++                    config.functions.find(nextBase) != config.functions.end();
++
++                if (!isPdataOrConfig)
++                {
++                    absorbedBases.insert(nextBase);
++                    next = functions.erase(next);
++                    ++absorbed;
++                }
++                else
++                {
++                    maxEnd = nextBase;
++                    conflict = true;
++                    break;
++                }
++            }
++
++            Function& fn = *it;
++            const uint32_t newBase = minLabel;
++            const uint32_t newSize = maxEnd - newBase;
++            if (newBase == oldBase && newSize == oldSize)
++                continue;
++
++            fn.base = newBase;
++            fn.size = newSize;
++            ++extended;
++
++            // Keep functions sorted so later upper_bound lookups stay correct.
++            std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++
++            // SymbolTable is a multiset of const-valued Symbols — erase
++            // and re-insert rather than mutating through the iterator.
++            auto sym = image.symbols.find(oldBase);
++            if (sym != image.symbols.end() && sym->address == oldBase && sym->type == Symbol_Function)
++            {
++                Symbol updated = *sym;
++                updated.address = newBase;
++                updated.name = fmt::format("sub_{:X}", newBase);
++                updated.size = newSize;
++                image.symbols.erase(sym);
++                image.symbols.insert(std::move(updated));
++            }
++            else
++            {
++                image.symbols.insert(Symbol{ fmt::format("sub_{:X}", newBase), newBase, newSize, Symbol_Function });
++            }
++
++            if (extended <= 12)
++                fmt::println("JTSWITCH: extended sub_{:X} -> sub_{:X} size {:#x} -> {:#x} (labels={}, absorbed={}, clamped={})",
++                    oldBase, newBase, oldSize, newSize, table.labels.size(), absorbed, conflict ? 1 : 0);
++        }
++
++        // Drop absorbed case-body symbols so they are not emitted or mapped.
++        for (uint32_t base : absorbedBases)
++        {
++            auto sym = image.symbols.find(base);
++            if (sym != image.symbols.end() && sym->address == base && sym->type == Symbol_Function)
++                image.symbols.erase(sym);
++        }
++
++        fmt::println("JTSWITCH: extended={} absorbed={} clamped={}", extended, absorbed, unresolved);
++    }
+ }
+ 
+ bool Recompiler::Recompile(
+@@ -631,8 +768,10 @@ bool Recompiler::Recompile(
+                 auto label = switchTable->second.labels[i];
+                 if (label < fn.base || label >= fn.base + fn.size)
+                 {
+-                    println("\t\t// ERROR: 0x{:X}", label);
+-                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
++                    // Out-of-span case targets are shared thunks ending in blr, so a tail
++                    // call matches guest semantics; this mirrors PPC_INST_B above.
++                    fmt::println("JTS-TAILCALL: switch case in {:X} jumps outside to {:X}", base, label);
++                    printFunctionCall(label);
+                     println("\t\treturn;");
+                 }
+                 else

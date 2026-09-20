@@ -325,48 +325,6 @@ std::mutex g_pubMutex;
 std::vector<GuestPub> g_pubStates;
 } // namespace
 
-void CpAdvanceGuestPublication(uint32_t windowsCompleted) {
-  if (windowsCompleted == 0) {
-    return;
-  }
-  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-  std::lock_guard<std::mutex> lock(g_pubMutex);
-  ForEachDevice([&](uint32_t dev) {
-    uint32_t subctx = 0;
-    if (!mem.ReadU32BE(dev + 10896, &subctx) || subctx == 0) {
-      return;
-    }
-    uint32_t put = 0;
-    (void)mem.ReadU32BE(dev + 10908, &put);
-    GuestPub *st = nullptr;
-    for (auto &s : g_pubStates) {
-      if (s.dev == dev) {
-        st = &s;
-        break;
-      }
-    }
-    if (st == nullptr) {
-      uint32_t seed = 0;
-      (void)mem.ReadU32BE(subctx, &seed);
-      g_pubStates.push_back({dev, seed});
-      st = &g_pubStates.back();
-    }
-    uint32_t next = st->count + 2u * windowsCompleted;
-    if (next < st->count || next > put) next = put;  // overflow guard
-    if (next != st->count) {
-      const uint32_t prev = st->count;
-      st->count = next;
-      (void)mem.WriteU32BE(subctx + 0, next);
-      static std::atomic<uint32_t> s_pubLog{0};
-      const uint32_t n = s_pubLog.fetch_add(1) + 1;
-      if (n <= 24 || (n % 500) == 0) {
-        MCLA_LOG_INFO("CP: GUEST-PUB #{} dev={:08X} pub {}->{} put={}", n, dev,
-                      prev, next, put);
-      }
-    }
-  });
-}
-
 void PublishRptr(RingState &ring) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t rptr = ring.rptrIndex.load(std::memory_order_relaxed);
@@ -788,6 +746,50 @@ void DrainRing(RingState &ring, uint32_t wptr, const char *source) {
 }
 
 } // namespace
+
+// Advance guest publication counter (subctx+0) for all tracked devices.
+// Used to unblock guest fence waits when CP is idle but guest thinks work is pending.
+void CpAdvanceGuestPublication(uint32_t windowsCompleted) {
+  if (windowsCompleted == 0) {
+    return;
+  }
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  std::lock_guard<std::mutex> lock(g_pubMutex);
+  ForEachDevice([&](uint32_t dev) {
+    uint32_t subctx = 0;
+    if (!mem.ReadU32BE(dev + 10896, &subctx) || subctx == 0) {
+      return;
+    }
+    uint32_t put = 0;
+    (void)mem.ReadU32BE(dev + 10908, &put);
+    GuestPub *st = nullptr;
+    for (auto &s : g_pubStates) {
+      if (s.dev == dev) {
+        st = &s;
+        break;
+      }
+    }
+    if (st == nullptr) {
+      uint32_t seed = 0;
+      (void)mem.ReadU32BE(subctx, &seed);
+      g_pubStates.push_back({dev, seed});
+      st = &g_pubStates.back();
+    }
+    uint32_t next = st->count + 2u * windowsCompleted;
+    if (next < st->count || next > put) next = put;  // overflow guard
+    if (next != st->count) {
+      const uint32_t prev = st->count;
+      st->count = next;
+      (void)mem.WriteU32BE(subctx + 0, next);
+      static std::atomic<uint32_t> s_pubLog{0};
+      const uint32_t n = s_pubLog.fetch_add(1) + 1;
+      if (n <= 24 || (n % 500) == 0) {
+        MCLA_LOG_INFO("CP: GUEST-PUB #{} dev={:08X} pub {}->{} put={}", n, dev,
+                      prev, next, put);
+      }
+    }
+  });
+}
 
 bool CpDeferredConsumeEnabled() { return DeferredConsumeEnabled(); }
 

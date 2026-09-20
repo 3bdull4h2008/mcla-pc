@@ -1,7 +1,7 @@
 #pragma once
+#include <kernel/mutex.h>
 
-#include "mutex.h"
-#include <o1heap.h>
+#include <kernel/o1heap.h>
 #include <cstdint>
 
 struct Heap

@@ -3,7 +3,9 @@
 // __builtin_debugtrap() the recompiler would have emitted.
 
 #include "ppc_config.h"
-#include "ppc_context.h"
+// Angle include: self-dir src/cpu/ppc_context.h is the TLS holder, not the
+// ABI header (moved to src/cpu/, quote include would shadow src/ppc_context.h).
+#include <ppc_context.h>
 
 #include "logging.h"
 

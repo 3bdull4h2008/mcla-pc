@@ -21,7 +21,7 @@
 // for Phase 3 guest-vertex wiring.
 
 #include "frame_trace.h"
-#include "vertex_decode.h"
+#include "renderer/vertex_decode.h"
 
 #include <cstdarg>
 #include <cstdint>

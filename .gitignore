@@ -6,7 +6,9 @@
 /build-standalone/
 
 # Derived / regenerable
-/docs/
+# NOTE: /docs/ was ignored here until 2026-09-20. It is NOT regenerable — it is the
+# cross-session handoff trail, and it has already been lost once to `git clean -xdf`.
+# Every doc had to be `git add -f`'d individually. Do not re-ignore it.
 /game_data/
 /mcla extracted cache/
 /.research/
@@ -15,7 +17,11 @@
 # Binaries / downloaded
 /SDL3.zip
 /SDL3_extract/
-/tools/
+# NOTE: /tools/ was ignored here until 2026-09-20 (it once held downloaded binaries).
+# It now holds source: the phase-gate validators, the RE scripts that back the
+# raw-byte rule, and tools/xenonrecomp_local.patch — the only preserved copy of the
+# JTS-TAILCALL recompiler patch. Ignoring it hid 16 files from `git status` entirely.
+# Do not re-ignore it; ignore specific binary subpaths instead if one ever appears.
 rexglue-sdk/
 *.exe
 *.dll

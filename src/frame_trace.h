@@ -1,6 +1,6 @@
 #pragma once
 
-#include "native_types.h"
+#include "renderer/trace_types.h"
 #include <filesystem>
 #include <fstream>
 #include <string>

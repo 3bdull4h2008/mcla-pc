@@ -7,7 +7,7 @@
 
 #include "logging.h"
 
-#include "vfs_rpf.h"
+#include "fs/vfs_rpf.h"
 
 namespace mcla::rage {
 

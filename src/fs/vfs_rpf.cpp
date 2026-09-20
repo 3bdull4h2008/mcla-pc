@@ -1,4 +1,4 @@
-#include "vfs_rpf.h"
+#include "fs/vfs_rpf.h"
 #include "logging.h"
 #include "guest_memory.h"
 

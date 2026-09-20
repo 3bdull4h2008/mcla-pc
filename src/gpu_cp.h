@@ -78,4 +78,8 @@ void CpInstallMmioRouting();
 uint64_t CpSwapCount();
 uint64_t CpDrainCount();
 
+// Advance guest publication counter (subctx+0) for all tracked devices.
+// Used to unblock guest fence waits when CP is idle but guest thinks work is pending.
+void CpAdvanceGuestPublication(uint32_t windowsCompleted);
+
 } // namespace mcla::gpu

@@ -1,6 +1,5 @@
 #include <stdafx.h>
 #include "xdm.h"
-#include "freelist.h"
 
 Mutex g_kernelLock;
 

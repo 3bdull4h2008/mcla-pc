@@ -42,7 +42,7 @@ using Microsoft::WRL::ComPtr;
 // #include <imgui.h>
 // #include <imgui_internal.h>
 // #include <backends/imgui_impl_sdl2.h>
-#include <o1heap.h>
+#include <kernel/o1heap.h>
 #include <cstddef>
 #include <smolv.h>
 #include <set>
@@ -53,7 +53,7 @@ using Microsoft::WRL::ComPtr;
 #include <charconv>
 
 #include "framework.h"
-#include "mutex.h"
+#include <kernel/mutex.h>
 
 #ifndef _WIN32
 #include <sys/mman.h>

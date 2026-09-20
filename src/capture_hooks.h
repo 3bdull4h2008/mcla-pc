@@ -2,7 +2,7 @@
 
 #include "guest_memory.h"
 #include "frame_trace.h"
-#include "native_types.h"
+#include "renderer/trace_types.h"
 #include "native_renderer.h"
 
 #include <filesystem>

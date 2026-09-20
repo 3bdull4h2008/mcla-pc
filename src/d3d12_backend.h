@@ -22,7 +22,7 @@
 
 #include "renderer/resource_cache.h"
 #include "renderer/pipeline_cache.h"
-#include "native_types.h"
+#include "renderer/trace_types.h"
 
 namespace mcla::native {
 

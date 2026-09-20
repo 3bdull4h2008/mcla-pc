@@ -98,7 +98,10 @@ add_executable(mcla
     src/app.cpp
     src/app.h
     src/patches.cpp
-    src/vmx128_pack.cpp
+    src/hooks/hooks.h
+    src/hooks/alloc_census.cpp
+    src/hooks/config_dispatch.cpp
+    src/cpu/vmx128_pack.cpp
     src/dispatch_guard.cpp
     src/patches.h
     src/gpu_mmio.cpp
@@ -121,13 +124,11 @@ add_executable(mcla
     src/frame_trace.h
     src/capture_hooks.cpp
     src/capture_hooks.h
-    src/native_types.h
-    src/vfs_rpf.cpp
-    src/vfs_rpf.h
+    src/renderer/trace_types.h
+    src/fs/vfs_rpf.cpp
+    src/fs/vfs_rpf.h
     src/d3d12_backend.cpp
     src/d3d12_backend.h
-    src/render_command_queue.cpp
-    src/render_command_queue.h
     src/compat.cpp
     src/compat.h
     src/apu/audio.cpp
@@ -145,8 +146,8 @@ add_executable(mcla
     src/boot_host.cpp
     src/boot_host.h
     src/boot_log.cpp
-    src/logging.h
-    src/cvar.h
+    src/common/logging.h
+    src/common/cvar.h
     src/renderer/xenos_microcode.cpp
     src/renderer/xenos_microcode.h
     src/renderer/xenos_shader_ir.cpp
@@ -161,8 +162,6 @@ add_executable(mcla
     src/renderer/vertex_decode.h
     src/renderer/grc_fvf_decode.cpp
     src/renderer/grc_fvf_decode.h
-    src/renderer/rage_asset_pipeline.cpp
-    src/renderer/rage_asset_pipeline.h
     src/renderer/resource_cache.cpp
     src/renderer/resource_cache.h
     src/renderer/texture_decode.cpp
@@ -359,6 +358,7 @@ add_executable(mcla
 target_include_directories(mcla PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kernel
     ${CMAKE_CURRENT_SOURCE_DIR}/generated/ppc_xenon
     ${CMAKE_CURRENT_SOURCE_DIR}/.research/UnleashedRecomp/tools/XenonRecomp/XenonUtils
@@ -410,7 +410,7 @@ set(RENDERER_IR_TUS
     src/renderer/xenos_microcode.cpp
     src/renderer/xenos_shader_ir.cpp
     src/renderer/shader_translator.cpp
-    src/renderer/shader_dxc_compile.cpp
+    tools/validators/shader_dxc_compile.cpp
     src/renderer/dxc_runtime.cpp
     src/renderer/pipeline_cache.cpp
 )
@@ -418,6 +418,8 @@ set(RENDERER_IR_TUS
 set(VALIDATOR_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/validators
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL3/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt
@@ -429,50 +431,55 @@ set(VALIDATOR_INCLUDE_DIRS
 set(VALIDATOR_COMPILE_DEFS NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS MCLA_STANDALONE _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH _HAS_CXX23=0)
 
 add_executable(shader_pipeline_validator
-    src/renderer/shader_pipeline_validator.cpp ${RENDERER_IR_TUS})
+    tools/validators/shader_pipeline_validator.cpp ${RENDERER_IR_TUS})
 target_include_directories(shader_pipeline_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(shader_pipeline_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+target_link_libraries(shader_pipeline_validator PRIVATE d3d12.lib dxgi.lib dxguid.lib)
 
 add_executable(xenos_decode_validator
-    src/renderer/xenos_decode_validator.cpp ${RENDERER_IR_TUS})
+    tools/validators/xenos_decode_validator.cpp ${RENDERER_IR_TUS})
 target_include_directories(xenos_decode_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(xenos_decode_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+target_link_libraries(xenos_decode_validator PRIVATE d3d12.lib dxgi.lib dxguid.lib)
 
 add_executable(phase3_validator
-    src/renderer/phase3_validator.cpp ${RENDERER_IR_TUS}
+    tools/validators/phase3_validator.cpp ${RENDERER_IR_TUS}
     src/renderer/vertex_decode.cpp src/renderer/grc_fvf_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
 target_include_directories(phase3_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(phase3_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
+target_link_libraries(phase3_validator PRIVATE d3d12.lib dxgi.lib dxguid.lib)
 
 add_executable(texture_decode_test
-    src/renderer/texture_decode_test.cpp
+    tools/validators/texture_decode_test.cpp
     src/renderer/texture_decode.cpp src/renderer/resource_cache.cpp)
 target_include_directories(texture_decode_test PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(texture_decode_test PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
 add_executable(capture_dump_validator
-    src/renderer/capture_dump_validator.cpp src/frame_trace.cpp src/frame_trace.h
+    tools/validators/capture_dump_validator.cpp src/frame_trace.cpp src/frame_trace.h
     src/renderer/vertex_decode.cpp)
 target_include_directories(capture_dump_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(capture_dump_validator PRIVATE
     ${VALIDATOR_COMPILE_DEFS}
     FMT_HEADER_ONLY=1 SPDLOG_FMT_EXTERNAL SPDLOG_FWRITE_UNLOCKED)
+# frame_trace.cpp -> logging.h uses try/catch (see phase0 note re bare -MT).
+target_compile_options(capture_dump_validator PRIVATE /GS- /EHa)
 target_link_libraries(capture_dump_validator PRIVATE
     fmt::fmt spdlog::spdlog_header_only)
 
-add_executable(xtr_dump_validator src/renderer/xtr_dump_validator.cpp)
+add_executable(xtr_dump_validator tools/validators/xtr_dump_validator.cpp)
 target_include_directories(xtr_dump_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(xtr_dump_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
 add_executable(backend_validator
-    src/renderer/backend_validator.cpp
+    tools/validators/backend_validator.cpp
     src/renderer/vertex_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)
 target_include_directories(backend_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(backend_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 target_link_libraries(backend_validator PRIVATE d3d12.lib dxgi.lib dxguid.lib)
 
 add_executable(phase0_validator
-    src/kernel/phase0_validator.cpp
+    tools/validators/phase0_validator.cpp
     src/kernel/memory.cpp
     src/kernel/heap.cpp
     src/kernel/o1heap.c
@@ -493,5 +500,9 @@ target_include_directories(phase0_validator PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenonRecomp/thirdparty/TinySHA1"
     "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenonRecomp/thirdparty/libmspack/libmspack/mspack")
 target_compile_definitions(phase0_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
-target_link_libraries(phase0_validator PRIVATE fmt::fmt spdlog::spdlog_header_only)
+# heap.cpp -> logging.h uses try/catch; needs async EH like mcla itself.
+# NOTE: keep the /GS- first: this toolchain emits a bare -MT that swallows
+# the next token as its depfile target (mcla's /GS- absorbs it, sparing /EHa).
+target_compile_options(phase0_validator PRIVATE /GS- /EHa)
+target_link_libraries(phase0_validator PRIVATE fmt::fmt spdlog::spdlog_header_only dbghelp.lib)
 

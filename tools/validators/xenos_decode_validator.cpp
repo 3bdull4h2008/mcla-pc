@@ -11,7 +11,7 @@
 //    artifact breaks failures down by opcode family.
 // Exit code 0 = clean, 1 = errors found.
 
-#include "xenos_microcode.h"
+#include "renderer/xenos_microcode.h"
 
 #include <cstdint>
 #include <cstdio>
