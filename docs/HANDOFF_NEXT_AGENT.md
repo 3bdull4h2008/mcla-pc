@@ -1,3 +1,23 @@
+## 2026-09-23 ~22:20 — T41.3n2 IN FLIGHT (session: E-primary, goal active). State:
+- S2/S3 committed + pushed (origin @ `T41.3n2 S2/S3`): XMemDecompress census fixed (entry-lr,
+  uncapped dedup). w48 verdict: all 14 boot decoder calls are the 7 MB streamables job;
+  zero list-member feeds. Frontier w48 == w47 (C0000005 0, Fatal 2, GFx 3, star_glow 41).
+- S4b PROVEN so far (raw bytes vs logs, on E:): globaltex.list runtime entry =
+  entry+0=GtaO 3D9B8154, +4=stored 0x23F (575), +8=data_offset 0x000D0000, +12=0x400000EC.
+  On-disk xarchive_cache.rpf @0xD0000 head `75914d4e...` == RD-BUF #5 guest buffer
+  (C6157B80) head byte-for-byte -> POSITION IS CORRECT. 64 zero bytes at 0xD023F = exactly
+  member end -> data region NOT AES-CBC (ciphertext cannot pad to zeros); members are
+  headerless LZX (F-073 stands). All reads (TOC + list pages) come from ONE guest pump,
+  RD-SUBMIT #1-#8 lr=821C50A4 (inside fiDevice archive code). openGateBit30=1 appears 36x
+  in w48 (package entries carry bit30 in +8); the six .list entries have plain offsets
+  there — that is the flag DISCCHK forces (peer 21:00 thread, consistent).
+- NEXT (exact): disassemble the consumer of C6157B80 after 821C50A4 returns (ppc_disasm.py
+  on build/cache/mcla_pe.bin, offset VA-0x82000000) — find the branch that would call
+  sub_8244FF20: candidate gates = (a) XMem-header magic check on the page (bytes lack it),
+  (b) stored-vs-expanded compare using +12&0x3FFFFFFF=0xEC (236), (c) bit30 of +8 as
+  in-package flag. Naming (a)/(b)/(c) with the branch words completes T41.3n2 criterion (b).
+- Baselines: w48 (E, post-fix census) vs w47 (E, T41.3o) vs w46 (E, merge-verify) vs w45b (C, frozen).
+
 # HANDOFF — next agent, read this first
 
 > Compressed 2026-09-20. Queue: `LONG_TODO_MASTER.md` (T37.0 first). This =
