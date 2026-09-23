@@ -10168,6 +10168,51 @@ PPC_FUNC(sub_8244F4C0) {
   }
 }
 
+// T41.3n2 S4b: pump attribution. Raw-byte decode recovered the two read-pump
+// prologues (0x821C4F98, 0x821C5038) — they own every RD-SUBMIT lr seen for
+// the *.list page reads; their own caller is the consumer that should branch
+// to XMemDecompress. Log-only entry census with honest (pre-call) lr.
+PPC_FUNC_IMPL(__imp__sub_821C4F98);
+PPC_FUNC(sub_821C4F98) {
+  static std::atomic<uint32_t> s_pump1{0};
+  const uint32_t n = s_pump1.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (n <= 24)
+    MCLA_LOG_WARN("T413N2-PUMP1 #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, lr);
+  __imp__sub_821C4F98(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_821C5038);
+PPC_FUNC(sub_821C5038) {
+  static std::atomic<uint32_t> s_pump2{0};
+  const uint32_t n = s_pump2.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (n <= 24)
+    MCLA_LOG_WARN("T413N2-PUMP2 #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, lr);
+  __imp__sub_821C5038(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821CC970);
+PPC_FUNC(sub_821CC970) {
+  // T41.3n2 S4b hop 3: the XDK window pager (page-loop, [TLS+52]-gated).
+  // Its entry lr names the RAGE consumer that should branch to inflate.
+  static std::atomic<uint32_t> s_pager{0};
+  const uint32_t n = s_pager.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  uint32_t tls52 = 0;
+  {
+    auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t tls = ctx.r13.u32;
+    if (tls) (void)memP.ReadU32BE(tls + 52u, &tls52);
+  }
+  if (n <= 24)
+    MCLA_LOG_WARN("T413N2-PAGER #{} r3={:08X} r4={:08X} r5={:08X} "
+                  "[TLS+52]={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, tls52, lr);
+  __imp__sub_821CC970(ctx, base);
+}
+
 // Session 75w: slot-ready fix. sub_821CBE18(slot) waits on the slot's
 // event while [slot+12]==1 (read in flight). Our NtReadFile completes all
 // reads synchronously with no event signal, so pending slots would block
