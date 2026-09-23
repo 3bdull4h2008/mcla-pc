@@ -474,6 +474,17 @@ static int XsfOffsetCandidates(uint32_t w0, uint32_t w1, uint32_t w2,
 // Same pattern as job2: OpenFile + ReadFileAt, refuse junk windows.
 static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
   outSize = 0;
+  // T41.3g (F-077): the six *.list name-list members are COMPRESSED in the
+  // cache RPF (stored 126-460 vs expanded 260-1246, F-073) and serving their
+  // raw stored bytes at a host-chosen position bypasses the guest's own TOC
+  // arithmetic. Let list paths take the guest's own open/read: if ASCII names
+  // appear the guest decoded them, if they vanish the payload is opaque.
+  if (path != nullptr && (std::strstr(path, ".list") != nullptr ||
+                          std::strstr(path, "preload") != nullptr ||
+                          std::strstr(path, "globaltex") != nullptr)) {
+    MCLA_LOG_WARN("HOSTSERVE-BLOCKED path='{}' (T41.3g/F-077)", path);
+    return 0;
+  }
   uint32_t w[4] = {0, 0, 0, 0};
   std::string pathKey = path ? path : "";
   {
@@ -2041,17 +2052,16 @@ PPC_FUNC(sub_82177948) {
 // ===========================================================================
 // Stage C: Shader dictionary hash-table hydration
 //
-// ROOT CAUSE (refined): Factory sub_8218BF20 runs 10x creating entries that
-// are linked into the active list at 0x82839ED0. The hash table at 0x82839F70
-// (256 slots x 4 bytes) is NEVER populated. When sub_82189438 calls
-// sub_82189138 (lookup-or-insert), it scans the empty hash table, tries to
-// INSERT via sub_82188E50, which calls sub_8218C760 -> sub_821BDF20 to
-// resolve the name as a file resource. sub_821BDF20 calls sub_821CB488
-// (resource handler lookup) which returns NULL, causing the INSERT to fail.
-//
-// FIX: After factory completes (10 TEXDICT-CALLER hits), populate the hash
-// table with pointers to the factory-created entries. This way sub_82189138
-// finds the entries during its linear scan without needing the INSERT path.
+// MEASURED (F-085/F-086, 2026-09-21). The table address 0x82839F70 is
+// raw-verified: sub_82188E50 holds `lis r11,0x8284` at 0x82188E5C and
+// `addi r28,r11,-0x6090` at 0x82188E60. The old account here ("empty table ->
+// sub_82189138 returns -1 -> star_glow fatal") is REFUTED: w38s.log:3975 shows
+// DICTLOOKUP-OK slot=10 followed by a different fatal, and w41i.log calls
+// sub_82189138 zero times while the same fatal occurs, so the lookup is not on
+// the fatal path. sub_821CB488 is a 7-byte "memory:" comparator, not a resource
+// handler lookup. The ten entries written below all carry a zero word at +4 and
+// an empty name, so a match by name hash is not possible.
+// Kept in tree pending a measured behaviour-neutral removal (soak x2).
 // ===========================================================================
 
 // Hash table hydration: populate 0x82839F70 from factory-created entries.
@@ -2096,9 +2106,11 @@ static void HydrateShaderHashTable() {
                 inserted, count, TABLE);
 }
 
-// Census on sub_82189138 (hash-table lookup-or-insert).
-// Scans 256 slots at 0x82839F70 comparing entry+4 hash with target.
-// On miss: tries sub_82188E50 (INSERT) twice, then falls to fatal path.
+// Census on sub_82189138 (lookup-or-insert).
+// ASSUMED, not verified (F-085/F-086): "scans 256 slots at 0x82839F70 comparing
+// entry+4 hash with target". Measured instead: sub_82189138 builds an
+// "embedded:/" path at +0xA8 (0x821891E0, literal 0x8200B39C, len 11), and it
+// was called 0 times in w41i while the star_glow fatal still occurred.
 PPC_FUNC_IMPL(__imp__sub_82189138);
 static std::atomic<uint32_t> s_h189138{0};
 PPC_FUNC(sub_82189138) {
@@ -10068,10 +10080,53 @@ PPC_FUNC(sub_8244F4C0) {
                   "a2={:08X} a3={:08X} lr={:08X}",
                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                   static_cast<uint32_t>(ctx.lr));
+  // Capture BEFORE the call: sub_8244F4C0 moves r4/r5 into its own registers,
+  // so post-call ctx.r4/r5 are clobbered (the project's own sticky-register
+  // caveat, PROGRAM_GUIDE s8 -- a census that reads them after prints nothing).
+  const uint32_t bufG = ctx.r4.u32, cntG = ctx.r5.u32, r6G = ctx.r6.u32,
+                 r7G = ctx.r7.u32;
   __imp__sub_8244F4C0(ctx, base);
   if (ctx.r4.u32 != 0 && ctx.r4.u32 != 0xCDCDCDCDu) {
     const uint32_t idx = g_doneBufIdx.fetch_add(1) % kDoneBufCap;
     g_doneBufs[idx].store(ctx.r4.u32, std::memory_order_release);
+  }
+  // T41.3n (F-091), UNCAPPED read-only: the discriminator F-077's experiment
+  // was missing. r4 = destination buffer, r5 = byte count, and NtReadFile
+  // completes synchronously, so the bytes the guest now holds are the answer to
+  // "did a *.list body decode to ASCII names, or is the payload opaque?".
+  // Nothing in this project has ever printed a read buffer's CONTENT.
+  {
+    const uint32_t buf = bufG;
+    const uint32_t cnt = cntG;
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    // No IsValid() gate: it validates the virtual heap only, and these buffers
+    // live in the physical arena (0xC6...), so it returned false and the census
+    // printed nothing -- the same blind-printer trap as F-089 s6. ReadBytes
+    // itself reports whether the read worked, and the line prints either way.
+    if (buf != 0 && buf != 0xCDCDCDCDu && cnt >= 0x10u) {
+      char raw[17] = {0};
+      const bool got = memR.ReadBytes(buf, raw, 16);
+      uint32_t pr = 0, nz = 0;
+      char vis[17] = {0};
+      for (int k = 0; k < 16; ++k) {
+        const unsigned char c = static_cast<unsigned char>(raw[k]);
+        if (c) ++nz;
+        if (c >= 0x20u && c < 0x7Fu) {
+          ++pr;
+          vis[k] = static_cast<char>(c);
+        } else {
+          vis[k] = '.';
+        }
+      }
+      uint32_t pos = 0, posHi = 0, out = 0;
+      (void)memR.ReadU32BE(r7G + 24u, &pos);
+      (void)memR.ReadU32BE(r7G + 28u, &posHi);
+      (void)memR.ReadU32BE(r6G, &out);
+      MCLA_LOG_WARN("RD-BUF #{} h={:08X} buf={:08X} cnt={} read={} ascii={}/16 "
+                    "nz={}/16 head=[{}] reqPos={:08X}_{:08X} out={:08X}",
+                    n, ctx.r3.u32, buf, cnt, got ? 1 : 0, pr, nz, vis, posHi,
+                    pos, out);
+    }
   }
 }
 
@@ -10449,8 +10504,14 @@ PPC_FUNC(sub_821CBFC0) {
   char path[68] = {0};
   memR.ReadBytes(pathPtr, path, 64);
   MclaSanitizePath(path, sizeof(path));
+  // T41.3m (F-089): the n<=80 window closed 1 ms before the star_glow lookups,
+  // so the guest's own TOC answer for them was never printed. GetDevice
+  // (sub_821CB488) reaches this function through the mount-prefix-stripping
+  // thunk sub_821CDB88 (vtable 0x82012BDC slot+4), so the paths arriving here
+  // are relative ("fxl_final/star_glow.fxc"). Log-only.
   const bool hot =
-      (n <= 80) || (path[0] && std::strstr(path, "policecam") != nullptr);
+      (n <= 80) || (path[0] && (std::strstr(path, "policecam") != nullptr ||
+                                std::strstr(path, "star_glow") != nullptr));
   uint32_t inner = 0, tStart = 0, tCount = 0, e0 = 0, e4 = 0, e8 = 0, e12 = 0;
   if (hot) {
     (void)memR.ReadU32BE(obj + 8u, &inner);
@@ -10493,6 +10554,38 @@ PPC_FUNC(sub_821CBFC0) {
                   "lr={:08X}",
                   n, ctx.r3.u32, path, w[0], w[1], w[2], w[3],
                   openGate ? 1 : 0, allZero ? 1 : 0, lr);
+    // T41.3h (F-078) read-only: the host currently consumes entry+8 as BOTH
+    // the Open gate flags (XSF-OPEN-GATE ORs bit30 there) and the member
+    // offset, which cannot both hold. Dump the neighbouring 8 words so the
+    // real layout is read from guest bytes instead of guessed. A 16-byte
+    // stride that repeats the shape means the entry is 16B and +10 is sibling.
+    uint32_t L[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < 8; ++i)
+      (void)memR.ReadU32BE(ctx.r3.u32 + 4u + static_cast<uint32_t>(i * 4),
+                           &L[i]);
+    MCLA_LOG_WARN(
+        "TOC76-LAYOUT #{} path='{}' entry={:08X} +4=[{:08X} {:08X} {:08X} "
+        "{:08X}] +14=[{:08X} {:08X} {:08X} {:08X}] xsf={} list={}",
+        n, path, ctx.r3.u32, L[0], L[1], L[2], L[3], L[4], L[5], L[6], L[7],
+        std::strstr(path, ".xsf") != nullptr ? 1 : 0,
+        std::strstr(path, ".list") != nullptr ? 1 : 0);
+  }
+  // T41.3m (F-089) read-only, UNCAPPED: PathLooksLikeArchiveContent matches
+  // .xsf/.xtd/.list/… but can never match "fxl_final/star_glow.fxc", so the
+  // guest's TOC answer for the exact file the boot fatals on has never been
+  // printable. Deliberately NOT routed through XsfTocCache or the Open-gate
+  // pre-scan — a census, not a serve. If this line is absent for a path the
+  // GETDEV census shows being asked for, the lookup was never attempted.
+  if (path[0] && std::strstr(path, "star_glow") != nullptr) {
+    const uint32_t ret = ctx.r3.u32;
+    uint32_t w[4] = {0, 0, 0, 0};
+    if (ret != 0 && ret != 0xFFFFFFFFu && ret != 0xCDCDCDCDu) {
+      for (int i = 0; i < 4; ++i)
+        (void)memR.ReadU32BE(ret + static_cast<uint32_t>(i * 4), &w[i]);
+    }
+    MCLA_LOG_WARN("TOC76-SG #{} path='{}' ret={:08X} [{:08X} {:08X} {:08X} "
+                  "{:08X}] lr={:08X}",
+                  n, path, ret, w[0], w[1], w[2], w[3], lr);
   }
 }
 
@@ -10525,9 +10618,9 @@ PPC_FUNC(sub_821CCEA0) {
       uint32_t e8 = 0;
       if (memR.ReadU32BE(it->second.entry + 8, &e8) &&
           (e8 & 0x40000000u) == 0) {
-        (void)memR.WriteU32BE(it->second.entry + 8, e8 | 0x40000000u);
+  // T41.3h (F-079): (void)memR.WriteU32BE(it->second.entry + 8, e8 | 0x40000000u);
         it->second.w[2] = e8 | 0x40000000u;
-        MCLA_LOG_WARN("XSF-OPEN-GATE path='{}' entry={:08X} +8 {:08X} -> "
+        MCLA_LOG_WARN("XSF-OPEN-GATE-SKIPPED path='{}' entry={:08X} +8 {:08X} -> "
                       "{:08X} (set bit30 so Open proceeds)",
                       path, it->second.entry, e8, e8 | 0x40000000u);
       }
@@ -11171,12 +11264,15 @@ PPC_FUNC(sub_821CAFB8) {
     }
     if (n <= 40 || (n % 200) == 0)
       MCLA_LOG_WARN("AFB76-MISS #{} path='{}' lr={:08X}", n, path, lr);
-    // T41.3d (F-066): the rage_im substitution guaranteed the guest's
-    // "drawblit technique is old and busted" fatal, because rage_im is the only embedded body that
-    // contains drawblit (at buf+0x1365) and none of the 15 contains a star_glow key name. Report the
-    // miss honestly and let the guest's own not-found path run.
+    // T41.3d (F-066/F-067): this substitution could never work. star_glow.fxc is
+    // absent from all 15 embedded fxl_final/* bodies and none carries a star_glow
+    // key name, while rage_im's body necessarily contains the obsolete drawblit
+    // technique at buf+0x1365 - so serving it guaranteed the guest's
+    // 'drawblit technique is old and busted' fatal. Measured on the pre-fault
+    // tree: C0000005 2 -> 0 (first zero-AV soak), parked thread 1 -> 0.
     if (std::strstr(path, "star_glow") != nullptr)
-      MCLA_LOG_WARN("AFB76-MISS-HONEST #{} path='{}' lr={:08X} (T41.3d/F-066)", n, path, lr);
+      MCLA_LOG_WARN("AFB76-MISS-HONEST #{} path='{}' lr={:08X} (T41.3d/F-066)",
+                    n, path, lr);
     ctx.r3.u32 = 0xFFFFFFFFu;
     return;
   }
@@ -11194,6 +11290,8 @@ PPC_FUNC(sub_821CAFB8) {
   // w13: UI .xsf body host-serve. Guest TOC lookup finds the file but the
   // body Read never lands (encrypted RPF + Open gate). Serve from cache RPF
   // at the TOC-derived offset when we have one — same pattern as job2.
+  // T41.3f was VOID as a no-op (F-077): this branch never served the list
+  // paths. The gate now lives in HostServeUiBody (T41.3g).
   if (uiBody) {
     uint32_t xsz = 0;
     const uint32_t xbuf = HostServeUiBody(path, xsz);
@@ -11520,9 +11618,14 @@ PPC_FUNC(sub_821D3070) {
   // returned and the [0x8287E26C] singleton was never created (F-061). The
   // guard exists only for the unusable-object case; keep it to that.
   const bool fromMagic = (ctx.r4.u32 & 0x8000u) != 0 &&
-                         static_cast<uint32_t>(ctx.lr) == 0x8218C89Cu;
+                         (ctx.lr == 0x8218C89Cu ||
+                          static_cast<uint32_t>(ctx.lr) == 0x8218C89Cu);
+  // F-063 re-applied (it was lost with E:'s working tree on 2026-09-21 00:54;
+  // see C:\mcla-pc\docs\HANDOFF_NEXT_AGENT.md): bit 15 of r4 is a FLAG the
+  // 8C760 magic-accept path ORs in, not a size, so skipping on it starved the
+  // shader's own 32 KB buffer. The other clauses (null obj / null +8) stay.
   if (obj == 0 || obj == 0xCDCDCDCDu || field8 == 0 || field8 == 0xCDCDCDCDu) {
-    if (n <= 16)
+    if (n <= 16 || fromMagic)
       MCLA_LOG_WARN("D3070-SKIP #{} obj={:08X} +8={:08X} r4={:08X} lr={:08X}",
                     n, obj, field8, ctx.r4.u32,
                     static_cast<uint32_t>(ctx.lr));
