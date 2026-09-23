@@ -4,7 +4,30 @@
 #include <string>
 #include <vector>
 
+// Global-scope forward declaration (the real type is defined in src/ppc_context.h).
+// Declaring it inside mcla::boot would create a DIFFERENT incomplete type and break
+// every PPCContext use in this namespace.
+struct PPCContext;
+
 namespace mcla::boot {
+
+// T38.2b (F-046): the VEH crash dump prints ONE PPCContext per thread. Guest code
+// that runs on a *synthetic* context (the forced boot gate, the GFx ctor call) must
+// publish it here or the dump silently reports an unrelated frame's registers — which
+// is exactly how four sessions misread the 0x7E780000 fault. Diagnostic only: this
+// changes no execution, only whose registers get printed.
+class FaultContextScope
+{
+public:
+    FaultContextScope(const PPCContext* ctx, const char* tag);
+    ~FaultContextScope();
+    FaultContextScope(const FaultContextScope&) = delete;
+    FaultContextScope& operator=(const FaultContextScope&) = delete;
+
+private:
+    const PPCContext* prevCtx_;
+    const char* prevTag_;
+};
 
 // What the boot observed, for fault triage and gate evidence. Mirrors the
 // proven smoke-host BootReport (tools/xenon_smoke, commit 8fc8842).

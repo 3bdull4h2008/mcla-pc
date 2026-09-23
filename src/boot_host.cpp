@@ -30,7 +30,6 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 #include <unordered_map>
 
 // Skip flag for generated code (defined in generated/ppc_xenon/ppc_recomp.49.cpp)
-extern std::atomic<bool> s_skipSub822FA958;
 
 // UILOAD thread tracking
 std::atomic<DWORD> s_uiLoadThreadId{0};
@@ -71,7 +70,11 @@ namespace
     std::mutex g_reportMutex;
     BootReport g_report;
     std::atomic<bool> g_bootDone{false};
-    const PPCContext* g_faultCtx = nullptr;
+    // Per-thread, because the VEH handler runs on the faulting thread: a process-wide
+    // pointer here printed the BOOT THREAD'S context for a fault on any other thread
+    // (F-046). The tag names which context so a dump can never be mistaken again.
+    thread_local const PPCContext* g_faultCtx = nullptr;
+    thread_local const char* g_faultCtxTag = "none";
     uintptr_t g_moduleBase = 0;
     static DWORD s_bootWorkerThreadId = 0;
 
@@ -521,6 +524,37 @@ namespace { // resume file-local helpers
         return buf;
     }
 
+    // T38.2b (F-046): "which translated guest function contains the faulting host RIP"
+    // is answerable WITHOUT the context registers, so it survives the wrong-frame problem.
+    // Allocation- and lock-free on purpose (unwind metadata + the static mapping table):
+    // this runs inside the VEH handler, where NearestFunctionName's dbghelp path does not.
+    const char* GuestFnAtHostAddr(uint64_t hostAddr)
+    {
+        static thread_local char buf[80];
+        DWORD64 imageBase = 0;
+        const PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry((DWORD64)hostAddr, &imageBase, nullptr);
+        if (fn == nullptr)
+        {
+            std::snprintf(buf, sizeof(buf), "no unwind entry");
+            return buf;
+        }
+        const uintptr_t start = (uintptr_t)(imageBase + fn->BeginAddress);
+        for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
+        {
+            if ((uintptr_t)PPCFuncMappings[i].host == start)
+            {
+                // The offset is HOST code bytes from the translated function's entry, not a guest PC
+                // displacement — 0x82304348 + 0x144 decoded as guest is a block that never ran (F-050).
+                std::snprintf(buf, sizeof(buf), "guest 0x%08zX (host+0x%llX)", PPCFuncMappings[i].guest,
+                              (unsigned long long)(hostAddr - start));
+                return buf;
+            }
+        }
+        std::snprintf(buf, sizeof(buf), "host 0x%llx, not a mapped guest fn",
+                      (unsigned long long)start);
+        return buf;
+    }
+
     static void CaptureFaultInfo(EXCEPTION_POINTERS* info, BootReport& report, bool captureStack)
     {
         const uintptr_t pc = (uintptr_t)info->ContextRecord->Rip;
@@ -704,6 +738,7 @@ void BootWorker(uint32_t entryGuest)
     SetPPCContext(ctx);
 
     g_faultCtx = &ctx;
+    g_faultCtxTag = "boot-root";
 
 // Install vectored exception handler for early crash detection
     PVOID vehHandle = AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS ExceptionInfo) -> LONG {
@@ -732,11 +767,40 @@ void BootWorker(uint32_t entryGuest)
                 fprintf(crashFile, "  Param[%u]=0x%p\n", i, (PVOID)info[i]);
             }
             
+            // Register-independent attribution (survives a stale/wrong-context dump).
+            fprintf(crashFile, "  rip owner=%s\n", GuestFnAtHostAddr(pc));
+
             // PPC context
             if (const PPCContext* fc = g_faultCtx) {
+                fprintf(crashFile, "  ppc ctx=%p tag=%s tid=%lu (registers below belong to THIS context)\n",
+                        (const void*)fc, g_faultCtxTag, GetCurrentThreadId());
                 fprintf(crashFile, "  ppc r1=%08X lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r13=%08X\n",
                         fc->r1.u32, (uint32_t)fc->lr, fc->r3.u32, fc->r4.u32, fc->r5.u32,
                         fc->r6.u32, fc->r7.u32, fc->r8.u32, fc->r9.u32, fc->r10.u32, fc->r13.u32);
+                // T38.2 (revised at build time): PPCContext has NO ctr/xer/r11/r30
+                // members — ppc_config.h makes them host locals
+                // (PPC_CONFIG_CTR_AS_LOCAL / _NON_ARGUMENT_AS_LOCAL / _NON_VOLATILE_AS_LOCAL),
+                // so they can never be dumped. What CAN settle the 0x7E780000 family is
+                // identity-testing the fault address against the function-table probe
+                // PPC_LOOKUP_FUNC(base,y) for the candidate targets, because the generated
+                // code does `ctr.u64 = ctx.rN.u64` straight before the call.
+                const uint64_t b = (uint64_t)(uintptr_t)g_base;
+                fprintf(crashFile, "  g_base=0x%llX table=0x%llX\n",
+                        (unsigned long long)b,
+                        (unsigned long long)(b + PPC_IMAGE_BASE + PPC_IMAGE_SIZE));
+                for (const uint32_t cand :
+                     { (uint32_t)0u, fc->r8.u32, fc->r9.u32, fc->r3.u32, (uint32_t)fc->lr }) {
+                    const uint64_t s64 = (uint64_t)PPC_IMAGE_BASE + PPC_IMAGE_SIZE +
+                                         (uint64_t(uint32_t(cand) - PPC_CODE_BASE) * 2);
+                    const bool hit = code == 0xC0000005 && nInfo >= 2 &&
+                            (uint32_t)(uintptr_t)info[1] == (uint32_t)s64;
+                    fprintf(crashFile, "  probe y=%08X -> off32=0x%08X%s\n", cand,
+                            (uint32_t)s64, hit ? " == Param[1] (base contributed 0)" : "");
+                }
+            } else {
+                fprintf(crashFile, "  ppc ctx=nil tag=%s tid=%lu — nothing published on the faulting thread;"
+                                   " any GPR read from this dump would be another frame's (F-046)\n",
+                        g_faultCtxTag, GetCurrentThreadId());
             }
             
             // Host registers
@@ -858,12 +922,43 @@ void BootWorker(uint32_t entryGuest)
         for (DWORD i = 0; i < nInfo; ++i) {
             MCLA_LOG_ERROR("  Param[{}]=0x{:p}", i, (PVOID)info[i]);
         }
+        // Register-independent attribution: the translated guest function that
+        // contains the faulting host instruction.
+        MCLA_LOG_ERROR("  rip owner={}", GuestFnAtHostAddr(pc));
         if (const PPCContext* fc = g_faultCtx)
         {
+            MCLA_LOG_ERROR("  ppc ctx={:p} tag={} tid={} (registers below belong to THIS context)",
+                           (const void*)fc, g_faultCtxTag, GetCurrentThreadId());
             MCLA_LOG_ERROR("  ppc r1={:08X} lr={:08X} r3={:08X} r4={:08X} r5={:08X} r6={:08X} "
                            "r7={:08X} r8={:08X} r9={:08X} r10={:08X} r13={:08X}",
                            fc->r1.u32, (uint32_t)fc->lr, fc->r3.u32, fc->r4.u32, fc->r5.u32,
                            fc->r6.u32, fc->r7.u32, fc->r8.u32, fc->r9.u32, fc->r10.u32, fc->r13.u32);
+            // T38.2 (revised at build time): ctr/xer/r11/r30 are NOT PPCContext members
+            // (ppc_config.h PPC_CONFIG_CTR_AS_LOCAL / _NON_ARGUMENT_AS_LOCAL /
+            // _NON_VOLATILE_AS_LOCAL make them host locals), so the dump can never carry
+            // them. Identity-test the fault address against the function-table probe
+            // instead — the generated code copies a ctx register into ctr immediately
+            // before PPC_CALL_INDIRECT_FUNC, so one of these candidates must match.
+            const uint64_t b = (uint64_t)(uintptr_t)g_base;
+            MCLA_LOG_ERROR("  g_base=0x{:X} table=0x{:X}", b,
+                           b + PPC_IMAGE_BASE + PPC_IMAGE_SIZE);
+            for (const uint32_t cand :
+                 { (uint32_t)0u, fc->r8.u32, fc->r9.u32, fc->r3.u32, (uint32_t)fc->lr })
+            {
+                const uint64_t s64 = (uint64_t)PPC_IMAGE_BASE + PPC_IMAGE_SIZE +
+                                     (uint64_t(uint32_t(cand) - PPC_CODE_BASE) * 2);
+                MCLA_LOG_ERROR("  probe y={:08X} -> off32=0x{:08X}{}", cand, (uint32_t)s64,
+                               code == 0xC0000005 && nInfo >= 2 &&
+                                       (uint32_t)(uintptr_t)info[1] == (uint32_t)s64
+                                   ? " == Param[1] (base contributed 0)"
+                                   : "");
+            }
+        }
+        else
+        {
+            MCLA_LOG_ERROR("  ppc ctx=nil tag={} tid={} — nothing published on the faulting thread;"
+                           " any GPR read from this dump would be another frame's (F-046)",
+                           g_faultCtxTag, GetCurrentThreadId());
         }
 
         // Host GP registers - session 17: pin which pointer is the bad raw
@@ -921,92 +1016,22 @@ void BootWorker(uint32_t entryGuest)
         const bool isBootWorker = (GetCurrentThreadId() == s_bootWorkerThreadId);
         const bool isUILoadThread = (GetCurrentThreadId() == s_uiLoadThreadId.load()) || s_inUILoad.load();
 
-        // W36f: boot worker / UILOAD thread special handling — don't park, try to recover
-        // from float-div-0 and AV so the render pipeline stays alive.
+        // W36f: boot worker / UILOAD thread special handling.
+        //
+        // T38.3 (2026-09-20): the three recovery paths that used to live inside this block are
+        // DELETED, not tuned. They were (a) float-div-0 → clear MXCSR + zero XMM0 + re-execute,
+        // plus a 0xC3 (RET) code patch over sub_823D91F8's host entry and an infinite park at
+        // lr=0x82133440; (b) illegal-instruction → Rip += 256MB; (c) the "known crash site"
+        // lr=0x822F44E0/0x82133440 branch → set s_skipSub822FA958, patch sub_822FA958's host
+        // entry with 0xC3 and Rip += 256MB. F-051 measured 0 firings across two honest soaks and
+        // called them dead; build/w38e.log disproved that the moment the gate driver reached
+        // UILOAD — (c) fired 616,824 times, each 256MB advance re-faulting 0x10000000 higher,
+        // turning ONE guest write to 0xE0 into a 1.86M-line log. All three fabricated execution
+        // (PLAN_VMX128 risk R5) and hid the real fault. A guest AV now takes the VEH-NEUTRAL
+        // decline below, and then the generic park at the end of the handler.
         if (isBootWorker || isUILoadThread) {
-if (code == 0xC000008E) { // STATUS_FLOAT_DIVIDE_BY_ZERO
-                if (ExceptionInfo->ContextRecord) {
-                    // Clear FP exception flags in MXCSR (bits 0-5 = IE,DE,ZE,OE,UE,PE)
-                    ExceptionInfo->ContextRecord->MxCsr &= ~0x3F;
-                    // Known float-div-0 crash site: park thread after patch
-                    if (glr == 0x82133440) {
-                        static bool s_patched823D91F8 = false;
-                        if (!s_patched823D91F8) {
-                            s_patched823D91F8 = true;
-                            // Patch the called function host entry
-                            PPCFunc* funcPtr = PPC_LOOKUP_FUNC(g_base, 0x823D91F8);
-                            if (funcPtr) {
-                                void* hostEntry = (void*)funcPtr;
-                                DWORD oldProtect;
-                                if (VirtualProtect(hostEntry, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                                    *(unsigned char*)hostEntry = 0xC3; // RET instruction
-                                    VirtualProtect(hostEntry, 1, oldProtect, &oldProtect);
-                                    unsigned char patched = *(unsigned char*)hostEntry;
-                                    MCLA_LOG_WARN("VEH: patched sub_823D91F8 host entry with RET at {:p} (verify: 0x{:02X})", hostEntry, patched);
-                                }
-                            }
-                        }
-                        MCLA_LOG_WARN("VEH: parking boot worker thread after float-div-0 at lr={:08X}, render thread continues", glr);
-                        for (;;) Sleep(1000);
-                    }
-                    // Heuristic: set result register (XMM0) to 0 to avoid re-fault
-                    ExceptionInfo->ContextRecord->Xmm0.Low = 0;
-                    ExceptionInfo->ContextRecord->Xmm0.High = 0;
-                    MCLA_LOG_WARN("VEH boot-worker float-div-0: cleared MXCSR, zeroed XMM0, continuing at lr={:08X}", glr);
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-            }
-            // Handle illegal instruction in UILOAD context (0xC000001D = STATUS_ILLEGAL_INSTRUCTION)
-            if (code == 0xC000001D && isUILoadThread) {
-                if (ExceptionInfo->ContextRecord) {
-                    MCLA_LOG_WARN("VEH: UILOAD context illegal instruction at lr={:08X}, advancing RIP", glr);
-                    ExceptionInfo->ContextRecord->Rip += 256ull * 1024 * 1024; // 256MB advance
-                    ExceptionInfo->ContextRecord->Rax = 0;
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-            }
             if (code == 0xC0000005) { // STATUS_ACCESS_VIOLATION
                 if (ExceptionInfo->ContextRecord) {
-                    // Known crash sites: immediately return from function (pop return addr)
-                    const bool isKnownCrashSite = (glr == 0x822F44E0 || glr == 0x82133440);
-
-                    if (isKnownCrashSite) {
-                        // Set skip flag to permanently disable this function in generated code
-                        if (glr == 0x822F44E0) {
-                            s_skipSub822FA958.store(true, std::memory_order_relaxed);
-                            MCLA_LOG_WARN("VEH: permanently disabled sub_822FA958 (lr={:08X})", glr);
-                            // Runtime code patch: write RET (0xC3) at host function entry (once)
-                            static bool s_patched822FA958 = false;
-                            if (!s_patched822FA958) {
-                                s_patched822FA958 = true;
-                                PPCFunc* funcPtr = PPC_LOOKUP_FUNC(g_base, 0x822FA958);
-                                if (funcPtr) {
-                                    void* hostEntry = (void*)funcPtr;
-                                    DWORD oldProtect;
-                                    if (VirtualProtect(hostEntry, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                                        *(unsigned char*)hostEntry = 0xC3; // RET instruction
-                                        VirtualProtect(hostEntry, 1, oldProtect, &oldProtect);
-                                        unsigned char patched = *(unsigned char*)hostEntry;
-                                        MCLA_LOG_WARN("VEH: patched sub_822FA958 host entry with RET at {:p} (verify: 0x{:02X})", hostEntry, patched);
-                                    }
-                                }
-                            }
-                        }
-                        // If running UILOAD (either dedicated thread or boot worker running UILOAD),
-                        // don't park - let execution continue after patch
-                        if (s_inUILoad.load()) {
-                            MCLA_LOG_WARN("VEH: UILOAD context crash at lr={:08X}, patch applied, continuing", glr);
-                            // Nuclear advance: 256MB to skip entire caller chain
-                            ExceptionInfo->ContextRecord->Rip += 256ull * 1024 * 1024; // 256MB advance
-                            ExceptionInfo->ContextRecord->Rax = 0;
-                            return EXCEPTION_CONTINUE_EXECUTION;
-                        }
-                        // Park boot worker thread after first crash - let render thread continue
-                        MCLA_LOG_WARN("VEH: parking boot worker thread after crash at lr={:08X}, render thread continues", glr);
-                        // Don't return to faulting code - park this thread forever
-                        for (;;) Sleep(1000);
-                    }
-
                     // EXPERIMENT (session 79, user-approved): the recovery removed here
                     // advanced the host RIP by 16/64/4096 bytes and fabricated returns
                     // with RAX=0, so the guest executed control flow the PPC binary does
@@ -1076,6 +1101,22 @@ if (code == 0xC000008E) { // STATUS_FLOAT_DIVIDE_BY_ZERO
         return 0;
     }
 } // namespace
+
+    // Publishes the context the current thread is running guest code ON, so a VEH dump
+    // taken inside the scope names the faulting frame instead of the boot thread's root
+    // context (F-046). Restores the previous pairing on scope exit.
+    FaultContextScope::FaultContextScope(const PPCContext* ctx, const char* tag)
+        : prevCtx_(g_faultCtx), prevTag_(g_faultCtxTag)
+    {
+        g_faultCtx = ctx;
+        g_faultCtxTag = tag;
+    }
+
+    FaultContextScope::~FaultContextScope()
+    {
+        g_faultCtx = prevCtx_;
+        g_faultCtxTag = prevTag_;
+    }
 
 bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
 {

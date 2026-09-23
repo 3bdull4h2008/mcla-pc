@@ -83,7 +83,9 @@ raw bl-scan found 4. Generated TUs = other ground truth.
   **0 broken** (was 1719); 44,707 mappings link-safe; 33% `.long 0x0` =
   never-executed, not a defect (F-022).
 - `.research/` + `generated/` gitignored → tool patches committed as `.patch`.
-  Helpers: `tools/fix_stubs_{iter,self}.py` (span fixed-point loops).
+  Helpers: `fix_stubs_{iter,self}.py` **at the repo root** (verified 19:25 — not `tools/`; they are
+  untracked junk per `LONG_TODO_MASTER` T37.1, so re-check before relying on them),
+  span fixed-point loops.
 
 ## 6. Host runtime architecture
 
@@ -209,7 +211,12 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 | `PRELOAD-CTX` / `POST-EXEC` | post-inflate callback context (streamCnt, cbPtr, arcDev, bufPtr) |
 | `REQ` / `REQDUMP` / `COMPLETE` / `RELSEMA` | streaming queue requests, executor completions, semaphore releases |
 | `JOIN` / `PAGESLOT` / `RD-SUBMIT` / `READWRAP` | join-table dump, page-cache slot states, kernel read submits, stream reads |
-| `WAIT` / `WAKE` | KeWaitForSingleObject/KeResetEvent (KWFSO) with object, status, lr |
+| `WAIT` / `WAKE` | KeWaitForSingleObject/KeResetEvent (KWFSO) with object, status, lr. The `WAIT` line's `put=`/`rptrWB=`/`wb@XXXXXXXX=` fields are a **census of the waiter's view**: since T40.4 the write-back word is read through `CpPrimaryWritebackVA()` (the CP's own publish target) instead of a hard-coded address that was 4 bytes wrong for soaks (F-057(1)). `wb@00000000=` means no write-back is enabled, not a stalled ring. |
+| `CP-T3-CENSUS` | unhandled PM4 Type-3 opcode, first 3 per opcode with argument dwords, then a running total (`src/gpu_cp.cpp:351-367`). Replaced a logger that collapsed every opcode `>= 0x20` — the whole draw range — into one line (F-059). Names: `xenos.h` PM4 enum. |
+| `CP-DRAW` | decoded `PM4_DRAW_INDX` (0x22) / `PM4_DRAW_INDX_2` (0x36): `VGT_DRAW_INITIATOR` split into `src`/`prim`/`numIdx`/`idxSize` plus `dmaBase`/`dmaSize` for kDMA (`src/gpu_cp.cpp:496-531`, fields per `registers.h:311-326`). **Census only — it does not render**; `DRAW_INDEXED` is a different, still-starved path. |
+| `MSGCHAIN` / `MSGBISECT` | The F-060/F-061/F-063 boot-init chain census (`src/gpu_device.cpp:9450-9560`): every hook **chains** to `__imp__` (log-only), prints its `r3`, `lr`, a guest stack back-chain and `[0x8287E26C]`/`[0x82839F68]`/`[0x8287E064]`. `MSGBISECT 5-822FBAF8 RETURN` is the line that says the `star_glow` effect init completed. Numbers are matched-LINE counts like everything here — one `RETURN` missing is the whole finding. |
+| `GATE-STACK` / `GATE-WAIT` | The forced boot gate's own host thread (`src/gpu_device.cpp:1097+`): the guest stack it runs on (from `g_userHeap`, never the phys o1heap — that caused 3 bogus `AllocPhysical` nulls) and the value of `[0x8287E26C]` after it waited up to 500 ms for the guest to publish its singleton. |
+| `D3070-SKIP` / `D3070-RUN` | `sub_821D3070` buffer guard (`src/gpu_device.cpp:11516+`). SKIP = object/block unusable; RUN = the call was passed to the guest. Since F-063 the `r4 & 0x8000` flag test no longer forces a SKIP, so a SKIP now genuinely means a dead object. |
 | `TICK-PROBE` | VSYNC semaphore release into the tick object |
 | `NFS-CENSUS` | file reads served by VFS |
 | `REBASE-POISON` / `P10-PRE` | poison param zeroing / poison-id skip (`task_dispatch_trace.cpp`) |
@@ -226,13 +233,20 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 
 ## 10. RE tooling
 
-- **IDA MCP** on `127.0.0.1:8745` (program `mcla_pe.bin`, base `0x82000000`).
-  Start: `powershell -File tools\start_idalib_mcp.ps1` then `check_connection`;
-  or run the venv python (path in `tools\start_idalib_mcp.ps1`)
-  with arg `-v "E:/mcla pc/build/cache/mcla_pe.bin"`. Do NOT use the SSE
-  `idalib_server.py` with the proxy. Useful tools: `get_function_by_address`,
-  `decompile_function`, `disassemble_function`, `get_xrefs_to`,
-  `list_strings_filter`, `read_memory_bytes`, `data_read_string`.
+- **IDA MCP** on `127.0.0.1:8745`. **Two ways in, and the safe one is usually not the configured one.**
+  `idalib-mcp.exe "<workspace>\build\game_data\default.xex"` already serves MCP over HTTP there, so if
+  a process by that name exists, **attach to it** (POST `/mcp` with
+  `Accept: application/json, text/event-stream`, keep the `Mcp-Session-Id`, then `initialize` →
+  `notifications/initialized` → `tools/list` / `tools/call`; 47 tools, `get_metadata` gives
+  `base 0x82000000 size 0xad3000 md5 062233a2…`). Do **not** start `ida-bridge.py` in that case —
+  its line 25 is `taskkill /F /IM idalib-mcp.exe`, which destroys another session's IDB (rule 11,
+  and `LONG_TODO_MASTER` §8.8). Only when nothing is listening is the bridge the way in
+  (`tools/start_idalib_mcp.ps1`, or the venv python with `-v "E:/mcla pc/build/cache/mcla_pe.bin"`).
+  Do NOT use the SSE `idalib_server.py` with the proxy. Useful tools: `get_function_by_address`,
+  `decompile_function`, `disassemble_function`, `get_xrefs_to`, `list_strings_filter`,
+  `read_memory_bytes`, `data_read_string`. Remember §4/§10: an IDA xref list is a hypothesis until the
+  generated TUs and raw words agree — F-060/F-061 were both built by pairing `get_xrefs_to` with
+  `grep` over `generated/ppc_xenon`, and F-062 refuted a TLS theory that IDA's output supported.
 - Ghidra RETIRED.
 - Generated TUs are ground truth for bodies; IDA function starts are
   unreliable on this raw bin; IDA xrefs must be bl-scan-verified (§4).

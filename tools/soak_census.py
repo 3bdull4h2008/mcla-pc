@@ -40,17 +40,65 @@ FRONTIER = [
     "swfCMD", "PUT=",
 ]
 
-# The five crash/TLS-path mitigations of T38.3, one marker each. They all begin
-# with "VEH", which the battery above already counts, so without these the census
-# cannot tell a *declined* fault (honest) from a recovered one (a short-circuit).
-# Verified against the format strings at src/boot_host.cpp:1043-1101 (2026-09-20).
-# "parking thread" is NOT one of them -- no soak has ever emitted it; the real
-# string is "parking boot worker thread".
+# The crash-path signals: one marker per thing the handler can DO with a fault.
+# Regenerated 2026-09-20 21:45 from the live format strings, because the previous
+# list carried 8 markers that exist nowhere in src/ (T38.3(a) deleted those paths)
+# and omitted the one park that does -- so "all recovery markers are 0" was a
+# tautology, not a verdict (F-057(6)). `dead_tracked()` below now fails loudly
+# instead of letting that happen again.
 VEH_PATHS = [
-    "VEH-NEUTRAL", "parking boot worker", "advancing RIP", "Nuclear advance",
-    "patch applied, continuing", "permanently disabled", "patched sub_82",
-    "cleared MXCSR", "UILOAD context",
+    "VEH-NEUTRAL",          # handler declined -> EXCEPTION_CONTINUE_SEARCH (honest)
+    "VEH W0: parking thread",  # src/boot_host.cpp:1064, the generic park
 ]
+
+
+def src_blob() -> str:
+    """`src/` plus the recompiler output, lower-cased, for the marker-truth check.
+
+    A marker can legitimately live outside `src/` (guest-produced text), so this
+    covers every tree that can emit a log line.
+    """
+    out = []
+    for root in ("src", "generated/ppc_xenon"):
+        for pat in ("**/*.cpp", "**/*.h"):
+            for p in (REPO / root).glob(pat):
+                try:
+                    out.append(p.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+    return "\n".join(out).lower()
+
+
+def marker_tokens(marker: str) -> list[str]:
+    """The literal alternatives a doc-style marker name stands for.
+
+    `PROGRAM_GUIDE` sec 9 writes names like `BUDDY76-*`, `GEN76-ALLOC/FREE` and
+    `TEXINSERT(2)`; matching those verbatim against the source is a false negative.
+    """
+    out = []
+    for part in re.split(r"[/,]", marker):
+        part = part.strip()
+        if not part:
+            continue
+        if part.endswith("-*"):
+            out.append(part[:-2])
+        elif part.endswith("*"):
+            out.append(part[:-1])
+        else:
+            out.append(re.sub(r"\(\d+\)$", "", part))
+    return [t for t in out if t]
+
+
+def dead_tracked(markers: list[str]) -> list[str]:
+    """Tracked markers with no literal anywhere in `src/` or `generated/`.
+
+    Their zero is only *suspicious*, not automatically meaningless: a marker can
+    name text the guest itself prints. So report it as a question, never a verdict.
+    """
+    blob = src_blob()
+    return [m for m in markers
+            if m and not any(t.lower() in blob for t in marker_tokens(m))]
+
 
 # Mirrors the short-circuit labels in PROGRAM_GUIDE sec 7. Curated rather than
 # parsed out of that prose, because prose would also yield junk tokens (`SEH`,
@@ -75,6 +123,11 @@ GUEST_LR = re.compile(r"\blr=([0-9A-Fa-f]{8})\b")
 TS_PREFIX = re.compile(r"^\[[0-9:.]+\]\s*(?:\[\w+\]\s*)?")
 NUM = re.compile(r"0x[0-9A-Fa-f]+|\d+")
 CP_RING = re.compile(r"put=(\d+)\s+rptrWB=([0-9A-Fa-f]+)")
+# The waiter line's put/rptrWB pair is NOT the CP's state: `rptrWB` was read from
+# a hard-coded address for soaks on end (F-057(1), fixed by T40.4). These two are
+# the producer's own words and are the only honest ring signals.
+CP_DRAIN = re.compile(r"CP: RING \w DRAIN .*?rptr ([0-9A-Fa-f]{4})->([0-9A-Fa-f]{4})")
+CP_PUB = re.compile(r"CP: GUEST-PUB #\d+ dev=[0-9A-Fa-f]+ pub (\d+)->(\d+) put=(\d+)")
 LEVEL = re.compile(r"\[(error|warning)\]")
 # A line is only evidence of a fault if it reports one. Two exclusions matter:
 # hot polling paths (the 30 ms KWFSO/GPU poller at lr=8242FC1C) also carry `lr=`
@@ -83,10 +136,20 @@ LEVEL = re.compile(r"\[(error|warning)\]")
 # guest failure, not a fault report. The 703 baseline VEH events still match,
 # because those lines carry `VEH`/`AV` in their own right.
 FAULT_LINE = re.compile(
-    r"C0000005|C0000003|C000001D|C000008E|80000003|access violation|\bAV\b"
+    r"code=0xC0000005|code=0xC0000003|code=0xC000001D|code=0xC000008E"
+    r"|code=0x80000003|access violation|\bAV\b"
     r"|\bVEH\b|parking|Fatal error",
     re.IGNORECASE,
 )
+
+# An NTSTATUS-looking hex is not an exception. `80000003` counted +1 in w38m.log
+# and read as "a new VMX debugtrap", but its only occurrence is a PM4 packet
+# argument: `CP-T3-CENSUS op=0x58 … args=80000003 071D82C0 DEADBEEF`. Every real
+# fault line in this project prints `code=0x…` (measured over w38n.log:
+# C0000005 1/1, 406D1388 1/1, 80000003 0/1), so the codes below are only counted
+# in that context. do-not #22 / T41.4.
+EXC_CODES = ("C0000005", "C0000003", "C000001D", "C000008E", "80000003",
+             "406D1388")
 
 
 def markers_from_guide(path: Path) -> list[str]:
@@ -128,7 +191,14 @@ def census(path: Path, markers: list[str]) -> dict:
     lines = text.splitlines()
     lower = [ln.lower() for ln in lines]
 
-    by_marker = {m: sum(1 for ln in lower if m.lower() in ln) for m in markers}
+    def hits(m: str) -> int:
+        ml = m.lower()
+        if m in EXC_CODES:  # only in an exception-shaped line, see do-not #22
+            return sum(1 for ln in lines
+                       if ml in ln.lower() and f"code=0x{ml}" in ln.lower())
+        return sum(1 for ln in lower if ml in ln)
+
+    by_marker = {m: hits(m) for m in markers}
 
     rings = CP_RING.findall(text)
 
@@ -144,6 +214,8 @@ def census(path: Path, markers: list[str]) -> dict:
         "levels": Counter(m.group(1) for m in LEVEL.finditer(text)),
         "ring_first": rings[0] if rings else None,
         "ring_last": rings[-1] if rings else None,
+        "drains": CP_DRAIN.findall(text),
+        "pubs": CP_PUB.findall(text),
         "shapes": Counter(shape(ln) for ln in lines if ln.strip()),
     }
 
@@ -207,6 +279,9 @@ def main() -> int:
     print("#   counts are matching LINES, case-insensitive (grep -ic compatible)")
     for line in quality(new):
         print(f"#   LOG QUALITY: {line}")
+    for m in sorted(set(dead_tracked(VEH_PATHS + SHORT_CIRCUITS_TRACKED
+                                     + FRONTIER + markers_from_guide(GUIDE)))):
+        print(f"#   MARKER NOT IN SRC: '{m}' -- no such literal in src/ or generated/; its zero is unexplained (F-057(6))")
     if old:
         print(f"#   baseline: {old['path'].name} ({old['lines']:,} lines)")
         for line in quality(old):
@@ -245,11 +320,22 @@ def main() -> int:
     print(f"host short-circuit lines (mitigations firing, NOT fixes): {new['short_circuits']:,}"
           + (f"   (baseline {old['short_circuits']:,})" if old else ""))
 
-    if new["ring_last"]:
+    if new["drains"] or new["pubs"]:
+        last_drain = new["drains"][-1][1] if new["drains"] else "-"
+        if new["pubs"]:
+            pub, put = new["pubs"][-1][1], new["pubs"][-1][2]
+            state = "caught up" if pub == put else f"LAGGING by {int(put) - int(pub)}"
+            print(f"CP truth  drains={len(new['drains'])} last_rptr={last_drain}"
+                  f"   pub={pub} put={put} ({state})")
+        else:
+            print(f"CP truth  drains={len(new['drains'])} last_rptr={last_drain}"
+                  "   pub=<never published>")
+    elif new["ring_last"]:
         print(f"CP ring  first put={new['ring_first'][0]} rptrWB={new['ring_first'][1]}"
               f"   last put={new['ring_last'][0]} rptrWB={new['ring_last'][1]}")
-        if new["ring_last"][1].strip("0") == "":
-            print("  rptrWB never advanced -> no CP consumer; guest is parked on the ring")
+        print("  no `CP: RING DRAIN`/`GUEST-PUB` line exists in this soak -- the"
+              " waiter's rptrWB field is not evidence of a consumer (F-057(1)).")
+
 
     if new["lr_fault"]:
         total = sum(new["lr_fault"].values())

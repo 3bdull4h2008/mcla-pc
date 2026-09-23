@@ -2110,18 +2110,21 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
       (void)memC.ReadU32BE(0x82839254u, &gpuCtx);
       if (gpuCtx != 0)
         (void)memC.ReadU32BE(gpuCtx + 10908u, &put);
-      // w18: census the REAL writeback VA (CpEnableRPtrWriteBack publishes
-      // PhysToKernelVA(0x071D81BC)=C71D81BC). The old hard-coded 0xC701C4BC
-      // was a different word and always read 0 — hid the reinit unpark.
-      uint32_t rptrWbReal = 0;
-      (void)memC.ReadU32BE(0xC71D81BCu, &rptrWbReal);
-      (void)memC.ReadU32BE(0xC701C4BCu, &rptrWb);
+      // T40.4 (F-057(1)): read the word the CP ACTUALLY publishes. The two
+      // hard-coded addresses here were both wrong — 0xC71D81BC is 4 bytes left
+      // of the real target and 0xC701C4BC is unrelated — so this line reported
+      // "rptrWB=0000" (read as "no consumer") for many soaks while the ring
+      // drained normally. CpPrimaryWritebackVA() is the CP's own publish target.
+      rptrWb = 0;
+      const uint32_t wbVA = mcla::gpu::CpPrimaryWritebackVA();
+      if (wbVA != 0)
+        (void)memC.ReadU32BE(wbVA, &rptrWb);
       MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} "
                     "to={}ms lr={:08X} put={} rptrWB={:04X} "
-                    "wb@C71D81BC={:08X} pc={:08X}:{}",
+                    "wb@{:08X}={:08X} pc={:08X}:{}",
                     n, hot ? "!" : " ", GetCurrentThreadId(), objAddr,
                     WaitReason, GuestTimeoutToMilliseconds(Timeout), lr, put,
-                    rptrWb & 0xFFFF, rptrWbReal, pcBlk, pc);
+                    rptrWb & 0xFFFF, wbVA, rptrWb, pcBlk, pc);
     }
   }
   // MAIN-THREAD PARK PROBE

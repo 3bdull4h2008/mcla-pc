@@ -2,7 +2,7 @@
 
 > **Compressed 2026-09-20.** Part 1 = the audit method. Part 2 = the report as written at audit
 > close (session 78b), with a short "what later superseded it" note. Part 3 = the **append-only
-> evidence ledger F-001…F-054**, entries compacted to claim + evidence (F-numbers, titles,
+> evidence ledger F-001…F-063**, entries compacted to claim + evidence (F-numbers, titles,
 > classes and priorities preserved; nothing was dropped, only de-verbed).
 > Pre-compression text: `git show 8f07a39:docs/ROOT_CAUSE_VALIDATION.md`.
 > Live queue: `docs/LONG_TODO_MASTER.md`; current frontier: top of `HANDOFF_NEXT_AGENT.md`.
@@ -1054,9 +1054,1109 @@ attribution and one instrumentation limit (new do-not #19).
   gate's flags and let `sub_82131008` run its own init (the remainder of **T38.3(e)** — the whole
   forced driver is a stand-in), not to fill in the globals the guest was supposed to build.
 
+**F-056 — 2026-09-20 21:30. F-055 is wrong twice, and the residual AV is now named to the source
+line: an unchecked `stvx128` in the *caller* `sub_822F3BD8`, not the leaf.** FACT · H · P0. Supersedes
+F-055's bullet 4 (both its facts) and closes its "next step" premise. Established by a 22-agent
+read-only sweep of every `src/`, `docs/` and `tools/` file against `build/w38g.log`, then re-verified
+here against raw words and `generated/`.
+
+- **(1) The address is `0x8287E334`, not `0x8288E334`.** Raw words (`build/cache/mcla_pe.bin`,
+  offset = VA − 0x82000000): `822FA958 3D608288 lis r11,8288` → `r11=0x82880000`;
+  `822FA96C 816BE334 lwz r11,-7372(r11)` → D-field `0xE334` sign-extends to **−7372**, so
+  EA = `0x82880000 − 0x1CCC` = **`0x8287E334`**. F-055 dropped the sign extension. Neither spelling
+  appears as a literal anywhere in `src/` or `generated/` (`grep -i` → 0 hits each), so the value is
+  computed — the "no `stw` with `0xE334`" half of F-055 survives, the addressing half does not.
+  This is the `lis` sign-extension trap the `mcla-guest-raw-decode` skill warns about; the skill's
+  own worked example is still wrong (see the tool-rot note in F-057).
+- **(2) The fault is `stvx128 v33,r31,r7` with `r31 = 0` → guest EA `0xE0`, and it is a *raw*
+  (unchecked) store.** `generated/ppc_xenon/ppc_recomp.49.cpp:2660-2661`:
+  `// stvx128 v33,r31,r7` → `simde_mm_store_si128((__m128i*)(base + ((r31.u32 + ctx.r7.u32) & ~0xF)), …)`
+  — no `IsValidRange`, unlike `PPC_STORE_U32`. `r31` is a translator-local, not a `ctx` register.
+  `ppc_recomp.49.cpp:2614-2615` `// addi r10,r31,16` → `ctx.r10.s64 = r31.s64 + 16`, and the dump
+  prints `r10=00000010` ⇒ **`r31 = 0`** at the fault. `ctx.r7 = 224` comes from
+  `// li r7,224` at `:2583-2585`, matching the dump's `r7=000000E0`. The faulting host RIP
+  `0x7ff6ccde774a` (`w38g.log:4359`) is that line.
+- **(3) F-055's leaf attribution is refuted, and so is its `r7`/`r10` "signature" reading.** The
+  line at `:2661` sits inside `PPC_FUNC_IMPL(__imp__sub_822F3BD8)` which opens at
+  `ppc_recomp.49.cpp:500` — the *caller*, not `__imp__sub_822FA958` (`:18143`). F-055's two
+  candidate signatures (`r7=0xE0` ⇔ `0x822F44E8 addi r7,r1,224` with `r1=0`;
+  `r10=0x10` ⇔ `0x822FA978 add r10,r10,r11` with `r11=0`) are both wrong: the dump's `r1=8EFFE590`
+  is non-null, and `sub_822FA958`'s own `lis r11,0x8288`/`add r10,r10,r11` would give
+  `r10≈0x13EC2280`, `r7=0x827E2978` (`822FA960/68` raw words above) — neither matches.
+- **(4) `lr=822F44E0` is sticky (do-not #14), not the faulting call's return address.** F-055 called
+  `lr` "honest" here; it is the return address set at `ppc_recomp.49.cpp:1965-1966` immediately
+  before `sub_822FA958(ctx, base)`. That is *why* the sweep first blamed the leaf — the sticky `lr`
+  and the `rip owner=` line agreed with each other and with nothing else.
+- **Consequence for T38.3f:** the seeds are gone and the unseeded guest gate still dies at the same
+  single instruction (`w38g.log:4331-4359`, one `C0000005`, `tag=forced-boot-gate`), so F-055's
+  causal hypothesis ("seeding `[0x8288E6F0]=1` skipped the allocator's init and left a null table")
+  is **not** what the surviving fault tests. The guest reaches `sub_822F3BD8` with a null VMX scratch
+  base in a translator-local regardless of the flags. Next measurement, not next fix: print
+  `report.faultBytes` + `SymFromAddr`/`SymGetLineFromAddr64` of `g_report.faultHost`
+  (`src/boot_host.cpp:615-618`, `:641+`) so the soak names the store line itself instead of us
+  reconstructing it from registers. Acceptance: next soak prints a `base + (…)` store form and
+  `rva=0x14D774A` is unchanged.
+
+**F-057 — 2026-09-20 21:30. Five load-bearing "starvation" readings are measurement bugs, and the
+dark-blue screen is host-generated — proven with pixels, not inference.** FACT · H · P0.
+Supersedes the "downstream is starved" half of F-050/F-052 and every §0 line that reads
+`rptrWB=0000` / `put=11` / "boot thread parks" as evidence of a stalled pipeline.
+
+- **(1) `rptrWB=0000` in `WAIT[KWFSO]` is a wrong-address read.** `src/kernel/imports.cpp:2117`
+  polls hard-coded `0xC71D81BCu`; the CP publishes to `PhysToKernelVA(0x071D82BC)` = **`C71D82BC`**
+  (`src/gpu_cp.cpp:934`, `:951-953` `vaForm`), as the soak itself says:
+  `w38g.log:794` `VdEnableRingBufferRPtrWriteBack: writeback=0x071D82BC` and `:795`
+  `CP: RING A rptr writeback raw=071D82BC (phys) -> publish @ C71D82BC (kernel VA)`. Every
+  `DRAIN` line prints `wb=C71D82BC published=true`; only the waiter's census line reads the word 4
+  bytes to the left, so it can only ever print 0. The `wb@C71D81BC=` field added at w18 (see the
+  comment at `imports.cpp:2112-2116`) is off by the same 4 bytes.
+- **(2) The CP ring is not frozen — it drained 8× and the host is fully caught up.**
+  `w38g.log:865,874,1787,1794` then a ring reinit and `:2952,2959,3178,3186`:
+  `rptr 0000→0016→0019→001C→001F`, `consumed=22/3/3/3`, `src=doorbell`, `lr=82411220`.
+  Publication tracks production exactly: `CP: GUEST-PUB #5 … pub 9->11 put=11` (`w38g.log:3185`,
+  `src/gpu_cp.cpp:752-790`), so `put=11` in the waiter line is the guest's own word at
+  `gpuCtx+10908` and the host has matched it. "No consumer" is dead. What is actually missing is
+  *content*: `DrainIndirectBuffer` is called with a raw phys `listPtr` at `src/gpu_cp.cpp:664-666`
+  while `PhysToKernelVA` exists at `:202-204` and is used exactly once (`:951`), so an IB at phys
+  `0x06258300` is walked as `0x06258300` instead of `0xC6258300` → zero packets, zero draws.
+  That, not the crash, is the `DRAW_INDEXED=0` cause.
+- **(3) The boot thread does not park on `40004D7C`.** `grep -ic "parking thread" w38g.log` = **0**
+  (and `src/` has exactly one such line, `src/boot_host.cpp:1064`), and the **2,852**
+  `WAIT[KWFSO] … obj@40004D7C` lines all carry `tid=00000C90 lr=8242FC1C` — a different thread, and a
+  *satisfied* 16 ms heartbeat (2,851 × `WAKE[KWFSO] … status=00000000`). The boot worker
+  (`tid=19552`, `tag=forced-boot-gate`) has its **last** line at `w38g.log:4335`/`:4359`:
+  the handler **declined** (`recovery disabled, declining`) and the thread went silent. It was never
+  parked; it was abandoned mid-gate by our own honest handler.
+- **(4) The dark blue is 100 % host, and the window really is showing it.** Pixel capture of the
+  live window during `build/w38h_screen2.log` (`build/screen_shot.png`, 33 s into a boot):
+  `AVG_RGB=16,26,56`, 79/81 grid samples `0F1938`, title `MCLA Native`, client area empty.
+  `16,26,56` = `0.06,0.10,0.22` × 255 — the hard-coded host colour at `src/render_thread.cpp:85`
+  (initial clear, logged `RenderThread: initial clear+present (dark blue)`), `:444` (per-present
+  default) and `:505-507` (black-FB override), reached every heartbeat because
+  `PRESENT #n … fb=00000000` ⇒ `blitVA=0` ⇒ `if (!blitOk) ClearAndPresent(cr,cg,cb)`
+  (`:535-539`) at ~30 Hz. Guest `PRESENT-FB sample rgb=(0.06,0.10,0.22)` ×4 (`w38g.log:3496,3845,
+  3852,3860`) is *not* a guest pixel reading: `:503-507` substitutes that exact triple whenever the
+  sampled framebuffer sums below 0.02, so the four guest presents had **black/zero framebuffers**
+  and the log line is the override, while `PresentBgra` blits the real (black) buffer. Two follow-on
+  defects, both unfixed: the Present HRESULT is never checked or logged anywhere in
+  `src/render_thread.cpp`, and `:572-574` calls `ClearAndPresent(0,0,0.02)` *after*
+  `DrawDynamicMesh` inside the same `BeginFrame` block, so a captured draw is cleared by the very
+  call that presents it.
+- **(5) "The extracted cache is empty so no asset can load" is only half true.** `VFS: Indexed 1
+  files/directories` (`src/fs/vfs_rpf.cpp:173`) is real, but both call sites walk the same empty
+  directory, so fixing the index alone yields nothing; a real-archive reader already exists at
+  `src/fs/vfs_rpf.cpp:443-459`. **38 distinct `path='…'` strings** appear in `w38g.log` and the UI ones
+  are really served — 5 × `.xsf` + 1 × `.xtd` under `resources/ui/` (`credits`, `garage`, `legals`,
+  `policecam`, `raceeditor`, `meshtextures`), 5 × `shaders/*/preload.list`, `globaltex.list`, with
+  **57** `XSF-OPEN` lines returning `ret=0` (`w38g.log:2787+`, `lr=821CCF78`) — and
+  `xarchive_cache.rpf` is intact (RPF3 magic at offset 0, `0x7F008000`, zero-padding after
+  `0x5C000000` — not truncated). The blocker is that the package offset is chosen by a
+  **path string match**: `MclaPreferredPkgOffForPath` returns hard-coded `0xA0000` for
+  `.xsf`/`.xtd`/`resources/ui` and `0x60000` for `meshtextures` (`src/gpu_device.cpp:285-296`),
+  bypassing the TOC-derived `MclaPkgOffFromTocW2` (`:272-282`) that already reads the real offset
+  out of the TOC w2 word. Every served UI file is therefore read from the wrong window.
+- **(6) Tool / skill rot found by the same sweep** (each is a future false conclusion, so fix before
+  trusting the next soak): `tools/soak_census.py`'s `VEH_PATHS` holds 9 markers and **8 do not exist
+  anywhere in `src/`** (`parking boot worker`, `advancing RIP`, `Nuclear advance`,
+  `patch applied, continuing`, `permanently disabled`, `patched sub_82`, `cleared MXCSR`,
+  `UILOAD context` — measured by grepping each literal against every `src/**.{cpp,h}`) while the one
+  path that *does* fire, `VEH W0: parking thread` (`src/boot_host.cpp:1064`), is absent from the list —
+  so its recovery rows are structurally zero; `tools/mitigation_audit.py` self-reports
+  **626 label-shaped tokens → 81 mitigation-shaped, 64 census-shaped, 481 unclassified**, i.e. it
+  never flags a suffix-less short-circuit; the `mcla-log-census` skill's marker table cites
+  `rptrWB=0000` as "no consumer", which (1) above now forbids, and **all 7** of the named recovery
+  paths its "reading discipline" section tells us to count (`advancing RIP`, `Nuclear advance`,
+  `permanently disabled`, `patched sub_82`, `parking boot worker`, `fallback advance`,
+  `cleared MXCSR`) measure **0 in `src/` and 0 in `w38g.log`** — they are F-040/F-051 leftovers, so a
+  "all zero → honest soak" verdict from that list is vacuous rather than reassuring.
+  *UNVERIFIED, do not act on it:* the sweep also claimed `tools/ppc_disasm.py` prints RS/RA swapped
+  for `ori`/`rlwinm`. Re-checked here — `548A1838 → rlwinm r10,r4,sh=3,mb=0,me=28` and
+  `6129FFFF → ori r9,r9,FFFF` are both correct, and no `ori` with `rt != ra` was found in the sampled
+  8 KB, so the claim is unsupported; the tool's real gap is that it decodes no FP/VMX
+  (`C0092978 → ?op48:`, `13E100CF → float/ps`).
+
+**F-058 — 2026-09-20 21:55. T40.3 + T40.4 are IN and the CP now decodes real packets — but F-057(5)
+is void: the "wrong package window" blocker never existed.** FIX + FACT · H/F · P0. Soak
+`build/w38j.log` (11,120 lines, `BOOT_RC=124`, exe 21:45, `build/w38i_build2.log` `BUILD_RC=0`)
+against baseline `build/w38g.log`.
+
+- **T40.3 fixed and measured.** `PhysToKernelVA` is now applied to the PM4 `INDIRECT_BUFFER` list
+  pointer at both call sites (`src/gpu_cp.cpp:454` nested, `:666` ring). Before, the walk ran over the
+  phys form (`w38g.log:858-872` printed eight `CP[IB]: TYPE0 base=000 count=1` — a zero header decodes
+  as Type-0 base 0, count 1, so it was stepping over uninitialised memory one dword at a time). After,
+  the same eight packets carry **real Xenos register offsets** (`w38j.log:858-872`:
+  `base=A31`, `A2F`, `D02`, `A02`, `1DD`, `1DC`, `5C8`, `D04`) and the entry lines read
+  `CP: INDIRECT_BUFFER @ C62582C0` / `C61D8280` (`w38j.log:857,866`). Three **nested** IBs are now
+  reached that `w38g` never saw: `@ C71DA800 dwords=74 depth=1`, `C71DB540 dwords=13`,
+  `C71DC180 dwords=48` (`w38j.log:873-875`) — proof the outer stream is being parsed as packets rather
+  than zeros.
+- **`DRAW_INDEXED` is still 0, and the reason is now specific rather than inferred.** The only Type-3
+  opcodes this CP implements are `0x3F INDIRECT_BUFFER`, `0x3D MEM_WRITE`, `0x48 ME_INIT`, `0x64`
+  (host-invented swap) — `src/gpu_cp.cpp:361-363`, `:43`. The draw packets are **`0x22 PM4_DRAW_INDX`**
+  and `0x36 PM4_DRAW_INDX_2` (`.research/xenia/src/xenia/gpu/xenos.h:1600-1601`), and neither has a
+  handler. The one Type-3 the soak does hit is `0x3C` = `PM4_WAIT_REG_MEM` (`xenos.h:1581`), logged
+  once as `CP: skipping TYPE3 opcode=0x3C count=5 (unimplemented)` (`w38j.log`). So the next draw work
+  is T37.6's Wave C (register-stream state + `DRAW_INDX`), **not** another pipeline bug — and it is a
+  wave, not a one-liner: it needs the Type-0/Type-2 register writes decoded into RT/shader state first.
+- **T40.4 fixed and measured.** The waiter's census now asks the CP for its own publish target
+  (new `CpPrimaryWritebackVA()`, `src/gpu_cp.cpp:986`, used at `src/kernel/imports.cpp:2112-2122`), so
+  the line prints `wb@C71D82BC=<value>` instead of the two hard-codes `C71D81BC`/`C701C4BC`.
+  `tools/soak_census.py` gained `dead_tracked()` (reports a tracked marker whose literal exists in
+  neither `src/` nor `generated/`) and its `rptrWB → "no CP consumer"` verdict line is deleted, replaced
+  by `CP truth drains=N last_rptr=X pub=P put=Q (caught up|LAGGING)` — on this soak:
+  **`drains=8 last_rptr=001F pub=11 put=11 (caught up)`**. It currently flags 4 suspicious markers
+  (`boot-worker AV`, `fallback advance` = genuinely deleted; `swfCMD`, `VECTORED exception code=…` =
+  names that never existed as literals, `swfCMD` nonetheless fires 2× so it is guest-produced).
+- **F-057(5)'s last sentence is VOID — "every served UI file is read from the wrong window" is
+  unsupported, and T40.1 as written is therefore not a fix to make.** Checked before implementing:
+  `MclaPreferredPkgOffForPath` and `MclaPkgOffFromTocW2` **agree** where the log lets us compare. The
+  only served file whose TOC flag word is printed is `resources/ui/meshtextures.xtd`
+  (`w38j.log` `READWRAP-SERVE #1 … r5=40060000`), and `40060000 & 0x00FFF000 = 0x60000` — exactly the
+  value the path branch returns for `meshtextures` (`src/gpu_device.cpp:291`). Both call sites already
+  *prefer* the path value and fall back to the TOC (`:534`, `:9549-9551`), so inverting them would
+  change nothing for that file. And the hard-code is a **deliberate, documented** choice, not sloppiness:
+  `:521-523` says the TOC-derived bodies for `.xtd`/`.xsf` are often AES ciphertext and the plaintext
+  package window is served instead. What is actually unproven is whether that ciphertext claim is true —
+  that, not the offset, is the question worth a census. **Do not spend a session "fixing" T40.1.**
+- **Everything else is unchanged, as it should be:** `C0000005` 1 → **1** (same instruction,
+  `lr=822F44E0`, `hostRip` moved with the link), `GFx` 9 → 9, `PRESENT` 68 → 68, `PRESENT-FB` 4 → 4,
+  `Fatal error` 1 → 1, short-circuit lines 185 → 178, `[error]` lines 58 → 58, and `fault-line guest
+  lr` still **1 event / 1 distinct**. Two apparent deltas are not faults: the census's `VEH` 1 → 2 is
+  the substring in `ser**ve H**ead` on a new line (below), not a second AV.
+- **One genuinely new serve, plausibly downstream of T40.3 (unattributed):**
+  `READWRAP-SERVE #1 path='resources/ui/meshtextures.xtd' r5=40060000 … pos=0->32768
+  serveHead=[05435352 0FF512EF] lr=821BC334` (`w38j.log:2289`) — **0 occurrences in `w38g.log`**. It
+  fires 2.4 s after the first real-packet IB drain and hands the guest a valid RSC5/XC container head.
+  Not claimed as caused by the CP fix: one event, no second soak, and `lr=821BC334` is a census `lr`
+  (do-not #14). Reproduce it before attributing it.
+
+**F-059 — 2026-09-20 22:10. The guest DOES submit draws: 24 real `PM4_DRAW_INDX_2` packets decoded.
+The CP's own logger was hiding them by collapsing the whole draw opcode range.** FIX · A/H · P0.
+T40.6 steps 1-2. Soaks `build/w38k.log` (census only) and `build/w38m.log` (decode) vs baseline
+`build/w38j.log`; exe 22:05, `build/w38m_build.log` `BUILD_RC=0`, both `BOOT_RC=124`.
+
+- **What was blocking the observation:** `LogUnknownOpcode` reported each opcode `< 0x20` once and
+  collapsed **every** opcode `>= 0x20` into a single line — the exact range the draws live in
+  (`PM4_DRAW_INDX = 0x22`, `PM4_DRAW_INDX_2 = 0x36`, `xenos.h:1600-1601`). One `skipping TYPE3
+  opcode=0x3C` line in `w38j` was therefore the maximum the old code could say. Replaced by
+  `LogType3Unhandled` (`src/gpu_cp.cpp:351-367`): first 3 hits per opcode with their argument dwords,
+  then a running total.
+- **The stream's real contents, named (`w38k.log`, 13 distinct unhandled opcodes):** `0x21 REG_RMW`,
+  `0x2B IM_LOAD_IMMEDIATE`, `0x3B INVALIDATE_STATE`, `0x3C WAIT_REG_MEM`, `0x45 COND_WRITE`,
+  `0x46 EVENT_WRITE`, `0x54 INTERRUPT`, `0x58 EVENT_WRITE_SHD`, `0x60/0x61 SET_BIN_MASK_LO/HI`,
+  `0x62/0x63 SET_BIN_SELECT_LO/HI` (names from `.research/xenia/src/xenia/gpu/xenos.h`).
+  `0x36` has left the list since the decode landed (`w38m.log` shows 12).
+- **Draw decode shipped:** `case kPm4DrawIndx / kPm4DrawIndx2` in `DrainPacketAt`
+  (`src/gpu_cp.cpp:496-531`), reading `VGT_DRAW_INITIATOR` per
+  `.research/xenia/src/xenia/gpu/registers.h:311-326` (prim_type +0/6, source_select +6/2,
+  index_size +11/1, num_indices +16/16) and `VGT_DMA_BASE`/`VGT_DMA_SIZE` for `kDMA` only.
+- **Measured result — the guest submits 24 draws in one buffer:** `CP-DRAW #1…#24` in `w38m.log`, every
+  one `op=0x36 src=2 prim=1 numIdx=1 idxSize=0 initiator=00010081 hdr=C0003600`, at
+  `C71DC180 → C71DC238` in a strict 8-byte stride. `src=2` = `SourceSelect::kAutoIndex`
+  (`xenos.h:743-747`), `prim=1` = `kPointList` (`xenos.h:46`). The stride × 24 packets × 2 dwords =
+  48 dwords, which is exactly the buffer's declared length
+  (`CP: INDIRECT_BUFFER @ C71DC180 dwords=48 depth=1`) — the whole nested IB is a draw list.
+- **The misaligned-walk alternative was tested and refuted, not assumed:** if the walk were parsing data
+  as packets, the "headers" would be arbitrary. They are not — `hdr=C0003600` is a well-formed Type-3
+  header (`bits31-30 = 0b11`, opcode field `0x36`, count field 0 → 1 argument dword) at every one of the
+  24 addresses, and the census line reports no `#64`, so the total is bounded to `[24, 63]`.
+- **`DRAW_INDEXED` is still 0 and this entry does not claim otherwise.** Decoding a submission is not
+  rendering one: the CP models no Xenos register file, so there is no VB/IB/shader state to build a
+  draw from. The separate host-side path (`src/gpu_device.cpp:1793-1803`, which *does* enqueue
+  `RenderCommand::DRAW_INDEXED`) is starved for its own documented reason — the `sub_82420BA8` hook
+  only ever sees dummy `li r5=0` submits because the guest's D3D9 draw chain
+  (`sub_8217A470 → sub_8241BE78 → sub_8241C308 → sub_82420BA8`) never runs
+  (`src/gpu_device.cpp:1829-1835`). Two independent paths to a pixel, both still short.
+- **No regression anywhere:** `C0000005` 1 → 1, `GFx` 9 → 9, `UILOAD` 1 → 1, `PRESENT` 68 → 68,
+  `Fatal error` 1 → 1, `VEH W0: parking thread` 0 → 0, short-circuit lines 178 → 177. The `rptrWB`/`PUT=`
+  `+165` is heartbeat-count drift over the log window, not ring state (`CP truth` still
+  `drains=8 pub==put`).
+- **Open, unattributed:** 24 identical 1-point auto-indexed draws is an odd submission — a point-splat
+  overlay, a cursor, or a driver stub are all consistent with it. Do not treat it as the menu. The next
+  measurement is which of them is true, and it needs the register writes around the draws
+  (`0x21 REG_RMW`, `0x2B IM_LOAD_IMMEDIATE`) decoded, not more draw logging.
+
+**F-060 — 2026-09-20 22:40. The last surviving `C0000005` is a null SINGLETON with exactly one
+writer in the whole image — and that writer is a message handler that is never dispatched. Not a
+gate argument, not an allocator-table failure.** FACT · D/G · P0. Supersedes the "the forced gate
+passes `r3=0`" framing that `LONG_TODO_MASTER` §0 (22:45) put on T41.3, and closes F-056's
+"translator-local `r31 = 0`" down to its producer. Established with IDA attached to the **live**
+`idalib-mcp` RPC (T41.1) + generated-code text + raw words; rule-4 `addr_owners --check` run on all
+five addresses (all unclaimed).
+
+- **(1) The `this` is guest `[0x8287E26C]`.** `sub_822F3BD8` has **one** code caller in
+  `generated/ppc_xenon/`: `ppc_recomp.50.cpp:6063`, inside `__imp__sub_823045E0` (opens `:6044`). That
+  thunk is five instructions: `lis r11,-32120` → `r11 = 0x82880000`;
+  `lwz r3,-7572(r11)` → `0x82880000 − 0x1D94` = **`0x8287E26C`** (the D-field sign-extends — the
+  F-056(1) trap, applied in the correct direction this time); `bl 0x822f3bd8`.
+- **(2) One writer, nowhere else.** `grep -rn "STORE_U32(.*+ -7572" generated/ppc_xenon/*.cpp` →
+  **3 hits**, and only one is to the global: `ppc_recomp.48.cpp:27313` `stw r3,-7572(r11)` with
+  `r11.s64 = -2105016320` at `:27311`, inside `__imp__sub_822F38C0` (opens `:27283`). The other two
+  are struct-relative (`r31.u32 + -7572` at `:20187`, `ctx.r10.u32 + -7572` at `:27328`). Raw-image
+  confirmation is the same arithmetic (`0x8210DA98` holds `0x822F38C0`).
+- **(3) What that function is: the object's factory, and it can also publish 0 deliberately.**
+  `ppc_recomp.48.cpp:27283-27339`: `li r3,14720` → `bl 0x82130528` (the XTL alloc thunk — host
+  override at `src/gpu_device.cpp:11783`, ABI `r4 = r3`, align 16, **it does honour `r3`**) →
+  `cmplwi cr6,r3,0` → `beq 0x822f38f8`, and that branch **stores 0 into the same global**
+  (`:27328` region). Non-null path: `bl 0x822f3498` (the ctor) then publish `r3`. So there are two
+  candidate mechanisms — the factory never runs, or it ran and its allocation failed — and they are
+  told apart by the new `MSGCHAIN` census, not by argument.
+- **(4) Both ends of the chain are `(handler, msgid)` table entries, i.e. the guest reaches them by
+  message, not by call.** Raw words (identity-mapped `mcla_pe.bin`): `0x8210DA98 = 0x822F38C0` /
+  `0x8210DA9C = 0x40001503` (the creator), `0x8210DED8 = 0x823045E0` / `+4 = 0x40000B03` (the
+  consumer that faults), `0x82102AC0 = 0x82131008` / `+4 = 0x40003B03` (**the boot gate the host has
+  been hand-calling since W36d is itself msg `0x40003B03`**), `0x8210DEF0 = 0x823047D8` /
+  `+4 = 0x4000EA03`, `0x8210DAA8 = 0x822F3BD8` / `+4 = 0x4004A207`. This is the shape
+  `PROGRAM_GUIDE` §8 already documents ("loaders reachable only by messages, `(handler,msgid)` tables
+  in `.rdata`; boot loads arrive as msg `0x40003803`", `src/gpu_device.cpp:9421`). **`src/` has zero
+  references to this table region** (`grep -rn "0x8210D|82102AC0" src/` → nothing but that one
+  comment), so no host code walks it.
+- **(5) Why F-056 could not see this.** The dump's `r3=828609E0` (`w38m.log:4358`) is *not* the entry
+  value — inside `sub_822F3BD8`, `r31` is `mr r31,r3` at `:592`, spilled `std r31,176(r1)` at `:1986`
+  and reloaded `ld r31,176(r1)` at `:2338`, and the only other `r31` write between is `:2076`
+  (`r31 = r30+r11`), which is *after* the spill and never re-stored. So the faulting
+  `:2660 stvx128 v33,r31,r7` dereferences the **entry `r3`**, and the entry `r3` is the global from
+  (1). This is do-not #17's rule with a converse worth stating: the dump's registers can be useless
+  while the generated code's register *provenance* is decisive.
+- **(6) One global, two starved subsystems.** IDA `get_xrefs_to 0x8287E26C` lists readers in
+  `sub_822112A8`, **`sub_82227428` (`+0x4c`, `+0x1b0`)** — the draw dispatcher of
+  `PROGRAM_GUIDE` §8 — and `sub_82232938`/`sub_82232AF8`/`sub_82232C78` among others. If that is
+  right, the missing object is in front of both the crash and `DRAW_INDEXED`; `sub_82227428` counts
+  **0** in every soak to date (`DRAWDISP`=0, `w38m.log`), so this is a hypothesis with a named
+  verification, not a claim: bl-scan the readers (rule 3/§10) and re-census `DRAWDISP` after the
+  factory runs.
+- **Consequence for the queue.** T41.3 is re-scoped from "give the gate its real arguments" to
+  **"dispatch msg `0x40001503` the way the guest's own message system does"**; `w38m.log:3885`
+  (`W35-BOOT-GATE #00001 r3=00000000`) is *not* the null source, and the "0 `DPC` lines" fact still
+  stands (`grep -ic "dpc|8242FD00" w38m.log` = 0). Next action: read `build/w38n.log`'s `MSGCHAIN`
+  rows.
+
+**F-061 — 2026-09-20 23:15. The boot's real blocker is `sub_822FBAF8` — the `star_glow` effect
+init — which never returns, so the tail of `sub_823047D8` (including F-060's singleton factory) is
+unreached. And F-055's "no producer of `[0x8287E334]`" is wrong: it is two lines inside that same
+function.** FIX + FACT · D/G · P0. Supersedes the mechanism F-060's "consequence" bullet implied
+(the inline gate dispatch was NOT why the factory never ran — tested and refuted), and closes
+F-055 §2 / F-056(1)'s open half. Soaks `build/w38n.log`…`build/w38q.log` vs baseline
+`build/w38m.log`; new census `MSGCHAIN`/`MSGBISECT`/`GATE-WAIT`/`GATE-STACK` at
+`src/gpu_device.cpp:9450-9530`.
+
+- **(1) `sub_822FBAF8` never returns.** `w38q.log` has `MSGBISECT 5-822FBAF8 star_glow-init #1`
+  (entry, `lr=823048D0` = its call site inside `sub_823047D8`) and **0** occurrences of the matching
+  `RETURN` line, 0 for the two hooks that follow it in that function (`sub_823074B0`,
+  `sub_822F96E0`), 0 for `MSGCHAIN creator-822F38C0`, and `GATE-WAIT [8287E26C]=00000000 after 500 ms`
+  (`after 5000 ms` in `w38p.log`) — the singleton is not merely late, it is never produced.
+- **(2) What that function is.** IDA (`get_metadata` verified `default.xex` @ `0x82000000`, attached
+  to the live `:8745` RPC) decompiles `0x822FBAF8` as the `star_glow` effect constructor:
+  alloc 104 → `[0x8287E334] = sub_822F9FA8()`; 3 × `sub_821B4838` render targets (13824/3072 B);
+  then at **`0x822FBC24`** `(*(*[0x82839F68] + 4))([0x82839F68], "star_glow", 0, 0)` → `[0x8287E318]`;
+  then `(*(*[0x8287E318] + 12))(..., "star_glow", 0, 0)`; then the parameter/technique lookups
+  `DepthMap`, `CentrePosition`, `StarTexture`, `draw_starglow`, `draw_glow`, `draw_trail`,
+  `draw_glow_notap`; then `(*(*[0x82839D70] + 12))(..., "star_glow", 0)`. **`0x822FBC28` is the
+  historic `lr` of the 703-fault era** (F-040/F-043/F-046) — this is the same function, and it is
+  still the frontier.
+- **(3) The host is standing in for its very first step.** `w38q.log` puts
+  `FIX-821873E8 #1 TLSDEAD r13=8F200000 tlsTable=8F201000 slot12=00000000 lr=822FBC28` at the
+  `0x822FBC24` call — i.e. the shader-record allocator (`T38.3(d)`, `src/gpu_device.cpp:1044`, which
+  fabricates a 16 B allocator object + vtable and a zero-filled 72 B object, then calls the guest
+  ctor `sub_82188CF8`). The step after it dereferences **that fabricated object's vtable+12**, and the
+  census says the function never gets past this region. Same instant, `w38q.log:3882`:
+  `GETDEV #45 path='embedded:/fxl_final/star_glow.fxc'` → `GETDEV-RET ret=827D838C vt=82012918` (the
+  memory device). **The star_glow shader load is still the blocker; 10 days of "fixed" it has moved
+  from fatal → absorbed-by-host → never-returning.**
+- **(4) F-055's negative scan is refuted.** `ppc_recomp.49.cpp:20994-20996`, inside
+  `__imp__sub_822FBAF8`: `lis r11,-32120` (`r11 = 0x82880000`) + `stw r3,-7372(r11)` →
+  `PPC_STORE_U32(r11.u32 + -7372, ctx.r3.u32)` — i.e. **`[0x8287E334] = sub_822F9FA8()`**. F-055
+  searched for an immediate of `0xE334` and concluded no producer exists; F-056 fixed the *address*
+  but never re-ran the *producer* search. Do-not #16's lesson again: a `lis`+signed-`d` pair must be
+  decoded, not string-matched. `sub_822FBAF8` therefore **is** the writer F-055 said was missing, and
+  `[0x8287E334]` is not a mystery global — it is `sub_822F9FA8`'s return value.
+- **(5) The control-flow hijack was real but was not the cause.** `FIX-821873E8` used to force
+  `sub_82131008` **inline**, from inside the guest's own allocator hook, on the stack of the thread that
+  was mid-`sub_823047D8` (`w38o.log:3866→:3868→:3869`), so the AV the gate provoked killed that thread
+  too. That is now moved to its own thread with its own 256 KB guest stack (`GATE-STACK`), which is a
+  correctness fix on its own terms — but (1) proves the init stalls identically without it, so the
+  hypothesis in F-060's last bullet is **refuted by test, not by argument**.
+- **(6) One new, previously-masked defect exposed by the fix.** `w38p.log:3922-3926` /
+  `w38q.log:3888-3890`: three `AllocPhysical: o1heapAllocate returned null size=0xca71d3xx`
+  (**0** in `w38m.log`), one ms after `D3070-SKIP #2 obj=8EFFEE20 +8=CA71D5A8 r4=00008000
+  lr=8218C89C`. A 3.4 GB "size" is a **pointer used as a length**: the buffer object at guest
+  `0x8EFFEE20` holds uninitialised stack, because its initialiser is downstream of the stalled init.
+  The old inline gate kept its own frames in exactly that stack window
+  (`reserve=8EFFE920` ⊃ `8EFFEE20`) and so wrote something there by accident — the baseline's
+  `D3070-SKIP #1 obj=8EFFF7F0 +8=82839580` was only "healthy" because of that overlap. Do-not #13's
+  shape: a mitigation was covering a hole.
+- **Consequence for the queue.** New #1 = **T41.3a: make the `star_glow` effect init complete** — the
+  acceptance is `MSGBISECT 5-822FBAF8 RETURN` with `[8287E318]`/`[8287E334]` non-zero, after which
+  F-060's singleton factory and therefore `BOOT-GATE-RETURN`/`UILOAD-ret` become reachable.
+  `PLAN_VMX128`/Route B stays parked. Next baseline: `build/w38q.log`.
+
+**F-062 — 2026-09-20 23:25. TLS is not one thing. The tree already has a real per-thread TLS
+implementation (`src/kernel/guest_thread.cpp`, 0x100 = exactly the 64 slots the XEX declares) and boot
+**bypasses** it for a hand-fabricated fixed block at `0x8F200000` in which **one** of 64 slots is
+filled and which **every** guest thread shares. Two candidate causes of `slot12=00000000` are refuted
+outright; the third was not reachable statically, and (7) names the one-soak measurement that settles
+it.** FACT + NEGATIVE RESULTS · D · P1. Read-only session, no `src/` change, no soak taken (a
+concurrent session held the tree: exe 23:03, `w38q.log` 23:05, this file 23:09). Baseline
+`build/w38q.log`. Evidence: `mcla_pe.bin` raw words, `default.xex` header parse, `generated/` text,
+`.research/xenia/` `file:line`.
+
+- **(1) What `sub_821873E8` actually is — a per-thread scratch allocator, in full.**
+  `generated/ppc_xenon/ppc_recomp.9.cpp:4749-4800`:
+  `lwz r11,0(r13)` → `r11.u64 = PPC_LOAD_U32(ctx.r13.u32 + 0)`; `li r10,12`; `li r6,0`; `li r5,16`;
+  `li r4,72`; `lwzx r3,r10,r11` → **`r3 = TLS[12]`**; `lwz r9,0(r3)`; `lwz r8,8(r9)`; `mtctr r8`;
+  `bctrl` → **`TLS[12] -> vtable[+8](TLS[12], 72, 16, 0)`**; `cmplwi cr6,r3,0` / `beq` → return 0;
+  else `bl 0x82188cf8` (the ctor). This is why the T38.3(d) substitution's *shape* was right (F-045) —
+  16 B object + vtable + 72 B block — and adds what F-045 could not: the semantic, a thread allocator
+  taking `(size=72, align=16, flags=0)`.
+- **(2) The XEX's own TLS contract, parsed.** Header layout per
+  `.research/xenia/src/xenia/kernel/util/xex2_info.h:548-557` (magic@0, module_flags@4, header_size@8,
+  reserved@0xC, security_offset@0x10, **header_count@0x14**, entries@0x18); `default.xex` gives
+  `header_count = 15`. `XEX_HEADER_TLS_INFO = 0x00020104` (`xex2_info.h:294`, struct `:419-424`) →
+  file `0x11D4` → **`slot_count = 64`, `raw_data_address = 0x8294A800`, `data_size = 0x94`,
+  `raw_data_size = 0x94`**. Entry: optional header `0x00010100 -> 0x821322B8`, and the decoded PE
+  independently agrees (`build/cache/mcla_pe.bin`: MZ@0, PE sig@0x108, machine `0x1F2`,
+  `ImageBase 0x82000000`, `AddressOfEntryPoint` RVA `0x1322B8`) ⇒ **entry = `0x821322B8` = `_xstart`**
+  (`generated/ppc_xenon/ppc_func_mapping.cpp:93`).
+- **(3) REFUTED — "slot 12 is a load-time TLS initialiser the host forgot to copy."** Raw words at the
+  template (`mcla_pe.bin`, offset `VA − 0x82000000 = 0x94A800`, rule 3): of its 37 dwords **all are 0
+  except slot 14 = `0xFFFFFFFF`**. `[tlsTable+12] == 0` at thread start is therefore *correct*
+  behaviour — Xenia's own sequence (allocate `slot_count*4`, zero-fill, then copy `data_size` from
+  `raw_data_address`; `.research/xenia/src/xenia/kernel/xthread.cc:289-321`) yields the same zeros.
+  **No fix of the form "copy the TLS template" can produce slot 12.** (This entry's own first
+  hypothesis, tested and killed.)
+- **(4) REFUTED — "`_xstart` / the CRT never runs".** `w38q.log:38` `image base 0x82000000 size
+  0x9E0000 entry 0x821322B8`, `:86`, `:129`, and `:131` `BootWorker: calling entry point 0x821322B8`.
+  The comment at `src/boot_host.cpp:312-314` ("our boot host jumps at the game entry and those inits
+  never run") is about the **`.CRT$XCU` registration arrays**, not about the entry point, and must not
+  be read as "the entry is skipped".
+- **(5) NOT REFUTED — the structural defect: two thread-block implementations, and the fabricated one
+  wins.** `src/kernel/guest_thread.cpp:9-30` builds a real per-thread layout (`TLS_SIZE = 0x100`,
+  `[thread+0]` = TLS pointer, `[thread+0x100]` = TEB pointer, thread-id at `TEB+0x14C`) — `0x100`
+  bytes = exactly the 64 slots (2) declares. But `src/boot_host.cpp:260-286` instead fabricates a
+  **fixed** block: `ThreadBlock = 0x8F200000`, `TableBase = ThreadBlock + 0x1000`,
+  `storeU32(ThreadBlock + 0x000, TableBase)`, and **exactly one** table slot —
+  `storeU32(TableBase + 28, Descriptor)` for the XTL alloc/free chain. `r13 = 0x8F200000` is then
+  hard-set at **25 sites** (`src/gpu_device.cpp` 21, `src/kernel/imports.cpp` 2, `src/apu/audio.cpp` 1,
+  `src/boot_host.cpp` 1), so **every guest thread aliases one TLS array whose other 63 slots are
+  permanently 0**. `src/gpu_device.cpp:1071-1090` closes the resulting null by *writing a fabricated
+  allocator object into `tlsTable + 12`* — so the shared block ends up carrying a host-made "per-thread"
+  singleton that all threads read as their own. That is a labelled mitigation, not a fix, and it is the
+  one F-061(3) observed firing.
+- **(6) NEGATIVE RESULT on the static hunt — record it so nobody re-spends a session.** No TLS[12]
+  producer was located in `generated/`, and all three attempts failed as *instrument* errors, not as
+  facts about the image: (a) a whole-file scan with no per-function scope reported **5,826** "producers"
+  (translator-locals `r11`/`r30` are reused across every pointer); (b) a scope-correct scan for
+  `PPC_STORE_U32(base + 12, …)` reported **0** because the real idiom is *indexed* — `stwx r10,r11,r9`
+  with `li r9,12`, exactly the form (1) reads with; (c) the indexed scan then printed **159** sites, 6 at
+  offset 12, and reading those 6 shows struct/list insertion, not TLS (`sub_821BBEA8` at
+  `ppc_recomp.14.cpp:18364-18378` stores at 12/16/24 off a container pointer). **Do not read "0
+  producers" as "the guest never writes it"** — same class as do-not #16/#20: a scanner artifact is not a
+  negative result. `sub_821BBEA8`, `sub_821BBF00`, `sub_821C91C0`, `sub_8218C1C0`, `sub_82131228` all
+  count **0** in `w38q.log`; only `sub_821C91C8` appears (13×) and it is already owned by
+  `src/gpu_device.cpp` + `src/kernel/imports.cpp`.
+- **(7) The measurement that settles it, in one soak.** The producer is cheap to find *dynamically*:
+  put an x86 hardware watchpoint (DR0) on the guest dword `TableBase + 12` (host `g_base +
+  0x8F20100C`) inside the existing VEH (`src/boot_host.cpp`) and log guest PC/`lr` + value for every
+  writer. Either it names the guest function that installs the thread allocator — which is what
+  T41.3/T41.3a have been standing in for — or it proves no guest code ever writes it, which is itself
+  the finding F-060 was waiting for. It simultaneously answers a question nobody has measured: whether
+  **any** thread other than the boot worker uses TLS at all. ⇒ new **T42.1**; do not pair it with any
+  change to `tlsTable + 12`'s value in the same soak.
+- **(8) Addendum, 23:30 — the hook that stands in for `sub_821873E8` is also a control-flow hijack, and
+  it will confound any `star_glow` measurement until the two jobs are separated.** `src/gpu_device.cpp`
+  (read at 23:26; line numbers drift under a live session): `:1096-1099` states it plainly — *"After
+  chain init, dispatch the REAL boot-gate (`sub_82131008`) on this thread"* — and `:1111-1112` does
+  `MCLA_LOG_WARN("FIX-821873E8 dispatching BOOT-GATE … on its own thread"); std::thread([caller = ctx]()
+  mutable { … })` closing in `.detach()` at `:1271`. So a guest call whose entire semantics are
+  `TLS[12]->alloc(72, 16, 0)` (§1) additionally (i) **captures the caller's live `PPCContext`**, which is
+  exactly why `w38q.log:4011` prints `BOOT-GATE-ENTER 82131008 … lr=822FBC28` — the gate carrying
+  star_glow's own return address — and (ii) runs it on a **detached** thread while `:1219` logs
+  `BOOT-GATE started on boot worker thread`, which is not what the code does. Consequence for whoever
+  holds #1: `MSGBISECT 5-822FBAF8 RETURN` cannot appear while the gate is forked from inside that call,
+  because the frame that would print the return is not the frame the gate runs on; and every census of
+  star_glow progress is a census of **two** threads sharing one `r13` (§5). Suggested split, small and
+  carrying no behaviour claim: let the hook do only its own job (return the 72 B block per §1) and
+  trigger the gate where the guest triggers it — F-060's `(handler,msgid)` table, msg `0x40003B03`.
+- **(9) §7's status after F-063 (same tree, other session, so recorded here rather than as a new
+  entry):** F-063's `MSGBISECT 8-822F9FA8 e334-producer` names the producer of `[0x8287E334]`, **not** of
+  `TLS[12]`, so **T42.1 survives unchanged** — it is still the only measurement that can say whether the
+  guest ever installs its own per-thread allocator. But F-063 also puts `sub_822FBAF8` one technique
+  lookup from returning, which **demotes** T42.1 below that, and creates a fork worth deciding in the
+  open: if `sub_822FBAF8` returns while `TLS[12]` is still the `src/gpu_device.cpp:1071-1090` fabrication
+  in a block shared by every thread (§5), then that fabrication is **load-bearing for the boot path** and
+  belongs in `PROGRAM_GUIDE` §7 as a named mitigation with this entry as its evidence — do-not #9's
+  disclosure arm, not a quiet keep.
+
+**F-063 — 2026-09-20 23:28. The `D3070` guard skipped the `star_glow` shader's own 32 KB buffer: its
+skip condition tested a caller's flag bit as if it described the request. Removing that clause is the
+first change of this era that makes the guest do MORE, and it takes the tree from 177 host
+short-circuit lines to 96.** FIX + FACT · D · P0. Closes F-061's "why", and runs — for the first time
+in the project's history — the `[0x8287E334]` producer F-055 said had none. Soak `build/w38s.log` vs
+`build/w38r.log` (same tree minus this one condition). Parallel to **F-062** (another session, TLS
+structure) and it answers part of that entry's §7 — see the last bullet.
+
+- **The defect, at `src/gpu_device.cpp:11516-11545`:** `PPC_FUNC(sub_821D3070)` returned `r3 = 0`
+  whenever `(ctx.r4 & 0x8000) != 0`, alongside the legitimate null-object guards. The comment above it
+  says where the bit comes from — "8C760 magic-accept path does `ori r4,r4,0x8000` then D3070" — i.e.
+  **bit 15 of `r4` is a flag the *caller* sets**, not a property of the request, so every call from that
+  path was dropped even with a perfectly good object:
+  `D3070-SKIP #2 obj=8EFFEE20 +8=CA71D5A8 r4=00008000 lr=8218C89C` (`w38r.log:3937`) — non-null `obj`,
+  non-null block pointer. The guard's stated purpose (the `0x7E780000` TLS-null AV) is served by the
+  four object/field tests alone.
+- **Measured consequence of running it (`w38s.log`):** `D3070-SKIP` **0** (was 2);
+  `TSLAB-OWNER #16 size=32768 align=16 lr=821D30B4` — the shader's 32 KB buffer is really allocated;
+  `MSGBISECT 8-822F9FA8 e334-producer #1 r3=CA53C700 lr=822FBB34` — **the producer exists and now runs**
+  (F-061(4)); then 9, 10, 11 ×6 (the three render-target pairs `r3=0x3600`/`0xC00`),
+  **12 `sub_82188CF8` shader-obj-ctor `r3=A0021270`**, then 13/14 param+technique lookups against
+  `r3=CA71D388`, a real object.
+- **`o1heapAllocate returned null size=0xca71d380` ×3 → 0.** F-061(6)'s pointer-as-length is confirmed
+  downstream of this skip rather than independent: the guest asks for that absurd size only when the
+  buffer call before it was silently dropped.
+- **Host short-circuit lines 177 → 96, `[error]` 61 → 51** — the largest mitigation reduction the tree
+  has had, and it came from *deleting* a guard rather than adding one.
+- **What did NOT advance, exactly:** `MSGBISECT 5-822FBAF8 RETURN` is still **0** and `[0x8287E26C]` is
+  still **0** at every sample. Last step reached:
+  `MSGBISECT 14-8218B688 technique-lookup #6 r3=CA71D388 r4=8200934C` (`w38s.log:3980`, 23:19:13.745) =
+  IDA's line 39, `"draw_starglow"`. The next guest statement is line 40, the `"draw_glow"` lookup at
+  `0x822FBCFC`. **One technique lookup from completing** — so F-060's singleton and F-061's stall are
+  consequences, not the disease. Next: why that lookup does not return, which is the shader-dict INSERT
+  path `PROGRAM_GUIDE` §8 already documents as NULL on PC
+  (`82189438/88E50 → 8218C760 → resolver 821BDF20 → 821CB488`); do-not #8 still applies to
+  `DICT-HYDRATE`.
+- **Two marker drops that are not lost guest progress** (F-051's test, applied honestly):
+  `GFx 9 → 1` — the 8 lost lines are the host's own stand-in prints (`GFX-BLOCK`, `GFX-ALLOC`,
+  `GFX-CTOR-FN/entering/done/VT-MISMATCH`, `W34-GFX-CENSUS`, `W34-NOGFX`); the only guest-produced one,
+  `GFXINIT-census sub_82177948`, survives. `UILOAD 1 → 0` — the forced gate's **only** trigger was the
+  `FIX-821873E8` TLSDEAD branch, which now never fires, so `sub_82131008` is not dispatched at all.
+  The stand-in was carrying UILOAD; **T41.6 must find its real trigger** (F-060(4): msg `0x40003B03`,
+  table entry `0x82102AC0`).
+- **New frontier, unattributed:** one fault 3 s in — `code=0xC0000005 Param[1]=0x100000040` (= guest
+  EA **0x40** through a null base), `ppc ctx=nil tag=none`,
+  `rip owner=host 0x7ff7a7fcc0a0, not a mapped guest fn`, and the handler **parked** it
+  (`VEH W0: parking thread` 0 → 1; `w38s.log:5804`/`:5825`). No published guest context ⇒ nothing in the
+  dump is attributable (do-not #17), so **T40.5** (symbolise the faulting host address) is on the
+  critical path for the first time.
+- **Cross-read with F-062 (same hour, other session).** That entry's §7 asked whether any thread other
+  than the boot worker ever uses TLS. In `w38s.log` the answer for this path is measured: the
+  shader-record call at `0x822FBC24` reached the **guest's own** `sub_821873E8` body
+  (`FIX-821873E8` fires **0** times, 0 `TLSDEAD` lines) and constructed through it at
+  `sub_82188CF8 r3=A0021270` — a `A0001010..A2E81000` simple-pool address, not a host `CAxxxxxx` one —
+  so the single shared fabricated TLS block at `0x8F201000` **did** have slot 12 live by then (armed by
+  one of the three sites F-062(5) enumerates). That is consistent with F-062's structural complaint
+  rather than against it: one shared array works only because every thread aliases it, and T42.1 is
+  still the right fix. Baseline for the next soak: **`build/w38s.log`**.
+
+**F-064 — 2026-09-20 23:32. `sub_822FBAF8` does stop at the `"draw_glow"` lookup, and it stops with a
+GUEST FATAL: `'drawblit technique is old and busted, rename to blit_draw.'` The bytes it parsed are
+not a shader — the host is serving a 5258-byte name-list blob as `star_glow.fxc`.** FACT · C/E/G · P0.
+Answers T41.3b's question in one soak and names the next one. Evidence: `build/w38s.log:3857`,
+`:3860`, `:3870-3892`, `:3978-3990`.
+
+- **The terminal event is a guest fatal, not a hang.** Immediately after
+  `MSGBISECT 14-8218B688 technique-lookup #6 r3=CA71D388 r4=8200934C lr=8218875C`
+  (`w38s.log:3980`, 23:19:13.745) comes `w38s.log:3981`
+  `Fatal error dispatcher invoked - terminating game`,
+  `lr=0x82188770 r1=0x8EFFF330 r3=0x8200B15C`, `slot 0x8285FEA0 = 0x82130678`,
+  **`fatal message: 'drawblit technique is old and busted, rename to blit_draw.'`** So F-063's "never
+  returns" is answered: the technique lookup does not return *normally*, it raises. (The process
+  survives — `NATIVE-PRESENT`/`PRESENT` continue after it, and this is the 1 `Fatal error` the census
+  has been reporting all day: it is **this** message, not the old `star_glow` load failure.)
+- **What it was handed instead of a shader.** `w38s.log:3857`
+  `AFB8-IN #4 r3=827D838C r4=CA71D500 path='embedded:/fxl_final/star_glow.fxc' lr=821BDF5C` →
+  `AFB76-MISS` → **`AFB76-FALLBACK #4 path='embedded:/fxl_final/star_glow.fxc' serve rage_im
+  buf=827D2DD0 size=5258 stream=00000008`** (`:3860`), then the guest reads 76 bytes of it in four
+  slot-serving steps (`BE710-SLOT #50..53 … served=4/16/16/40`, `:3870`-`:3892`). Per
+  `PROGRAM_GUIDE` §8 / the session-78 ledger row, `0x827D2DD0` size `0x148A` = **5258** is the
+  **embedded name-list buffer** (`SeedEmbeddedNameList: node 0x828495B8, name 0x820093D4,
+  buf 0x827D2DD0, size 0x148A`) — a name table, not shader code. The three sites that keep it that way
+  are `src/gpu_device.cpp:3409`, `:8355`, `:9203`.
+- **Why that is now on the critical path and was not before.** While the TLS-dead substitution was
+  firing, the shader path never got far enough to parse technique names. F-063 let it get there, and
+  the first thing it parses is a fabricated body. This is the same class as do-not #9/#13: a
+  stand-in that was covering a hole, now exposed by progress on the step before it.
+- **What is NOT concluded.** It is not established that `star_glow.fxc` exists in the retail content
+  we are allowed to read: the `xarchive_cache.rpf` TOC is encrypted (`0xB116A6AB` @ 0x800, guest
+  decrypts), so **grepping the archive proves nothing** — the honest measurement is the guest's own
+  `TOC76`/`TOC76-RET` census for `fxl_final/star_glow.fxc`, plus whether the `a:/archive/…` fallback
+  in the session-78 cascade (`EXECUTION_PHASES.md` §A1: `GETDEV #41/#42/#43` all missed) is even
+  reachable, given F-034's "the non-archive Mount chain never executes".
+- **Next (T41.3b step 1, one soak, census only):** log which path names reach `TOC76` and what they
+  return, and whether the guest *would* have asked the archive device if `AFB76-FALLBACK` did not
+  answer first. Do **not** swap in a different blob, do not patch `byte_827D5C70`, do not stub the
+  fatal (do-not #3, §11 rule 4).
+
+**F-065 — 2026-09-20 23:35. The `(handler, msgid)` table is real and its bounds are the PE data
+directory, but **no code in the guest image computes a pointer into it** — so T41.3 step 2 cannot be
+answered by finding a `lis/addi` walker, and two plausible leads are closed. FACT + NEGATIVE RESULTS · D
+· P1. Read-only session (concurrent session held the tree; no build, no soak — see the file-mtime note
+in F-062's header). Evidence: `build/cache/mcla_pe.bin` raw words (rule 3), `generated/` text, one
+whole-corpus scan of 176 TUs.
+
+- **(1) F-060(4) confirmed independently, and the array is bigger than claimed.** `0x82102A00` holds
+  consecutive `{handler, msgid}` dwords with monotonically ascending handler VAs:
+  `82130048/40005703`, `821301A8/40001403`, `821301F8/40001805`, then at `0x82102AC0`
+  `82131008/40003B03` (the boot gate F-060 identified), `821310F8/40002A03`, `821311A0/40002104`; and
+  at `0x8210DA98` `822F38C0/40001503`, `822F3918/4000A305`, `822F3BD8/4004A207`. Shape is
+  unambiguous — the ids are all `0x400xxxxx` and the handlers are adjacent functions.
+- **(2) The region's bounds are not a guess: they are the PE data directory.** `mcla_pe.bin` optional
+  header dir **EXCEPTION = rva `0x102A00`, size `0x00027338`** → VA `0x82102A00`..`0x82129D38` =
+  **12,902 eight-byte records**. `IMAGE_DIRECTORY_ENTRY_EXCEPTION` is where a PPC PE keeps its function
+  table; this title's directory instead holds the handler/msgid pairs, so a loader reaches them through
+  the **directory**, not through a literal address. (The same parse gives `IMPORT` at `0x82950000`,
+  `BASERELOC` at `0x82960200`, `TLS` dir at `0x820DB8D8`, `IAT` at `0x82000600`, and
+  `AddressOfEntryPoint` RVA `0x1322B8` — see F-062(2).)
+- **(3) NEGATIVE, and it retargets T41.3 step 2.** Whole-corpus scan of `generated/ppc_xenon/*.cpp`
+  for every `lis` whose page overlaps that directory (`0x82100000`/`0x82110000`/`0x82120000`/
+  `0x82130000`) plus a following `addi`: **14 sites in 11 functions**, and **all 14 land in the tail
+  `0x82128020`–`0x82129840`** (`sub_82131790`, `sub_8265BF20`, `sub_82689200`, `sub_82143C48`,
+  `sub_821E63F0`, `sub_821F28D0`, `sub_822365B8`, `sub_822B8F48`, `sub_8235AF90`, `sub_823B59A8`,
+  `sub_823C8218`, `sub_823DEDD8`) — **zero** reach the pair area where F-060's creator/consumer/gate
+  live. So the table is not entered by an in-image address materialisation. Either its base is loaded
+  from a *global* that the PE-directory read writes (see (5)), or nothing walks it — and "find the
+  `lis/addi`" is now the wrong method, which is exactly what T41.3 step 2 told the next agent to do.
+- **(4) Two false leads closed.** (a) The 10 `lis 0x82100000` sites are all in
+  `sub_823DE730`/`sub_823DE738`/`sub_823DEDD0`/`sub_823DEDD8`/`sub_823DEF0C` and point at
+  `+10092`/`+10076`/`+10220` = `0x8210276C`/`77C`/`7A0C` — a **different structure in the same page**
+  (`00000000 823DE658 | 00000000 8210277C | 00000003 8210278C`, i.e. `{0, handler}` + `{count, ptr}`
+  records), reached as `sub_823E5B70(r3 = obj+88, r4 = &records)`. (b) `sub_823E5B70` is therefore not
+  a message registrar: its body (`ppc_recomp.71.cpp:21263+`) builds a 32-byte descriptor via
+  `sub_823DA950(&r1[80], 0x820EDEF0, 32)`, stores `obj`/`table` at `r1+104/108`, tests **bit 3 of
+  `table[0]`** and writes the constant `0x01004000` — reflection-descriptor shape, matching
+  `PROGRAM_GUIDE` §8's `fwReflected`/`fgDesriptor` family. Do not spend a session on either as "the
+  dispatcher".
+- **(5) One concrete missing capability, measured rather than assumed.** The API by which a guest reads
+  XEX/PE image fields is `RtlImageXexHeaderField`, and it is a **stub that returns nothing**:
+  `src/kernel/imports.cpp:1377` `void RtlImageXexHeaderField() { LOG_UTILITY("!!! STUB !!!"); }`
+  (hooked at `:3452`). The guest really calls it — **5 sites**: `ppc_recomp.0.cpp:7206`,
+  `ppc_recomp.80.cpp:9435`, `ppc_recomp.81.cpp:4532`, `:9384`, `:9703` — and it fires **0** times in
+  `build/w38s.log`, so those callers are not yet reached: **this is not today's blocker.** It is,
+  however, the only in-image route to (2)'s directory and to `TLS_INFO` (F-062(2)), so when any of the
+  five callers is reached the stub silently hands back zero, and the failure will look like a null
+  global, exactly like F-060's. Register it in §7 as a known stub now; do not implement it speculatively
+  (rule 1) — implementing it *is* cheap and correct (`XexGetModuleHeaderField`-style: return the value
+  for the key from the table in F-062(2)), but a fix nobody has seen called has no acceptance signal.
+- **Consequence for the queue.** T41.3 **step 2 is re-scoped by (3)**: stop looking for a literal table
+  base; instead ask who *writes* a pointer to `0x82102A00` into a global — i.e. find the store of the
+  directory value, which is (5)'s stub or an `IMPORT`-table walk — and census the 5 `RtlImageXexHeaderField`
+  call sites' enclosing functions to learn what the guest expected back. **T41.3a/T41.3 step 1 stay
+  ahead of this** (F-063 has the guest one technique lookup from returning); F-065 is a
+  search-space narrowing, not a new #1.
+
+**F-066 — 2026-09-20 23:38. The current terminal fatal is produced by a documented host mitigation that
+**cannot ever succeed**: `AFB76-FALLBACK` answers the missing `fxl_final/star_glow.fxc` with the body of
+`fxl_final/rage_im.fxc`, and `rage_im` necessarily contains the obsolete `drawblit` technique that the
+guest then rejects. The real `star_glow` body is absent from the entire embedded set — measured over all
+15 blobs, not inferred. Corrects F-063's identification of the sixth lookup argument.** FACT + FIX
+DIRECTION · C/E/G · P0. Supersedes F-063's `r4=8200934C` = `"draw_starglow"` and completes F-064's
+"what it was handed". Read-only session (a concurrent session held the tree — no build, no soak).
+Evidence: `build/cache/mcla_pe.bin` raw words (rule 3) + `src/boot_host.cpp:319-364` + `src/gpu_device.cpp:3405-3410`.
+
+- **(1) What the embedded device actually contains — the authoritative list.** The 15 `{name,buf,size}`
+  triples the host seeds (`src/boot_host.cpp:328-344`, "decoded from every `bl 0x821d22e8`", pushed at
+  `0x82860AF8`) have name strings that are **full archive paths**, read straight from the image:
+  `fxl_final/rage_im.fxc` (5258 @ `0x827D2DD0`), `fxl_final/rage_fastmipmap.fxc` (5406),
+  `fxl_final/rage_spotlightfog.fxc` (10331), `fxl_final/rage_bink.fxc` (3187),
+  `fxl_final/rmptfx_default.fxc` (3612), `fxl_final/rmptfx_litsprite.fxc` (8133),
+  `dcl/rmptfx_default.dcl` (138), `dcl/rmptfx_litsprite.dcl` (138),
+  `fxl_final/rage_atmoscatt_clouds.fxc` (32280), `fxl_final/rage_perlinnoise.fxc` (5713),
+  `fxl_final/rmptfx_collision.fxc` (4564), `fxl_final/rage_shadowcollector.fxc` (5112),
+  `fxl_final/rage_shadowdepth.fxc` (4347), `fxl_final/rage_blendshadows.fxc` (18323),
+  `fxl_final/rage_postfx.fxc` (48). **`star_glow.fxc` is not among them** — so `AFB76-MISS`
+  (`w38s.log:3857`→`:3860`) is a *correct* miss, not a lookup bug.
+- **(2) Negative over the whole permitted set, measured per blob.** Searched each of the 15 bodies for
+  every key the guest's `sub_822FBAF8` looks up (F-061(2): `star_glow`, `draw_starglow`, `draw_glow`,
+  `draw_trail`, `draw_glow_notap`, `StarTexture`, `CentrePosition`, plus `blit_draw`): **no blob
+  contains any of them.** Those names exist in the image only as `.rdata` lookup keys, contiguous at
+  `0x82040EAB`-`0x82040F0C` (`$/textures/effects`, `draw_glow_notap`, `draw_trail`, `draw_glow`,
+  `draw_starglow`, `StarTexture`, `CentrePosition`, `star_glow`). Two blobs carry `DepthMap`
+  (`rage_im`, `rmptfx_default`/`_litsprite`) and exactly one carries `drawblit`: **`rage_im`, at
+  `0x827D4135` = buf+`0x1365`** — inside the body being served.
+- **(3) The chain, closed.** `AFB8-IN path='embedded:/fxl_final/star_glow.fxc'` → `AFB76-MISS` →
+  `AFB76-FALLBACK serve rage_im buf=827D2DD0 size=5258` → the guest's `rgxa` magic test passes (that is
+  the fallback's stated purpose, `src/gpu_device.cpp:3405-3410`: *"keep the AFB76-FALLBACK (serves the
+  known-good rage_im blob at 827D2DD0) so the guest's own compare passes on real content"*) → the parse
+  reaches `rage_im`'s own `drawblit` technique → `Fatal error dispatcher invoked`,
+  `r3=0x8200B15C` = `'drawblit technique is old and busted, rename to blit_draw.'`
+  (`w38s.log:3981`). **The host chose a body whose content guarantees the fatal.** F-064's
+  "a stand-in that was covering a hole, now exposed by progress" is exactly right, one layer further:
+  this stand-in does not cover a hole, it *is* the hole.
+- **(4) CORRECTION to F-063, by raw words.** F-063 reads
+  `MSGBISECT 14-8218B688 technique-lookup #6 r3=CA71D388 r4=8200934C` as IDA's line 39
+  `"draw_starglow"`. `0x8200934C` is the 8-byte string **`drawblit`**; `draw_starglow` is at
+  `0x82040EE0`. So lookup #6 was the obsolete-technique check against the served `rage_im` content, and
+  `sub_822FBAF8` **never reached its first real `star_glow` lookup** — which is also why "one technique
+  lookup from completing" overstates the progress. F-063's D3070 fix and its marker deltas are
+  unaffected.
+- **(5) Why the obvious alternative was already tried and also fataled.** `src/gpu_device.cpp:8355` and
+  `:9203` register the inflated **preload pack** (`A47FD000`) instead; the `rgxa` first-word compare
+  (`kRgxaMagic = 0x61786772` = `'rgxa'` BE, effect-loader check at `sub_8218C844`) rejects it →
+  `FATAL-SOFT "Old version of rage effect"` at `lr=8218C864`. So the tree has two host bodies for this
+  request and **both terminate**; there is no third blob to swap in (per (2)), which is what makes the
+  honest-miss experiment the only untried branch and satisfies F-064's "do not swap in a different blob".
+- **(6) Next action — T41.3d (queue): make the miss honest, one soak.** At `src/gpu_device.cpp:11181` let a path
+  whose name is not in the seeded list **miss** instead of serving `rage_im`, and census what the guest
+  does with a genuinely-absent effect: does it ask the archive device (`GETDEV`/`READWRAP` for
+  `fxl_final/star_glow.fxc`), take its own not-found branch, or fatal the same way? Acceptance is a
+  named delta vs **`build/w38s.log`**: `AFB76-FALLBACK` for that path → 0, plus the first
+  `GETDEV`/`READWRAP` row for the same path (0 today) and the `drawblit` fatal → 0 **or** replaced by a
+  *different*, named guest error — which is also a valid and informative result. **Forbidden:** stubbing
+  the fatal or patching the technique name (do-not #3), and any new blob substitution (F-064).
+
+- **(7) One measured calibration, so a future session does not re-run this scan.** A full pass over all
+  2,130,739,200 bytes of `build/game_data/xarchive_cache.rpf` for four needles returns **0 hits for
+  `fxl_final`, `star_glow`, `.fxc` and — decisively — `resources/ui/legals`**, a path the guest resolves
+  from that same archive 22× in `w38s.log` (`TOC76 #1..`, `lr=821CCED0`). So no name string in that
+  archive is plaintext: **a name grep there is uninformative in both directions**, which quantifies
+  F-064's warning instead of asserting it. It also shows the host's `RpfVirtualFileSystem` is not what
+  serves those `.xsf` files — it indexes the on-disk `mcla extracted cache`, verified **empty** (0
+  files; `src/fs/vfs_rpf.cpp:144-160` therefore contributes nothing) — the guest's own decrypted TOC is.
+  Consequence: (5)/(6) cannot be settled offline, and with (2) ruling out every embedded body and (7)
+  ruling out inspection, **T41.3d is the only branch whose outcome is unknown** — whether
+  `fxl_final/star_glow.fxc` exists in the archive is answerable only by letting the guest ask.
+
+**F-067 — 2026-09-20 23:49. T41.3d run: deleting the `star_glow`→`rage_im` substitution removes every
+access violation in a 120 s soak (`C0000005` 2 → **0**, first soak in the project's recorded history with
+none), releases the parked thread, and moves the guest from the effect-loader fatal back to the SWF-parse
+stage. It also disproves F-066's framing of the archive route: the guest **does** ask the archive device,
+and `GETDEV` answers `0` for that one path while answering the *same* prefix for UI files.** FIX + FACT ·
+D/G · P0. Soak `build/w38t.log` (exe 23:45, `BUILD_RC=0`, `BOOT_RC=124`, 11,072 lines) vs baseline
+`build/w38s.log`; rule-11 check first (no `mcla`/`ninja`, newest log 25 min old). Change is one deleted
+block at `src/gpu_device.cpp:11174-11189`, now labelled with this entry.
+
+- **(1) The change, and why it was allowed.** The `AFB76-FALLBACK` branch that served
+  `fxl_final/rage_im.fxc` for any `star_glow` request is deleted; a miss now logs
+  `AFB76-MISS-HONEST` and falls through to the pre-existing `r3 = 0xFFFFFFFF` not-found return that every
+  other missed path already used. No new mitigation, no invented data (do-not #9 is satisfied by
+  *removing* one), and per F-066(2) the substitution could not succeed on any input.
+- **(2) Measured: the fault family is gone.** `C0000005` **2 → 0**; `VEH W0: parking thread` **1 → 0**;
+  `tools/soak_census.py` prints *"fault-line guest lr: none (no line matched the fault filter)"* — i.e.
+  not one access violation in 120 s, where every baseline since W36 has had ≥1. `[error]` lines 51 → 41.
+  Host short-circuit lines 96 → 98 (**+2**, not a reduction: the guest now reaches two more
+  resource-absorbing paths), and `DRAW_INDEXED`/`DRAWDISP`/`CP-DRAW 24`/`PRESENT 68`/`FRAME-END 3`
+  unchanged.
+- **(3) Where the guest went instead.** It retries the effect through three more names and then raises
+  its own error: `embedded:/dcl/star_glow.dcl` (`AFB76-MISS-HONEST #3`, `:3843`),
+  `embedded:/star_glow.dcl` (`#4`, `:3851`), then
+  **`GETDEV #48 path='a:/archive/fxl_final/star_glow.fxc' → GETDEV-RET ret=00000000 vt=00000000`**
+  (`:3891`-`:3893`) → `Fatal error dispatcher invoked`,
+  `lr=0x82189270 r3=0x8200B358 r4=0x82040F0C`,
+  **`fatal message: 'Unable to load shader '%s', it probably wasn't preloaded properly.'`, aux
+  r4 = 'star_glow'** (`0x82040F0C`, F-049's string — the same address `w38b.log` pointed at 700 faults a
+  day). `FATAL-SOFT` absorbs it (`:3894`), execution continues, and **1.2 s later the guest is parsing
+  SWF**: `swfCMD` **0 → 2** — `'swfCMD::Fixup - unknown type %d'` at `lr=8260A8CC` (`:5433`, `:5441`),
+  which is T38.4's long-standing frontier. So the run returns to the UI-parsing stage instead of dying in
+  the effect loader.
+- **(4) F-066(5)/(6) framing corrected — measured, not argued.** The archive *is* tried, and the failure
+  is path-specific, not mount-specific: `MOUNT76 #1 dev=C60ABD08` and `#2 dev=C60AC180` both mount the
+  **same** prefix `a:/archive/` with the same vtable `82012BDC` (`:617`, `:706`), and in the *same*
+  lookup array the calls that follow `GETDEV #48` still resolve
+  `a:/archive/resources/ui/{raceeditor,garage}.xsf → ret=C60AC180` (`:1903`, `:1920`). 94 `GETDEV` lookups
+  use `a:/archive/`; only `fxl_final/*` comes back `0`. Two candidate readings, both untested: the effects
+  archive needs a mount that never happens (`MOUNT76 #3` = 0), or `fxl_final/star_glow.fxc` is not in the
+  archives the guest opened (`game:/xarchive_cache.rpf`, `game:/xarchive_audlo.rpf`) and the real source is
+  the **preload** the message names — `it probably wasn't preloaded properly` + `shaders/effects/preload.list`
+  being resolved 8× in this very soak. Preload, not archive, is the cheaper hypothesis.
+- **(5) Census trap found and named — do not claim UILOAD from this soak.** The `UILOAD` **0 → 1** delta
+  is **false**: the single match is the substring inside the host's own
+  `W34-NOGFX #1 — no GFx loader objects (vt 0x82073xxx) in scan bands; UILOAD/EF220 never armed after
+  inflate` (`w38t.log:5637`). `UILOAD` is **0** in substance, and the same marker read 1 in older soaks only
+  when the forced gate ran. Do-not #22's class again, one row over: a bare identifier in a host sentence is
+  not a guest event. `tools/soak_census.py` should scope the `UILOAD` row to `UILOAD-enter|ret|param` the
+  way T41.4 scoped exception codes — folded into T41.4's remaining work, not a new task.
+- **Consequence.** The deletion **stays** (it removed every AV and advanced the guest). New #1 =
+  **T41.3e: answer the shader-preload question**, not the archive one — census what
+  `shaders/effects/preload.list` (already served) is parsed into and whether `star_glow` is expected in
+  it; `GETDEV` for `fxl_final/*` returning 0 while `resources/ui/*` returns a device is the same
+  measurement's control. Baseline for the next soak: **`build/w38t.log`**.
+
+
+**F-068 — 2026-09-20 23:53. Every shader **preload list** the guest is served is undecipherable bytes,
+while package reads in the same soak land on valid XCompress containers — so F-067's
+`it probably wasn't preloaded properly` fatal has a named, measured proximate cause, and T41.3e is
+re-scoped from "find star_glow" to "why do `.list` reads miss the container format".** FACT · C/E · P0.
+`build/w38t.log` (same soak as F-067, no new build); rule-3 raw-word comparison of served heads against
+`kXCompressMagic = 0x0FF512EF` (`src/gpu_device.cpp:3403`).
+
+- **(1) Six for six.** Every `GLOBTEX-BODY` line for a `*.list` in `w38t.log` has a head that is not a
+  container: `shaders/ui/preload.list` len=260 `7D8DC10A C2300C86`; `shaders/effects/preload.list`
+  len=368 `7590416E 03310845`; `shaders/city/preload.list` len=1246 `6D94E16E 9C300CC7`;
+  `shaders/cars/preload.list` len=1108 `7D93DB92 9B300C86`; `shaders/characters/preload.list` len=496
+  `8D905D0A C3201084`; `textures/global/cars/globaltex.list` len=575 `75914D4E C4300C85`. Their ASCII is
+  unprintable (`u.An.1.E..r..`), i.e. **not a name list**, which is what a `.list` must be for the guest
+  to preload anything from it.
+- **(2) The control, in the same soak.** A valid container head is `05435352` followed by `0FF512EF`
+  (`READWRAP-SERVE`/`serveHead=`, and `INFLATE #1 magic=05435352` at `:2231`), and `0FF512EF` appears on
+  **20 lines** of `w38t.log` with `INFLATE` running 387 times — so the inflater and the container format
+  are working for the paths that find them. **0 of the 31 `XSF-HOSTSERVE` lines has the magic in its
+  head**, so the divergence is not "encryption everywhere": some serve paths reach containers and the
+  `.list` path does not.
+- **(3) The discriminator to test (hypothesis, named so it can be killed cheaply).** The `.list` bodies
+  are served at the **TOC word +8** offset — `XSF-HOSTSERVE path='shaders/effects/preload.list'
+  off=00304E12` — after the host **forces bit 30 on that very word**: `XSF-OPEN-GATE … +8 00304E12 ->
+  40304E12 (set bit30 so Open proceeds)` (`w38t.log:3742`; same for ui at `:3312`). If bit 30 of that
+  word is a *format/encryption flag* rather than part of the offset — as the `4000007E`/`400000BC`
+  fourth words suggest — then both the offset used and the body interpretation are wrong for every `.list`,
+  while the `.xsf`/`.xtd` bodies that come via the path-window route (`0x60000`/`0xA0000`, F-057(5)/F-058)
+  land correctly. **This is F-058's open census question, one layer down**: F-058 retracted "wrong
+  window" for `meshtextures.xtd` on the single case where both routes were comparable, and never
+  addressed the `.list` class at all.
+- **Consequence.** T41.3e is re-scoped: do not hunt for `star_glow`'s body. Read the `.list` entries the
+  guest expects (a plaintext name list is a *data* question with a checkable answer — a correct body
+  should contain ASCII names like `star_glow`, `drawblit`, `rage_im`), and settle what TOC word +8 bit 30
+  means before touching any serve offset. Forbidden as ever: patching `byte_827D5C70`, stubbing the
+  fatal, or inventing a list body (do-not #3/#9). If bit 30 turns out to be an encryption flag, the
+  honest finding is **the archive's `.list` members are encrypted and the tree has no decryptor** —
+  which is a bigger but real answer than another substitution.
+
+
+**F-069 — 2026-09-20 23:57. Why the `.list` bodies are garbage, measured offline: a `.list` TOC `w[2]` is
+**not page-aligned and is not a package head**, and the host seeks to it as a raw file offset — so it can
+only ever hand the guest compressed bytes. The host's own comment on that path ("Lists never take a
+package substitute (their name bodies work)") is therefore false, and F-068's six-for-six result is its
+measurement.** FACT · C/E · P0. Offline scan of `build/game_data/xarchive_cache.rpf` (2,130,739,200 B =
+`0x7F008000`) + `src/gpu_device.cpp:506-575`. No build, no soak; F-068's soak numbers are the on-line
+half. Corrects nothing in F-068, supplies its mechanism.
+
+- **(1) What a package head actually is.** `05435352` (`CSR`) occurs **1,617** times, always 4 KB
+  aligned, each with `0FF512EF` at `+0xC` and a count at `+0x04`. First two, verbatim:
+  `0x60000: 05435352 00000009 DC2C0810 0FF512EF 0003AB93 08EADF20 E60C7BCC 00500000`
+  `0xA0000: 05435352 0000001B D454283D 0FF512EF 0002FFC9 10F8B820 4940954D 00506200`
+  ⇒ `+0x04` entry count (9, 27), `+0x10` payload size (240,531 / 196,553), `+0x1C` = `0x50000`-class
+  window size. **These are the two addresses `MclaPreferredPkgOffForPath` hard-codes** (`0x60000`,
+  `0xA0000`, F-057(5)/F-058) — so that hard-code is pointing at real containers, which is why the UI
+  `.xsf`/`.xtd` route works at all.
+- **(2) The `.list` words are a different kind of value.** `shaders/effects/preload.list` `w=[0DB1C876
+  00000170 00304E12 400000BC]` and `shaders/ui/preload.list` `w=[0DB1C876 00000104 001DD11C 4000007E]`
+  (`w38t.log:3723`, `:3299`). `w[1]` = 368 / 260 = the exact served length (so `w[1]` is the
+  **uncompressed** size) and `w[3]&0xFFFF` = 188 / 126 = **compressed** size (~2× shrink) with bit 30 set
+  — i.e. these members are stored compressed, and their `w[2]` (`0x304E12`, `0x1DD11C`) is **not** 4 KB
+  aligned and **not** one of the 1,617 heads. Both lie inside the *file span* of the container at
+  `0xA0000` (`0xA0000`..`0x35A000`), past its `+0x10` payload end.
+- **(3) The mechanism of the defect.** `src/gpu_device.cpp` serves the list by seeking to `w[2]` as a
+  file offset and copying `w[1]` bytes (`serveOff = offs[c]`, `XSF-HOSTSERVE … off=00304E12`), and then
+  deliberately **skips any package/inflate handling for it**: `isList = strstr(path,".list") || "globaltex"
+  || "preload"` gates out `PKG-SUBST` with the comment *"their name bodies work"*. Compressed bytes cannot
+  be a plaintext name list, so that comment is the bug's statement of belief and F-068(1) is its refutation.
+  F-068(3)'s bit-30 guess is **not** the mechanism: bit 30 sits in `w[3]` (the compressed-size/flag word),
+  and `XSF-OPEN-GATE` sets it in `w[2]` for the guest's `Open` gate (`00304E12 -> 40304E12`) — the serve
+  path masks it back off, so the served bytes are what a raw seek yields, not a mis-decoded flag.
+- **(4) Next measurement, and it is a small one.** The address space of `w[2]` for a *compressed member*
+  is unresolved offline and resolving it is a **decode question, not a seek question**: read the guest's
+  own open/read chain for these members — `XSF-OPEN lr=821CCFF0` → `TOC76 lr=821CCED0` → the
+  `sub_821BC380`/`821BC868` inflate worker (`INFLATE #1 st=006D8F20 in=32768 out=8192 magic=05435352`,
+  `w38t.log:2231`) — and answer what the guest computes `w[2]` against (a member-table base inside the
+  inflated stream, most likely, given `w[1]`/`w[3]` are sizes). `build/cache/mcla_pe.bin` +
+  `tools/ppc_disasm.py` are operable; `ida-pro` must be attached to the live `:8745` RPC, not re-launched.
+  If the answer is "inflate the containing package, then slice at `w[2]`-within-stream", the tree already
+  has every part (working inflater, `MclaLoadPkgWindow`, `PackageSizeAt`) and this closes the whole
+  preload family, not just `star_glow`.
+- **Consequence.** T41.3e's first sub-step is now (4), and it is a read-only decode — do it before any
+  change to a serve path. `isList`'s comment is the thing to delete once (4) answers; until then every
+  `.list` the guest reads is compressed bytes, which is why nothing preloads and why the shader fatal
+  fires for `star_glow` specifically (F-067(3)).
+
+
+- **(5) Offline base-guessing is exhausted — recorded so nobody re-probes it.** The RPF header is
+  `RPF3 00D80500 7B5D0000 00000000` + zeros (`+0x10` = `FFFFFFFF`), giving no usable `data_start`; and
+  for each of the two member offsets, a ±`0x800` window contains **neither** `0FF512EF` **nor**
+  `05435352`, while candidate bases `0x1000`/`0x2000`/`0x10000`/`0x20000`/`0x40000` put the computed file
+  position on high-entropy bytes and `0x4000`/`0x8000` land in a **zero-padded** region. Combined with the
+  whole-archive scans (0 plaintext hits for `fxl_final`, `star_glow`, `.fxc` and even
+  `resources/ui/legals`, F-066(7)), the conclusions that survive are: `.list` members are
+  **compressed** (`w[1]` = 368/260 uncompressed vs `w[3]&0xFFFF` = 188/126, ~2×, and `w[3]` bit 30 set),
+  and their `w[2]` is **not** a file-linear seek value. So the answer can only come from the guest's own
+  TOC→seek arithmetic in (4) — and the fix shape is inflate-then-slice, not another offset constant.
+  `tools/probe_toc_off_w18.py` is a prior attempt at exactly this; check it before writing a fourth probe.
+
+**F-070 — 2026-09-20 21:01. The `.list` member offsets point into a **gap between RSC5 packages**, and the
+reason the UI packages work is now measured: `PKG-SUBST` substitutes a *real* container for them and has
+nothing to substitute for a list. This also kills the obvious cheap fix before anyone spends a soak on
+it.** FACT + PREDICTED-NO-OP · C/E · P0. Offline computation over `xarchive_cache.rpf` (1,617 RSC5
+headers, payload length read from each header's `+0x10`) + `build/w38t.log`. Follows F-069; same tree.
+
+- **(1) Coverage, measured.** The 1,617 RSC5 packages' spans cover **1,504,450,533 of 2,130,739,200
+  bytes = 70.6 %** of the archive. So most of the file is package data, and the rest is gaps of
+  non-package content.
+- **(2) Both sampled list members sit in the SAME gap.** Package `0x60000` = 240,531 B ⇒ ends `0x9BAB3`;
+  package `0xA0000` = 196,553 B ⇒ ends **`0xCFFE9`**; the next package head is `0x35A000`. The gap
+  `0xCFFE9..0x35A000` is **2,661,399 B**, and it contains both
+  `shaders/ui/preload.list w[2]=0x1DD11C` and `shaders/effects/preload.list w[2]=0x304E12`. It is the
+  second-largest gap in the archive. So `w[2]` for a `.list` is not "a byte inside a package" either —
+  it addresses the non-package region, whose bytes are high-entropy with **no** `05435352`/`0FF512EF`
+  within ±`0x800` (F-069(5)) and no plaintext anywhere in the whole file (F-066(7)).
+- **(3) Why the UI path works and the list path cannot, in one line each.** `resources/ui/*.xsf` and
+  `meshtextures.xtd`: `PKG-SUBST` fires (**19** of the 31 `XSF-HOSTSERVE` lines have `pkgSubst!=0`),
+  serving a window that *begins with a valid RSC5 header* (`0x60000`/`0xA0000`, confirmed INSIDE a real
+  package at (1)) — the guest's own container reader then does the work. The 12 lines with
+  `pkgSubst=00000000` are **exactly** the 6 `.list` files ×2 serves, i.e. 100 % of list serves are the
+  raw gap read, and 0 % carry any container magic.
+- **(4) PREDICTED NO-OP — do not spend a soak removing `isList`.** Dropping the `isList` exclusion at
+  `src/gpu_device.cpp:~517` would let lists take `pkgOff = pathPkg ? pathPkg : tocPkg`, but for a list
+  `MclaPreferredPkgOffForPath` returns 0 (paths are `shaders/…`, not `resources/ui/…`), so it falls to
+  `MclaPkgOffFromTocW2(w[2])` = `0x304E12 & ~0xFFF` = `0x304000`, which is inside the gap and has no
+  header — and `PKG-SUBST`'s own guard (`pbe == 0x05435352 || pbe == 0x0FF512EF`) then rejects it. The
+  change compiles, logs nothing new, and cannot alter a byte. Stated as a prediction, to be falsified by
+  whoever runs it.
+- **(5) What actually has to be answered, and where to look.** How does the guest fetch a *non-package*
+  member at all? The answer is in its own archive-read path, not in the file: `INFLATE #1 st=006D8F20
+  in=32768 out=8192 consumed=0 magic=05435352 lr=821BC380 … chain[ f0=821BC940 … ]`
+  (`w38t.log:2231`) — so **`sub_821BC380` / `sub_821BC940`** are the inflate-driver frames, and the
+  function that turns a TOC entry into a read request upstream of them is the one that knows whether
+  `w[2]` is package-relative, gap-relative, or a logical-cluster index. Decode those two with IDA
+  attached to the live `:8745` RPC (**do not** launch `ida-bridge.py`, it `taskkill`s the session) and
+  `mcla_pe.bin` words, then re-derive the offset from the guest's own arithmetic rather than from a
+  base guess. Honest alternative outcome, which F-069(5) already makes likely: the gap region is
+  encrypted and there is no host-side route to it at all — in which case the finding is that
+  **`.list`/non-package members need the guest's own key path**, and the substitute should be deleted
+  rather than extended.
+
+
+**F-071 — 2026-09-20 21:06. CORRECTION to F-068/F-069/F-070's fix shape, and a bigger finding: the
+guest inflates archive members **itself**, so "the host must inflate-then-slice" is wrong; and every byte
+of guest content funnels through **one host hook that rewrites the inflater's pointers through five
+stacked heuristics (waves w20→w28)**, which is live right now. This is the tree's densest mitigation
+cluster and the real gate on content loading.** FACT + FIX OF MY OWN REASONING · D/G · P0. Supersedes
+F-070(5) and F-069(3)'s "inflate then slice" conclusion; F-070(1)-(4)'s archive measurements stand as
+data. Evidence: `generated/ppc_xenon/ppc_recomp.14.cpp:19080-19140`, `src/gpu_device.cpp:6789-6860+`,
+`build/w38t.log`.
+
+- **(1) The guest's own read+inflate loop, decoded from generated text (rule 3).** Inside
+  `__imp__sub_821BC140`: `r11=[r3]` (vtable) → `r10=[r11+28]` → `mtctr/bctrl` with `r5 = [r1+80]` loaded as
+  **`PPC_LOAD_U64`** — a 64-bit file position — then `r3`(bytes read) is compared to the request, the
+  position is advanced (`r6 = extsw(r3) + [r1+80]`, `std r6,80(r1)`), the remainder recomputed
+  (`subf r7,r29,r3`), and the chunk is handed to **`bl 0x821d5e10`** with `lr=0x821BC380`
+  (`ppc_recomp.14.cpp:19134`). `sub_821D5E10` is `zlibInflater::InflateBegin` (the host's own comment at
+  `src/gpu_device.cpp:3391-3393` says so). ⇒ compressed bytes at a member offset are **expected input**, so
+  F-068(1)'s "six garbage heads" is not itself the defect, and F-070(5)'s conclusion was the wrong fix
+  shape. The heads are still not an XCompress/RSC5 block start (F-069(5)), so the *position* question in
+  F-070(5) remains open — but it is now a question about what the guest is fed, not about who inflates.
+- **(2) Where the interception is, and how loaded it is.** The host hooks `sub_821D5E10` at
+  `src/gpu_device.cpp:6789` and then **rewrites the inflater's own state** through five stacked
+  conditions in one `if`: `badMagic`, `stackWalk`, `j2NeedRepoint`, `stackPkgHead` (`:6838-6860`), under
+  comments naming six accumulated waves — **w20, w21, w22, w24, w27, w28** — including
+  *"stack-hosted RSC5/XC head is a PLANTED HEAD (READWRAP-SERVE copies ≤256B to stack dest), NOT the full
+  compressed body"* and a *"w27 regression"* note. So the tree does not merely serve bytes: it plants
+  256-byte container heads on the guest stack and re-points `st+0`/`st+4` at a **host-chosen**
+  guest-heap package bounce (`0xA0000`-class) so that `XMem`/the inflater produces something.
+- **(3) Measured as live, not dead (`w38t.log`).** `INFLATE` 387 lines over ≤16 numbered events
+  (max seq `#16`), **`REFORCE` 32**, `W27-XC-FULL` 5, `J2-DIST` 21, `READWRAP-SERVE` 1, and
+  `INFLATE-SKIP`/`INFLATE-EMPTY`/`CORRUPT`/`W28-XC-J1CONV` 0. The re-point machinery is therefore carrying
+  real work today — deleting it blind would regress boot, and adding to it is do-not #9 in its purest form.
+- **(4) Why this matters for "a working game" more than `star_glow` does.** Shaders, UI packages,
+  textures and (post-menu) the world are all archive members, so **all of them traverse this hook**;
+  F-047's 81-unregistered-label debt is concentrated here, and none of the w20→w28 branches is in
+  `PROGRAM_GUIDE` §7's table. Each per-file serve hack (including any new `.list` handling) increases the
+  coupling. The order that actually shortens the path to a menu is: make this hook's behaviour observable
+  and honest **first**, then let the `.list`/shader questions fall out of it.
+- **(5) Next action — T41.3e2, logging-only, one soak.** The hook already has `st`, `inPtr`, `magic`,
+  `outPtr`, `consumed`, `produced` in hand; the existing `INFLATE`/`REFORCE` lines just don't say **which
+  path or member** they belong to, so no soak can currently attribute an inflate to a file. Add the
+  path/`tocEntry` (and which of the five branches was taken) to those lines, soak, and answer two
+  questions with it: does a `.list` read ever reach `sub_821D5E10` at all, and if so which branch rewrites
+  it? Only after that should any serve offset or `isList` behaviour change. Acceptance: a named branch +
+  path per inflate vs baseline `build/w38t.log`, with every other marker unchanged (logging-only ⇒ the
+  census must be identical, and F-067's `C0000005 0` must stay 0).
+
+
+**F-072 — 2026-09-20 21:18. A/B/A over four soaks and three builds: the boot's **per-marker** counts are
+bit-reproducible, but `host short-circuit lines` and the other aggregates swing by **±80 between runs of
+identical source**, so several headline numbers the project has been comparing (including F-063's
+"177 → 96") are inside that band and cannot carry a causal claim. Also answers F-071(5)'s question about
+which inflate branches fire. FACT (methodology) · D · P0.** Soaks `build/w38t.log`, `w38u.log`,
+`w38v.log`, `w38w.log`; builds 23:45 (T41.3d), 00:06 (+1 census block), 00:13 (block reverted ⇒ source
+identical to the 23:45 build, exe size restored to 97,362,944). All four `BOOT_RC=124`, 120 s.
+
+- **(1) Bit-stable across all four runs (the valid acceptance set).** `C0000005` **0**, `GFx` **3**,
+  `Fatal error` **2**, `PRESENT` **68**, `DRAW_INDEXED` **0**, `swfCMD` **2**, `GETDEV` **185**,
+  `CP-DRAW` **24**, `MSGBISECT` **35**, `UILOAD` **1** (the host-text false positive of F-067(5), stable),
+  `PKG-SUBST` **19**, `GLOBTEX-SERVE-DONE` **13**, the `star_glow` "wasn't preloaded" fatal **2**,
+  `CP truth drains=8 pub==put=11`, and *"fault-line guest lr: none"* — identical in every run. **F-067's
+  T41.3d result therefore reproduces**: four runs, zero access violations, and a stable frontier at the
+  `swfCMD::Fixup` stage.
+- **(2) Not reproducible (the aggregates).** `host short-circuit lines` = **98 (w38t) → 166 (w38u) →
+  172 (w38v) → 176 (w38w)**; `[warning]` 2,929 → 3,360 → 3,360 → 3,325; `INFLATE` 387 → 503 → (n/a) →
+  463; `WAIT`/`WAKE`/`rptrWB`/`PUT=` ±20 between the two same-exe runs; `PARK-SAMPLE` ±6;
+  `[error]` 41 → 39. Spread on identical source: **78 lines of short-circuit count**.
+- **(3) The observer-effect hypothesis was tested and is NOT the explanation.** The 00:06 build added one
+  throttled `MCLA_LOG_WARN` in the inflate hook (40 lines emitted, no control-flow change); reverting it
+  in the 00:13 build did **not** return to 98 but moved further to **176**. So the ordering tracks
+  wall-clock/thread interleaving, not the instrumentation, and **`w38t` is the outlier** (its 11,072
+  lines vs ~11.5k in the others). Practical rule established here: *read per-marker counts (1), and treat
+  aggregate mitigation totals as a gauge with ±80 noise; a claim needs the marker table, and a
+  same-source repeat run to say anything about the aggregate.* F-063's and F-067's aggregate sentences
+  should be re-read under that rule (their marker tables do hold up).
+- **(4) F-071(5)'s question, answered by the reverted-away census (`w38u.log`, 40 samples).** Of the five
+  stacked conditions on the `sub_821D5E10` hook, **30/40 fire none** (`bad=false walk=false j2=false
+  pkghead=false zero=false repoint=false` — the inflater proceeds unmodified), **8/40 fire
+  `bad+walk+zero ⇒ repoint`**, and **1/40 `pkghead ⇒ repoint`**. The `magic` word at the inflate source is
+  `0FF512EF` in **1 of 40** and `05435352` in **0**; the rest are `DD7E8AC4`×11, `6655A8B1`×11,
+  `5AECD510`×8, `00000000`×8 — i.e. **the guest's own inflater is being entered almost always with data
+  that is not an XCompress/RSC5 head**, which is consistent with F-070(2)'s gap result from the other
+  side. The re-point heuristics are *not* the main path; the main path is feeding the guest non-containers.
+  Caveat stated: only the first 40 entries were logged and attribution to a path is by adjacency, so this
+  is a strong signal, not a census of all 387+.
+- **(5) Tree state after this entry.** The census block is **reverted**; `src/gpu_device.cpp` carries only
+  T41.3d (F-067) among my edits, exe = 00:13 build = the w38t source, `mcla.exe` killed, and
+  `build/w38w.log` is a fresh same-source reproduce of F-067's result. If the branch census is wanted
+  again, re-add it as its own experiment with a same-source control run, per (3).
+
+
+**F-073 — 2026-09-20 21:24. The archive's non-package member layout is decoded, and it pins the content
+gate to one wrong length field: for the six `.list` members `w[1]` is the **expanded** size and
+`w[3]&0xFFFF` is the **stored LZX length** (ratios 1.96-3.76, all six inside the `0xD0000..0x35A000` gap,
+no overlaps), while `XsfOffsetCandidates` serves the list form with `szs = w[1]` — expanded-length bytes
+read from a compressed position and never inflated.** FACT + FIX SPEC · C/E · P0. Offline check over the
+12 distinct `TOC76-XSF` quads in `build/w38w.log` + `src/gpu_device.cpp:473-530`, `:495-512`. No build,
+no soak; this is the read-only half of T41.3e3.
+
+- **(1) The layout, with the numbers.** Per member (values as logged, i.e. after `XSF-OPEN-GATE` sets bit
+  30 in `w[2]`; subtract `0x40000000` to recover the stored position):
+  `shaders/ui/preload.list` w1=260, w2=`0x1DD11C`, csz=126 (2.06x);
+  `shaders/effects/preload.list` 368 / `0x304E12` / 188 (1.96x);
+  `shaders/city/preload.list` 1246 / `0x1F4A3B` / 452 (2.76x);
+  `shaders/cars/preload.list` 1108 / `0x27E5CF` / 460 (2.41x);
+  `shaders/characters/preload.list` 496 / `0x2DB961` / 132 (3.76x);
+  `textures/global/cars/globaltex.list` 575 / `0xD0000` / 236 (2.44x).
+  **All six `w[3]` carry bit 30 in the guest's own TOC** (`openGateBit30=0` on the first read), so bit 30
+  of `w[3]` is a *stored-is-compressed* flag, not part of a size — F-068(3)'s open question answers in the
+  affirmative and F-070(2)'s gap is its consequence. Every position lies inside the
+  `0xCFFE9..0x35A000` gap ⇒ **that region is the archive's non-package member area, holding headerless LZX
+  blocks whose sizes are out-of-band in the TOC**, which is exactly why F-072(4) found a container magic at
+  the inflate source in only 1 of 40 samples.
+- **(2) Why 19 of the 31 serves work.** For the six `.xsf`/`.xtd`, `w[1]` is **32768 for every one** — a
+  window size, matching `dSz=32768` in `W27-XC-FULL` and `in=32768` in `INFLATE` — and their `w[2]`/`w[3]`
+  are not offsets in this reading at all. Those paths work only because `PKG-SUBST` swaps in a whole real
+  RSC5 window (`0x60000`/`0xA0000`), so the guest's *package* reader handles them. A `.list` has no
+  package to substitute, hence 12/12 raw reads.
+- **(3) Codec identity, corrected mid-entry.** My first guess was headerless Xpress; the tree's own
+  comment refutes it — `src/gpu_device.cpp:2203-2205`: *"XMemDecompress (RPF3 LZX) - the real unsquish for
+  archive … `8244FF20` = XMemDecompress dispatcher (codec must be 1/LZX)"*. So **the guest already owns
+  the decoder**; the host must not grow one. Deliver the stored bytes at the stored length and let
+  `sub_8244FF20` run. No offline decode was attempted (LZX is out of scope and unnecessary).
+- **(4) The defect is one field.** `src/gpu_device.cpp:500-506`, the "w18 list-form" branch, sets
+  `offs[n] = w2 & 0xFFFFFF; szs[n] = w1;` — the **expanded** size at the **compressed** position —
+  over-reading by `w1 - csz` (180 of 368 bytes for the effects list, into the neighbouring member) and
+  then presenting the result as finished content. The enclosing function is a five-branch guesser over the
+  four TOC words (it opens with `(void)w0; (void)w3;` and its own comment says *"NOT always
+  {off,size,uncomp}"*), which is why the semantics were never pinned down. Under (1) the list branch wants
+  `offs = w2 & ~0xC0000000` (stored position, host-set bit 30 excluded), `szs = w3 & 0xFFFF`, gated on
+  `w3 & 0x40000000`.
+- **(5) Fix spec, ordered so it stays attributable.** Step 1 is *not* the length change: re-add the
+  F-071(5) census and additionally print the stored fields and whether `sub_8244FF20`/`XMemDecompress` is
+  reached for a `.list` at all (prediction: it is not, because the host hands the guest what looks like a
+  finished body). Step 2, only on that evidence: set the list length to `w3 & 0xFFFF` **and stop the
+  no-magic passthrough treating a flagged-compressed member as already-inflated**
+  (`src/gpu_device.cpp:6838-6841`'s `badMagic` must not imply "copy through"). Acceptance: a
+  `GLOBTEX-BODY ascii=` field that is actually a name list (`star_glow`, `rage_im`, `.fxc` are the
+  witnesses), then the `Unable to load shader 'star_glow', it probably wasn't preloaded properly` fatal
+  disappearing because the preload has entries. Per F-072, run a same-source control beside it — the
+  aggregate gauges cannot show this; the per-marker table and the `ascii=` content can.
+- **(6) Scope, stated honestly.** This explains the **preload** family (the shader/texture lists) and
+  therefore the effect-loader fatal that has gated the path since F-061. It does **not** by itself reach a
+  menu: the `.xsf` UI packages arrive by the substituted package route, and `swfCMD::Fixup` (T38.4) is
+  still downstream and unfixed. What changes is that the largest unexplained item in the content path now
+  has a mechanism, a one-field defect site, and a log-readable acceptance test.
+
+**F-074 — 2026-09-20 21:31. The RPF3 format reference that the VFS was written against has been
+recovered from git and it names the false assumption directly: `src/fs/vfs_rpf.h:16-18` claims archive file
+data is **STORED** ("`file_size == uncompressed` so no XMem LZX decode is needed on our side"), while the
+restored §7/§8 rule is *compressed iff those two differ* — and all six `.list` members from F-073 differ,
+by 1.96-3.76x. The guest's LZX decoder is already working (`XMEM` 22x, **all `ret=0`**); it is simply
+never handed these members.** FACT + RECOVERY · C/E · P0. Closes the citation half of T39.3/T41.14 for
+this file and gives T41.3e4 its mechanism.
+
+- **(1) The document was destroyed, not missing-by-design.** `docs/MCLA_RPF3_Technical_Reference.txt`
+  (27,073 B, 591 lines) existed through `82cb758` and was deleted by **`5fbc08e` "remove docs, build
+  artifacts, and AI tooling files"** — the same data-loss event whose `.gitignore` hole `5eb9932` later
+  closed. `HANDOFF_NEXT_AGENT.md:350` (session **75g**, 09-11) records the loss ("lost to the gitignore;
+  folded into …"), but three live citations survived and one was never re-checked:
+  `src/fs/vfs_rpf.h:16` and `src/gpu_device.cpp:2204` both still point at the missing path. **Restored
+  into `docs/` this session** (`git check-ignore` rc=1 ⇒ not ignored; `git add` will track it normally).
+- **(2) The authoritative layout, which the host never had while guessing.** §3/§4/§5:
+  zero page → header at `0x800` (`RPF3`, `toc_size`, `entry_count`, **big-endian**) → TOC at `0x1000`,
+  entries **exactly 16 B**: `{name_offset INT24 | type_flags, data_offset, file_size /*compressed*/,
+  uncompressed}`, `data_offset` **absolute from file start**, `byte[3] & 0x80` = directory; §6 names are
+  null-terminated ASCII in a section at `0x1000 + toc_size`; §7 the deciding rule
+  **`file_size != uncompressed ⇒ compressed`**; §8 the codec is **XMem LZX** (`XMEMCODEC_LZX = 1`, block
+  `0x10000`), with raw-zlib as the documented fallback; §9 the **TOC block itself is AES-CBC encrypted**,
+  key inside the game image; §10 RAGE uses two custom **filename hashes**.
+- **(3) Three prior findings are now explained rather than merely measured.** (i) F-066(7)'s
+  whole-archive grep finding no plaintext path name, and F-064's `B116A6AB @ 0x800` high-entropy "TOC
+  decrypts at runtime" — that is §9's AES-CBC TOC, documented. (ii) F-070's "the `.list` offsets fall in
+  a gap between RSC5 packages" is not a mystery: per §5 `data_offset` is absolute into a region that
+  legitimately holds plain member data between packages. (iii) `w[0] = 0x0DB1C876` being discarded by
+  `XsfOffsetCandidates` (`(void)w0;`) is correct — it is a §10 hash / name offset, never a number to
+  seek by. Conversely the same function's five-branch guessing over `w[1..3]` exists *because* the layout
+  in §5 was unavailable to whoever wrote it; §5 now supersedes it.
+- **(4) The false assumption, in the source's own words.** `src/fs/vfs_rpf.h:16-18`:
+  *"… filename section, then **STORED file data** (file_size == uncompressed so no XMem LZX decode is
+  needed on our side)".* F-073(1) measured six members for which the two sizes **differ**, and §7 says
+  those are compressed. Meanwhile `sub_8244FF20` (the guest's `XMemDecompress`) fires 22x in
+  `build/w38w.log` **every one `ret=00000000`** on 7,179,936→7,179,940-byte calls — corroborating
+  session 75h's row (`HANDOFF_NEXT_AGENT.md:349`: "XMemDecompress works … all `ret=0`"). So decoding is
+  not the missing capability; **routing the compressed members to it is**.
+- **(5) Consequences for T41.3e4, now that the format is documented.** (a) The list branch of
+  `XsfOffsetCandidates` should be replaced by a §5-shaped read of the *guest's decrypted* TOC entry
+  (the object at `entry=C60F9530`), i.e. use the documented `{data_offset, file_size, uncompressed}`
+  triple rather than candidate arithmetic over four dwords — the guest already has the AES-CBC key
+  working, so the host should consume its parse, never re-implement §9. (b) Where `file_size !=
+  uncompressed`, the host must hand the guest `file_size` **stored** bytes and let `sub_8244FF20`
+  inflate — which means the `badMagic` → "copy through as uncompressed" short-circuit at
+  `src/gpu_device.cpp:6838-6841` is wrong for exactly this class (a headerless LZX member legitimately
+  has no `0FF512EF` at its start, per §8; F-072(4) measured a container magic in 1 of 40 entries).
+  (c) The `vfs_rpf.h:16-18` comment must be corrected as part of any such change — a later session
+  reading it will otherwise re-infer "everything is stored", which is what this entry exists to kill.
+- **(6) Not yet done, stated as the boundary.** No emulator behaviour was changed by this entry; the
+  restore is documentation-only and `src/` still carries only T41.3d among my edits. §5's field order
+  still has to be matched against the *guest's in-memory* entry (the host's `w[]` quad does not line up
+  1:1 with it: `entry+8` holds `0x304E12`, which §5 would call `file_size`), so (5a) needs one census,
+  not a blind rewrite.
+
+**F-075 — 2026-09-20 21:40. T41.3e4 tested and REFUTED: serving the `.list` members at the stored
+(compressed) length instead of the expanded length changes nothing in the guest. The reason is
+instructive — both readings seek to the *same position*, so the experiment never varied the variable it
+was designed to vary. `w[2]`-as-data-position is therefore still unproven, exactly as F-074(6) warned,
+and the branch has been reverted rather than left as a sixth guess.** NEGATIVE RESULT · C/E · P1. Change
+built (`build/w38x_build.log` `BUILD_RC=0`, exe 00:36) and soaked 120 s (`build/w38x.log`,
+`BOOT_RC=124`, 11,487 lines) vs the same-source-except-this control `build/w38w.log`; then reverted and
+rebuilt so the exe matches the source. Per-marker comparison (F-072's rule), not aggregates.
+
+- **(1) The change did land and was observable.** Served lengths became the stored ones for all six
+  members: `shaders/effects/preload.list off=00304E12 size=188`, `ui 126`, `city 452`, `cars 460`,
+  `characters 132`, `globaltex 236` (was 368/260/1246/1108/496/575) — i.e. F-073's `w[3] & 0xFFFF`
+  reading was implemented exactly, and the census proves the new candidate was taken.
+- **(2) Nothing else moved.** `C0000005` 0 = 0, `GFx` 3 = 3, `Fatal error` 2 = 2, `PRESENT` 68 = 68,
+  `DRAW_INDEXED` 0 = 0, `swfCMD` 2 = 2, `TOC76` 238 = 238, `INFLATE` 463 = 463, `MSGBISECT` 35 = 35,
+  `XMEM` 28 = 28, `GLOBTEX-SERVE-DONE` 13 = 13, `BE710-SLOT` 49 = 49, `noneObj` 14 = 14,
+  `wasn't preloaded properly` **2 = 2**. Only `GETDEV` moved, 185 → 169. The `GLOBTEX-SERVE-DONE
+  lists=N inserted=M` ladder is byte-for-byte the same shape (16/8/40/35/9/13 with every second pass 0).
+- **(3) Why the test could not have detected what it looked for — the design flaw in my own experiment.**
+  The first four bytes at the served position are unchanged between the two builds (effects list head is
+  `7590416E 03310845` in both `w38w.log` and `w38x.log`), because the *position* was identical and only
+  the length differed; and the guest decodes nothing at either length. So this run refutes "**length** is
+  the bug", not "position is right". Per §7 of the restored reference the two are inseparable — a correct
+  `{data_offset, file_size}` pair is required — and only the length half was varied. Recorded so nobody
+  reads (2) as "the archive path is fine".
+- **(4) What is now actually supported.** The bytes at `w[2]` are high-entropy and are **not** an
+  XCompress/RSC5 head (F-072(4): container magic in 1 of 40 inflate entries), no plaintext name fragment
+  exists anywhere in the 2.13 GB archive (`shaders`, `.xsf`, `globaltex`, `preload.list`,
+  `star_glow.fxc` all 0 hits — a *positive* result now, since §6 says names are stored as leaf fragments
+  and those fragments are absent too), and §9 documents AES-CBC on the TOC. **The simplest reading of all
+  three is that this archive's member data is encrypted as well as its TOC**, which would make every
+  host-side serve-by-offset futile and would explain five weeks of `serveHead=`/`pkgSubst`/`REFORCE`
+  accretion in `src/gpu_device.cpp`. Untested, and testable: `XMEM` already returns `ret=0` for the
+  7 MB pack bodies, so *some* data is plainly LZX-decodable — the discriminator is whether the `.list`
+  positions decode at all under the guest's own `sub_8244FF20`, which needs the position question settled
+  first (F-074(5)(i): map §5's triple against the guest's decrypted entry, not against its guesses).
+- **(5) Tree state.** The candidate branch is **reverted**; `src/gpu_device.cpp` carries only T41.3d
+  among my edits; exe rebuilt to match. `w38x.log` is retained as the falsifying soak, and per rule 5 it
+  is a new name, not an overwrite. Consequence for the queue: **T41.3e4 is closed as refuted**, and the
+  live item is T41.3e5(i) — the mapping census — which must vary the *position*, not the length.
+
 ---
 
-*Ledger continues with F-056+. (`F-050` was held open for the T38.2b answer and is now filled;
+
+*Ledger continues with F-076+. (`F-050` was held open for the T38.2b answer and is now filled;
 `F-051`/`F-052` were taken by the tooling session out of chronological order, `F-053` supersedes
 half of `F-048`, and `F-054` quantifies what `F-051` measured the absence of.) Keep the format; keep
 every claim tied to a log line, raw file words or `file:line`.*

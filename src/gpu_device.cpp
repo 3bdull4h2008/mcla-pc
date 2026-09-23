@@ -10,6 +10,7 @@
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "generated/ppc_xenon/ppc_context.h"
 #include "kernel/memory.h"
+#include "kernel/heap.h"
 #include "logging.h"
 #include <cpu/ppc_context.h>
 #include "fs/vfs_rpf.h"
@@ -25,6 +26,7 @@
 #include <unordered_set>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern std::atomic<uint32_t> g_mainGuestThreadId;
@@ -1040,6 +1042,7 @@ PPC_FUNC_IMPL(__imp__sub_82413588);
 // atArray ctor family (slot 12 = 16B allocator). Host-complete the alloc
 // when the slot is dead; call original when it is live.
 PPC_FUNC_IMPL(__imp__sub_821873E8);
+static void LogFabricatedShader(const char *tag, uint32_t obj);  // defined at the MSGCHAIN block
 static std::atomic<uint32_t> s_821873E8_hits{0};
 PPC_FUNC(sub_821873E8) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -1096,21 +1099,64 @@ PPC_FUNC(sub_821873E8) {
   // skip the 823043F8/4348 crash path.
   static std::atomic<uint32_t> s_uiLoadCalled{0};
   if (s_uiLoadCalled.fetch_add(1) == 0) {
-    MCLA_LOG_WARN("FIX-821873E8 dispatching BOOT-GATE (sub_82131008) after chain init");
-    auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
-    // ponytail: real init-done flag is [0x8288E6F0], not code addr 0x8212E6F0
-    uint32_t gateFlag = 0;
-    (void)mem2.ReadU32BE(0x8288E6F0u, &gateFlag);
-    MCLA_LOG_WARN("BOOT-GATE-FLAG [8288E6F0] = {:08X} -> 1", gateFlag);
-    (void)mem2.WriteU32BE(0x8288E6F0u, 1u);
-
-    // ponytail: seed the two 821C0750 event objects the gate checks (r3=82830ACC/AB8)
-    // If null, gate skips them and flows to UILOAD unblocked.
-    (void)mem2.WriteU32BE(0x82830ACCu, 0u);
-    (void)mem2.WriteU32BE(0x82830AB8u, 0u);
-
-    // ponytail: seed 821FC008 counter so it skips the semaphore wait block (sub_82305870)
-    (void)mem2.WriteU32BE(0x82830B14u, 0u);
+    // T41.3 / w38o: this stand-in used to run INLINE, i.e. the host forced
+    // sub_82131008 re-entrantly from inside the guest's own allocator hook, on the
+    // thread that was mid-way through sub_823047D8 (w38o.log:3866 -> :3868 -> :3869
+    // -> :4088 in w38n). The AV the gate provoked therefore killed that caller too,
+    // and the tail of sub_823047D8 never ran — including 0x82304910, whose callee
+    // sub_822F38C0 is the ONLY writer of the [0x8287E26C] singleton that the gate
+    // then faulted on (F-060). Same stand-in, off the caller's stack, and given the
+    // guest a window to publish that singleton itself first. Nothing is fabricated:
+    // if [0x8287E26C] never appears, GATE-WAIT says so and the gate runs anyway.
+    MCLA_LOG_WARN("FIX-821873E8 dispatching BOOT-GATE (sub_82131008) on its own thread");
+    std::thread([caller = ctx]() mutable {
+      PPCContext &ctx = caller;
+      SetPPCContext(ctx);  // a fresh host thread has no TLS context (guest_thread.cpp:34)
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      // This thread now runs concurrently with the guest thread the hook was called
+      // from, so the gate cannot share that thread's stack: everything below r1 is
+      // exactly where a live thread pushes its next frames. Give it its own — from
+      // the HOST user heap, the same source GuestThreadContext uses for real guest
+      // thread stacks (src/kernel/guest_thread.cpp:20). Taking it from
+      // GuestMemoryHeap::Alloc (the guest PHYSICAL o1heap) is wrong: w38p.log:3890
+      // allocated r1=CA75D740 there and 1 ms later three
+      // `AllocPhysical: o1heapAllocate returned null size=0xca71d400` appeared that
+      // are absent from the baseline w38m.log.
+      void *stackHost = g_userHeap.Alloc(0x40000);
+      const uint32_t callerR1 = ctx.r1.u32;
+      if (stackHost != nullptr) {
+        ctx.r1.u64 = mcla::kernel::MapVirtual(
+                         static_cast<uint8_t *>(stackHost) + 0x40000u - 64u) &
+                     ~15u;
+        MCLA_LOG_WARN("GATE-STACK own guest stack r1={:08X} (caller's was {:08X})",
+                      ctx.r1.u32, callerR1);
+      } else {
+        MCLA_LOG_WARN("GATE-STACK 256K userHeap alloc FAILED, gate reuses caller r1={:08X}",
+                      ctx.r1.u32);
+      }
+      uint32_t sing = 0;
+      int waits = 0;
+      for (; waits < 50; ++waits) {
+        sing = 0;
+        (void)mem.ReadU32BE(0x8287E26Cu, &sing);
+        if (sing != 0 && sing != 0xCDCDCDCDu) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      MCLA_LOG_WARN("GATE-WAIT [8287E26C]={:08X} after {} ms", sing, waits * 10);
+      auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
+    // T38.3f (2026-09-20): the four seed writes that used to be here are DELETED. The driver
+    // used to publish [0x8288E6F0]=1, [0x82830ACC]=0, [0x82830AB8]=0 and [0x82830B14]=0 and then
+    // call, by hand, exactly the functions those flags tell the gate to skip (raw decode:
+    // 0x82131020 `lwz r11,4(r29)` / 0x82131028 `bc -> 0x8213103C` skips 0x82131030/1038). Now
+    // the flags are only READ, so the log shows what the guest really has and the guest's own
+    // branches decide what runs. (F-055: the stage deletions got UILOAD to fire; this removes
+    // the last of the fabricated state that made that entry meaningless.)
+    for (const uint32_t flag : {0x8288E6F0u, 0x82830ACCu, 0x82830AB8u, 0x82830B14u, 0x8288B9ACu,
+                                0x82830998u}) {
+      uint32_t v = 0;
+      (void)mem2.ReadU32BE(flag, &v);
+      MCLA_LOG_WARN("GATE-FLAG-READ [{:08X}] = {:08X} (read-only, T38.3f)", flag, v);
+    }
 
     // ponytail: pump scheduler tick semaphore (0x40004D7C) now so UILOAD's KeWait
     // doesn't park forever on an unsignaled semaphore.
@@ -1118,14 +1164,19 @@ PPC_FUNC(sub_821873E8) {
 
     constexpr uint32_t kBootGateAddr = 0x82131008;
     if (auto *gateFn = mcla::kernel::g_memory.FindFunction(kBootGateAddr)) {
-      (void)gateFn; // looked up for presence only; stages run manually below
+      // T38.3f: this is now the ONE guest entry the host forces here — sub_82131008 itself,
+      // with no seeded flags and no hand-staged callees (see the block below).
       // ponytail: fresh ctx per house style (W32/W34 levers); gate takes no args, propagate stack only
       PPCContext g{};
       g.r1.u64 = ctx.r1.u64;
       g.r13.u64 = ctx.r13.u64;
       g.fpscr = ctx.fpscr;
-      g.lr = 0x821310BCu;
       g.fpscr.disableFlushModeUnconditional();
+
+      // Every guest call below runs on `g`, not on the caller's ctx: publish it so a
+      // fault inside the gate reports THIS frame (F-046 — the old dumps printed the
+      // boot thread's root context and every session read them as the faulting one).
+      mcla::boot::FaultContextScope gateCtx(&g, "forced-boot-gate");
 
       // ponytail: create GFx loader object BEFORE gate stages so it exists even if gate hangs
       // The ctor 824C6F08 writes vtable 0x820736DC at offset 0 and 0x820736B0 at offset 672.
@@ -1144,6 +1195,7 @@ PPC_FUNC(sub_821873E8) {
           gfxP.r13.u64 = ctx.r13.u64;
           gfxP.fpscr = ctx.fpscr;
           gfxP.r3.u64 = gfxLoader; // ctor expects object pointer in r3
+          mcla::boot::FaultContextScope gfxCtx(&gfxP, "gfx-loader-ctor");
           MCLA_LOG_ERROR("GFX-CTOR entering loader={:08X}", gfxLoader);
           ctorFn(gfxP, mcla::kernel::g_memory.base);
           uint32_t vt = 0, vt2 = 0;
@@ -1170,76 +1222,39 @@ PPC_FUNC(sub_821873E8) {
         ~UiLoadGuard() { s_inUILoad.store(false); }
       } uiGuard;
 
-      // Reserve 256B guest stack window for event out-params; never reuse the
-      // caller's live frame (prior r1+80/84 overwrote LR-save area).
+      // Reserve 4 KB guest stack window for the gate and everything it calls; never
+      // reuse the caller's live frame (prior r1+80/84 overwrote the LR-save area).
+      // T38.3f: 256 B was enough for the hand-staged leaf calls, but the gate now runs
+      // its own tree (0x82131010 `stwu r1,-128(r1)` plus nested frames), so the reserve
+      // has to cover nested guest frames instead of one leaf.
       uint32_t stageStack = 0;
       {
         auto &mm = mcla::kernel::GuestMemoryHeap::Instance();
-        const uint32_t rs = (g.r1.u32 - 256u) & ~15u;
+        const uint32_t rs = (g.r1.u32 - 4096u) & ~15u;
         uint32_t probe = 0;
-        if (rs && mm.ReadU32BE(rs, &probe)) {
+        uint32_t probeLo = 0;
+        if (rs && mm.ReadU32BE(rs, &probe) && mm.ReadU32BE(rs + 4080u, &probeLo)) {
           stageStack = rs;
           g.r1.u32 = rs;
         } else {
-          MCLA_LOG_WARN("GATE-STAGE no stack reserve, keeping r1={:08X}", g.r1.u32);
+          MCLA_LOG_WARN("GATE-STAGE no 4K stack reserve, keeping r1={:08X}", g.r1.u32);
         }
       }
-      auto freshVolatiles = [&]() {
-        g.r5.u64 = 0; g.r6.u64 = 0; g.r7.u64 = 0; g.r8.u64 = 0;
-        g.r9.u64 = 0; g.r10.u64 = 0;
-      };
-      // ponytail: stage the gate calls manually to isolate hang point (per Rank 2 plan)
-      if (auto *fn823043F8 = mcla::kernel::g_memory.FindFunction(0x823043F8)) {
-        MCLA_LOG_WARN("GATE-STAGE init-823043F8");
-        freshVolatiles();
-        fn823043F8(g, mcla::kernel::g_memory.base);
-      }
-      if (auto *fn82304348 = mcla::kernel::g_memory.FindFunction(0x82304348)) {
-        MCLA_LOG_WARN("GATE-STAGE init-82304348");
-        freshVolatiles();
-        fn82304348(g, mcla::kernel::g_memory.base);
-      }
-      if (auto *fn821C0750_1 = mcla::kernel::g_memory.FindFunction(0x821C0750)) {
-        MCLA_LOG_WARN("GATE-STAGE event1-821C0750 r3=82830ACC");
-        freshVolatiles();
-        g.r3.u32 = 0x82830ACCu; g.r4.u32 = stageStack ? stageStack + 80 : g.r1.u32 + 80;
-        fn821C0750_1(g, mcla::kernel::g_memory.base);
-        MCLA_LOG_WARN("GATE-STAGE event1-ret r3={:08X}", g.r3.u32);
-      }
-      if (auto *fn821C0750_2 = mcla::kernel::g_memory.FindFunction(0x821C0750)) {
-        MCLA_LOG_WARN("GATE-STAGE event2-821C0750 r3=82830AB8");
-        freshVolatiles();
-        g.r3.u32 = 0x82830AB8u; g.r4.u32 = stageStack ? stageStack + 84 : g.r1.u32 + 84;
-        fn821C0750_2(g, mcla::kernel::g_memory.base);
-        MCLA_LOG_WARN("GATE-STAGE event2-ret r3={:08X}", g.r3.u32);
-      }
-      if (auto *fnUILOAD = mcla::kernel::g_memory.FindFunction(0x822C0980)) {
-        MCLA_LOG_WARN("GATE-STAGE UILOAD-enter r3=[82830998]");
-        freshVolatiles();
-        g.r3.u32 = 0;
-        auto &mem3 = mcla::kernel::GuestMemoryHeap::Instance();
-        (void)mem3.ReadU32BE(0x82830998, &g.r3.u32);
-        MCLA_LOG_WARN("GATE-STAGE UILOAD-param r3={:08X}", g.r3.u32);
-        fnUILOAD(g, mcla::kernel::g_memory.base);
-        MCLA_LOG_WARN("GATE-STAGE UILOAD-ret");
-      }
-      if (auto *fn821FC008 = mcla::kernel::g_memory.FindFunction(0x821FC008)) {
-        MCLA_LOG_WARN("GATE-STAGE 821FC008");
-        freshVolatiles();
-        fn821FC008(g, mcla::kernel::g_memory.base);
-      }
-      if (auto *fn82304398 = mcla::kernel::g_memory.FindFunction(0x82304398)) {
-        MCLA_LOG_WARN("GATE-STAGE 82304398 SKIP stale-r3 (needs guest this, not UILOAD ret r3={:08X})",
-                      g.r3.u32);
-        (void)fn82304398;
-      } else {
-        MCLA_LOG_WARN("GATE-STAGE 82304398 NOT FOUND");
-      }
-      // Staged callees manage their own frames; do NOT adjust g.r1/ctx.r1 here
-      // (prior +128 writeback corrupted the caller frame).
-      // Restore caller's SP (we reserved 256B at stageStack) before continuing.
-      if (stageStack)
-        g.r1.u32 = (stageStack + 256u);
+      // T38.3f (2026-09-20): the hand-staged calls (sub_821C0750 x2 + UILOAD sub_822C0980)
+      // are DELETED. They existed only to isolate a hang point after the gate's own
+      // prologue crashed, and they contradicted the flag seeds that are now gone: the guest
+      // reaches them itself at 0x82131054 / 0x821310B0 with r1-relative out-params and
+      // r3=[0x82830998], and it compares their results against [0x827D7500+44] before
+      // deciding (raw decode of 0x82131008-0x821310D0). Running the real function is the
+      // only measurement that says whether the boot path can advance without a host
+      // stand-in (F-055 named the last fabrication; this deletes it).
+      // lr is the caller's own return address, so `mflr r12` at 0x82131008 sees a frame
+      // this host actually called from.
+      g.lr = ctx.lr;
+      MCLA_LOG_WARN("BOOT-GATE-ENTER 82131008 r1={:08X} r13={:08X} lr={:08X} reserve={:08X} (no seeds, T38.3f)",
+                    g.r1.u32, g.r13.u32, (uint32_t)g.lr, stageStack);
+      gateFn(g, mcla::kernel::g_memory.base);
+      MCLA_LOG_WARN("BOOT-GATE-RETURN 82131008 r3={:08X} r1={:08X}", g.r3.u32, g.r1.u32);
       MCLA_LOG_WARN("BOOT-GATE stages done on boot worker thread r1={:08X}", g.r1.u32);
 
       // Factory 82488C98 DISABLED: generated ppc_recomp.88.cpp:14741 shows
@@ -1253,6 +1268,7 @@ PPC_FUNC(sub_821873E8) {
       MCLA_LOG_ERROR("GFX-FACTORY-SKIP 82488C98 needs real r6 config + 11576B parent (see ppc_recomp.88)");
       (void)mem;
     }
+    }).detach();
   }
 
   uint32_t obj = mem.Alloc(72, 16);
@@ -1268,9 +1284,11 @@ PPC_FUNC(sub_821873E8) {
     newCtx.r13 = ctx.r13;
     newCtx.fpscr = ctx.fpscr;
     newCtx.r3.u64 = obj;
+    mcla::boot::FaultContextScope initCtx(&newCtx, "tls-alloc72-init");
     initFn(newCtx, mcla::kernel::g_memory.base);
   }
   ctx.r3.u64 = obj;
+  LogFabricatedShader("FIX-821873E8 HANDOFF", obj);
 }
 
 PPC_FUNC(sub_82413588) {
@@ -9477,6 +9495,165 @@ PPC_FUNC(sub_821E5FD0) {
   __imp__sub_821E5FD0(ctx, base);
 }
 
+// ===========================================================================
+// T41.3 census (2026-09-20): the last surviving C0000005 is a null
+// SINGLETON, not a null gate argument.
+//   sub_823045E0 (msg-handler table entry 0x8210DED8, msg 0x40000B03) does
+//     lis r11,-32120; lwz r3,-7572(r11); bl 0x822f3bd8
+//   so `this` for sub_822F3BD8 is guest [0x8287E26C] (ppc_recomp.50.cpp:6059-6063).
+//   The ONLY writer of that word in the whole image is sub_822F38C0
+//   (ppc_recomp.48.cpp:27313 stw r3,-7572(r11)), which is itself a table entry
+//   (0x8210DA98, msg 0x40001503) and allocates 14720 B via sub_82130528.
+// Log-only, every hook chains to __imp__: which of the chain runs, and from
+// whom. Nothing here changes behaviour (rule 1, do-not #9).
+// ===========================================================================
+static void LogMsgChain(const char *tag, uint32_t n, uint32_t a0,
+                        const PPCContext &c) {
+  if (n > 16 && (n % 200) != 0) return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  char chain[128] = {0};
+  size_t off = 0;
+  uint32_t sp = c.r1.u32;
+  for (int f = 0; f < 5 && sp != 0 && off + 16 < sizeof(chain); ++f) {
+    uint32_t back = 0, lrA = 0, lrB = 0;
+    if (!mem.ReadU32BE(sp, &back) || back == 0 || back <= sp) break;
+    (void)mem.ReadU32BE(back - 8, &lrA);
+    (void)mem.ReadU32BE(back + 4, &lrB);
+    off += static_cast<size_t>(snprintf(chain + off, sizeof(chain) - off,
+                                        " f%d=%08X/%08X", f, lrA, lrB));
+    sp = back;
+  }
+  uint32_t sing = 0;
+  (void)mem.ReadU32BE(0x8287E26Cu, &sing);
+  MCLA_LOG_WARN("MSGCHAIN {} #{} a0={:08X} [8287E26C]={:08X} lr={:08X} chain[{}]",
+                tag, n, a0, sing, static_cast<uint32_t>(c.lr), chain);
+}
+
+PPC_FUNC_IMPL(__imp__sub_822F38C0);
+static std::atomic<uint32_t> s_hF38C0{0};
+PPC_FUNC(sub_822F38C0) {
+  const uint32_t n = s_hF38C0.fetch_add(1) + 1;
+  LogMsgChain("creator-822F38C0", n, ctx.r3.u32, ctx);
+  __imp__sub_822F38C0(ctx, base);
+  uint32_t pub = 0;
+  (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(0x8287E26Cu, &pub);
+  MCLA_LOG_WARN("MSGCHAIN creator-822F38C0 #{} RET [8287E26C]={:08X}", n, pub);
+}
+
+PPC_FUNC_IMPL(__imp__sub_823045E0);
+static std::atomic<uint32_t> s_h045E0{0};
+PPC_FUNC(sub_823045E0) {
+  LogMsgChain("consumer-823045E0", s_h045E0.fetch_add(1) + 1, ctx.r3.u32, ctx);
+  __imp__sub_823045E0(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_822F3BD8);
+static std::atomic<uint32_t> s_hF3BD8{0};
+PPC_FUNC(sub_822F3BD8) {
+  // The faulting frame: r3 on entry is the `this` F-056's store dereferences.
+  LogMsgChain("faulting-822F3BD8", s_hF3BD8.fetch_add(1) + 1, ctx.r3.u32, ctx);
+  __imp__sub_822F3BD8(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_823047D8);
+static std::atomic<uint32_t> s_h047D8{0};
+PPC_FUNC(sub_823047D8) {
+  LogMsgChain("init-823047D8", s_h047D8.fetch_add(1) + 1, ctx.r3.u32, ctx);
+  __imp__sub_823047D8(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_822C2EA8);
+static std::atomic<uint32_t> s_hC2EA8{0};
+PPC_FUNC(sub_822C2EA8) {
+  LogMsgChain("parent-822C2EA8", s_hC2EA8.fetch_add(1) + 1, ctx.r3.u32, ctx);
+  __imp__sub_822C2EA8(ctx, base);
+}
+
+// T41.3 step 2 (w38n): sub_823047D8 is ENTERED (w38n.log:2650) but the factory
+// census above never fires, and IDA shows the call at 0x8230490c is
+// unconditional — so the bail is inside the first 30 instructions of that
+// function (IDA lines 29-58). Hook every step in that window to bisect it.
+// Log-only; each hook chains to __imp__ (rule 1, do-not #9). All seven were
+// verified unowned by tools/addr_owners.py --check first (rule 4).
+static void LogBisect(const char *tag, uint32_t n, const PPCContext &c) {
+  if (n > 8) return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t mgr = 0, res = 0, sing = 0;
+  (void)mem.ReadU32BE(0x82839F68u, &mgr);
+  (void)mem.ReadU32BE(0x8287E064u, &res);
+  (void)mem.ReadU32BE(0x8287E26Cu, &sing);
+  MCLA_LOG_WARN(
+      "MSGBISECT {} #{} r3={:08X} r4={:08X} [82839F68]={:08X} "
+      "[8287E064]={:08X} [8287E26C]={:08X} lr={:08X}",
+      tag, n, c.r3.u32, c.r4.u32, mgr, res, sing, static_cast<uint32_t>(c.lr));
+}
+
+#define MCLA_BISECT_HOOK(guest_fn, tag)                                     \
+  PPC_FUNC_IMPL(__imp__##guest_fn);                                         \
+  static std::atomic<uint32_t> s_h_##guest_fn{0};                           \
+  PPC_FUNC(guest_fn) {                                                      \
+    LogBisect(tag, s_h_##guest_fn.fetch_add(1) + 1, ctx);                    \
+    __imp__##guest_fn(ctx, base);                                           \
+  }
+
+MCLA_BISECT_HOOK(sub_82182240, "1-82182240 register-cars")
+MCLA_BISECT_HOOK(sub_8218A9E0, "2-8218A9E0 shader-dir")
+MCLA_BISECT_HOOK(sub_821CA540, "3-821CA540 name-insert")
+MCLA_BISECT_HOOK(sub_821C9A90, "4-821C9A90 lookup-or-create")
+MCLA_BISECT_HOOK(sub_823074B0, "6-823074B0 a1p2-ctor")
+MCLA_BISECT_HOOK(sub_822F96E0, "7-822F96E0 a1-before-factory")
+
+// w38p: sub_823047D8 enters sub_822FBAF8 (the star_glow effect init, IDA
+// 0x822fbb04..0x822fbd90: alloc 104 -> [0x8287E334], 3x sub_821B4838 render
+// targets, then vtable+4 on [0x82839F68] with "star_glow") and none of the
+// hooks after it ever fire — with the gate dispatch moved off this thread the
+// factory at 0x82304910 is STILL unreached (w38p.log:6564
+// GATE-WAIT [8287E26C]=00000000 after 5000 ms). So the question is now only
+// whether FBAF8 returns. Log its exit.
+PPC_FUNC_IMPL(__imp__sub_822FBAF8);
+static std::atomic<uint32_t> s_hFBAF8{0};
+PPC_FUNC(sub_822FBAF8) {
+  const uint32_t n = s_hFBAF8.fetch_add(1) + 1;
+  LogBisect("5-822FBAF8 star_glow-init", n, ctx);
+  __imp__sub_822FBAF8(ctx, base);
+  uint32_t glowObj = 0, glowRdr = 0, sing = 0;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  (void)mem.ReadU32BE(0x8287E318u, &glowObj);
+  (void)mem.ReadU32BE(0x8287E334u, &glowRdr);
+  (void)mem.ReadU32BE(0x8287E26Cu, &sing);
+  MCLA_LOG_WARN("MSGBISECT 5-822FBAF8 RETURN #{} [8287E318]={:08X} "
+                "[8287E334]={:08X} [8287E26C]={:08X}",
+                n, glowObj, glowRdr, sing);
+}
+
+MCLA_BISECT_HOOK(sub_822F9FA8, "8-822F9FA8 e334-producer")
+MCLA_BISECT_HOOK(sub_8218FE20, "9-8218FE20 fba-fmtor")
+MCLA_BISECT_HOOK(sub_82187150, "10-82187150 e330-create")
+MCLA_BISECT_HOOK(sub_821B4838, "11-821B4838 render-target")
+MCLA_BISECT_HOOK(sub_82188CF8, "12-82188CF8 shader-obj-ctor")
+MCLA_BISECT_HOOK(sub_8218A568, "13-8218A568 param-lookup")
+MCLA_BISECT_HOOK(sub_8218B688, "14-8218B688 technique-lookup")
+#undef MCLA_BISECT_HOOK
+
+// w38q: sub_822FBAF8 enters, our FIX-821873E8 substitution answers its
+// 0x822FBC24 call (lr=822FBC28), and the function never returns (F-061). The
+// next step it takes is through the vtable of the object THIS hook hands back,
+// so print what that object actually looks like on the way out.
+static void LogFabricatedShader(const char *tag, uint32_t obj) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t vt = 0, s4 = 0, s8 = 0, s12 = 0;
+  if (obj) {
+    (void)mem.ReadU32BE(obj + 0, &vt);
+    if (vt) {
+      (void)mem.ReadU32BE(vt + 4, &s4);
+      (void)mem.ReadU32BE(vt + 8, &s8);
+      (void)mem.ReadU32BE(vt + 12, &s12);
+    }
+  }
+  MCLA_LOG_WARN("{} obj={:08X} vt={:08X} vt+4={:08X} vt+8={:08X} vt+12={:08X}",
+                tag, obj, vt, s4, s8, s12);
+}
+
 // Session 75p: IO-credit census. The streamer refill waits while
 // [0x82757500] <= 0 (Sleep 100ms) before issuing its virtual read â€” an
 // async-IO credit/deepth limit. These two TU45 functions are the credit
@@ -10994,20 +11171,12 @@ PPC_FUNC(sub_821CAFB8) {
     }
     if (n <= 40 || (n % 200) == 0)
       MCLA_LOG_WARN("AFB76-MISS #{} path='{}' lr={:08X}", n, path, lr);
-    // W6: star_glow is not in the CRT seed list and preload names often
-    // miss. Serve the known-good static rgxa blob so the loader continues.
-    if (std::strstr(path, "star_glow") != nullptr) {
-      uint32_t fbuf = 0, fsize = 0;
-      if (EmbeddedListLookup("fxl_final/rage_im.fxc", &fbuf, &fsize) ||
-          (fbuf = 0x827D2DD0u, fsize = 5258u, true)) {
-        const uint32_t st = MakeMemoryStream(kMemDeviceObj, fbuf, fsize);
-        MCLA_LOG_WARN("AFB76-FALLBACK #{} path='{}' serve rage_im buf={:08X} "
-                      "size={} stream={:08X}",
-                      n, path, fbuf, fsize, st);
-        ctx.r3.u32 = st;
-        return;
-      }
-    }
+    // T41.3d (F-066): the rage_im substitution guaranteed the guest's
+    // "drawblit technique is old and busted" fatal, because rage_im is the only embedded body that
+    // contains drawblit (at buf+0x1365) and none of the 15 contains a star_glow key name. Report the
+    // miss honestly and let the guest's own not-found path run.
+    if (std::strstr(path, "star_glow") != nullptr)
+      MCLA_LOG_WARN("AFB76-MISS-HONEST #{} path='{}' lr={:08X} (T41.3d/F-066)", n, path, lr);
     ctx.r3.u32 = 0xFFFFFFFFu;
     return;
   }
@@ -11342,20 +11511,27 @@ PPC_FUNC(sub_821D3070) {
   uint32_t field8 = 0;
   if (obj != 0 && obj != 0xCDCDCDCDu)
     (void)mem.ReadU32BE(obj + 8, &field8);
-  // 8C760 magic-accept path does ori r4,r4,0x8000 then D3070 â€” original
+  // 8C760 magic-accept path does ori r4,r4,0x8000 then D3070 — original
   // pulls r3 from TLS[+28] and AVs when that is null (0x7e780000).
+  // F-062: the r4 test must NOT be part of the skip condition. The star_glow
+  // shader buffer call arrives as obj=8EFFEE20 +8=CA71D5A8 r4=00008000
+  // lr=8218C89C (w38r.log:3937) — a VALID object and a valid block pointer —
+  // and skipping it left the shader with no buffer, so sub_822FBAF8 never
+  // returned and the [0x8287E26C] singleton was never created (F-061). The
+  // guard exists only for the unusable-object case; keep it to that.
   const bool fromMagic = (ctx.r4.u32 & 0x8000u) != 0 &&
-                         (ctx.lr == 0x8218C89Cu ||
-                          static_cast<uint32_t>(ctx.lr) == 0x8218C89Cu);
-  if (obj == 0 || obj == 0xCDCDCDCDu || field8 == 0 || field8 == 0xCDCDCDCDu ||
-      (ctx.r4.u32 & 0x8000u) != 0) {
-    if (n <= 16 || (ctx.r4.u32 & 0x8000u) != 0)
+                         static_cast<uint32_t>(ctx.lr) == 0x8218C89Cu;
+  if (obj == 0 || obj == 0xCDCDCDCDu || field8 == 0 || field8 == 0xCDCDCDCDu) {
+    if (n <= 16)
       MCLA_LOG_WARN("D3070-SKIP #{} obj={:08X} +8={:08X} r4={:08X} lr={:08X}",
                     n, obj, field8, ctx.r4.u32,
                     static_cast<uint32_t>(ctx.lr));
     ctx.r3.u32 = 0;
     return;
   }
+  if (fromMagic && n <= 16)
+    MCLA_LOG_WARN("D3070-RUN #{} obj={:08X} +8={:08X} r4={:08X} lr={:08X}",
+                  n, obj, field8, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_821D3070(ctx, base);
 }
 

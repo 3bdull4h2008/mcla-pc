@@ -4,11 +4,88 @@
 > Token-saving reading order: **this file** → `HANDOFF_NEXT_AGENT.md` live block →
 > `PROGRAM_GUIDE.md` on demand. All long-form trail was compressed on 2026-09-20:
 > `HANDOFF_NEXT_AGENT.md` now carries a session ledger, `EXECUTION_PHASES.md` phase
-> ledgers, `ROOT_CAUSE_VALIDATION.md` the F-001…F-054 ledger (append-only — grep it, the range drifts
+> ledgers, `ROOT_CAUSE_VALIDATION.md` the F-001…F-063 ledger (append-only — grep it, the range drifts
 > every session). Anything
 > deeper lives in git (`git show 8f07a39:docs/<file>`) — grep there, never full-load.
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
+
+## 0a7. State (verified 2026-09-20 21:31 — the RPF3 format reference is RECOVERED; F-074)
+
+- **`docs/MCLA_RPF3_Technical_Reference.txt` is back** (591 lines, from `82cb758`; destroyed by `5fbc08e`'s
+  docs purge). It is the spec `src/fs/vfs_rpf.h:16` was written against and still cites.
+- **It names the false assumption outright:** the VFS comment claims file data is **STORED**
+  (`file_size == uncompressed`, "no XMem LZX decode is needed") while §7 says compressed iff those differ —
+  and all six `.list` members differ (1.96-3.76x). §8 = XMem **LZX**, and the guest's own decoder works
+  (`XMEM` 22x, all `ret=0`). So the archive gap is not a mystery: §5's `data_offset` is absolute and the
+  region between RSC5 packages is ordinary member data.
+- **Reads that were guesses are now decodable** (T41.3e5): §5's 16-byte entry layout + §10's filename
+  hashes replace `XsfOffsetCandidates`'s five-branch word guessing — but one census first, because the
+  host's in-memory quad does not yet line up 1:1 with §5 (F-074(6)).
+
+## 0a6. State (verified 2026-09-20 21:18 — F-072 methodology: the aggregate counters are NOT comparable)
+
+- **Use per-marker counts, never `host short-circuit lines`.** Four soaks / three builds: identical source
+  gives 98 → 176 on that gauge (**±78**), `[warning]` ±431 and `INFLATE` ±116, while `C0000005` 0, `GFx` 3,
+  `Fatal error` 2, `PRESENT` 68, `DRAW_INDEXED` 0, `swfCMD` 2, `GETDEV` 185, `CP-DRAW` 24, `MSGBISECT` 35,
+  `PKG-SUBST` 19 and *"fault-line lr: none"* are **bit-identical in all four**. Any claim about mitigation
+  totals needs a same-source repeat run beside it (F-063's 177→96 predates this rule).
+- **The T41.3d plateau reproduces**: `build/w38w.log` is a fresh same-source soak with 0 AVs and the same
+  frontier (`swfCMD::Fixup - unknown type`). Baseline stays **`build/w38t.log`**; `w38w` is its duplicate.
+- **Inflate branch data (F-071(5))**: 30/40 hook entries take no re-point branch, 9/40 do, and the source
+  `magic` is a real XCompress head in **1 of 40** — the guest's inflater is fed non-containers. Tree is
+  back to T41.3d only (census block reverted, exe 00:13 = that source).
+
+## 0a5. State (verified 2026-09-20 23:49 — T41.3d BUILT + SOAKED → F-067; supersedes §0/§0a4's baseline)
+
+- **`build/w38t.log` is the new baseline** (exe 23:45, `BUILD_RC=0`, `BOOT_RC=124`, 11,072 lines).
+  Deleting the `star_glow`→`rage_im` substitution took **`C0000005` 2 → 0** — no access violation in any
+  120 s soak for the first time in the project — plus `VEH W0: parking thread` 1 → 0 and `[error]` 51 → 41.
+  The guest now gets past the effect loader and back to **`swfCMD::Fixup - unknown type`** (T38.4), `swfCMD` 0 → 2.
+  `DRAW_INDEXED`/`DRAWDISP` 0 and short-circuits 96 → **98** (the guest reaches two more absorbing paths).
+- **F-066's "the archive is the only route" was wrong, measured:** the guest asks
+  `a:/archive/fxl_final/star_glow.fxc` and `GETDEV` returns **0** for it while the *same* prefix, same
+  vtable, same array resolves `a:/archive/resources/ui/*.xsf → C60AC180` (`w38t.log:3891`-`:3893` vs
+  `:1903`). The guest's own fatal says **`it probably wasn't preloaded properly`** and
+  `shaders/effects/preload.list` is served 8× in the same soak ⇒ **T41.3e** (preload, not archive).
+- **Do not read this soak's `UILOAD 0 → 1`:** the single match is the substring in the host's own
+  `W34-NOGFX …UILOAD/EF220 never armed` line (`w38t.log:5637`). UILOAD is 0 in substance. Same class as
+  do-not #22; scoping that row is folded into T41.4's leftovers.
+
+## 0a4. State (verified 2026-09-20 23:38 — read-only forensic session; adds F-065 + F-066, changes no §0 state)
+
+- **The terminal fatal is caused by a host mitigation that cannot work (F-066).** `star_glow.fxc` is
+  legitimately absent from the 15 embedded `fxl_final/*` files the host seeds
+  (`src/boot_host.cpp:328-344`; names are full archive paths, read from the image), so
+  `AFB76-FALLBACK` substitutes `rage_im`'s body — which contains the obsolete `drawblit` technique at
+  `buf+0x1365`, guaranteeing `'drawblit technique is old and busted'`. **No embedded blob holds any
+  `star_glow` key name** (measured over all 15) ⇒ the only untried branch is an honest miss: **T41.3d**.
+- **F-063's lookup #6 argument is misidentified:** `r4=8200934C` is the string `drawblit`, not
+  `draw_starglow` (`0x82040EE0`), so `sub_822FBAF8` never reached its first real `star_glow` lookup.
+- **T41.3 step 2 is re-scoped (F-065):** the `{handler,msgid}` array is confirmed and its bounds are the
+  PE **EXCEPTION directory** (`VA 0x82102A00`, size `0x27338` = 12,902 records), but a whole-corpus scan
+  found **no** `lis/addi` reaching the pair area (14 sites, all in the `0x82128xxx` tail) — stop hunting
+  for a literal walker; find who *stores* the directory value. Related known gap: `RtlImageXexHeaderField`
+  is a stub (`src/kernel/imports.cpp:1377`) with 5 guest call sites, 0 fired in `w38s.log`.
+
+## 0a3. State (verified 2026-09-20 23:25 — read-only TLS session; adds F-062, changes no §0 state)
+
+- **`sub_821873E8` is decoded: `TLS[12] -> vtable[+8](TLS[12], 72, 16, 0)`** — a **per-thread scratch
+  allocator**, not a device or a list (`generated/ppc_xenon/ppc_recomp.9.cpp:4749-4800`). So T38.3(d)'s
+  fabricated 16 B object + 72 B block has the right *shape* (F-045) and now a named meaning.
+- **Two causes of `slot12=00000000` are refuted, do not re-derive them:** the XEX TLS *template*
+  (`TLS_INFO` @ file `0x11D4`: `slot_count=64`, `raw_data_address=0x8294A800`, `data_size=0x94`) is
+  **all zeros except slot 14 = `0xFFFFFFFF`**, so copying it cannot yield slot 12; and `_xstart`
+  (`0x821322B8`, = PE `AddressOfEntryPoint`, confirmed two ways) **is** called
+  (`w38q.log:38, :131`).
+- **The surviving structural defect:** `src/kernel/guest_thread.cpp:9-30` already implements real
+  per-thread TLS (`TLS_SIZE = 0x100` = exactly 64 slots), but `src/boot_host.cpp:260-286` fabricates a
+  fixed block at `0x8F200000` with **one** slot filled, and **25 sites** hard-set
+  `r13 = 0x8F200000` (21 in `gpu_device.cpp`) — every guest thread aliases one TLS array, and
+  `src/gpu_device.cpp:1071-1090` writes a fabricated allocator into the shared `tlsTable + 12`.
+- **Negative result:** the TLS[12] producer is **not findable by text scan** — three scans failed
+  differently (5,826 false positives / 0 from missing the indexed `stwx` idiom / 6 offset-12 hits that
+  are container inserts). Recorded so the next session goes straight to the dynamic method: **T42.1**.
 
 ## 0a. Newest facts (2026-09-20 20:20, tooling session) — read before §0; it adds three facts and changes none of §0's state
 
@@ -33,7 +110,163 @@
   `"all"`; and `config/mcla_manifest.toml:16`'s `renderer_mode = "legacy"` is read by **nothing** in
   `src/` (zero grep hits), so that manifest key is inert.
 
-## 0. State (verified 2026-09-20 20:40 — supersedes the 19:55, 19:20, 17:57, 17:45, 17:05 and 16:23 blocks below)
+## 0. State (verified 2026-09-20 23:30 — supersedes my own 22:45 block below, whose null-`this` story F-060/F-061/F-063 corrected in place; IDA + the `80000003` facts still stand)
+
+- **Three fixes shipped this session, all built and soaked, none committed.** (i) The forced boot gate
+  no longer runs *inside* the guest's own allocator hook on that thread's stack — it is dispatched on
+  its own host thread with its own 256 KB guest stack taken from `g_userHeap`
+  (`src/gpu_device.cpp:1097-1130`, `GATE-STACK`/`GATE-WAIT`). (ii) `PPC_FUNC(sub_821D3070)` no longer
+  skips a buffer request just because the caller set bit 15 of `r4` as a flag — **F-063**, and it is
+  the first change in the tree's recent history that makes the guest do more: host short-circuit lines
+  **177 → 96**, `[error]` 61 → 51, `o1heapAllocate returned null` 3 → 0. (iii) `tools/soak_census.py`
+  no longer counts a PM4 argument dword as an exception code (**T41.4**, do-not #22) and still
+  reproduces the F-040 ground truth `C0000005 703 → 1`.
+- **The guest now builds a real `star_glow` shader object.** `build/w38s.log`: the 32 KB buffer is
+  allocated (`TSLAB-OWNER #16 size=32768 lr=821D30B4`), `[0x8287E334]`'s producer `sub_822F9FA8` runs
+  for the first time ever (`MSGBISECT 8 … r3=CA53C700`), the guest's own `sub_82188CF8` ctor runs on
+  `A0021270` from the simple pool (`FIX-821873E8` fires **0** times → T38.3(d) is no longer reached on
+  this path), and the param/technique lookups address a real object `CA71D388`.
+- **New #1 is answered (F-064, 23:32): it is not a hang, it is a GUEST FATAL.**
+  `w38s.log:3981` `Fatal error dispatcher invoked` /
+  **`'drawblit technique is old and busted, rename to blit_draw.'`** at `lr=0x82188770`
+  `r3=0x8200B15C`, immediately after the `"draw_starglow"` technique lookup. The bytes being parsed are
+  fabricated: `AFB76-FALLBACK #4 path='embedded:/fxl_final/star_glow.fxc' serve rage_im
+  buf=827D2DD0 size=5258` (`w38s.log:3860`) — that buffer+size is the **embedded name list**
+  (`PROGRAM_GUIDE` §8), not a shader. So T41.3b step 1 is a read-only TOC question, and the three
+  sites that keep the fake in place are `src/gpu_device.cpp:3409`, `:8355`, `:9203`.
+- (superseded framing, kept for the trail) One instruction deeper: the `"draw_glow"` technique lookup at guest `0x822FBCFC` never
+  returns** (`w38s.log:3980` is the preceding `"draw_starglow"` hit at 23:19:13.745, and
+  `MSGBISECT 5-822FBAF8 RETURN` is still 0). That is the shader-dict INSERT path
+  `PROGRAM_GUIDE` §8 already names as NULL-on-PC (`82189438/88E50 → 8218C760 → resolver 821BDF20 →
+  821CB488`), with `DICT-HYDRATE` as its life-support (do-not #8). Consequences still blocked on it:
+  `[0x8287E26C]` = 0 → F-060's singleton factory `sub_822F38C0` never runs.
+- **A second frontier appeared by removing a stand-in, and it is honest, not a regression:**
+  `UILOAD 1 → 0` because the forced gate's only trigger was the `FIX-821873E8` TLSDEAD branch, which
+  the shader fix made unreachable, so `sub_82131008` is now never dispatched; and `GFx 9 → 1` where
+  all 8 lost lines are the host's own `GFX-*`/`W34-*` stand-in prints (enumerate in F-063). Plus one
+  new **host-side** fault: `Param[1]=0x100000040` (guest EA `0x40`), `ppc ctx=nil tag=none`,
+  `rip owner=host … not a mapped guest fn`, parked (`w38s.log:5804`, `:5825`) ⇒ **T40.5 is now on the
+  critical path**, not a nice-to-have.
+- **Rule 11 is live again:** another session wrote **F-062** + T42.1/T42.2 (TLS structure) into the
+  ledger and this file at 23:23-23:25 while this session was soaking. `src/gpu_device.cpp` is 23:17
+  (mine). Check mtimes + `tasklist` before the next build. Baseline: **`build/w38s.log`**.
+
+### Trail — the 22:45 block of this session (kept; its IDA and `80000003` bullets stand)
+
+- **IDA Pro is connected, without the bridge.** `idalib-mcp.exe` (PID 13440, started 15:08 on
+  `build/game_data/default.xex`) already serves MCP-over-HTTP on `127.0.0.1:8745`; attaching to it
+  directly answers `tools/list` (47 tools) and `get_metadata`
+  (`base 0x82000000`, `size 0xad3000`, `md5 062233a2db24808d429fd0b539c1d4b4`). This is **how T39.1
+  should be closed**: `ida-bridge.py` line 25 is `taskkill /F /IM idalib-mcp.exe`, so running the
+  configured command while a session is live destroys it. ⇒ new **T41.1**.
+- **The one surviving `C0000005` has an argument-level cause — and it is NOT the gate's `r3`
+  (corrected at 22:40 by F-060, which this block overstated).** `w38m.log:3885` does show
+  `W35-BOOT-GATE #00001 r3=00000000 r4=00000000 r5=00000000`, and `w38m.log:4379` does show the gate
+  thread ending at `lr=822F44E0 write to host addr 0x1000000e0 … declining`, but the null is **loaded
+  from a guest global by guest code**: `sub_822F3BD8`'s only caller in `generated/ppc_xenon/` is
+  `sub_823045E0` (`ppc_recomp.50.cpp:6063`), whose `lwz r3,-7572(r11)` reads
+  **`[0x8287E26C]`**, and the only writer of that word in the entire image is
+  `sub_822F38C0` (`ppc_recomp.48.cpp:27313`) — a factory (`alloc 14720` → ctor `sub_822F3498` →
+  publish, or **publish 0** if the alloc fails). See **F-060** for the proof chain.
+- **Both ends are `(handler, msgid)` table entries, so the guest reaches them by message.** Raw words:
+  `0x8210DA98/9C = {sub_822F38C0, 0x40001503}` (creator), `0x8210DED8/DC = {sub_823045E0,
+  0x40000B03}` (faulting consumer), `0x82102AC0/C4 = {sub_82131008, 0x40003B03}` (**the gate the
+  host has hand-called since W36d is itself a message handler**), `0x8210DEF0/F4 = {sub_823047D8,
+  0x4000EA03}`. `src/` contains **no** reference to this table region — nobody walks it. ⇒ **T41.3 is
+  re-scoped**: dispatch msg `0x40001503` the way the guest's own message system does, and make the
+  `MSGCHAIN` census (`src/gpu_device.cpp:9450+`, built into exe 22:39, soak `build/w38n.log`) say
+  which of the five runs.
+- **`sub_82131008` is a table-resident callback, not a main() function** (IDA `get_xrefs_to`:
+  data refs at `0x82102AC0` and `0x821315F4` inside `sub_82131508`, **zero `bl` sites**); and
+  `sub_822F3BD8`'s only code xref is `0x823045F4` in `sub_823045E0` + a data ref at `0x8210DAA8`.
+  Both still need the bl-scan verification rule 3/`PROGRAM_GUIDE` §10 requires. ⇒ the host is
+  invoking something the guest normally reaches **through its own message/task dispatch**, with the
+  arguments that dispatch supplies. That is **T41.3**, and it is the gate to everything downstream.
+- **New `80000003` in the 22:12 census is not a VMX trap.** Its single occurrence
+  (`w38m.log:3054`) is a *packet argument*:
+  `CP-T3-CENSUS op=0x58 … args=80000003 071D82C0 DEADBEEF`. `debugtrap`/`illegal instruction` are
+  both 0 in that soak, so `PLAN_VMX128` Route B stays parked. A bare-hex marker matched anywhere in a
+  line is not an event — **T41.4** + do-not #22.
+- Baseline for the next soak stays `build/w38m.log` (11,514 lines, exe 22:05, `BOOT_RC=124`);
+  `CP truth drains=8 last_rptr=001F pub=11 put=11 (caught up)`, `DRAW_INDEXED` 0, `CP-DRAW` 24.
+
+## 0t1. State (verified 2026-09-20 22:12 — trail, superseded by §0 above; T40.6 steps 1-2 shipped)
+
+- **T40.6 steps 1-2 are SHIPPED AND SOAKED → F-059: the guest really does submit draws.** The CP's
+  unknown-opcode logger used to collapse every opcode `>= 0x20` into one line — the entire draw range —
+  so `skipping TYPE3 opcode=0x3C` was the maximum it could report. It is now
+  `LogType3Unhandled` (`src/gpu_cp.cpp:351-367`, first 3 hits/opcode + args), which named **13**
+  previously-invisible opcodes in `build/w38k.log` (`0x21 REG_RMW`, `0x2B IM_LOAD_IMMEDIATE`,
+  `0x3B INVALIDATE_STATE`, `0x3C WAIT_REG_MEM`, `0x45 COND_WRITE`, `0x46 EVENT_WRITE`, `0x54 INTERRUPT`,
+  `0x58 EVENT_WRITE_SHD`, `0x60-0x63 SET_BIN_MASK/SELECT`), and `PM4_DRAW_INDX`/`DRAW_INDX_2` are now
+  decoded (`:496-531`, `VGT_DRAW_INITIATOR` per `registers.h:311-326`). Measured in `build/w38m.log`:
+  **`CP-DRAW #1…#24`, all `op=0x36 src=2 (kAutoIndex) prim=1 (kPointList) numIdx=1`,
+  `hdr=C0003600`, `C71DC180→C71DC238` at an 8-byte stride — 24 packets × 2 dwords = the buffer's full
+  declared 48 dwords.** The misaligned-walk explanation was tested and refuted (every header is a
+  well-formed Type-3 header), and the count is bounded to `[24, 63]` (no `#64` line).
+- **`DRAW_INDEXED` is still 0 and F-059 does not claim otherwise.** Decode ≠ render: the CP models no
+  Xenos register file, so there is no VB/IB/shader state behind the submission. The *other* path to a
+  pixel — the host-side `sub_82420BA8` hook that does enqueue `RenderCommand::DRAW_INDEXED`
+  (`src/gpu_device.cpp:1793-1803`) — is starved for its own documented reason: it only ever sees dummy
+  `li r5=0` submits because the guest's D3D9 chain `sub_8217A470 → sub_8241BE78 → sub_8241C308 →
+  sub_82420BA8` never runs (`:1829-1835`). ⇒ **T40.6 step 3 = register state**, and the new question is
+  what those 24 point draws *are* (overlay? cursor? driver stub?) — answer it from `0x21`/`0x2B`, not by
+  logging more draws. No regression: `C0000005` 1→1, `GFx` 9→9, `UILOAD` 1→1, `PRESENT` 68→68,
+  `Fatal error` 1→1, short-circuits 178→177.
+
+## 0a2. State (verified 2026-09-20 21:55 — superseded by §0 above; T40.3/T40.4 shipped, T40.1 void)
+
+- **T40.3 + T40.4 are FIXED, BUILT AND SOAKED (`build/w38j.log`, exe 21:45, `BUILD_RC=0`) → F-058, and
+  T40.1 is VOID.** The CP now walks indirect buffers through their kernel-VA alias
+  (`src/gpu_cp.cpp:454`, `:666`), so the eight IB packets that previously decoded as
+  `TYPE0 base=000` (zeros) now carry real Xenos register offsets (`A31/A2F/D02/A02/1DD/1DC/5C8/D04`) and
+  **three nested IBs are reached for the first time** (`w38j.log:873-875`). The waiter's census reads the
+  CP's own publish target (new `CpPrimaryWritebackVA()`), and `tools/soak_census.py` lost its
+  `rptrWB → no consumer` verdict in favour of `CP truth drains=8 last_rptr=001F pub=11 put=11 (caught up)`
+  plus a `MARKER NOT IN SRC` check (4 suspicious names today). **`DRAW_INDEXED` is still 0 and the reason
+  is now specific:** this CP implements only Type-3 `0x3F`/`0x3D`/`0x48`/`0x64`; the draw packets
+  `0x22 PM4_DRAW_INDX` / `0x36 PM4_DRAW_INDX_2` (`xenos.h:1600-1601`) have no handler, and the only Type-3
+  the soak hits is `0x3C WAIT_REG_MEM`. ⇒ new #1 is **T40.6 (draws = T37.6 Wave C)**.
+- **T40.1 must NOT be implemented.** Its premise came from the 22-agent sweep and it is false: the path
+  hard-code and the TOC decode **agree** wherever the log lets us compare (`meshtextures.xtd`,
+  `r5=40060000` → `[23:12]` = `0x60000` = what `:291` returns), both call sites already fall back to the
+  TOC, and the hard-code is a documented choice because TOC-derived `.xsf`/`.xtd` bodies are AES
+  ciphertext (`src/gpu_device.cpp:521-523`). F-057(5)'s last sentence is retracted by F-058. The open
+  question there is whether the ciphertext claim is true — a census, not a fix.
+- *The 21:30 block below stands except where F-058 corrects it* (its T40.1/T40.3/T40.4 queue numbering is
+  now resolved; its dark-blue, CP, parking and F-056 findings are all still current).
+
+## 0b. State (verified 2026-09-20 21:30 — superseded by §0 above except where noted)
+
+- **T38.3f IS DONE (seeds deleted) → F-056 + F-057, and it voids the premise of the whole
+  forced-gate era.** Soak `build/w38g.log` (11,298 lines, `BOOT_RC=124`) vs baseline `build/w38f.log`:
+  the guest's own `sub_82131008` runs unseeded on real guest-published pointers (`w38g.log:3810-3816`
+  six `GATE-FLAG-READ` census lines, `:3823` `BOOT-GATE-ENTER r1=8EFFE920 r13=8F200000`), and the one
+  surviving `C0000005` is **unchanged** (`:4331-4359`) — so the flags were never the cause. The fault
+  is now named to the source line: `generated/ppc_xenon/ppc_recomp.49.cpp:2660-2661`
+  `stvx128 v33,r31,r7` with translator-local `r31 = 0` → guest EA `0xE0`, inside the *caller*
+  `__imp__sub_822F3BD8` (`:500`), **not** the leaf `sub_822FA958`; `lr=822F44E0` is sticky (do-not
+  #14) and F-055's `[0x8288E334]` is a dropped sign extension — the raw words give **`0x8287E334`**.
+- **New #1 is measurement, not the crash.** F-057 overturns five readings this file and §9 still
+  carries: `rptrWB=0000` is a wrong-address poll (`src/kernel/imports.cpp:2117` reads `C71D81BC`, the
+  CP publishes `C71D82BC` — `w38g.log:794-795`); the CP **drained 8×** to `rptr=001F` with
+  `pub==put==11` (`:865`-`:3186`, `GUEST-PUB #5`), so "no consumer" is dead; the boot worker
+  **declined and went silent** (0 `parking thread` lines) while the 2,852 `40004D7C` waits belong to
+  another thread's satisfied 16 ms heartbeat; the dark blue is **host** fallback proven by a pixel
+  capture of the live window (`build/screen_shot.png`, `AVG_RGB=16,26,56` = `0.06,0.10,0.22`,
+  `src/render_thread.cpp:85,444,505-507`) — the four guest `PRESENT-FB` "samples" are that same
+  constant substituted for a **black** framebuffer, not guest pixels; and UI packages are served from
+  a path-string hard-code (`src/gpu_device.cpp:285-296` → `0xA0000`) that bypasses the TOC-derived
+  offset at `:272-282`.
+- **Ordered plan (roadmap sweep, causal dependency — do NOT fix the crash first):** B1 derive the
+  package offset from the TOC instead of the path match → B2 delete the remaining fatal absorbers →
+  B3 apply `PhysToKernelVA` to `listPtr` at `src/gpu_cp.cpp:664-666` (the IB is walked at phys
+  `0x06258300` instead of `0xC6258300` ⇒ zero packets ⇒ `DRAW_INDEXED=0`) → B4 fix the two measurement
+  bugs above → B5 PCR/TLS parity with Xenia → B6 untile/PSO. Acceptance per step is a marker table
+  against `build/w38g.log`.
+- *State at 20:40, kept for trail (its `[0x8288E334]`, leaf-attribution, "CP ring frozen" and
+  "seeds at `src/gpu_device.cpp:1101-1113`" statements are all void — the seeds are deleted and
+  F-056/F-057 replace the rest):*
 
 - **T38.3(a)(b)(c) + the three self-contradictory gate stages ARE DELETED → F-055. The boot worker now
   reaches UILOAD for the first time in the project's history, and new #1 is the atArray allocator
@@ -43,7 +276,8 @@
   handler now declines → generic park), and `w38f.log:3885-3890` carries
   `event1-ret r3=00000000` → `event2-ret r3=00000000` → `UILOAD-enter r3=[82830998]` →
   `UILOAD-param r3=C9A24500` with **no** `UILOAD-ret`. The deleted stages were `sub_823043F8`,
-  `sub_82304348` and `sub_821FC008` — the driver seeded `[0x8288E6F0]=1` / `[0x82830B14]=0` and then
+  `sub_82304348` and `sub_821FC008` — the driver seeded `[0x8288E6F0]=1` / `[0x82830B14]=0`
+  (`src/gpu_device.cpp:1101-1113`) and then
   called exactly the functions those flags tell the guest to skip (`0x82131020 lwz r11,4(r29)` +
   `beq -> 0x8213103C`, and `0x821310C0`; F-055 §1). **The surviving fault** (`w38f.log:4416-4421`) is a
   **write to guest `0xE0`** (`Param[1]=0x1000000E0`, `tag=forced-boot-gate`,
@@ -179,6 +413,218 @@ timeout 120 ./build/mcla.exe > build/w37a.log 2> build/w37a_err.log   # new name
 
 ## 2. Tasks (in order; stop-ship gate each)
 
+### T41 — the ordered route from "one AV kills the boot gate" to a playable loop (added 2026-09-20 22:45)
+
+Dependency order, not wishlist order. Every item's acceptance is a `tools/soak_census.py` delta against
+the **named** baseline in its own line, per rule 13. Nothing below is "done" without that line.
+
+**Stage 1 — make the guest finish its own boot (nothing downstream is measurable until this).**
+
+- **T41.1 — close T39.1 the safe way + record the attach method.** IDA is reachable by HTTP at
+  `127.0.0.1:8745` (verified: `tools/list` → 47 tools, `get_metadata` → `default.xex` @ `0x82000000`).
+  Write that into `PROGRAM_GUIDE.md` §10 and `AGENTS.md` (attach-to-live-RPC, and *why*: `ida-bridge.py:25`
+  `taskkill`s the other session), add `--attach` guidance to the `mcla-guest-raw-decode` skill, and get a
+  rendered list of `renderdoc` only if a GPU question actually needs it. Gate: a doc line naming both
+  methods and the kill hazard; one IDA `decompile_function` result quoted into an F-### entry.
+- **T41.2 — finish the null-`this` proof before touching code.** Two checks: (i) does `:1986`
+  `std r31,176(r1)` dominate `:2338` `ld r31,176(r1)` on the executed path (the other slot writers are
+  `:1085` `stfs` and `:3351`)? (ii) bl-scan `generated/` + the raw image for callers of `0x822F3BD8`
+  (IDA says `sub_823045E0+0x14` only — §10 says verify) and for `0x82131008` (IDA says none — a table
+  entry at `0x82102AC0`). Gate: **F-060** written as FACT not INFERENCE, with the raw words or the
+  generated line numbers for each step.
+- **T41.3 — dispatch msg `0x40001503` (the singleton factory) the way the guest's own message system
+  does.** *Re-scoped 22:40 by F-060: it was written as "give the boot gate its real arguments", and the
+  gate's `r3` is not the null source.* The null `this` is `[0x8287E26C]`, published only by
+  `sub_822F38C0`, which is a `(handler,msgid)` entry at `0x8210DA98` for message `0x40001503`; the
+  faulting consumer is that table's entry for `0x40000B03`. Step 1 (in) = read the `MSGCHAIN` census
+  rows in `build/w38n.log` to learn which of `sub_822F38C0` / `sub_823045E0` / `sub_822F3BD8` /
+  `sub_823047D8` / `sub_822C2EA8` actually run and what `[0x8287E26C]` holds at each. Step 2 = find the
+  dispatcher that reads the table region (`0x82102A00`+, ~19k entries — locate the walker by finding
+  the `lis/addi` that materialises a table base, not by guessing). Step 3 = make the guest post the
+  message through its own queue (`0x82849518` / prod `821BC868` / worker `821BC910` / exec `821BC140`)
+  rather than hand-calling a handler. **Forbidden**: writing the object pointer into
+  `[0x8287E26C]` from the host, arming `[0x8287E334]`, a vtable or `0xA00xxxxx` scratch to make the
+  store land (do-not #9/#18/#19) — if the guest cannot create its own object, *that* is the finding.
+  Gate: `MSGCHAIN creator-822F38C0 … RET [8287E26C]!=00000000` in a soak, `C0000005` → 0, and the
+  gate's `BOOT-GATE-RETURN 82131008` line (`src/gpu_device.cpp:1211`, 0 occurrences today) appears.
+  Baseline `build/w38m.log`.
+- **T41.3a — DONE 23:25 (F-063).** `sub_821D3070`'s skip tested the caller's `r4` bit-15 flag; removing
+  that clause made the `star_glow` shader allocate its 32 KB buffer and run the guest's own ctor.
+- **T41.3b — NEW #1: the shader body the host serves for `star_glow.fxc` is a name list, and the
+  guest fatals on it (F-064).** `sub_822FBAF8` reaches the `"draw_glow"` lookup and raises
+  `'drawblit technique is old and busted, rename to blit_draw.'` (`w38s.log:3981`, `lr=0x82188770`),
+  because `AFB76-FALLBACK` serves `buf=827D2DD0 size=5258` — the `SeedEmbeddedNameList` buffer
+  (`PROGRAM_GUIDE` §8) — as the file's contents (`src/gpu_device.cpp:3409`, `:8355`, `:9203`).
+  Step 1, **read-only**: census the guest's own `TOC76`/`TOC76-RET` for `fxl_final/star_glow.fxc` and
+  find whether the `a:/archive/…` fallback of the session-78 cascade is reachable at all (F-034 says
+  the non-archive Mount chain never runs). Do NOT grep the archive — its TOC is encrypted
+  (`0xB116A6AB` @ 0x800, guest decrypts), so absence proves nothing. Step 2 depends on step 1: either
+  wire the real RPF read (`src/fs/vfs_rpf.cpp:443-459` already exists) or record that the prototype's
+  `fxl_final` is not in the retail content, which is a blocking finding, not a fix. Gate for either:
+  `MSGBISECT 5-822FBAF8 RETURN` with `[8287E318]`/`[8287E334]` non-zero and that fatal gone.
+  Do-not #3/#8 still apply (no dict pokes, no `byte_827D5C70`, hydrate stays until INSERT is clean).
+  Baseline `build/w38s.log`.
+- **T41.3c — re-arm a trigger for the forced gate, or delete it.** Since F-063, `FIX-821873E8` never
+  fires, so `sub_82131008` is dispatched by nobody: `UILOAD 1 → 0`, and the 8 `GFx` lines that vanished
+  were the host's own stand-in prints. Two honest options, one soak each: (a) dispatch the gate on
+  msg `0x40003B03`'s real path (F-060(4), table `0x82102AC0`) — preferred; (b) delete the whole
+  forced-gate + `GFX-BLOCK` stand-in (T38.3(e)) and let T41.6 own UILOAD. Do not "restore" the inline
+  dispatch from `sub_821873E8` — that was the hijack F-063 names.
+- **T40.5 — promoted onto the critical path by F-063.** The new parked fault has `ppc ctx=nil
+  tag=none` and `rip owner=host … not a mapped guest fn`, so nothing in the dump can be attributed;
+  printing `SymFromAddr`/`SymGetLineFromAddr64` of `g_report.faultHost` is the only way to name it.
+- **T41.3d — DONE 23:49, built + soaked (F-067).** The `AFB76-FALLBACK` `star_glow` branch is deleted
+  (`src/gpu_device.cpp:11174`, now a labelled `AFB76-MISS-HONEST` + the shared not-found return). Measured
+  vs `w38s.log`: `C0000005` **2 → 0** (no AV in the soak at all), parked thread 1 → 0, `[error]` 51 → 41,
+  `swfCMD` 0 → 2 (back to T38.4's stage), short-circuits +2. Its premise about the archive being the next
+  stop was corrected by the same soak — see **T41.3e**; the next baseline is `build/w38t.log`.
+- **T41.3e — RE-SCOPED 23:53 by F-068: the shader **preload lists** are undecipherable, so do not hunt for `star_glow`'s body. All six `*.list` bodies served in `w38t.log` have non-container heads (`shaders/effects/preload.list` `7590416E 03310845`), while 20 lines in the same soak carry the real XCompress magic `0FF512EF` and 387 `INFLATE`s run — and the `XSF-OPEN-GATE` step **forces bit 30 on the same TOC word the offset is taken from** (`00304E12 -> 40304E12`). First question: is bit 30 an encryption/format flag (F-068(3)); a correct `.list` body should be ASCII names. (Original framing, F-067(4):  The guest's terminal fatal on
+  this path is its own: `'Unable to load shader '%s', it probably wasn't preloaded properly.'` with
+  `r4 = 0x82040F0C = 'star_glow'`, after `GETDEV` returned **0** for
+  `a:/archive/fxl_final/star_glow.fxc` while the identical mount answered `resources/ui/*.xsf`. So the
+  question is what `shaders/effects/preload.list` (already served 8×) is parsed *into*, and whether
+  `star_glow` is a listed member that the preload step failed to instantiate — a census of the
+  preload-list parse (its entries, counts, and where they land), **not** a new file-serving path. Forbidden:
+  re-adding the `rage_im` substitution, any new blob swap (F-064), stubbing the fatal (do-not #3), and
+  arming `[0x8287E26C]`/`[0x8287E334]` by hand (do-not #9/#18/#19). Gate: `MSGBISECT 5-822FBAF8 RETURN`
+  appears, **or** the fatal changes to a named, different cause — both vs baseline `build/w38t.log`.
+
+
+- **T41.3e1 — DECODED TARGET, and one predicted no-op (added 21:01, F-070).** Do NOT delete the `isList`
+  exclusion at `src/gpu_device.cpp:~517` as a fix: lists would fall back to
+  `MclaPkgOffFromTocW2(w[2]) = 0x304000`, which lies in a gap and is rejected by `PKG-SUBST`'s own magic
+  check ⇒ byte-identical result (F-070(4), stated so it can be falsified). Measured instead: the two
+  sampled `.list` members both address the **2,661,399-byte gap `0xCFFE9..0x35A000`** (RSC5 packages
+  cover only 70.6% of the archive), and 19/31 serves get a real container while the 12 that don't are
+  exactly the 6 lists ×2. Next measurement is the guest's own fetch arithmetic: `sub_821BC380` /
+  `sub_821BC940` (the `INFLATE` driver frames, `w38t.log:2231`), IDA via the live `:8745` RPC only.
+- **T41.3e2 — DONE 21:11 (census added, soaked `w38u`/`w38v`, then reverted; F-072(4)/(5)).**
+  Attribute the inflater hook before touching any serve path (added 21:06, F-071). The
+  guest inflates its own archive members (`sub_821BC140` → device vtable `+28` with a 64-bit position at
+  `[r1+80]` → `bl 0x821D5E10` at `lr=821BC374/821BC380`), so F-070(5)/F-069(3)'s "host must
+  inflate-then-slice" is **void**. The host hook at `src/gpu_device.cpp:6789` instead rewrites the
+  inflater's state through five stacked branches (`badMagic`/`stackWalk`/`j2NeedRepoint`/`stackPkgHead` +
+  `REFORCE`, waves w20→w28, incl. a **planted 256-byte RSC5 head on the guest stack**) and is measurably
+  live (`REFORCE` 32, `W27-XC-FULL` 5 in `w38t.log`). Step 1 is logging-only: put the path/`tocEntry` and
+  the taken branch on the `INFLATE`/`REFORCE` lines, soak, and answer whether a `.list` read reaches the
+  inflater at all. **Every non-inflate marker must be unchanged (logging-only) and `C0000005` must stay
+  0** — that equality is the test that the census addition is inert. Do not delete or extend the branch
+  stack on the way; it is the single funnel for all guest content and §7 registers none of it.
+- **T41.3e3 — the follow-on T41.3e2's answer opened (21:18, F-072(4)/F-072(5)).** Branch flags recorded in
+  F-072(4); the follow-on it enables is **T41.3e3**: the inflater's input is not a container in
+  39/40 samples, T41.3e2 is DONE (census ran, block reverted; branch flags in F-072(4)). Next: trace *what the host is feeding `sub_821D5E10`* (the `XSF-HOSTSERVE`/gap path of
+  F-070(2)) rather than the hook's branches — and per F-072, run a same-source control soak beside any
+  change here, because the aggregate gauges cannot show the effect.
+- **T41.3e4 — CLOSED 21:40, REFUTED BY TEST (F-075).** Built, soaked (`w38x`), compared marker-by-
+  marker against `w38w`, and reverted. Serving the stored length changed nothing — and the test could
+  not have worked: both readings seek to the *same* position, so only the length varied (F-075(3)).
+  **Position, not length, is the open unknown.** Original premise, kept as trail: the preload lists are
+  LZX and the host reads them at the wrong length (added 21:24, F-073). Decided offline: for a `.list` member, `w[1]` = expanded size, `w[3]&0xFFFF` = stored LZX
+  length, `w[3]` bit 30 = "stored compressed" (six members, ratios 1.96-3.76, all in the
+  `0xD0000..0x35A000` gap, no overlaps) — and the guest already owns the decoder
+  (`XMemDecompress`, `sub_8244FF20`, codec LZX). Defect site: `src/gpu_device.cpp:500-506`, which serves
+  `szs = w1` at the compressed position (over-reading 180 of 368 bytes there). Order matters: F-073(5)
+  step 1 first (census: are the stored fields as (1) predicts, and is `sub_8244FF20` reached for a
+  `.list`?), then step 2 (`szs = w3 & 0xFFFF` + stop `badMagic` implying "copy through"). Acceptance: a
+  `GLOBTEX-BODY ascii=` that reads as a name list, then the `wasn't preloaded properly` fatal going away;
+  **run a same-source control beside it** (F-072: the aggregate gauges cannot show this effect).
+
+- **T41.3e5 — replace the TOC guesser with the recovered §5 layout (added 21:31, F-074).** The format
+  reference is back in `docs/` (recovered from `82cb758`, deleted by `5fbc08e`), so
+  `XsfOffsetCandidates`'s five-branch guessing over four dwords is no longer necessary: §5 defines a
+  16-byte entry `{name_offset|flags, data_offset, file_size /*compressed*/, uncompressed}` with
+  `data_offset` absolute, and §7 decides compression by **`file_size != uncompressed`** — true for all six
+  `.list` members (F-073(1)). Two edits follow, in this order: (i) one census matching §5's field order
+  against the guest's in-memory entry (`entry+8` currently holds `0x304E12`, which §5 would name
+  `file_size`, so the mapping is NOT yet proven — F-074(6)); (ii) serve `file_size` stored bytes and let
+  `sub_8244FF20`/LZX inflate, which requires the `badMagic` short-circuit at `src/gpu_device.cpp:6838-6841`
+  to stop treating a headerless LZX member as already-inflated (§8 says a member has no `0FF512EF` at its
+  start). Also fix the stale comment at `src/fs/vfs_rpf.h:16-18` ("STORED … no XMem LZX decode is needed")
+  in the same change — it is the assumption that produced this bug class. Guest's decoder is proven good:
+  `XMEM` 22x, all `ret=0` (`w38w.log`, session 75h). Same-source control run required (F-072).
+- **T41.4 — DONE 23:00 (do-not #22).** `tools/soak_census.py` counts the exception-code markers
+  (`C0000005`/`C0000003`/`C000001D`/`C000008E`/`80000003`/`406D1388`) only inside `code=0x…` context,
+  because `80000003` had matched `CP-T3-CENSUS … args=80000003 …` and read as "a new VMX trap".
+  Measured: `w38m.log` now reports that marker **0** (was 1) with every other row unchanged, and the
+  F-040 ground truth still reproduces (`build/w38n.log` vs `build/smoke_long2.log` =
+  `C0000005 1 ← 703`). The `mcla-log-census` skill still needs the same wording — fold it in with T41.1.
+- **T41.5 — finish T38.3(d)(e)**: the `sub_821873E8` TLS-dead substitution and the `GFX-BLOCK`
+  (`GFX-CTOR-VT-MISMATCH`, `W34-NOGFX`, `GFX-FACTORY-SKIP` — all still firing once each in `w38m.log`).
+  Only after T41.3, so the census shows which one the guest now does for itself. Gate: their markers →
+  0 while `UILOAD`/`GFx` do **not** drop (a drop means the stand-in was carrying them — that is F-051's
+  test and it is a finding, not a failure).
+
+- **T42.1 — name the TLS[12] producer dynamically (added 2026-09-20 23:25, F-062).** One logging-only
+  change: set an x86 hardware watchpoint (DR0, `Dr7` local-execute/write) on the guest dword
+  `TableBase + 12` = host `g_base + 0x8F20100C`, from the existing VEH in `src/boot_host.cpp`, and log
+  the **guest PC + `lr` + value** of every writer (throttle to the first N, or it becomes F-054 poison).
+  This is the cheapest thing that can end the 10-day `sub_821873E8` loop: it either names the guest
+  function that installs the per-thread allocator — which is what T41.3/T41.3a are hand-standing-in for
+  — or proves no guest code ever writes it, which is the finding F-060 was waiting for. It also answers
+  an unmeasured question: does **any** thread besides the boot worker use TLS at all, given 25 sites
+  share one `r13`. **Forbidden in the same soak:** any change to the *value* at `tlsTable + 12`
+  (including the existing `src/gpu_device.cpp:1071-1090` fabrication) — a writer and a substituted
+  value in one log is unattributable. Gate: `TLSW-#` lines in a soak vs baseline `build/w38q.log`, and
+  the writer's `file:line` in `generated/` resolved by rule 3. If instead it prints 0 writers, that is
+  F-063, not a failure.
+- **T42.2 — the follow-on, only after T42.1 shows a producer:** route guest threads through
+  `src/kernel/guest_thread.cpp`'s real per-thread TLS block instead of the shared fabricated
+  `0x8F200000` one (roadmap B5 / PCR-TLS parity), and delete the `tlsTable + 12` substitution. Do not
+  start it on F-062's structural observation alone — rule 1.
+
+**Stage 2 — authored pixels on screen (the first real thing a player sees).**
+
+- **T41.6 — Wave A (was T37.4): the guest builds its own GFx loader.** The acceptance signal is
+  `sub_82482F78` (the guest movie-ctor wrapper) going from **0** to ≥1 occurrence — F-044's proof that
+  no guest loader exists today. Then `UILOAD-enter` must get a matching `UILOAD-ret`, and the SWF tag
+  walk (T38.4, `swfCMD::Fixup - unknown type 0xB7` at `lr=8260A8CC`) must be answered as a data
+  question first. Gate: menu/legal screen package parsed; no new `[error]` class.
+- **T41.7 — decide and record which draw path is canonical, then implement only that one.** Two
+  independent routes to a pixel exist and both are short: (a) the **API boundary** —
+  `sub_8217A470 → sub_8241BE78 → sub_8241C308 → sub_82420BA8`, which already enqueues
+  `RenderCommand::DRAW_INDEXED` (`src/gpu_device.cpp:1793-1803`) and is starved because the chain never
+  runs; (b) the **PM4/CP route** — 24 decoded `PM4_DRAW_INDX_2` submissions with no Xenos register
+  file behind them (T40.6 step 3). `PROGRAM_GUIDE.md` §1 states the project's own architecture as
+  "intent is captured at the draw boundary … **no Xenos CP emulation**", which is (a). Write the
+  decision into §1 with the evidence either way, and if (b) wins, say what changed. Gate: a dated
+  decision block, and only one of the two becomes the queue's #1.
+- **T41.8 — Wave B (was T37.5): a real framebuffer.** Fix the two known `src/render_thread.cpp`
+  defects first — Present's HRESULT is never checked anywhere, and `:572-574` clears *after*
+  `DrawDynamicMesh` inside the same `BeginFrame` (F-057(4)) — then detile/PSO so `PRESENT-FB sample`
+  stops being the `0.06,0.10,0.22` override. Gate: `PRESENT-FB` samples vary, and a pixel capture of
+  the live window (`build/cap.ps1`) is not one flat colour for 10 s.
+- **T41.9 — T40.2: delete the remaining fatal absorbers** once pixels exist —
+  `tools/mitigation_audit.py` currently reports 81 mitigation-shaped labels vs §7's 13 registered.
+  Gate: §7 and `src/` agree, each deletion cited.
+
+**Stage 3 — a game you can actually play (each wave gated on the one above).**
+
+- **T41.10 — Wave D input (was T37.7).** `XamInputGetState`: fix **T39.7(2)** first — the live
+  dead-hook (`patches.cpp:827-853` replaces the import so the compile-time
+  `GUEST_FUNCTION_HOOK` at `imports.cpp:3537` never runs, and it synthesises `r3=0` without chaining).
+  Then SDL3→XINPUT mapping. Gate: `XINPUT-STATE` overlay lines and the menu cursor moves on a dpad.
+- **T41.11 — Wave E audio (was T37.8).** Census the 0-returning audio stubs, confirm the audlo TOC
+  `.xma`, drive `XAudio2SubmitRenderDriverFrame` from an SDL3 callback (silence-stub first, XMA later).
+  Gate: non-zero audio samples submitted, no crash, `timeout 120` soak survives.
+- **T41.12 — Wave F world (was T37.9).** Post-UI streaming census (retail `xarchive_cache.rpf` only),
+  INLINE-EXEC payloads (XCompress + raw), then vehicle/camera/HUD and a free-roam spawn. Gate: car
+  spawns, camera follows, 60 s with no fatal.
+- **T41.13 — Wave G polish (was T37.10 + `CODE_OPTIMIZATION_PLAN` items 3-4).** Dtor-poison AVs, log
+  floods (`WAIT`/`WAKE` are 51 % of `w38m.log`), frame pacing, `.bik` skip, save/load.
+
+**Stage 4 — the housekeeping that keeps the next session honest (do a slice of this every session).**
+
+- **T41.14 — T37.2/T37.3/T39.3/T39.4/T39.6 as one hygiene pass:** W36+W37+W38 ledger rows, the root
+  junk (`11`, `err.txt`, `NUL.obj`, `crash_dump.txt`, `crash_log_early.txt`, `fix_stubs_*.py`,
+  `mcla_jts_regen.toml`, `write_opt_plan.bat`, root `CODE_OPTIMIZATION_PLAN.md`), the two
+  `GITHUB_APPEAL_*.txt` deletions that are **not** this line's work, `tools/fix_stubs_*` citation, and
+  `addr_owners --check` written into rule 4 or deleted as a claim. Ask before deleting user files.
+- **T41.15 — F-059's open question: what are those 24 point draws.** Answer from `0x21 REG_RMW` +
+  `0x2B IM_LOAD_IMMEDIATE` decode (register writes → `VGT_*`/`RB_*`), not from more draw logging. Only
+  after T41.7 picks a path; if the answer is (a), this item closes as void.
+
+## Older queue (still in force where not superseded above)
+
 **T38.0 — kill the VEH RIP-advance runaway, then root-cause the one genuine AV.**
 **STATUS 17:45: step 1-2 + acceptance DONE** (removed in `5eb9932`; `w37a.log` `C0000005` = 1 vs
 baseline 703, recovery lines 0 — F-040). **Steps 3-4 are still open** and are now T38.2/T38.3; the
@@ -307,8 +753,8 @@ host-offset trap below plus the `0x82839D70` singleton census of the block that 
 > `sub_82304348`, `sub_821FC008`) are deleted because the driver's own flag-seed tells the guest to
 > skip them. **Still open: (d) the `sub_821873E8` TLS-dead branch, (e) the `GFX-BLOCK` (left in place
 > this soak deliberately, so the UILOAD delta stays attributable to the stage deletions), and the
-> `[0x8288E6F0]=1` / `[0x82830B14]=0` / `[0x82830ACC]=0` seeds themselves** — see new **#1 = T38.3f**
-> below. Do not add new mitigations meanwhile.
+> `[0x8288E6F0]=1` / `[0x82830B14]=0` / `[0x82830ACC]=0` seeds themselves** (`src/gpu_device.cpp:1101-1113`)
+> — see new **#1 = T38.3f** below. Do not add new mitigations meanwhile.
 
 **T38.3f — NEW #1: stop seeding the gate's flags and let `sub_82131008` run its own init (the
 remainder of T38.3(e): the whole forced driver is a stand-in).** The residual AV is now one specific
@@ -321,6 +767,73 @@ what runs; then census `UILOAD-enter`/`-ret`, `C0000005` and the CP ring against
 hand-write `[0x8288E334]`, `[0x8288B9AC]` or any vtable to make the store land (do-not #9/#18/#19) —
 if the guest cannot build the allocator table itself, the finding is *that*, and it is worth more than
 a passing store.
+> **STATUS 2026-09-20 21:30 — DONE, and its own premise is refuted (F-056).** The six seed writes are
+> deleted (the `src/gpu_device.cpp:1101-1113` block is now a read-only `GATE-FLAG-READ` census) and
+> `sub_82131008` is entered once on a 4 KB reserve with `g.lr = ctx.lr`. Soak `build/w38g.log`
+> (11,298 lines, `BOOT_RC=124`) vs `w38f.log`: `C0000005` **1 → 1** at the *same* instruction, so the
+> flags were never the cause. Two of this task's own facts were wrong: the address is
+> **`0x8287E334`** (`lwz r11,-7372(r11)` — sign extension), and the fault is not in the leaf at all but
+> in the caller — `generated/ppc_xenon/ppc_recomp.49.cpp:2660-2661 stvx128 v33,r31,r7`, translator-local
+> `r31 = 0`, an unchecked raw store, with `lr=822F44E0` sticky. The gate driver itself remains a
+> stand-in (T38.3(d)/(e) still open). Queue continues at **T40.1**.
+
+**T40.1 — VOID, DO NOT IMPLEMENT (F-058).** Its premise came from the 22-agent sweep and it does not
+survive checking: `MclaPreferredPkgOffForPath` and `MclaPkgOffFromTocW2` **agree** wherever the log
+exposes a comparison (`meshtextures.xtd`, `w38j.log` `READWRAP-SERVE #1 … r5=40060000` →
+`& 0x00FFF000 = 0x60000`, exactly what `src/gpu_device.cpp:291` returns), both call sites already fall
+back to the TOC (`:534`, `:9549-9551`), and the hard-code is a documented decision because the
+TOC-derived `.xsf`/`.xtd` bodies are AES ciphertext (`:521-523`). The text below is kept as the trail of
+what the sweep claimed. **What is actually open here is a census question:** is the ciphertext claim
+true, and if so which of the 6 served UI files get plaintext vs ciphertext?
+> ~~`MclaPreferredPkgOffForPath` (`src/gpu_device.cpp:285-296`) returns hard-coded `0xA0000` for
+> `.xsf`/`.xtd`/`resources/ui` and `0x60000` for `meshtextures`, bypassing the TOC-derived
+> `MclaPkgOffFromTocW2` (`:272-282`); every served UI package is therefore read from the wrong window
+> even though 12 of them open and are served (F-057(5)).~~ ← retracted by F-058; the count was 6, and
+> the offsets agree.
+
+**T40.2 — delete the remaining fatal absorbers** (rule 1, do-not #9; F-047's 81-label debt). Only
+after T40.6, so the delta is attributable. Acceptance: each deleted site's marker → 0 while
+`C0000005` and `Fatal error` counts are reported, not hidden.
+
+**T40.3 — DONE 21:45, built and soaked (F-058).** `PhysToKernelVA` is applied to `listPtr` at both
+sites (`src/gpu_cp.cpp:454`, `:666`). Measured: the eight IB packets went from `TYPE0 base=000` (zeros)
+to real register offsets (`A31/A2F/D02/A02/1DD/1DC/5C8/D04`, `w38j.log:858-872`) and three nested IBs are
+now reached (`:873-875`). **Its own acceptance criterion is NOT met** — `DRAW_INDEXED` stayed **0** —
+because the diagnosis was one layer short: the missing layer is packet *handlers*, not addressing. That
+is T40.6.
+
+**T40.4 — DONE 21:45, built and soaked (F-058).** `CpPrimaryWritebackVA()` (`src/gpu_cp.cpp:986`)
+replaces both hard-coded addresses in the waiter census (`src/kernel/imports.cpp:2112-2222`), and
+`tools/soak_census.py` gained `dead_tracked()`/`marker_tokens()` and lost its
+`rptrWB → "no CP consumer"` verdict for a `CP truth drains=… pub=… put=…` line. Measured on `w38j`:
+`drains=8 last_rptr=001F pub=11 put=11 (caught up)`, 4 markers flagged as unexplained.
+
+**T40.6 — NEW #1: implement the draw packets (this IS T37.6 Wave C — do not open a second draw task).**
+The CP now parses real streams but handles only Type-3 `0x3F INDIRECT_BUFFER`, `0x3D MEM_WRITE`,
+`0x48 ME_INIT` and the host-invented `0x64` (`src/gpu_cp.cpp:361-363`, `:43`). The draws live in
+**`0x22 PM4_DRAW_INDX`** and `0x36 PM4_DRAW_INDX_2` (`.research/xenia/src/xenia/gpu/xenos.h:1600-1601`),
+neither of which exists here; the only Type-3 the soak actually hits is `0x3C WAIT_REG_MEM`
+(`w38j.log`, logged once as unimplemented). Order of work: (1) census every Type-3 opcode + its arg
+dwords that the newly-real IB streams contain, so the handler is written against observed packets and
+not invented ones; (2) the Type-0/Type-2 register writes into RT/shader state; (3) `DRAW_INDX` → the
+existing `DRAW_INDEXED` path. Constraint that has bitten before: **no invented draw data** — a census
+hook logs, it does not synthesise (AGENTS.md, non-negotiables). Acceptance: `DRAW_INDEXED > 0` in 120 s
+vs baseline `build/w38j.log`.
+> **STATUS 2026-09-20 22:12 — steps (1) and (2) DONE; step (3) is the whole remaining task (F-059).**
+> The census replaced a logger that collapsed every opcode `>= 0x20` into one line, and it named 13 real
+> opcodes (`build/w38k.log`). `DRAW_INDX`/`DRAW_INDX_2` now decode, and `build/w38m.log` shows **24 real
+> `PM4_DRAW_INDX_2` submissions** (`CP-DRAW #1…#24`, all `kAutoIndex`/`kPointList`/`numIdx=1`, filling a
+> 48-dword nested IB exactly — the misaligned-walk alternative was tested and refuted). `DRAW_INDEXED` is
+> still **0** because there is no Xenos register file behind them, so step (3) is now specifically
+> `0x21 REG_RMW` + `0x2B IM_LOAD_IMMEDIATE` + the Type-0 register writes into VB/IB/shader state; the
+> secondary question is what those 24 point draws actually are. **Baseline for the next soak is
+> `build/w38m.log`, not `w38j`.**
+
+**T40.5 — make the crash dump name its own store.** Print `report.faultBytes` plus
+`SymFromAddr`/`SymGetLineFromAddr64` of `g_report.faultHost` (`src/boot_host.cpp:615-618`, `:641+`) so
+the soak prints the `base + (…)` form directly instead of reconstructing it from registers (F-056's
+closing note). Acceptance: next soak prints that line and `rva=0x14D774A` is unchanged.
+
 
 **Old T38.3 text (the original enumeration, kept for the (d)/(e) items still open):**
 Three are live and none is in `PROGRAM_GUIDE.md` §7's table: (a) `boot_host.cpp` ~`:932-951`
@@ -491,7 +1004,7 @@ link-errors (header fn left undefined).
 
 ## 4. Do-not (each cost ≥1 session; carry forward)
 
-1. Edit `generated/`. 2. Regen without the reproducibility gate (`PLAN_VMX128.md` §4 Route B step 3; TU count must stay 176). 3. Poke shader dict / patch `byte_827D5C70` / stub fatals. 4. GETDEV-redirect (F-027). 5. Write `0xA00xxxxx` scratch from SeedPreBootSlots. 6. Treat `525DE064` as magic (stack residue). 7. Depend on `mc4/art`. 8. Remove hash-table hydration until INSERT proven clean. 9. Stack short-circuits without root cause. 10. Leave mcla.exe running. 11. Follow root `CODE_OPTIMIZATION_PLAN.md` Phase 0 (edits generated/) — VOID by rule 2. 12. "Fix" VMX traps by skipping instructions (R5 — stale vectors). 13. Treat PresentKick r4 as framebuffer (F-B: swap-table timestamp slot). 14. Build caller chains from census `lr` after memset/leaf calls (sticky-LR; use xrefs + arg regs). 15. Widen the `W34` loader scan (`src/gpu_device.cpp:5251-5254`) to accept `0x8206Dxxx` vtables, or write `0x820736DC`/`0x820736B0` into the fabricated loader after `sub_824C6F08` returns — both manufacture loaders out of sub-object memory (F-044). 16. Trust a `lis`/`addi` decode produced by hand or by a scanner that breaks on the *second* of two consecutive `lis`s — the first version of the vtable-producer scan under-reported (`0x824C6F28` missed); re-run with a sliding register state (F-044 §2). 17. Read a VEH crash dump's `lr` **or any GPR** as the faulting frame's until the dump's context is known to be the one that faulted — `g_faultCtx` is the boot worker's *root* `PPCContext`, while the forced gate runs stages on an unpublished local `g` (F-046: identical `lr`/`r3`/`r8`/`r9` 1.044 s apart). Also never try to add `ctr`/`xer`/`r11`/`r14`-`r31` to a dump: `ppc_config.h:5,9,10` make them host locals, so it cannot compile. 18. Read the `+0x…` in a `rip owner=guest 0xAAAAAAAA +0xBBBB` crash-dump line as a guest PC offset — it is `RtlLookupFunctionEntry`-relative **host code** bytes, so adding it to the guest address lands on a block that never executed (F-050: it pointed this session at `0x8230448C`, a second unrelated null-`bctrl`, while the real fault was the `bctrl` at `0x82304368`). Only the function half of that line is evidence. Fixed in text at `src/boot_host.cpp:547` (now `(host+0x…)`), unbuilt-in-soak. 19. Treat a crash-dump `rip owner=…` line as a *guest*-PC bound at all — `GuestFnAtHostAddr` answers from `RtlLookupFunctionEntry`, which returns the enclosing **unwind** entry, and the XenonRecomp output has one entry per recompiled function with no size bound that tracks the guest basic block. F-055 proved it: the printed owner named neither `sub_822F44DC` (the caller at the fault `lr`) nor `sub_822FA958` (the callee). Attribute a fault with `lr` + rule-3 raw words at `lr - 4`; use `rip owner` only as a weak hint about which host region the RIP sits in.
+1. Edit `generated/`. 2. Regen without the reproducibility gate (`PLAN_VMX128.md` §4 Route B step 3; TU count must stay 176). 3. Poke shader dict / patch `byte_827D5C70` / stub fatals. 4. GETDEV-redirect (F-027). 5. Write `0xA00xxxxx` scratch from SeedPreBootSlots. 6. Treat `525DE064` as magic (stack residue). 7. Depend on `mc4/art`. 8. Remove hash-table hydration until INSERT proven clean. 9. Stack short-circuits without root cause. 10. Leave mcla.exe running. 11. Follow root `CODE_OPTIMIZATION_PLAN.md` Phase 0 (edits generated/) — VOID by rule 2. 12. "Fix" VMX traps by skipping instructions (R5 — stale vectors). 13. Treat PresentKick r4 as framebuffer (F-B: swap-table timestamp slot). 14. Build caller chains from census `lr` after memset/leaf calls (sticky-LR; use xrefs + arg regs). 15. Widen the `W34` loader scan (`src/gpu_device.cpp:5251-5254`) to accept `0x8206Dxxx` vtables, or write `0x820736DC`/`0x820736B0` into the fabricated loader after `sub_824C6F08` returns — both manufacture loaders out of sub-object memory (F-044). 16. Trust a `lis`/`addi` decode produced by hand or by a scanner that breaks on the *second* of two consecutive `lis`s — the first version of the vtable-producer scan under-reported (`0x824C6F28` missed); re-run with a sliding register state (F-044 §2). 17. Read a VEH crash dump's `lr` **or any GPR** as the faulting frame's until the dump's context is known to be the one that faulted — `g_faultCtx` is the boot worker's *root* `PPCContext`, while the forced gate runs stages on an unpublished local `g` (F-046: identical `lr`/`r3`/`r8`/`r9` 1.044 s apart). Also never try to add `ctr`/`xer`/`r11`/`r14`-`r31` to a dump: `ppc_config.h:5,9,10` make them host locals, so it cannot compile. 18. Read the `+0x…` in a `rip owner=guest 0xAAAAAAAA +0xBBBB` crash-dump line as a guest PC offset — it is `RtlLookupFunctionEntry`-relative **host code** bytes, so adding it to the guest address lands on a block that never executed (F-050: it pointed this session at `0x8230448C`, a second unrelated null-`bctrl`, while the real fault was the `bctrl` at `0x82304368`). Only the function half of that line is evidence. Fixed in text at `src/boot_host.cpp:547` (now `(host+0x…)`), unbuilt-in-soak. 19. Treat a crash-dump `rip owner=…` line as a *guest*-PC bound at all — `GuestFnAtHostAddr` answers from `RtlLookupFunctionEntry`, which returns the enclosing **unwind** entry, and the XenonRecomp output has one entry per recompiled function with no size bound that tracks the guest basic block. F-055 proved it: the printed owner named neither `sub_822F44DC` (the caller at the fault `lr`) nor `sub_822FA958` (the callee). Attribute a fault with `lr` + rule-3 raw words at `lr - 4`; use `rip owner` as a weak hint about which host region the RIP sits in. **[21:30 correction, F-056: the second half of that sentence is the useful one — in `w38g` the owner line named `sub_822F3BD8` and that *was* the function holding the faulting store; it was F-055's `lr`-based leaf inference that was wrong. So `rip owner` is a valid function-level hint and an invalid PC-level one; never let either alone override the generated-code line.]** 20. Read a census log field as the value of the thing it names — `WAIT[KWFSO] … rptrWB=0000` is a hard-coded **wrong address** (`src/kernel/imports.cpp:2117` polls `0xC71D81BC` while the CP publishes to `C71D82BC`, `src/gpu_cp.cpp:951`), so "CP ring frozen / no consumer" was an artifact for many sessions while the ring was in fact draining (`w38g.log` 8 × `DRAIN`, `rptr→001F`, `pub==put`). Cross-check every pipeline field against the producer's own log line before claiming starvation (F-057(1)(2)). 21. Read a colour in a `PRESENT-FB sample` line as guest pixels — `src/render_thread.cpp:503-507` substitutes the host's `0.06,0.10,0.22` whenever the sampled framebuffer sums below 0.02, so that triple means "the guest framebuffer is black", and the on-screen dark blue is the host clear (`build/screen_shot.png`: `AVG_RGB=16,26,56`, 79/81 samples `0F1938`). Present success is unmeasured — the HRESULT is never checked (F-057(4)). 22. Read a bare-hex census marker as an event — `80000003` counted **+1** in `w38m.log` and reads as "a new VMX `debugtrap`", but its one occurrence is `CP-T3-CENSUS … args=80000003 071D82C0 DEADBEEF`, i.e. a **PM4 packet argument** (`w38m.log:3054`), while `debugtrap`/`illegal instruction` are both 0 there. Exception-code markers must be matched on exception-shaped lines only. Same class as #20, one layer further down (T41.4).
 
 ## 5. Done = playable loop
 

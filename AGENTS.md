@@ -10,7 +10,8 @@ Xbox 360 (Xenon) → PC emulator: XenonRecomp static PPC→C++ recompiler + D3D1
 2. `docs/HANDOFF_NEXT_AGENT.md` — live block + session ledger (what the last session actually saw).
 3. `docs/PROGRAM_GUIDE.md` on demand — §3 build/run gotchas, §4 guest image, §5 recompiler pipeline,
    §7 host short-circuit table, §9 log-marker inventory, §11 forbidden paths.
-4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-04x`.
+4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-076` here;
+   **F-077…F-092 exist only in `C:\mcla-pc\docs\` (rule 6)** — check both before re-deriving a fact.
 
 Older status text anywhere else = trail, not truth. Pre-compression doc text: `git show 8f07a39:docs/<file>`.
 
@@ -33,6 +34,14 @@ re-measured. That is rule 13 in practice: *no claim without a log line, raw word
 5. **Concurrent sessions are normal.** Before building/booting: `tasklist | grep -iE "mcla|ninja"`
    and check the newest `build/*.log` is >2 min old (rule 11). Before writing a doc: check its
    mtime and add a dated superseding block rather than editing someone else's.
+6. **The tree is split in two (09-23).** `E:\mcla pc` has the only working git, but its `src/` and
+   `tools/` are up to 3 days stale: C: is newer in `gpu_cp.cpp` (has the register file + PM4 decode —
+   E: has neither), `patches.cpp` (C: deleted the refuted import-detour code), `fs/vfs_rpf.h` (C: has
+   the corrected compressed/encrypted RPF model), and the fixed `ppc_disasm.py` + `addr_owners.py`
+   live on C: only. `C:\mcla-pc` holds all post-`w38` logs (baseline chain to `w45b`) but no working
+   git. Docs split too: F-069/070 only on E:, F-077…F-092 only on C:. Before claiming anything
+   about GPU/patches/VFS/tool output, `diff -q` the file against `C:/mcla-pc/` — a claim measured
+   on one tree has no meaning for the other. **Never bulk-copy C:→E:**; merge is per-file.
 
 ## Project skills (`.qoder/skills/`) — use them, don't rediscover the gotchas
 
@@ -48,7 +57,7 @@ re-measured. That is rule 13 in practice: *no claim without a log line, raw word
 
 | Tool | When | Exit code |
 |---|---|---|
-| `tools/soak_census.py <new.log> <baseline.log>` | reading or comparing any soak. 115 markers counted as matching **lines**, case-insensitive (identical to `grep -ic`), plus a fault-line vs all-line `lr=` split, the CP-ring tail and a **LOG QUALITY** line that flags a soak dominated by one repeating mitigation message as POISONED (F-054: 616,824 laundered firings = 66% of `w38e.log`). Reconcile a hand count with it before claiming it. | 0 (informational) |
+| `tools/soak_census.py <new.log> <baseline.log>` | reading or comparing any soak. 115 markers counted as matching **lines**, case-insensitive (identical to `grep -ic`), plus a fault-line vs all-line `lr=` split, a **CP truth** line (`drains`/`last_rptr`/`pub` vs `put` — the only honest pipeline signal; a waiter's `rptrWB=` field is not, F-057(1)/F-058) and a **LOG QUALITY** line that flags a soak dominated by one repeating mitigation message as POISONED (F-054: 616,824 laundered firings = 66% of `w38e.log`). It also prints **MARKER NOT IN SRC** for any tracked marker whose literal exists in neither `src/` nor `generated/` — such a marker's zero means nothing (F-057(6): 8 of the old 9 VEH markers were dead text). Reconcile a hand count with it before claiming it. | 0 (informational) |
 | `tools/addr_owners.py` | rule 4, before adding **any** hook — guest address → `file:line` → hook name, and which sites actually *claim* it. `--check <addr\|symbol>` for one site; `--gates <addr>` prints each claim's enclosing-function conditions **verbatim, uninterpreted** so a possible conflict is resolved by reading the soak for the installer's own log line, never by guessing which registration wins (F-053). | **1 = duplicate owners** |
 | `tools/mitigation_audit.py` | do-not #9 — diffs the `PROGRAM_GUIDE` §7 registry against the mitigation-shaped labels really in `src/` (F-047: §7 lists 13, `src/` has 81). `--tiers`, `--label X`. | **1 = unregistered/stale** |
 
@@ -56,7 +65,7 @@ re-measured. That is rule 13 in practice: *no claim without a log line, raw word
 
 | Server | What it is | Constraint |
 |---|---|---|
-| `ida-pro` | `python ~/.local/share/mcp/ida-bridge.py` → idalib on `build/game_data/default.xex`, RPC :8745 | it `taskkill`s `idalib-mcp.exe` on start — **never** launch it while another session's IDA session is open |
+| `ida-pro` | `python ~/.local/share/mcp/ida-bridge.py` → idalib on `build/game_data/default.xex`, RPC :8745 | it `taskkill`s `idalib-mcp.exe` on start — **never** launch it while another session's IDA session is open. If `tasklist` shows `idalib-mcp.exe`, **attach to `http://127.0.0.1:8745/mcp` instead** (POST, `Accept: application/json, text/event-stream`, keep `Mcp-Session-Id`) — verified working 09-20 22:2x: 47 tools, `get_metadata`, `decompile_function`, `get_xrefs_to` (PROGRAM_GUIDE §10) |
 | `renderdoc` | `python -m renderdoc_mcp` + `C:\Program Files\RenderDoc` | for capture analysis only (W34/W35 GPU work); hooks must stay log-only, no RenderDoc in the boot path |
 
 Already-connected built-ins worth using: `node-repl` (the manifest TOMLs must be edited via node

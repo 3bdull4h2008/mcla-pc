@@ -341,26 +341,44 @@ void PublishRptr(RingState &ring) {
   }
 }
 
-// Throttled unknown-opcode logger.
-void LogUnknownOpcode(uint32_t opcode, uint32_t count) {
-  static std::atomic<uint32_t> seenMask{0};
-  static std::atomic<bool> highReported{false};
-  if (opcode < 32) {
-    const uint32_t bit = 1u << opcode;
-    if (seenMask.fetch_or(bit) & bit)
-      return; // already reported this opcode once
-  } else {
-    if (highReported.exchange(true))
-      return; // one report covers all >=32 opcodes
+// T40.6 step 1: per-opcode Type-3 census. The logger this replaces reported each
+// opcode < 0x20 once and collapsed EVERY opcode >= 0x20 into a single line -
+// exactly the range the draw packets live in (PM4_DRAW_INDX = 0x22,
+// PM4_DRAW_INDX_2 = 0x36, xenos.h:1600-1601), so no soak could say what the
+// stream actually holds. Now the first 3 hits of each opcode print their
+// argument dwords and later hits report a running total. LOG-ONLY: it consumes
+// nothing and changes no packet's advance.
+void LogType3Unhandled(uint32_t opcode, uint32_t count, uint32_t headerAddr,
+                       int depth) {
+  static std::atomic<uint32_t> totals[128]{};
+  const uint32_t idx = opcode & 0x7Fu;
+  const uint32_t n = totals[idx].fetch_add(1, std::memory_order_relaxed) + 1u;
+  if (n > 3u && (n % 512u) != 0u) {
+    return;
   }
-  MCLA_LOG_WARN("CP: skipping TYPE3 opcode=0x{:02X} count={} (unimplemented)",
-                opcode, count);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t a[6] = {0, 0, 0, 0, 0, 0};
+  for (uint32_t i = 0; i < 6u && i < count; ++i)
+    (void)mem.ReadU32BE(headerAddr + 4u + i * 4u, &a[i]);
+  MCLA_LOG_WARN("CP-T3-CENSUS op=0x{:02X} #{} count={} depth={} addr={:08X} "
+                "args={:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                idx, n, count, depth, headerAddr, a[0], a[1], a[2], a[3], a[4],
+                a[5]);
 }
 
 // PM4 TYPE3 opcode values (xenia gpu/xenos.h PM4 enum).
 constexpr uint32_t kPm4MeInit = 0x48;         // initialize CP micro-engine
 constexpr uint32_t kPm4IndirectBuffer = 0x3F; // indirect buffer dispatch
 constexpr uint32_t kPm4MemWrite = 0x3D;       // write N dwords to memory
+constexpr uint32_t kPm4DrawIndx = 0x22;   // fetch index buffer and draw
+constexpr uint32_t kPm4DrawIndx2 = 0x36;  // draw with indices supplied in packet
+
+// VGT_DRAW_INITIATOR field positions (xenia gpu/registers.h:311-326):
+// prim_type +0 (6), source_select +6 (2: kDMA/kImmediate/kAutoIndex),
+// index_size +11 (1), num_indices +16 (16).
+inline uint32_t DrawInitiatorField(uint32_t v, uint32_t shift, uint32_t bits) {
+  return (v >> shift) & ((1u << bits) - 1u);
+}
 
 // GpuSwap mirror (xenia command_processor.cc:1038-1064): endianness encoded
 // in the low bits of PM4 memory addresses.
@@ -452,7 +470,8 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
         !mem.ReadU32BE(byteAddr + 8, &listLen)) {
       return false;
     }
-    DrainIndirectBuffer(listPtr & ~0x3u, listLen & 0xFFFFFu, depth + 1);
+    DrainIndirectBuffer(PhysToKernelVA(listPtr) & ~0x3u, listLen & 0xFFFFFu,
+                        depth + 1);
     outAdvanceDwords = count + 1u;
     return true;
   }
@@ -474,8 +493,44 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
     outAdvanceDwords = count + 1u;
     return true;
   }
+  case kPm4DrawIndx:
+  case kPm4DrawIndx2: {
+    // T40.6: the draw packets. The first argument dword is VGT_DRAW_INITIATOR;
+    // kDMA draws carry VGT_DMA_BASE + VGT_DMA_SIZE after it, kAutoIndex draws
+    // carry nothing (indices are implicit 0..num_indices-1).
+    // This decodes and reports the submission - it does NOT render, because the
+    // Xenos register file (shader/vertex state) this CP does not model yet.
+    // Advancing `count + 1` keeps the stream in sync exactly as the old
+    // skip-everything default did.
+    uint32_t di = 0;
+    if (!mem.ReadU32BE(byteAddr + 4, &di)) {
+      return false;
+    }
+    const uint32_t prim = DrawInitiatorField(di, 0, 6);
+    const uint32_t src = DrawInitiatorField(di, 6, 2);
+    const uint32_t idxSize = DrawInitiatorField(di, 11, 1);
+    const uint32_t numIdx = DrawInitiatorField(di, 16, 16);
+    uint32_t dmaBase = 0, dmaSize = 0;
+    if (src == 0 && count >= 3) { // SourceSelect::kDMA
+      (void)mem.ReadU32BE(byteAddr + 8, &dmaBase);
+      (void)mem.ReadU32BE(byteAddr + 12, &dmaSize);
+    }
+    static std::atomic<uint32_t> s_drawSeen{0};
+    const uint32_t n = s_drawSeen.fetch_add(1) + 1;
+    if (n <= 24 || (n % 64) == 0) {
+      uint32_t hdr = 0;
+      (void)mem.ReadU32BE(byteAddr, &hdr);
+      MCLA_LOG_WARN("CP-DRAW #{} op=0x{:02X} src={} prim={} numIdx={} "
+                    "idxSize={} dmaBase={:08X} dmaSize={:08X} initiator={:08X} "
+                    "hdr={:08X} at {:08X}",
+                    n, opcode, src, prim, numIdx, idxSize, dmaBase, dmaSize, di,
+                    hdr, byteAddr);
+    }
+    outAdvanceDwords = count + 1u;
+    return true;
+  }
   default:
-    LogUnknownOpcode(opcode, count);
+    LogType3Unhandled(opcode, count, byteAddr, depth);
     outAdvanceDwords = count + 1u;
     return true;
   }
@@ -663,7 +718,13 @@ void DrainRing(RingState &ring, uint32_t wptr, const char *source) {
         // - execute the referenced buffer's packets now.
         uint32_t listPtr = ReadRingU32(ring, (rptr + 1u) % cap);
         uint32_t listLen = ReadRingU32(ring, (rptr + 2u) % cap);
-        DrainIndirectBuffer(listPtr & ~0x3u, listLen & 0xFFFFFu, 0);
+        // PM4_INDIRECT_BUFFER carries a PHYSICAL list pointer (Xenia maps it
+        // through physical memory). Our flat guest view exposes the phys window
+        // at its kernel-VA alias, so walking the raw value stepped over zeros
+        // and decoded no packets at all (F-058: real register offsets + nested
+        // IBs appear only after this transform).
+        DrainIndirectBuffer(PhysToKernelVA(listPtr) & ~0x3u,
+                            listLen & 0xFFFFFu, 0);
       } else if (opcode == kPm4MeInit) {
         // PM4_ME_INIT (xenia :880-890): CP micro-engine init -
         // consumes count dwords of ME binary; no memory side effects.
@@ -676,7 +737,7 @@ void DrainRing(RingState &ring, uint32_t wptr, const char *source) {
         const uint32_t wordAddr = ReadRingU32(ring, (rptr + 1u) % cap);
         ExecuteMemWrite(wordAddr, count);
       } else {
-        LogUnknownOpcode(opcode, count);
+        LogType3Unhandled(opcode, count, ring.baseGuestVA + rptr * 4u, -1);
       }
 
       rptr = (rptr + count + 1u) % cap;
@@ -981,6 +1042,18 @@ void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2) {
   } else {
     MCLA_LOG_INFO("CP: RING {} rptr writeback @ {:08X}", ring->id, vaForm);
   }
+}
+
+uint32_t CpPrimaryWritebackVA() {
+  const uint32_t slot = g_primarySlot.load(std::memory_order_acquire);
+  if (slot >= kMaxRings) {
+    return 0;
+  }
+  const RingState &r = g_rings[slot];
+  if (!r.writebackEnabled.load(std::memory_order_acquire)) {
+    return 0;
+  }
+  return r.writebackVA.load(std::memory_order_relaxed);
 }
 
 void CpAttachDriverCtx(uint32_t devVA) {

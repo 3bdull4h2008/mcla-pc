@@ -60,15 +60,53 @@ All values case-insensitive, measured by `tools/soak_census.py` on 2026-09-20.
 | `80000003` | host `int3` from an unimplemented VMX128 op | 0 (Route A landed) | 0 | 0 |
 | `GFx` / `UILOAD` | UI layer reached | 7 / 2 | 9 / 1 | 9 / 1 |
 | `DRAW_INDEXED` / `DRAWDISP` | real draws — **the actual goal** | 0 / 0 | **0 / 0** | **0 / 0** |
-| `put=` / `rptrWB=` on `WAIT[KWFSO]` | CP ring producer/consumer; `rptrWB=0000` = no consumer | put=11, rptrWB=0000 | put=11, rptrWB=0000 | put=11, rptrWB=0000 |
+| `put=` / `rptrWB=` on `WAIT[KWFSO]` | ~~`rptrWB=0000` = no consumer~~ **VOID — see the 21:30 correction below**; use `CP: RING A DRAIN` + `CP: GUEST-PUB` instead | put=11, rptrWB=0000 | put=11, rptrWB=0000 | put=11, rptrWB=0000 |
 | `Fatal error` | guest fatal dispatcher | 0 | **1** (`swfCMD::Fixup`, F-042) | 1 |
 | short-circuit lines | host mitigations firing — never a fix | 784 | 166 | 172 |
+
+**21:30 correction (F-057) — two fields in this table lie, and both were cited as "starvation":**
+- `rptrWB=0000` is a **wrong-address poll**: `src/kernel/imports.cpp:2117` reads hard-coded
+  `0xC71D81BC` while the CP publishes to `C71D82BC` (`src/gpu_cp.cpp:951`). It can only ever print 0.
+  The honest CP signals are `CP: RING A DRAIN … rptr XXXX->YYYY … published=true` and
+  `CP: GUEST-PUB #n … pub A->B put=B` — in `w38g.log` the ring drained 8× to `rptr=001F` with
+  `pub==put==11`, i.e. the consumer was keeping up, while `DRAW_INDEXED` stayed 0 for a different
+  reason (`src/gpu_cp.cpp:664-666`, raw phys `listPtr`).
+- `PRESENT-FB sample rgb=(0.06,0.10,0.22)` is **not** a guest-pixel reading. `src/render_thread.cpp`
+  substitutes that exact triple whenever the sampled framebuffer sums below 0.02, so the line means
+  "the guest framebuffer is black"; the on-screen dark blue is the same host constant
+  (`:85`, `:444`, `:505-507`). Never count it as "UI visible" and never treat a `PRESENT` heartbeat as
+  a guest present — check `fb=` on the `RenderThread: PRESENT` line (`fb=00000000` = heartbeat).
+
+**23:32 correction (F-063 / do-not #22) — a bare hex code is not an event.** `80000003` counted **+1**
+in `w38m.log` and was read as "a new VMX `debugtrap`", i.e. Route B back on the critical path. Its one
+occurrence was a PM4 argument dword: `CP-T3-CENSUS op=0x58 … args=80000003 071D82C0 DEADBEEF`
+(`w38m.log:3054`), and `debugtrap`/`illegal instruction` were both 0 there. `tools/soak_census.py` now
+counts `C0000005`/`C0000003`/`C000001D`/`C000008E`/`80000003`/`406D1388` only inside a `code=0x…`
+context (every real fault line prints that — measured), and it still reproduces F-040's `703 → 1`.
+Generalise it yourself whenever a marker is a value rather than a word: check what the matching LINE
+actually is before reporting a count.
+
+**New vocabulary since then (`w38n`…`w38s`)** — all log-only, all chained, defined in
+`PROGRAM_GUIDE` §9: `MSGCHAIN`/`MSGBISECT` (the boot-init chain, incl.
+`MSGBISECT 5-822FBAF8 RETURN` = the `star_glow` init completed), `GATE-STACK`/`GATE-WAIT` (the forced
+gate's own thread + `[0x8287E26C]`), and `D3070-RUN` next to `D3070-SKIP` (F-063: SKIP now means a
+dead object, not a caller flag). A count that goes DOWN after a fix is only a regression if the lines
+were guest-produced — enumerate which tool emitted them (F-051's test; `GFx 9 → 1` at 23:25 was eight
+host `GFX-*`/`W34-*` stand-in prints, not guest output).
 
 `VEH` alone is not enough: count the *named* recovery paths (`advancing RIP`, `Nuclear advance`,
 `permanently disabled`, `patched sub_82`, `parking boot worker`, `fallback advance`,
 `cleared MXCSR`) — all zero in `w37a`/`w38b`, and 692 + 2 in the laundered baseline (F-051). A soak
 whose only VEH line is `VEH-NEUTRAL … declining` is honest; one with a `VEH` total in the hundreds is
 not, whatever its `C0000005` says.
+
+**21:30 correction (F-057(6)) — that list is dead text.** All 7 names above now measure **0 in `src/`**
+and 0 in `w38g.log`: the paths were deleted in T38.3(a) and the list was never regenerated, so "all
+zero" from it is vacuous, not reassuring. The live VEH signals to count instead are
+`VEH-NEUTRAL` (the handler declined — honest) and `VEH W0: parking thread`
+(`src/boot_host.cpp:1064`, the generic park). `tools/soak_census.py` has the same rot: 8 of its 9
+`VEH_PATHS` entries are gone from `src/` and it omits `parking thread` — fix it (T40.4) before
+trusting its recovery column, and re-derive the list from the source rather than from this file.
 
 ## Reading discipline
 

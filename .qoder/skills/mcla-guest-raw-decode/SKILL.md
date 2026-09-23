@@ -50,6 +50,23 @@ produced the wrong global (`0x82859F68`) and a wrong callee name. Compute it, do
 python -c "print(hex(-2105278464 & 0xFFFFFFFF), hex((-2105278464 & 0xFFFFFFFF) - 24728))"
 ```
 
+**The mirror-image trap (F-055 → F-056, 20:35→21:30 the same day): never read a D-field's raw hex as
+part of the address.** `822FA96C 816BE334 lwz r11,-7372(r11)` with `822FA958 3D608288 lis r11,8288` is
+`0x82880000 − 0x1CCC` = **`0x8287E334`**, *not* `0x8288E334` — the low two bytes of the word are the
+signed displacement, and pasting them onto the `lis` result silently adds instead of subtracting. Same
+rule as above: `python -c "print(hex(0x82880000 - 7372))"`, and prefer the generated TU's own comment
+(`// lwz r11,-7372(r11)`) over the disassembler's hex.
+
+## The second thing `rip owner=` cannot do (F-056)
+
+A fault whose `lr` points at a `bl` is **not** necessarily inside that callee. If the generated body
+holds a raw `simde_mm_store_si128(... base + ((rX.u32 + ctx.rY.u32) & ~0xF) ...)` — an unchecked VMX
+store, unlike `PPC_STORE_U32` — the fault can be the *caller's* store, with `lr` left sticky by the
+translator at the last `ctx.lr = …` before a call. Prove it from the caller's own locals: find the line
+whose computed register matches the dump (F-056 used `// addi r10,r31,16` → dump `r10=00000010` →
+translator-local `r31 = 0`), and check which `PPC_FUNC_IMPL` encloses that line number — `awk` over the
+file, not the nearest preceding `sub_` mention.
+
 ## Cross-check against generated code
 
 `generated/ppc_xenon/*.cpp` is the recompiler's own decode, with the original PPC text as comments:

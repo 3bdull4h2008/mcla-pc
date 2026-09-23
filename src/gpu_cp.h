@@ -25,6 +25,10 @@ namespace mcla::gpu {
 
 void CpInitializeRingBuffer(uint32_t physAddr, uint32_t sizeLog2);
 void CpEnableRPtrWriteBack(uint32_t rptrWritebackAddr, uint32_t blockSizeLog2);
+// The CP's own publish target (kernel-VA form), or 0 when no write-back is
+// enabled. A census that wants the ring's read pointer must read this word,
+// never a hard-coded address four bytes away from it (F-057(1)).
+uint32_t CpPrimaryWritebackVA();
 
 // Register a guest driver-extension object (GuestDevice VA whose [+10896]
 // holds the 96-byte ring-context object). Idempotent; keeps a small registry -
