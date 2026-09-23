@@ -10164,6 +10164,40 @@ PPC_FUNC(sub_8244F4C0) {
                     "nz={}/16 head=[{}] reqPos={:08X}_{:08X} out={:08X}",
                     n, ctx.r3.u32, buf, cnt, got ? 1 : 0, pr, nz, vis, posHi,
                     pos, out);
+      // B2a (F-095 follow-on): one-shot dump of the guest's DECRYPTED archive
+      // views so member names are enumerated from the guest's own answer, not
+      // our on-disk parsing (F-090: src has no RPF TOC parser and must not
+      // gain one for a verdict; disk names proven absent-encrypted 09-23).
+      {
+        static bool s_tocDumped = false;
+        static bool s_earlyDumped = false;
+        auto dumpOnce = [&](uint32_t wantBuf, uint32_t wantCnt, bool& flag,
+                            const char* path) {
+          if (flag || buf != wantBuf || cnt < wantCnt) return;
+          flag = true;
+          std::vector<uint8_t> tmp(wantCnt);
+          bool okAll = true;
+          for (uint32_t o = 0; o < wantCnt; o += 4096u) {
+            const uint32_t piece = (wantCnt - o < 4096u) ? (wantCnt - o) : 4096u;
+            if (!memR.ReadBytes(buf + o, reinterpret_cast<char*>(&tmp[o]), piece)) {
+              okAll = false;
+              MCLA_LOG_WARN("TOC-DUMP {} failed at +{} buf={:08X}", path, o, buf);
+              break;
+            }
+          }
+          if (!okAll) return;
+          FILE* fp = nullptr;
+          if (fopen_s(&fp, path, "wb") == 0 && fp != nullptr) {
+            fwrite(tmp.data(), 1, wantCnt, fp);
+            fclose(fp);
+            MCLA_LOG_WARN("TOC-DUMP wrote {} bytes={} buf={:08X}", path, wantCnt, buf);
+          } else {
+            MCLA_LOG_WARN("TOC-DUMP {} open failed", path);
+          }
+        };
+        dumpOnce(0xC60B7780u, 382976u, s_tocDumped, "toc_decrypted.bin");
+        dumpOnce(0xC60ACE00u, 18432u, s_earlyDumped, "early_decrypted.bin");
+      }
     }
   }
 }
@@ -10637,6 +10671,37 @@ PPC_FUNC(sub_821CBFC0) {
                   "lr={:08X}",
                   n, ctx.r3.u32, path, w[0], w[1], w[2], w[3],
                   openGate ? 1 : 0, allZero ? 1 : 0, lr);
+    // B2a rev2 (F-095 lesson): the fill-time dump caught the table PRE-parse;
+    // the live hashed entries exist only from query time on. One-shot dump of
+    // the parsed region anchored on the entry array base the census itself
+    // names (inner=C60B7780, TOC76 lines), triggered on the first real entry.
+    {
+      static bool s_parsedDumped = false;
+      if (!s_parsedDumped && w[0] != 0) {
+        s_parsedDumped = true;
+        const uint32_t region = 0xC60B7780u, len = 382976u;
+        std::vector<uint8_t> tmp(len);
+        bool okAll = true;
+        for (uint32_t o = 0; o < len; o += 4096u) {
+          const uint32_t piece = (len - o < 4096u) ? (len - o) : 4096u;
+          if (!memR.ReadBytes(region + o, reinterpret_cast<char*>(&tmp[o]), piece)) {
+            okAll = false;
+            break;
+          }
+        }
+        bool wrote = false;
+        if (okAll) {
+          FILE* fp = nullptr;
+          if (fopen_s(&fp, "toc_parsed.bin", "wb") == 0 && fp != nullptr) {
+            fwrite(tmp.data(), 1, len, fp);
+            fclose(fp);
+            wrote = true;
+          }
+        }
+        MCLA_LOG_WARN("TOC-DUMP2 parsed wrote={} okread={} entry={:08X} at query #{}",
+                      wrote ? 1 : 0, okAll ? 1 : 0, ctx.r3.u32, n);
+      }
+    }
     // T41.3h (F-078) read-only: the host currently consumes entry+8 as BOTH
     // the Open gate flags (XSF-OPEN-GATE ORs bit30 there) and the member
     // offset, which cannot both hold. Dump the neighbouring 8 words so the
