@@ -70,6 +70,11 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest);
 // outcome (fault report or parked-in-main-loop) is logged by a monitor.
 void Start(uint32_t entryGuest);
 
+// B1 discriminator (F-094): arm this thread's DR0/DR1 watchpoints on the
+// globaltex.list member pages. Called from BootThreadProc and every guest
+// thread start; log-only, budgeted, self-disarming.
+void B1ArmGuestThread();
+
 const BootReport& GetReport();
 
 // W36b: peek at the boot worker thread's live PPCContext (g_faultCtx).

@@ -4,6 +4,7 @@
 #include <kernel/heap.h>
 #include <kernel/function.h>
 #include "ppc_context.h"
+#include <boot_host.h>  // B1ArmGuestThread (F-094 discriminator)
 
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
@@ -71,6 +72,7 @@ static void* GuestThreadFunc(void* arg)
 static void GuestThreadFunc(GuestThreadHandle* hThread)
 {
 #endif
+    mcla::boot::B1ArmGuestThread();  // B1 discriminator (F-094), log-only
     hThread->suspended.wait(true);
     GuestThread::Start(hThread->params);
 #ifdef USE_PTHREAD

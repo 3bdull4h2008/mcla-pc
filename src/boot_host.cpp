@@ -78,6 +78,60 @@ namespace
     uintptr_t g_moduleBase = 0;
     static DWORD s_bootWorkerThreadId = 0;
 
+    // B1 discriminator (F-094 open bit): hardware watchpoints on the two
+    // globaltex.list member-page heads (stable VAs across w47-w50). A hit whose
+    // host RIP is NOT our NtReadFile fill path means a real consumer touched the
+    // member bytes; hits only from the fill path = the prototype tolerates the
+    // raw opaque window as-is. Log-only, budgeted, self-disarming.
+    constexpr uint32_t kB1WatchVas[2] = {0xC6157B80u, 0xC6167C00u};
+    std::atomic<uint32_t> g_b1Hit[2]{};
+    std::atomic<uint32_t> g_b1Logged{0};
+
+    bool B1HandleSingleStep(PEXCEPTION_POINTERS ei) {
+        CONTEXT* c = ei->ContextRecord;
+        if (c == nullptr) return false;
+        int slot = -1;
+        if (c->Dr6 & 1ULL) slot = 0;
+        else if (c->Dr6 & 2ULL) slot = 1;
+        if (slot < 0) return false;  // not ours: let the rest of the VEH see it
+        const uint32_t n = g_b1Hit[slot].fetch_add(1) + 1;
+        const uint32_t ln = g_b1Logged.fetch_add(1) + 1;
+        uint32_t glr = 0;
+        if (const PPCContext* pc = GetPPCContext()) glr = (uint32_t)pc->lr;
+        const uintptr_t rip = (uintptr_t)c->Rip;
+        const uintptr_t rv = (g_moduleBase != 0 && rip >= g_moduleBase) ? rip - g_moduleBase : rip;
+        if (ln <= 48) {
+            MCLA_LOG_WARN("B1-WATCH slot={} va={:08X} hits={} tid={} hostRIP=0x{:X} guestLR={:08X}",
+                          slot, kB1WatchVas[slot], n, GetCurrentThreadId(), rv, glr);
+        } else {
+            c->Dr7 &= ~(1ULL << 0 | 1ULL << 2);  // budget spent: disarm
+        }
+        c->Dr6 = 0;
+        return true;  // ours: continue execution, no park/crash-dump
+    }
+
+    void B1ArmCurrentThreadImpl() {
+        if (g_base == nullptr) {
+            MCLA_LOG_WARN("B1-ARM tid={} SKIP base=null", GetCurrentThreadId());
+            return;
+        }
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        HANDLE self = GetCurrentThread();
+        if (!GetThreadContext(self, &ctx)) {
+            MCLA_LOG_WARN("B1-ARM tid={} FAIL getcontext err={}", GetCurrentThreadId(), GetLastError());
+            return;
+        }
+        ctx.Dr0 = (DWORD64)(uintptr_t)(g_base + kB1WatchVas[0]);
+        ctx.Dr1 = (DWORD64)(uintptr_t)(g_base + kB1WatchVas[1]);
+        ctx.Dr6 = 0;
+        ctx.Dr7 = (1ULL << 0) | (2ULL << 16) | (3ULL << 18)   // L0 RW len8
+                | (1ULL << 2) | (2ULL << 20) | (3ULL << 22);  // L1 RW len8
+        const bool ok = SetThreadContext(self, &ctx) != 0;
+        MCLA_LOG_WARN("B1-ARM tid={} ok={} dr0={:X} dr1={:X}", GetCurrentThreadId(), ok,
+                      (uintptr_t)ctx.Dr0, (uintptr_t)ctx.Dr1);
+    }
+
     // Reverse map: host function entry -> guest address, for fault triage.
     std::unordered_map<uintptr_t, uint32_t> g_hostToGuest;
 
@@ -750,6 +804,13 @@ void BootWorker(uint32_t entryGuest)
         const uintptr_t pc = (uintptr_t)addr;
         const uintptr_t rva = (g_moduleBase != 0 && pc >= g_moduleBase) ? pc - g_moduleBase : pc;
 
+        // B1: DR watchpoint single-steps are ours — log and continue BEFORE any
+        // of the census/park machinery below sees them (they would eat the
+        // fullDump budget and could park a healthy consumer thread).
+        if (code == 0x80000004L && B1HandleSingleStep(ExceptionInfo)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         // W0 flood cap: full dump only for the first few exceptions. Later
         // faults on other threads get a one-liner and still get parked.
         static std::atomic<uint32_t> s_vehCount{0};
@@ -1097,10 +1158,15 @@ void BootWorker(uint32_t entryGuest)
     DWORD WINAPI BootThreadProc(LPVOID param)
     {
         const uint32_t entryGuest = (uint32_t)(uintptr_t)param;
+        B1ArmCurrentThreadImpl();
         BootWorker(entryGuest);
         return 0;
     }
 } // namespace
+
+    // B1 cross-TU arming entry: guest_thread.cpp calls this at every guest
+    // thread's start so the watchpoints follow the workers, not just the root.
+    void B1ArmGuestThread() { B1ArmCurrentThreadImpl(); }
 
     // Publishes the context the current thread is running guest code ON, so a VEH dump
     // taken inside the scope names the faulting frame instead of the boot thread's root
