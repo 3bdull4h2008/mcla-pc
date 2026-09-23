@@ -680,22 +680,37 @@ static bool MclaFindServedBody(uint32_t dev, uint32_t handle, uint32_t flagWord,
       return true;
     }
   }
+  // T41.3o (F-091): (dev,handle) is a per-device SLOT key, not a file
+  // identity — it served legals.xsf as the body of all five
+  // shaders/*/preload.list reads. Log-only; exact tocEntry/w3 still serve.
   if (dev && handle != 0xFFFFFFFFu) {
     auto it = g_servedByDevH.find(MclaDevHandleKey(dev, handle));
     if (it != g_servedByDevH.end()) {
-      *out = it->second;
-      return true;
+      static std::atomic<uint32_t> s_dhSkip{0};
+      const uint32_t k = s_dhSkip.fetch_add(1) + 1;
+      if (k <= 24)
+        MCLA_LOG_WARN("T413O-SKIP #{} key=devh dev={:08X} h={} would-serve "
+                      "path='{}' size={}", k, dev, handle, it->second.path,
+                      it->second.size);
     }
   }
   // CC6F0 r5 ≈ TOC w2 with low byte cleared (gate/size family).
+  // T41.3o (F-091): this family match ignores the low byte, so a .list read
+  // borrows whatever shader body shares its w2 family. Log-only; the exact
+  // w3 re-check below still stands.
   if (flagWord) {
     for (const auto &kv : g_servedByPath) {
       const uint32_t w2 = kv.second.w2;
       if (w2 == 0)
         continue;
       if ((w2 & 0xFFFFFF00u) == (flagWord & 0xFFFFFF00u)) {
-        *out = kv.second;
-        return true;
+        static std::atomic<uint32_t> s_fwSkip{0};
+        const uint32_t k = s_fwSkip.fetch_add(1) + 1;
+        if (k <= 24)
+          MCLA_LOG_WARN("T413O-SKIP #{} key=flagWord {:08X} would-serve "
+                        "path='{}' size={}", k, flagWord, kv.second.path,
+                        kv.second.size);
+        break;
       }
     }
     // joinf[0] is TOC w3 — allow flagWord to be w3 too.
@@ -705,6 +720,9 @@ static bool MclaFindServedBody(uint32_t dev, uint32_t handle, uint32_t flagWord,
       return true;
     }
   }
+  // T41.3o (F-091): the bare-dev "last body on this device" fallback is the
+  // loosest of the three — it would re-introduce exactly the legals.xsf-as-
+  // .list-body contamination the task is removing, so it is now log-only too.
   if (dev) {
     const MclaServedBody *best = nullptr;
     for (const auto &kv : g_servedByPath) {
@@ -712,8 +730,11 @@ static bool MclaFindServedBody(uint32_t dev, uint32_t handle, uint32_t flagWord,
         best = &kv.second;
     }
     if (best) {
-      *out = *best;
-      return true;
+      static std::atomic<uint32_t> s_devSkip{0};
+      const uint32_t k = s_devSkip.fetch_add(1) + 1;
+      if (k <= 24)
+        MCLA_LOG_WARN("T413O-SKIP #{} key=dev dev={:08X} would-serve "
+                      "path='{}' size={}", k, dev, best->path, best->size);
     }
   }
   return false;
