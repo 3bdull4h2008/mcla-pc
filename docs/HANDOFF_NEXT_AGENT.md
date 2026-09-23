@@ -16,6 +16,16 @@
   sub_8244FF20: candidate gates = (a) XMem-header magic check on the page (bytes lack it),
   (b) stored-vs-expanded compare using +12&0x3FFFFFFF=0xEC (236), (c) bit30 of +8 as
   in-package flag. Naming (a)/(b)/(c) with the branch words completes T41.3n2 criterion (b).
+- UPDATED after first decode pass: 0x821C50A0-0x821C5108 IS NOT THE GATE. It decodes as a
+  pure submit/wait/resubmit PUMP: bl 8244F4C0 -> cmpi r3 -> wait-helper 82135DB0 -> per-item
+  bctrl callback at 821C50DC (callee = array @ [r26=0x8286FEA0]) -> second bl 8244F4C0 ->
+  loop; tail-exit b 823D9240. The decompress-vs-parse decision is INSIDE that bctrl callee.
+  Next session: read [0x8286FEA0] (callback array; runtime, so read from a soak dump or VEH
+  census, or find its .data init in mcla_pe.bin @ VA-0x82000000), resolve the callee VA,
+  then walk its head for the (a)/(b)/(c) gate. Pump function start is < 821C4E00 (no prologue
+  in that window; scan further back if needed). NOTE the F-071(5) "1 of 40 magic" census was
+  HOST re-point-branch entries (our mitigation), not a guest-branch count — do not cite it as
+  guest behaviour.
 - Baselines: w48 (E, post-fix census) vs w47 (E, T41.3o) vs w46 (E, merge-verify) vs w45b (C, frozen).
 
 # HANDOFF — next agent, read this first
