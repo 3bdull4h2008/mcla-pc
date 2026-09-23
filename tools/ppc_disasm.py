@@ -41,13 +41,13 @@ def decode(i, pc):
     if op == 15:
         return f"lis {r(d)},{uimm:04X}"
     if op == 24:
-        return f"ori {r(a)},{r(d)},{uimm:04X}"
+        return f"ori {r(d)},{r(a)},{uimm:04X}"
     if op == 25:
-        return f"oris {r(a)},{r(d)},{uimm:04X}"
+        return f"oris {r(d)},{r(a)},{uimm:04X}"
     if op == 26:
-        return f"xori {r(a)},{r(d)},{uimm:04X}"
+        return f"xori {r(d)},{r(a)},{uimm:04X}"
     if op == 27:
-        return f"xoris {r(a)},{r(d)},{uimm:04X}"
+        return f"xoris {r(d)},{r(a)},{uimm:04X}"
     if op == 12:
         return f"addic {r(d)},{r(a)},{simm}"
     if op == 13:
@@ -70,10 +70,19 @@ def decode(i, pc):
         tgt = li if aa else pc + li
         return f"b{'l' if i & 1 else ''} {tgt & 0xFFFFFFFF:08X}" + (" aa" if aa else "")
     if op == 19:
-        if xo9 == 16:
-            return f"bclr bo={bo} bi={bi}" + (" l" if i & 1 else "")
-        if xo9 == 528:
-            return f"bctr bo={bo} bi={bi}" + (" l" if i & 1 else "")
+        # 10-bit xo: 528 & 0x1FF == 16, so a 9-bit mask printed bctr/bctrl (a
+        # computed CALL) with the same string as blr (a RETURN).
+        if xo == 16 or xo == 528:
+            _bn = "blr" if xo == 16 else "bctr"
+            if i & 1:
+                _bn += "l"
+            return _bn if bo == 20 else f"{_bn} bo={bo} bi={bi}"
+        if xo == 18 or xo == 530:
+            return f"bc{'ctr' if xo == 530 else 'lr'} bo={bo} bi={bi}"
+        if xo == 17 or xo == 529:
+            return f"b{'ctr' if xo == 529 else 'lr'}l bo={bo} bi={bi} aa"
+        if xo == 19 or xo == 531:
+            return f"b{'ctr' if xo == 531 else 'lr'}la bo={bo} bi={bi} aa"
         if xo9 == 20:
             return "rfi"
         if xo9 == 0:
@@ -114,12 +123,17 @@ def decode(i, pc):
             return f"srw {r(d)},{r(a)},{r(b)}{rc}"
         if xo == 28:
             return f"and {r(d)},{r(a)},{r(b)}{rc}"
-        if xo == 44:
-            return f"or {r(d)},{r(a)},{r(b)}{rc}"
         if xo == 444:
-            return f"mr {r(d)},{r(a)}"
-        if xo == 476:
-            return f"nand {r(d)},{r(a)},{r(b)}"
+            # mr is or with RB == RT; printing a 3-operand or as mr drops RB.
+            return f"mr {r(d)},{r(a)}" if d == b else f"or {r(d)},{r(a)},{r(b)}{rc}"
+        if xo == 478:
+            return f"nand {r(d)},{r(a)},{r(b)}{rc}"
+        if xo == 124:
+            return f"nor {r(d)},{r(a)},{r(b)}{rc}"
+        if xo == 56:
+            return f"eqv {r(d)},{r(a)},{r(b)}{rc}"
+        if xo == 284:
+            return f"orc {r(d)},{r(a)},{r(b)}{rc}"
         if xo == 60:
             return f"andc {r(d)},{r(a)},{r(b)}{rc}"
         if xo == 412:

@@ -151,7 +151,6 @@ extern "C" DWORD __fastcall CallOriginalNativeXamInputGetState(DWORD port,
 }
 
 static PPCFunc *g_original_KeWait = nullptr;
-static PPCFunc *g_original_XamInputGetState = nullptr;
 static PPCFunc *g_original_NtCreateFile = nullptr;
 static PPCFunc *g_original_NtReadFile = nullptr;
 static PPCFunc *g_original_NtQueryInformationFile = nullptr;
@@ -163,36 +162,6 @@ static thread_local uint32_t t_pendingLocHandleOut = 0;
 static thread_local uint32_t t_lastLocStatus = 0;
 static std::unordered_set<uint32_t> s_realLocHandles;
 static std::mutex s_realLocHandlesMtx;
-
-PPCFunc *mcla_DetourImportThunk(uint8_t *thunk, PPCFunc *hook) {
-  if (!thunk)
-    return nullptr;
-  if (thunk[0] != 0xFF || thunk[1] != 0x25) {
-    MCLA_LOG_ERROR("DetourImportThunk: unexpected thunk bytes at %p: %02X %02X",
-                   (void *)thunk, thunk[0], thunk[1]);
-    return nullptr;
-  }
-  int32_t disp = *reinterpret_cast<int32_t *>(thunk + 2);
-  void **iat_entry = reinterpret_cast<void **>(thunk + 6 + disp);
-  void *original_func = *iat_entry;
-  if (!original_func)
-    return nullptr;
-
-  DWORD old;
-  VirtualProtect(thunk, 12, PAGE_EXECUTE_READWRITE, &old);
-  thunk[0] = 0x48;
-  thunk[1] = 0xB8;
-  memcpy(thunk + 2, &hook, sizeof(void *));
-  thunk[10] = 0xFF;
-  thunk[11] = 0xE0;
-  FlushInstructionCache(GetCurrentProcess(), thunk, 12);
-  VirtualProtect(thunk, 12, PAGE_EXECUTE_READ, &old);
-
-  MCLA_LOG_INFO(
-      "DetourImportThunk: 0x{:p} -> 0x{:p} (original DLL func = 0x{:p})",
-      (void *)thunk, (void *)hook, original_func);
-  return reinterpret_cast<PPCFunc *>(original_func);
-}
 
 static const std::chrono::steady_clock::time_point g_wallClockStart =
     std::chrono::steady_clock::now();
@@ -513,98 +482,38 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
   }
 
   if (BisectGroupEnabled("in")) {
-    dispatcher->SetFunction(0x827BDC64, hk_XamInputGetState);
+    // Removed 2026-09-23 (F-092): this shadowed the REAL input path. The
+    // generated table owns the slot -- ppc_func_mapping.cpp:44998 maps
+    // 0x827BDC64 to __imp__XamInputGetState, which via GUEST_FUNCTION_HOOK
+    // (kernel/function.h:351) reaches kernel::XamInputGetState
+    // (kernel/xam.cpp:261), an SDL keyboard-to-pad mapping. SetFunction
+    // overwrites m_functions[addr] AND calls InsertFunction
+    // (app.cpp:337-341), and mcla_ApplyPatches runs after
+    // InstallFunctionTable (boot_host.cpp:1279) -- so this later
+    // registration always won, leaving the guest reading a pad that
+    // reports no buttons unless the synthetic StartPulseActive() timer
+    // (patches.cpp:51, no host input behind it) happened to be high.
+    // Two owners of one guest address is also what rule 4 forbids.
+    // hk_XamInputGetState is left defined but unreferenced, so the
+    // synthetic pulse can be reinstated deliberately, not by accident.
 
     auto *ks = mcla::GetApp();
     if (ks) {
       g_virtual_membase = ks->GetPPCBase();
     }
 
-    // DetourImportThunk for hotpatch thunk analysis (x86 pointer, not PPC)
-    g_original_XamInputGetState = mcla_DetourImportThunk(
-        reinterpret_cast<uint8_t *>(
-            reinterpret_cast<void *>(&__imp__XamInputGetState)),
-        hk_XamInputGetState);
-    if (!g_original_XamInputGetState) {
-      MCLA_LOG_WARN("XamInputGetState thunk detour failed (hotpatch analysis skipped, hook still active)");
-    } else {
-      uint8_t *hotpatch_thunk = (uint8_t *)g_original_XamInputGetState;
-      if (hotpatch_thunk[0] == 0xE9) {
-        int32_t rel = *reinterpret_cast<int32_t *>(hotpatch_thunk + 1);
-        g_native_XamInputGetState_func = (void *)(hotpatch_thunk + 5 + rel);
-        MCLA_LOG_INFO("XamInputGetState hotpatch thunk at 0x{:p} -> actual "
-                      "func at 0x{:p}",
-                      (void *)hotpatch_thunk, g_native_XamInputGetState_func);
-
-        uint8_t *af = (uint8_t *)g_native_XamInputGetState_func;
-        MCLA_LOG_INFO(
-            "Actual func first 128 bytes: "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-            "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-            af[0], af[1], af[2], af[3], af[4], af[5], af[6], af[7], af[8],
-            af[9], af[10], af[11], af[12], af[13], af[14], af[15], af[16],
-            af[17], af[18], af[19], af[20], af[21], af[22], af[23], af[24],
-            af[25], af[26], af[27], af[28], af[29], af[30], af[31], af[32],
-            af[33], af[34], af[35], af[36], af[37], af[38], af[39], af[40],
-            af[41], af[42], af[43], af[44], af[45], af[46], af[47], af[48],
-            af[49], af[50], af[51], af[52], af[53], af[54], af[55], af[56],
-            af[57], af[58], af[59], af[60], af[61], af[62], af[63], af[64],
-            af[65], af[66], af[67], af[68], af[69], af[70], af[71], af[72],
-            af[73], af[74], af[75], af[76], af[77], af[78], af[79], af[80],
-            af[81], af[82], af[83], af[84], af[85], af[86], af[87], af[88],
-            af[89], af[90], af[91], af[92], af[93], af[94], af[95], af[96],
-            af[97], af[98], af[99], af[100], af[101], af[102], af[103], af[104],
-            af[105], af[106], af[107], af[108], af[109], af[110], af[111],
-            af[112], af[113], af[114], af[115], af[116], af[117], af[118],
-            af[119], af[120], af[121], af[122], af[123], af[124], af[125],
-            af[126], af[127]);
-
-        if (g_native_XamInputGetState_func) {
-          uint8_t *wrap = (uint8_t *)g_native_XamInputGetState_func;
-          int32_t rel = *reinterpret_cast<int32_t *>(wrap + 70);
-          void *real_func = wrap + 74 + rel;
-          MCLA_LOG_INFO(
-              "Translation wrapper calls real XamInputGetState at 0x{:p}",
-              real_func);
-
-          uint8_t *rf = (uint8_t *)real_func;
-          MCLA_LOG_INFO(
-              "Real XamInputGetState func first 16 bytes: "
-              "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-              "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-              rf[0], rf[1], rf[2], rf[3], rf[4], rf[5], rf[6], rf[7], rf[8],
-              rf[9], rf[10], rf[11], rf[12], rf[13], rf[14], rf[15]);
-
-          MCLA_LOG_INFO("Installing native XamInputGetState detour on REAL "
-                        "func at 0x{:p} ...",
-                        real_func);
-          if (InstallNativeDetour(real_func, (void *)hk_native_XamInputGetState,
-                                  g_original_native_bytes, 12)) {
-            MCLA_LOG_INFO("Native XamInputGetState (real func) detour "
-                          "installed successfully");
-          } else {
-            MCLA_LOG_ERROR("Failed to install native XamInputGetState detour "
-                           "on real func");
-          }
-        } else {
-          MCLA_LOG_WARN("XamInputGetState target does NOT start with E9 (jmp). "
-                        "Using thunk address directly.");
-          g_native_XamInputGetState_func = (void *)hotpatch_thunk;
-        }
-      }
-    }
-
+    // Removed 2026-09-23 (F-092): mcla_DetourImportThunk(&__imp__XamInputGetState)
+    // could never succeed, and success would have been worse than the error it
+    // logged. __imp__XamInputGetState is NOT a Windows import thunk --
+    // GUEST_FUNCTION_HOOK (src/kernel/function.h:351) expands it to a host
+    // PPC_FUNC at src/kernel/imports.cpp:3540, so its first bytes are our own
+    // compiled prologue, never the `FF 25` (jmp [rip+disp32]) the test demanded.
+    // Had it passed, VirtualProtect + the 12-byte write would have replaced the
+    // head of that live host function with `movabs rax,hook; jmp rax`. Everything
+    // downstream (E9/hotpatch analysis, the 128-byte dumps, InstallNativeDetour on
+    // the "real" func) sat unreachable behind that impossible condition, and its
+    // only consumer was more logging. Guest-side interception here is the
+    // dispatcher->SetFunction call above -- the mechanism this emulator uses.
     if (true) { // BisectGroupEnabled("gp") - FORCE ENABLED
       mcla::gpu::CpInstallMmioRouting();
       mcla::gpu::InstallGpuHooks(dispatcher, mcla::gpu::GpuHooks{});

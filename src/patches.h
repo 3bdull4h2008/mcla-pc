@@ -16,7 +16,6 @@ bool BisectGroupEnabled(std::string_view group);
 bool mcla_SlimTslabFind(uint32_t addr, uint32_t* outElem,
                         uint32_t* outCallerLr, uint32_t* outElemsize);
 
-mcla::App::FunctionDispatcher::PPCFunc* mcla_DetourImportThunk(uint8_t* thunk, mcla::App::FunctionDispatcher::PPCFunc* hook);
 
 extern "C" void sub_82554080_stub(mcla::PPCContext& ctx, uint8_t* base);
 extern "C" void hk_press_start_shim(mcla::PPCContext& ctx, uint8_t* base);

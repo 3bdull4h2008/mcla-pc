@@ -236,6 +236,37 @@ def scan_toml(path: Path) -> list[Owner]:
     return out
 
 
+MAP_ROW = re.compile(r"\{\s*(0x[0-9A-Fa-f]{6,8})\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}")
+
+
+def scan_mapping(path: Path) -> list[Owner]:
+    """The generated dispatch table is the authoritative address -> body map.
+
+    `SKIP_DIRS` excludes `generated/` so this tool cannot mis-parse 176 TUs, but
+    that also hid the one file that decides who owns a guest address:
+    `ppc_func_mapping.cpp` maps e.g. `{ 0x827BDC64, __imp__XamInputGetState }`.
+    Without it, `--check` reported that import slot as "unclaimed" and a new
+    `SetFunction` there would have looked legal while silently shadowing the
+    real implementation (F-092).
+    """
+    out: list[Owner] = []
+    if not path.exists():
+        return out
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    line = 1
+    pos = 0
+    NL = chr(10)
+    for m in MAP_ROW.finditer(text):
+        line += text.count(NL, pos, m.start())
+        pos = m.start()
+        out.append(Owner("map", norm(m.group(1)), m.group(2), path, line,
+                         m.start() - text.rfind(NL, 0, m.start())))
+    return out
+
+
 def collect() -> list[Owner]:
     owners: list[Owner] = []
     for path in sorted(SRC.rglob("*")):
@@ -246,6 +277,15 @@ def collect() -> list[Owner]:
         owners.extend(scan_source(path))
     for t in TOMLS:
         owners.extend(scan_toml(t))
+    # Fallback only: the generated table row is reported when nothing in src/
+    # or config/ claims the address, so an ordinary src hook still reads as
+    # itself rather than as a src claim + a table row pair.
+    claimed = {o.addr for o in owners}
+    for o in scan_mapping(REPO / "generated" / "ppc_xenon"
+                          / "ppc_func_mapping.cpp"):
+        if o.addr not in claimed:
+            claimed.add(o.addr)
+            owners.append(o)
     return owners
 
 

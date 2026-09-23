@@ -13,9 +13,11 @@
 namespace mcla::vfs {
 
 // Synthesized RPF3 archive served over an extracted directory tree.
-// Layout follows MCLA_RPF3_Technical_Reference.txt: zero page, BE header at
-// 0x800 ("RPF3"), TOC at 0x1000, filename section, then STORED file data
-// (file_size == uncompressed so no XMem LZX decode is needed on our side).
+// Layout follows MCLA_RPF3_Technical_Reference.txt: header, TOC, filename
+// section, then member data. NOT all STORED: section 7 decides compression
+// by stored != expanded, and F-073 measured all six *.list members with
+// stored 126-460 against expanded 260-1246 (1.96-3.76x), i.e. compressed.
+// The on-disk TOC is additionally AES-CBC encrypted (section 9, F-076(2)).
 struct VirtualRpfSegment {
     uint64_t virtual_offset = 0;   // absolute offset inside synthesized image
     uint64_t size = 0;

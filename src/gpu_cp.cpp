@@ -39,6 +39,132 @@ constexpr uint32_t kWptrSentinel = 0xBAADF00Du;
 constexpr size_t kMmioRegCount = kMmioSize / 4u;
 std::atomic<uint32_t> g_regShadow[kMmioRegCount]{};
 
+// ---------------------------------------------------------------------------
+// T40.6 step 3 - the Xenos register file. A Type-0 packet used to be logged
+// and its payload dwords thrown away, and there was no handler at all for
+// 0x21 PM4_REG_RMW / 0x2B PM4_IM_LOAD_IMMEDIATE, so no draw could ever be
+// parameterised from state. Indices aliasing the MMIO shadow are mirrored so
+// guest read-back still agrees.
+// ---------------------------------------------------------------------------
+// Xenos register indices: type-3 header base_index is 14-bit (`header &
+// 0x3FFF`), PM4_REG_RMW's index field is 13-bit (upstream masks 0x1FFF at
+// command_processor.cc:1050-1065 — we match it). The file itself is
+// 0x5003 dwords wide upstream (register_file.h:40 `kRegisterCount`), and this
+// constant used to be 0x2000 while CpRegPoke returned BEFORE bumping
+// g_xenosRegWrites — so every type-0 write the guest aimed at 0x2000..0x3FFF
+// vanished silently. Measured in w42a.log: bases 0x200D, 0x2080, 0x2100,
+// 0x2104, 0x2180, 0x2200, 0x2203, 0x2204, 0x2208, 0x2280, 0x2293, 0x2302,
+// 0x2312 (63 distinct high bases) — the whole RB_/PA_/VGT_/SQ_PROGRAM_CNTL
+// block, i.e. all 3D state, including VGT_DRAW_INITIATOR. F-090.
+constexpr uint32_t kXenosRegCount = 0x5003u;
+std::atomic<uint32_t> g_xenosReg[kXenosRegCount]{};
+std::atomic<uint32_t> g_xenosRegWrites{0};
+// Accepted pokes at index >= the old 0x2000 bound: non-zero is the proof the
+// widen took effect (F-090).
+std::atomic<uint32_t> g_xenosRegHiWrites{0};
+
+inline uint32_t CpRegPeek(uint32_t index) {
+  if (index >= kXenosRegCount) return 0u;
+  return g_xenosReg[index].load(std::memory_order_relaxed);
+}
+
+inline void CpRegPoke(uint32_t index, uint32_t value) {
+  if (index >= kXenosRegCount) return;
+  g_xenosReg[index].store(value, std::memory_order_relaxed);
+  g_xenosRegWrites.fetch_add(1, std::memory_order_relaxed);
+  if (index >= 0x2000u) {
+    g_xenosRegHiWrites.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (index < kMmioRegCount) {
+    g_regShadow[index].store(value, std::memory_order_relaxed);
+  }
+}
+
+void CpType0Write(uint32_t header, uint32_t byteAddr, uint32_t count) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t base = header & 0x3FFFu;
+  uint32_t stored = 0;
+  for (uint32_t i = 0; i < count && i < 0x40u; ++i) {
+    uint32_t v = 0;
+    if (!mem.ReadU32BE(byteAddr + 4u + i * 4u, &v)) break;
+    CpRegPoke(base + i, v);
+    ++stored;
+  }
+  static std::atomic<uint32_t> s_t0{0};
+  const uint32_t n = s_t0.fetch_add(1) + 1;
+  if (n <= 40 || (n % 250) == 0) {
+    MCLA_LOG_WARN("CP-REG-T0 #{} base={:03X} n={} val={:08X} writes={}", n,
+                  base, stored, stored ? CpRegPeek(base) : 0u,
+                  g_xenosRegWrites.load(std::memory_order_relaxed));
+  }
+  // F-090 proof-of-widen, deduplicated by base and NOT counter-capped: one
+  // line per distinct register base at/above the old 0x2000 bound, which used
+  // to be dropped. So an absent line really means the guest never wrote that
+  // base (unlike CP-REG-T0, whose cap makes its zeros meaningless).
+  if (base + stored > 0x2000u) {
+    static uint32_t seenBase[64] = {};
+    static uint32_t seenN = 0;
+    bool dup = false;
+    for (uint32_t i = 0; i < seenN; ++i) {
+      if (seenBase[i] == base) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup && seenN < 64u) {
+      seenBase[seenN++] = base;
+      MCLA_LOG_WARN("CP-REG-HI #{} base={:04X} n={} val={:08X} hiWrites={}",
+                    seenN, base, stored, stored ? CpRegPeek(base) : 0u,
+                    g_xenosRegHiWrites.load(std::memory_order_relaxed));
+    }
+  }
+}
+
+bool CpExecRegRmw(uint32_t byteAddr, uint32_t &outAdvance) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t info = 0, andMask = 0, orMask = 0;
+  if (!mem.ReadU32BE(byteAddr + 4u, &info) ||
+      !mem.ReadU32BE(byteAddr + 8u, &andMask) ||
+      !mem.ReadU32BE(byteAddr + 12u, &orMask)) {
+    return false;
+  }
+  const uint32_t idx = info & 0x1FFFu;
+  uint32_t value = CpRegPeek(idx);
+  if ((info >> 31) & 0x1u) value &= CpRegPeek(andMask & 0x1FFFu);
+  else                      value &= andMask;
+  if ((info >> 30) & 0x1u) value |= CpRegPeek(orMask & 0x1FFFu);
+  else                      value |= orMask;
+  CpRegPoke(idx, value);
+  static std::atomic<uint32_t> s_rmw{0};
+  const uint32_t n = s_rmw.fetch_add(1) + 1;
+  if (n <= 40 || (n % 250) == 0) {
+    MCLA_LOG_WARN("CP-REG-RMW #{} idx={:03X} and={:08X} or={:08X} -> {:08X} "
+                  "(info={:08X})", n, idx, andMask, orMask, value, info);
+  }
+  outAdvance = 4u;
+  return true;
+}
+
+bool CpExecImLoad(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t type = 0, hdr1 = 0;
+  if (!mem.ReadU32BE(byteAddr + 4u, &type) ||
+      !mem.ReadU32BE(byteAddr + 8u, &hdr1)) {
+    return false;
+  }
+  static std::atomic<uint32_t> s_im{0};
+  const uint32_t n = s_im.fetch_add(1) + 1;
+  if (n <= 24 || (n % 50) == 0) {
+    MCLA_LOG_WARN("CP-IM-LOAD #{} shader_type={} start={} size_dwords={} "
+                  "packet_count={}", n, type, hdr1 >> 16, hdr1 & 0xFFFFu,
+                  count);
+  }
+  outAdvance = count + 1u;
+  return true;
+}
+
+
+
 // Type-3 opcodes we give special treatment (values per xenia gpu/xenos.h).
 constexpr uint32_t kPm4XeSwap = 0x64; // Xenia-invented swap packet
 
@@ -446,6 +572,7 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
       MCLA_LOG_INFO("CP[IB]: TYPE0 base={:03X} count={}", header & 0x3FFFu,
                     count);
     }
+    CpType0Write(header, byteAddr, count);
     outAdvanceDwords = count + 1u;
     return true;
   }
@@ -526,9 +653,20 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
                     n, opcode, src, prim, numIdx, idxSize, dmaBase, dmaSize, di,
                     hdr, byteAddr);
     }
+    MCLA_LOG_WARN("CP-DRAW-STATE #{} initiator={:08X} writes={} r08B={:08X} "
+                  "r08C={:08X} r0DD={:08X} r0D2={:08X} r0A2={:08X} "
+                  "r1DC={:08X} r1DD={:08X}",
+                  n, di, g_xenosRegWrites.load(std::memory_order_relaxed),
+                  CpRegPeek(0x08Bu), CpRegPeek(0x08Cu), CpRegPeek(0x0DDu),
+                  CpRegPeek(0x0D2u), CpRegPeek(0x0A2u), CpRegPeek(0x1DCu),
+                  CpRegPeek(0x1DDu));
     outAdvanceDwords = count + 1u;
     return true;
   }
+  case 0x21:  // PM4_REG_RMW
+    return CpExecRegRmw(byteAddr, outAdvanceDwords);
+  case 0x2B:  // PM4_IM_LOAD_IMMEDIATE
+    return CpExecImLoad(byteAddr, count, outAdvanceDwords);
   default:
     LogType3Unhandled(opcode, count, byteAddr, depth);
     outAdvanceDwords = count + 1u;
@@ -751,6 +889,14 @@ void DrainRing(RingState &ring, uint32_t wptr, const char *source) {
       if (type0Seen.fetch_add(1) < 8) {
         MCLA_LOG_INFO("CP: TYPE0 base={:03X} count={}", header & 0x3FFFu,
                       count);
+      }
+      // T40.6 step 3: the ring is circular, so the payload comes from
+      // ReadRingU32 rather than a linear guest read.
+      {
+        const uint32_t t0Base = header & 0x3FFFu;
+        for (uint32_t i = 0; i < count && i < 0x40u; ++i) {
+          CpRegPoke(t0Base + i, ReadRingU32(ring, (rptr + 1u + i) % cap));
+        }
       }
       rptr = (rptr + count + 1u) % cap;
       continue;
