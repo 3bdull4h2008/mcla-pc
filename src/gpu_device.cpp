@@ -10357,30 +10357,29 @@ PPC_FUNC(sub_82187820) {
     uint32_t f[6] = {0};
     for (int i = 0; i < 6; ++i)
       memP.ReadU32BE(ctx.r4.u32 + i * 4u, &f[i]);
-    char path[48] = {0};
-    for (int cand = 0; cand < 24 && path[0] == 0; ++cand) {
-      const uint32_t addr = f[cand % 6] + (cand / 6) * 4u;
-      // Session 76x: descriptor fields can be NULL/garbage â€” read through the
-      // checked accessor only (a raw MmGetHostAddress + deref AV'd at guest 0).
-      if (addr < 0x1000)
-        continue;
-      unsigned char raw[41] = {0};
-      if (!memP.ReadBytes(addr, raw, 40))
-        continue;
-      size_t j = 0;
-      for (; j < 40; ++j) {
-        if (raw[j] == 0) break;
-        path[j] = (raw[j] >= 32 && raw[j] < 127) ? (char)raw[j] : '?';
+    // F-102: r4 is NOT an array of pointers (w58 proved it: r4=82041D80 holds the
+    // bytes "cars\0\0\0\0$/shaders" inline), so render the record as text instead
+    // of dereferencing each word, and capture the call's outcome afterwards.
+    char head[25] = {0};
+    {
+      unsigned char raw[24] = {0};
+      if (ctx.r4.u32 >= 0x1000u && memP.ReadBytes(ctx.r4.u32, raw, 24)) {
+        for (int i = 0; i < 24; ++i)
+          head[i] = (raw[i] >= 32 && raw[i] < 127) ? (char)raw[i] : '.';
       }
-      path[j] = 0;
-      if (j < 3) path[0] = 0;
     }
     MCLA_LOG_WARN("BOOTPATH sub_82187820 #{} r3={:08X} r4={:08X} "
-                  "desc=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] path='{}'",
+                  "desc=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] head='{}'",
                   n, ctx.r3.u32, ctx.r4.u32, f[0], f[1], f[2], f[3], f[4],
-                  f[5], path);
+                  f[5], head);
   }
+  const uint32_t preLr = static_cast<uint32_t>(ctx.lr);
   __imp__sub_82187820(ctx, base);
+  // Post-call registers are the callee's (the sticky-register trap), but r3 is
+  // exactly what the caller branches on: this is the per-group pass/fail bit.
+  if (n <= 8)
+    MCLA_LOG_WARN("BOOTPATH-RET #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, preLr);
 }
 
 // Session 76g: census of the 13 preload-list global users â€” which runs?
