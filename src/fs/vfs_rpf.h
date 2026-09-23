@@ -14,10 +14,13 @@ namespace mcla::vfs {
 
 // Synthesized RPF3 archive served over an extracted directory tree.
 // Layout follows MCLA_RPF3_Technical_Reference.txt: header, TOC, filename
-// section, then member data. NOT all STORED: section 7 decides compression
-// by stored != expanded, and F-073 measured all six *.list members with
-// stored 126-460 against expanded 260-1246 (1.96-3.76x), i.e. compressed.
-// The on-disk TOC is additionally AES-CBC encrypted (section 9, F-076(2)).
+// section, then member data. The on-disk TOC is additionally AES-CBC encrypted
+// (section 9, F-076(2)).
+// F-105 CORRECTION (was F-073): the six *.list members are stored as
+// headerless raw-DEFLATE streams whose EXPANDED length equals the TOC's stored
+// length (260/1246/1108/575/496/368 in == out, all six verified by
+// src/raw_inflate.h); the "126-460" numbers were level-9 recompression sizes,
+// not offsets or lengths recorded in the archive.
 struct VirtualRpfSegment {
     uint64_t virtual_offset = 0;   // absolute offset inside synthesized image
     uint64_t size = 0;
@@ -96,6 +99,13 @@ private:
     mutable std::mutex m_mutex;
     bool m_mounted = false;
 };
+
+// T41.3p (F-105): register an archive member that the guest's own archive
+// layer would hand out EXPANDED (the six raw-DEFLATE *.list name lists).
+// Reads covering the whole span get the expanded bytes in place; the expansion
+// is computed once from the stored bytes and cached. Called from the guest-TOC
+// census (gpu_device.cpp) with the size/offset the guest itself published.
+void MarkMemberExpanded(uint64_t offset, uint32_t storedLen);
 
 inline std::string GuestPathToVirtual(const std::string& guest_path) {
     std::string path = guest_path;

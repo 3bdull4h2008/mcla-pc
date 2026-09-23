@@ -1,6 +1,7 @@
 #include "fs/vfs_rpf.h"
 #include "logging.h"
 #include "guest_memory.h"
+#include "raw_inflate.h"
 
 #include <fstream>
 #include <algorithm>
@@ -608,6 +609,88 @@ bool RpfVirtualFileSystem::ReadFile(OpenFileHandle& file, void* buffer, uint64_t
     return result != FALSE;
 }
 
+namespace {
+// T41.3p (F-105): raw-DEFLATE member spans the guest must see EXPANDED. The
+// offsets/sizes are not host guesses — they are the size/offset words the
+// guest itself published from its decrypted TOC (TOC76-XSF census). The
+// expansion is decoded once from the stored bytes and cached; a span is only
+// substituted when a single read covers it whole, because DEFLATE cannot be
+// decoded from a fragment and an in-place substitute must not shift the rest
+// of the window.
+struct ExpandedSpan {
+    uint64_t off = 0;
+    uint32_t storedLen = 0;
+    std::vector<uint8_t> bytes;
+    bool failed = false;
+};
+std::mutex g_expMtx;
+std::vector<ExpandedSpan> g_expSpans;
+
+// The registered offsets are positions inside the PHYSICAL xarchive_cache.rpf
+// (they come from the guest's decrypted TOC). A synthesized VirtualRpf image is
+// a different address space, so the substitution is limited to the one file it
+// was measured against — w75 proved what happens otherwise: the guest spun on
+// corrupted texture pages and the log reached 804k lines.
+bool IsCachePackfile(const std::string& physical_path) {
+    static const std::string kName = "xarchive_cache.rpf";
+    if (physical_path.size() < kName.size()) return false;
+    for (size_t i = 0; i < kName.size(); ++i) {
+        const char a = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(
+                physical_path[physical_path.size() - kName.size() + i])));
+        if (a != kName[i]) return false;
+    }
+    return true;
+}
+
+void ApplyExpandedSpans(const std::string& physical_path, uint8_t* win,
+                        uint64_t winOff, uint64_t winLen) {
+    if (win == nullptr || winLen == 0 || !IsCachePackfile(physical_path))
+        return;
+    std::lock_guard<std::mutex> lk(g_expMtx);
+    if (g_expSpans.empty()) return;
+    for (auto& s : g_expSpans) {
+        if (s.failed || s.off < winOff || s.off + s.storedLen > winOff + winLen)
+            continue;
+        const uint64_t rel = s.off - winOff;
+        if (s.bytes.empty()) {
+            std::vector<uint8_t> out;
+            if (!mcla::RawInflate(win + rel, s.storedLen, out) || out.empty()) {
+                s.failed = true;
+                MCLA_LOG_WARN("MEMBER-EXPAND-FAIL off={:08X} stored={}", s.off,
+                              s.storedLen);
+                continue;
+            }
+            if (out.size() != s.storedLen) {
+                s.failed = true;
+                MCLA_LOG_WARN("MEMBER-EXPAND-SIZE off={:08X} stored={} "
+                              "expanded={} (lengths differ; in-place refused)",
+                              s.off, s.storedLen, out.size());
+                continue;
+            }
+            uint32_t nl = 0;
+            for (uint8_t b : out)
+                if (b == '\n') ++nl;
+            MCLA_LOG_WARN("MEMBER-EXPAND off={:08X} stored={} expanded={} nl={}",
+                          s.off, s.storedLen, out.size(), nl);
+            s.bytes.swap(out);
+        }
+        std::memcpy(win + rel, s.bytes.data(), s.bytes.size());
+    }
+}
+}  // namespace
+
+void MarkMemberExpanded(uint64_t offset, uint32_t storedLen) {
+    if (offset == 0 || storedLen < 16u || storedLen > 0x100000u) return;
+    std::lock_guard<std::mutex> lk(g_expMtx);
+    for (const auto& s : g_expSpans)
+        if (s.off == offset) return;
+    ExpandedSpan e;
+    e.off = offset;
+    e.storedLen = storedLen;
+    g_expSpans.push_back(std::move(e));
+}
+
 bool RpfVirtualFileSystem::ReadFileAt(OpenFileHandle& file, uint64_t offset,
                                       void* buffer, uint64_t size,
                                       uint64_t& bytes_read) {
@@ -626,12 +709,18 @@ bool RpfVirtualFileSystem::ReadFileAt(OpenFileHandle& file, uint64_t offset,
                         static_cast<DWORD>(size), &got, &ov))
             return false;
         bytes_read = got;
+        ApplyExpandedSpans(file.physical_path, static_cast<uint8_t*>(buffer),
+                           offset, bytes_read);
         return got == size;
     }
     // fallback: shared-position path (virtual rpf / pseudo files)
     lock.unlock();
     file.position = offset;
-    return ReadFile(file, buffer, size, bytes_read);
+    const bool ok = ReadFile(file, buffer, size, bytes_read);
+    if (ok)
+        ApplyExpandedSpans(file.physical_path, static_cast<uint8_t*>(buffer),
+                           offset, bytes_read);
+    return ok;
 }
 
 bool RpfVirtualFileSystem::CloseFile(OpenFileHandle& file) {

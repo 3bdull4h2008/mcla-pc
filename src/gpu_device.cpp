@@ -472,19 +472,32 @@ static int XsfOffsetCandidates(uint32_t w0, uint32_t w1, uint32_t w2,
 
 // Host-serve a UI body from xarchive_cache.rpf using cached TOC words.
 // Same pattern as job2: OpenFile + ReadFileAt, refuse junk windows.
+//
+// T41.3p (F-105): the six *.list name-list members are headerless raw-DEFLATE
+// streams in xarchive_cache.rpf. All six expand to CRLF shader/texture NAME
+// LISTS (measured with Python zlib wbits=-15 and independently by
+// src/raw_inflate.h: ui 260, city 1246, cars 1108, globaltex 575, characters
+// 496, effects 368 — in == out for every one, so the packer padded the stream
+// to the TOC's stored length). The image carries its own zlib 1.2.3 (" inflate
+// 1.2.3 Copyright 1995-2005 Mark Adler " at VA 0x82017F00 with length_base /
+// dist_base at 0x82017F30 / 0x82017FB0) but never calls it for these members
+// (all 149 decompressor entries in w74 are the RSC5 package path), so the
+// expansion is applied where the archive bytes enter guest memory —
+// RpfVirtualFileSystem::ReadFileAt. Without it the loader's line reader
+// (sub_82188E50) is handed binary and yields no name (F-104).
+static bool MclaListMemberPath(const char *path) {
+  if (path == nullptr)
+    return false;
+  const size_t n = std::strlen(path);
+  return n >= 5 && std::strcmp(path + n - 5, ".list") == 0;
+}
+
 static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
   outSize = 0;
-  // T41.3g (F-077): the six *.list name-list members are COMPRESSED in the
-  // cache RPF (stored 126-460 vs expanded 260-1246, F-073) and serving their
-  // raw stored bytes at a host-chosen position bypasses the guest's own TOC
-  // arithmetic. Let list paths take the guest's own open/read: if ASCII names
-  // appear the guest decoded them, if they vanish the payload is opaque.
-  if (path != nullptr && (std::strstr(path, ".list") != nullptr ||
-                          std::strstr(path, "preload") != nullptr ||
-                          std::strstr(path, "globaltex") != nullptr)) {
-    MCLA_LOG_WARN("HOSTSERVE-BLOCKED path='{}' (T41.3g/F-077)", path);
-    return 0;
-  }
+  // T41.3g (F-077) refusal RETIRED by T41.3p/F-105: list paths were blocked
+  // from host-serve so the guest's own open/read could be observed. F-103 showed
+  // the guest's own path never reaches the loader (BE8D8-PACK-MISS: no body),
+  // and F-105 identifies the transform, so list bodies are served expanded.
   uint32_t w[4] = {0, 0, 0, 0};
   std::string pathKey = path ? path : "";
   {
@@ -568,6 +581,11 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
         }
       }
     }
+
+    // T41.3p (F-105): the expansion of raw-DEFLATE list members happens once,
+    // in RpfVirtualFileSystem::ReadFileAt (registered from the guest's own TOC
+    // words at the TOC76-XSF census), so the guest's page-cache copy and this
+    // host-served body see the same expanded archive image.
 
     dst = mem.Alloc(static_cast<uint32_t>(serveBytes.size()), 16);
     if (!dst)
@@ -827,7 +845,17 @@ static int MclaInsertNamesFromBytes(uint8_t *base, uint32_t noneObj,
   return inserted;
 }
 
+// T41.3q (F-105): both GLOBTEX bootstraps below are HOST stand-ins — they write
+// shader/texture names into the guest's non-resident-texture registry by hand
+// (and one of them reads the extracted tree off the host disk). Switching them
+// off was tested in w77 alongside the archive-level expansion: the page-retry
+// spin was unchanged, so the double-registration hypothesis is refuted and the
+// stand-ins stay on until the guest's own loader demonstrably replaces them.
+constexpr bool kHostGlobaltexNameInjection = true;
+
 static void MclaBootstrapGlobaltexFromServed(uint8_t *base) {
+  if (!kHostGlobaltexNameInjection)
+    return;
   uint32_t noneObj = 0;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   (void)mem.ReadU32BE(0x82839CF0, &noneObj);
@@ -1994,6 +2022,8 @@ static std::atomic<uint32_t> s_h180A30{0};
 // loader fills them (replace on re-insert).
 PPC_FUNC_IMPL(__imp__sub_821854C8);
 static void MclaBootstrapGlobaltexNames(uint8_t *base) {
+  if (!kHostGlobaltexNameInjection)
+    return;
   static std::atomic<bool> s_done{false};
   if (s_done.exchange(true))
     return;
@@ -10768,6 +10798,26 @@ PPC_FUNC(sub_821CBFC0) {
     for (int i = 0; i < 4; ++i)
       (void)memR.ReadU32BE(ctx.r3.u32 + static_cast<uint32_t>(i * 4), &w[i]);
     XsfTocCache(path, ctx.r3.u32, w);
+    // T41.3p (F-105): tell the archive layer this member's span is one the
+    // guest must see DEFLATE-expanded, using the size/offset the guest itself
+    // published (w[1]=size, w[2]=offset; bit30 of the offset is our own
+    // open-gate flag, so mask it off).
+    //
+    // kExpandListInArchive: OFF by default. With it ON (w76/w77) the guest
+    // parses the expanded globaltex.list itself and opens all eight named
+    // textures (2dnoise3/4, anisodir, billettanmap, cf_bump2, dmg_scrape,
+    // no_damage, powerup_beam — each with its own TOC record), which proves the
+    // transform and where it belongs; it then wedges in a page-retry loop on the
+    // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
+    // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
+    // is the open question, not the transform. See F-105.
+    constexpr bool kExpandListInArchive = false;
+    if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
+        w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
+      mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);
+      MCLA_LOG_WARN("MEMBER-EXPAND-MARK path='{}' off={:08X} stored={}", path,
+                    w[2] & 0x3FFFFFFFu, w[1]);
+    }
     // Open gate (CCEA0): proceeds when bit 30 of [entry+8] is SET.
     const bool openGate = (w[2] & 0x40000000u) != 0;
     const bool allZero = (w[0] | w[1] | w[2] | w[3]) == 0;

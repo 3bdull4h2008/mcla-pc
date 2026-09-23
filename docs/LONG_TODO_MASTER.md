@@ -11,6 +11,10 @@
 > Older status blocks elsewhere = trail, not truth.
 
 
+## 0y. State (verified 2026-09-24 02:30 JST — B2's transform settled by F-105; supersedes nothing, adds the seam result)
+
+`*.list` members are raw DEFLATE name lists (all six, expanded length == stored length), `src/raw_inflate.h` reproduces them, and the only seam that makes the guest consume the content is the archive read (`RpfVirtualFileSystem::ReadFileAt`, behind `kExpandListInArchive = false`). With it on, the guest opens the eight textures the list names and then stalls on a 0-byte `C000000D` read of the page holding the named member — that read is T41.3r and is the next gate item. `w78` is the default-tree baseline (`== w72`/`w58`: `C0000005 0`, `Fatal error 2`, `GFx 3`, `GETDEV 168`, `TOC76 334`, `CP-DRAW 52`, `DRAW_INDEXED 0`); `w75`-`w77` are poisoned (storm/loop) and must not be cited as progress. B3 unchanged; B4/B5 still behind the fatal.
+
 ## 0z. State (2026-09-23 — TWO-TREE MERGE LANDED; supersedes every split-tree warning elsewhere)
 - `E:\mcla pc` is again the PRIMARY tree: source of truth for src+tools+docs+skills AND the only working
   git repo. `C:\mcla-pc` is RETIRED to read-only archive (its live value was copied here; the frozen
