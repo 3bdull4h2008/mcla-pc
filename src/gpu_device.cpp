@@ -10231,7 +10231,17 @@ PPC_FUNC(sub_8244F4C0) {
       // F-100 / rule 19: our own census reads are done, so arm the guard page on
       // the window just filled and let the NEXT accessor name itself. Physical
       // arena 0xC6xxxxxx holds the four archive page-cache buffers.
-      if (got && cnt >= 0x100u && (buf & 0xFF000000u) == 0xC6000000u) {
+      //
+      // ARMING RETIRED (F-106): B1's verdict was earned in F-101, and the witness
+      // is now actively breaking I/O — PAGE_NOACCESS on a buffer that a host-side
+      // ::ReadFile targets makes ReadFile FAIL with ERROR_NOACCESS (gle 998)
+      // instead of raising the exception we handle, so any page the guest re-reads
+      // fails forever (w76/w77/w79: 1339 retries at off=0x158000, ~800k log lines).
+      // The instrument survives in src/boot_host.cpp for a future one-shot window;
+      // it just no longer claims pages in the archive read path.
+      constexpr bool kB1GuardArmFromReads = false;
+      if (kB1GuardArmFromReads && got && cnt >= 0x100u &&
+          (buf & 0xFF000000u) == 0xC6000000u) {
         mcla::boot::B1GuardArm(buf);
       }
     }
@@ -10811,7 +10821,7 @@ PPC_FUNC(sub_821CBFC0) {
     // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
     // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
     // is the open question, not the transform. See F-105.
-    constexpr bool kExpandListInArchive = false;
+    constexpr bool kExpandListInArchive = false;   // ON => w80 branch, see F-106
     if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
         w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
       mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);

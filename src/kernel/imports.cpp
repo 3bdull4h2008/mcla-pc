@@ -1081,10 +1081,21 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
 
   uint64_t bytesRead = 0;
   bool ok = false;
+  DWORD hostErr = 0;  // T41.3r (F-105): WHY a failed read failed. The old line
+                      // printed `off=0x0` for both "byteOffset == null" and a
+                      // genuine position 0, and mapped every host error to
+                      // C000000D, so w76/w77's 1339-retry spin was uncitable.
+  uint32_t rawHandle = 0;
+  uint64_t offDbg = 0;
+  bool posDbg = false;
+  const char *pathDbg = nullptr;
   if (fileObj) {
+    rawHandle = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+        fileObj->fileHandle.handle));
     auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
     uint64_t offset = 0;
     if (byteOffset) {
+      posDbg = true;
       // Session 76d: positional read — concurrent NtReadFile callers on the
       // same handle raced the shared seek position and served wrong bytes
       // (garbage pointers downstream: 0xFF00FF00 used as an object).
@@ -1098,6 +1109,9 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
         fileObj->fileHandle.position += bytesRead;
       }
     }
+    offDbg = offset;
+    pathDbg = fileObj->fileHandle.virtual_path.c_str();
+    hostErr = ::GetLastError();  // captured immediately, before any other call
     MCLA_LOG_DEBUG("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes", handle,
                    offset, length, bytesRead);
   } else {
@@ -1117,14 +1131,14 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
   if (!ok || bytesRead < length) {
     static std::atomic<uint32_t> s_rdFail{0};
     const uint32_t fn = s_rdFail.fetch_add(1) + 1;
-    if (fn <= 32 || (fn % 200) == 0)
+    if (fn <= 40 || (fn % 500) == 0)
       MCLA_LOG_WARN(
           "NtReadFile: {} h={:08X} off={:#x} len={} got={} status={:08X} "
-          "lr={:08X} (#{})",
-          ok ? "SHORT" : "FAIL", handle,
-          byteOffset ? byteOffset->get() : 0, length, bytesRead,
+          "lr={:08X} (#{}) [pos={} rawHandle={:08X} gle={} path='{}']",
+          ok ? "SHORT" : "FAIL", handle, offDbg, length, bytesRead,
           ok ? 0u : 0xC000000Du,
-          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0), fn);
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0), fn,
+          posDbg ? 1 : 0, rawHandle, hostErr, pathDbg ? pathDbg : "");
   }
 
   // Session 75p FIX: async-read completion. The streamer refill submits
