@@ -10679,6 +10679,35 @@ PPC_FUNC(sub_821CBFC0) {
         "TOC76 #{} obj={:08X} inner={:08X} start={:08X} cnt={:08X} "
         "e0={:08X} e4={:08X} e8={:08X} e12={:08X} path='{}' lr={:08X}",
         n, obj, inner, tStart, tCount, e0, e4, e8, e12, path, lr);
+    // B2c: d0's PARSED inner at query time (the fill-time copy is pre-parse).
+    if (obj == 0xC60ABD08u && inner != 0 && path[0] &&
+        std::strstr(path, "star_glow") != nullptr) {
+      static bool s_d0Dumped = false;
+      if (!s_d0Dumped) {
+        s_d0Dumped = true;
+        const uint32_t len = 18432u;
+        std::vector<uint8_t> tmp(len);
+        bool okAll = true;
+        for (uint32_t o = 0; o < len; o += 4096u) {
+          const uint32_t piece = (len - o < 4096u) ? (len - o) : 4096u;
+          if (!memR.ReadBytes(inner + o, reinterpret_cast<char*>(&tmp[o]), piece)) {
+            okAll = false;
+            break;
+          }
+        }
+        bool wrote = false;
+        if (okAll) {
+          FILE* fp = nullptr;
+          if (fopen_s(&fp, "d0_parsed.bin", "wb") == 0 && fp != nullptr) {
+            fwrite(tmp.data(), 1, len, fp);
+            fclose(fp);
+            wrote = true;
+          }
+        }
+        MCLA_LOG_WARN("TOC-DUMP3 d0 wrote={} okread={} inner={:08X} path='{}'",
+                      wrote ? 1 : 0, okAll ? 1 : 0, inner, path);
+      }
+    }
   }
   const auto t0 = std::chrono::steady_clock::now();
   __imp__sub_821CBFC0(ctx, base);

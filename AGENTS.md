@@ -10,7 +10,7 @@ Xbox 360 (Xenon) → PC emulator: XenonRecomp static PPC→C++ recompiler + D3D1
 2. `docs/HANDOFF_NEXT_AGENT.md` — live block + session ledger (what the last session actually saw).
 3. `docs/PROGRAM_GUIDE.md` on demand — §3 build/run gotchas, §4 guest image, §5 recompiler pipeline,
    §7 host short-circuit table, §9 log-marker inventory, §11 forbidden paths.
-4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-092` (whole again on
+4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-099` (whole again on
    E: since the 09-23 merge; `C:\mcla-pc\docs` is archive only — see rule 6).
 
 Older status text anywhere else = trail, not truth. Pre-compression doc text: `git show 8f07a39:docs/<file>`.
@@ -60,6 +60,7 @@ re-measured. That is rule 13 in practice: *no claim without a log line, raw word
 | `tools/soak_census.py <new.log> <baseline.log>` | reading or comparing any soak. 115 markers counted as matching **lines**, case-insensitive (identical to `grep -ic`), plus a fault-line vs all-line `lr=` split, a **CP truth** line (`drains`/`last_rptr`/`pub` vs `put` — the only honest pipeline signal; a waiter's `rptrWB=` field is not, F-057(1)/F-058) and a **LOG QUALITY** line that flags a soak dominated by one repeating mitigation message as POISONED (F-054: 616,824 laundered firings = 66% of `w38e.log`). It also prints **MARKER NOT IN SRC** for any tracked marker whose literal exists in neither `src/` nor `generated/` — such a marker's zero means nothing (F-057(6): 8 of the old 9 VEH markers were dead text). Reconcile a hand count with it before claiming it. | 0 (informational) |
 | `tools/addr_owners.py` | rule 4, before adding **any** hook — guest address → `file:line` → hook name, and which sites actually *claim* it. `--check <addr\|symbol>` for one site; `--gates <addr>` prints each claim's enclosing-function conditions **verbatim, uninterpreted** so a possible conflict is resolved by reading the soak for the installer's own log line, never by guessing which registration wins (F-053). | **1 = duplicate owners** |
 | `tools/mitigation_audit.py` | do-not #9 — diffs the `PROGRAM_GUIDE` §7 registry against the mitigation-shaped labels really in `src/` (F-047: §7 lists 13, `src/` has 81). `--tiers`, `--label X`. | **1 = unregistered/stale** |
+| `tools/rpf_offline.py` | archive forensics without a soak: `header` (RPF3 TOC length/endianness), `names <toc_dump>` (GtaO-joins an **in-guest** TOC dump to real path names), `find <path> [archive\|dump]`, `member <off> <len>`, `islands <lo> <hi>`. Raw-archive `find` returns 0 by design — the on-disk TOC is AES, the in-guest copy is a hash-sorted cleartext table (F-099). | 0 (informational) |
 
 ## Project MCP servers (`.qoder/settings.json`, committed — first load shows a trust prompt; run `/mcp reload`)
 
