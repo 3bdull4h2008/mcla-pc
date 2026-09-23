@@ -2246,8 +2246,25 @@ PPC_FUNC(sub_8244FF20) {
   const uint32_t destSz = ctx.r5.u32;
   const uint32_t src = ctx.r6.u32;
   const uint32_t srcSz = ctx.r7.u32;
+  // T41.3n2 S2: lr must be captured BEFORE the call (F-091 trap #1 — the
+  // old XMEM line read ctx.lr after return, so its lr= was callee residue),
+  // and every call must reach the log: the old n<=16|n%100 cap meant calls
+  // 17..99 were invisible, which is how "all XMEM are the 7 MB job" was
+  // partly an instrument artifact. Dedup by (src>>16, srcSz), max 64 keys.
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   __imp__sub_8244FF20(ctx, base);
   const uint32_t ret = ctx.r3.u32;
+  {
+    static std::mutex s_t413n2Mtx;
+    static std::unordered_set<uint64_t> s_seen;
+    const uint64_t key =
+        (static_cast<uint64_t>(src >> 16) << 32) | srcSz;
+    std::lock_guard<std::mutex> lk(s_t413n2Mtx);
+    if (s_seen.size() < 64 && s_seen.insert(key).second)
+      MCLA_LOG_WARN("T413N2-XMEM #{} src={:08X} srcSz={} dest={:08X} "
+                    "destSz={} ret={:08X} lr={:08X}",
+                    n, src, srcSz, dest, destSz, ret, lr);
+  }
   if (n <= 16 || (n % 100) == 0) {
     MCLA_LOG_INFO("XMEM #{} ctx={:08X} dest={:08X} destSz={} src={:08X} "
                   "srcSz={} ret={:08X} lr={:08X}",
