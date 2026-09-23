@@ -10247,6 +10247,41 @@ PPC_FUNC(sub_821CC970) {
   __imp__sub_821CC970(ctx, base);
 }
 
+// B2b (F-096 follow-on): device-claim census. sub_821CB650-0x821CB68C is the
+// mount device loop: it asks each device's vtable[+4] (sub_821CDB88) about the
+// path and STOPS at the first device whose answer leaves r4 != -1. Both
+// a:/archive/ devices share the 11-char prefix, so a non -1 answer from the
+// 2-entry d0 shadow hides the full-table d1 forever. Log dev+path at entry
+// (pre-call, trap #1 honest) and the r3/r4 the loop actually branches on.
+PPC_FUNC_IMPL(__imp__sub_821CDB88);
+static std::atomic<uint32_t> s_hCDB88{0};
+PPC_FUNC(sub_821CDB88) {
+  const uint32_t n = s_hCDB88.fetch_add(1) + 1;
+  const uint32_t dev = ctx.r3.u32;
+  const uint32_t pathPtr = ctx.r4.u32;
+  char pbuf[96] = {0};
+  if (pathPtr) {
+    auto &memD = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t got = 0;
+    for (uint32_t i = 0; i + 4 <= 96; i += 4) {
+      uint32_t w = 0;
+      if (!memD.ReadU32BE(pathPtr + i, &w)) break;
+      const char* b = reinterpret_cast<const char*>(&w);
+      for (int k = 3; k >= 0; --k) {
+        if (!b[k]) { pbuf[got] = 0; got = 99; break; }
+        pbuf[got++] = b[k];
+      }
+      if (got == 99) break;
+    }
+    if (got < 96) pbuf[95] = 0;
+  }
+  __imp__sub_821CDB88(ctx, base);
+  if (n <= 96)
+    MCLA_LOG_WARN("DEVCLAIM #{} dev={:08X} path='{}' -> r3={:08X} r4={:08X} lr={:08X}",
+                  n, dev, pbuf, ctx.r3.u32, ctx.r4.u32,
+                  static_cast<uint32_t>(ctx.lr));
+}
+
 // Session 75w: slot-ready fix. sub_821CBE18(slot) waits on the slot's
 // event while [slot+12]==1 (read in flight). Our NtReadFile completes all
 // reads synchronously with no event signal, so pending slots would block
