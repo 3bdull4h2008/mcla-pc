@@ -10198,6 +10198,12 @@ PPC_FUNC(sub_8244F4C0) {
         dumpOnce(0xC60B7780u, 382976u, s_tocDumped, "toc_decrypted.bin");
         dumpOnce(0xC60ACE00u, 18432u, s_earlyDumped, "early_decrypted.bin");
       }
+      // F-100 / rule 19: our own census reads are done, so arm the guard page on
+      // the window just filled and let the NEXT accessor name itself. Physical
+      // arena 0xC6xxxxxx holds the four archive page-cache buffers.
+      if (got && cnt >= 0x100u && (buf & 0xFF000000u) == 0xC6000000u) {
+        mcla::boot::B1GuardArm(buf);
+      }
     }
   }
 }

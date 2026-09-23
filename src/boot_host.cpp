@@ -132,9 +132,111 @@ namespace
                       (uintptr_t)ctx.Dr0, (uintptr_t)ctx.Dr1);
     }
 
+    // B1 redo (rule 19 / F-100). Debug registers cannot be programmed from a
+    // running thread, so the page-cache windows are watched with a guard page
+    // instead: thread-agnostic, and its EFFECT is provable, because every arm is
+    // followed by a deliberate one-byte read that must fault and log tag=SELFTEST
+    // before the watch is left live. One trip per arm; the handler restores
+    // PAGE_READWRITE and lets the accessor re-execute untouched, so the guest
+    // sees no behavioural change beyond the log line.
+    namespace {
+        uintptr_t g_b1gHost = 0;
+        SIZE_T g_b1gLen = 0;
+        std::atomic<bool> g_b1gArmed{false};
+        std::atomic<bool> g_b1gSelfTest{false};
+        std::atomic<uint32_t> g_b1gTrips{0};
+        std::atomic<uint32_t> g_b1gSelfTests{0};
+        std::atomic<uint32_t> g_b1gLogged{0};
+        // Every page this instrument has ever made inaccessible. A fault on any
+        // of them is ours no matter what the protection looks like at handler
+        // time: w62/w63 showed that claiming only the first trip let a second
+        // thread's in-window fault reach the park machinery and parked a live
+        // guest thread, which moved the frontier (GETDEV 168->116, fatal lost).
+        constexpr int kB1gPages = 32;
+        std::atomic<uintptr_t> g_b1gPages[kB1gPages];
+        std::atomic<int> g_b1gPageN{0};
+
+        bool B1GuardOwns(uintptr_t page) {
+            const int n = g_b1gPageN.load(std::memory_order_acquire);
+            for (int i = 0; i < n; ++i) {
+                if (g_b1gPages[i].load(std::memory_order_relaxed) == page) return true;
+            }
+            return false;
+        }
+
+        void B1GuardClaim(uintptr_t page) {
+            const int n = g_b1gPageN.load(std::memory_order_relaxed);
+            if (n >= kB1gPages) return;
+            g_b1gPages[n].store(page, std::memory_order_relaxed);
+            g_b1gPageN.store(n + 1, std::memory_order_release);
+        }
+    }  // namespace
+
+    bool B1GuardHandle(PEXCEPTION_POINTERS ei) {
+        const EXCEPTION_RECORD* rec = ei->ExceptionRecord;
+        if (rec == nullptr || rec->ExceptionCode != 0xC0000005L ||
+            rec->NumberParameters < 2) {
+            return false;
+        }
+        const uintptr_t fa = (uintptr_t)rec->ExceptionInformation[1];
+        constexpr uintptr_t kPage = 0xFFFull;
+        if (!B1GuardOwns(fa & ~kPage)) return false;
+        const uint32_t n = g_b1gTrips.fetch_add(1) + 1;
+        const bool wantWrite = (rec->ExceptionInformation[0] == 1);
+        const bool wasWatched = g_b1gArmed.load(std::memory_order_acquire);
+        DWORD old = 0;
+        const uintptr_t page = fa & ~kPage;
+        VirtualProtect((void*)page, 4096, PAGE_READWRITE, &old);
+        g_b1gArmed.store(false, std::memory_order_release);  // one watch per arm
+        if (g_b1gSelfTest.load()) {
+            g_b1gSelfTests.fetch_add(1);
+            MCLA_LOG_WARN("B1-GUARD tag=SELFTEST trip={} addr={:X} want={} tid={}", n, fa,
+                          wantWrite ? "W" : "R", GetCurrentThreadId());
+            return true;  // the read instruction re-executes on restored RW
+        }
+        if (g_b1gLogged.fetch_add(1) < 48) {
+            const uintptr_t rip = (uintptr_t)ei->ContextRecord->Rip;
+            const uintptr_t rv =
+                (g_moduleBase != 0 && rip >= g_moduleBase) ? rip - g_moduleBase : rip;
+            uint32_t glr = 0;
+            if (const PPCContext* pc = GetPPCContext()) glr = (uint32_t)pc->lr;
+            MCLA_LOG_WARN("B1-GUARD tag={} trip={} addr={:X} want={} hostRIP=0x{:X} "
+                          "guestLR={:08X} tid={}",
+                          wasWatched ? "ACCESS" : "LATE", n, fa, wantWrite ? "W" : "R",
+                          rv, glr, GetCurrentThreadId());
+        }
+        return true;
+    }
+
+    void B1GuardArmImpl(uint32_t guestVa) {
+        if (g_base == nullptr || guestVa == 0) return;
+        constexpr SIZE_T kLen = 4096;
+        const uintptr_t host = (uintptr_t)(g_base + guestVa) & ~(uintptr_t)0xFFF;
+        DWORD old = 0;
+        g_b1gHost = host;
+        g_b1gLen = kLen;
+        if (!VirtualProtect((void*)host, kLen, PAGE_NOACCESS, &old)) {
+            MCLA_LOG_WARN("B1-GUARD arm-FAIL va={:08X} host={:X} err={}", guestVa, host,
+                          GetLastError());
+            return;
+        }
+        B1GuardClaim(host);
+        g_b1gArmed.store(true, std::memory_order_release);
+        g_b1gSelfTest.store(true, std::memory_order_release);
+        volatile uint32_t sink = 0;
+        sink = *reinterpret_cast<volatile uint32_t*>(host);  // must trip: proves the watch lives
+        (void)sink;
+        g_b1gSelfTest.store(false, std::memory_order_release);
+        const bool rearmed =
+            VirtualProtect((void*)host, kLen, PAGE_NOACCESS, &old) != 0;
+        if (rearmed) g_b1gArmed.store(true, std::memory_order_release);
+        MCLA_LOG_WARN("B1-GUARD armed va={:08X} host={:X} live={} selftests={} trips={}",
+                      guestVa, host, rearmed ? 1 : 0, g_b1gSelfTests.load(),
+                      g_b1gTrips.load());
+    }
+
     // Reverse map: host function entry -> guest address, for fault triage.
     std::unordered_map<uintptr_t, uint32_t> g_hostToGuest;
-
     void InsertFunction(uint32_t guest, PPCFunc* host)
     {
         PPC_LOOKUP_FUNC(g_base, guest) = host;
@@ -811,6 +913,13 @@ void BootWorker(uint32_t entryGuest)
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
+        // B1 guard-page watchpoint (F-100 rule 19): same reason — must be
+        // resolved before the census/park machinery, which would otherwise spend
+        // the fullDump budget and park a thread that is merely the consumer.
+        if (code == 0xC0000005L && B1GuardHandle(ExceptionInfo)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         // W0 flood cap: full dump only for the first few exceptions. Later
         // faults on other threads get a one-liner and still get parked.
         static std::atomic<uint32_t> s_vehCount{0};
@@ -1167,6 +1276,8 @@ void BootWorker(uint32_t entryGuest)
     // B1 cross-TU arming entry: guest_thread.cpp calls this at every guest
     // thread's start so the watchpoints follow the workers, not just the root.
     void B1ArmGuestThread() { B1ArmCurrentThreadImpl(); }
+
+    void B1GuardArm(uint32_t guestVa) { B1GuardArmImpl(guestVa); }
 
     // Publishes the context the current thread is running guest code ON, so a VEH dump
     // taken inside the scope names the faulting frame instead of the boot thread's root

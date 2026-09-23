@@ -75,6 +75,12 @@ void Start(uint32_t entryGuest);
 // thread start; log-only, budgeted, self-disarming.
 void B1ArmGuestThread();
 
+// B1 guard-page watchpoint (F-100 rule 19): make the page holding a guest buffer
+// inaccessible, prove the watch fires with a self-test read, then leave it live
+// for one real accessor. Log-only; the accessor re-executes after the page is
+// restored. Called from the RD-BUF read census.
+void B1GuardArm(uint32_t guestVa);
+
 const BootReport& GetReport();
 
 // W36b: peek at the boot worker thread's live PPCContext (g_faultCtx).
