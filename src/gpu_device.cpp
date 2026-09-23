@@ -10382,6 +10382,42 @@ PPC_FUNC(sub_82187820) {
                   ctx.r4.u32, preLr);
 }
 
+// F-104: `sub_82187820` (the per-group preload-list loader) is a LINE READER, not
+// a binary parser — `bl 821CFAA8(r3=chunk src, r4=line buf, r5=128)` in a loop,
+// three `bl 823DB730` token walks, `stb r24,0(r31)` NUL terminators, and
+// `bl 82188E50(r3=r1+80)` handing over one line. So the retail `preload.list`
+// bodies are TEXT, and this is the only way to see what the loader is handed:
+// the first per-line text print in the project (T41.3n's unfinished question).
+// In `w69`/`w70`/`w71` it fires exactly TWICE, both from the FATAL function
+// (lr=82189234/82189248 inside sub_82189138) with 'embedded:/star_glow' and the
+// bare name at 0x82040F0C — never from the loader, because its line loop is
+// never entered (see F-104 for the stream-binding reason).
+PPC_FUNC_IMPL(__imp__sub_82188E50);
+PPC_FUNC(sub_82188E50) {
+  static std::atomic<uint32_t> s_lineN{0};
+  const uint32_t n = s_lineN.fetch_add(1) + 1;
+  if (n <= 40) {
+    auto &memL = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t buf = ctx.r3.u32;
+    char text[129] = {0};
+    bool got = false;
+    if (buf >= 0x1000u && buf != 0xCDCDCDCDu) {
+      unsigned char raw[128] = {0};
+      got = memL.ReadBytes(buf, raw, 128);
+      for (int i = 0; i < 128; ++i) {
+        const unsigned char c = raw[i];
+        if (c == 0) break;
+        text[i] = (c >= 32 && c < 127) ? static_cast<char>(c) : '.';
+      }
+    }
+    MCLA_LOG_WARN("LISTLINE sub_82188E50 #{} r3={:08X} r4={:08X} lr={:08X} "
+                  "read={} text='{}'",
+                  n, buf, ctx.r4.u32, static_cast<uint32_t>(ctx.lr), got ? 1 : 0,
+                  text);
+  }
+  __imp__sub_82188E50(ctx, base);
+}
+
 // Session 76g: census of the 13 preload-list global users â€” which runs?
 // (the global 0x827D7770 is never populated before the boot init reads it)
 PPC_FUNC_IMPL(__imp__sub_8268A828);
