@@ -10,6 +10,19 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+
+## 0z. State (2026-09-23 — TWO-TREE MERGE LANDED; supersedes every split-tree warning elsewhere)
+- `E:\mcla pc` is again the PRIMARY tree: source of truth for src+tools+docs+skills AND the only working
+  git repo. `C:\mcla-pc` is RETIRED to read-only archive (its live value was copied here; the frozen
+  provenance snapshot is `E:\mcla-c-snapshot-20260923`). Do not build or soak on C: anymore.
+- Historical note (how the split happened): the build had moved to C: on 09-21 when E: build/ rejected
+  new files; that relocation is now being reversed — see ACCEPTANCE GATE below for whether E: can build.
+- Provenance: src+tools from frozen snapshot (cmp-verified); gpu_device.cpp
+  true 3-way merge (base 4280c9d; both conflicts = convergent T41.3d/F-066 + F-063 fixes, C wording kept,
+  E-only gate census restored); ledger = C base with E's F-069/F-070 spliced before F-077; §2 gains the
+  ten T41.3g..n2 items below. Pre-merge E state: commit 35912f0.
+- ACCEPTANCE GATE (not yet done): the merged tree has never compiled. Configure + build on E:; if E:
+  build/ still rejects writes, fall back to a fresh build dir (`cmake -B build2`) and update this block.
 ## 0a7. State (verified 2026-09-20 21:31 — the RPF3 format reference is RECOVERED; F-074)
 
 - **`docs/MCLA_RPF3_Technical_Reference.txt` is back** (591 lines, from `82cb758`; destroyed by `5fbc08e`'s
@@ -1001,6 +1014,89 @@ link-errors (header fn left undefined).
 ## 3. File map (post-reorg; re-list before editing — hooks/ is in flight)
 
 `src/` root: boot_host, main, app, patches (registry only), **gpu_device.cpp ~11.5k lines (monolith, being split)**, gpu_cp, gpu_mmio, d3d12_backend, native_renderer, render_thread, renderer_mode, guest_memory, dispatch_guard, early_init, capture_hooks, frame_trace · `src/hooks/`: PPC_FUNC bodies from patches.cpp, now absorbing gpu_device (alloc_census ~94 KB+, LIVE) · `src/common/`: logging.h, cvar.h · `src/cpu/`: vmx128_pack, guest_thread.h, ppc_context.h · `src/fs/`: vfs_rpf · `src/rage/`: rage_asset_pipeline · `src/kernel/`: imports (Nt*/Ke*/Xam*), memory, heap+o1heap, xam (input), xdm, guest_thread · `src/renderer/`: xenos decode, shader IR→DXIL, caches · `src/apu/`, `src/user/` · `tools/validators/`: phase-gate exes · `generated/ppc_xenon/`: 176 TUs, INPUT ONLY · `build/`: mcla.exe, logs, `cache/mcla_pe.bin`.
+
+
+#### Merge 09-23 — C-side queue items restored from E:/mcla-c-snapshot-20260923
+
+### T41.3g — gate the real `.list` server (was T41.3f; T41.3f is VOID as a no-op — F-077)
+Gate `HostServeUiBody` (`src/gpu_device.cpp:568`) at its caller `XSF-POSTOPEN-SERVE` (`:10400`) and
+`XSF-OPEN-GATE` (`:10353`) on the `*.list`/`preload`/`globaltex` predicate, and delete the ineffective
+`:11030-11034` gate so exactly one mechanism serves list paths. Build + soak from **`C:\mcla-pc`**
+(`build_on_c.bat`, then `timeout 120 ./build/mcla.exe > build/w41b.log`), baseline = **`w41a.log`**
+(`C:\mcla-pcuild`), census = `python tools/soak_census.py build/w41b.log build/w41a.log`.
+
+
+### T41.3h — remove both list-path stand-ins and read the real TOC entry layout (F-078)
+`XSF-OPEN-GATE` (`src/gpu_device.cpp:10353`, ORs bit30 into `entry+8`) and the list branch of
+`HostServeUiBody` (`:473-485`, T41.3g) contradict each other: the same dword is consumed as flags and as
+the file offset. Delete/neutralise both, widen `TOC76-XSF` to 8 words with explicit `+0/+4/+8/+C` labels,
+and compare one `.xsf` entry (known-good, RSC5 at `0xA0000`) against one `.list` entry. Build+soak from
+`C:\mcla-pc` (`build_on_c.bat build`, then `timeout 120 ./build/mcla.exe > build/w41c.log`), baseline
+**`w41b.log`**. Keep T41.3g in place until then — it is measured neutral and removes a false signal.
+
+### T41.3i — census the read path on an open list handle (F-080); the open gate is void
+Add read-only logging on the packfile size/Read chain for `*.list` handles (handle, requested offset,
+requested size, bytes returned, and which branch produced them), rebuild and soak `w41e.log` from
+`C:\mcla-pc`, baseline **`w41d.log`**. Decide from that whether the member region is compressed-but-present
+(then decompress with the guest's own `sub_8244FF20`) or opaque (then it is a key problem, not an offset
+problem, and the queue must move to T40.6 step 3 — the Xenos register file — where `DRAW_INDEXED=0`
+actually is). Stand-ins already removed on this tree, each measured behaviour-neutral: the `rage_im`
+substitution for `star_glow` (T41.3d), the host serve of `*.list` bodies (T41.3g), the bit-30 open-gate
+write (F-080). New baseline chain: `w41a` → `w41b` (T41.3g) → `w41c` (layout dump) → `w41d` (gate deleted).
+
+
+### T41.3j — name the fatal that now stops the boot (F-082) and clear it for real
+`C0000005` is 0 on this tree, so stop treating the AV as the blocker: read the fatal line in
+`C:\mcla-pcuild\w41i.log`, and if it is `drawblit technique is old and busted` then the remaining
+work is supplying the real `star_glow`/rgxa body (T41.3d deleted the stand-in that faked it), not more
+register work. Baseline = `w41i.log`.
+
+### T41.3k — census the `fiDevice` list at `GETDEV #41-#43` (F-084 supersedes T41.3j)
+> **CLOSED 2026-09-23 by measurement (F-089, T41.3m).** The array is exonerated: `arr=C60B4E00 cnt=1 cap=16` is byte-identical across all 41 logged lookups, `sub_821CB488`'s device `vtable+4` (`sub_821CDB88`) strips the 11-char mount prefix and tail-calls the archive TOC lookup, and `w42a.log:4414-4467` prints that lookup answering `ret=00000000` for all three star_glow paths, twice each. There is no registry defect here — the file is not in the archive the game mounted. Successor: **T41.3n**.
+
+The shader fatal is `GETDEV` returning 0 for `a:/archive/fxl_final/star_glow.fxc` while the same array
+serves `a:/archive/textures/...` — so log the device array (entries, prefix lengths, mount owner) at that
+moment. Baseline = `w41i.log`, build/soak from `C:\mcla-pc`.
+### T41.3l — remove `HydrateShaderHashTable` under measurement (F-085 §4, F-086 §2)
+
+Delete `HydrateShaderHashTable` (`src/gpu_device.cpp:2054-2090`), its `s_factoryEntryPtrs` /
+`s_factoryEntryCount` state, the collection block in `PPC_FUNC(sub_8218B000)` and the `if (n == 10)` trigger.
+**Gate:** build from `C:\mcla-pc`, soak twice into new log names, and prove behaviour-neutral by diffing
+`DICT-HYDRATE` (11 → 0, expected), `DICTLOOKUP` (0 → 0), `TEXDICT-CALLER` (10 → 10), `GETDEV`/`BDF20` counts
+and the fatal block verbatim. If the fatal block changes in any way, **revert** — the removal is only justified
+as neutral cleanup, not as a fix. Do not bundle into a T41.3k run.
+
+### T41.3m — DONE (2026-09-23): uncap the archive census at the fatal's file → F-089 §4/§7
+`star_glow` added to the `TOC76` `hot` gate + a new uncapped read-only `TOC76-SG` line in
+`PPC_FUNC(sub_821CBFC0)`. Acceptance met: the six lines above exist, every gate marker is unchanged,
+and the fatal block is verbatim.
+
+### T41.3n — census the guest's own read of ONE preload-list body (F-089 §9)
+No log in project history has printed a list body. Target `shaders/effects/preload.list`, whose decrypted
+TOC entry is already in the baseline: `w41i.log:4405` `TOC76-LAYOUT #80 … +4=[00000170 00304E12 400000BC
+…]` (stored/expanded sizes per F-073). Steps: (1) census the guest's read path on that open handle —
+`RD-SUBMIT sub_8244F4C0` / `NFS-CENSUS[Read]` already show 32 KB reads at `off=0x300000`, so log the
+buffer the guest ends up holding and whether ASCII names appear; (2) if ASCII names appear, count how many
+`.fxc` names the list yields and re-run `TOC76-SG`-style uncapped lookups for those leaves to test whether
+the shader bodies are in `xarchive_cache.rpf` at all; (3) if they are absent, stop and escalate the
+content-policy question (which archive carries shader bodies — `AGENTS.md` permits only
+`xarchive_cache.rpf` + audio/music and forbids `mc4/art`) rather than mounting forbidden art.
+Baseline = `w42a.log`, build/soak from `C:\mcla-pc`. Gate: a list-body census line with ASCII names, or a
+recorded negative **from an uncapped printer**.
+
+### T41.3n2 — decompress one list member with the guest's own decoder, or prove it cannot (F-091 §1)
+The bytes are in guest memory at `C6137A80`/`C6147B00`/`C6157B80`/`C6167C00` (32 KB pages read at the
+member's `pos & ~0x7FFF`). Establish, log-only: (1) does the guest ever call `sub_8244FF20`
+(`XMemDecompress`) with `srcSz` in the 126-460 range, i.e. a list member? If not, find the guest site that
+*should* — `sub_821CCEA0`'s success path stores the entry at `dev+40+idx*68` and returns; the read submitter
+is `sub_8244F4C0`, so the consumer of a completed read is the next caller of the entry handle: census the
+`sub_821BE250`/`sub_821BE710`/`sub_821CC6F0` trio for a body/length pair and check whether any of them sees
+the 32 KB page or only the `legals.xsf` substitute (T41.3o). (2) Only once a real member body is in hand,
+test the LZX path by *reading* what the guest computes — never by inflating host-side and writing the
+result (do-not #9; F-075's length-vs-position lesson). Baseline = `w44c.log`, build/soak from `C:\mcla-pc`.
+**Gate:** a log line carrying `srcSz` in the member-size range and its destination, or a recorded negative
+from an UNCAPPED printer.
+
 
 ## 4. Do-not (each cost ≥1 session; carry forward)
 

@@ -23,14 +23,38 @@ superseding blocks, never rewrite another session's text (append-only), and neve
 
 ## Entry format (Part 3 of `docs/ROOT_CAUSE_VALIDATION.md`)
 
+The live format is an `###` heading plus five field lines (verified against
+`docs/ROOT_CAUSE_VALIDATION.md:1799`, `### F-089 — …`; ledger is at **F-089**, so the next ID is
+**F-090**). The old `**F-0NN — …** FACT | …` one-liner form is NOT what is in the file — grep
+`^### F-0` for real entries; the 56 `**F-0` hits are inline references inside other entries.
+
 ```
-**F-0NN — <short title>.** FACT | INFERENCE | FIX · <class A..I> · P0..P4.
-<claim, with the exact evidence: log file:line, raw file words, or file:line>
+### F-0NN — <the claim, as one sentence>
+
+- Task:        T## (and the wave log, e.g. `build/w43a.log`)
+- Type:        FACT | INFERENCE | FIX
+- Class:       A..I
+- Priority:    P0..P4
+- Evidence:    <log file:line · raw words from build/cache/mcla_pe.bin · src file:line>
+<body — one bold lead per item>
 ```
+
+**If a marker's printer is counter-capped (`n <= 40`, `(n % 250) == 0`), say so and say what the cap
+hides** — a zero from a capped printer is not a negative result (F-089 §6 lost a whole conclusion this
+way: `TOC76` stopped at #80, 1 ms before the lookups that mattered).
 
 Classification: A = recompiler/codegen, B = generated code computes wrong, C = guest ABI/pointer/
 endianness, D = kernel/runtime implementation, E = filesystem/device, F = GPU/shader translation,
 G = the game's own coded behavior, H = instrumentation artifact, I = insufficient evidence.
+
+**Numbering hole to know about (F-090 audit, 2026-09-23):** the live ledger has **no numbered entries
+between F-056 and F-077** — that week survives only as unnumbered prose at
+`ROOT_CAUSE_VALIDATION.md:1071-1166` (identical to `LEDGER-ADDENDUM.md` in the emergency backup), and
+seven F-numbers are cited *from `src/`* with no entry to resolve to (F-057 `gpu_cp.h:30`,
+F-058 `gpu_cp.cpp:828`, F-063 `gpu_device.cpp:11397`, F-066/067 `:11047`, F-073 `fs/vfs_rpf.h:18`,
+F-076 `vfs_rpf.h:20`). So **grepping for a cited F-number and finding nothing does NOT mean it was
+invented** — check that prose block and `C:\mcla-emergency-20260921-0112\` before calling a citation
+bogus, and never re-use an ID in the gap.
 
 Rules that make or break the entry:
 

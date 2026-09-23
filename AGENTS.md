@@ -10,8 +10,8 @@ Xbox 360 (Xenon) → PC emulator: XenonRecomp static PPC→C++ recompiler + D3D1
 2. `docs/HANDOFF_NEXT_AGENT.md` — live block + session ledger (what the last session actually saw).
 3. `docs/PROGRAM_GUIDE.md` on demand — §3 build/run gotchas, §4 guest image, §5 recompiler pipeline,
    §7 host short-circuit table, §9 log-marker inventory, §11 forbidden paths.
-4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-076` here;
-   **F-077…F-092 exist only in `C:\mcla-pc\docs\` (rule 6)** — check both before re-deriving a fact.
+4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-092` (whole again on
+   E: since the 09-23 merge; `C:\mcla-pc\docs` is archive only — see rule 6).
 
 Older status text anywhere else = trail, not truth. Pre-compression doc text: `git show 8f07a39:docs/<file>`.
 
@@ -34,14 +34,14 @@ re-measured. That is rule 13 in practice: *no claim without a log line, raw word
 5. **Concurrent sessions are normal.** Before building/booting: `tasklist | grep -iE "mcla|ninja"`
    and check the newest `build/*.log` is >2 min old (rule 11). Before writing a doc: check its
    mtime and add a dated superseding block rather than editing someone else's.
-6. **The tree is split in two (09-23).** `E:\mcla pc` has the only working git, but its `src/` and
-   `tools/` are up to 3 days stale: C: is newer in `gpu_cp.cpp` (has the register file + PM4 decode —
-   E: has neither), `patches.cpp` (C: deleted the refuted import-detour code), `fs/vfs_rpf.h` (C: has
-   the corrected compressed/encrypted RPF model), and the fixed `ppc_disasm.py` + `addr_owners.py`
-   live on C: only. `C:\mcla-pc` holds all post-`w38` logs (baseline chain to `w45b`) but no working
-   git. Docs split too: F-069/070 only on E:, F-077…F-092 only on C:. Before claiming anything
-   about GPU/patches/VFS/tool output, `diff -q` the file against `C:/mcla-pc/` — a claim measured
-   on one tree has no meaning for the other. **Never bulk-copy C:→E:**; merge is per-file.
+6. **E: is primary again (merged 2026-09-23, was rule-6's split-tree warning).** The C:\mcla-pc merge
+   landed: `src/`+`tools/` ported (gpu_cp register file, patches F-092 cleanup, RPF3 model, fixed
+   `ppc_disasm.py`+`addr_owners.py`), `gpu_device.cpp` 3-way-merged, ledger whole on E: (F-001…F-092),
+   §2 queue unioned, skills synced. Verified: merged tree **built clean on E: (`build_on_e.bat`, 11/11,
+   0 errors) and `w46.log` reproduces `w45b`** (C0000005 0, Fatal 2, GFx 3). `C:\mcla-pc` is retired
+   read-only archive; provenance snapshot `E:\mcla-c-snapshot-20260923`. Pre-merge state = commit
+   `35912f0`. Do not start building on C: again; if a file still differs from the snapshot, `diff -q`
+   before trusting either side.
 
 ## Project skills (`.qoder/skills/`) — use them, don't rediscover the gotchas
 

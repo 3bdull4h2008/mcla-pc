@@ -160,6 +160,20 @@ when. Answers: ledger F-001…F-035.
 - **Successor:** T5 ("remove hydration once INSERT works without it") stayed open on purpose;
   `DICT-HYDRATE` is still in tree (commit `3c8744e`).
 
+> **CORRECTION 2026-09-21 (F-085) — read before trusting Stages B/C/D below.** Raw-byte and log
+> measurement converted Phase 0's predictions into evidence. **Confirmed:** F-024's `0x82839F70`, decoded from
+> `3D608284` (`lis r11,0x8284`) + `3B8B9F70` (`addi r28,r11,-0x6090`) at VA `0x82188E5C`/`0x82188E60` inside
+> `sub_82188E50`; and Stage A's factory census. **Refuted:** Stage B's "empty hash table → `sub_82189138`
+> returns −1 → `star_glow` fatal" — `w38s.log:3975` shows `DICTLOOKUP-OK … slot=10`, a *success*, followed by a
+> *different* fatal, and `w41i.log` shows `sub_82189138` called **0 times** while the same fatal occurs, so the
+> dictionary lookup is not on the fatal path. **Refuted:** Stage D's "fatal ABSENT". The only log that ever got
+> past `star_glow` did so because the host served the `rage_im.fxc` body (5,258 B) in answer to `star_glow`
+> requests (`w38s.log:3848`, `:3860`) — a do-not #9 fabrication, since removed by T41.3d
+> (`src/gpu_device.cpp:11030`, `AFB76-MISS-HONEST`). **The present tree is not regressed, it is honest; do not
+> restore that frontier.** Stage C's `HydrateShaderHashTable` runs identically on both trees and writes ten
+> `0xA002xxxx` objects whose +4 word is `00000000` and whose names are empty — no measured effect. Full
+> evidence: `ROOT_CAUSE_VALIDATION.md` **F-085**.
+
 # PHASE 1 — IO completion gap / streaming stall — **CLOSED (09-13)**
 
 - **Ground-truth correction (F-030):** the Phase-1 §0 claim "the IO slot never completes" is
@@ -177,6 +191,22 @@ when. Answers: ledger F-001…F-035.
   string was located (F-035: `"memory:$%p,%d,%d:%s"` @ `0x82012A28`, `"memory:"` @ `0x820127D8`).
 - **Output of this phase = the Phase-2 brief** (below): hunt the fetch armer and the CDCD
   marathon, not more IO hooks.
+
+> **CORRECTION 2026-09-21 (F-086) — A-capsule and Phase 1 re-measured.** **Confirmed by raw bytes:**
+> A2's "vtable+4 = `sub_821CAFB8`" (words at `0x82012918` are `821CAE50 821CAFB8 …`, preceded by RTTI
+> `820DDDC8 821D61F8`); F-035's two `memory:` literals; F-033's mount census (exactly 2 `MOUNT76`, both
+> `a:/archive/`, both `lr=821CBF54`); F-031 (TOC76 reaches #80, no `#22` hang). **Refuted:** A2's wrapper
+> `sub_8218C9D8` — 0x1000 bytes of its body contain no `lis` that can form any of the four `embedded:/`
+> literals; the real builders are `sub_82189138`+0xA8, the device vtable's slot 0 `sub_821CAE50`+0x20, and
+> `sub_821CB488`+0x3C, and the measured caller of `sub_821BDF20` on the shader path is `sub_8218C760`
+> (`lr=8218C7F4`). The `memory:`-only test is real but lives in **`sub_821CB488`** (7-byte compare against
+> `0x820127D8`), not in `sub_821CAFB8` — so the "resource handler lookup returns NULL" wording in
+> `src/gpu_device.cpp:2042` is false. **Void citation:** F-030's `40004D7C` occurs **0 times** in the image;
+> both hot `lr` sites are `bl 0x827BD5A4` = `KeWaitForSingleObject` followed by an `lwarx/stwcx.` refcount
+> release, hit 13,237× per boot — F-030's conclusion survives, its label "GPU-worker tick" does not.
+> **Answered (A5 Q3):** `sub_8218C650` is not a function; it is `sub_8218C638 + 0x18`. **Superseded:** F-034's
+> "no `memory:` device is ever registered" — device `0x827D838C` is returned for every `embedded:/` GETDEV.
+> Full evidence: `ROOT_CAUSE_VALIDATION.md` **F-086**.
 
 # PHASE 2 — de-park the boot (CDCD fill marathon, executor fetch, TLS truth) — **CLOSED**
 

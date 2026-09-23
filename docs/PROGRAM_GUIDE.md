@@ -1,5 +1,7 @@
 # MCLA-PC PROGRAM GUIDE
 
+
+
 Stable knowledge (build/run, arch, census, cheat sheets, rules). Queue:
 `LONG_TODO_MASTER.md`; frontier: `HANDOFF_NEXT_AGENT.md` top. Compressed
 2026-09-20; full text `git show 8f07a39:docs/<file>`. `docs/` is gitignored:
@@ -119,6 +121,35 @@ raw bl-scan found 4. Generated TUs = other ground truth.
   (`patches.cpp:441`, `imports.cpp:2818-2873`): dump + `ExitProcess(0x80000003)`;
   slot `0x82130678` is real (F-007). **Task-join table:** cnt `0x8283D1A8`,
   entries `0x8283D1C4`, stride 28, wait = `entry+12`.
+
+## §7-ADDENDUM (2026-09-23, F-091 §7) — guest-affecting mitigations registered NOWHERE (read first)
+
+The table below still lists 13 entries; `src/` currently carries **80** mitigation-shaped labels, and
+**135 guest-affecting lines per 120 s soak** belong to mitigations that are in neither this section nor
+`tools/soak_census.py`'s tracked list. Fire counts are from `build/w43a.log`.
+
+| label | site | effect on the guest | fires |
+|---|---|---|---|
+| `BE710-SLOT` | `src/gpu_device.cpp:11484` | answers a device Read from the host slot table, `ctx.r3=served/4; return` — `__imp__sub_821BE710` never runs | 49 |
+| `XSF-POSTOPEN-SERVE` | `:10450` | registers a host-served body and publishes its size into guest memory (`:10470` writes `[tocEntry+4]`) | 31 |
+| `P5-PHYS` | `src/task_dispatch_trace.cpp:606` | "already physical, skip fatal": `ctx.r3=0; return` | 24 |
+| `JOB2-PKG-SERVE` | `src/gpu_device.cpp:6765` | host inflates the job-2 package and returns without running `sub_821D5E10` | 22 |
+| `PKG-SUBST` | `:562` | substitutes a host package body for the TOC offset (`Alloc` + `WriteBytes` into guest) | 19 |
+| `P10-GATE` | `src/task_dispatch_trace.cpp:855` | rebase-map miss → `ctx.r3=0; return` (delta 0) | 17 |
+| `BE250-SLOT` | `src/gpu_device.cpp:11436` | slot-table read serve (same shape as `BE710-SLOT`) | 25 |
+| `FDA90-GATE` | `src/task_dispatch_trace.cpp:380` | skips a fixup dispatch (`return`) | 12 |
+| `(dev,handle)` served-body fallback | `src/gpu_device.cpp:668-690` | **loose match returns one file's body for another** — offers `legals.xsf` as the body of all five `shaders/*/preload.list` (`BE8D8-PACK #2-#6`) | 5 |
+| `W30-ARR-FIX` / `W31-ARR-FIX` / `PLACE-ARR-PRE` / `PLACE-ARR-FIX` | `:4465` / `:4720` / `:8971` / `:8981` | rewrite guest child arrays (incl. a synthesised array at hard-coded `0xB7B41000`) then call the guest place | 2/1/1/1 |
+| `D2308-INS-SKIP` | `:8348` | skips the guest's `EmbeddedListInsert` name registration | 2 |
+| `AFB76-HIT` | `:11039` | serves a body straight out of guest `.data` (legitimate for `rage_im`; sets `ctx.r3`, guest open not run) | 1 |
+| `FATAL-SOFT` / `FATAL-SOFT-RESOURCE-PARK` | `src/kernel/imports.cpp:2990` / `:3010` | a guest `Fatal` is soft-parked (`return`), so the window survives and the boot "continues" | 2 / 1 |
+| `READWRAP-SERVE` | `src/gpu_device.cpp:9818` | credits a refill + `ctx.r3=…; return` (no `__imp__sub_821CC6F0`) | 1 (`w42a` 0) |
+| `INFLATE-J2-WIN-CONT-SKIP` | `:7354` | abandons the guest's continuation walk | 1 |
+
+Registered-but-dead (§7 names them, they fire 0×): `INFLATE-SKIP`, `INFLATE-EMPTY`, `TEXCREATE-SC`,
+`SLOT-READY`, `BLIT-OOB-GUARD`. §7 entries that are prose rather than labels (so no tool can verify them):
+`SEH o1heap`, `pow2 align`, `NtReleaseSemaphore` "Wait-like resolve". `DICT-HYDRATE` is registered without
+its second printer at `:2087`. Full measurement: ledger **F-091 §7**.
 
 ## 7. Short-circuits in tree (life-support — do not stack more without root cause)
 
