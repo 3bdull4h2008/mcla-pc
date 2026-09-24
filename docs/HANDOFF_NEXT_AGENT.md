@@ -1,3 +1,23 @@
+## 2026-09-24 ~14:55 - **F-161 (commit `818c158`, pushed): step 2 of the slot-release work is REFUTED by measurement and reverted - `w168`/HEAD is the frontier again**
+
+- Extending F-160's release to the **read** sites (`sub_821BE250`/`sub_821BE710`, at the exact moment
+  `slot pos >= size` - F-135 tier-1's own condition) was built and soaked as `w169`: `Fatal error 0→2`,
+  `FATAL-SOFT 0→3`, fatal-shaped lines `37→5,946`, `INFLATE 358→168`, `[error] 42→61`, while
+  `LISTLINE 171` / `TYPINIT 1` / `GETDEV 694` / `CP-DRAW 166` / `DRAW_INDEXED 0` did not move at all.
+- **Why:** `SLOT-RECYCLE-SHARED` legitimately hands the same index to consecutive bodies (all of them
+  are described by the one shared static `kMemStreamSlot`), so a slot that reads as "consumed" IS the
+  slot another live handle is still aliasing - `w169` shows 6 of 12 releases hitting recycled `h=15`.
+  The copy-out site stays the only provable-dead point (the bytes are already in `dst`).
+- **So the retirement order is fixed:** remove the `kMemStreamSlot` shared-static aliasing so each
+  body owns a distinct slot, *then* release on consumption, *then* F-135/F-135b can go. Releasing
+  better cannot do it. The 16-entry bound is the guest's own (decoded at `0x821CB2B0`-`0x821CB2BC`),
+  so widening the table is not an option either.
+- **State:** `src/gpu_device.cpp` is comment-only vs the F-160 commit and the rebuild is byte-size
+  identical to the `w168` binary (97542144 B), so `w168` remains the measured frontier - no soak
+  burned re-proving it. Census tracks 136 markers; ledger to F-161.
+- **Still open from the 14:40 block:** F-159's refutation of B4's premise stands (the guest submits no
+  geometry at this frontier), and the user has not yet re-approved the change of means.
+
 ## 2026-09-24 ~14:40 - **F-160 (commits `1f1f653`, pushed): the slot-release mechanism is found, decoded and now used - and the frontier is unchanged, which is the honest part**
 
 - `sub_821CB2A0` decoded from raw words: rejects `h<0 || h>=16` (**the 16-entry bound is the guest's
