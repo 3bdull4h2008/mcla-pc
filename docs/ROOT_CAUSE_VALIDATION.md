@@ -3130,3 +3130,27 @@ So the serve **advances** the guest past everything the frontier does and stops 
 **(4) Consequence for B4, stated plainly.** Getting to `DRAW_INDEXED >= 1` needs effect bodies whose header validates, i.e. the **transform** applied to `.fxc`/effect members the way F-105's expansion applied to `.list` members — not more host-written words. Next concrete step (T41.10, census first, no behaviour change): print the first 32 bytes + an ASCII rendering of one served effect body (the `BE8D8-PACK … head=[…] ascii='…'` pattern already exists for list bodies) and decide whether the bytes are raw DEFLATE (then `MarkMemberExpanded` covers them the way it covers the three list spans) or a genuinely different container. Pass condition for that step: a body that begins `rgxa` after the host's own pipeline, with `kBe710MagicWrite = false` and the frontier markers intact.
 
 **(5) Restore note.** `kBe710MagicWrite` is back to `true` and rebuilt; the committed binary is therefore semantically identical to `w128`'s build (same constexpr value, only a comment differs), and `w128` is that configuration's soak evidence (`LISTLINE 167`, `Fatal error 0`, `C0000005 0`).
+
+### F-129 — **What the rage-effect gate is actually handed: a shader *name list* read from the middle of a string, and undecrypted archive bytes whose first 8 bytes repeat across two different members. Two named host defects, both upstream of `DRAW_INDEXED`.**
+
+- Task:        T41.10 (B4 feed), `build/w132.log` (new read-only `BE710-BODY` census; frontier confirmed equal to `w128`) vs baseline `build/w128.log`
+- Type:        FACT (the transform question is answered; F-128 §4's open question closes) + committed census, no behaviour change
+- Class:       E (archive serve path)
+- Evidence:    `w132` `BE710-BODY` for the six earliest gated reads —
+
+```
+#68 sbuf=C9DC6100 size=3170  [696D6541 6C706861 2E66780D 0A556E6C …] 'imeAlpha.fx..UnlitRuntimeColor.f'
+#69 sbuf=C9DD7480 size=16482  [ED5B0F70 14E7757F DFEEDE3F E9905620 …] high entropy
+#70 sbuf=C9DEF800 size=3125   [95564D6C 1B55109E 5DC78E7F D68E5322 …] high entropy
+#71 sbuf=C9E00B80 size=20882  [ED5C0D70 1BC7757E 7B3FC01D F807CA94 …]
+#72 sbuf=C9E18F80 size=19328  [ED5C0D70 1BC7757E 7B7700EE 008A0465 …]   ^ same first 8 bytes as #71
+#73 sbuf=C9E31380 size=14981  [ED5B0D8C 54D7753E F7BD377F BBC3EE5B …]
+```
+
+**Defect 1 — the candidate offset is inside a name table.** The body that the rage-effect gate validates (`#68`, the read whose word our mitigation stamps) begins mid-string: `'imeAlpha.fx' CRLF 'UnlitRuntimeColor.f…'`. So the 3,170-byte member the host delivered is *name-list text*, sliced from a point that is not a record start — and `HostServeUiBody`'s only sanity filter on a candidate is `be != 0 && be != 0xCDCDCDCD && be != 0xFFFFFFFF`, which any text or ciphertext word passes. `XsfOffsetCandidates` can therefore return a body that is the wrong file's bytes at the wrong offset, and nothing in the pipeline notices (this is the same family as F-053's "one file's body for another", now caught by content instead of by inference).
+
+**Defect 2 — the archive members are not decrypted.** `#71` (20,882 B) and `#72` (19,328 B) are different members with the **identical first 8 bytes** `ED5C0D70 1BC7757E`, and all five non-text bodies are high-entropy with no zlib header (`78 9C/01/DA`). Compression does not reproduce an 8-byte prefix across unrelated payloads; a keystream/XOR with the same nonce does. So what the host VFS hands the guest for these members is still encrypted/undecoded image data — while the three `.list` spans that F-105's `MarkMemberExpanded` mechanism covers do come out as plaintext. Coverage of that expansion, not the read position, is the gap: F-128 §4's question is answered as "both a wrong candidate and a missing decode", and the missing decode is the one that affects every non-list member.
+
+**Frontier check for the census.** `w132` vs `w128`: `C0000005 0`, `Fatal error 0`, `FATAL-SOFT 0`, `GETDEV 694`, `TOC76 2,079`, `DISCCHK2 41`, `CP-DRAW 166`, `PRESENT 34`, `PRESENT-FB 4`, `NATIVE-PRESENT 4`, `GFx 3`, `[error] lines 15`, `CP truth drains=8 pub=11 put=11`, `LISTLINE 167` — all equal, so the census is observationally neutral (unlike F-125's hook, which was not).
+
+**Next (T41.11), with the pass condition stated.** The gate's pass condition is unchanged and now mechanical: with `kBe710MagicWrite = false`, a body whose first word is `0x61786772` must appear from the host pipeline. Two candidate moves, in the order the evidence supports: (1) make `HostServeUiBody`'s candidate acceptance *content-based* rather than sentinel-based — for a member the guest opens as an effect/rage container, require the container magic, and log the reject (`-BLOCKED`-style) so a wrong candidate cannot silently ship; (2) find the decode the `.list` spans get and are missing elsewhere — the `ED5C0D70 1BC7757E` repetition is the fingerprint to chase (a fixed keystream start means the key/nonce is constant per archive, so the guest's own decryption routine, reachable by `tools/ppc_xrefs.py find-str` on the archive header strings, is where to look). Do not stack a host-written word on top of either: F-128 proved that word is what currently hides this layer from us.

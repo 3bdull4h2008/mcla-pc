@@ -12350,6 +12350,25 @@ PPC_FUNC(sub_821BE710) {
                       "dst={:08X} dstWordNow={:08X} magic={:08X} r5words={}",
                       n, obj, s_lastMemStream, sbuf, ssize, pos, head, atPos,
                       ctx.r4.u32, dstNow, 0x61786772u, ctx.r5.u32);
+        // T41.10 (read-only): is the served body raw DEFLATE, ciphertext, or a
+        // container this guest simply never validated? The head word says little
+        // without the surrounding bytes, so print 32 of each the way
+        // BE8D8-PACK does for list bodies.
+        static std::atomic<uint32_t> s_bodyDumped{0};
+        if (s_bodyDumped.fetch_add(1) < 6u) {
+          uint8_t raw[32] = {0};
+          char vis[33] = {0};
+          if (mem2.ReadBytes(sbuf, raw, sizeof(raw))) {
+            for (int k = 0; k < 32; ++k)
+              vis[k] = (raw[k] >= 32u && raw[k] < 127u) ? (char)raw[k] : '.';
+          }
+          std::string hexb;
+          for (int k = 0; k < 32; ++k)
+            hexb += fmt::format("{:02X}{}", raw[k], (k % 4 == 3) ? " " : "");
+          MCLA_LOG_WARN("BE710-BODY #{} sbuf={:08X} size={} bytes=[{}] "
+                        "ascii='{}'",
+                        n, sbuf, ssize, hexb, vis);
+        }
       }
       // MITIGATION, load-bearing (F-127): the guest's rage-effect gate at
       // sub_8218C760 reads ONE word through sub_821BE710 and requires it to be
