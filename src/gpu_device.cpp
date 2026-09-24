@@ -10432,6 +10432,128 @@ PPC_FUNC(sub_82187820) {
 // (lr=82189234/82189248 inside sub_82189138) with 'embedded:/star_glow' and the
 // bare name at 0x82040F0C — never from the loader, because its line loop is
 // never entered (see F-104 for the stream-binding reason).
+// CORRECTED by F-107/F-109: with the archive-level expansion in place the loader
+// DOES enter its line loop and this prints 77 real names from
+// shaders/city/preload.list. F-104's stream-binding reason is superseded (F-105).
+PPC_FUNC_IMPL(__imp__sub_823DB730);
+// T41.3u (F-109 follow-on) census, log-only. sub_823DB730 is a case-folding
+// backward string scan (`addi -1`, `lbzu`, `ori 0x20` on A-Z, `subf` result) —
+// i.e. the loader's per-line token/extension test, called twice at the loop head
+// 0x82187928/0x8218793C where r3==0 selects whether 0x82187948..0x82187954 (NUL
+// terminator + the line hand-over) run at all. Four of the five lists never
+// reach the read, so print the operands and the result — filtered to calls from
+// inside the loader, or this would swamp the log.
+PPC_FUNC(sub_823DB730) {
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (lr < 0x82187820u || lr >= 0x82187A00u) {
+    __imp__sub_823DB730(ctx, base);
+    return;
+  }
+  static std::atomic<uint32_t> s_sc{0};
+  const uint32_t n = s_sc.fetch_add(1) + 1;
+  const uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32;
+  auto &memS = mcla::kernel::GuestMemoryHeap::Instance();
+  auto peek = [&memS](uint32_t a, int back) {
+    std::string s;
+    if (a < 0x1000u || a == 0xCDCDCDCDu)
+      return std::string("<bad>");
+    const uint32_t at = a - static_cast<uint32_t>(back);
+    unsigned char raw[32] = {0};
+    if (!memS.ReadBytes(at, raw, 32))
+      return std::string("<unread>");
+    for (unsigned char c : raw)
+      s += (c >= 32u && c < 127u) ? static_cast<char>(c) : (c ? '?' : '.');
+    return s;
+  };
+  __imp__sub_823DB730(ctx, base);
+  if (n <= 120)
+    MCLA_LOG_WARN("DB730-LOADER #{} r3={:08X}['{}'] r4={:08X}['{}'@-24] "
+                  "ret={:08X} lr={:08X}",
+                  n, a3, peek(a3, 0), a4, peek(a4, 24), ctx.r3.u32, lr);
+}
+
+// T41.3u3 (F-109 follow-on), log-only: the loader's setup ends with
+// `bl 821CA490` at 0x8218789C and takes `mr r31,r4` at 0x821878A8 — and r31 is
+// what the line loop tests at 0x82187900 (`cmpli r31,0` → skip the NUL-terminate
+// + hand-over at 0x82187948..0x82187954 for every chunk). In w90/w91 the ui/cars/
+// effects groups read chunks yet never hand one over and never even reach the
+// token compare, which says their r31 was 0. Print this call's argument and both
+// returns, filtered to the loader's site.
+PPC_FUNC_IMPL(__imp__sub_821CA490);
+PPC_FUNC(sub_821CA490) {
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (lr != 0x821878A0u) {
+    __imp__sub_821CA490(ctx, base);
+    return;
+  }
+  static std::atomic<uint32_t> s_gs{0};
+  const uint32_t n = s_gs.fetch_add(1) + 1;
+  const uint32_t a3 = ctx.r3.u32;
+  __imp__sub_821CA490(ctx, base);
+  if (n <= 40)
+    MCLA_LOG_WARN("A490-LOADER #{} self={:08X} -> r3={:08X} r4={:08X} r5={:08X} "
+                  "(r4 is the loop gate)",
+                  n, a3, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+}
+
+// T41.3u2 (F-109 follow-on) census, log-only: the loader's per-line read is
+// `bl 821CFAA8(r3 = stream obj at r1+208, r4 = line buf, r5 = 128)` at
+// 0x82187964, and r3==0 exits the loop at 0x821878F0. Four of the five lists
+// deliver plaintext bodies yet never produce a line, so dump the stream object
+// and the return for reads issued from inside the loader.
+PPC_FUNC_IMPL(__imp__sub_821CFAA8);
+PPC_FUNC(sub_821CFAA8) {
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (lr < 0x82187820u || lr >= 0x82187A00u) {
+    __imp__sub_821CFAA8(ctx, base);
+    return;
+  }
+  static std::atomic<uint32_t> s_rd{0};
+  const uint32_t n = s_rd.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32, dst = ctx.r4.u32, cnt = ctx.r5.u32;
+  auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t f[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int k = 0; k < 8; ++k)
+    (void)memR.ReadU32BE(obj + k * 4u, &f[k]);
+  // F-110 candidate test: word[3] is the stream wrapper (0x82860C40 family) and
+  // word[5] looks like the memory-stream slot our MakeMemoryStream returned.
+  // Dump that slot's {buf,size,pos,flag} (guest slot table @0x82860740, 16 B per
+  // slot — kGuestSlotTable) so "the slot was consumed by the first of the two
+  // opens" is answered by the soak instead of by argument.
+  uint32_t s[4] = {0, 0, 0, 0};
+  const uint32_t slotBase = 0x82860740u + (f[5] < 16u ? f[5] * 16u : 0u);
+  for (int k = 0; k < 4; ++k)
+    (void)memR.ReadU32BE(slotBase + k * 4u, &s[k]);
+  uint32_t wdev = 0, whandle = 0;
+  (void)memR.ReadU32BE(f[3], &wdev);
+  (void)memR.ReadU32BE(f[3] + 4u, &whandle);
+  // F-110: sub_821CFAA8 turns out NOT to be a stream reader — its own body
+  // compares a char against 32/9/10/13/0, i.e. it splits the NEXT TOKEN out of
+  // the caller's buffer (r1+80) and returns its length. So the dead groups'
+  // question is simply what that buffer held; print it at entry.
+  char bufvis[65] = {0};
+  {
+    unsigned char braw[64] = {0};
+    if (dst && memR.ReadBytes(dst, braw, 64)) {
+      for (int k = 0; k < 64; ++k) {
+        const unsigned char c = braw[k];
+        if (c == 0)
+          break;
+        bufvis[k] = (c >= 32u && c < 127u) ? static_cast<char>(c) : '?';
+      }
+    }
+  }
+  __imp__sub_821CFAA8(ctx, base);
+  if (n <= 60 || (n % 100) == 0)
+    MCLA_LOG_WARN("CFAA8-LOADER #{} obj={:08X} words=[{:08X} {:08X} {:08X} "
+                  "{:08X} {:08X} {:08X} {:08X} {:08X}] dst={:08X} cnt={} "
+                  "ret={:08X} lr={:08X} | wrap@{:08X}=[{:08X},{:08X}] "
+                  "slot[{}]=[{:08X} {:08X} {:08X} {:08X}] buf='{}'",
+                  n, obj, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], dst,
+                  cnt, ctx.r3.u32, lr, f[3], wdev, whandle, f[5], s[0], s[1],
+                  s[2], s[3], bufvis);
+}
+
 PPC_FUNC_IMPL(__imp__sub_82188E50);
 PPC_FUNC(sub_82188E50) {
   static std::atomic<uint32_t> s_lineN{0};
@@ -10824,7 +10946,7 @@ PPC_FUNC(sub_821CBFC0) {
     // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
     // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
     // is the open question, not the transform. See F-105.
-    constexpr bool kExpandListInArchive = false;   // ON => w80..w88 branch, see F-109
+    constexpr bool kExpandListInArchive = false;   // ON => w80..w95 branch, see F-110
     if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
         w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
       mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);
