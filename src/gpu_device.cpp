@@ -12640,6 +12640,53 @@ PPC_FUNC(sub_821CFE80) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// F-150 CENSUS ONLY (read-only; rule 4 checked first: addr_owners --check
+// 0x821BE568 → only ppc_func_mapping.cpp:3836, no owner).
+// w160's single C0000005 (which F-149's entity.type expansion exposed) is
+// sub_821BE568 - a buffered-stream Seek - executing loc_821BE5D0:
+//   lwz r3,0(r31) ; lwz r4,4(r31) ; lwz r11,0(r3) ; lwz r10,44(r11) ; bctrl
+// i.e. it loads the DEVICE out of [stream+0], the HANDLE out of [stream+4], and
+// dereferences the device's vtable. The fault context matches that instruction
+// exactly (r3=0 from [stream+0], r4=0 from [stream+4], lr=0x821BE5F4 = the bctrl
+// site, faulting guest address 0). So the stream object is live but unbound -
+// the same dead-wrapper shape F-122 fixed for the READ path (sub_821BE250),
+// which this Seek path has no equivalent for. r14-r31 are host locals
+// (F-113), so the VEH dump cannot name r31; print it here, with the object's own
+// buffered fields, but only for objects that are actually unbound so the marker
+// stays rare enough to read.
+PPC_FUNC_IMPL(__imp__sub_821BE568);
+static std::atomic<uint32_t> s_hSeekDead{0};
+PPC_FUNC(sub_821BE568) {
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t pos = ctx.r4.u32;
+  const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
+  bool dead = false;
+  uint32_t dev = 0, h = 0, cur = 0, en = 0, cap = 0;
+  // Seek is a hot path, and F-125 says a census that perturbs timing is not
+  // citable: pay exactly one checked read per call, and only resolve the rest of
+  // the object for the rare unbound case.
+  if (obj && obj != 0xCDCDCDCDu) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(obj + 0, &dev);
+    dead = (dev == 0u || dev == 0xCDCDCDCDu || dev == 0xFFFFFFFFu);
+    if (dead) {
+      (void)mem.ReadU32BE(obj + 4, &h);
+      (void)mem.ReadU32BE(obj + 24, &cur);
+      (void)mem.ReadU32BE(obj + 28, &en);
+      (void)mem.ReadU32BE(obj + 32, &cap);
+    }
+  } else {
+    dead = true;
+  }
+  if (dead && s_hSeekDead.fetch_add(1) < 24) {
+    MCLA_LOG_WARN("SEEK-DEAD obj={:08X} dev={:08X} h={:08X} cur={} end={:08X} "
+                  "cap={:08X} seekto={:08X} lr={:08X}",
+                  obj, dev, h, cur, en, cap, pos, lrIn);
+  }
+  __imp__sub_821BE568(ctx, base);
+}
+
 // Stream read: [obj+0] must be a live device. Dead wrapper â†’ serve bytes from
 // the wrapper fields ourselves (MakeMemoryStream layout) so factory reads get
 // real data instead of -1 (which cascaded into AF68's cap=-1 AV).

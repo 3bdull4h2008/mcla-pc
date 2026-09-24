@@ -3825,3 +3825,53 @@ registration stops there. **`C0000005 0` is the invariant this breaks, and it is
 the next thing to root-cause** - not paper over: `r3=r4=r5=0` at entry to that
 block says the caller passed nothing, so the question is which caller handed a null
 to the read of the now-parseable `entity.type` body.
+
+### F-151: the AV F-149 exposed is **our own Open contract** - `sub_821CAFB8` returns a slot *index* where this caller dereferences a stream *object*
+
+`w161` (read-only `SEEK-DEAD` census on `sub_821BE568`, `src/gpu_device.cpp:12660`-ff, one
+checked read per call) catches the whole failure in four lines at 13:04:11.351:
+
+```
+BE0C8 #179 r3=8EFF1750[6D656D6F] r4=827D838C[82012918] vt+4=821CAFB8 pth='memory:$CE83A580,11487,1:unavailable' r5=1 lr=821BE988
+SLOT-RECYCLE #6 idx=1 took buf=CE83A580 size=11487 from exhausted slot (pos>=size)
+BE0C8-RET stream=00000001 buf=CE83A580 size=11487
+SEEK-DEAD obj=00000001 dev=00000000 h=00000000 cur=0 end=00000000 cap=00000000 seekto=00000000 lr=82191100
+```
+
+Chain, all resolved from `build/mcla.map` (same link, F-120) and `generated/**`:
+`sub_821864C0+0x71 -> sub_82192448+0x2E8 -> sub_82191040` whose body is
+`sub_821CA6A8(mgr,name,'type',0,1)` -> `sub_821BE8D8` (load-whole-file) -> keep the return in
+`r31` -> `sub_821BE4F0(r31)` (a resource-type code; 26 = the text/reader branch) -> **else**
+`sub_821BE568(r31, 0)` (Seek) -> `loc_821BE5D0: lwz r3,0(r31) / lwz r4,4(r31) /
+lwz r11,0(r3) / lwz r10,44(r11) / bctrl` -> **r3 = [stream+0] = 0** -> fault on guest 0.
+
+The "stream" is `1` because `PPC_FUNC(sub_821CAFB8)` (`src/gpu_device.cpp:11946`-ff) - the
+memory/embedded device **Open**, vtable `0x82012918+4`, which `sub_821BE0C8` calls - ends with
+`ctx.r3.u32 = MakeMemoryStream(kMemDeviceObj, buf, size)` and `MakeMemoryStream`
+(`src/gpu_device.cpp:11782`-ff) deliberately **returns the slot index** ("the guest treats an
+open handle as a slot index - return the INDEX", the F-132/F-135 fix). So two different guest
+callers of the same Open want two different shapes:
+
+* `sub_821BE8D8`'s `vt+56` GetSize path wants a slot index (that is what F-134/F-135 fixed, and
+  it is why `LISTLINE` is 171);
+* `sub_82191040`/`sub_821BE568` want a stream **object** it can do `[obj+0]`/`[obj+4]` on.
+
+F-122's read hook hides the mismatch for `Read` (`MemoryStreamServeRead` serves from the
+wrapper fields when `[obj+0]` is dead); **Seek has no such equivalent**, so the index is
+dereferenced. It only fires now because F-149's expansion let `entity.type` parse far enough to
+reach this load.
+
+**Fix under test (next soak).** Make the object and the index agree instead of choosing between
+them: fill the shadow wrapper at `kMemStreamSlot` in the *guest-native* shape
+(`+0 = kMemDeviceObj`, `+4 = slotIdx`, `+8 = buf`, `+24 = cur`, `+28 = end`, `+32 = cap` -
+`EnsureMemoryDeviceVtable()` already installs `+44 = sub_821CB2A0` Seek on that vtable) and
+return that address from `sub_821CAFB8` **only** on the `sub_821BE0C8` re-open (gate
+`lr == 0x821BE988`), leaving every other open on today's index contract. Pass condition, stated
+before running it: `SEEK-DEAD` 1 -> 0, `C0000005` 1 -> 0, `TYPINIT` 1 -> more lines with
+`TYPINIT-RET r3 != 0`, `LISTLINE 171` and `RD-SUBMIT 24` held, and `Fatal error 0` /
+`FATAL-SOFT 0` not bought back by a new fatal. If `LISTLINE` or `BE8D8` regresses, the change is
+reverted, not tuned.
+
+**Frontier.** w161 = w160 on every marker (`RD-SUBMIT 24`, `LISTLINE 171`, `Fatal error 0`,
+`FATAL-SOFT 0`, `SHGRP-VARS 0`, `DRAW_INDEXED 0`, `C0000005 1`, `VEH-NEUTRAL 1`, `TYPINIT 1`,
+`REALIZE-CAST 1`) - the `SEEK-DEAD` census is measurement only.
