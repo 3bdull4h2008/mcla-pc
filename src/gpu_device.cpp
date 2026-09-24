@@ -12106,6 +12106,15 @@ PPC_FUNC(sub_821BDF20) {
 // (the exact contract of the tail's BE0C8-RET path).
 PPC_FUNC_IMPL(__imp__sub_821BE8D8);
 static std::atomic<uint32_t> s_hBE8D8{0};
+// F-162: latched around the single sub_821BE8D8 call whose caller dereferences
+// the return value. sub_82191040 does `mr r31,r3` after this call
+// (generated/ppc_xenon/ppc_recomp.10.cpp:10912-10993) and then passes r31 to
+// sub_821BE4F0 / sub_821CF7B8 / sub_821BE610 / sub_821BE568 as a stream OBJECT,
+// while every other caller stores the value as a slot handle - which is precisely
+// why F-153/F-155/F-156's blanket object return at sub_821BE0C8 lost ground (it
+// re-shaped all 179 re-opens). w170's caller tally shows this caller runs exactly
+// once per boot: BE8D8-CALLER #4 lr=82191070 first at n=190.
+static bool s_reopenWantsObject = false;
 PPC_FUNC(sub_821BE8D8) {
   const uint32_t n = s_hBE8D8.fetch_add(1) + 1;
   EnsureMemoryDeviceVtable();
@@ -12123,6 +12132,50 @@ PPC_FUNC(sub_821BE8D8) {
       obj == 0x7E780000u)
     MCLA_LOG_WARN("BE8D8 #{} obj={:08X} dev={:08X} vt={:08X} h={:08X} lr={:08X}",
                   n, obj, dev, vt, h, lr);
+  // F-162 census: WHICH callers reach this function. The predicate above only
+  // ever showed lr=8218C804, and sub_82191040 - the caller whose `mr r31,r3`
+  // makes this return value a stream object at four later sites (F-157) - lands
+  // outside that window, so its attribution could be neither confirmed nor
+  // refuted from the log. Tally by caller, print each caller once when it first
+  // appears, and print the whole tally every 200 calls. Log-only.
+  {
+    struct Caller {
+      uint32_t lr;
+      std::atomic<uint32_t> n;
+    };
+    static Caller s_tally[12] = {};
+    int found = -1, freeSlot = -1;
+    for (int k = 0; k < 12; ++k) {
+      if (s_tally[k].lr == 0) {
+        if (freeSlot < 0)
+          freeSlot = k;
+        continue;
+      }
+      if (s_tally[k].lr == lr) {
+        found = k;
+        break;
+      }
+    }
+    if (found < 0 && freeSlot >= 0) {
+      s_tally[freeSlot].lr = lr;
+      s_tally[freeSlot].n.store(1, std::memory_order_relaxed);
+      MCLA_LOG_WARN("BE8D8-CALLER #{} lr={:08X} first at n={} obj={:08X} "
+                    "dev={:08X} h={:08X}",
+                    freeSlot, lr, n, obj, dev, h);
+    } else if (found >= 0) {
+      s_tally[found].n.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((n % 200) == 0) {
+      char acc[256] = {0};
+      int o = 0;
+      for (int k = 0; k < 12 && o < 200; ++k)
+        if (s_tally[k].lr != 0)
+          o += std::snprintf(acc + o, sizeof(acc) - o, " %08X:%u",
+                             s_tally[k].lr,
+                             s_tally[k].n.load(std::memory_order_relaxed));
+      MCLA_LOG_WARN("BE8D8-CALLERS at n={} lr:count[{}]", n, acc);
+    }
+  }
   // Host-complete for memory-device wrappers whose handle is a slot index
   // (0..15) registered by MakeMemoryStream (SLOT-REG). The guest slot table
   // at 0x82860740 holds {buf, size, pos, flag}.
@@ -12304,6 +12357,15 @@ PPC_FUNC(sub_821BE8D8) {
       }
     }
   }
+  // F-162: the ONE call whose caller dereferences the result - let the guest's
+  // own tail run (it reaches sub_821BE0C8 from inside, w170: BE0C8 #179 with
+  // lr=821BE988 right after this site) but ask that re-open for an object.
+  if (lr == 0x82191070u) {
+    s_reopenWantsObject = true;
+    __imp__sub_821BE8D8(ctx, base);
+    s_reopenWantsObject = false;
+    return;
+  }
   __imp__sub_821BE8D8(ctx, base);
 }
 
@@ -12426,6 +12488,33 @@ PPC_FUNC(sub_821BE0C8) {
     // r5, sub_821BE610, sub_821BE568 Seek). So the object that is missing is
     // sub_821BE8D8's return value (w161 BE8D8-HOST prints it as stream=00000001,
     // alongside a dst=CBE40280 buffer it filled), not this function's.
+    // F-162 narrows that: the object IS wanted, but only by the one caller that
+    // dereferences it (sub_82191040, latched by the sub_821BE8D8 hook above).
+    // Building it here serves that caller's contract while leaving the other 178
+    // re-opens on the index shape they store as a handle.
+    if (s_reopenWantsObject && st >= 1u && st < kGuestSlotCount) {
+      s_reopenWantsObject = false;  // exactly the latched call
+      static uint32_t s_objPool = 0;
+      if (s_objPool == 0)
+        s_objPool = mem.Alloc(kGuestSlotCount * 64, 16);  // one touch, ever
+      const uint32_t o = s_objPool != 0 ? s_objPool + st * 64u : 0;
+      if (o != 0) {
+        for (uint32_t q = 0; q < 64; q += 4)
+          (void)mem.WriteU32BE(o + q, 0);
+        (void)mem.WriteU32BE(o + 0, kMemDeviceObj);  // +0  device
+        (void)mem.WriteU32BE(o + 4, st);             // +4  handle = slot index
+        (void)mem.WriteU32BE(o + 8, mb);             // +8  buffer
+        (void)mem.WriteU32BE(o + 28, ms);            // +28 end
+        (void)mem.WriteU32BE(o + 32, ms);            // +32 cap
+        MCLA_LOG_WARN("BE0C8-OBJ #{} obj={:08X} dev={:08X} h={} buf={:08X} "
+                      "size={} lr={:08X}",
+                      n, o, kMemDeviceObj, st, mb, ms,
+                      static_cast<uint32_t>(ctx.lr));
+        ctx.r3.u32 = o;
+        return;
+      }
+      MCLA_LOG_WARN("BE0C8-OBJ-FAIL #{} pool=0, returning index {}", n, st);
+    }
     ctx.r3.u32 = st;
     return;
   }

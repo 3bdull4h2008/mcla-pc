@@ -4318,3 +4318,56 @@ therefore cannot be done by releasing better - it requires each served body to o
 until it is genuinely finished, i.e. the shared-static `kMemStreamSlot` aliasing has to go first (the
 16-entry bound itself is the guest's, decoded at `0x821CB2B0`-`0x821CB2BC`, so it is not the limit).
 Reverted; `src/gpu_device.cpp` is byte-identical to HEAD except for the comment that records this.
+
+
+### F-163: THE FIX (B4 unblock) - scoping the stream-object return to the one caller that dereferences it makes the entity-type registration **complete** for the first time: `TYPINIT` 4 enters / 4 returns, `C0000005 1->0`, `SEEK-DEAD 1->0`, `INFLATE 358->17,220` - and the group is no longer null
+
+- Task:    T41.6 / B4's feed, `build/w171.log` against baselines `build/w170.log` (census build) and `w168` (frontier)
+- Type:    FIX
+- Class:   C (guest ABI/pointer semantics)
+- Priority: P0
+- Evidence: `build/w171.log` (`BE8D8-CALLER #4`, `BE0C8-OBJ #179..#182`, `TYPINIT`, `TYPINIT-RET`, `SHGRP-VARS #1`, `Fatal error`); `generated/ppc_xenon/ppc_recomp.10.cpp:10912-10993`; `src/gpu_device.cpp` (the latch at the `sub_821BE8D8` fallthrough, the object build in `sub_821BE0C8`'s `memory:$` branch)
+
+**Why the previous three attempts failed and this one didn't.** F-153/F-155/F-156 (w164/w165/w166)
+changed the return shape of *every* `memory:$` re-open - and `w170`'s new caller tally shows all 179
+of them arrive from one site (`lr=821BE988`, inside the guest's own `sub_821BE8D8` tail), so a blanket
+change re-shaped 178 consumers that legitimately store the value as a slot handle. The caller that
+dereferences it is **one** - `sub_82191040`, `BE8D8-CALLER #4 lr=82191070 first at n=190` - so the
+shape is now chosen per caller: the `sub_821BE8D8` hook latches a flag around a call made with
+`lr == 0x82191070`, and `sub_821BE0C8` builds the guest-shaped object
+(`+0 kMemDeviceObj, +4=slot index, +8=buf, +28/+32=size`, from a pool allocated once) only for that
+call. It fired 4 times (`BE0C8-OBJ #179..#182`) - once per entity realization, not 179 times.
+
+**Measured, against the census build `w170` (which is the committed frontier's marker-for-marker twin):**
+
+| marker | `w170` | `w171` | |
+|---|---|---|---|
+| `C0000005` / `VEH-NEUTRAL` | 1 / 1 | **0 / 0** | the AV is gone, nothing masked to remove it |
+| `SEEK-DEAD` | 1 | **0** | |
+| `TYPINIT` (lines) / `TYPINIT-RET` | 1 / 0 | **4 enters / 4 returns** | the registration completes |
+| `INFLATE` | 358 | **17,220** | |
+| `DICTLOOKUP` / `REQ` | 14 / 135 | **23 / 154** | |
+| `BLIT-SRC` | 27 | 36 | |
+| `[error]` lines | 42 | **28** | |
+| `LISTLINE` / `GETDEV` / `CP-DRAW` / `PRESENT` / `RD-SUBMIT` / `DRAW_INDEXED` | 171 / 694 / 166 / 34 / 24 / 0 | unchanged | |
+| `Fatal error` / `FATAL-SOFT` | 0 / 0 | **1 / 1** | cost, stated below |
+
+**The cost, stated: B5's criterion 3 (zero `FATAL-SOFT`) regresses 0 -> 1**, and the new fatal is the
+*old* gate - `Required grmShaderGroupVar 'skinningData' not found.` (`lr=0x82193BA0`, `r4='skinningData'`).
+It is not a regression of a working state: it is a gate that was previously unreachable because the
+registration never got far enough to look the variable up. Same shape as F-149, which also exposed a
+new blocker and was kept.
+
+**Why this is the B4 unblock rather than another dead end: the shader group is now a real object.**
+`SHGRP-VARS #1 group=A003CA30 vt=8200C4C0 arr=A003CA80 nvars=1 req=1 want='skinningData'
+e0=A003CA90/'' e1=00000000/'' lr=82379D04` - through w138..w168 this binder was only ever reached with
+`group=0` (F-142/F-144). It now arrives with a live group, a live var array, and **one declared
+variable** whose name reads back empty. So F-136's "the content does not declare skinningData" is dead
+a second time, and the next question is narrow and instrumented: what is in the var descriptor at
+`A003CA90`, and is its name at an offset the census does not read.
+
+**Known weakness, kept honest:** the pool is indexed by slot index, and because
+`SLOT-RECYCLE-SHARED` keeps handing out `idx=1`, all four objects landed on the same address
+(`obj=CE83E5C0`) - i.e. the four live realizations alias one object. 4/4 still returned, so no
+evidence of damage this boot, but the aliasing F-161 identified is the reason that is luck rather
+than design; per-body slots remain the cleanup that would retire F-135/F-135b.
