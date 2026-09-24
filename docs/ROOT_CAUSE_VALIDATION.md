@@ -4756,3 +4756,75 @@ magic/ID validation, so it can still bind a member to the substring-mapped packa
 map is now only a labelled fallback at the census site (`:730`
 `// MITIGATION fallback (pre-F-171 substring map)`); retiring it at `:10032` is the follow-up, and
 `CC6F0-PKGSUBST` lines are the instrument to watch when it is done.
+
+### F-172: the UI containers are never inflated because the guest's own inflate loop is entered with a **byte count of 0** - every `XMem`/`INFLATE-ENTER` line at this frontier is our re-point machinery feeding it a bounce buffer whose address is a **semaphore handle**, so "the RSC5 payload will not decode" was never actually tested (read-site window hypothesis REFUTED, code reverted)
+
+- Task:    B5 (menu) / B4's feed - the codec question F-170/F-171 left open; answers it
+- Type:    FACT (root cause) + INFERENCE (what to fix) + a recorded refutation of my own prior hypothesis
+- Class:   G (the game's coded behaviour) with a D/E component (what our device returns)
+- Priority: P0 - it is the single blocker on the UI route, and it says the blocker is ours to remove, not a cipher
+- Evidence: `build/w182.log` (new soak, binary `3584fca` + one reverted edit) lines 3972/3985/3990 and the `READWRAP`/`INFLATE-ENTER` pair; `generated/ppc_xenon/ppc_recomp.14.cpp:19040-19140` (`sub_821BC140`'s priming block and its `bl InflateBegin`); `ppc_recomp.18.cpp:10831`-ff (`sub_821D5E10` = `zlibInflater::InflateBegin`, register-accurate); `build/cache/mcla_pe.bin` strings `0x82015770`/`0x820157AC`/`0x820157D4`; `src/gpu_device.cpp:7067`-ff (the hook) and `:3646`-ff (its own comment)
+
+**What the guest's own code requires, read off the generated listing.** `sub_821BC140` is the only
+caller of `zlibInflater::InflateBegin` (`tools/ppc_xrefs.py calls 0x821D5E10` -> one site,
+`0x821BC37C`). Its loop does:
+
+```
+r30 = [r28 + 4]                     // the byte count still to inflate
+r31 = min(r30, 32768)               // 0x821BC2D4-0x821BC2DC: cmplwi r30,32768 / mr r31,r30
+r3 = [r28+8] -> [[r3]+28](r3, r20, cursor@(r1+80), dst = r1+128, r7 = r31)   // device Read
+if ([r27+1852] == 0 && r3 == r31) {          // ONLY on an exactly-full read
+    [r1+96] = r3 - r29                        // inflater st+0  (remaining INPUT)
+    [r1+100] = (r1+128) + r29                 // inflater st+4  (input pointer)
+    cursor += r3
+}
+InflateBegin(r3 = r24, r4 = r1 + 96)          // the state is a STACK object
+```
+`InflateBegin` then requires `st+8 == 0`, compares `*st+4` against **`0x0FF512EF`**
+(`lis r10,0FF5` + `ori r9,r10,12EF`, `ppc_recomp.18.cpp:10865`-ff) - failing that it prints
+`zlibInflater::InflateBegin - not in XCompress format` - consumes 8 bytes (magic + size at src+4)
+and calls `sub_8244FF20` = **XMemDecompress** (`XMemCreateDecompressionContext`, same string block).
+So the RSC5 header's `+0x0C` magic / `+0x10` size pair is the XCompress sub-header, and the LZX
+stream starts at **`pkg+0x14`**. The magic occurs exactly once per package in the archive, always at
+`pkg+0x0C` (measured over each package's whole declared range), which confirms the framing.
+
+**Why it never runs.** `READWRAP sub_821CC6F0 #1 ... r5=00060000 r6=006D8F40 r7=0 ... ret=00000000
+lr=821BC334` - the read that feeds the inflate is asked for **`r7 = 0` bytes** (`r7` is the count,
+`r6` the caller's stack destination), because `[r28+4]` is 0. An exactly-full read of zero still
+satisfies `r3 == r31`, so the guest primes the stack state anyway and computes
+`st+0 = 0 - 12 = 0xFFFFFFF4` and `st+4 = (r1+128) + 12 = 0x006D8F4C` - **which is exactly what
+`INFLATE-ENTER #1 st=006D8F20 in=4294967284 inPtr=006D8F4C consumed=0` prints** (st = r1+96, and
+`r1 = 006D8EC0` is visible in the same log as `r1in=`). Two independent derivations agreeing to the
+dword: the count is 0 before we ever touch it.
+
+**What our code then does with it.** `PPC_FUNC(sub_821D5E10)` (`src/gpu_device.cpp:7067`-ff)
+re-points `st+0`/`st+4` at a host bounce whenever the magic is absent (its own comment at
+`:3646`-ff calls this a short-circuit), and the resulting XMem calls are ours, with our constants:
+every one of the 34 `XMEM` lines carries `srcSz=7179936 destSz=7179940`, the hard-coded
+`j1SrcSz`/`j1DestSz` at `src/gpu_device.cpp:4322`-`4323`, and `ret=00000000`. The `src=` of the first
+is `CA327114` - **`CA327100` is a semaphore** (`SEMA-CREATE #31 h=CA327100 init=0 max=32767`,
+`PRELOAD-CTX #1 ... arcDev=CA327100`), so we are handing the guest's LZX decoder a kernel object's
+memory and reading "XMem produced nothing" as a property of the archive. It is not.
+**Consequence, stated plainly: F-091/F-102's "the only inflate door was reached and produced 0" and
+F-170's "the payload is encrypted or an unimplemented codec" are both unsupported - the door was
+never fed real bytes.**
+
+**My own prior hypothesis, refuted in the same soak.** I changed the `sub_821CC6F0` read site to
+(a) prefer the record's own validated package over the path-substring map (F-171's recorded open
+item) and (b) size the bounce by the declared length. `w182` is **identical to `w181` on every
+counter** (`LISTLINE 171`, `TYPINIT 3/3`, `Fatal 0`, `FATAL-SOFT 0`, `C0000005 0`, `SEEK-DEAD 0`,
+`GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `DICTLOOKUP 22`, `[error] 14`, `INFLATE-ENTER 149`,
+`XSF-INFLATE 0`, `swfCMD 0`, `DRAW_INDEXED 0`) - because **`CC6F0-PKGSUBST` and `CC6F0-PKGCONT` fire
+0 times**, i.e. that substitution branch is dead at this frontier. So F-171's "open asymmetry" is
+inert, the 32 KB read-window clamp is not what bounds the inflate, and the edit is reverted (tree
+back to `3584fca`). The only durable product of that build is the negative result.
+
+**The next step, named and bounded.** Find who is supposed to fill `[r28+4]` (the inflate byte
+count) for a container member and why it is 0 while the TOC entry carries the right size
+(`TOC76-LAYOUT` prints `+4=[0002FFDD 000A001B D454283D 0040626E]` for legals). `r28`'s `+8` is the
+device and `+4` the count, and the census serve already publishes a size through
+`XSF-POSTOPEN-SERVE`/the `CDE/Open (CCEA0)` wire at `src/gpu_device.cpp:800`-ff - so this is a
+field-transfer question inside code we own, answerable by reading `sub_821BC140`'s entry block
+(`r28`'s provenance) rather than by adding another instrument. When the count is real, the guest's
+own `InflateBegin` will either decode (LZX works, UI follows) or print `not in XCompress format`
+through its own path - **both are answers, and neither has ever been tried on real bytes.**

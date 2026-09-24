@@ -1,3 +1,56 @@
+## 2026-09-24 ~17:05 - **F-172: the "RSC5 payload codec" question is CLOSED as the wrong question - the guest's inflate loop is entered with a byte count of 0, and every XMem line at this frontier is our own re-point machinery feeding the guest's LZX decoder a semaphore handle. `w182` == `w181` on every counter; the read-site edit that produced that proof is REVERTED, so HEAD stays `3584fca`**
+
+- **Read the contract off the generated listing, not from a guess:** `sub_821BC140` is the *only*
+  caller of `zlibInflater::InflateBegin` (`ppc_xrefs calls 0x821D5E10` -> `0x821BC37C`). It takes
+  `r30 = [r28+4]` (bytes still to inflate), asks the device for `min(r30, 32768)` into a **stack
+  buffer at `r1+128`**, and primes the stack inflater state **only if the read returns exactly that
+  many bytes**: `st+0 = r3 - r29`, `st+4 = (r1+128) + r29`, then `InflateBegin(r4 = r1+96)`
+  (`ppc_recomp.14.cpp:19040`-`19140`). `InflateBegin` wants `st+8 == 0`, compares `*st+4` against
+  `0x0FF512EF`, consumes 8, and calls `sub_8244FF20` = **XMemDecompress** - so the LZX stream starts
+  at **`pkg+0x14`**, and the magic appears exactly once per package, always at `pkg+0x0C` (measured
+  across each package's whole declared range).
+- **The fingerprint that proves it:** `READWRAP sub_821CC6F0 #1 r5=00060000 r6=006D8F40 r7=0 ret=0
+  lr=821BC334` = a **0-byte** inflate read, and the very next `INFLATE-ENTER #1 st=006D8F20
+  in=4294967284 inPtr=006D8F4C` is that zero read *passed through the priming arithmetic*:
+  `0 - 12 = 0xFFFFFFF4` and `(r1+128)+12 = 0x006D8F4C`, with `r1 = 006D8EC0` visible as `r1in=`. Two
+  derivations agreeing to the dword.
+- **So the XMem census has been measuring us:** all 34 `XMEM` lines carry our hard-coded
+  `j1SrcSz=7179936`/`j1DestSz=7179940` (`src/gpu_device.cpp:4322`-`4323`) and `ret=0`, and
+  `src=CA327114` is `CA327100`+0x14 where `CA327100` is a **semaphore** (`SEMA-CREATE #31`,
+  `PRELOAD-CTX #1 arcDev=CA327100`). Withdraw these: "the payload is encrypted / an unimplemented
+  codec" (F-170) and "the one inflate door was reached and produced 0" (F-091/F-102's reading) - the
+  door has never been fed real bytes.
+- **Refuted in the same build (my own hypothesis, recorded so nobody re-walks it):** the
+  `sub_821CC6F0` read-site *is not the truncator*. Preferring the record's validated package there and
+  sizing the bounce by the declared length changed **nothing** (`w182` identical to `w181` across
+  `LISTLINE 171`, `TYPINIT 3/3`, `Fatal 0`, `FATAL-SOFT 0`, `C0000005 0`, `SEEK-DEAD 0`, `GETDEV 694`,
+  `CP-DRAW 166`, `PRESENT 34`, `DICTLOOKUP 22`, `[error] 14`, `INFLATE-ENTER 149`, `XSF-INFLATE 0`,
+  `swfCMD 0`, `DRAW_INDEXED 0`) because `CC6F0-PKGSUBST`/`CC6F0-PKGCONT` fire **0 times** - the branch
+  is dead. F-171's "open asymmetry at `:10032`" is therefore inert too. Edit reverted; tree == HEAD.
+- **Next step, named:** find who fills `[r28+4]` for a container member and why it is 0 while the TOC
+  entry has the size (`TOC76-LAYOUT +4=[0002FFDD 000A001B D454283D 0040626E]`). `r28` = {+4 count,
+  +8 device}; the census serve already publishes a size through `XSF-POSTOPEN-SERVE` / the
+  `CDE/Open (CCEA0)` wire (`src/gpu_device.cpp:800`-ff). Read `sub_821BC140`'s entry block for
+  `r28`'s provenance - no new instrument needed. If the count becomes real, either the guest's LZX
+  decodes (UI follows) or it prints `not in XCompress format` through its own path; **both are
+  answers.**
+- Plan state: B1/B2/B3 closed. **B4's gate (`DRAW_INDEXED >= 1` from a non-zero constant bank)
+  unmet**; B5 criteria 1-2 unmet, criterion 3 (zero `FATAL-SOFT`) met.
+- **New lead for B4, found in the same `w182` and NOT yet verified (do not cite it as a finding
+  until it is):** the two `PKT-CAP` windows that hold real ring bytes decode cleanly by hand -
+  `00000A31 02000000` and `00010A2F 00001000 08A11000` are **Type-0 register writes** (reg `0x0A31` =
+  1 dword, reg `0x0A2F` = 2 dwords), and `C0043C00 00000003 00000A31 00000000 80000000 00000008` is
+  **`PM4_WAIT_REG_MEM`** (op `0x3C`, `wait_info=3`, poll reg `0x0A31`, ref 0, mask `0x80000000`,
+  `wait=8`) - which is one of the ten opcodes sitting in `CP-T3-CENSUS` as unhandled. The `0x0A2F`
+  payloads are `0x00001000 0x08A11000` then `0x00001000 0x08A15000` = a size/64-bit-address pair
+  pointing at **16 KB blocks 0x4000 apart**, i.e. the shape of an indirect-buffer submission. The
+  summaries for those windows read `t0=146/147/151 indirect=3/4 dw=307..335 clamped=1`, so the scan
+  *is* counting Type-0 packets but only over a clamped few hundred dwords. Question to ask next,
+  statically: does `DrainPacketAt` follow indirection at all (implemented ops are
+  `0x3F/0x48/0x3D/0x22/0x36/0x21/0x2B` - `0x33` is not among them, and no `0x33` line appears in
+  `CP-T3-CENSUS` either), and if the ring's real packets live behind that pair, F-159's "the register
+  file contains no VB/IB/constant state" is a statement about a walk that never entered them.
+
 ## 2026-09-24 ~16:30 - **F-171 (this commit): each container member is now served from the package its OWN TOC record names (magic + ID verified), and the local archive was replaced with a complete copy - so all seven UI packages exist and bind at their own sizes. `w180`/`w181` identical, `Fatal error 0` / `FATAL-SOFT 0` / `C0000005 0` / `TYPINIT 3/3`**
 
 - **The bug was a 20-bit mask plus a scan-bounded table.** `MclaPkgOffFromTocW2` used `& 0x00FFF000`,
