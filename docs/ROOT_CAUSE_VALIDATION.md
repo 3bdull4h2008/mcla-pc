@@ -4960,3 +4960,44 @@ Consequences for the plan, stated plainly:
    carries the decoder, so a correctly-lengthed request is all that is missing. If a correctly
    lengthed request still yields no tags, *that* is the point at which the container itself is in
    question - and it has never been reached.
+
+
+**Addendum to F-175, same session (2026-09-24 ~17:30) - stated precisely, because the headline above
+over-reaches.** Reading the rest of `pgStreamer::Open`'s body
+(`ppc_recomp.14.cpp`, the span after the `InitClass` assert): it does **not** demonstrably write the
+consumer's array. What it actually does is
+
+```
+lwz  r11,0(r24)          // r24 = 0x8283D1A4  -> loads [0x8283D1A4], NOT [0x8283D1C4]
+mulli r10,r10,28
+add  r29,r10,r11         // r29 = a 28-byte record in the array based at [0x8283D1A4]
+stw  r25,16(r29)         // r25 = 0
+...  helper calls at 0x823DD800 / 0x823DD7F0 / 0x823DD850 on r30 (= its name-ish arg,
+     and on r30+6, and with a length cap of 44) - CRT-region addresses, name/string work
+stw  r25,8(r29); stw r25,20(r29); stw r11,4(r29)   // r11 = (helper result) + r31
+```
+So the correct statements are: (a) `Open` computes the **address** `0x8283D1C4` (which is the field
+`sub_821BC140` reads its array base from) and separately indexes a 28-byte array through the
+*neighbouring* field `0x8283D1A4` - the two are 0x30 apart in the same `pgStreamer` class static;
+(b) the value it puts in `[record+4]` is built from string helpers applied to its argument, which is
+**not** the shape of a byte count; and (c) therefore `Open` is a strong candidate for the *owner and
+initialiser* of the handle arrays (consistent with the `pgStreamer::InitClass` assert and the
+`out of handles` message), but it is **not** established as the writer of the specific field the
+inflate loop consumes.
+
+Why the field is nevertheless certainly a count *at the consumer*: `sub_821BC140` loads
+`r30 = [r28+4]` (`ppc_recomp.14.cpp:18967`), clamps it (`cmplwi r30,32768`), and passes the clamp as
+the device Read's count argument (`r7 = r31`, indirect call at `0x821BC334`) - and **no write to `r28`
+occurs between `:18873` (where it is formed) and `:19052`**, re-checked over that whole span, not just
+part of it. The measured consequence in `w182` is the 0-byte read with `lr=821BC334`, so the field's
+*role* is proven by the log even while its *writer* is still unnamed.
+
+Corrected next step, still static and still one address wide: find what stores into
+`[0x8283D1C4]` (the array-base field) and what writes `[record+4]` in **that** array - i.e. trace the
+users of the base rather than assuming `Open` is one. `xref 0x8283D1C4` gives the single computation
+site above, so the search is for stores through pointers derived from it, which means reading
+`sub_821BC674`-`sub_821BC694` (the three reads of the class static that sit inside the same function
+family as the inflate loop) and `sub_821BCB10+0x44` (our `ENQ` chooser). If neither writes it, the
+array is filled by `pgStreamer::InitClass` sizing plus a per-request insert elsewhere, and a
+registers-only census at `sub_821BC140`'s *caller* (`sub_821BC910`, the enqueue path that produced
+`INLINE-EXEC #n`) is the cheapest admissible way to see the request as it is handed over.
