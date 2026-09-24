@@ -1,3 +1,59 @@
+## 2026-09-24 ~18:50 - **F-186/F-187: UI enqueue gap confirmed, direct fix failed — two paths remain (host LZX or guest descriptors). Commit `cdd9949`, frontier w193/w195 identical**
+
+### What was found (F-186)
+4 UI `.xsf` containers opened through `sub_821E2940` (lr=`821E29C4`) but NEVER enqueued for
+async inflate. Only non-UI path (`sub_821E5DC8` lr=`821E5E10` → `sub_821E5E58` → `sub_821BCB10`)
+enqueues. GFx stays at nGfx=0 because UI data stays compressed. F-170 truncation refuted:
+archive is complete (2.1 GB, valid RSC5 at all UI offsets).
+
+### What was tried (F-187)
+Direct call to `sub_821E5E58` from inside `sub_821E2940` hook **corrupted guest state**: 3/4
+subsequent opens failed with handle=FFFFFFFF. Root cause: `sub_821E5E58` needs TWO descriptor
+objects per container (inflate descriptor at r3 with context pointer at +0, data/layout
+descriptor at r4 with halfwords at +0/+2 and data pointer at +4) that the UI path never
+constructs. Passing the open struct as r3 returned `0x736F7572` ("sour") = garbage.
+
+### Census hook retained
+`sub_821E2940` override in `src/gpu_device.cpp:9877` logs all 4 UI opens with struct/path/handle.
+Verified working in w194: raceeditor handle=0, garage=1, policecam=2, credits=3, all ret=1.
+
+### Two fix paths for next agent
+
+**Path A — Host-side LZX decompressor (recommended, ~300 lines):**
+RSC5 payloads are XCompress LZX (codec=1), NOT DEFLATE. No host LZX decoder exists.
+XCompress frame format already parsed at `gpu_device.cpp:4005-4009`. Implement host LZX,
+decompress UI packages when served through CC6F0, serve decompressed bytes directly.
+Eliminates guest-state dependency entirely.
+
+**Path B — Guest descriptor construction:**
+Call `sub_821E5C78` + `sub_821BC5D0` to build inflate/data descriptors before calling
+`sub_821E5E58`. Must happen at caller level (`sub_821FDED8` at address `0x821FE5D0`, after
+all 4 opens complete) to avoid register corruption. Fragile — replicates guest setup logic.
+
+### Other findings from parallel investigation
+- **CP/IB route NOT the answer**: CP already has full IB following (opcode 0x3F), ring walker,
+  nested IB support. DRAW_INDEXED=0 because draw chain (`sub_8217A470→sub_8241BE78→
+  sub_8241C308→sub_82420BA8`) delivers null VB descriptors. PM4_WAIT_REG_MEM (0x3C)
+  unimplemented but not the blocker.
+- **Input**: Real XamInputGetState wired correctly (SDL mapper at `src/kernel/xam.cpp:261-322`),
+  synthetic removed in F-092. Guest never polls during boot. B5 criterion 2 (PRESENT-FB) met:
+  `rgb=(0.06,0.10,0.22)` dark blue frame at 1280×720.
+- **Mitigations**: 73 undocumented in src/. FIXWALK-GATE easiest to retire (7 firings). P10-PRE
+  biggest do-not #9 violator (305/soak). kInflateIntervene hardest (highest blast radius).
+  SLOT-RECYCLE blocked on per-stream slot allocation (F-161).
+
+### Soaks this session
+- w193: REC4-CHANGE sampler relocated, confirmed record[+4] consumption lifecycle
+- w194: UI-OPEN census hook verified (4 containers, handles 0-3, all succeed)
+- w195: Direct enqueue attempt — 3/4 opens broke, zero delta on all markers. Reverted.
+
+### Key addresses
+- `sub_821E2940`: UI open path (hooked at `src/gpu_device.cpp:9885`)
+- `sub_821E5E58`: enqueue function (needs descriptors, not raw struct)
+- `sub_821E5F48`: non-UI caller that does Open+enqueue correctly
+- `sub_821FDED8`: UI caller, injection point at `0x821FE5D0` (after all 4 opens)
+- `sub_821BC7A0`: metadata lookup only, no enqueue
+- `0x8201BB28`: shared global passed as r5 to all UI opens (resource descriptor, NOT inflate desc)
 ## 2026-09-24 ~18:35 - **F-186: UI containers opened but NEVER enqueued for inflate — the dispatch gap, not data or truncation**
 
 - REC4-CHANGE sampler relocated to unconditional CC6F0 entry (was in unreached branch in w192).

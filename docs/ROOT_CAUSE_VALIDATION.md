@@ -5526,3 +5526,25 @@ REC4-CHANGE sampler relocated to unconditional CC6F0 entry; only one transition 
 **Next:** Either (a) make UI path also enqueue (hook `sub_821E2940` post-Open to call
 `sub_821E5E58`), or (b) host-side inflate UI containers when served through this path.
 Option (a) risks guest scheduling assumptions; option (b) is transparent but adds host work.
+
+### F-187 (2026-09-24 18:50, w195) — direct UI enqueue from sub_821E2940 hook corrupts guest state
+
+**Finding:** Calling `sub_821E5E58(structPtr, paramR5, 0, 0)` from inside the `sub_821E2940`
+override after a successful open caused 3 of 4 subsequent opens to fail with handle=`FFFFFFFF`.
+The first enqueue returned `0x736F7572` ("sour" in ASCII) — garbage, not a valid slot index.
+Zero delta on all structural markers vs w193 baseline. Reverted to census-only hook.
+
+**Root cause:** `sub_821E5E58` needs two descriptor objects that the UI path never constructs:
+(1) inflate descriptor at r3 with context pointer at +0, handle slot at +8, secondary param at
++12; (2) data/layout descriptor at r4 with halfword counts at +0/+2 and data pointer at +4.
+The UI container struct (`{+0: 0, +4: handle, +8: flags}`) is layout-incompatible with both.
+Passing it as r3 produced garbage because `sub_821BC6B8` interpreted the zero at +0 as a null
+context pointer.
+
+**Safe injection point identified:** Address `0x821FE5D0` inside `sub_821FDED8`, immediately
+after all 4 UI opens complete and before `sub_821C9A90`. Both branch paths converge here; no
+further `sub_821E2940` calls follow. But descriptors must still be constructed first.
+
+**Two remaining fix paths:** (A) host-side LZX decompressor (~300 lines, eliminates guest-state
+dependency), or (B) construct descriptors via `sub_821E5C78` + `sub_821BC5D0` at caller level
+before calling `sub_821E5E58`. Path A recommended for architectural cleanliness.
