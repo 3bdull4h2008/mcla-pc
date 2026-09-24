@@ -4828,3 +4828,60 @@ field-transfer question inside code we own, answerable by reading `sub_821BC140`
 (`r28`'s provenance) rather than by adding another instrument. When the count is real, the guest's
 own `InflateBegin` will either decode (LZX works, UI follows) or print `not in XCompress format`
 through its own path - **both are answers, and neither has ever been tried on real bytes.**
+
+### F-173: the zero inflate count has a single, named source - `sub_82187150` is the ONLY caller of the streamer's request registrar and it calls it with a zero scalar twice per boot; `REQFILL` proves it with a census whose frontier delta is exactly zero
+
+- Task:    B5 (menu) - continues F-172 up the same chain to its origin
+- Type:    FACT (census) + correction of F-172's stated next step
+- Class:   G
+- Priority: P1 - it names the exact call to interrogate next, and retires one guess
+- Evidence: `build/w183.log` (`REQFILL` x2, and all 17 frontier counters identical to `build/w182.log`); `src/gpu_device.cpp:8403`-ff (the census, registers-only); `generated/ppc_xenon/ppc_recomp.9.cpp:4565`-`4596` (the argument setup at `sub_82187150+0x1A8`); `tools/ppc_xrefs.py calls 0x821867A0` -> **1 site**; `tools/ppc_xrefs.py fn 0x821872FC` -> `sub_82187150 +0x1ac`; `ppc_recomp.14.cpp:18873`/`:18966` with no intervening write to `r28` (which is what re-confirms F-172's `[slot+4]` reading)
+
+**The chain, end to end, each link cited.** `sub_821BC140` (our `INLINE-EXEC`) computes
+`r28 = [0x8203D190+52] + [task+0] * 28` at `ppc_recomp.14.cpp:18873` and takes its transfer length
+from `r30 = [r28+4]` at `:18966`, with **no write to `r28` in between** (checked over
+`18860`-`18970`) - so F-172's claim that the count is a field of the 28-byte request slot stands, and
+my own momentary doubt about it (the surface-size-looking arithmetic right after `:18966` reads
+`[r28+8]`/`[r28+16]`, i.e. other fields of the same slot) is recorded here as resolved, not as a
+retraction.
+
+Who writes that slot? `sub_821867A0` - four `stw rT,4(entry)` sites after `mulli rN,rN,28`, all
+inside it (`ppc_recomp.9.cpp:3029`, `:3222`, `:3273`, `:3568`), plus a branch that writes the
+**literal 6** into `[entry+4]` when bit 1 of the request's own flags is set (`:3017`-`3022`,
+`li r28,6` / `stw r28,4(r11)`). It has exactly **one** caller:
+
+```
+REQFILL sub_821867A0 #1 r3=8EFFF1E0 r4=8EFFF980 r5=00000000 r6=8EFFF170 r7=8EFFF178 -> r3=00000003 lr=821872FC
+REQFILL sub_821867A0 #2 r3=8EFFF020 r4=8EFFF7D0 r5=00000000 r6=8EFFEFB0 r7=8EFFEFB8 -> r3=00000004 lr=821872FC
+```
+- It runs **twice per boot** and returns slot ids **3** and **4**; `REQDUMP #1`'s task carries
+  `[task+0] = 4`, so the inflate loop reads the slot that `REQFILL #2` registered.
+- Four of the five arguments are **stack pointers** (`0x8EFFFxxx`, and `r6`/`r7` are 8 bytes apart =
+  two locals the callee writes back). `r5` is the only scalar, and it is **0** on both calls. At the
+  call site `sub_82187150+0x1A8` (`ppc_recomp.9.cpp:4565`-`4596`) the same four are `r1+128/132/136`
+  and `r1+224 + idx*28` - so `r5` is a computed value the caller decided, not an out-parameter.
+- `sub_82187150`'s own callers are `0x8219F964`, `0x821A0E60`, `0x821A0FF4`, `0x821A1428`,
+  `0x822EAD44` and **`0x822FBBA0`** - the last being inside `sub_822FBAF8`, whose
+  `MSGBISECT 5-822FBAF8 RETURN` line is this project's marker for "the star_glow effect init
+  completed" (PROGRAM_GUIDE §9). So the request registrar is reached from the same init/message
+  chain the frontier already proves is running.
+
+**Admissibility of the instrument (F-125/F-133 satisfied by measurement, not by claim).** `w183` vs
+`w182`, matched-line counts: `LISTLINE 171/171`, `Fatal error 0/0`, `FATAL-SOFT 0/0`,
+`C0000005 0/0`, `SEEK-DEAD 0/0`, `TYPINIT 6/6`, `GETDEV 694/694`, `CP-DRAW 166/166`, `PRESENT 34/34`,
+`DICTLOOKUP 22/22`, `[error] 14/14`, `INFLATE-ENTER 149/149`, `XSF-INFLATE 0/0`, `swfCMD 0/0`,
+`DRAW_INDEXED 0/0`, `INLINE-EXEC 3/3`, `PRELOAD-CTX 3/3`. The hook is registers-only by design (the
+`ENQ sub_821BCB10` note at `src/gpu_device.cpp:8404`-ff records a census **in this same subsystem**
+that AV'd its consumer by reading guest memory), so it stays.
+
+**What is NOT claimed here.** That `r5` *is* the byte count. It is the only scalar at the call, and
+the slot's `[+4]` is 0 whenever the streamer reads it, so it is the prime candidate - but the field
+transfer inside `sub_821867A0` (which of its four `[entry+4]` stores runs, and from which input) is
+not yet traced. The next step, named: read `sub_821867A0`'s body for the store that reaches
+`[slot+4]` and match it to a register, then check that register's producer in
+`sub_82187150+0x140`-`0x1AC`. Both are static reads of `generated/`, no build required.
+
+**Also true and worth repeating:** the three streamer tasks per boot carry `{src, dst, size}` tables
+in their own descriptors (`REQDUMP #1 a0=82849B2C d=[00000004 50000000 A47FD000 00002000 60000000
+B7A01000 00080000 ...]` = 3-dword records `{virtual source, destination, size}`, sizes 0x2000 and
+0x80000), so **the guest does know the lengths** - they simply do not reach the request slot.

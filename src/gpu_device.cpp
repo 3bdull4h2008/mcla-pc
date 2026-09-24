@@ -8415,6 +8415,29 @@ PPC_FUNC(sub_821BCB10) {
                   a0, a6, ctx.r3.u32);
 }
 
+// F-173: sub_821867A0 is the writer of the streamer request slots that
+// sub_821BC140 reads (`r28 = [0x8203D190+52] + [task+0]*28`, and the count it
+// inflates is `[r28+4]`; four `stw rT,4(entry)` sites after `* 28` index math,
+// all inside this one function). F-172 proved that count is 0 at this frontier,
+// so this is the link that decides whether the request was never filled or was
+// filled with a zero length.
+// MINIMAL FORM - REGISTERS ONLY, no guest reads: an adjacent census in this
+// subsystem crashed its consumer by reading memory (the ENQ note at
+// sub_821BCB10), and the F-125/F-133 footprint rule applies anyway.
+PPC_FUNC_IMPL(__imp__sub_821867A0);
+static std::atomic<uint32_t> s_h867A0{0};
+PPC_FUNC(sub_821867A0) {
+  const uint32_t n = s_h867A0.fetch_add(1) + 1;
+  const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+  const uint32_t r6 = ctx.r6.u32, r7 = ctx.r7.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  __imp__sub_821867A0(ctx, base);
+  if (n <= 24 || (n % 2000) == 0)
+    MCLA_LOG_INFO("REQFILL sub_821867A0 #{} r3={:08X} r4={:08X} r5={:08X} "
+                  "r6={:08X} r7={:08X} -> r3={:08X} lr={:08X}",
+                  n, r3, r4, r5, r6, r7, ctx.r3.u32, lr);
+}
+
 // INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
 // (the [obj+4]!=0 path). If this fires for op tag=4, the task ran inline and
 // its own completion step is what silently failed.

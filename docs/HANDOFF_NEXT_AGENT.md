@@ -1,3 +1,32 @@
+## 2026-09-24 ~17:20 - **F-173: the zero inflate count traced to its only source - `sub_821867A0` (the streamer's request registrar) has exactly ONE caller, `sub_82187150+0x1A8`, and it is called twice per boot with `r5 = 0`; the new `REQFILL` census has a proven-zero frontier delta (`w183` == `w182` on all 17 counters) so it stays in the tree**
+
+- Chain, all cited: `sub_821BC140` reads its transfer length as `[r28+4]` where
+  `r28 = [0x8203D190+52] + [task+0]*28` (`ppc_recomp.14.cpp:18873` → `:18966`, no write to `r28`
+  between - this re-confirms F-172 and my momentary doubt about it is closed: the surface-looking
+  arithmetic after `:18966` reads *other fields of the same slot*). `sub_821867A0` writes that slot
+  (four `[entry+4]` stores, one of them the **literal 6** when bit 1 of the request flags is set).
+- `REQFILL … #1 r3=8EFFF1E0 r4=8EFFF980 **r5=00000000** r6=8EFFF170 r7=8EFFF178 -> r3=00000003`
+  and `#2 … r5=00000000 … -> r3=00000004`. Four of the five args are stack pointers; **`r5` is the
+  only scalar and it is 0 both times**. Return values are slot ids 3 and 4, and `REQDUMP #1`'s task
+  selects slot **4** - the one `REQFILL #2` registered, whose `[+4]` the streamer later reads as 0.
+- `sub_82187150` is reachable from `0x822FBBA0` = inside `sub_822FBAF8`, i.e. the same init chain
+  whose `MSGBISECT 5-822FBAF8 RETURN` line the frontier already prints. So this is not a path that
+  never runs; it is a path that runs with a zero length.
+- **The guest knows the sizes.** The streamer task descriptors carry 3-dword `{virtual src, dst,
+  size}` records (`REQDUMP #1 … 50000000 A47FD000 00002000 | 60000000 B7A01000 00080000 | …`), so
+  the lengths exist in the context and simply do not reach the request slot.
+- **Next step, static only (no build):** trace which of `sub_821867A0`'s four `[entry+4]` stores
+  actually runs and from which register, then find that register's producer in
+  `sub_82187150+0x140`-`0x1AC`. If a caller-side scalar is the missing size, the fix is a field
+  transfer we control, not a codec.
+- Census hygiene note: `REQFILL` is **registers-only on purpose** - `src/gpu_device.cpp:8404`-ff
+  records that a census in this same subsystem AV'd its consumer by reading guest memory. Keep it
+  that way if it is extended.
+- Plan state unchanged: B1/B2/B3 closed, **B4's gate (`DRAW_INDEXED >= 1` from a non-zero constant
+  bank) unmet**, B5 criteria 1-2 unmet / criterion 3 met. F-172's separate B4 lead (the Type-0
+  `0x0A2F/0x0A30` size+address pair at `0x08A11000`/`0x08A15000` and unimplemented `WAIT_REG_MEM`)
+  is still unverified and still open.
+
 ## 2026-09-24 ~17:05 - **F-172: the "RSC5 payload codec" question is CLOSED as the wrong question - the guest's inflate loop is entered with a byte count of 0, and every XMem line at this frontier is our own re-point machinery feeding the guest's LZX decoder a semaphore handle. `w182` == `w181` on every counter; the read-site edit that produced that proof is REVERTED, so HEAD stays `3584fca`**
 
 - **Read the contract off the generated listing, not from a guess:** `sub_821BC140` is the *only*
