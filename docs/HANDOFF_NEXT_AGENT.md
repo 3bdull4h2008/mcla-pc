@@ -1,3 +1,19 @@
+## 2026-09-24 ~15:50 - **F-169 (commit `3d93392`): the UI's RSC5 bodies are now served at their declared length - and the boot is BIMODAL, which invalidates single-soak verdicts on several counters we have been using all day**
+
+- **Fixed:** `XSF-BIND size=` was `32768` for all six container members; it is now the length the
+  package header declares at `+0x10` (`trash.xrn` 10,799 / four `.xsf` 196,553 / `meshtextures.xtd`
+  240,531), non-containers untouched. Use the declared length as a **replacement**; `max()` with the
+  package-table size over-reads into neighbouring archive data (`w174`: `Fatal error 1→4`).
+- **Not yet won:** `swfCMD` is still 0 in all four soaks. The UI has its real bytes; what the guest
+  does with them is the next question.
+- **The hazard to internalise before reading any soak:** three soaks of the *same* binary give
+  `TYPINIT 3/3, Fatal 0, [error] 14`, `3/3, 0, 14`, and `4/4, Fatal 1, [error] 28`. The last is the
+  pre-fix profile, from the fixed executable. So `TYPINIT`, `Fatal error`, `FATAL-SOFT`, `[error]`,
+  `DICTLOOKUP`, `REQ` and `nValidTag` are **two-soak minimum** signals, and F-163's
+  `DICTLOOKUP 14→23` / `[error] 42→28` deltas should be treated as unproven (its `C0000005 1→0`,
+  `SEEK-DEAD 1→0`, `TYPINIT-RET 0→4` held in every post-fix run, so the fix itself stands).
+- **Still true and still the plan's problem:** `DRAW_INDEXED 0` in every soak today; all 34 `PRESENT`
+  are heartbeat; B5's criteria 1-2 unmet; and `skinningData` remains a content gate (F-164).
 ## 2026-09-24 ~15:35 - **F-165..F-168: the menu's blocker is located and it is ours - the UI's RSC5 packages are served 6x short. Frontier is still `w171` / HEAD `ae944c8`; no code changed for these four (all offline archive reads)**
 
 - **Symptom, measured in `w171`:** six different UI members all bind at `size=32768`
