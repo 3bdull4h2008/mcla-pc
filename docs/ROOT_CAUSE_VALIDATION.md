@@ -4559,3 +4559,44 @@ that do not can be reported as a volume mismatch rather than silently served wro
 testable pass condition for that change is unchanged from F-165/F-166: `XSF-BIND size=` per path
 (today six identical 32768s), then any `nValidTag > 0` / `swfCMD` line - and `legals.xsf` is the first
 screen, so it is the member that matters for B5.
+
+
+### F-168: the RSC5 header layout is settled and it proves the UI is **truncated, not mis-mapped** - `+0x00` magic, `+0x04` header length, `+0x08` package ID (== TOC word[3]), `+0x0C` `0x0FF512EF`, `+0x10` the UNCOMPRESSED size; three for three, and every one of them is bound at 32768
+
+- Task:    B5 (menu) - continuation of F-167 from the archive bytes only
+- Type:    FACT
+- Class:   E
+- Priority: P0
+- Evidence: `build/game_data/xarchive_cache.rpf` at `0x000A0000`, `0x00060000`, `0x0035A000`
+  (first 32 bytes of each printed below); `build/w171.log` `XSF-BIND`; `src/gpu_device.cpp:671`-`:705`
+  (the substitute branch, which already computes the right offset), `:303`-`:332` (`MclaLoadPkgWindow`)
+
+| package | `hdrLen` | ID at `+8` | `+0x0C` | **uncompressed size at `+0x10`** | what the boot binds |
+|---|---|---|---|---|---|
+| `legals.xsf` @ `0x000A0000` | 27 | `D454283D` = TOC `w3` | `0FF512EF` | **196,553** | 32,768 |
+| `meshtextures.xtd` @ `0x00060000` | 9 | `DC2C0810` = TOC `w3` | `0FF512EF` | **240,531** | 32,768 |
+| `trash.xrn` @ `0x0035A000` | 66 | `C0001814` = TOC `w3` | `0FF512EF` | **10,799** | 32,768 |
+
+Raw first 32 bytes (legals): `05 43 53 52 | 00 00 00 1b | d4 54 28 3d | 0f f5 12 ef | 00 02 ff c9 | 10 f8 b8 20 | 49 40 95 4d | 00 50 62 00`.
+
+**Two corrections this forces.** (1) F-165's framing was right about the symptom but its prescription
+was wrong twice over: the TOC offset is not the data (F-166), and the substring map is *not* what
+breaks `legals.xsf`/`meshtextures.xtd` - for those two `MclaPreferredPkgOffForPath` and the TOC decode
+agree (F-167), and the code already prefers the substring (`uint32_t pkgOff = pathPkg ? pathPkg :
+tocPkg;`, `:686`) so flipping the priority would change nothing. (2) F-126's "w[3] is the TOC record's
+FLAGS dword, not a file identity" is now too strong: word[3] equals the package's ID word in 3 of 3
+cases where the package is in this archive, and the 4 cases where it does not match are exactly the 4
+whose word[2] prefix (`0x64…`) points outside this archive. Both statements need the same follow-up
+(flip the priority *and* add the `+8 == w3` check) only once the size problem below is dealt with.
+
+**The remaining question, precisely.** `+0x10` is the *uncompressed* length; the window we load is
+capped at `0x8000` by `MclaLoadPkgWindow` (`:309-311`) and `pkgSz` is floored to the same value
+(`:689-690`), while the inflate path at `:655` (`kHeadRsc5`/`kHeadXcmp` -> `XSF-INFLATE`) can only
+expand bytes it was given. So either (a) the stored length is elsewhere in the header (the trailing
+`00 50 62 00 74 13 00 70 00 00 ff 5f` is unexamined) or (b) loading a larger *stored* window and then
+inflating is enough. That is answerable by one experiment: raise the window cap to a few hundred KB
+keyed on the declared size and look at whether `XSF-INFLATE expanded=` reaches the declared number
+and `XSF-BIND size=` stops being 32768. Pass condition as before: per-path sizes differing, then
+`W32-CONSTRUCT-CENSUS nValidTag > 0` or any `swfCMD` line, with `LISTLINE 171` / `TYPINIT` 4/4 /
+`C0000005 0` unchanged - and per F-164's hazard note, no new log lines and no per-call extra reads to
+measure it.

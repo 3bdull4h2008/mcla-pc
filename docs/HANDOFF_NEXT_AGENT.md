@@ -1,3 +1,31 @@
+## 2026-09-24 ~15:35 - **F-165..F-168: the menu's blocker is located and it is ours - the UI's RSC5 packages are served 6x short. Frontier is still `w171` / HEAD `ae944c8`; no code changed for these four (all offline archive reads)**
+
+- **Symptom, measured in `w171`:** six different UI members all bind at `size=32768`
+  (`credits/garage/policecam/raceeditor.xsf`, `meshtextures.xtd`, `trash.xrn`) while non-container
+  members get true sizes (`fog.dds` 3,268,608 / `preload.list` 1246). Downstream that is what an empty
+  UI looks like: `W32-CONSTRUCT-CENSUS arr=0 nValidTag=0`, `W26-PLUS24-NODE swfc=0`, `W34-NOGFX`,
+  `swfCMD` 0 in every soak.
+- **`RSC5` header layout, 3 for 3 from the archive:** `+00` magic `05435352` | `+04` header length
+  (27/9/66) | `+08` package ID | `+0C` `0x0FF512EF` (Xcompress) | **`+10` the UNCOMPRESSED size** =
+  `legals.xsf` 196,553 / `meshtextures.xtd` 240,531 / `trash.xrn` 10,799. A 32,768 bind is therefore a
+  truncation, and `legals.xsf` is the boot's first screen.
+- **What is NOT the bug (three dead ends closed so nobody re-walks them):** the TOC offset is not the
+  data (F-166: high-entropy bytes at every UI `tocOff`); the substring map is not what misdirects
+  `legals`/`meshtextures` (F-167: `MclaPreferredPkgOffForPath` and the TOC decode agree for them, and
+  `:686` already prefers the substring, so flipping the priority is a no-op); and F-126's "w[3] is
+  only FLAGS" is now too strong (w3 == package ID at `+8` in 3 of 3 resolvable cases).
+- **Open, and it is one experiment:** is the *stored* length elsewhere in the header (the trailing
+  `00 50 62 00 74 13 00 70 00 00 ff 5f` is unread), or is simply loading a bigger window enough? The
+  window is capped at `0x8000` in `MclaLoadPkgWindow` (`src/gpu_device.cpp:309-311`) and floored to the
+  same at `:689-690`, and `XSF-INFLATE` can only expand what it was given. Raise it keyed on `+0x10`,
+  then look for per-path `XSF-BIND size=` and `nValidTag > 0` / any `swfCMD` line.
+- **Measurement discipline from this session (F-164/F-166):** do not add log lines or per-call reads
+  to measure it - a second line plus ~22 reads in one hook moved `Fatal error 1->4` and `FATAL-SOFT
+  1->7`. And `INFLATE` / the `fatal`-substring count are run-unstable (358 / 17,220 / 7,597 / 5,022
+  across consecutive boots); rely on `LISTLINE`, `TYPINIT`/`TYPINIT-RET`, `DICTLOOKUP`, `SLOT-*`,
+  `C0000005`, `Fatal error`, `[error]`.
+- **Also still open from F-164:** `skinningData` is a content gate (the `.mtlgeo` templates are not in
+  the served archive), so the vehicle-material route stays closed; the UI route above is the live one.
 ## 2026-09-24 ~15:20 - **F-163 IS THE FRONTIER NOW (`w171`, commit `0136855`): the entity-type registration completes for the first time, and F-164 shows the `skinningData` gate is a content gate one level up (the `.mtlgeo` templates are not in the archive we serve)**
 
 - **The fix.** All 179 `memory:$` re-opens come from one site (`lr=821BE988`, inside the guest's own
