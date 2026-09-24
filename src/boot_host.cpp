@@ -1365,6 +1365,16 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // watch confirms the fill source and catches any OTHER fill site live.
     mcla::native::RegisterGuestWatchValue(0xCDCDCDCDu);
 
+    // F-141: name the producer of the two values that the renderer treats as
+    // resource pointers at the current frontier - 0x80010000 (the AUTO draw's
+    // CP register 0x81 value, and the object `sub_82184458`'s fixup runs on)
+    // and 0x00020037 (`r01DC`, which `sub_82185190` dereferences as a
+    // descriptor at the PlaceTexture fatal). Both are 0x80010000-style
+    // non-addresses, so the question is who stored them; the store-level report
+    // is in gpu_cp.cpp PageWatchOnWrite (RSC-REF-STORE).
+    mcla::native::RegisterGuestWatchValue(0x80010000u);
+    mcla::native::RegisterGuestWatchValue(0x00020037u);
+
     // Session 73 probe: poison-param regions (see gpu_cp.cpp PARAM-STORE).
     mcla::native::RegisterGuestWatchRange(0xA0106000u, 0xA0107000u);
     mcla::native::RegisterGuestWatchRange(0xA0197E00u, 0xA0197F00u);
