@@ -4923,3 +4923,40 @@ is not hooked. So the manager is small and closed, and the question "who allocat
 request array, and who should set a slot's `[+4]`" now has a single named starting point:
 `sub_821BCE68` (and the three reads at `0x821BC674`-`0x821BC694`, which are in the same page of code
 as the inflate loop and may be its completion path). Static reading of those, not another instrument.
+
+### F-175: the subsystem has a name - `sub_821BCE68` is **`pgStreamer::Open`** and it is the only code that indexes the handle array whose `[+4]` the inflate loop reads, so "who sets the length" now has one address to interrogate
+
+- Task:    B5 (menu) - terminates the F-172/F-174 chain at a named owner
+- Type:    FACT (static, from the guest's own assert strings)
+- Class:   G
+- Priority: P1 - the next experiment is one registers-only census here, or a pure read of this body
+- Evidence: `build/cache/mcla_pe.bin` strings `0x82010FF0` = `pgStreamer::Open - out of handles` and
+  `0x82011014` = `You forgot to call pgStreamer::InitClass.`, both referenced from
+  `sub_821BCE68` (`generated/ppc_xenon/ppc_recomp.14.cpp`, `PPC_FUNC_IMPL(__imp__sub_821BCE68)`;
+  `addi r3,r11,4080` / `addi r3,r11,4116` with `lis r11,-32255` = `0x82010000`); the control-block
+  addresses decode from the raw immediates: `lis -32124` = `0x82840000`, so `addi -11888` ->
+  **`0x8283D190`** (the class static `sub_821BC140`/`sub_821BCB10` use), `addi -11836` ->
+  **`0x8283D1C4`** (= that static `+0x34`, the handle-array base `pgStreamer::Open` reads), and
+  `addi -11804` -> `0x8283D1E4` (the lock/mutex member passed to `sub_821C8FE0`).
+
+`ppc_xrefs.py xref 0x8283D1C4` returns exactly one site, `sub_821BCE68+0x2C`, and `xref 0x8283D190`
+returns five, all inside `sub_821BC140` / `sub_821BC674`-`0x821BC694` / `sub_821BCB10`. So the
+`pgStreamer` class static and its handle array have one allocator-side door and a handful of
+consumers, and **the door is the function that would record a request's length**: it asserts if the
+class was never initialised, and it reports `out of handles`, which is allocator behaviour. The
+`sub_821BC674`-`0x821BC694` reads sit in the same page of code as the inflate loop and are its most
+likely completion path.
+
+Consequences for the plan, stated plainly:
+1. F-172's blocker is now `pgStreamer`-shaped, not codec-shaped. The guest's LZX decoder
+   (`sub_8244FF20` = XMemDecompress, reachable through `zlibInflater::InflateBegin`) is in the image
+   and the container framing is understood (`RSC5 +0x0C` magic, `+0x10` length, stream at `+0x14`);
+   what is missing is a streamer request whose `[+4]` is non-zero.
+2. The next move is one of two, both cheap: read `sub_821BCE68`'s body to see which field it writes
+   from which argument (static, no build), or census it registers-only at `0x821BCE68` - it is
+   currently **un-owned** (checked with `addr_owners`/grep; `sub_821BC140` is already ours, so a hook
+   there would need rule 4 re-checked).
+3. Do not re-attach the "encrypted payload" or "host needs an LZX implementation" ideas: the guest
+   carries the decoder, so a correctly-lengthed request is all that is missing. If a correctly
+   lengthed request still yields no tags, *that* is the point at which the container itself is in
+   question - and it has never been reached.
