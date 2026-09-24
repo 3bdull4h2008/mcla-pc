@@ -4610,19 +4610,36 @@ static int MclaW30BindPstreamChildren(auto &mem, uint32_t obj,
       p.r13.u64 = 0x8F200000u;
       p.r3.u64 = obj;
       p.r4.u64 = s_w30Ctx;
-      MCLA_LOG_WARN("W30-PLACE obj={:08X} arr={:08X} n={} — re-dispatch "
-                    "825EF100 after ARR-FIX",
-                    obj, arrSlot, nb);
-      place(p, mcla::kernel::g_memory.base);
-      uint32_t vt2 = 0, arr2 = 0, a2 = 0;
-      uint16_t cnt2 = 0;
-      (void)mem.ReadU32BE(obj + 0, &vt2);
-      (void)mem.ReadU32BE(obj + 12, &arr2);
-      (void)mem.ReadU16BE(obj + 16, &cnt2);
-      if (arr2 && arr2 != 0xCDCDCDCDu && arr2 != 0xFFFFFFFFu)
-        (void)mem.ReadU32BE(arr2, &a2);
-      MCLA_LOG_WARN("W30-PLACE-DONE vt={:08X} arr={:08X} [arr]={:08X} cnt={}",
-                    vt2, arr2, a2, cnt2);
+      // F-117: this call is host-fabricated execution. It builds a synthetic
+      // PPCContext (r1 = 0x006D8EC0 from a 15-day-old run, r13 = 0x8F200000) and
+      // drives the guest's own place/fixup walker over obj+12 -- a field the
+      // block above just wrote. w103 line-for-line: ARR-FIX(6204) -> PLACE(6328)
+      // -> walker on our synthetic r13 (P5-MISSFIX/P9-B588) -> the boot's only
+      // remaining fatal, 'swfCMD::Fixup - unknown type %d' (14613), on
+      // node=B7B6D9B4 type=B7 with r13=8F200000 -- our own value, and
+      // type == the top byte of the B7 pointer WE stored at arrSlot+4. The
+      // guest never sees obj+12 != 0 without the write above, so this fatal is
+      // an artifact of the re-dispatch, not of the boot (rule 1 / the same
+      // reason the VEH RIP-advance recovery was removed). ARR-FIX's writes stay
+      // so the memory hypothesis remains testable without this execution.
+      constexpr bool kW30SyntheticPlaceRedispatch = false;
+      MCLA_LOG_WARN(
+          "W30-PLACE obj={:08X} arr={:08X} n={} — re-dispatch 825EF100 after "
+          "ARR-FIX {}",
+          obj, arrSlot, nb,
+          kW30SyntheticPlaceRedispatch ? "RUN" : "SKIPPED");
+      if (kW30SyntheticPlaceRedispatch) {
+        place(p, mcla::kernel::g_memory.base);
+        uint32_t vt2 = 0, arr2 = 0, a2 = 0;
+        uint16_t cnt2 = 0;
+        (void)mem.ReadU32BE(obj + 0, &vt2);
+        (void)mem.ReadU32BE(obj + 12, &arr2);
+        (void)mem.ReadU16BE(obj + 16, &cnt2);
+        if (arr2 && arr2 != 0xCDCDCDCDu && arr2 != 0xFFFFFFFFu)
+          (void)mem.ReadU32BE(arr2, &a2);
+        MCLA_LOG_WARN("W30-PLACE-DONE vt={:08X} arr={:08X} [arr]={:08X} cnt={}",
+                      vt2, arr2, a2, cnt2);
+      }
     }
   }
   return nb;
