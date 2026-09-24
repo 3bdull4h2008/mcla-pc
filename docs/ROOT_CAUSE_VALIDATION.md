@@ -2602,3 +2602,48 @@ code=0xC0000005` events — the two host-completed stream-wrapper faults already
 (`rva=0x58D5384`, `lr=821BE508`, guest `0xC61`), each re-reported per attempt. The blocker is real
 but it is 2 faults, not 50; the per-fault count is a retry multiplier and must not be quoted as an
 event count. `w102` reproduces the same 50 lines / 2 events, and `DRAW_INDEXED` is still 0.
+
+### F-114 — B4's first measurement: the `PRESENT` marker was counting our own 33 ms timer, not the guest (2,880 heartbeats vs **0** guest presents on that counter; the guest's 4 real swaps show as `NATIVE-PRESENT`), and no draw can reach the backend at all because the builder is invoked with a null vertex-stream pointer and `streams=0` — `SETSTREAMS-census` has never fired in any soak.
+
+- Task:        T41.4b (B4), `build/w103.log` vs baseline `build/w99.log` (and `build/w102.log` for the pre-change census)
+- Type:        FIX (present hygiene) + FACT (where the draw feed actually breaks)
+- Class:       F (GPU/shader translation) + H (marker semantics)
+- Priority:    P0 — it is the gate for every remaining plan step
+- Evidence:    `build/w99.log` has **34** `RenderThread: PRESENT #…` lines and `build/w103.log` has **0**, replaced by 34 `RenderThread: HB-FLICKER #…` lines the last of which reads `HB-FLICKER #2880 frame=0 obj=00000000 fb=00000000 surf=00000000` (≈33 ms × 120 s); `w103` `NATIVE-PRESENT #1 obj=40002080 fb=C71D82C0 surf=00000000 q=1` … `#4 … fb=C71D82CC q=3`; `w102:4409` `SUBMIT-census sub_82420BA8 #2 dev=40002080 flags=0 lr=8217BB10 streams=0 vb0=[00000000,00000000,00000000] r5=00000000 [...] r6=4000DF60 [00100003 00000002 ...] plausible=0 dummy=1`; `w102` marker counts `DRAW-GATE plausible 0`, `DRAW-GATE dummy 2`, `SETSTREAMS-census 0`, `41C308 0`, `DRAW_INDEXED 0`.
+
+**Fixes landed (both are B4's named items, and both are behaviour-visible):**
+`render_thread.cpp:392-399` no longer calls `ClearAndPresent()` after a draw —
+`D3D12Backend::DrawDynamicMesh*` already closes, executes, **presents** and advances the frame index
+(`d3d12_backend.cpp:1487-1503`), so the old call was a second `Present` of the same frame whose first
+act is `ClearRenderTargetView`, i.e. it erased whatever had just been drawn. And the PRESENT-case log
+line now splits heartbeat presents (`{frameNumber=0, obj=0, swapInfo=0}`, `render_thread.cpp:112-125`)
+onto the `HB-FLICKER` marker. `w103` shows the consequence: the render-thread counter printed **34
+heartbeat lines in `w99` and zero in `w103`** (`soak_census`'s own `PRESENT` marker fell 68 → 34 only
+because it matches those lines as a substring — its remaining 34 are `NATIVE-PRESENT`/`PRESENT-FB`/
+`W31-PRESENT-CENSUS`/`PRESENT-BLIT-SYNTH`, *not* render-thread events), while
+`C0000005 50`, `VEH 123`, `GFx 3`, `Fatal error 1`, `swfCMD 2`, `NATIVE-PRESENT 4`, `PRESENT-FB 4`,
+`LISTLINE 167`, `'not preloaded properly' 0` and `CP truth pub=11 put=11 (caught up)` all hold — i.e.
+**the guest issued zero presents on the render-thread counter for the whole 120 s soak**, and every
+previous "PRESENT is advancing" reading was our timer. Its real swap traffic is the 4
+`NATIVE-PRESENT` entries against swap-table slots `C71D82C0…C71D82CC` (`surf=004E0D30` on #2-#4).
+
+**Where B4 actually stops:** the draw-feed gap is upstream of the renderer, not in it. The two builder
+calls in the whole boot (`sub_82420BA8`, from `lr=8217BB10`) arrive with **`r5 = NULL`** (the vertex
+stream descriptor), **`dev+12748 streams = 0`** and `vb0 = [0,0,0]`, so `plausible` is false at
+`src/gpu_device.cpp:1948` and nothing is queued — `DRAW-GATE plausible 0`. The session-75b hypothesis
+chain (`sub_8217A470 → sub_8241BE78 SetStreams → sub_8241C308 → sub_82420BA8`) is **not** the path this
+boot takes: `SETSTREAMS-census` and any `41C308` marker print 0 lines in `w99`/`w102`/`w103`, and the
+marker literals are present in `src/` (`gpu_device.cpp:1989-1999`), so per F-057(6) that zero is real:
+`sub_8241BE78` is never called at this stage. Meanwhile the CP ring does publish draws
+(`CP-DRAW op=0x36 … numIdx=1 idxSize=0 dmaBase=00000000`, 26 of them, `writes=54` register writes each,
+`r08B/r08C/r0DD/r0D2/r0A2` all zero, `r1DC=00020037 r1DD=071D8380`) — trivial one-index submissions
+with no DMA buffer attached, i.e. the shape of a clear/setup pass, not menu geometry.
+
+**Consequence for the plan.** `DRAW_INDEXED >= 1` from a non-zero constant bank cannot be reached by
+renderer work alone while (a) the only surviving fatal (`'swfCMD::Fixup - unknown type %d'`,
+`FATAL-SOFT`-masked) still stops the guest before its UI build, and (b) no vertex-stream binding has
+ever been observed. So the next B4 step is the *feed*: identify what binds streams on this path (the
+`writes=54` register batch at `rptr` around `C71DC180`, and/or the caller at `lr=8217BB10`), and lift
+the `swfCMD` fatal — the constant-bank capture has nothing to bind to until one of those lands. Zero
+`PRESENT`-counter events is now the honest baseline for B5's "non-fallback PRESENT-FB" criterion, which
+also still samples the `rgb=(0.06,0.10,0.22)` fallback for all 4 framebuffer reads.

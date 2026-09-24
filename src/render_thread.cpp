@@ -389,13 +389,18 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             desc.indexFormat = (d.ibFormat & 1) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
             desc.indexCount = d.indexCount;
 
+            // B4 (T41.4b): one present per drawn frame. DrawDynamicMesh* already
+            // closes, executes, presents and advances the frame index, so the
+            // old ClearAndPresent() here was a SECOND present of the same frame
+            // whose first act is ClearRenderTargetView — it erased whatever the
+            // draw had just rendered. The present belongs to the draw path until
+            // the backend grows a real EndFrame.
             if (backend_.BeginFrame()) {
                 if (pipeline) {
                     backend_.DrawDynamicMeshWithPipeline(desc, pipeline);
                 } else {
                     backend_.DrawDynamicMesh(desc);
                 }
-                backend_.ClearAndPresent(0.0f, 0.0f, 0.02f, 1.0f);
             }
             break;
         }
@@ -418,9 +423,21 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             const auto& p = std::get<PresentCommand>(cmd.data);
             static std::atomic<uint32_t> presentCount{0};
             const uint32_t n = presentCount.fetch_add(1) + 1;
+            // B4 (T41.4b): the 33 ms heartbeat enqueues exactly
+            // {frameNumber=0, obj=0, swapInfo=0}, so it can be told apart from a
+            // guest PresentKick without guessing. Counting them as PRESENT made
+            // the marker measure our own timer, not the guest (w102: 60 PRESENT
+            // lines, all heartbeat). The heartbeat line deliberately avoids the
+            // substring "PRESENT" because soak_census counts matching LINES
+            // (F-054 discipline): a guest-driven PRESENT count is now real.
+            const bool heartbeat =
+                p.frameNumber == 0 && p.obj == 0 && p.swapInfo == 0;
             if (n <= 10 || (n % 120) == 0)
-                MCLA_LOG_INFO("RenderThread: PRESENT #{} frame={} obj={:08X} fb={:08X} surf={:08X}",
-                              n, p.frameNumber, p.obj, p.swapInfo, p.surfaceVA);
+                MCLA_LOG_INFO(
+                    "RenderThread: {} #{} frame={} obj={:08X} fb={:08X} "
+                    "surf={:08X}",
+                    heartbeat ? "HB-FLICKER" : "PRESENT", n, p.frameNumber,
+                    p.obj, p.swapInfo, p.surfaceVA);
 
             // Frame pacing
             using Clock = std::chrono::steady_clock;

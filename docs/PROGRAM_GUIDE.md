@@ -111,8 +111,12 @@ raw bl-scan found 4. Generated TUs = other ground truth.
   `sub_821D5E10` (`0x0FF512EF`; unknown → skip-fatal).
 - **IO contract:** Xbox submit → PENDING(259) → completion; ours completes
   sync — `SLOT-READY` (`sub_821CBE18`: `[slot+12] 1→2`) is the honest
-  equivalent; `DISCCHK` (`sub_821CC1E0`) sets bit31 ack BEFORE `__imp__` when
-  bit30 set.
+  equivalent; `DISCCHK` (`sub_821CC1E0`) sets bit31 BEFORE `__imp__` when bit30
+  set — **F-112 says what those bits are**: the word is the RPF3 TOC record's
+  4th dword (every cache-packfile record has bit30), bit30 = "bytes not resident,
+  do the disc read", bit31 = "the read completed". Forcing it skips the guest's
+  own read submission (`sub_821DEE40(io,2)` returns -3 on ours; r3<0 is exactly
+  its `Fatal disc error` condition), so it is a mitigation, not the mechanism.
 - **GPU:** `gpu_device/gpu_cp` own the boundary (submit/streams/blits, swap-table
   handshake dev+21624/21628, completion `sub_824286A0`); renderer =
   `src/renderer/*`; `FRAME-END`/`NATIVE-PRESENT`;
@@ -159,7 +163,9 @@ on `0xCD`) · P10-PRE (poison-id skip) · INFLATE-SKIP/EMPTY/PENDING (no XCompre
 → 0/bail/retry) · TEXCREATE-SC (`sub_82177EB0` r3<0→0) · SEH o1heap (AV→null) ·
 pow2 align · NtReleaseSemaphore (Wait-like resolve) · BLIT-OOB-GUARD (skip
 overrun blit — closed s74 AV storm) · SLOT-READY (`sub_821CBE18` 1→2) ·
-DISCCHK bit31 pre-ack · DICT-HYDRATE (hash `0x82839F70` after 10 factory hits,
+DISCCHK bit31 pre-ack (F-112: = "pretend the record's bytes are already
+resident", skipping the guest's own disc read for every cache-packfile record; load-
+bearing — w100/w101 without it die at 4,528 lines vs 17,868) · DICT-HYDRATE (hash `0x82839F70` after 10 factory hits,
 `3c8744e` — stays till INSERT clean). Wake-loss identity fix = real bugfix.
 Poison values: `0xCDCDCDCD` = guest fill-on-alloc (uninitialized, NOT
 corruption) · `0xDD` = free-fill · `0xFF00FF00`/`0xFFFF00FF` = missing-texture
@@ -235,7 +241,9 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 | `BOOTPATH` | boot-init package processing (`sub_82187820`) with descriptor dump |
 | `INFLATE` / `-SKIP` / `-EMPTY` / `-PENDING` | inflate hook (`sub_821D5E10`): magic, sizes, retries |
 | `SLOT-READY` | page-cache slot wait (`sub_821CBE18`) state flip |
-| `DISCCHK` | disc-error polarity check (`sub_821CC1E0`) |
+| `DISCCHK` / `DISCCHK2` | disc-error check (`sub_821CC1E0`): `DISCCHK2` dumps `strm/fobj/len/rec/size/offs/flags/route=` (route = the executed bit30×bit31 decision, F-112) — `n <= 40 \|\| (n % 200) == 0` |
+| `DISCCHK2-WAIT` / `-RES` | the guest's own completion call inside the disc-read block (`sub_821DEE40(io, 2)`) and its return value; **only observable with `kDiscChkForcedAck = false`**, so their zero in a normal soak means the mitigation is firing, not that the path is dead |
+| `HB-FLICKER` | the 33 ms heartbeat present (`render_thread.cpp` PRESENT case, `swapInfo=0`). Split out of `RenderThread: PRESENT` in T41.4b because soak_census counts lines: `w103` had 2,880+ heartbeats and **0** guest presents on that counter — the guest's real swaps show as `NATIVE-PRESENT` (4 per soak) |
 | `BLIT-CAP` / `BLIT-SRC` / `BLITWRAP` / `BLIT-OOB-GUARD` | tiled surface blits (`sub_82431A40`/`sub_824321E0`) + overrun guard (guard changes behavior) |
 | `DICTFACT` | shader-dict factory (`sub_8218BF20`) with stream-slot name dump |
 | `TEXDICT-CALLER` / `DICT-HYDRATE` / `DICTLOOKUP` | dict registration (`sub_8218B000`), hash-table hydration, lookup census (`sub_82189138`) |
