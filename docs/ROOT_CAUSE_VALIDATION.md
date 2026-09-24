@@ -4427,3 +4427,48 @@ content that would declare their variables is not in the archive we serve. The r
 the ones that do not need those templates: the UI/GFx path (the boot already shows `GFx 3`,
 `UILOAD 1`, `swfCMD 0`), or a group whose vars are declared inline (the `RimMain 1 { shaderMaterialId
 { int 2 } }` shape above shows that form exists in this content).
+
+
+### F-165: the menu's actual blocker, found - **every RSC5-framed member is bound at exactly 32768 bytes**, while non-RSC5 members get their true sizes; all UI content is RSC5-framed, and the GFx side shows the consequence
+
+- Task:    B5 (menu on screen) / the route F-164 left open; measured entirely from `build/w171.log`
+- Type:    FACT (a structural defect in our own serve path, not content)
+- Class:   E (filesystem/device)
+- Priority: P0 - it is the first hard blocker on the menu path that is ours to fix
+- Evidence: `build/w171.log` (`XSF-BIND`, `PKG-SUBST`, `XSF-HOSTSERVE`, `TOC76-XSF`,
+  `W32-CONSTRUCT-CENSUS`, `W34-NOGFX`); `src/gpu_device.cpp:307`-`:313`, `:689`-`:700`;
+  `python tools/rpf_offline.py find legals.xsf build/toc_parsed.bin` -> 1 record (control in the
+  same run: `entity.type` -> 12, `ext_matteblack.mtlgeo` -> 0)
+
+**The measurement.** `XSF-BIND ... size=` for every member the boot binds, grouped by path:
+
+| bound at | members |
+|---|---|
+| **`size=32768`** | `resources/ui/credits/credits.xsf`, `.../garage/garage.xsf`, `.../policecam/policecam.xsf`, `.../raceeditor/raceeditor.xsf`, `resources/ui/meshtextures.xtd`, `resources/city/SC/trash.xrn` - **every one of them `head=05435352`, i.e. the `RSC5` container magic**, and every `PKG-SUBST` maps them to one shared `pkg` base (`000A0000` for all four `.xsf`, `00060000` for the `.xtd`, `0035A000` for the `.xrn`) |
+| true size | `shaders/city/preload.list 1246`, `textures/effects/fog.dds 3,268,608`, `textures/effects/rain.dds 824`, `textures/effects/star_glow.dds 3,235,840`, `.../dmg_test_3.dds 3,346,432`, `.../tire_track.dds 3,338,240` |
+
+So this is not "the serve path is broken" - plain and `.dds` members are served at full length (and
+the peer's F-156 validator round-trips `.dds` byte-exact). It is the **RSC5 framing** specifically:
+the length handed to the bind is the `0x8000` walk window from `src/gpu_device.cpp:309-311`
+(`uint32_t n = want ? want : 0x8000u; if (n > 0x8000u) n = 0x8000u;`, with `pkgSz` floored to
+`0x8000` at `:689-690`), not the member's own length, and `resources/ui/legals/legals.xsf` - the
+first screen the boot asks for - appears in `PKG-SUBST` but never reaches `XSF-BIND` at all.
+
+**The consequence, visible in the same log.** The Scaleform side is constructed but empty:
+`W32-CONSTRUCT-CENSUS #2 obj=B7B41000 vt=82085364 +24=CDCDCDCD arr=00000000 nPtr=0 nValidTag=0
+nSwfLike=0 nDest=0` and `W26-PLUS24-NODE ... swfc=0`, with
+`W34-NOGFX #1 - no GFx loader objects (vt 0x82073xxx) in scan bands; UILOAD/EF220 never armed after
+inflate`. `swfCMD` is 0 across every soak at this frontier. That is what a UI whose container was cut
+to 32 KB looks like from the inside.
+
+**The control that makes this citable.** The ten `entity.type` members F-149 fixed are *also* served
+from the same archive and *also* needed a length correction - and there the fix was to take the length
+from the TOC's own word (the inflated size), which made them parse. The same class of defect is now
+identified on the UI path with the sizes on the table above.
+
+**Next step, stated as a testable task:** take the real length for RSC5 members (the TOC record's size
+word, or the length the `RSC5` header itself declares - F-156 established the header carries one)
+instead of the `0x8000` window, bind that, and the pass condition is `XSF-BIND size=` for the `.xsf`
+paths becoming their true lengths, `W32-CONSTRUCT-CENSUS nValidTag > 0` (or any `swfCMD` line) firing
+for the first time, with `LISTLINE 171` / `TYPINIT 4`/`TYPINIT-RET 4` / `C0000005 0` unchanged. B4's
+`DRAW_INDEXED` gate is downstream of this, because a UI draw is the most likely first indexed draw.
