@@ -5494,3 +5494,35 @@ bookkeeping (`+0x44` also materialises that static). `record[+12]` moves 0 → 4
 same interval (F-180 vs F-181), which is a state field and points at the same writer:
 whatever advances a record sets both. Next read is those two functions' store lists, not a
 new instrument.
+
+### F-186 (2026-09-24 18:35, w193) — UI containers opened but never enqueued for inflate
+
+**Finding:** The 4 UI `.xsf` containers (raceeditor idx=0, garage idx=1, policecam idx=2,
+credits idx=3) are opened through `sub_821E2940` (lr=`821E29C4`) which calls
+`pgStreamer::Open` but does **not** enqueue the result for async inflate. Only the 3 non-UI
+containers (meshtextures idx=4, legals idx=0x8004, trash.xrn idx=0x10004) opened through
+`sub_821E5DC8` (lr=`821E5E10`) proceed to `sub_821E5E58` → `sub_821BCB10` (enqueue chooser)
+→ ring buffer → `sub_821BC140` (inflate executor). Evidence: STREAM-OPEN #1-#4 lr=`821E29C4`
+no ENQ; STREAM-OPEN #5-#7 lr=`821E5E10` each followed by ENQ at matching timestamp. BC140
+fires exactly 3 times, all on record slot 4 with generation tags 0/1/2. W34-NOGFX fires
+twice: `nGfx=0` — GFx loader never initializes because UI data stays compressed.
+
+**Refutes F-170 truncation claim:** `xarchive_cache.rpf` is 2,130,739,200 bytes
+(0x7F008000); offset 0x64CB0000 (raceeditor.xsf) has 439 MB remaining and 249/256 non-zero
+bytes past the RSC5 header. All five UI packages have valid `05435352` magic and real
+compressed payloads. The archive is complete; the blocker is dispatch, not data.
+
+**Call chains decoded:**
+- Non-UI: caller → `sub_821E5F48` → `sub_821E5DC8` (Open @`821E5E10`) → `sub_821E5E58`
+  (enqueue @`821E5EF8`) → `sub_821BCB10` → ring buffer → `sub_821BC140`
+- UI: caller → `sub_821E2940` (Open @`821E29C4`) → `sub_821BC7A0` → return (NO enqueue)
+
+**record[+4] lifecycle resolved:** Open seeds correctly (F-181); BC140-REC shows correct
+values at execution time (240,531 / 10,799); the one zero (legals rec[+4]=0 at BC140-REC #2)
+is post-consumption — the inflate loop consumed it between Open and the second BC140 call.
+REC4-CHANGE sampler relocated to unconditional CC6F0 entry; only one transition observed
+(sentinel→0 at lr=`821BC334` = inside BC140 itself), confirming consumption not corruption.
+
+**Next:** Either (a) make UI path also enqueue (hook `sub_821E2940` post-Open to call
+`sub_821E5E58`), or (b) host-side inflate UI containers when served through this path.
+Option (a) risks guest scheduling assumptions; option (b) is transparent but adds host work.

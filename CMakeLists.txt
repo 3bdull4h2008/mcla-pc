@@ -483,6 +483,31 @@ target_include_directories(backend_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(backend_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 target_link_libraries(backend_validator PRIVATE d3d12.lib dxgi.lib dxguid.lib)
 
+# External asset-import proof: links the REAL src/d3d12_backend.cpp (not a replica of
+# its calls the way backend_validator section 9 is) so CreateDecodedTexture finally has
+# a producer. Deliberately not part of mcla.exe - it opens its own window, presents to
+# it, and cannot affect the boot path or any CP-DRAW/DRAW_INDEXED counter.
+add_executable(texture_import_validator
+    tools/validators/texture_import_validator.cpp
+    tools/validators/texture_import_stubs.cpp
+    src/d3d12_backend.cpp
+    src/guest_memory.cpp
+    ${RENDERER_IR_TUS}
+    src/renderer/vertex_decode.cpp
+    src/renderer/grc_fvf_decode.cpp
+    src/renderer/resource_cache.cpp
+    src/renderer/texture_decode.cpp)
+target_include_directories(texture_import_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(texture_import_validator PRIVATE
+    ${VALIDATOR_COMPILE_DEFS}
+    FMT_HEADER_ONLY=1 SPDLOG_FMT_EXTERNAL SPDLOG_FWRITE_UNLOCKED)
+# src/common/logging.h uses try/catch and the default flag set is bare -MT (same
+# reason capture_dump_validator carries this - see the phase0 note there).
+target_compile_options(texture_import_validator PRIVATE /GS- /EHa)
+target_link_libraries(texture_import_validator PRIVATE
+    d3d12.lib dxgi.lib dxguid.lib user32.lib gdi32.lib
+    fmt::fmt spdlog::spdlog_header_only)
+
 add_executable(phase0_validator
     tools/validators/phase0_validator.cpp
     src/kernel/memory.cpp

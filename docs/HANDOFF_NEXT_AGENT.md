@@ -1,3 +1,18 @@
+## 2026-09-24 ~18:35 - **F-186: UI containers opened but NEVER enqueued for inflate — the dispatch gap, not data or truncation**
+
+- REC4-CHANGE sampler relocated to unconditional CC6F0 entry (was in unreached branch in w192).
+  w193 shows one transition: sentinel→0 at lr=`821BC334` (inside BC140 itself) = consumption.
+- **The 4 UI `.xsf` containers are opened through `sub_821E2940` (lr=`821E29C4`) which does NOT
+  enqueue.** Only the 3 non-UI containers opened through `sub_821E5DC8` (lr=`821E5E10`) proceed
+  to `sub_821E5E58` → `sub_821BCB10` → ring buffer → `sub_821BC140`. Evidence: STREAM-OPEN
+  #1-#4 lr=`821E29C4` no ENQ; #5-#7 lr=`821E5E10` each followed by ENQ. BC140 fires exactly 3×.
+- **F-170 truncation refuted:** archive is 2.1 GB (0x7F008000); offset 0x64CB0000 has 439 MB
+  remaining with valid RSC5 headers and non-zero payloads. Data is present; dispatch is broken.
+- W34-NOGFX fires 2× with `nGfx=0`: GFx loader never initializes because UI data stays compressed.
+- Call chains: non-UI = `E5F48→E5DC8(Open)→E5E58(enqueue)→BCB10`; UI = `E2940(Open)→BC7A0→ret`.
+- **Next:** either hook `sub_821E2940` post-Open to call enqueue, or host-side inflate UI containers
+  on serve. Four background agents investigating: UI path detail, CP/IB B4 route, mitigation audit,
+  input status.
 ## 2026-09-24 ~18:20 - **F-182..F-185: ran the experiment I had pre-declared. Removing our InflateBegin re-point makes the guest attempt inflate ONCE and fail its OWN `not in XCompress format` check (spin 149→1, XMem 40→1) - but it costs `Fatal error 0→2`, `FATAL-SOFT 0→2`, `GFx 5→1`, so it is reverted and both switches are off. Frontier restored: `w191` == `w188`**
 
 - Two new named switches in `src/gpu_device.cpp` (registered in PROGRAM_GUIDE §7):

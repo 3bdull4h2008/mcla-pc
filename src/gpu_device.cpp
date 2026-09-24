@@ -9874,6 +9874,40 @@ PPC_FUNC(sub_821E5F48) {
   __imp__sub_821E5F48(ctx, base);
 }
 
+// F-187: sub_821E2940 opens .xsf UI containers through pgStreamer::Open +
+// sub_821BC7A0, but never enqueues them for async inflate. The non-UI path
+// (sub_821E5DC8 -> sub_821E5F48 -> sub_821E5E58) does enqueue. Direct
+// enqueue from inside this hook corrupts guest state (3/4 opens fail with
+// handle=FFFFFFFF). Need to find a safe injection point — likely at the
+// caller level (sub_821FDED8) after all four opens complete.
+PPC_FUNC_IMPL(__imp__sub_821E2940);
+static std::atomic<uint32_t> s_hE2940{0};
+PPC_FUNC(sub_821E2940) {
+  const uint32_t n = s_hE2940.fetch_add(1) + 1;
+  const uint32_t structPtr = ctx.r3.u32;
+  const uint32_t pathPtr = ctx.r4.u32;
+  const uint32_t paramR5 = ctx.r5.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  char pathName[68] = {0};
+  if (pathPtr != 0 && pathPtr != 0xCDCDCDCDu) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    mem.ReadBytes(pathPtr, pathName, 64);
+    MclaSanitizePath(pathName, sizeof(pathName));
+  }
+  __imp__sub_821E2940(ctx, base);
+  uint32_t handle = 0xFFFFFFFFu;
+  if (structPtr != 0 && structPtr != 0xCDCDCDCDu) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(structPtr + 4, &handle);
+  }
+  if (n <= 8 || (n % 100) == 0) {
+    MCLA_LOG_WARN("UI-OPEN sub_821E2940 #{} struct={:08X} path='{}' "
+                  "r5={:08X} -> handle={:08X} ret={:08X} lr={:08X}",
+                  n, structPtr, pathName, paramR5,
+                  handle, ctx.r3.u32, lr);
+  }
+}
+
 // Session 75o: async-request wrapper census + dispatcher hunt. Boot loads
 // arrive here via message 0x40003803 (table entry 0x821071B0). Walk the
 // stack (both LR-slot conventions) to identify the message dispatcher.
@@ -10118,6 +10152,28 @@ PPC_FUNC(sub_821CC6F0) {
   const uint32_t r7 = ctx.r7.u32;
   const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  // F-186: sample streamer record[+4] (remaining bytes) on EVERY call, before
+  // any conditional branch. Log only on change; cap 24 entries. The lr here
+  // names whoever triggered the read that observed the new value.
+  {
+    static uint32_t s_lastRec4 = 0xFFFFFFFFu;
+    static uint32_t s_rec4Logs = 0;
+    uint32_t rbase = 0, rv4 = 0, rv12 = 0;
+    if (mem.ReadU32BE(0x8283D1C4u, &rbase) && rbase >= 0x80000000u &&
+        rbase != 0xCDCDCDCDu && rbase != 0xFFFFFFFFu) {
+      const uint32_t rec = rbase + 4u * 28u;
+      if (mem.ReadU32BE(rec + 4u, &rv4) && rv4 != s_lastRec4) {
+        if (s_rec4Logs < 24) {
+          s_rec4Logs++;
+          (void)mem.ReadU32BE(rec + 12u, &rv12);
+          MCLA_LOG_WARN("REC4-CHANGE #{} {} -> {} [+12]={:08X} lr={:08X}",
+                        s_rec4Logs, s_lastRec4, rv4, rv12, lrIn);
+        }
+        s_lastRec4 = rv4;
+      }
+    }
+  }
 
   uint32_t inner = 0, obj24 = 0, vt = 0, tocEntry = 0;
   if (r3 && r3 != 0xCDCDCDCDu) {
