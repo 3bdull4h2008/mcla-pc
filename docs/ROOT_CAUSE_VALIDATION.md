@@ -4124,3 +4124,111 @@ critical path: with the index return the boot still reaches `TYPINIT` (`w161:151
 B4's blocker - B4's gate is still `DRAW_INDEXED 0` at all four builds. If the fault is revisited it
 must be at `sub_821BE8D8`'s return, and it then has to satisfy both consumers, which means the
 index/object duality in `MakeMemoryStream` has to go, not be routed around.
+
+
+### F-158: B5's acceptance criterion 1 names a file that does not exist (`src/xam.cpp`); the two `XamInputGetState` printers are **indistinguishable by marker name**, and neither fires at the frontier
+
+- Task:    B5 acceptance test, checked before it is claimed
+- Type:    FACT (plan-wording correction + measurement)
+- Class:   H (instrumentation) / D (kernel runtime)
+- Priority: P2 - it costs a session a false gate claim otherwise
+- Evidence: `ls src/xam.cpp` -> No such file; `src/kernel/xam.cpp:318`, `src/patches.cpp:744`,
+  `src/patches.cpp:119`/`:132`; `build/w161.log` (`grep -ic xaminput` = 0, and
+  `grep -ic "GetState"` = 0)
+
+**Where the real one is.** The plan text says "xam.cpp's real `XamInputGetState` line fires (not
+patches.cpp's synthetic)". There is no `src/xam.cpp`; the implementations are `src/kernel/xam.cpp`
+(the XAM syscall the guest imports, `src/kernel/xam.h`, registered via `src/kernel/imports.cpp`) and
+`src/patches.cpp` (a native detour `hk_native_XamInputGetState` at `:113`, plus the PPC-side
+`hk_XamInputGetState` at `:236`).
+
+**The discriminator, because the marker name cannot serve.** Both print the same prefix
+`XamInputGetState[` at **INFO** level, so a name-based census counts them together:
+
+| printer | file:line | shape of the line | cap |
+|---|---|---|---|
+| real (kernel) | `src/kernel/xam.cpp:318` | `XamInputGetState[N] port= buttons=XXXX lx= ly=` | `N <= 8 or N % 2000` |
+| synthetic (patch) | `src/patches.cpp:744` | `XamInputGetState[N]: port= buf=0xXXXXXXXX held= lr=` (note the colon) | `N <= 100 or N % 1000` |
+
+So B5 criterion 1 is `grep -c "XamInputGetState\[.* buttons=" build/wNN.log` >= 1 - the `buttons=`
+field, not the marker name. Both caps are low, so a small count is not a small number of calls.
+
+**Measured state.** In `w161` (the frontier) *neither* fires: `XamInput`, `GetState`, `xam` all count
+0 lines. Input is therefore not polled at all before the menu, which is consistent with the guest
+never having reached a UI loop - criterion 1 is blocked by B4's feed, not by an instrument gap. Do
+not read the zero as "input is broken" until a soak exists that draws a menu.
+
+
+### F-159: B4's premise is **empty, measured three independent ways** - the guest has submitted no geometry at this frontier, so there is nothing for the constant-capture step to capture; and F-139/F-140's `draw_indx=0` was a 904-dword sample, not a property of the packet stream
+
+- Task:    B4 gate analysis (`DRAW_INDEXED >= 1` from a non-zero constant bank), builds `w161`/`w166`
+- Type:    FACT (refutation of a plan premise) + correction of F-139/F-140's evidence
+- Class:   F (GPU/shader translation)
+- Priority: P0 - it decides what the next task can be
+- Evidence: `build/w161.log` / `build/w166.log` (`SUBMIT-census sub_82420BA8`, `DRAW-GATE dummy`,
+  `CP-DRAW #1..#24`, `PKT-CAP summary`, `PARK-SAMPLE`, `HB-FLICKER`); `src/gpu_device.cpp:1962-1968`,
+  `:1986-2021`, `:1574`; `src/gpu_cp.cpp:639-696`; `src/d3d12_backend.cpp:1459-1467`,
+  `src/d3d12_backend.h:356`; `.research/xenia/src/xenia/gpu/register_table.inc:493-571`
+
+**1. The API draw path carries no vertex stream.** `sub_82420BA8` is the only producer of
+`DRAW_INDEXED` (`src/gpu_device.cpp:2027-2028`, consumer `src/render_thread.cpp:240`), and it is
+called **twice per boot**: `SUBMIT-census sub_82420BA8 #1 dev=40002080 flags=0 lr=8217BB10 streams=0
+vb0=[00000000,00000000,00000000] r5=00000000 ... r6=40000770` then `DRAW-GATE dummy #1
+vb=00000000/0 ib=00100003/2 stride=0 cnt=1280`. `streams` is read from the device at `dev+12748`
+(`:1963-1967`) and is **0**, and `r5` - the vertex-stream descriptor `:1986-1990` reads `vbAddr`/
+`vbStride`/`vbSize` from - is 0. So the `plausible` gate at `:2019-2021` fails on the vertex side
+while the index side half-decoded (`cnt=1280`). Two calls, both dummy, `plausible` counter never
+incremented.
+
+**2. The CP path's draws have no geometry operands either.** 24 AUTO draws
+(`op=0x36 source_select=2`, `src/gpu_cp.cpp:639-696`) all read
+`CP-DRAW #N op=0x36 src=2 prim=1 numIdx=1 idxSize=0 dmaBase=00000000 dmaSize=00000000
+initiator=00010081 hdr=C0003600 at C71DC180` - a 1-index, zero-size, null-DMA submission. And that
+site is census-only by design ("it does NOT render", `src/gpu_cp.cpp:643-647`): `g_commandQueue`
+appears 0 times in `gpu_cp.cpp`.
+
+**3. The register file contains no VB/IB/constant state to decode.** F-116's "10 of 54 pokes are
+`0x2xxx`" is true but those pokes are **raster and backend state only**. All 22 distinct high ids in
+`CP-REG-HI #1..#22`, named against the local Xenia register table:
+
+| id | name | id | name |
+|---|---|---|---|
+| `2000` | RB_SURFACE_INFO (16 writes) | `2202` | RB_COLORCONTROL |
+| `2007` | COHER_DEST_BASE_1 | `2203` | RB_HIZCONTROL |
+| `200D` | COHER_DEST_BASE_7 | `2204` | PA_CL_CLIP_CNTL |
+| `2080` | PA_SC_WINDOW_OFFSET | `2208` | RB_MODECONTROL |
+| `2100` | VGT_MAX_VTX_INDX (`0000FFFF`) | `2280` | PA_SU_POINT_SIZE |
+| `2104` | RB_COLOR_MASK | `2293` | PA_SC_VIZ_QUERY |
+| `210D` | RB_STENCILREFMASK | `2300` | PA_SC_LINE_CNTL (38 writes) |
+| `2180` | SQ_PROGRAM_CNTL (`1000000E`) | `2301` | PA_SC_AA_CONFIG |
+| `2200` | RB_DEPTHCONTROL | `2302` | PA_SU_VTX_CNTL |
+| `2201` | RB_BLENDCONTROL0 | `2312` / `2318` / `231B` | PA_SC_AA_MASK / RB_COPY_CONTROL / RB_COPY_DEST_INFO |
+
+`.research/xenia/src/xenia/gpu/register_table.inc:493` (`0x200D`), `:501` (`0x2100`), `:523`
+(`0x2180`), `:571` (`0x2300`). No vertex-buffer offset/stride register, no index-buffer address, no
+float-constant bank. `CpRegPoke` (`src/gpu_cp.cpp:82`) is pure storage with **no semantic decode**,
+and no `CpRegPeek` call site ever reads an id `>= 0x2000` (only `0x08B/0x08C/0x0DD/0x0D2/0x0A2/
+0x1DC/0x1DD`, all log-only). PM4 `0x2D SET_CONSTANT` / `0x2F LOAD_ALU_CONST` are **not
+implemented** in `DrainPacketAt` (`src/gpu_cp.cpp:606-702` implements `0x3F/0x48/0x3D/0x22/0x36/
+0x21/0x2B`; the rest hits `LogType3Unhandled`), and `CpExecImLoad` (`:161-180`) reads the shader
+upload header and **discards the microcode** - it fires 8 times with real payloads
+(`CP-IM-LOAD #1 shader_type=0 size_dwords=24`).
+
+**Correction to F-139/F-140's evidence.** Their conclusion came from `PKT-CAP`, which scans only the
+windows `sub_82411640` hands it, clamped to `kPktCapMaxDwords = 256`
+(`src/gpu_device.cpp:1574`) - cumulative `PKT-CAP summary: desc=15 dw=904`, while the same boot
+requests windows of `n=131072`/`n=131086` dwords, and it never reads the `C71DC1xx` region where the
+real draws decode. So `draw_indx=0 set_const=0 load_alu=0` was a **904-dword sample**, never a
+statement about the guest's packet stream. (It happens to point the same way as items 1-3, because
+of item 2's direct packet fields - but it could not have established them.)
+
+**Consequence, stated plainly.** The zero-filled bank at `src/d3d12_backend.cpp:1463-1466` has no
+producer anywhere (`kShaderConstantBytes` is referenced only there and at
+`src/d3d12_backend.h:356`; `DynamicMeshDesc` has no constant field), and B4's capture work is
+downstream of a draw that the guest has not made. All 34 `PRESENT` lines are heartbeat
+(`HB-FLICKER #2880 frame=0`), and `RenderThread: PRESENT` - the guest-kicked present - is **0 lines**.
+The boot is parked in `NtDelayExecution` on a 30 ms poll (`WAIT[KWFSO] ... reason=3 to=30ms`,
+`PARK-SAMPLE nf=NtDelayExecution+0x14`, 130 identical samples) with the CP caught up
+(`pub=11 put=11`, `drains=8`). So the blocker between this frontier and a rendered menu is no longer
+"the renderer is fed zeros" - it is **why the guest stops submitting anything**, and B4's gate is
+only reachable through that.

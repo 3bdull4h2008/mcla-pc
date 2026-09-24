@@ -1,3 +1,34 @@
+## 2026-09-24 ~14:25 - **F-158/F-159: B4's premise is EMPTY (measured three ways) - the guest has submitted no geometry, so the constant-capture step has nothing to capture. The blocker is now "why does the boot stop submitting", and it is measured, not assumed**
+
+- **The three measurements (F-159, all re-verified from the log/source, not from a subagent
+  summary).** (1) `sub_82420BA8` - the only producer of `DRAW_INDEXED` - is called **2x per boot**,
+  both `r5=0` with the device's own stream count (`dev+12748`) at **0** → `DRAW-GATE dummy`,
+  `plausible` never increments. (2) The 24 CP-side AUTO draws are all `numIdx=1 idxSize=0
+  dmaBase=00000000` - and that site is census-only by design (`src/gpu_cp.cpp:643-647`), it pushes
+  nothing. (3) The 22 distinct `0x2xxx` registers the guest pokes are **raster/backend state only**
+  (`RB_SURFACE_INFO`, `PA_SC_*`, `VGT_MAX_VTX_INDX`, `SQ_PROGRAM_CNTL`, ... named against
+  `.research/xenia/src/xenia/gpu/register_table.inc`) - no VB base/stride, no index buffer, no
+  constant bank, and PM4 `0x2D SET_CONSTANT`/`0x2F LOAD_ALU_CONST` are not implemented at all
+  (`src/gpu_cp.cpp:606-702`), while `CpExecImLoad` **discards the microcode** it loads.
+- **Withdraw the F-139/F-140 basis.** `PKT-CAP` clamps every window to 256 dwords
+  (`kPktCapMaxDwords`, `src/gpu_device.cpp:1574`) and scanned **904 dwords total** against windows
+  requesting 131,072+; its `draw_indx=0 set_const=0` was a sample, not a property of the stream. The
+  conclusion happened to survive (via measurement 2), the evidence did not.
+- **The corrected frontier picture.** All 34 `PRESENT` are heartbeat (`HB-FLICKER #2880 frame=0`);
+  `RenderThread: PRESENT` (the guest-kicked one) is **0 lines**. The CP is caught up
+  (`pub=11 put=11 drains=8`) and the main thread parks in `NtDelayExecution` on a 30 ms poll
+  (`WAIT[KWFSO] reason=3 to=30ms lr=8242FC1C`, 130 identical `PARK-SAMPLE`s). So the guest is idle in
+  its own loop, not blocked on us - the next task is to name what that loop waits on.
+- **F-158** (same commit): B5's criterion 1 as written is unsatisfiable - there is no
+  `src/xam.cpp`. The real printers are `src/kernel/xam.cpp:318` (`buttons=`, cap 8) and
+  `src/patches.cpp:744` (`buf=0x`, cap 100) and **both use the same `XamInputGetState[` prefix**, so
+  the test is `grep "XamInputGetState\[.* buttons="`. Neither fires at this frontier (input is never
+  polled before a menu).
+- **Unchanged from the 14:10 block:** F-157 closed the stream-object re-open as a 3-build measured
+  loss and withdrew the `0x82861740` phantom; `w161` is still the frontier (`LISTLINE 171`,
+  `Fatal 0`, `FATAL-SOFT 0`, `TYPINIT 1`, `C0000005 1` VEH-masked). Census now tracks 134 markers
+  (was 124) including `LISTLINE` itself.
+
 ## 2026-09-24 ~14:10 - **F-157: the stream-object re-open question is CLOSED as measured-negative (three builds), and F-154's `0x82861740` "second handle table" is withdrawn as a phantom. Frontier unchanged: `w161` = `LISTLINE 171`, `Fatal 0`, `FATAL-SOFT 0`, `TYPINIT 1`, `C0000005 1` (VEH-masked), `DRAW_INDEXED 0`**
 
 - **What ran.** `docs/f154_staged_be0c8_object.patch` was NOT applied as written - its second-table
