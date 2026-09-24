@@ -5041,3 +5041,115 @@ same class static inside the inflate family, which are the most likely completio
 (still 0 in `w182`/`w183`); B5 criteria 1-2 unmet, criterion 3 met. What changed is the shape of the
 remaining work: the UI route is a streamer-request question with a named identity chain, and the
 "implement a host LZX decoder"/"find the key" framings are withdrawn (F-172).
+
+### F-177: the zero inflate length is produced by a **vtable slot we never implemented** - `pgStreamer::Open` sets `record.length := obj->vtable[+84](obj)`, and slot +84 of the `memory:` device is the shared stub `0x821A5CC0` that 13 other slots also point at
+
+- Task:    B5 (menu) - the root cause F-172 named and F-176 narrowed
+- Type:    FACT (census + static derivation)
+- Class:   C (guest ABI/vtable slot) with an E component (what our device answers)
+- Priority: P0
+- Evidence: `build/w185.log` (`STREAM-OPEN` x7; all 17 frontier counters identical to
+  `build/w183.log`, incl. `READWRAP 278/278` and `INFLATE-ENTER 149/149`, so the census is
+  admissible); `generated/ppc_xenon/ppc_recomp.14.cpp:21190`-`21250` (the store in
+  `sub_821BCE68`); `ppc_recomp.17.cpp:1016`-ff (`sub_821CB488`); raw vtable words at
+  `0x82012918` in `build/cache/mcla_pe.bin`; string `memory:` at `0x820127D8`
+
+**`pgStreamer::Open`'s length store, verbatim from the listing** (`sub_821BCE68`, +0x13C..+0x170):
+```
+lwz  r10,-11824(r11)     // [0x8283D1F0] = a factory fnptr registered at InitClass
+mtctr r11 ; bctrl        // call it with r3 = local -> creates the stream
+bl 0x821cb488 (r3=local, r4=1) -> r31 = the OBJECT
+stw  r31,8(r29)          // record+8  = object
+lwz  r11,0(r31)          // its vtable
+lwz  r10,84(r11)         // ★ slot +84
+mtctr r10 ; bctrl        // obj->vt[+84](obj)
+stw  r3,4(r29)           // ★ record+4 = that call's return  == the length BC140 reads
+```
+`sub_821BC140`'s `r30 = [record+4]` (F-172) is therefore **whatever slot +84 returns**, and
+`sub_821BCB10` only searches these records by `record[0]` (F-176), so nothing else writes the field.
+
+**Measured: `Open` runs, seven times, and the lengths are 0.** `w185`:
+```
+#1 r3=8EFFF770 r4=8EFFF760 r5=0000001B -> r3=00000000 lr=821E29C4
+#2 .. r5=0000001B -> r3=00000001      #3 .. r5=0000001B -> r3=00000002
+#4 .. r5=0000001B -> r3=00000003      #5 r3=8EFFEEB0 r4=0 r5=00000009 -> r3=00000004
+#6 r3=8EFFEFD0 r4=0 r5=0000001B -> r3=00008004      #7 r3=8EFFEDC0 r4=0 r5=00001542 -> r3=0010004
+```
+`r3` on return is the handle id, and the executed requests carry `record[0] = 4`, `0x8004`,
+`0x10004` (`REQDUMP d[0]`, F-176) - so **these three Opens are the ones the inflate loop consumes**,
+and the loop then reads their `record+4` as 0.
+
+**`r5` settles the RSC5 header argument for free.** The seven `r5` values are
+`27, 27, 27, 27, 9, 27, 5442` = exactly the `+0x04` word of the seven RSC5 packages measured
+offline (`legals/credits/garage/policecam/raceeditor` 27, `meshtextures.xtd` 9, `trash.xrn` 5442), and
+`#5`'s `r5=9` pairs with the `READWRAP … r5=00060000` cursor that F-172 saw for meshtextures. So the
+guest parses `RSC5+0x04` and hands it to `pgStreamer::Open` as a parameter - it is **not** a header
+length in the "bytes of header" sense F-168 guessed; whatever it selects, the guest agrees with our
+offline reading of the field, which independently validates F-171's package selection.
+
+**Why slot +84 answers nothing.** `sub_821CB488(name, 1)` compares the first 7 characters against
+`"memory:"` (string at `0x820127D8`) and on a match returns `0x827D838C` - `kMemDeviceObj`, the
+device **whose vtable we install** (`kMemVtable = 0x82012918`). The raw vtable words are:
+```
++0 AE50  +4 AFB8  +44 CB2A0 (Close)  +56 CABB8 (GetSize)  +80 CB400  +108 CB480  +116 CAC38
++8 249B538   +12/+28 82762480   +128 82130000
++48,+60,+64,+68,+72,+76,+84,+88,+96,+104,+112,+124  all = 0x821A5CC0   ← one shared stub
+```
+So slot +84 is one of **thirteen** slots pointing at the same function `0x821A5CC0` - the image's
+"unimplemented virtual" thunk. If the object is the memory device, `record.length` is that stub's
+return value, which is what F-172 measured as 0 and F-173/174 chased through the wrong array.
+
+**Consequences, stated without over-reach.** (a) The UI/menu blocker is now a *missing device
+capability* - answer `vt+84` on the stream object with the real size and the request gets a length,
+the guest's own `InflateBegin`/XMem path gets bytes, and `swfCMD`/`XSF-INFLATE` become testable.
+(b) It is NOT yet proven that the seven Opens took the `memory:` branch nor that
+`0x821A5CC0` returns 0 - both are one registers-only census away: `sub_821CB488`
+(`r3` = name pointer, `r4` = flag, `-> r3` = the object) and, if needed, `sub_821A5CC0` capped and
+deduped by `lr` because it is a shared stub any vtable miss can reach. (c) Whatever the answer, the
+fix belongs in the device vtable, not in the archive serve path - F-169/F-171 already made the
+served bytes whole.
+
+## Continuation, same session - the two devices differ at exactly this slot, and our own override is what forces the zero
+
+Reading the two device vtables side by side from `build/cache/mcla_pe.bin` (rule 3, raw words):
+
+| slot | packfile/archive device `0x82012BDC` | `memory:` device `0x82012918` |
+|---|---|---|
+| +44 | `821CD400` | `821CB2A0` (Close, the routine F-160 uses) |
+| +56 | `821CD3C8` (GetSize -> `[tocEntry+4]`) | `821CABB8` |
+| **+80** | **`821A5CC0` = the no-op stub** | `821CB400` (real) |
+| **+84** | **`821CC498` (real)** | **`821A5CC0` = the no-op stub** |
+| +88 | `821CC410` (`ld r3,16(r3); blr`) | `821A5CC0` |
+| +124 | `82656BF8` | `821A5CC0` |
+
+`sub_821CC498` decodes to `r10=[dev+0]; r11=[dev+36]; r4=r11+r4; call [r10+144](r3,r4)` - a real
+sized query on the inner file object, and `pgStreamer::Open` stores **its** return into `record+4`.
+The memory device answers the same slot with `sub_821A5CC0`, which is `li r3,0; blr` (4 bytes,
+verified from the image). **So the archive device can supply the length and the `memory:` device
+structurally cannot.**
+
+And we make it worse: `src/gpu_device.cpp:12642`-`12646` is a **strong override of that stub** -
+`PPC_FUNC(sub_821A5CC0) { ctx.r3.u32 = 0; }` with no chain to `__imp__` - installed because
+`sub_8218C760` called `device+88` after GETDEV and AV'd on a null slot. It pins **all thirteen**
+slots that share the stub to 0, including the archive-relevant `+84` on the `memory:` device.
+Separately, our `sub_821CB488` (= `fiDevice::GetDevice`, per the Session 76j census comment at
+`src/gpu_device.cpp:10990`-ff) is documented in-code as "return the memory device so the vtable+88
+no-op can run" (`:10992`-`10994`) - i.e. we route some opens at the device whose +84 is a zero.
+
+**Root cause, stated as one sentence:** `pgStreamer::Open` asks the stream's device for its size via
+`vtable[+84]`; for the `memory:` device (which our own `GetDevice` override hands out, and whose
+names genuinely start with `"memory:"` per the guest's own `strncmp(name, "memory:", 7)` at
+`sub_821CB488+0x14`) that slot is the shared `li r3,0` stub which we additionally force to 0, so
+`record.length = 0`, so the inflate loop issues a 0-byte read, so nothing ever reaches the guest's
+working XMem/LZX decoder.
+
+**Fix design (this is an implementation, not a mitigation, and is testable in one build):** give the
+memory device a real `+84`. It cannot be done inside `sub_821A5CC0` (thirteen slots share it and the
+address carries no information), so the options are (a) install a distinct function pointer at
+`kMemVtable + 84` (`0x82012918+84`) that returns the served body's size for the handle the stream
+carries - `MakeMemoryStream` already knows `{buf,size}` and `XSF-BIND` already publishes the same
+number; or (b) stop handing the memory device to opens that name an archive member. (a) is the
+smaller change and does not disturb F-163's re-open path. Pre-declared success criterion for F-178:
+`READWRAP` with `r7=0 lr=821BC334` becomes a non-zero count, `INFLATE-ENTER`'s `st+0` stops being
+`0xFFFFFFF4`, `XMEM` calls appear with per-file sizes instead of our constant 7,179,936, and only
+then `swfCMD`/`XSF-INFLATE` become meaningful. Revert if `LISTLINE`/`C0000005`/`SEEK-DEAD` regress.

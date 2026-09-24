@@ -1,3 +1,34 @@
+## 2026-09-24 ~17:45 - **F-177: the menu's root cause is a device vtable slot we answer with zero - `pgStreamer::Open` sets `record.length := dev->vtable[+84](dev)`, the `memory:` device's +84 is the shared `li r3,0; blr` stub, and we additionally force that stub to 0. `w185` == `w183` on all 17 counters, so the new `STREAM-OPEN` census is admissible and stays**
+
+- **The store, verbatim** (`sub_821BCE68` = `pgStreamer::Open`, `ppc_recomp.14.cpp:21190`-`21250`):
+  call the factory fnptr at `[0x8283D1F0]`, then `bl sub_821CB488(name,1)` (=
+  `fiDevice::GetDevice`) -> object; `stw obj,8(record)`; `lwz r10,84(vtable); bctrl`;
+  **`stw r3,4(record)`**. F-172's `r30 = [record+4]` is exactly that value, and F-176 showed
+  `sub_821BCB10` only searches these records, so nothing else writes it.
+- **Measured** (`w185`): Open runs **7x**, returning handle ids `0,1,2,3,4,0x8004,0x10004`, and its
+  **`r5` = `27,27,27,27,9,27,5442`** - byte-for-byte the `RSC5+0x04` word of the seven packages
+  (legals/credits/garage/policecam/raceeditor 27, meshtextures 9, trash.xrn 5442). That independently
+  confirms F-171's per-record package decode from the guest side. The three executed requests carry
+  ids 4/0x8004/0x10004 = Opens #5/#6/#7.
+- **Why it is 0**: the archive device `0x82012BDC` has a **real** `+84` (`0x821CC498`, which does
+  `[dev+0]->vt[+144](dev, [dev+36]+off)`); the `memory:` device `0x82012918` has `+84 = +88 = +124 =
+  0x821A5CC0` = `li r3,0; blr`. And `src/gpu_device.cpp:12642`-`12646` strongly overrides that stub
+  with `ctx.r3 = 0` (installed so `sub_8218C760`'s `device+88` call wouldn't AV), pinning all
+  thirteen slots that share it.
+- **Fix design for F-178 (an implementation, not a mitigation)**: give the `memory:` device a real
+  `+84` - it cannot be keyed on `sub_821A5CC0`'s address (thirteen slots share it), so install a
+  distinct pointer at `kMemVtable + 84` returning the served body's size for the handle the stream
+  carries (`MakeMemoryStream`/`XSF-BIND` already know that number). Pre-declared pass criteria:
+  `READWRAP … r7=0 lr=821BC334` becomes non-zero, `INFLATE-ENTER`'s `st+0` stops being `0xFFFFFFF4`,
+  `XMEM`'s `srcSz` stops being our constant 7,179,936. Revert if `LISTLINE`/`C0000005`/`SEEK-DEAD`
+  regress. Alternative considered and not chosen: stop handing the memory device to archive-name
+  opens (touches F-163's re-open path).
+- Frontier unchanged and still clean: `LISTLINE 171`, `Fatal 0`, `FATAL-SOFT 0`, `C0000005 0`,
+  `SEEK-DEAD 0`, `TYPINIT 3/3`, `GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `READWRAP 278`,
+  `INFLATE-ENTER 149`, `XSF-INFLATE 0`, `swfCMD 0`, **`DRAW_INDEXED 0`**. B4's gate and B5
+  criteria 1-2 remain unmet. F-172's separate B4 lead (Type-0 `0x0A2F/0x0A30` size+address pair at
+  `0x08A11000`/`0x08A15000`, unimplemented `PM4_WAIT_REG_MEM`) is still open.
+
 ## 2026-09-24 ~17:25 - **F-174: correcting myself twice before it costs a build - the streamer control block is `0x8283D190` (F-172's `0x8203D190` came from mis-signing a `lis`), and `sub_821867A0` is NOT the writer of the zero-count slot (F-173's mechanism withdrawn, its facts kept)**
 
 - **Address fix, use this one:** `sub_821BC140`'s `lis r10,-32124` = `-2105278464` = `0x82840000`, and

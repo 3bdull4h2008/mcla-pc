@@ -8440,6 +8440,34 @@ PPC_FUNC(sub_821867A0) {
                   n, r3, r4, r5, r6, r7, ctx.r3.u32, lr);
 }
 
+// F-177: sub_821BCE68 is pgStreamer::Open (its own assert strings are at
+// 0x82010FF0 'pgStreamer::Open - out of handles' and 0x82011014 'You forgot to
+// call pgStreamer::InitClass.'). F-176's trace of its body found the store that
+// sets the field the inflate loop reads as its transfer length:
+//
+//   lwz  r10,-11824(r11)  -> [0x8283D1F0] a factory fnptr; blr-call it
+//   bl 0x821cb488 (r4=1)  -> r31 = the stream object
+//   stw  r31,8(r29)       -> record+8 = object
+//   lwz  r11,0(r31); lwz r10,84(r11); mtctr r10; bctrl   -> obj->vt[+84]()
+//   stw  r3,4(r29)        -> record+4  =  that call's return
+//
+// so F-172's zero length is vt+84 returning 0 (or Open never running, which is
+// what the 'calls' count here settles - the records are 28 bytes and
+// sub_821BCB10 only SEARCHES them by record[0]). Registers-only: see the ENQ
+// note above for the guest-memory-read AV this subsystem has already produced.
+PPC_FUNC_IMPL(__imp__sub_821BCE68);
+static std::atomic<uint32_t> s_hBCE68{0};
+PPC_FUNC(sub_821BCE68) {
+  const uint32_t n = s_hBCE68.fetch_add(1) + 1;
+  const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  __imp__sub_821BCE68(ctx, base);
+  if (n <= 24 || (n % 500) == 0)
+    MCLA_LOG_INFO("STREAM-OPEN sub_821BCE68 #{} r3={:08X} r4={:08X} r5={:08X} "
+                  "-> r3={:08X} lr={:08X}",
+                  n, r3, r4, r5, ctx.r3.u32, lr);
+}
+
 // INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
 // (the [obj+4]!=0 path). If this fires for op tag=4, the task ran inline and
 // its own completion step is what silently failed.
