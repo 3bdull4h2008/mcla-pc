@@ -4,7 +4,15 @@
 - **Do not trust `tools/ppc_disasm.py` for direction** (F-113): it prints `mr A,B` inverted and prints `bc bo=/bi=` with no polarity (`bo=12,bi=EQ` **is** `beq`), and `PPCContext` has **no `r14`–`r31` members** (`PPC_CONFIG_NON_VOLATILE_AS_LOCAL`) so a hook can never see a callee-saved register. Read `generated/` instead. This nearly put a false refutation in the ledger.
 - **B4 hygiene landed:** the post-draw `ClearAndPresent()` (a second Present that cleared what was just drawn) is gone, and heartbeat presents now log `HB-FLICKER` — which revealed that **every** previous `RenderThread: PRESENT` line was our 33 ms timer (w99: 34 lines, counter #2880; w103: **0**), and the guest's real swaps are 4 `NATIVE-PRESENT` on slots `C71D82C0…CC`.
 - **F-115 (same session, static + existing logs) sharpens T41.4c into two concrete moves:**
-  (a) the observed builder call site passes a **literal `li r5,0`** (`generated/ppc_recomp.8.cpp:1120-1152`,
+  **UPDATE 05:20 — (a) is DONE: F-116 / `build/w104.log`. The 54-poke batch is now dumped as
+  `CP-DRAW-REGS` (`src/gpu_cp.cpp:64-82`, `:679-695`), and the AUTO draw's 3D state really is in the
+  register file: `r01DD=071D8380`+`r01DC=00020037` (a surface pair; +0xC0000000 = the swap family
+  `NATIVE-PRESENT` reports), four `0xA02..0xA05` 16.16-looking values, and ten `0x2xxx` writes (the
+  band F-090 widened for). `r057C=0BADF00D` is an unexplained sentinel. Next: name the ids against
+  `.research/xenia/src/xenia/gpu/` (no `reg_base.h`/`REG_OFFSET` in this tree — locate the offset enum
+  first), then decode VB/IB + float constants from the file and bind them at `d3d12_backend.cpp:1462`.
+  Frontier unchanged by the census (`w104` == `w103`).
+  (b) `'swfCMD::Fixup - unknown type %d'` (`generated/ppc_recomp.8.cpp:1120-1152`,
   `CP-DRAW src=2` = AUTO vertex source), so `plausible` at `gpu_device.cpp:1948` can never open — dump the
   draw's 54-write register batch and decode the VB from registers, do **not** widen the gate;
   (b) `'swfCMD::Fixup - unknown type %d'` reads `type=0xB7` out of B7-heap node `B7B6D9B4`, a block our own
