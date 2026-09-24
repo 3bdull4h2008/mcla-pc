@@ -3236,3 +3236,32 @@ Attribution, step by step, each with its own evidence:
    - `h=0x82905500` **is** the value our own serve printed for that same file: `AFB76-HIT #4 path='embedded:/fxl_final/rage_postfx.fxc' buf=8281BB00 size=38024 stream=82905500`. A *pointer* sat in the handle field, so the device's Seek rejected it, so `GetSize` returned -1.
 6. Why a pointer: `MakeMemoryStream` returns a slot **index** only while `GuestSlotTableInsert` succeeds, and its fallback (`:11708-11709`) returns the `.data` slot object pointer. `w145` shows the exhaustion in order: `SLOT-REG #1…#16 idx=1…15` (the table holds indices 1..15 — 0 is reserved as the open-success sentinel), then `SLOT-TABLE-FULL #1 (16/16 in use)` at 09:56:36.820, then the doomed `BE8D8` 0.7 s later. Nothing in the file releases a slot except the one `BE8D8` memory-device path that writes `[slot+0]=0` (`:12024`), so every served body after the fifteenth got a pointer handle. That is the whole frontier: 15 slots, no recycle, then `-1` → 4 GB alloc (`w138:12555`) → 4 GB read (`w142`, F-133) → park (`w138` tail, F-132).
 7. Logging defect noted so nobody re-reads it wrong: `XSF-POSTOPEN-SERVE`'s `handle={}` field prints `ret`, which in that block is the Open **status** (always 0, since the block is gated on `ret == 0`), and the same 0 is passed to `MclaRegisterServedBody` as its handle argument (`:11269-11270`). Not the cause of the 21 `BE8D8-PACK-MISS` lines — F-126 established that only `tocEntry` is an exact key — but the field name is misleading and must not be read as a handle.
+
+### F-135 — **The fix holds and the frontier moves for the first time in this chain: giving the guest a real slot index instead of a pointer kills the `0xFFFFFFFF` allocation, kills the 321 MB poison storm, and carries the `.list` walk from `#167` to `#171` — four more embedded effects load, and the boot now dies inside the *renderer* (`grmShaderGroupVar 'skinningData' not found`). Two iterations were needed, and the first one is recorded as insufficient.**
+
+What was changed, in `src/gpu_device.cpp` `GuestSlotTableInsert` (the function F-134 showed had no release path):
+
+- Iteration 1 (`build/w146.log`) — recycle a slot only when the guest has read it to its last byte (`[slot+8] pos >= [slot+4] size`). **Insufficient and measured so:** it fired exactly once (`SLOT-RECYCLE #1 idx=1 … size=13908`) and the table still filled (`SLOT-TABLE-FULL #1…#8`), the doomed `BE8D8` still happened (`w146:12649 … h=2190497024 doomed=1`) and the 4 GB alloc still failed (`w146:12650`). Reason, from the same log: these bodies are consumed through the served-registry path, not through `SlotTableServeRead`, so `slot pos` never advances and the criterion can almost never match.
+- Iteration 2 (`build/w147.log`, kept) — before the pointer fallback, reuse the index **this same host path handed out last**. Justification is in the code comment and is not a guess: `MakeMemoryStream` describes *every* stream with one shared static object (`kMemStreamSlot = 0x82905500`), so an older handle from this path already aliases the newer body whether or not the slot table does — the pointer fallback bought nothing. Labelled `MITIGATION` at its `file:line` (do-not #9) and registered in `PROGRAM_GUIDE` §7 as `SLOT-RECYCLE-SHARED`.
+
+Verification — `tools/soak_census.py build/w147.log build/w138.log` (205 s soak, `w138` = the committed baseline):
+
+| marker | w138 | w147 |
+|---|---|---|
+| `AllocPhysical … size=0xffffffff` | 1 | **0** |
+| `BE8D8-RAGESZ … doomed=1` | 1 | **0** |
+| `SLOT-TABLE-FULL` | 8 | **0** |
+| `SLOT-RECYCLE-SHARED` | 0 | 24 |
+| `LISTLINE` lines | 167 | **171** |
+| `CDCD-FILL` lines | 24¹ | **24** (no storm) |
+| `C0000005` / `swfCMD` | 0 / 0 | 0 / 0 |
+| `GETDEV` / `CP-DRAW` / `PRESENT` / `PRESENT-FB` | 694 / 166 / 34 / 4 | 694 / 166 / 34 / 4 |
+| `Fatal error` / `FATAL-SOFT` | 0 / 0 | **10 / 18** |
+| `RD-SUBMIT` | 24 | 24 (not a VOID soak, F-123) |
+
+¹ The `CDCD-FILL` comparison has to be made against the *longer* soaks, not `w138`: `w138` was killed 29 s into the park and never reached the storm either. At comparable duration the storm is gone — `w140` (305 s) 4,041 lines / store `#080,340,000`, `w141` (245 s) 4,012 lines, `w147` (205 s) **24** lines.
+
+- The advance is the four extra `.list` lines, and their text names them: `w147` ends the walk at `#168 'embedded:/rage_shadowdepth'`, `#169 'embedded:/rage_blendshadows'`, `#170 'embedded:/rage_shadowcollector'`, `#171 'embedded:/rmptfx_collision'`. `w138` stops at `#167 'embedded:/rage_postfx'`. So the loader now reads the embedded effect bodies it previously could not size — exactly what F-131 said B4 needs (v3 containers from the XEX, not the archive).
+- Cost, stated, not hidden: `FATAL-SOFT 0 → 18` and `Fatal error 0 → 10`, so B5's third acceptance criterion is **no longer met** by this build. These are the guest's own hard errors, soft-parked by the existing dispatcher mitigation, and they are *new* gates rather than the old one — see below. `w147` is also flagged `POISONED` by the census for log quality (7,990 `P5-LOOKUP … POISON` lines), so only the frontier markers above are citable from it, not its volume.
+- The new frontier, named from the guest's own registers (no new instrument): `w147` 10:11:35.646 `fatal-dispatch regs: lr=0x82193BA0 r1=0x8EFFF8A0 r3=0x8200C4C4 r4=0x8204A408 r5=0x00000001`, and those words decode from `mcla_pe.bin` as `r3 = "Required grmShaderGroupVar '%s' not found."`, `r4 = 'skinningData'` — i.e. a **shader-group variable lookup**, inside the renderer, after the shader files loaded. Immediately before it: `P5-LOOKUP #014185 r3=8EFFF170 r4=CDCDCDCD -> FFFFFFFF lr=8224C074 POISON` (the lookup key itself is poison, 14,185 attempts). The other two soft-parked fatals are `Resource 'Invalid fixup, address is neither virtual nor physical'` (`lr=82184514`, strings at `0x82013168`/`0x82009840`) and `Bad resource type %d in grcTextureFactoryXenon::PlaceTexture` (`lr=8217EC4C`).
+- Next step, on-plan (B4): take the `P5-LOOKUP` poison key as the target — name what should have written the handle at `lr=8224C074`'s caller, because `grmShaderGroupVar 'skinningData'` is the same lookup failing one level up. `BE710-MAGIC` doubled (166 → 332) with the fix, consistent with more served bodies going through the slot path, and it is still the mitigation that must be retired once real v3 bytes satisfy the gate on their own.

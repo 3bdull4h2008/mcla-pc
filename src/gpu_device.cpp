@@ -11651,6 +11651,11 @@ static std::atomic<uint32_t> s_slotTableFull{0};
 
 static int GuestSlotTableInsert(uint32_t buf, uint32_t size) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  // The index this path handed out most recently. Only MakeMemoryStream calls
+  // us, and every one of its streams is described by the single shared static
+  // object kMemStreamSlot - so an older handle from this path already aliases
+  // the newer body whether or not the slot table does.
+  static std::atomic<uint32_t> s_lastIdx{0};
   // Slot 0 is reserved: the guest uses `r3 != 0` as the open-success check
   // (8218C804 after BE8D8), so index 0 is indistinguishable from NULL.
   for (uint32_t i = 1; i < kGuestSlotCount; ++i) {
@@ -11663,7 +11668,67 @@ static int GuestSlotTableInsert(uint32_t buf, uint32_t size) {
       mem.WriteU32BE(slot + 4, size);
       mem.WriteU32BE(slot + 8, 0);
       mem.WriteU32BE(slot + 12, 0);
+      s_lastIdx.store(i, std::memory_order_relaxed);
       return static_cast<int>(i);
+    }
+  }
+  // F-135: the table is bounded (15 usable) and nothing ever released an
+  // entry, so from the 16th served body on this returned -1 and
+  // MakeMemoryStream fell back to handing the guest a raw pointer as its
+  // handle. The guest's own device Seek (sub_821CB2A0, installed at vtable+44
+  // for 0x827D838C) rejects h >= 16 with -1, and that -1 is exactly the size
+  // the frontier's stream slurp allocates and reads: w145 SLOT-REG #1..#16
+  // fill idx=1..15, SLOT-TABLE-FULL #1 starts 0.7 s later, and the single
+  // doomed BE8D8 (w145, n=173, obj=82860C40 = the wrapper BDF20 #532 returned
+  // for embedded:/fxl_final/rage_postfx.fxc) follows. Recycle a slot the guest
+  // has already read to its last byte (pos >= size, the only state in which no
+  // later Read of that body can still want it) before giving up.
+  for (uint32_t i = 1; i < kGuestSlotCount; ++i) {
+    const uint32_t slot = kGuestSlotTable + i * 16;
+    uint32_t osize = 0, opos = 0;
+    if (!mem.ReadU32BE(slot + 4, &osize) || !mem.ReadU32BE(slot + 8, &opos))
+      continue;
+    if (osize == 0 || osize == 0xCDCDCDCDu || opos < osize)
+      continue;
+    mem.WriteU32BE(slot + 0, buf);
+    mem.WriteU32BE(slot + 4, size);
+    mem.WriteU32BE(slot + 8, 0);
+    mem.WriteU32BE(slot + 12, 0);
+    static std::atomic<uint32_t> s_reused{0};
+    const uint32_t r = s_reused.fetch_add(1) + 1;
+    if (r <= 24 || (r % 200) == 0)
+      MCLA_LOG_WARN("SLOT-RECYCLE #{} idx={} took buf={:08X} size={} from "
+                    "exhausted slot (pos>=size)",
+                    r, i, buf, size);
+    s_lastIdx.store(i, std::memory_order_relaxed);
+    return static_cast<int>(i);
+  }
+  // F-135b MITIGATION (labelled, cited; do-not #9): last resort before the
+  // pointer fallback that F-134 proves costs the boot. w146 measured that the
+  // pos>=size test above recycles only 1 of 15 slots (SLOT-RECYCLE #1 then
+  // SLOT-TABLE-FULL #1..#8) because the guest consumes these bodies through
+  // the served-registry path, never advancing slot pos - so the table stays
+  // full and the frontier's embedded:/fxl_final/rage_postfx.fxc stream still
+  // gets a pointer handle (w146:12649 doomed=1, w146:12650 the 0xffffffff
+  // alloc). Overwrite the index this same host path used last: any older
+  // handle already aliases the newer body anyway, because MakeMemoryStream
+  // describes every stream with the one shared static kMemStreamSlot.
+  {
+    const uint32_t prev = s_lastIdx.load(std::memory_order_relaxed);
+    if (prev >= 1 && prev < kGuestSlotCount) {
+      const uint32_t slot = kGuestSlotTable + prev * 16;
+      mem.WriteU32BE(slot + 0, buf);
+      mem.WriteU32BE(slot + 4, size);
+      mem.WriteU32BE(slot + 8, 0);
+      mem.WriteU32BE(slot + 12, 0);
+      static std::atomic<uint32_t> s_shared{0};
+      const uint32_t q = s_shared.fetch_add(1) + 1;
+      if (q <= 24 || (q % 200) == 0)
+        MCLA_LOG_WARN("SLOT-RECYCLE-SHARED #{} idx={} reused the index this "
+                      "host path last handed out (shared static stream) for "
+                      "buf={:08X} size={}",
+                      q, prev, buf, size);
+      return static_cast<int>(prev);
     }
   }
   const uint32_t n = s_slotTableFull.fetch_add(1) + 1;
@@ -11673,7 +11738,6 @@ static int GuestSlotTableInsert(uint32_t buf, uint32_t size) {
                   n, buf, size);
   return -1;
 }
-
 static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
                                   uint32_t size) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -12093,6 +12157,51 @@ PPC_FUNC(sub_821BE8D8) {
       MCLA_LOG_WARN("BE8D8-PACK-MISS #{} dev={:08X} h={} tocEntry={:08X} "
                     "toc+4={:08X} (no served body)",
                     n, dev, h, tocEntry, tsz);
+    }
+  }
+  // T41.13 CENSUS ONLY (read-only). The frontier's one 0xFFFFFFFF per boot is
+  // the size this call site's *own* device GetSize returns: the rage-effect
+  // loader's slurp is `bl 0x821be8d8` with ctx.lr = 0x8218C804
+  // (ppc_recomp.9.cpp:18394-18396), and the body computes
+  //   size = [[dev]+56](dev, handle)          (ppc_recomp.15.cpp:200-212)
+  //   buf  = XTL alloc(size)                  (thunk sub_82130528: mr r4,r3;
+  //                                            li r5,16 -> __xtl_alloc, which
+  //                                            is the caller of the failed
+  //                                            AllocPhysical(0xffffffff) -
+  //                                            XAllocMem printed 0x in w143)
+  //   then Read(buf, size)                    -> the 321 MB poison memcpy
+  // GetSize is 0x821CD3C8 (raw word at vtable 0x82012BDC+56 in mcla_pe.bin):
+  //   cmpi r4,0 / cmpi r4,16 -> li r3,-1 ; toc=[dev+40+h*68] ; if(!toc) li r3,-1
+  //   else return [toc+4]
+  // so -1 is an ERROR return, not a size read from data, and the body allocates
+  // whatever it returns without checking (ppc_recomp.15.cpp:213-222). Print only
+  // the calls where the guest's own GetSize will answer -1, plus every wrapper
+  // that is not the 0x82860C68 one the archive path reuses.
+  if (lr == 0x8218C804u) {
+    static std::atomic<uint32_t> s_rageSz{0};
+    uint32_t sz56 = 0, toc = 0, toc4 = 0, f8 = 0, f24 = 0, f28 = 0, f32 = 0;
+    if (vt)
+      (void)mem.ReadU32BE(vt + 56, &sz56);
+    if (dev && h < 64u) {
+      (void)mem.ReadU32BE(dev + 40u + h * 68u, &toc);
+      if (toc && toc != 0xCDCDCDCDu)
+        (void)mem.ReadU32BE(toc + 4, &toc4);
+    }
+    const bool doomed = (h == 0u) || (h >= 16u) || (toc == 0u) ||
+                        (toc == 0xCDCDCDCDu) || (toc4 == 0xFFFFFFFFu);
+    if (doomed || obj != 0x82860C68u) {
+      const uint32_t k = s_rageSz.fetch_add(1) + 1;
+      if (k <= 40) {
+        (void)mem.ReadU32BE(obj + 8, &f8);
+        (void)mem.ReadU32BE(obj + 24, &f24);
+        (void)mem.ReadU32BE(obj + 28, &f28);
+        (void)mem.ReadU32BE(obj + 32, &f32);
+        MCLA_LOG_WARN("BE8D8-RAGESZ #{} n={} obj={:08X} dev={:08X} vt={:08X} "
+                      "h={} getSz={:08X} slot={:08X} toc={:08X} toc+4={:08X} "
+                      "obj+8={:08X} +24={} +28={} +32={} doomed={}",
+                      k, n, obj, dev, vt, h, sz56, dev + 40u + h * 68u, toc,
+                      toc4, f8, f24, f28, f32, doomed ? 1 : 0);
+      }
     }
   }
   __imp__sub_821BE8D8(ctx, base);
