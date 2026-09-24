@@ -506,6 +506,41 @@ uint32_t RtlSizeHeap(uint32_t heapHandle, uint32_t flags, uint32_t memoryPointer
 
 uint32_t XAllocMem(uint32_t size, uint32_t flags)
 {
+    // F-133 census (read-only; at most 40 lines per boot). The frontier's last
+    // deterministic guest event is a physical allocation of 0xFFFFFFFF that
+    // fails - once per boot, identical in w138/w140/w141 (w138:12555) - and the
+    // guest then memcpy's that same length (r5=0xFFFFFFFF at the store site,
+    // w142) for ~321 MB. MmAllocatePhysicalMemoryEx is ruled out as the caller
+    // (its own FAILED line never prints), so name this import's caller: lr, the
+    // flags bits (bit30 is the ones that would memset a null ptr below) and the
+    // caller's stack words.
+    if (size >= 0x04000000u)
+    {
+        static std::atomic<uint32_t> s_hugeAlloc{0};
+        const uint32_t n = s_hugeAlloc.fetch_add(1) + 1;
+        if (n <= 40)
+        {
+            uint32_t lr = 0, sp = 0, a3 = 0, a4 = 0, a5 = 0;
+            uint32_t s[8] = {};
+            if (const PPCContext *c = GetPPCContext())
+            {
+                lr = static_cast<uint32_t>(c->lr);
+                sp = c->r1.u32;
+                a3 = c->r3.u32;
+                a4 = c->r4.u32;
+                a5 = c->r5.u32;
+                for (int k = 0; k < 8; ++k)
+                    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(
+                        sp + k * 4u, &s[k]);
+            }
+            MCLA_LOG_WARN("XALLOC-HUGE #{} size={:#x} flags={:08X} lr={:08X} "
+                          "r3={:08X} r4={:08X} r5={:08X} sp={:08X} "
+                          "stk=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                          "{:08X} {:08X}]",
+                          n, size, flags, lr, a3, a4, a5, sp, s[0], s[1], s[2],
+                          s[3], s[4], s[5], s[6], s[7]);
+        }
+    }
     void* ptr = (flags & 0x80000000) != 0 ?
         g_userHeap.AllocPhysical(size, (1ull << ((flags >> 24) & 0xF))) :
         g_userHeap.Alloc(size);
