@@ -1,4 +1,5 @@
 #include "gpu_device.h"
+#include "raw_inflate.h"  // F-130: expand a member the page-window hook can't
 #include "gpu_cp.h"
 #include "render_queue.h"
 #include "renderer_mode.h"
@@ -578,6 +579,18 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
     return 0;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t dst = 0;
+  // F-129/T41.11: pass 0 accepts ONLY a candidate whose first word is a real
+  // container magic; pass 1 repeats with today's "first non-sentinel" rule so a
+  // plaintext .list body still lands (it has no magic). Measured why this is
+  // needed: the member at the TOC's own offset/size inflates to
+  // 'rgxa\1\377\1\22VS_UnlitTransform' - the head the guest's rage-effect gate
+  // compares (0x61786772 LE) - while the masked candidates (MEMBER-EXPAND
+  // off=001DD11C stored=260, i.e. w2 with its low bits cleared) yield another
+  // member's name-list text, which is what w132's BE710-BODY #68 showed.
+  constexpr uint32_t kHeadRgxa = 0x72677861u;  // 'rgxa' as BE of bytes r,g,x,a
+  constexpr uint32_t kHeadRsc5 = 0x05435352u;  // 'RSC5'
+  constexpr uint32_t kHeadXcmp = 0x0FF512EFu;  // XCompress
+  for (int pass = 0; pass < 2 && dst == 0; ++pass) {
   for (int c = 0; c < ncand && dst == 0; ++c) {
     if (offs[c] == 0 || szs[c] < 0x40 || szs[c] > 0x400000)
       continue;
@@ -585,11 +598,34 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
     uint64_t got = 0;
     if (!vfs.ReadFileAt(fh, offs[c], tmp.data(), szs[c], got) || got < 0x40)
       continue;
-    const uint32_t be = (uint32_t(tmp[0]) << 24) | (uint32_t(tmp[1]) << 16) |
-                        (uint32_t(tmp[2]) << 8) | uint32_t(tmp[3]);
+    uint32_t be = (uint32_t(tmp[0]) << 24) | (uint32_t(tmp[1]) << 16) |
+                  (uint32_t(tmp[2]) << 8) | uint32_t(tmp[3]);
     // Refuse poison / zeros. Accept RSC5/XC package heads — archive .list
     // and dict bodies ARE those families; the old reject starved preload.
     if (be == 0xCDCDCDCDu || be == 0 || be == 0xFFFFFFFFu)
+      continue;
+    // F-130: the span hook in vfs_rpf.cpp only expands a member that fits
+    // WHOLE inside one read window, so a member straddling a page boundary -
+    // exactly the TOC's own 0x1DD1E8 + 3170 for AlphaModulate.fxc - reaches us
+    // still DEFLATE-compressed (that is why only 6 spans ever printed
+    // MEMBER-EXPAND and why no candidate carried a magic in w134). Inflate the
+    // candidate here, with the same helper.
+    if (be != kHeadRgxa && be != kHeadRsc5 && be != kHeadXcmp) {
+      std::vector<uint8_t> inf;
+      if (mcla::RawInflate(tmp.data(), tmp.size(), inf) && inf.size() >= 0x40) {
+        const uint32_t ibe = (uint32_t(inf[0]) << 24) |
+                             (uint32_t(inf[1]) << 16) |
+                             (uint32_t(inf[2]) << 8) | uint32_t(inf[3]);
+        if (ibe == kHeadRgxa || ibe == kHeadRsc5 || ibe == kHeadXcmp) {
+          MCLA_LOG_WARN("XSF-INFLATE path='{}' off={:08X} stored={} "
+                        "expanded={} head={:08X}->{:08X}",
+                        path, offs[c], szs[c], inf.size(), be, ibe);
+          tmp.swap(inf);
+          be = ibe;
+        }
+      }
+    }
+    if (pass == 0 && be != kHeadRgxa && be != kHeadRsc5 && be != kHeadXcmp)
       continue;
 
     // w20: TOC-derived bodies for .xtd/.xsf are often AES ciphertext.
@@ -648,9 +684,11 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
     }
     outSize = static_cast<uint32_t>(serveBytes.size());
     MCLA_LOG_WARN("XSF-HOSTSERVE path='{}' off={:08X} size={} buf={:08X} "
-                  "head={:08X} pkgSubst={:08X} toc=[{:08X} {:08X} {:08X} {:08X}]",
+                  "head={:08X} pkgSubst={:08X} pass={} toc=[{:08X} {:08X} "
+                  "{:08X} {:08X}]",
                   path, serveOff, outSize, dst, MclaBE(serveBytes.data()),
-                  pkgSubst, w[0], w[1], w[2], w[3]);
+                  pkgSubst, pass, w[0], w[1], w[2], w[3]);
+  }
   }
   vfs.CloseFile(fh);
   return dst;
@@ -11188,6 +11226,15 @@ PPC_FUNC(sub_821CCEA0) {
   // the packfile size/Read path (slot table + global BDF20 wrapper + served
   // registry). Guest Open returns 0; subsequent CC6F0/CD3C8/BE8D8 must see
   // these bytes, not empty/encrypted RPF payload.
+  // F-131 CLOSED this route with offline evidence, so archive .fxc bodies must
+  // NOT be served: the prototype XEX carries `rgxa 03 ff 03 10` at
+  // 0x827D2DD0 (13 such containers in the image) while the retail archive's
+  // compiled effects are `rgxa 01 ff 01 12` (AlphaModulate.fxc inflated at
+  // 0x1DD1E8), and the guest's gate reads that difference as
+  // 'Old version of rage effect found. You need to recompile your shaders!'.
+  // Serving the pending (ret==1) opens therefore cannot reach a draw - w117/
+  // w124/w125/w134/w136 all die at that fatal with LISTLINE 167 -> 1.
+  // ret==-1/1 are not served; only the resident opens (ret==0) are.
   if (ret == 0 && PathLooksLikeArchiveContent(path)) {
     uint32_t tw[4] = {0, 0, 0, 0};
     uint32_t tocEntry = 0;

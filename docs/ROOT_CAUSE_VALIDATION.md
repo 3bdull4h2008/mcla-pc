@@ -3154,3 +3154,34 @@ So the serve **advances** the guest past everything the frontier does and stops 
 **Frontier check for the census.** `w132` vs `w128`: `C0000005 0`, `Fatal error 0`, `FATAL-SOFT 0`, `GETDEV 694`, `TOC76 2,079`, `DISCCHK2 41`, `CP-DRAW 166`, `PRESENT 34`, `PRESENT-FB 4`, `NATIVE-PRESENT 4`, `GFx 3`, `[error] lines 15`, `CP truth drains=8 pub=11 put=11`, `LISTLINE 167` — all equal, so the census is observationally neutral (unlike F-125's hook, which was not).
 
 **Next (T41.11), with the pass condition stated.** The gate's pass condition is unchanged and now mechanical: with `kBe710MagicWrite = false`, a body whose first word is `0x61786772` must appear from the host pipeline. Two candidate moves, in the order the evidence supports: (1) make `HostServeUiBody`'s candidate acceptance *content-based* rather than sentinel-based — for a member the guest opens as an effect/rage container, require the container magic, and log the reject (`-BLOCKED`-style) so a wrong candidate cannot silently ship; (2) find the decode the `.list` spans get and are missing elsewhere — the `ED5C0D70 1BC7757E` repetition is the fingerprint to chase (a fixed keystream start means the key/nonce is constant per archive, so the guest's own decryption routine, reachable by `tools/ppc_xrefs.py find-str` on the archive header strings, is where to look). Do not stack a host-written word on top of either: F-128 proved that word is what currently hides this layer from us.
+
+### F-130 — **Why no archive effect body ever arrived with a container header: the span expansion in `vfs_rpf.cpp` can only substitute a member that fits whole inside one read window, so a page-straddling member is handed over still DEFLATE-compressed. Inflating the candidate in `HostServeUiBody` fixes it — and that is what exposes F-131.**
+
+- Task:        T41.10 / T41.11 (B4 feed), `build/w134.log` + `build/w136.log` vs baseline `build/w132.log`
+- Type:        FIX (candidate acceptance + per-candidate inflate, inert at the frontier) + FACT
+- Class:       E (archive serve path) + H (an instrument that cannot fire)
+- Code:        `src/gpu_device.cpp` — `XsfOffsetCandidates` results are now filtered by content: pass 0 accepts only a candidate whose first word is `rgxa`/`RSC5`/`XCompress`, and a non-magic candidate is fed through `mcla::RawInflate` (the same helper the VFS uses) before the decision; `XSF-INFLATE` logs the acceptance. `raw_inflate.h` is now included here.
+- Evidence:    the mechanism was invisible because `MEMBER-EXPAND` printed for exactly **6** offsets in every soak (`000D0000`, `001DD11C`, `001F41FB`, `0027F1AF`, `002DB9A1`, `00304E12`) and `MEMBER-EXPAND-FAIL`/`-SIZE` printed **0** times — i.e. the cross-page members were never even attempted (`ApplyExpandedSpans` skips a span unless `s.off + s.storedLen` lies inside the window). `w134` confirmed the consequence: `pass=0` **0** hits, all 34 serves via `pass=1`, `72677861` nowhere in the log. After the inflate: `w136` shows `XSF-INFLATE path='shaders/ui/fxl_final/AlphaModulate.fxc' off=001DD1E8 stored=3170 expanded=3170 head=9556CD6F->72677861` and the magic appearing 4 times.
+
+### F-131 — **The archive-shader route is CLOSED by a version mismatch measured offline, not by a host bug: this prototype's effect runtime is `rgxa 03 ff 03 10`, the retail archive's compiled effects are `rgxa 01 ff 01 12`. Feeding archive `.fxc` bodies can therefore never reach a draw, and `BE710-MAGIC` is what has been hiding the disagreement.**
+
+- Task:        B2/B4's "record why it cannot" branch, measured from `build/cache/mcla_pe.bin` and `build/game_data/xarchive_cache.rpf` directly (rule 3: raw bytes, no emulator), with the soak consequence in `w117`/`w124`/`w125`/`w134`/`w136` vs frontier `w127`/`w138`
+- Type:        FACT (a closed route) + revert of the pending-open serve + a correction to F-127/F-129's framing
+- Class:       E (content vintage) — not a kernel or emulator defect
+- Evidence:    at guest `0x827D2DD0` (the blob our own `BE0C8-FIX`/`AFB76-FALLBACK` hand to the guest as `fxl_final/rage_im.fxc`, and which the guest opens as `embedded:/fxl_final/rage_im.fxc` → `GETDEV-RET #5 ret=827D838C vt=82012918`) the image holds
+
+```
+72 67 78 61 03 ff 03 10 56 53 5f 54 72 61 6e 73 66 6f 72 6d 4c 69 74 …   'rgxa' VS_TransformLit
+```
+
+  and the archive's own member, inflated at its TOC offset `0x1DD1E8`/`0xC62`, begins
+
+```
+72 67 78 61 01 ff 01 12 56 53 5f 55 6e 6c 69 74 54 …                     'rgxa' VS_UnlitTransform
+```
+
+  `rgxa` in both, **different version fields** (`03 ff 03 10` vs `01 ff 01 12`). `sub_8218C760` reads the container and reports exactly that difference: `'%s: Old version of rage effect found. You need to recompile your shaders!'` (`lr=8218C864`). The image carries **13** `rgxa` containers (`0x827d2dd0`, `0x827d4458`, `0x827e2cb0`, `0x827f3c48`, `0x827f5380`, `0x827f61a0`, `0x827f9ce8`, `0x82801b00`, …), i.e. the embedded family is self-consistent and v3; `xarchive_cache.rpf`'s compiled effects are v1. So this prototype XEX cannot consume the retail cache's shaders at all.
+- Consequence, stated as the plan requires: **B4's shader feed cannot come from `xarchive_cache.rpf`.** Every attempt to serve those bodies (F-123's T41.7, F-126's T41.7b, this turn's T41.11 with correct inflate + magic-preferred candidates) ends at the same fatal with `LISTLINE 167 → 1`, `GETDEV 694 → 196`, `FATAL-SOFT 0 → 1` — and with the *correct* body delivered (`w136`) it still fails, which is what proves it is content vintage and not our decoding. The UI shader path must therefore come from the XEX's own `embedded:` containers, which the guest already opens (`AFB8-IN #1 path='embedded:/fxl_final/rage_im.fxc'`).
+- Reverted: the pending-open serve (`ret == 1`) and the two blocks it needed — this file no longer contains `g_servedOnce`/`XSF-BIND-REGONLY`. Kept, because they are correct and inert at the frontier: the magic-preferred candidate pass, the per-candidate inflate, `BE710-MAGIC-CENSUS`/`BE710-BODY`, and `kBe710MagicWrite` (true).
+- Frontier after this commit: `build/w138.log` — `LISTLINE 167`, `Fatal error 0`, `FATAL-SOFT 0`, `C0000005 0`, `CP-DRAW 166`, `GETDEV 694`, `DISCCHK2 41`, `PRESENT-FB 4`, `GFx 3`, `XSF-INFLATE 0`, `DRAW_INDEXED 0`.
+- Corrects F-129's closing hypothesis: the missing decode is real (F-130) but delivering the decoded bytes does not unblock B4 — the version gate does the blocking, and `BE710-MAGIC` has been stamping over it 166 times a boot.
