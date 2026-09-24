@@ -4648,3 +4648,52 @@ outcomes on its own: one entity realization either happens or does not, and when
 recorded so the next session does not spend a cycle re-deriving it. B4's `DRAW_INDEXED` and B5's
 guest-drawn `PRESENT-FB` are still unmet; the UI now has its real bytes, so the next question is what
 the guest does with a full-length `.xsf`.
+
+
+### F-170: the local xarchive_cache.rpf is a TRUNCATED COPY - 587,235,328 bytes (27.6%) past 0x5C000000 are zeros, and that tail is where four of the five UI .xsf packages live, so the menu is currently unreachable for a reason that is not in the emulator
+
+- Task:    B5 (menu) - answers the question F-169 left open ("what does the guest do with a full-length .xsf")
+- Type:    FACT (data-integrity blocker, found offline; no soak involved)
+- Class:   E
+- Priority: P0 - it is why swfCMD is 0 and the UI movie has no tags, and no code change can fix it
+- Evidence: scan of build/game_data/xarchive_cache.rpf in 4 MB strides (size 2,130,739,200 =
+  0x7F008000; last non-zero byte 1,543,503,872 = 0x5C000000); package offsets from the guest's own
+  records in build/w176b.log (TOC76-XSF / TOC76-LAYOUT); build/w175.log XSF-HOSTSERVE head=05435352
+  with XSF-INFLATE 0 in every soak today
+
+**Record layout, corrected and complete.** A TOC record is {leafHash, SIZE, pkgOffset|headerLength,
+pkgID}: the second word is the member size, not an offset. credits.xsf prints
+[02313636 0002FFC9 6496F01B D4082813] = size 0x2FFC9 (196,553) and package 0x6496F01B & 0xFFFFF000 =
+0x6496F000 - the field MclaPkgOffFromTocW2 already derives.
+
+| member | package offset per its own record | state on this disk |
+|---|---|---|
+| resources/ui/legals/legals.xsf | 0x000A0000 | present (RSC5 magic + ID verified, F-167) |
+| resources/ui/meshtextures.xtd | 0x00060000 | present |
+| resources/city/SC/trash.xrn | 0x0035A000 | present |
+| resources/ui/credits/credits.xsf | 0x6496F000 | ABSENT - zeros |
+| resources/ui/garage/garage.xsf | 0x64980000 | ABSENT - zeros |
+| resources/ui/policecam/policecam.xsf | 0x64CA3000 | ABSENT - zeros |
+| resources/ui/raceeditor/raceeditor.xsf | 0x64CB0000 | ABSENT - zeros |
+
+No other volume can hold those bytes (xarchive_audio.rpf is 1,615,757,312, smaller than
+0x6496F000 = 1,687,353,344), so the 0x64... prefix is a cache-file offset inside the missing tail -
+which corrects F-167's open inference that it was a volume selector.
+
+**Why the placeholder exists.** MclaPreferredPkgOffForPath's "every .xsf -> 0xA0000" therefore points
+the whole UI at the only .xsf package physically present (legals'). F-169's length fix makes those
+paths carry 196,553 real legals bytes instead of 32,768 of them - more correct, still the wrong body
+for four of five, and those four cannot be served at all until the file is whole.
+
+**A second, independent blocker on the package that IS present.** Its payload is not deflate: every
+plausible framing of +0x14..+0x2F was tried (length-then-data and data-only; raw windows -15/-12/15)
+and nothing inflates. With 0x0FF512EF in the header and high entropy after it, the body is encrypted
+or a codec we have not implemented - and XSF-INFLATE has fired 0 times today, so the guest is handed
+container bytes and produces no tags (W32-CONSTRUCT-CENSUS nPtr=0, W34-NOGFX).
+
+**Required action, stated as such.** Re-acquire xarchive_cache.rpf from the source and confirm it is
+materialized through 0x7F008000 before any further menu work; the prime suspect is the recorded E:
+volume trouble (2026-09-20 data loss, 2026-09-24 05:35 fsync failures), not a partial rip. Then
+re-test: if the four packages appear, F-169's length fix becomes testable for real; if the payload
+still will not inflate, the codec/keys question is the blocker and sub_821D5E10's inflate hook is
+where to look.

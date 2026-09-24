@@ -1,3 +1,23 @@
+## 2026-09-24 ~16:00 - F-170: STOP on the UI/menu until the archive is re-acquired. build/game_data/xarchive_cache.rpf is a TRUNCATED COPY - 587,235,328 bytes (27.6%) past 0x5C000000 are zeros, and 4 of the 5 UI .xsf packages live in that tail
+
+- Found offline, no soak needed. A TOC record's word[1] is the member SIZE and word[2] is
+  (packageOffset | headerLength), so each UI file names its own package: credits 0x6496F000,
+  garage 0x64980000, policecam 0x64CA3000, raceeditor 0x64CB0000 - all past the last non-zero byte
+  (0x5C000000). No other volume reaches that far (audio is 1,615,757,312 bytes), which also corrects
+  F-167's volume-selector guess.
+- Present and ID-verified: legals.xsf 0xA0000, meshtextures.xtd 0x60000, trash.xrn 0x35A000. So the
+  "every .xsf -> 0xA0000" substring map is pointing the UI at the one .xsf package on this disk, not
+  making an arbitrary choice.
+- Second blocker on the package that does exist: its payload is not deflate (every framing of
+  +0x14..+0x2F tried, raw windows -15/-12/15, nothing inflates) and XSF-INFLATE has fired 0 times in
+  all of today's soaks, while W34-NOGFX / nPtr=0 say the movie gets no tags. Encrypted, or a codec
+  behind the 0x0FF512EF header that we have not implemented.
+- Action is data recovery, not code: re-copy xarchive_cache.rpf and verify it is materialized through
+  0x7F008000 before more menu work. Prime suspect: the recorded E: volume trouble (09-20 data loss,
+  09-24 05:35 fsync failures).
+- Frontier keeps F-163 (registration completes, C0000005 0) and F-169 (UI bodies at declared length).
+  DRAW_INDEXED 0 and swfCMD 0 remain; B4's gate and B5 criteria 1-2 are unmet.
+
 ## 2026-09-24 ~15:50 - **F-169 (commit `3d93392`): the UI's RSC5 bodies are now served at their declared length - and the boot is BIMODAL, which invalidates single-soak verdicts on several counters we have been using all day**
 
 - **Fixed:** `XSF-BIND size=` was `32768` for all six container members; it is now the length the
