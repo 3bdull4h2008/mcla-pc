@@ -309,6 +309,11 @@ static uint32_t MclaPreferredPkgOffForPath(const char *path) {
 // package we actually have to carry instead.
 constexpr uint32_t kPkgWindowMax = 0x400000u;  // 4 MB
 
+// F-183: serve an RSC5 member from its XCompress sub-header (RSC5+0x0C)
+// instead of the container head, so the guest's own magic check sees the
+// stream it documents. Flip to false to restore the container-head framing.
+static constexpr bool kServeFromXCompressHead = false;
+
 // F-168: an RSC5 package states its own UNCOMPRESSED length. Layout, verified
 // against xarchive_cache.rpf on three packages (legals.xsf @0xA0000 hdrLen 27 ->
 // 196,553; meshtextures.xtd @0x60000 hdrLen 9 -> 240,531; trash.xrn @0x35A000
@@ -757,9 +762,23 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
         if (MclaLoadPkgWindow(pkgOff, 0, pkgSz, pkg) && pkg.size() >= 16) {
           const uint32_t pbe = MclaBE(pkg.data());
           if (pbe == 0x05435352u || pbe == 0x0FF512EFu) {
-            serveOff = pkgOff;
+            // F-183: zlibInflater::InflateBegin compares the FIRST WORD of the
+            // stream with 0x0FF512EF and consumes 8 bytes from there (magic +
+            // block size) before handing the rest to XMemDecompress. That header
+            // is not at the container head - it is at RSC5+0x0C, the guest's own
+            // pgStreamer::Open reading RSC5+0x04 as its parameter proves the
+            // preamble is real. F-182 measured the guest reaching the check for
+            // the first time and printing its own 'not in XCompress format', so
+            // hand it a stream that starts where its check looks.
+            uint32_t useOff = pkgOff;
+            if (kServeFromXCompressHead && pbe == 0x05435352u &&
+                pkg.size() > 16u) {
+              pkg.erase(pkg.begin(), pkg.begin() + 12);
+              useOff = pkgOff + 12u;
+            }
+            serveOff = useOff;
             serveBytes.swap(pkg);
-            pkgSubst = pkgOff;
+            pkgSubst = useOff;
             MCLA_LOG_WARN("PKG-SUBST path='{}' tocOff={:08X} tocHead={:08X} "
                           "-> pkg={:08X} head={:08X} n={}",
                           path, offs[c], be, pkgOff, pbe, serveBytes.size());
@@ -7061,6 +7080,9 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
 // starved job #1 and never delivered the job #2 package head.
 // (IsJob2UiDest now lives at file scope near the XSF helpers — w18.)
 PPC_FUNC_IMPL(__imp__sub_821D5E10);
+// F-182: the single switch for every state rewrite this hook performs. Set to
+// false to let the guest's own zlibInflater::InflateBegin run untouched.
+static constexpr bool kInflateIntervene = true;
 static std::atomic<uint32_t> s_h5E10{0};
 static std::atomic<uint32_t> s_h5E10pt{0};
 static std::atomic<uint32_t> s_h5E10empty{0};
@@ -7107,6 +7129,21 @@ PPC_FUNC(sub_821D5E10) {
   // zeros after the first XCompress window and magic must be visible then.
   if (inLeft >= 4 && inPtr != 0)
     (void)mem.ReadU32BE(inPtr, &magic);
+
+  // F-182 EXPERIMENT, revert first if the frontier moves. Everything below this
+  // line rewrites the guest's inflater state (re-point st+0/st+4 at a host
+  // bounce, force-serve windows, INFLATE-UNSTUCK zeroing outLeft). F-172 proved
+  // those paths are what the 34 XMem calls belong to (our j1SrcSz constants, a
+  // semaphore handle as `src`, ret=0 every time), and F-181 proved the guest
+  // needs nothing from us: pgStreamer::Open seeds every container's real
+  // length and we serve whole bodies since F-169/F-171. So: pass the call to the
+  // guest's own InflateBegin/XMemDecompress untouched and see what it does with
+  // the bytes - either it decodes, or it prints 'not in XCompress format'
+  // through its own path. Both are answers; neither has ever been tried.
+  if (!kInflateIntervene) {
+    __imp__sub_821D5E10(ctx, base);
+    return;
+  }
 
   // w20/w21: guest re-points inPtr at stack (006D8F4C / 006D9840) after
   // CC6F0 primes st. REFORCE when magic is bad OR when consumed>0 walking

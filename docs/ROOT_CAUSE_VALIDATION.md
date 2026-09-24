@@ -5379,3 +5379,118 @@ may finally move. Revert condition: any regression in `LISTLINE`/`TYPINIT`/`C000
 **Censuses left in the tree** (`STREAM-OPEN` extended, `BC140-REC`, `STUB-SLOT`, `REQFILL`): each
 shows a zero delta on the structural frontier, and `STREAM-OPEN`'s per-record read is now the only
 instrument that shows the streamer's lengths at all.
+
+### F-182: the pre-declared experiment was run - with our `InflateBegin` re-point removed the guest makes **one** inflate attempt, fails **its own** `not in XCompress format` check on the stack pointer a 0-byte read primed, and the 149-iteration spin collapses; the mitigation is load-bearing, so it is reverted
+
+- Task:    B5 (menu) - the experiment F-172/F-181 named, run to its verdict
+- Type:    FACT (reverted experiment) - `src/` behaviour is restored, so this is a measurement
+- Class:   G
+- Priority: P0 - it retires "maybe the guest only needs the bytes handed over honestly"
+- Evidence: `build/w189.log` vs `build/w188.log` (120 s soaks, exe `97,445,376` vs `97,570,816`);
+  `build/w191.log` proves the restore (`= w188`); `src/gpu_device.cpp:7085`
+  (`kInflateIntervene`, currently `true`)
+- Note: F-183 is the companion negative result on framing, same experiment series.
+
+**One early pass-through in `PPC_FUNC(sub_821D5E10)` skips every state rewrite the hook performs**
+(re-point, force-serve, `INFLATE-UNSTUCK`). Result: `INFLATE-ENTER 149→1`, `XMEM 40→1`, and the
+guest's own assert visible for the first time in this project's history:
+
+
+**F-182 - retire the re-point (`w189`).** One early pass-through in `PPC_FUNC(sub_821D5E10)` skips
+*every* state rewrite the hook performs (re-point, force-serve, `INFLATE-UNSTUCK`). Result:
+`INFLATE-ENTER 149→1`, `XMEM 40→1`, and the guest's own assert becomes visible for the first time:
+```
+INFLATE-ENTER #1 st=006D8F20 in=4294967284 inPtr=006D8F4C consumed=0 outPtr=A47FD000 lr=821BC380
+fatal message: 'zlibInflater::InflateBegin - not in XCompress format'
+FATAL-SOFT: '... not in XCompress format' lr=821D5E5C
+```
+`inPtr = stack+0x8C`, `in = 0xFFFFFFF4` - **exactly** F-172's derived `0 - 12` / `(r1+128) + 12`.
+So the single attempt the guest makes is the one primed from the exhausted record (`record[+4] = 0`,
+F-180), it reads a magic from the middle of the guest's own stack buffer, and it fails. Cost:
+`Fatal error 0→2`, `FATAL-SOFT 0→2`, `[error] 14→37`, `GFx 5→1`, `DICTLOOKUP 22→23`, `TYPINIT 6→8` -
+while `LISTLINE 171`, `GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `C0000005 0`, `SEEK-DEAD 0`,
+`DRAW_INDEXED 0` hold. **Reverted per the pre-declared condition** (B5 criterion 3 requires zero
+`FATAL-SOFT`). Lesson, same shape as F-128's `BE710-MAGIC`: this mitigation is load-bearing, and its
+removal is the only honest way to know that.
+
+### F-183: serving each RSC5 member from its XCompress sub-header (`pkg+0x0C`, head now
+`0x0FF512EF`) changes nothing at all - the stream the guest's check reads is not the body our XSF
+serve delivers
+
+- Task:    B5 (menu) - the follow-up to F-182, same experiment series
+- Type:    FACT (negative result)
+- Class:   E
+- Priority: P1
+- Evidence: `build/w190.log` vs `build/w189.log` (exe `97,445,888`); `src/gpu_device.cpp:315`
+  (`kServeFromXCompressHead`, left `false`)
+
+Serving each RSC5 member from `pkg+0x0C` (so the stream
+begins with `0x0FF512EF`) is visible in the log - `XSF-HOSTSERVE off=64CB000C size=143057
+head=0FF512EF` - and changed **nothing**: `w190` matches `w189` on all 18 counted markers, including
+`XCompress 2`, `INFLATE-ENTER 1`, `XMEM 1`, `Fatal error 2`, `GFx 1`. So the stream the guest checks
+is *not* the body our XSF serve delivers: the inflate attempt consumes the guest's own stack copy,
+which is filled by the `sub_821CC6F0` Read that F-180 showed being asked for 0 bytes. Left disabled by
+default (unproven under `kInflateIntervene = true`).
+
+**What the route therefore needs, restated from three measurements.** Not a codec, not a key, not a
+serve offset: **the record must still have bytes when the request executes.** F-181 showed Open seeds
+240,531 / 196,553 / 10,799 correctly; F-180 showed the same record at `C9A24970` arriving at the
+second and third executions with `[+4] = 0` and `[+12] = 4` while its `[+16]`/`[+24]` still name
+legals. Three queue generations (`[slot+0] = 4, 0x8004, 0x10004` - index 4, generation bits 15+) share
+that one record, so the remaining-bytes counter is being consumed by the generation before the one
+that reads it. That is `pgStreamer`'s own bookkeeping, and the next question is narrow and static:
+who decrements `record[+4]`, and is a *new* Open supposed to reset it (F-181 measured it non-zero
+immediately after each Open, so somebody zeroes it between Open and execution). The instrument for
+that already exists - `STREAM-OPEN` prints the length at Open time and `BC140-REC` prints it at
+execution time, and `w188` shows both for the same three containers.
+
+### F-184: state after the F-182/F-183 experiment series - frontier restored to `w188` numbers with both switches left off, and one question standing: who zeroes `record[+4]` between Open and execution
+
+- Task:    B5 (menu) - the durable state, so the next session starts from the restored tree
+- Type:    FACT
+- Class:   I → G (the open question is now specific enough to be class G)
+- Priority: P1
+- Evidence: `build/w191.log` vs `build/w188.log` (both 120 s soaks; exe `97,570,816` for both -
+  the restore is byte-identical in size and behaviour), `src/gpu_device.cpp:315`
+  (`kServeFromXCompressHead = false`), `:7085` (`kInflateIntervene = true`)
+
+`LISTLINE 171`, `Fatal error 0`, `FATAL-SOFT 0`, `C0000005 0`, `SEEK-DEAD 0`, `TYPINIT 6`,
+`GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `DICTLOOKUP 22`, `[error] 14`, `GFx 5`,
+`INFLATE-ENTER 149`, `swfCMD 0`, `XSF-INFLATE 0`, **`DRAW_INDEXED 0`**. B4's gate and B5 criteria 1-2
+remain unmet; B5 criterion 3 (zero `FATAL-SOFT` masking) is met again. `XMEM 41` vs 40 is the capped
+`T413N2-XMEM` dedup printer, not a structural delta.
+
+**The single open question, narrowed by three measurements.** `pgStreamer::Open` writes the correct
+length and `record[+12] = 0` (F-181, measured at its return); by the time `sub_821BC140` executes the
+second and third generations the same record at `C9A24970` reads `[+4] = 0`, `[+12] = 4` while
+`[+16]`/`[+24]` still name `legals` (F-180); and the guest's one honest inflate attempt under
+F-182 fails its own magic check on the pointer that 0-byte read produced. So: something between Open
+and execution consumes the counter that the *next* execution needs. Both instruments for that already
+exist and are free (`STREAM-OPEN` samples at Open time, `BC140-REC` at execution time); what they do
+not yet cover is the interval, which is where a `record[+4]` write happens - candidates are the
+decrement inside `sub_821BC140`'s own loop (static read: does it `stw` to `[r28+4]`?) and
+`sub_821BCB10`'s enqueue bookkeeping. Read the store list of `sub_821BC140` first: it is one grep and
+it would explain 149 iterations of the same request consuming the same record.
+
+
+### F-185: `sub_821BC140` does **not** write `record[+4]` - searched its whole 586-line body for a store through `r28`, so the remaining-bytes counter is decremented by someone else, and F-184's first candidate is closed
+
+- Task:    B5 (menu) - resolves the question F-184 named first
+- Type:    FACT (negative)
+- Class:   G
+- Priority: P2
+- Evidence: `generated/ppc_xenon/ppc_recomp.14.cpp:18805`-`19391` (the whole of
+  `PPC_FUNC_IMPL(__imp__sub_821BC140)`); searched for `PPC_STORE_U32(r28.u32 + 4` -
+  **0 matches**. The only arithmetic on the field's consumer-side copy is
+  `subf r30,r3,r30` at `+0x318` (r30 = remaining - bytes just read), which updates a
+  **register**, and `addi r30,r30,1` at `+0x503`; neither is stored back through
+  `r28`.
+
+So the field `pgStreamer::Open` seeds (F-181: 240,531 / 196,553 / 10,799 at return) is
+zeroed between Open and the next execution by some other part of the streamer - the
+remaining candidates are the completion/advance path around `sub_821BC674`-`0x821BC694`
+(the three other readers of the `0x8283D190` class static) and `sub_821BCB10`'s enqueue
+bookkeeping (`+0x44` also materialises that static). `record[+12]` moves 0 → 4 across the
+same interval (F-180 vs F-181), which is a state field and points at the same writer:
+whatever advances a record sets both. Next read is those two functions' store lists, not a
+new instrument.

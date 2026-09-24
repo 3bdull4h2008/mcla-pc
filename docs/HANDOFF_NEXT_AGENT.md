@@ -1,3 +1,26 @@
+## 2026-09-24 ~18:20 - **F-182..F-185: ran the experiment I had pre-declared. Removing our InflateBegin re-point makes the guest attempt inflate ONCE and fail its OWN `not in XCompress format` check (spin 149→1, XMem 40→1) - but it costs `Fatal error 0→2`, `FATAL-SOFT 0→2`, `GFx 5→1`, so it is reverted and both switches are off. Frontier restored: `w191` == `w188`**
+
+- Two new named switches in `src/gpu_device.cpp` (registered in PROGRAM_GUIDE §7):
+  `kInflateIntervene` (`:7085`, `true`) and `kServeFromXCompressHead` (`:315`, `false`). Flip the first
+  to `false` for the honest-guest test; it is the removal probe for the whole inflate hook.
+- F-183 is a clean negative: serving RSC5 members from `pkg+0x0C` so the stream starts with
+  `0x0FF512EF` changed **nothing** (`w190` ≡ `w189` on all 18 markers). The stream the guest validates
+  is its own stack copy, not the XSF-served body - so do not spend another soak on serve framing.
+- F-185 closes the first candidate for the remaining question: `sub_821BC140` has **no** store through
+  `r28` anywhere in its 586 lines, so it does not decrement `record[+4]`. Open seeds it correctly
+  (F-181: 240,531 / 196,553 / 10,799) and it is 0 by the next execution (F-180) together with
+  `record[+12]: 0 → 4`, i.e. one state-advancing writer touches both.
+- **Read next, static and cheap:** the store lists of `sub_821BC674`-`0x821BC694` and
+  `sub_821BCB10` (both also materialise the `0x8283D190` class static) for writes to `+4` and `+12` of
+  a `[base + (id & 0x7FFF)*28]` record. That is the last unexplained step before the guest's own LZX
+  path can be expected to run on the UI containers.
+- Census inventory added this session, all measured zero-delta on the structural frontier: `REQFILL`,
+  `STREAM-OPEN` (+ per-record length), `STUB-SLOT`, `BC140-REC`. And per F-178: **never** treat
+  `INFLATE-ENTER`/`READWRAP` totals as evidence - they count a timed spin.
+- Plan state: B1/B2/B3 closed; **B4 gate (`DRAW_INDEXED >= 1` from a non-zero constant bank) unmet**;
+  B5 criteria 1-2 unmet, criterion 3 met. F-172's separate B4 lead (Type-0 `0x0A2F/0x0A30`
+  size+address pair → `0x08A11000`/`0x08A15000`, unimplemented `PM4_WAIT_REG_MEM`) is still open,
+  still unverified, and may be the cheaper road to renderer feed.
 ## 2026-09-24 ~18:05 - **F-180 + F-181: the streamer record is finally read directly - `record[+4]` IS the byte count, `pgStreamer::Open` seeds all seven containers CORRECTLY (143,069 / 1,066,057 / 19,337 / 29,655 / 240,531 / 196,553 / 10,799), and the zero `sub_821BC140` sees is that same record after consumption. So the archive, the TOC, the device vtable and Open are all innocent; our `InflateBegin` re-point is the remaining suspect**
 
 - `BC140-REC` (3 checked reads inside the existing INLINE-EXEC hook) shows one shared 28-byte record at
