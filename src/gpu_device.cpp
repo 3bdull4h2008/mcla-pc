@@ -11990,6 +11990,10 @@ PPC_FUNC(sub_821CAFB8) {
       MCLA_LOG_WARN("AFB76-MEM$ #{} path='{}' buf={:08X} size={} stream={:08X} "
                     "lr={:08X}",
                     n, path, buf, size, st, lr);
+    // F-152: an object-shaped return for the sub_821BE0C8 re-open was tried here
+    // and MEASURED INERT (w162: AFB76-MEM$-OBJ 0 lines, SEEK-DEAD unchanged) -
+    // this hook never sees the memory:$ path at all, so the index that faults is
+    // the guest's own sub_821BE0C8 return. Reverted; see F-152.
     ctx.r3.u32 = st;
     return;
   }
@@ -12367,6 +12371,15 @@ PPC_FUNC(sub_821BE0C8) {
   if (ParseMemoryDollar(pth, &mb, &ms) && mb != 0) {
     const uint32_t st = MakeMemoryStream(kMemDeviceObj, mb, ms);
     MCLA_LOG_WARN("BE0C8-RET stream={:08X} buf={:08X} size={}", st, mb, ms);
+    // F-153/F-154: returning a guest-native OBJECT here (dev=kMemDeviceObj,
+    // +4=slot index, +8=buf, +28/+32=size) was built and soaked (w164). It did
+    // remove the fault - C0000005 1->0, SEEK-DEAD 1->0, BE0C8-OBJ 167 lines,
+    // Fatal/FATAL-SOFT still 0 - and it also LOST ground: LISTLINE 171->167 and
+    // TYPINIT/REALIZE-CAST 1->0, i.e. the four embedded effects F-135 recovers
+    // stopped loading, because a live [obj+0] sends the guest's own device
+    // methods at the memory device's OWN handle table (0x82861740+handle*16,
+    // from sub_821CB2A0's `lis -32122 / addi 1856`), which host-served bodies
+    // never populate. Reverted, not tuned (F-151's stated condition).
     ctx.r3.u32 = st;
     return;
   }

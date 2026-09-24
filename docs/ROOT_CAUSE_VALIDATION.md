@@ -3875,3 +3875,99 @@ reverted, not tuned.
 **Frontier.** w161 = w160 on every marker (`RD-SUBMIT 24`, `LISTLINE 171`, `Fatal error 0`,
 `FATAL-SOFT 0`, `SHGRP-VARS 0`, `DRAW_INDEXED 0`, `C0000005 1`, `VEH-NEUTRAL 1`, `TYPINIT 1`,
 `REALIZE-CAST 1`) - the `SEEK-DEAD` census is measurement only.
+
+### F-152: F-151's proposed fix was built, measured **inert**, and reverted - and the measurement relocates the defect: the `memory:$` re-open never enters our Open hook, and the `1` is the guest's own `sub_821BE0C8` return
+
+Implemented exactly as F-151 declared (`sub_821CAFB8`'s `ParseMemoryDollar` branch returns a
+guest-native-shaped object at a fresh allocation when `lr == 0x821BE988`), built green, soaked
+`build/w162.log`:
+
+```
+AFB76-MEM$-OBJ  0 lines        (the new branch never executed)
+SEEK-DEAD       obj=00000001   (unchanged)
+RD-SUBMIT 24  LISTLINE 171  Fatal error 0  FATAL-SOFT 0  C0000005 1  VEH-NEUTRAL 1  TYPINIT 1  DRAW_INDEXED 0
+```
+
+so identical to `w161` everywhere - no progress, no regression. Reverted (the comment stays at the
+site; `SEEK-DEAD` stays as the instrument).
+
+**Why it was inert, and that is the datum.** `PPC_FUNC(sub_821CAFB8)` fired **16 times in the whole
+soak**, every one with `lr=821BDF5C` (the `sub_821BDF20` INSERT path) and every `path` an
+`embedded:/` name - e.g. `AFB8-IN #16 r3=827D838C r4=CE582980 path='embedded:/fxl_final/rmptfx_collision.fxc' lr=821BDF5C`.
+Its own print condition includes `path[0] == 'm'`, so a `memory:$...` open through this function
+could not have been silent. Therefore **`sub_821BE0C8`'s re-open does not call
+`sub_821CAFB8`**: the `vt+4=821CAFB8` on the `BE0C8` census line is that census reading
+`[vtable+4]`, not evidence of a call (the same trap F-151 warned about for `DEVCLAIM`'s `r3`).
+
+**And the `1` is the guest's own.** No file in `src/` contains `memory:$` or `:unavailable`
+(`grep -rn` over `src/**` = 0 hits), so `memory:$CE71A380,11487,1:unavailable` is composed by the
+guest (F-134 already attributed the format to `sub_821CB740`), and `BE0C8-RET stream=1` is the
+guest's `sub_821BE0C8` returning the third field of its own path string.
+
+**Corrected blocker statement.** `sub_82191040` does
+`sub_821CA6A8` -> `sub_821BE8D8` -> keep r31 -> `sub_821BE4F0(r31)` and branches on the result:
+**==26** takes the reader branch (`sub_821CF7B8(sp+656, name, r31)` + `sub_8219F030` +
+`sub_821BE610`, returns 1 = success) - the same reader family that `REALIZE-CAST` proved works on
+the expanded text; anything **else** falls to `loc_821910EC`, which calls
+`sub_821BE568(r31, 0)` (Seek) unless the code is 13. So the AV is one level *up*: the value the
+guest re-opened with is not a stream object, and `sub_821BE4F0` does not classify it as the 26
+kind. Chasing the Seek's null guard would be do-not #1 territory.
+
+**Next measurement, declared before running.** A read-only census on `sub_821BE4F0` printing the
+handle it was given, the code it returns and `lr` (cap 24). Outcomes: returns something other than
+26 for a body that F-149 expanded correctly => the classifier reads a header/field our serve does
+not fill (and the fill is the fix, discovered from that function); returns 26 everywhere and the
+AV belongs to a *different* load => `SEEK-DEAD`'s `lr=82191100` plus `BE0C8`'s path identifies
+which resource, and that resource's serve is the gap.
+
+### F-154: `w163` was a STALE-EXE soak (the build had failed and I read its log anyway) - and `w164` measures the object-shaped re-open as a **net loss**, so it is reverted; the fact it revealed is that the memory device owns a SECOND handle table at `0x82861740`
+
+**Process defect, stated plainly.** The `w163` command chained build + soak and I read the
+log without checking `BUILD_RC`: it was **1** (`gpu_device.cpp:12398` - `use of undeclared
+identifier lr`), so `w163` ran the 13:22 exe, i.e. the *reverted* tree. Its numbers
+(`Fatal 0`, `FATAL-SOFT 0`, `C0000005 1`, `SEEK-DEAD 1`, `TYPINIT 1`) are therefore a clean
+**reproduction of `w161`** - which is worth having (the post-revert state is deterministic
+across two runs) - but it proved nothing about the experiment. This is rule 12 biting again
+in the same session; the fix is procedural: read `BUILD_RC` and the exe mtime before the log.
+
+**w164 (the experiment, correctly built: exe 13:33:23, `BUILD_RC=0`).** Returning a
+guest-native object from `sub_821BE0C8` (`+0 = kMemDeviceObj`, `+4 = slot index`,
+`+8 = buf`, `+24 = 0`, `+28 = +32 = size`), gated to the `memory:$` re-open whose `lr` is
+`0x821BE988`:
+
+| marker | w161 (baseline) | w164 |
+|---|---|---|
+| `BE0C8-OBJ` | - | 167 |
+| `SEEK-DEAD` | 1 | **0** |
+| `C0000005` | 1 | **0** |
+| `Fatal error` / `FATAL-SOFT` | 0 / 0 | 0 / 0 |
+| `LISTLINE` | 171 | **167** |
+| `TYPINIT` / `REALIZE-CAST` | 1 / 1 | **0 / 0** |
+| `RD-SUBMIT` | 24 | 24 |
+| `DRAW_INDEXED` | 0 | 0 |
+
+So it removed the fault **and** lost the four embedded-effect loads F-135 bought plus the whole
+`entity.type` text progress - the pass condition in F-151 was "LISTLINE 171 and RD-SUBMIT 24
+held", so per that pre-declared rule it is reverted (kept as a cited comment at
+`src/gpu_device.cpp:12373`-ff).
+
+**Why - and this is the useful part.** A *live* `[obj+0]` sends the guest's own device methods
+after the handle, and the memory device indexes **its own** table: `sub_821CB2A0` is
+`base = 0x82861740` (from `lis r10,-32122` = `0x82861000`, `addi r10,r10,1856`),
+`entry = base + handle*16`, and it **returns -1 when `[entry+0] == 0`** - which is the state for
+every body our host-serve path registers, because `GuestSlotTableInsert` writes
+`kGuestSlotTable = 0x82860740` (F-132/F-135's table, 16-byte stride, `{buf,size,pos,flag}`).
+Two parallel 16-byte tables, one per device, and only the `0x82860740` one is fed by us. The same
+`sub_821CB2A0` also *frees* `[entry+0]` when its byte `+12` is non-zero and then stores 0 there,
+so it is a Close-shaped routine, not a Seek - the `vt+44` slot my F-153 comment called "Seek" is
+`0x82860740`-space's Close for the *memory* device.
+
+**Next step, narrowed by that.** Either (a) register host-served bodies into the memory
+device's table as well (write `{buf,size,pos,flag}` at `0x82861740 + idx*16` **and** keep
+`flag = 0` so nothing is freed), then the object-shaped return of F-153 should give
+`C0000005 0` **with** `LISTLINE 171` and the `Version:` progress; or (b) leave the index contract
+and give `sub_821BE568`'s caller an object whose device vtable routes `+44` to a slot the memory
+device does own. (a) is a 5-line extension of `GuestSlotTableInsert`'s call site and is the one
+to try; it is also the first time F-132's "the guest treats an open handle as a slot index"
+finding has to be applied to the *second* table, which is likely why F-134 saw `GetSize` answer
+-1 for these handles at all.
