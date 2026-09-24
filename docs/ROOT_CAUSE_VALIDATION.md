@@ -2505,3 +2505,100 @@ the recompiler binary does not exist, so no generated-code regeneration is possi
 - **And the asset is there.** `shaders/effects/dcl/star_glow.dcl` now opens **successfully**: `ret=1 toc=[D8DABDFA 00000059 00305F0C 40000053]` (89 bytes at `0x305F0C`) in `w98` — so the whole chain list-name → group-prefixed record → open works for `star_glow` for the first time; what is left of B2 is that the 89-byte `.dcl` body then has to reach the shader/DCL consumer, which today dies at the `swfCMD::Fixup` fatal and the wrapper AVs. DISCCHK is untouched (6 firings in both trees). B4's first item now has a reason to exist: the boot reaches `swfCMD::Fixup`, i.e. Scaleform content, so the renderer feed work is unblocked once the wrapper fault is fixed.
 - **Also fixed on the way (F-101's wording).** `sub_823DA950`, called from `sub_821CBE18+0x78`, is an `eieio` + backward-walking cache-invalidate loop (`addi r9,-1` pairs over `r3`/`r5`), not a copy-out. F-101's conclusion (the pages ARE touched right after fill, with no decoder between) stands — the touch is the device's cache op over the DMA target — but its 'copies out' description was wrong.
 
+
+### F-112 — **B3 answered:** the DISCCHK "error flag" word is the RPF3 TOC record's 4th dword, bit30 is set on *every* cache-packfile record, and bit31 is the guest's own read-completion marker — so the forced ack is not an ack at all, it is "pretend the bytes are already resident", and it suppresses the guest's read submission for every file it touches.
+
+- Task:        T41.3w (B3), `build/w100.log` (ack OFF), `build/w101.log` (ack OFF + DISCCHK2 census), `build/w102.log` (ack ON + census = new committed default)
+- Type:        FACT + FIX (mitigation retained, now labelled and sited)
+- Class:       D (kernel/runtime implementation) + E (filesystem/device)
+- Priority:    P1 — it is the mechanism B4's texture/shader feed depends on
+- Evidence:    `build/w102.log` `DISCCHK2 #1 strm=C60AC1A8 fobj=C60AC180 len=1000 rec=C60F7A40 size=23F offs=D0000 flags=400000EC route=guest-disc-read`; `build/w99.log` `entry=C60F7A40 +4=[0000023F 000D0000 400000EC 4C84317A]` for `path='textures/global/cars/globaltex.list'`; `build/w101.log` `DISCCHK2-RES wait returned r3=4294967293 (guest fatals on ==1)`; `generated/ppc_xenon/ppc_recomp.17.cpp:3114-3175` + `:3229-3260`; `src/gpu_device.cpp:10443` (hook) and `src/task_dispatch_trace.cpp:934-957` (census).
+
+**The word is a TOC dword, not a device status.** `rec=C60F7A40` is the in-guest TOC record for
+`textures/global/cars/globaltex.list`, whose 16-byte record our own XSF census dumps as
+`[3D9B8154 0000023F 000D0000 400000EC]` — GtaO hash, size 0x23F (= 575 = the *stored* length F-105
+measured for that member), archive offset 0xD0000, and the 4th dword `0x400000EC`, which is exactly
+the value `sub_821CC1E0` tests. Fourteen further records line up the same way in `w99`
+(`2dnoise3.dds` → `C60F7AA0 … 4001258B`, `2dnoise4.dds` → `C60F7AE0 … 40010DEF`, `cf_bump2.dds` →
+`C60F7B30 … 4000A6F2`). **Every one of them has bit30 set**, which retires any reading of bit30 as
+"this file errored".
+
+**What the executed code does with it** (`generated/ppc_xenon/ppc_recomp.17.cpp:3114` ff — the
+recompiled body, which is what actually runs):
+
+| guest VA | executed statement | consequence |
+|---|---|---|
+| `0x821CC1F0` | `r31 = ctx.r4` | the read-request object arrives in **r4** (see F-113) |
+| `0x821CC200/04` | `r11 = [r31]`, `r10 = [r11+12]` | the TOC record, then its 4th dword |
+| `0x821CC208/10` | `if (!(r10 & 0x40000000)) → 0x821CC224` | bit30 clear ⇒ `r10 = r25 = 0` ⇒ normal path |
+| `0x821CC214/20` | `if (r10 & 0x80000000) → 0x821CC228` with `r10 = 1` | bit30 set **and** bit31 clear ⇒ `1 & 0xFF ≠ 0` ⇒ falls into the `0x821CC234` block |
+| `0x821CC230` | `if (r10 & 0xFF) == 0 → 0x821CC35C` | bit30 set **and** bit31 set ⇒ normal path |
+
+so the block runs **iff bit30 set && bit31 clear** — session 75z's model was right, and the census
+now prints that decision as `route=`. Inside the block the guest *performs the read it was told to
+do*: it computes a chunk (`len=1000` = 4096 in `#1`, clamped by `size-pos`), issues the device
+virtual call (`bctrl` at `0x821CC2B8`, slot `[{{[r30+32]}+0}+28]`), stores the caller-stack IO block
+(`stw r1+80 → [r31+12]`), then `bl 0x821DEE40(r31+12, 2)` and keys the outcome on its result:
+`r29 == 1` → return normally, `r29 == 0 || r29 > 1` → retry the chunk, **`r29 < 0` →
+`sub_821BD618` = `'Fatal disc error'`**. `w101` measured `r3 = 0xFFFFFFFD = -3` — the guest fataled
+because *its own completion call reported a negative result*, not because an "error was unacknowledged".
+
+**Therefore bit31 means "the record's bytes have been read in", and the missing step is the
+completion, not an ack flag.** With the forced write ON the guest never submits those reads at all;
+with it OFF, boot dies at 4,528 lines (`w100`/`w101`) versus 17,868 (`w99`) — census: `TOC76 232` vs
+`2,079`, `GETDEV 100` vs `694`, `LISTLINE 0` vs `167`. The mitigation is therefore **retained and
+load-bearing**, now labelled at its site (`src/gpu_device.cpp:10443`, `kDiscChkForcedAck`), and its
+cost is named: every file whose data the guest wanted at this stage is silently declared resident,
+so any content that path would have produced arrives (if at all) only through the host serve path.
+That is a standing hazard for B4 — the conversion target is to make `sub_821DEE40(io, 2)` return 1
+for a served record instead of -3, which retires the forced bit without a skip.
+
+**Cap disclosure (rule 19):** `DISCCHK2` prints at `n <= 40 || (n % 200) == 0`, so `w102`'s 41 lines
+are 40 consecutive head samples plus `#200`; the true per-run total is ≥ 200 and < 400 and the
+sample is a *head* sample, not a random one. `DISCCHK2-WAIT`/`-RES` are uncapped but can only fire
+while the ack is OFF (they live inside the block the ack skips), so in the committed configuration
+they print zero — a zero that means "the mitigation is working", not "the path is dead".
+
+### F-113 — Instrument post-mortem: `tools/ppc_disasm.py` prints `bc` as raw `bo=/bi=` with no polarity and prints `mr A,B` in the *opposite* operand order from what the recompiler emits; a "refutation" of the bit31 model assembled from it was wrong, and `PPCContext` has no `r14`–`r31` members at all, so a `PPC_FUNC` hook structurally cannot read a callee-saved register.
+
+- Task:        T41.3w (B3), discovered while compiling `src/gpu_device.cpp`
+- Type:        FACT (tool + API constraint)
+- Class:       H (instrumentation artifact)
+- Priority:    P1 — it nearly put a false "the old model is refuted" finding into the ledger
+- Evidence:    `build/ninja_b3b.log:116,119` (`error: no member named 'r31' in 'PPCContext'`, `no member named 'r29'`); `src/ppc_context.h:327-366` (r14…r31 inside `#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL`); `generated/ppc_xenon/ppc_recomp.17.cpp:3139-3141` vs `python tools/ppc_disasm.py 821CC1E0 32` line 5; `docs/ROOT_CAUSE_VALIDATION.md` F-112.
+
+Three traps in one instrument, all of them silent:
+
+1. **`mr` operand order.** The word at `0x821CC1F0` is `7C9F2378`. `ppc_disasm.py` prints
+   `mr r4,r31` (i.e. "r4 = r31"); the recompiler emits `r31.u64 = ctx.r4.u64` under the comment
+   `// mr r31,r4`. Only one can be what runs — and the recompiler's is the correct reading: the ISA
+   macro is `mr A,B` = `or B,A,B`, so `RT=4, RA=31, RB=4` *is* `mr r31,r4` (cross-check the
+   canonical `mr r1,r30` = `7FC1F378`, which likewise has `RT=30, RA=1, RB=30`). Behaviour agrees:
+   with `r31 = ctx.r4` the census reads a coherent TOC record, while a body that *read* an unassigned
+   `r31` would load from guest address 0 and AV on the first call. The tool collapses
+   `or RT,RA,RB` with `RB==RT` and prints it as `mr RT,RA` — the reverse direction.
+2. **`bc` polarity.** The tool prints `bc bo=12 bi=26 -> target` and leaves the meaning to the
+   reader. `bo=12` with `bi=EQ` is **`beq`** — cross-check the canonical `beq +20` = `41820014`
+   (`BO=0b01100, BI=2`), and the recompiler writes our branch as `if (cr6.eq) goto …`. Reading it as
+   "branch if condition false" inverts every control-flow conclusion in a function; that is what
+   produced the (now-withdrawn) claim that `0x821CC234` was the normal path and that
+   `[dev+12] & 0x3FFFFFFF` was a size the check ignored.
+3. **No callee-saved registers in `PPCContext`.** `r14`–`r31` are compiled away by
+   `PPC_CONFIG_NON_VOLATILE_AS_LOCAL`, so *any* hypothesis of the form "the object is in r31" is
+   untestable from a hook, and the correct move is to find which **argument register** the
+   recompiler assigns that object from — here `r4`, which the old hook already used correctly.
+
+**Rule to keep:** for executed semantics the authority is the generated body
+(`generated/ppc_xenon/ppc_recomp.NN.cpp`, `if (cr6.eq)` / `if (!cr6.lt)` lines are unambiguous);
+`ppc_disasm.py` is for opcode and immediate fields only. Do not assert a branch's direction or an
+`mr`'s source from it. Supersedes nothing — F-112 records the corrected conclusion.
+
+### F-111 correction (dated 09-24 04:55, T41.3w)
+
+F-111's last sentence says the new default "**costs the `C0000005 0` invariant: 50 access
+violations**". That 50 is a **line count** from `soak_census`, which counts matching lines: `w99` has
+50 `C0000005` lines and 48 `VEH[` lines, but only **2** distinct `Vectored exception:
+code=0xC0000005` events — the two host-completed stream-wrapper faults already named in F-108/F-110
+(`rva=0x58D5384`, `lr=821BE508`, guest `0xC61`), each re-reported per attempt. The blocker is real
+but it is 2 faults, not 50; the per-fault count is a retry multiplier and must not be quoted as an
+event count. `w102` reproduces the same 50 lines / 2 events, and `DRAW_INDEXED` is still 0.

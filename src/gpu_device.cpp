@@ -10406,29 +10406,61 @@ PPC_FUNC(sub_821CBE18) {
   __imp__sub_821CBE18(ctx, base);
 }
 
-// Session 75x: disc-error check census. sub_821CC1E0 fatals with
-// 'Fatal disc error' when [dev+12] bit30/31 (error/media flags) are set.
-// Log the device object and flag word to find who sets them.
+// T41.3w (B3): the "[dev+12] error/media flags" word is the RPF3 TOC record's
+// 4th dword, copied verbatim (w99/w100: dev=C60F7A40 flags=400000EC == the
+// globaltex.list record [3D9B8154 0000023F 000D0000 400000EC]; 2dnoise3.dds
+// C60F7AA0 == ...4001258B). Every record in the cache packfile has bit30 set,
+// so bit30 cannot mean "this file errored". What the guest does with it (read
+// the executed translation, NOT tools/ppc_disasm.py -- its mr/RA-RT order is
+// inverted, see F-112): generated/ppc_xenon/ppc_recomp.17.cpp:3114 ff --
+//   r31 = r4 (the read-request object), r30 = r3, r27 = r6 (length)
+//   r11 = [r31+0] = the TOC record;  r10 = [r11+12]
+//   if (r10 & 0x40000000) { if (!(r10 & 0x80000000)) -> 0x821CC234 block }
+//   else -> 0x821CC224 with r10 = r25 = 0 -> normal
+// so the block at 0x821CC234 runs iff bit30 set AND bit31 clear, and inside it
+// the guest submits the real read through the device vtable (bctrl at
+// 0x821CC2B8), waits on the IO block (bl 0x821DEE40 at 0x821CC2EC), and fatals
+// with 'Fatal disc error' when THAT returns 1 (r29 = r3, cmpi r29,1 at
+// 0x821CC2F8). i.e. bit30 = "bytes not resident yet, do a disc read",
+// bit31 = "read completed". The missing step is the completion, not an ack.
+// MITIGATION (labelled, NOT the mechanism): forcing bit31 claims the data is
+// already resident and skips the guest's own read submission. Without it the
+// boot dies 13k lines earlier (w100 vs w99: TOC76 232 vs 2079, GETDEV 100 vs
+// 694), so the forced bit is load-bearing while the completion path is unfixed.
+// The honest measurement of the missing step is DISCCHK2-RES below.
 PPC_FUNC_IMPL(__imp__sub_821CC1E0);
 static std::atomic<uint32_t> s_hCC1E0{0};
 PPC_FUNC(sub_821CC1E0) {
   const uint32_t n = s_hCC1E0.fetch_add(1) + 1;
-  const uint32_t strm = ctx.r4.u32;
-  // Session 75z: ack BEFORE the original â€” the fatal fires inside it.
-  // The check passes only when bit30 (error flag) is clear OR bit31
-  // (handled) is set; our emu misses the step that sets bit31.
+  const uint32_t strm = ctx.r4.u32;  // == the guest's r31 (generated mr r31,r4)
   {
     auto &memD = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t dev = 0, flags = 0;
-    memD.ReadU32BE(strm + 0, &dev);
-    if (dev != 0 && dev != 0xCDCDCDCDu) {
-      memD.ReadU32BE(dev + 12, &flags);
+    uint32_t rec = 0, flags = 0, size = 0, offs = 0;
+    memD.ReadU32BE(strm + 0, &rec);
+    if (rec != 0 && rec != 0xCDCDCDCDu) {
+      memD.ReadU32BE(rec + 12, &flags);
+      if (n <= 40 || (n % 200) == 0) {
+        (void)memD.ReadU32BE(rec + 4, &size);
+        (void)memD.ReadU32BE(rec + 8, &offs);
+        MCLA_LOG_WARN(
+            "DISCCHK2 #{} strm={:08X} fobj={:08X} len={:X} rec={:08X} "
+            "size={:X} offs={:X} flags={:08X} route={}",
+            n, strm, ctx.r3.u32, ctx.r6.u32, rec, size, offs, flags,
+            ((flags & 0x40000000u) && !(flags & 0x80000000u))
+                ? "guest-disc-read"
+                : "already-resident");
+      }
       if ((flags & 0x40000000u) != 0 && (flags & 0x80000000u) == 0) {
-        (void)memD.WriteU32BE(dev + 12, flags | 0x80000000u);
-        if (n <= 16 || (n % 200) == 0)
-          MCLA_LOG_WARN("DISCCHK #{} dev={:08X} flags {:08X} -> ack (bit31 "
-                        "set before check)",
-                        n, dev, flags);
+        // MITIGATION, load-bearing: w101 (false) dies at 4,528 lines with
+        // 'Fatal disc error' because the guest's own completion returns -3
+        // (DISCCHK2-RES), and r3<0 is exactly its fatal condition; w99 (true)
+        // reaches 17,868 lines. Cost: forcing bit31 tells the guest the bytes
+        // are already resident, so its read submission (the bctrl at
+        // 0x821CC2B8) never runs for ANY record -- every cache-packfile record
+        // has bit30. Retiring this means making that path deliver.
+        constexpr bool kDiscChkForcedAck = true;
+        if (kDiscChkForcedAck)
+          (void)memD.WriteU32BE(rec + 12, flags | 0x80000000u);
       }
     }
   }
@@ -11108,8 +11140,11 @@ PPC_FUNC(sub_821CCEA0) {
           (e8 & 0x40000000u) == 0) {
   // T41.3h (F-079): (void)memR.WriteU32BE(it->second.entry + 8, e8 | 0x40000000u);
         it->second.w[2] = e8 | 0x40000000u;
+        // T41.3w: the guest-visible write above was removed by T41.3h (F-079),
+        // so say what actually happens — only the host-side cached TOC copy
+        // gets bit30, which is what the host serve path reads.
         MCLA_LOG_WARN("XSF-OPEN-GATE-SKIPPED path='{}' entry={:08X} +8 {:08X} -> "
-                      "{:08X} (set bit30 so Open proceeds)",
+                      "host cache only {:08X} (guest memory untouched)",
                       path, it->second.entry, e8, e8 | 0x40000000u);
       }
     }

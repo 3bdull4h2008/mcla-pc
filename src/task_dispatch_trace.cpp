@@ -936,6 +936,26 @@ PPC_FUNC(sub_821DEE40)
         MCLA_LOG_INFO("P11-DEE40 #{:05} r3={:08X} kind={} lr={:08X}", n,
                       ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
     }
+    // T41.3w (B3): the call at guest 0x821CC2EC (return 0x821CC2F0) is the
+    // wait inside sub_821CC1E0's disc-read block, and its RESULT is what the
+    // guest compares against 1 before raising 'Fatal disc error' (generated/
+    // ppc_xenon/ppc_recomp.17.cpp: r29.u64 = ctx.r3.u64 after this call, then
+    // cmpi r29,1 at 0x821CC2F8). r3 = the guest IO block (r1+80 of the caller).
+    // Logging status/information before + after is the direct measurement of
+    // the completion step the forced-bit31 mitigation skips.
+    const bool discWait =
+        static_cast<uint32_t>(ctx.lr) == 0x821CC2F0u && ctx.r4.u32 == 2;
+    uint32_t iob0 = 0, iob4 = 0, iob8 = 0;
+    if (discWait)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)mem.ReadU32BE(ctx.r3.u32 + 0, &iob0);
+        (void)mem.ReadU32BE(ctx.r3.u32 + 4, &iob4);
+        (void)mem.ReadU32BE(ctx.r3.u32 + 8, &iob8);
+        MCLA_LOG_WARN("DISCCHK2-WAIT iob={:08X} [+0]={:08X} [+4]={:08X} "
+                      "[+8]={:08X}",
+                      ctx.r3.u32, iob0, iob4, iob8);
+    }
     // Session 72 AV: dump the worker-router object so we can see which
     // field becomes 0x7E780000 (unmapped guest VA).
     if (n <= 8)
@@ -952,9 +972,10 @@ PPC_FUNC(sub_821DEE40)
                       w[15]);
     }
     __imp__sub_821DEE40(ctx, base);
+    if (discWait)
+        MCLA_LOG_WARN("DISCCHK2-RES wait returned r3={} (guest fatals on ==1)",
+                      ctx.r3.u32);
 }
-
-
 
 // ---------------------------------------------------------------------------
 // P6 (session 26): container-build fixup walker census + node-slot watches.
