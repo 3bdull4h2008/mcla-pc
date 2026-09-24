@@ -12537,11 +12537,44 @@ PPC_FUNC(sub_821CFE80) {
     (void)mem.ReadU32BE(obj + 0, &vt);
     (void)mem.ReadU32BE(obj + 4, &w4);
   }
+  const uint32_t r1In = ctx.r1.u32;
   __imp__sub_821CFE80(ctx, base);
-  if (show)
-    MCLA_LOG_WARN("REALIZE-CAST obj={:08X} vt={:08X} +4={:08X} ti={:08X} "
-                  "flag={} -> r3={:08X} (byte={})",
-                  obj, vt, w4, ti, flag, ctx.r3.u32, ctx.r3.u32 & 0xFFu);
+  if (show) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    // Reader layout is settled by its constructor sub_821CF7B8
+    // (ppc_recomp.17.cpp:11858): +4 = name, +12 = the stream the lookup handed
+    // back, +16 = current char (initialised to 32), +24 = buffer count (0),
+    // +20 = 2, +8 = 1, +28 = 0, +540 = 0. sub_821CFAA8 (the [vt+8] tokeniser)
+    // indexes reader+count for the buffered bytes, so the reader's own payload
+    // starts at reader+32 - which is what the guest actually saw of
+    // entity.type. Printing it separates "we served ciphertext" (F-129 defect 2:
+    // MarkMemberExpanded covers the three .list spans and nothing else) from
+    // "we served text whose first keyword is not Version:".
+    uint32_t strm = 0, b8 = 0, c16 = 0, n24 = 0, mode20 = 0;
+    (void)mem.ReadU32BE(obj + 8, &b8);
+    (void)mem.ReadU32BE(obj + 12, &strm);
+    (void)mem.ReadU32BE(obj + 16, &c16);
+    (void)mem.ReadU32BE(obj + 20, &mode20);
+    (void)mem.ReadU32BE(obj + 24, &n24);
+    uint8_t raw[32] = {0};
+    (void)mem.ReadBytes(obj + 32, raw, 32u);
+    char asc[33] = {0};
+    for (int j = 0; j < 32; ++j)
+      asc[j] = (raw[j] >= 32u && raw[j] < 127u) ? (char)raw[j] : '.';
+    uint8_t tok[16] = {0};
+    (void)mem.ReadBytes(r1In - 560u, tok, 16u);
+    char tokAsc[17] = {0};
+    for (int j = 0; j < 16 && tok[j]; ++j)
+      tokAsc[j] = (tok[j] >= 32u && tok[j] < 127u) ? (char)tok[j] : '.';
+    MCLA_LOG_WARN("REALIZE-CAST obj={:08X} vt={:08X} name={:08X} stream={:08X} "
+                  "+8={} +20={} cur={:02X} cnt={} key={:08X} flag={} -> r3={:08X} "
+                  "(byte={}) buf='{}' hex={:02X} {:02X} {:02X} {:02X} {:02X} "
+                  "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} | tok='{}'",
+                  obj, vt, w4, strm, b8, mode20, c16 & 0xFFu, n24, ti, flag,
+                  ctx.r3.u32, ctx.r3.u32 & 0xFFu, asc, raw[0], raw[1], raw[2],
+                  raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9],
+                  raw[10], raw[11], tokAsc);
+  }
 }
 
 // Stream read: [obj+0] must be a live device. Dead wrapper â†’ serve bytes from

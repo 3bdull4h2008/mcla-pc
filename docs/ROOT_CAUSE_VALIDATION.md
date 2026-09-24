@@ -3644,3 +3644,62 @@ reader's own state: `reader+16` (what `sub_821CF7B8` stored, presumably the stre
 **Frontier.** w155 = w154 = w153 = w152 mode: `RD-SUBMIT 24`, `LISTLINE 171`, `C0000005 0`,
 `DRAW_INDEXED 0`, `Fatal error 1`, `FATAL-SOFT 1`, `TYPINIT 8`, `PATHMGR-OPEN 64`;
 `REALIZE-CAST` 4. Read-only census, no marker moved.
+
+### F-147: correction to F-145 - the non-zero `PATHMGR-OPEN` return is one of two *static stream wrappers* (0x82860C40 / 0x82860C68), and no `TOC76`/`XSF-OPEN` line exists for any `entity.type` path in the whole log, so "the file opens" is not established
+
+**What w157 adds** (`REALIZE-CAST` extended to dump the reader object,
+`src/gpu_device.cpp:12530`-ff):
+
+```
+obj=8EFFF6F0 vt=8201302C name=8204A418 stream=82860C40 +8=1 +20=2 cur=20 cnt=6 key=82089544 flag=0 -> r3=0 (byte=0) buf='Pu.......{...{........vR......o-' hex=50 75 00 00 00 00 04 B0 D0 7B E0 00 | tok='uP.n.'
+```
+and for the three `entity` requests the same shape with `stream=82860C40`,
+`cnt=119/27/43` and a high-entropy `buf` (`47 99 0F A9 6B 74 BE 5E ...`,
+`CF 24 85 52 36 ED A5 6B ...`, `4A 67 77 FE 31 37 59 4A ...`).
+
+1. **`stream` = `0x82860C40`** - not a fresh allocation. That address is one of the
+   three *static* wrapper objects F-122 named (`0x82860C18`/`0x82860C40`/`0x82860C68`,
+   image `.data`, 40-byte stride), and its image contents are all zero at boot.
+   `sub_821BDF20`'s return value is therefore "which static wrapper I filled", and
+   the census sees exactly two of them across all `PATHMGR-OPEN` lines:
+   `0x82860C40` (`ret=-2105144256`) for `.list` and `entity.type`, and
+   `0x82860C68` (`ret=-2105144216`) for the short-form `.dcl` candidates. A miss is
+   `ret=0`. So F-145's "the open returned the same static stream object the loading
+   `.list` files return" is right about the value and wrong about what it proves:
+   `.list` files *do* load (`LISTLINE 171`), so this wrapper is not itself proof of a
+   successful member read.
+2. **No archive activity for the name.** `grep -i entity build/w157.log` returns only
+   this session's three markers (`PATHMGR-OPEN`, `TYPINIT`, `REALIZE-CAST`). There is
+   **no** `TOC76*`, `XSF-OPEN`, `XSF-HOSTSERVE`, `XSF-POSTOPEN-SERVE` or `AFB76` line for
+   any `entity.type` path, while the same minute of the same log carries all five for
+   `resources/city/SC/trash.xrn` (`TOC76-XSF #1365`, `XSF-OPEN #1323`, whose own `ret` field is a different convention from
+   `PATHMGR-OPEN`'s,
+   `XSF-HOSTSERVE ... off=0035A000 size=32768 head=05435352`). The packfile device path
+   is instrumented end-to-end and did not fire for this open.
+3. The bytes the tokenizer then produced are not text and not a `Version:` keyword,
+   and the same wrapper is heavily reused - `BE710-SLOT #971..978 obj=82860C40 h=1
+   words=1 served=4` - so "leftover bytes from an earlier read of a different member"
+   is at least as good a description of `buf` as "the entity.type body". F-146's
+   either/or (ciphertext vs wrong keyword) therefore does not resolve; both branches
+   assumed the bytes came from this file, and that assumption is what F-147 withdraws.
+
+**Consequence for the plan.** The blocker chain is now: `grmShaderGroupVar 'skinningData'`
+<- `[object+8]` never published <- realize bails on the `Version:` token <- the token comes
+out of static wrapper `0x82860C40` <- **whether that wrapper was ever loaded with
+`entity.type` bytes is unresolved**. The bounded next datum is F-122's own dead-wrapper
+test applied at the moment of this open: `[wrapper+0]` (device), `+4` (handle), `+8` (buf),
+`+24/+28/+32` (cur/end/cap for the guest-native shape). Device+handle live and
+`end > cur` => a real read happened and the answer is content/decode; device dead =>
+the guest got a stale wrapper, which is the F-127/F-128 bind-and-serve defect class
+showing up on a new path, and the fix belongs there.
+
+**Also newly visible, from a concurrent session (rule 5, not mine):** `FIXWALK-GATE ...
+bucket=... buildCtx=D111B980 lr=825FDC64 bucketGate=1 nodeGate=0 - delta-0 skip`
+(`src/task_dispatch_trace.cpp:1048`) fires ~38,800 times per soak and is a
+**short-circuit** (it skips the guest's fixup for delta-0 buckets). It is interleaved with
+every line of this failing sequence, so B5's "zero FATAL-SOFT masking" criterion now has a
+second masking source to account for beyond `FATAL-SOFT` itself.
+
+**Frontier.** w157 = w156 = w155 = w154 mode and counts: `RD-SUBMIT 24`, `LISTLINE 171`,
+`C0000005 0`, `DRAW_INDEXED 0`, `Fatal error 1`, `FATAL-SOFT 1`, `TYPINIT 8`,
+`PATHMGR-OPEN 64`, `REALIZE-CAST 4`.
