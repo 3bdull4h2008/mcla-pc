@@ -2647,3 +2647,42 @@ ever been observed. So the next B4 step is the *feed*: identify what binds strea
 the `swfCMD` fatal — the constant-bank capture has nothing to bind to until one of those lands. Zero
 `PRESENT`-counter events is now the honest baseline for B5's "non-fallback PRESENT-FB" criterion, which
 also still samples the `rgb=(0.06,0.10,0.22)` fallback for all 4 framebuffer reads.
+
+### F-115 — Two B4 blockers named with their evidence: (a) our own `plausible` gate can never open for the draws this boot issues, because the guest calls the builder with a **literal `li r5,0`** for AUTO-source vertex draws (`CP-DRAW src=2`) — the vertex location is in the CP register batch, not the argument; (b) the surviving `'swfCMD::Fixup - unknown type %d'` fatal reads its "type" (`0xB7`) out of a B7-heap node our own rebase/alloc path installed, i.e. a pointer's top byte consumed as a type field.
+
+- Task:        T41.4c (B4), static read of `generated/` + existing lines in `build/w102.log` / `build/w103.log`
+- Type:        FACT (two blockers, one of them a design error in our own gate)
+- Class:       D (our runtime/gate) + G (the game's coded behavior) + F (GPU feed)
+- Priority:    P0
+- Evidence:    (a) `generated/ppc_xenon/ppc_recomp.8.cpp:1120-1152` — the site whose return address is the observed `lr=0x8217BB10`: `li r10,0 / li r9,0 / li r8,0 / li r7,0 / li r5,0 / lwzx r6,r11,r27 / bl 0x82420ba8`, i.e. **r5 is a compile-time zero**; `build/w102.log:4409` `SUBMIT-census … r5=00000000 … plausible=0 dummy=1`; `build/w102.log` `CP-DRAW #1 op=0x36 src=2 prim=1 numIdx=1 idxSize=0 dmaBase=00000000`; gate at `src/gpu_device.cpp:1948`. (b) `build/w103.log:14607-14613` `P5-MISSFIX #00017 desc=CA5E0800 a4=82009840 old=B7B6D9B4 lr=8260A8B0 r13=8F200000` → `P5-PHYS #00017 old=B7B6D9B4 … already physical, skip fatal (caller takes delta-0 path)` → `P9-B588 #00003 node=B7B6D9B4 type=B7 [0]=B7982758` → `fatal-dispatch regs: lr=0x8260A8CC r1=0x006D8D10 r3=0x82088854 r4=0x000000B7 r5=0xB7B6D9B4` → `'swfCMD::Fixup - unknown type %d'`.
+
+**(a) The gate contradicts the calling convention it is guarding.** `src=2` in the CP packet is the
+AUTO vertex source, and the executed caller really does pass `NULL` for the vertex-stream descriptor —
+four of its argument registers are literal zeroes and only r3 (device), r4 (primitive/flags) and r6 (a
+`lwzx`-loaded index-buffer word) carry data. Our check requires
+`dic.vbAddr >= 0x10000 && dic.vbSize && dic.vbStride && dic.ibAddr && dic.ibSize && dic.indexCount`,
+where all three VB fields are read from `[r5+0/4/8]` — so for every AUTO-source draw the gate is
+structurally closed and `DRAW-GATE plausible` must stay 0 forever. The VB base/stride for such a draw
+lives in the register batch the packet writes (the draw carries `writes=54`, and the census shows
+`r08B=r08C=r0DD=r0D2=r0A2=0`, `r1DC=00020037 r1DD=071D8380` — the last two look like a {size<<16|…,
+base} pair pointing at guest `0x071D8380`/`0xC71D8380`, the swap-table region family). **Next action:**
+dump the whole 54-write batch for the first draw and match ids to Xenia's `PM4_REGISTER_OFFSETS`
+(`.research/xenia`), then feed AUTO draws from registers instead of from `[r5]`. This is not a
+short-circuit request — it is completing the decode the plan already names ("UR-style dev+offset
+decode"). Do not widen the `plausible` test to accept VB-less draws: that would push garbage geometry
+into a PSO and produce a fake pass of B4's gate.
+
+**(b) The last fatal consumes a node our own rebase/allocation machinery produced.** The chain in
+`w103` is: `W30-ARR-FIX obj=B7B41000 arr=00000000->B7B6D9B4 n=1 cnt 0->1` (05:01:22.760) on a block
+that `J2-DIST-ARR`/`W25-ARR-DUMP` show as **all `CDCDCDCD`** at that moment, then two seconds later
+`P5-MISSFIX #00017 … old=B7B6D9B4` → `P5-PHYS … already physical, skip fatal (caller takes delta-0
+path)` (predicate at `src/task_dispatch_trace.cpp:600-604`, which is deliberate for the `0x50…`→`0xB7…`
+rewrites our RSC-NEST walk performs) → `P9-B588 node=B7B6D9B4 type=B7 [0]=B7982758` → the fatal with
+`r4=0x000000B7`. The `swfCMD::Fixup` "type" therefore equals the **top byte of a rewritten pointer**,
+which is the signature of a consumer reading a pointer field as a type byte (or of a rewrite landing in
+a non-pointer field) — the same object family that `FB0D8-DTOR … child=B7B41000 +4=CDCDCDCD` reports in
+`w100`. Not yet root-caused: the open question is one field offset, so the next census must print the
+node's first 8 words *at* the `swfCMD::Fixup` entry (`sub_8260A8CC`'s callee, `lr=8260A8B0` is the
+fixup walker's return site) rather than 2 s earlier. This supersedes the loose treatment in F-111
+("the surviving one … already existed in the old frontier") by naming its consumption chain — it does
+**not** license tightening the `alreadyPhys` predicate, which is load-bearing for the RSC-NEST design.
