@@ -12334,6 +12334,23 @@ PPC_FUNC(sub_821BE710) {
                   "ssize={} r4={:08X}",
                   n, obj, s_lastMemStream, sbuf, ssize, ctx.r4.u32);
     if (sbuf != 0 && ssize >= 4 && ctx.r4.u32 != 0) {
+      // T41.9 census (read-only, F-127 §5): the gate in sub_8218C760 compares the
+      // ONE word this call returns against 0x61786772 ('axgr' = rgxa LE). Print
+      // what the stream actually holds - at its head and at the cursor - so the
+      // question "does the real rage_im body carry the magic, and is our read
+      // position wrong?" is answered by the soak instead of by argument.
+      {
+        uint32_t pos = 0, head = 0, atPos = 0, dstNow = 0;
+        (void)mem2.ReadU32BE(s_lastMemStream + 24, &pos);
+        (void)mem2.ReadU32BE(sbuf, &head);
+        (void)mem2.ReadU32BE(sbuf + (pos < ssize ? pos : 0u), &atPos);
+        (void)mem2.ReadU32BE(ctx.r4.u32, &dstNow);
+        MCLA_LOG_WARN("BE710-MAGIC-CENSUS #{} obj={:08X} stream={:08X} "
+                      "sbuf={:08X} ssize={} pos={} head={:08X} [sbuf+pos]={:08X} "
+                      "dst={:08X} dstWordNow={:08X} magic={:08X} r5words={}",
+                      n, obj, s_lastMemStream, sbuf, ssize, pos, head, atPos,
+                      ctx.r4.u32, dstNow, 0x61786772u, ctx.r5.u32);
+      }
       // MITIGATION, load-bearing (F-127): the guest's rage-effect gate at
       // sub_8218C760 reads ONE word through sub_821BE710 and requires it to be
       // 0x61786772 ('axgr' = the rgxa magic, LE) before loc_8218C878; anything
@@ -12342,8 +12359,16 @@ PPC_FUNC(sub_821BE710) {
       // w117/w124/w125 once real archive .fxc bodies were served). This write
       // is what lets the current frontier past that gate. Conversion target:
       // make the rage_im stream itself deliver the magic at the read position.
-      mem2.WriteU32BE(ctx.r4.u32, 0x61786772u);
-      MCLA_LOG_WARN("BE710-MAGIC #{} wrote 61786772", n);
+      // T41.9b: set false (one soak) to prove the prop is load-bearing.
+      constexpr bool kBe710MagicWrite = true;   // false = w130 (T41.9b control)
+      if (kBe710MagicWrite) {
+        mem2.WriteU32BE(ctx.r4.u32, 0x61786772u);
+        MCLA_LOG_WARN("BE710-MAGIC #{} wrote 61786772", n);
+      } else {
+        MCLA_LOG_WARN("BE710-MAGIC-OFF #{} obj={:08X} dst={:08X} — withheld "
+                      "(diagnostic, guest gets the stream's own bytes)",
+                      n, obj, ctx.r4.u32);
+      }
       ctx.r3.u32 = 1;
       return;
     }
