@@ -10824,7 +10824,7 @@ PPC_FUNC(sub_821CBFC0) {
     // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
     // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
     // is the open question, not the transform. See F-105.
-    constexpr bool kExpandListInArchive = false;   // ON => w80/w82/w84 branch, see F-107
+    constexpr bool kExpandListInArchive = false;   // ON => w80/w82/w84/w86 branch, see F-108
     if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
         w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
       mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);
@@ -12021,6 +12021,26 @@ PPC_FUNC(sub_821BE250) {
                   "+32={:08X} lr={:08X}",
                   n, obj, dev, h, dst, count, f8, f16, f24, f28, f32,
                   static_cast<uint32_t>(ctx.lr));
+    // T41.3s2 census: w80's AV read guest 0x00000E17, and F-107 left the question
+    // "which field holds it". Dump the whole object (and the healthy wrapper the
+    // post-open serve does bind) so the offset comes from the soak.
+    {
+      constexpr uint32_t kBoundWrapper = 0x82860C18u;  // XSF-POSTOPEN-SERVE's obj
+      std::string w, ref;
+      for (int k = 0; k < 24; ++k) {
+        uint32_t v = 0;
+        (void)mem.ReadU32BE(obj + k * 4u, &v);
+        w += fmt::format("{:08X} ", v);
+      }
+      for (int k = 0; k < 24; ++k) {
+        uint32_t v = 0;
+        (void)mem.ReadU32BE(kBoundWrapper + k * 4u, &v);
+        ref += fmt::format("{:08X} ", v);
+      }
+      MCLA_LOG_WARN("BE250-OBJ #{} obj={:08X} words=[{}] boundWrapper={:08X} "
+                    "words=[{}]",
+                    n, obj, w, kBoundWrapper, ref);
+    }
   }
   __imp__sub_821BE250(ctx, base);
 }
