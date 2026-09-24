@@ -75,6 +75,13 @@ namespace
     // (F-046). The tag names which context so a dump can never be mistaken again.
     thread_local const PPCContext* g_faultCtx = nullptr;
     thread_local const char* g_faultCtxTag = "none";
+    // T41.5b: g_faultCtx is thread_local ON PURPOSE (F-046), which means every
+    // cross-thread reader of it -- the PARK-SAMPLE heartbeat, and
+    // GetBootWorkerReg() called from another thread -- has been silently reading
+    // its own null copy. That is why all the guest fields in those lines printed
+    // 0 in w108/w109; it was never evidence about the boot thread's state.
+    // This is a deliberate process-wide mirror of just the boot worker's context.
+    std::atomic<const PPCContext*> g_bootWorkerCtx{nullptr};
     uintptr_t g_moduleBase = 0;
     static DWORD s_bootWorkerThreadId = 0;
 
@@ -895,6 +902,8 @@ void BootWorker(uint32_t entryGuest)
 
     g_faultCtx = &ctx;
     g_faultCtxTag = "boot-root";
+    // T41.5b: the mirror another thread may read (see g_bootWorkerCtx above).
+    g_bootWorkerCtx.store(&ctx, std::memory_order_relaxed);
 
 // Install vectored exception handler for early crash detection
     PVOID vehHandle = AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS ExceptionInfo) -> LONG {
@@ -1261,6 +1270,7 @@ void BootWorker(uint32_t entryGuest)
         g_report.returned = returned;
     }
     g_faultCtx = nullptr;
+    g_bootWorkerCtx.store(nullptr, std::memory_order_relaxed);
     g_bootDone.store(true);
 }
 
@@ -1580,24 +1590,29 @@ void Start(uint32_t entryGuest)
                         (void)mem.ReadU32BE(ud, &ud1);
                     (void)mem.ReadU32BE(0x80003080, &ud8);
                 }
-                // Live guest state of the parked main thread: g_faultCtx points
-                // at BootWorker's PPCContext while it runs guest code. Context
-                // carries arg/TLS regs only (PPC_CONFIG_NON_VOLATILE_AS_LOCAL);
+                // Live guest state of the parked boot worker. T41.5b: this used
+                // to read g_faultCtx, which is thread_local -- from the sampler
+                // thread that is always null, so every field below printed 0 and
+                // looked like "no guest context" (it was the wrong thread's TLS).
+                // g_bootWorkerCtx is the process-wide mirror. Context carries
+                // arg/TLS regs only (PPC_CONFIG_NON_VOLATILE_AS_LOCAL);
                 // callee-saved r30/r31 + lr sit in the guest frame per the
                 // generated prologue convention (stw lr,-8(r1); std
-                // r30,-24(r1); std r31,-16(r1)) — read as raw slots.
+                // r30,-24(r1); std r31,-16(r1)) -- read here as raw slots.
+                const PPCContext* bwctx =
+                    g_bootWorkerCtx.load(std::memory_order_relaxed);
                 uint32_t gr3 = 0, gr4 = 0, gr13 = 0, glr = 0;
                 uint32_t swM8 = 0, swM16 = 0, swM24 = 0, tls0 = 0;
-                if (g_faultCtx != nullptr)
+                if (bwctx != nullptr)
                 {
-                    gr3 = g_faultCtx->r3.u32;
-                    gr4 = g_faultCtx->r4.u32;
-                    gr13 = g_faultCtx->r13.u32; // TLS/PCR base
-                    glr = (uint32_t)g_faultCtx->lr;
+                    gr3 = bwctx->r3.u32;
+                    gr4 = bwctx->r4.u32;
+                    gr13 = bwctx->r13.u32; // TLS/PCR base
+                    glr = (uint32_t)bwctx->lr;
                     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
                     if (gr13 != 0)
                         (void)mem.ReadU32BE(gr13 + 0x0, &tls0);
-                    const uint32_t sp = g_faultCtx->r1.u32;
+                    const uint32_t sp = bwctx->r1.u32;
                     if (sp != 0)
                     {
                         (void)mem.ReadU32BE(sp - 8, &swM8);   // saved lr slot
@@ -1618,6 +1633,42 @@ void Start(uint32_t entryGuest)
                               dev, cursor, vbl, flg, ud, ud1, ud8,
                               gr3, gr4, glr, gr13, tls0, swM8, swM16, swM24);
                 BootReportInfo(lbuf);
+                // T41.5b: name WHERE the boot worker sits. Host RIPs are
+                // unnameable in this build (no mcla.pdb, so llvm-symbolizer
+                // returns '??' -- F-118), but the guest frame chain is readable:
+                // the generated prologues keep the back-chain at [r1] and the
+                // caller's return address at [r1-8] (stw lr,-8(r1)); the stack
+                // grows down, so each caller frame sits at a HIGHER address.
+                // Each fNN= value is resolved offline against
+                // generated/ppc_xenon/ppc_func_mapping.cpp.
+                if (bwctx != nullptr)
+                {
+                    auto& mem2 = mcla::kernel::GuestMemoryHeap::Instance();
+                    char sbuf[512];
+                    size_t so = (size_t)std::snprintf(
+                        sbuf, sizeof(sbuf), "PARK-STACK sp=%08X lr=%08X:",
+                        bwctx->r1.u32, (uint32_t)bwctx->lr);
+                    uint32_t sp = bwctx->r1.u32;
+                    for (int fr = 0; fr < 8 && sp >= 0x80000000u &&
+                                    sp < 0x90000000u;
+                         ++fr)
+                    {
+                        uint32_t back = 0, ret = 0;
+                        if (!mem2.ReadU32BE(sp, &back) ||
+                            !mem2.ReadU32BE(sp - 8, &ret))
+                            break;
+                        const int w = std::snprintf(sbuf + so, sizeof(sbuf) - so,
+                                                    " f%d=%08X", fr, ret);
+                        if (w < 0)
+                            break;
+                        so += (size_t)w;
+                        if (back <= sp || back >= 0x90000000u ||
+                            back < 0x80000000u)
+                            break;
+                        sp = back;
+                    }
+                    BootReportInfo(sbuf);
+                }
             }
             {
                 char lbuf[2048];

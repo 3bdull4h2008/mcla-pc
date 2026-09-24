@@ -2858,3 +2858,47 @@ on by dumping its *guest* stack chain (the sampler already has `Rsp`, `g_faultCt
 `lr/r30/r31` slots) every heartbeat, and resolve the innermost guest return address to a mapped
 `PPC_FUNC` — then ask who is supposed to satisfy that wait, and whether that is the same thing the 13
 `sub_821C91C8` pool workers are waiting for.
+
+### F-119 — **T41.5b answered: the boot worker is not idle, it is blocked in the guest's device layer waiting for an IO completion** — 62 of 97 heartbeat samples over the whole tail read `sub_821BD7C0 → sub_82131790+0x284 → sub_822C4630+0x424 → sub_821CD7A0+0x298`, current `lr=0x821E0FF8`. It also corrects F-118: the reason those fields printed zero was a `thread_local` read from the wrong thread, not an absent context.
+
+- Task:        T41.5b (B4 gate / B5 menu), `build/w110.log` vs baseline `build/w107.log`; instrument fix in `src/boot_host.cpp`
+- Type:        FACT + FIX (log-only census + a cross-thread read fix; no guest-visible behaviour change)
+- Class:       H (instrument artifact, corrected) + D (device/IO behavior)
+- Priority:    P0 — this is the blocker in front of every remaining gate
+- Evidence:    `build/w110.log` `[06:19:19.715] PARK-STACK sp=8EFFECB0 lr=821E0FF8: f0=00000000 f1=821CDA38 f2=822C47B0 f3=82131A14 f4=821BD810 f5=82132454` (and 62 matching samples, spanning 06:19:19 → 06:20:22, i.e. the whole post-boot tail); `PARK-STACK` printed 97 times where `w109` printed it **0** times; frame→function map computed from `generated/ppc_xenon/ppc_func_mapping.cpp` (`0x821CDA38 = sub_821CD7A0+0x298`, `0x822C4A54 = sub_822C4630+0x424`, `0x82131A14 = sub_82131790+0x284`).
+
+**The instrument correction first, because it invalidates a prior reading.** `g_faultCtx` is
+`thread_local` **by design** (F-046: a process-wide pointer printed the boot thread's context for a
+fault on another thread). The consequence nobody had checked is the mirror image: a reader on
+*another* thread — the `PARK-SAMPLE` heartbeat, and `GetBootWorkerReg()` when called off-thread —
+sees its own null copy. So every `r3= / lr= / [r1-8]=` field in `w108`/`w109`'s `PARK-SAMPLE` lines was
+`0` because of *that*, and F-118's "the sampler already has `g_faultCtx->lr` and the saved slots" was
+wrong as a plan. Fixed with a deliberate process-wide mirror of the boot worker's context
+(`g_bootWorkerCtx`, published where `g_faultCtx` is set/cleared at `src/boot_host.cpp:~896`/`:~1263`,
+read at the heartbeat) — the VEH path keeps its thread-local copy untouched. Positive control
+(rule 19): the same census that printed 0 lines in `w109` prints 97 in `w110`.
+
+**What the boot worker is doing.** It is inside guest code (not a host queue), and its frames say a
+device-layer call under a kernel wait: `sub_82131790` (the `0x8213xxxx` kernel block that also holds
+the slot-park and the worker-router) → `sub_822C4630` → `sub_821CD7A0`, whose `+0x298` return site is
+in the same `0x821CDxxx` neighbourhood as the functions we already know (`sub_821CBFC0` TOC lookup,
+`sub_821CBE18` page-slot wait, `sub_821CCEA0` Open, `sub_821CC1E0` the F-112 disc-read). Current `lr`
+is `0x821E0FF8`, i.e. execution is parked around the `0x821E0Fxx` region one level deeper. So the
+state is: **the main thread issued a device request and is waiting for a completion that never
+arrives** — the same missing completion F-112 identified and that `kDiscChkForcedAck` papers over for
+the records it touches. This is why `swaps` never leaves 0 (F-118): the guest never gets to the frame
+that would present.
+
+Secondary chains, for completeness (`w110`, counts of 97): 12× `f0=FFFFFFFF f2=8218C7DC f3=82188EF4`
+(the `sub_8218C1xx`/`sub_82188E50` package-read family — the same region as F-107's preload-list
+loader), 7× `f0=827B85D0 f1=821BD7F8 f2=82132454` (thread bodies), 4×
+`f0=821C2F30 f1=82131410 f2=823E3CD0` (`sub_821C2E60` + the `sub_823E3CB8` family seen at F-089's
+name table). `f0=00000000` on the dominant chain means that frame's saved-lr slot is zero, so the
+innermost function name is `lr=0x821E0FF8`'s owner, not `f0` — the next census should print the
+function containing the *current* `lr` rather than stopping at the frame chain.
+
+**Next (T41.5c), no short-circuit proposed.** Decode `sub_821CD7A0` (raw bytes, `0x821CD7A0-0x82000000`
+in `build/cache/mcla_pe.bin`) and the `0x821E0Fxx` site to identify the request it submits and the
+object it waits on; then make *that* completion fire in the host device path. Retiring
+`kDiscChkForcedAck` (F-112's conversion target) and reaching `DRAW_INDEXED ≥ 1` both depend on this
+same site, which is the strongest reason to fix it rather than route around it.
