@@ -5324,3 +5324,58 @@ reads of `[0x8283D190+52] + (returnedId & 0x7FFF)*28` and print `record[+4]`/`[+
 of the seven Opens returns. That distinguishes "Open never wrote a length for legals" from "a later
 phase zeroed it", and `F-178`'s timing lesson means the admissibility check is the 16 structural
 counters, not `INFLATE-ENTER`/`READWRAP`.
+
+### F-181: `pgStreamer::Open` writes a **correct non-zero length for all seven containers** (143,069 / 1,066,057 / 19,337 / 29,655 / 240,531 / 196,553 / 10,799) - so the zero in `record[+4]` is reached *during* the request, and all 139 inflate-loop reads being `r7=0` says the loop is spinning at an exhausted count because our re-pointed inflate never produces output
+
+- Task:    B5 (menu) - completes F-180's question and fixes the causal direction
+- Type:    FACT (measurement) + correction of F-180's "one Open leaves 0"
+- Class:   D/G with an H component (our hook)
+- Priority: P0
+- Evidence: `build/w188.log` (`STREAM-OPEN #1..#7` with the per-record read; exe 97,570,816 @ 17:59;
+  **14 structural counters identical to `build/w187.log`** so the added reads are free: `LISTLINE 171`,
+  `Fatal error 0`, `FATAL-SOFT 0`, `C0000005 0`, `SEEK-DEAD 0`, `TYPINIT 6`, `GETDEV 694`,
+  `CP-DRAW 166`, `PRESENT 34`, `DICTLOOKUP 22`, `[error] 14`, `STREAM-OPEN 7`, `swfCMD 0`,
+  `DRAW_INDEXED 0`); `BC140-REC` rows byte-identical between `w187` and `w188`
+
+**The measurement, at each Open's return** (`rec = [[0x8283D190+52]] + (returnedId & 0x7FFF)*28`):
+```
+#1 -> id 0       rec[+4]= 143,069  [+16]=D4343015  raceeditor   lr=821E29C4
+#2 -> id 1       rec[+4]=1,066,057  [+16]=D574B032  garage       lr=821E29C4
+#3 -> id 2       rec[+4]=  19,337  [+16]=D41D2810  policecam    lr=821E29C4
+#4 -> id 3       rec[+4]=  29,655  [+16]=D4082813  credits      lr=821E29C4
+#5 -> id 4       rec[+4]= 240,531  [+16]=DC2C0810  meshtextures lr=821E5E10
+#6 -> id 0x8004  rec[+4]= 196,553  [+16]=D454283D  legals       lr=821E5E10
+#7 -> id 0x10004 rec[+4]=  10,799  [+16]=C0001814  trash.xrn    lr=821E5E10
+```
+Every length is right and `+12` is 0 at Open time in all seven. So **F-180's conclusion is corrected**:
+no Open leaves a zero; the zero that `sub_821BC140` sees (`BC140-REC #2`, `+4 = 0`, `+12 = 4`) is the
+*same record* after it has been consumed, and `+12` (0 at Open, 4 at the second execution) proves the
+record is mutated by the streaming path rather than by Open.
+
+**Direction of causality, restated from the two measurements.** `record[+4]` is a *remaining byte
+count*: Open seeds it, the streamer decrements it as it reads. The inflate loop's reads are
+`139/139` at `r7=0` (`lr=821BC334`) - i.e. the loop is not interleaving real reads and then a zero; it
+**only ever** sees 0, and `INFLATE-ENTER`'s `consumed=32748` repeats (F-172) show it parked. Combined
+with F-172's finding that all 34 `XMEM` calls are *our* replay (our `j1SrcSz=7179936`, `src` inside a
+semaphore object, `ret=0`), the mechanism is:
+
+1. `Open` seeds the record correctly (F-181).
+2. The request executes; our `PPC_FUNC(sub_821D5E10)` re-point fires because the guest's
+   stack-primed `st+0`/`st+4` look invalid (F-172 measured them as `-12`/`stack+12`), and points the
+   inflater at a host bounce with a bogus size.
+3. `XMemDecompress` returns 0 bytes, so no progress is reported; the remaining count reaches 0 (or is
+   never advanced past the first window) and the loop re-enters with `r7 = 0` 139 times.
+4. Nothing is ever handed to the GFx movie builder ⇒ `XSF-INFLATE 0`, `swfCMD 0`, no menu, no
+   geometry.
+
+**Therefore the experiment that has never been run** (and F-172's re-point is the thing standing in
+its way): let the guest's own `InflateBegin` run against the bytes we already serve whole
+(F-169/F-171), i.e. **retire the re-point** instead of routing around it. Pre-declared pass criteria,
+in order: the guest's own `not in XCompress format` path becomes observable (its assert goes through
+`sub_821BD618`) or `XMEM` appears with a per-file `srcSz` and `ret != 0`; then `XSF-INFLATE`/`swfCMD`
+may finally move. Revert condition: any regression in `LISTLINE`/`TYPINIT`/`C0000005`/`SEEK-DEAD`/
+`Fatal error`/`FATAL-SOFT` (structural counters only, per F-178).
+
+**Censuses left in the tree** (`STREAM-OPEN` extended, `BC140-REC`, `STUB-SLOT`, `REQFILL`): each
+shows a zero delta on the structural frontier, and `STREAM-OPEN`'s per-record read is now the only
+instrument that shows the streamer's lengths at all.

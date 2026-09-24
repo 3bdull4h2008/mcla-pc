@@ -1,3 +1,29 @@
+## 2026-09-24 ~18:05 - **F-180 + F-181: the streamer record is finally read directly - `record[+4]` IS the byte count, `pgStreamer::Open` seeds all seven containers CORRECTLY (143,069 / 1,066,057 / 19,337 / 29,655 / 240,531 / 196,553 / 10,799), and the zero `sub_821BC140` sees is that same record after consumption. So the archive, the TOC, the device vtable and Open are all innocent; our `InflateBegin` re-point is the remaining suspect**
+
+- `BC140-REC` (3 checked reads inside the existing INLINE-EXEC hook) shows one shared 28-byte record at
+  `C9A24970` = `[[0x8283D190+52]] + (id & 0x7FFF)*28`, ids `4 / 0x8004 / 0x10004` = index 4 with a
+  generation tag. Layout: `{+0 id|gen<<15, +4 remaining bytes, +8 device, +12 state, +16 package ID,
+  +20 entry offset, +24 package offset}` - the last three re-confirm F-171's per-record package decode.
+- `STREAM-OPEN` extended with the same reads proves Open writes correct lengths and `+12 = 0`; at the
+  second execution `+12 = 4` and `+4 = 0` ⇒ the streaming path mutates the record, F-180's "one Open
+  leaves 0" is corrected by F-181.
+- All **139** inflate-loop reads (`lr=821BC334`) are `r7=0` - the loop never interleaves a real read.
+  With F-172 (all 34 `XMEM` calls are our replay: `j1SrcSz=7179936`, `src` = semaphore+0x14, `ret=0`),
+  the remaining suspect is the re-point inside `PPC_FUNC(sub_821D5E10)` (`src/gpu_device.cpp:7067`-ff),
+  which fires because the guest's stack-primed `st+0/st+4` look invalid (`-12` / `stack+12`).
+- **Running now (F-182): retire that re-point so the guest's own XMem/LZX decoder sees the whole bodies
+  F-169/F-171 already serve.** Pass criteria in order: `XMEM` with a per-file `srcSz` and `ret != 0`,
+  or the guest's own `not in XCompress format` path becoming observable. Revert on any structural
+  regression - and per F-178 judge it on `LISTLINE`/`TYPINIT`/`C0000005`/`SEEK-DEAD`/`Fatal error`/
+  `FATAL-SOFT`/`GETDEV`/`CP-DRAW`/`PRESENT`/`DICTLOOKUP`/`[error]`/`DRAW_INDEXED`, **not**
+  `INFLATE-ENTER`/`READWRAP` (timed-spin counters).
+- Censuses added and kept this session, each with a measured zero structural delta: `REQFILL`,
+  `STREAM-OPEN`, `STUB-SLOT`, `BC140-REC`. Two of my own claims were retired on the way
+  (F-174, F-178) and one reversed-then-restored (F-179 vs F-181) - the ledger has the details.
+- Frontier unchanged and clean: `LISTLINE 171`, `Fatal 0`, `FATAL-SOFT 0`, `C0000005 0`,
+  `SEEK-DEAD 0`, `TYPINIT 3/3`, `GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `swfCMD 0`,
+  `XSF-INFLATE 0`, **`DRAW_INDEXED 0`**. B4's gate and B5 criteria 1-2 still unmet.
+
 ## 2026-09-24 ~17:45 - **F-177: the menu's root cause is a device vtable slot we answer with zero - `pgStreamer::Open` sets `record.length := dev->vtable[+84](dev)`, the `memory:` device's +84 is the shared `li r3,0; blr` stub, and we additionally force that stub to 0. `w185` == `w183` on all 17 counters, so the new `STREAM-OPEN` census is admissible and stays**
 
 - **The store, verbatim** (`sub_821BCE68` = `pgStreamer::Open`, `ppc_recomp.14.cpp:21190`-`21250`):

@@ -8462,10 +8462,25 @@ PPC_FUNC(sub_821BCE68) {
   const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   __imp__sub_821BCE68(ctx, base);
+  // F-181: which Open leaves its record's byte count at 0 (F-180 measured the
+  // legals generation at +4 = 0 with +12 = 4, while meshtextures and trash got
+  // their true sizes)? Read the record this return id selects, right here, so
+  // "Open never wrote a length" separates from "a later phase zeroed it".
+  uint32_t rbase = 0, rlen = 0, rflag = 0, rid = 0, rpkg = 0;
+  (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(0x8283D1C4u,
+                                                            &rbase);
+  rid = ctx.r3.u32;
+  if (rbase != 0 && rbase != 0xCDCDCDCDu && rid != 0xFFFFFFFFu) {
+    auto &m = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t rec = rbase + (rid & 0x7FFFu) * 28u;
+    (void)m.ReadU32BE(rec + 4u, &rlen);
+    (void)m.ReadU32BE(rec + 12u, &rflag);
+    (void)m.ReadU32BE(rec + 16u, &rpkg);
+  }
   if (n <= 24 || (n % 500) == 0)
     MCLA_LOG_INFO("STREAM-OPEN sub_821BCE68 #{} r3={:08X} r4={:08X} r5={:08X} "
-                  "-> r3={:08X} lr={:08X}",
-                  n, r3, r4, r5, ctx.r3.u32, lr);
+                  "-> r3={:08X} rec[+4]={} [+12]={} [+16]={:08X} lr={:08X}",
+                  n, r3, r4, r5, ctx.r3.u32, rlen, rflag, rpkg, lr);
 }
 
 // INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
