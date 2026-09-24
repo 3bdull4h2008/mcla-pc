@@ -271,18 +271,21 @@ static bool MclaHeadIsRscOrXc(const uint8_t *p, uint32_t n) {
   return be == 0x05435352u || be == 0x0FF512EFu;
 }
 
-// TOC w2 flag family 0x40XX000Y often encodes the plaintext package off in
-// bits [23:12] (40060009 → 0x60000 meshtextures; 400A001B → 0xA0000 UI).
+// TOC w2 encodes the plaintext package offset in bits [31:12] and the RSC5 header
+// length in bits [11:0] (0x000A001B -> package 0xA0000, header 27 bytes;
+// 0x6496F01B -> package 0x6496F000). F-171 corrected the earlier "bits [23:12]"
+// reading, which could not express any package above 16 MB.
 static uint32_t MclaPkgOffFromTocW2(uint32_t w2) {
-  const uint32_t cand = w2 & 0x00FFF000u;
-  if (cand == 0x60000u || cand == 0xA0000u || cand == 0x35A000u)
-    return cand;
-  BuildRscPackageTable();
-  std::lock_guard<std::mutex> lk(g_rscTabMtx);
-  for (const auto &p : g_rscTab)
-    if (p.off == cand)
-      return cand;
-  return 0;
+  // F-171: a UI record's word[2] is (packageOffset & 0xFFFFF000) | headerLength -
+  // credits.xsf's 0x6496F01B is package 0x6496F000 with a 27-byte header, and
+  // the archive confirms an RSC5 header there whose ID word at +0x08 equals the
+  // record's word[3] (verified for all four .xsf once the truncated local copy
+  // was replaced, F-170). Two earlier limits hid this: the mask was 0x00FFF000,
+  // which truncated any package above 16 MB, and table membership was required,
+  // which could never hold because BuildRscPackageTable scans only kScan =
+  // 0x2000000. The caller now validates the candidate (RSC5 magic AND
+  // [pkg+8] == word[3]), so a wrong guess cannot be served.
+  return w2 & 0xFFFFF000u;
 }
 
 static uint32_t MclaPreferredPkgOffForPath(const char *path) {
@@ -706,7 +709,27 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
           std::strstr(path, "globaltex") != nullptr ||
           std::strstr(path, "preload") != nullptr;
       if (wantsPkg && !isList) {
-        uint32_t pkgOff = pathPkg ? pathPkg : tocPkg;
+        // F-171: use the package the guest's OWN record names, but only when it
+        // verifies - a TOC record is {leafHash, SIZE, packageOffset|headerLength,
+        // packageID} and the package header repeats that ID at +0x08, so
+        // [pkg+8] == w[3] is a per-file check, not a guess. Verified on all
+        // seven UI members once the archive was complete (F-170): credits
+        // 0x6496F000 declares 29,655 bytes, garage 0x64980000 -> 1,066,057,
+        // policecam 0x64CA3000 -> 19,337, raceeditor 0x64CB0000 -> 143,069, each
+        // with RSC5 magic and a matching ID. The substring placeholder below is
+        // therefore kept only as a fallback, because it serves legals.xsf's
+        // package (196,553 bytes) to every .xsf.
+        uint32_t pkgOff = 0;
+        {
+          std::vector<uint8_t> probe;
+          if (tocPkg != 0 && MclaLoadPkgWindow(tocPkg, 0, 64, probe) &&
+              probe.size() >= 12 && MclaBE(probe.data()) == 0x05435352u &&
+              MclaBE(probe.data() + 8) == w[3])
+            pkgOff = tocPkg;
+          else if (pathPkg != 0)
+            pkgOff = pathPkg;  // MITIGATION fallback (pre-F-171 substring map)
+        }
+        if (pkgOff != 0) {
         // F-169: ask the package how big it is before deciding the window. The
         // table-derived size below was floored at 32 KB and capped at 256 KB, and
         // MclaLoadPkgWindow clamped every read to 32 KB as well, so a 196 KB UI
@@ -741,6 +764,7 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
                           "-> pkg={:08X} head={:08X} n={}",
                           path, offs[c], be, pkgOff, pbe, serveBytes.size());
           }
+        }
         }
       }
     }

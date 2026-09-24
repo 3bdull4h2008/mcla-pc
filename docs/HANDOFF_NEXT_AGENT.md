@@ -1,3 +1,31 @@
+## 2026-09-24 ~16:30 - **F-171 (this commit): each container member is now served from the package its OWN TOC record names (magic + ID verified), and the local archive was replaced with a complete copy - so all seven UI packages exist and bind at their own sizes. `w180`/`w181` identical, `Fatal error 0` / `FATAL-SOFT 0` / `C0000005 0` / `TYPINIT 3/3`**
+
+- **The bug was a 20-bit mask plus a scan-bounded table.** `MclaPkgOffFromTocW2` used `& 0x00FFF000`,
+  so `credits.xsf`'s word[2] `0x6496F01B` decoded to `0x96F000` - any package above 16 MB was
+  unreachable - and membership in `BuildRscPackageTable` (which scans only `kScan = 0x2000000`) was
+  required, so a correct candidate was still rejected. Now `& 0xFFFFF000` and the caller validates
+  **RSC5 magic at `pkg+0` AND `[pkg+8] == record word[3]`** (`src/gpu_device.cpp:278`, `:702`-`730`).
+  That validation is what lets the table go away: a wrong offset cannot pass both.
+- **The archive is whole** (F-170's required action): replaced with the complete 2,130,739,200-byte
+  copy from `E:\MCLA-Standalone\game_data\`; measured `last_nonzero = 2,130,710,477` (was
+  0x5C000000). The truncated file is preserved as `xarchive_cache.rpf.truncated-20260924`, not
+  deleted. All seven packages now show an RSC5 header whose ID equals its record's word[3].
+- **Measured (w180 + w181, same binary):** `PKG-SUBST` names 7 distinct packages
+  (00060000/000A0000/0035A000/6496F000/64980000/64CA3000/64CB0000) where every `.xsf` used to get
+  legals' body; `XSF-BIND size=` per path = credits 29,655 / garage 1,066,057 / policecam 19,337 /
+  raceeditor 143,069. Unchanged-or-better frontier: `LISTLINE 171`, `GETDEV 694`, `CP-DRAW 166`,
+  `PRESENT 34`, `DICTLOOKUP 22`, `[error] 14`, GFx 4→5, `DRAW_INDEXED 0`.
+- **Still the blocker on this route, and it is now offline-decidable:** `XSF-INFLATE` 0 and `swfCMD`
+  0 - the RSC5 payload at `0x0FF512EF` is not raw deflate in any framing tried over `+0x14..+0x2F`
+  (F-170). Seven complete packages + the guest's own inflate entry `sub_821D5E10` = a codec/keys
+  problem that needs no soak loop to attack.
+- **Recorded, not silently carried:** the read/continuation site (`src/gpu_device.cpp:10032`-`10036`)
+  still prefers `MclaPreferredPkgOffForPath` and does no magic/ID validation, so it can bind a member
+  to the substring-mapped package. The map is a *labelled* fallback only at the census site (`:730`).
+  Watch `CC6F0-PKGSUBST` when that one is retired.
+- Plan state unchanged: B1/B2/B3 closed; **B4's gate (`DRAW_INDEXED >= 1` from a non-zero constant
+  bank) unmet**; B5 criterion 3 (zero `FATAL-SOFT` masking) met, criteria 1-2 unmet.
+
 ## 2026-09-24 ~16:00 - F-170: STOP on the UI/menu until the archive is re-acquired. build/game_data/xarchive_cache.rpf is a TRUNCATED COPY - 587,235,328 bytes (27.6%) past 0x5C000000 are zeros, and 4 of the 5 UI .xsf packages live in that tail
 
 - Found offline, no soak needed. A TOC record's word[1] is the member SIZE and word[2] is

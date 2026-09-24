@@ -4697,3 +4697,62 @@ volume trouble (2026-09-20 data loss, 2026-09-24 05:35 fsync failures), not a pa
 re-test: if the four packages appear, F-169's length fix becomes testable for real; if the payload
 still will not inflate, the codec/keys question is the blocker and sub_821D5E10's inflate hook is
 where to look.
+
+### F-171: THE FIX (UI feed) - a container member is now served from the package its OWN TOC record names, validated by header magic + package ID, and the local archive has been replaced with a complete copy so all seven of those packages physically exist
+
+- Task:    B5 (menu) - executes the action F-170 required and retires F-166's placeholder mapping as the primary selector
+- Type:    FIX
+- Class:   E
+- Priority: P0 - it is the difference between the UI being fed one shared placeholder body and being fed its own body
+- Evidence: `src/gpu_device.cpp:278` (`MclaPkgOffFromTocW2`), `:702`-`730` (candidate + validation + labelled fallback), `:310`/`:320` (`kPkgWindowMax`, `MclaRsc5DeclaredSize`); soaks `build/w180.log` and `build/w181.log` (same binary, 16:16/16:18); `build/game_data/xarchive_cache.rpf` = 2,130,739,200 bytes with `last_nonzero = 2,130,710,477`, truncated original kept beside it as `xarchive_cache.rpf.truncated-20260924`
+
+**Two limits hid the offset, both now removed.** `MclaPkgOffFromTocW2` masked with `0x00FFF000`,
+which is a 20-bit offset: `credits.xsf`'s word[2] `0x6496F01B` decoded to `0x96F000`, not
+`0x6496F000`, so no package above 16 MB could ever be named. And it required membership in the
+package table, which `BuildRscPackageTable` builds by scanning only `kScan = 0x2000000` from 0 - so
+even a correct candidate was rejected for being outside the scan. Now `return w2 & 0xFFFFF000u;`
+and the **caller** validates: an RSC5 magic at `pkg+0` **and** `[pkg+0x08] == record word[3]`.
+That pair is what makes the unvalidated guess safe - a wrong offset cannot pass both, so there is
+no need for a scan-bounded table at all.
+
+**The archive is whole, and that is what made the fix testable.** F-170's required action was taken:
+the local copy was replaced with a complete 2,130,739,200-byte copy from
+`E:\MCLA-Standalone\game_data\xarchive_cache.rpf` (9.088 s copy; the old file is preserved, not
+deleted). Re-measured offline, all seven UI/cache containers now carry an RSC5 header whose ID word
+equals the TOC record's word[3]:
+
+| package | offset | `[pkg+8]` ID | declared size (RSC5 +0x10) |
+|---|---|---|---|
+| legals.xsf | 0x000A0000 | D454283D | 196,553 |
+| meshtextures.xtd | 0x00060000 | DC2C0810 | 240,531 |
+| trash.xrn | 0x0035A000 | C0001814 | 10,799 |
+| credits.xsf | 0x6496F000 | D4082813 | 29,655 |
+| garage.xsf | 0x64980000 | D574B032 | 1,066,057 |
+| policecam.xsf | 0x64CA3000 | D41D2810 | 19,337 |
+| raceeditor.xsf | 0x64CB0000 | D4343015 | 143,069 |
+
+**Measured at the draw-in (w180 and w181 are identical, so this is not the bimodality F-169 found):**
+`PKG-SUBST` names **seven distinct packages** (00060000 ×5, 000A0000 ×37, 0035A000 ×5, 6496F000 ×3,
+64980000 ×3, 64CA3000 ×3, 64CB0000 ×3) where before every `.xsf` received legals' body;
+`XSF-BIND` per path is now the file's own declared length - credits 29,655 / garage 1,066,057 /
+policecam 19,337 / raceeditor 143,069 - instead of all four at legals' 196,553.
+
+**Frontier counters are unchanged or better, which is the point of a serve-path fix:**
+`Fatal error 0`, `FATAL-SOFT 0`, `C0000005 0`, `SEEK-DEAD 0`, `LISTLINE 171`, `GETDEV 694`,
+`CP-DRAW 166`, `PRESENT 34`, `DICTLOOKUP 22`, `[error] 14`, `TYPINIT` entered/returned 3/3,
+GFx 4→5. F-163's registration and F-169's length fix both survive; `DRAW_INDEXED` is still 0.
+
+**What this does NOT fix - the remaining blocker on this route is the payload codec.** `XSF-INFLATE`
+fires 0 times and `swfCMD` is 0, exactly as before, so the guest is still handed container bytes it
+cannot turn into tags. That is now decidable offline against these seven whole packages with no soak
+in the loop: start from the guest's own inflate entry `sub_821D5E10` and the
+`0x0FF512EF` (XEX/Xcompress-family) magic at `RSC5+0x0C`. F-170 already recorded that every
+plausible raw-deflate framing of `+0x14..+0x2F` fails to inflate.
+
+**Open asymmetry, recorded rather than silently carried.** The read/continuation site
+(`src/gpu_device.cpp:10032`-`10036`, `sub_821CC6F0` region) still consults
+`MclaPreferredPkgOffForPath` **first** and falls back to `MclaPkgOffFromTocW2`, and it does no
+magic/ID validation, so it can still bind a member to the substring-mapped package. The substring
+map is now only a labelled fallback at the census site (`:730`
+`// MITIGATION fallback (pre-F-171 substring map)`); retiring it at `:10032` is the follow-up, and
+`CC6F0-PKGSUBST` lines are the instrument to watch when it is done.
