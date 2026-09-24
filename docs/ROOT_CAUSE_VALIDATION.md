@@ -4472,3 +4472,90 @@ instead of the `0x8000` window, bind that, and the pass condition is `XSF-BIND s
 paths becoming their true lengths, `W32-CONSTRUCT-CENSUS nValidTag > 0` (or any `swfCMD` line) firing
 for the first time, with `LISTLINE 171` / `TYPINIT 4`/`TYPINIT-RET 4` / `C0000005 0` unchanged. B4's
 `DRAW_INDEXED` gate is downstream of this, because a UI draw is the most likely first indexed draw.
+
+
+### F-166: correction to F-165's stated next step - the UI members' TOC offsets do **not** point at RSC5 headers, so "bind the TOC length" is wrong; the real defect is that `MclaPreferredPkgOffForPath` maps **every** `.xsf` to one placeholder package at `0xA0000` by path substring
+
+- Task:    B5 (menu) - same thread as F-165, measured before writing any code
+- Type:    FACT (refutes part of F-165) - and it re-scopes the fix
+- Class:   E
+- Priority: P0
+- Evidence: `build/game_data/xarchive_cache.rpf` read at each `tocOff` published by
+  `build/w171.log` `TOC76-XSF`; `src/gpu_device.cpp:288-301`
+  (`MclaPreferredPkgOffForPath`), `:303-332` (`MclaLoadPkgWindow`), `BuildRscPackageTable`
+
+**What is at the TOC offsets (32 bytes read at each, from the archive directly):**
+
+| member | `tocOff` | first bytes there | RSC5 (`05 43 53 52`)? |
+|---|---|---|---|
+| `resources/ui/credits/credits.xsf` | `000073EB` | `d3 f5 e7 27 94 67 3c 9f ...` | no |
+| `resources/ui/garage/garage.xsf` | `0010445D` | `c3 1e 27 64 2c 1b f4 eb ...` | no |
+| `resources/ui/legals/legals.xsf` | `0002FFDD` | `02 a1 bb 88 ff bc 58 34 ...` | no |
+| `resources/ui/policecam/policecam.xsf` | `00004B9D` | `fb 1e 8d 11 da 20 53 59 ...` | no |
+| `resources/ui/raceeditor/raceeditor.xsf` | `00022EF1` | `94 9d ee e9 b2 ec 55 41 ...` | no |
+| `resources/ui/meshtextures.xtd` | `0003ABA7` | `d1 0b f8 91 ae 75 ee cb ...` | no |
+| `resources/city/SC/trash.xrn` | `00002A43` | `b0 e5 6e 68 a8 ec b1 20 ...` | no |
+
+All high-entropy, none a container header. The offsets the boot actually serves from (`0xA0000` for
+all five UI `.xsf`, `0x60000` for the `.xtd`, `0x35A000` for the `.xrn`) DO begin with RSC5
+(`head=05435352` in `PKG-SUBST`) - because they are *packages*, and the UI members' bytes live
+**inside** them.
+
+**So F-165's prescription is withdrawn**: taking the TOC record's own size/offset would serve those
+high-entropy bytes and change nothing. The defect that stands is narrower and clearer:
+`MclaPreferredPkgOffForPath` (`src/gpu_device.cpp:288`-`:301`) is a placeholder that picks a package
+by path substring - `meshtextures` -> `0x60000`, and *any* `.xsf`/`.xtd`/`resources/ui` -> `0xA0000`,
+with everything else returning 0 (no substitution). Five different UI files therefore receive the same
+32 KB window of one package, and the `0x8000` clamp at `:309-313` bounds even that. The `Rpf3` model
+already builds a package table (`BuildRscPackageTable`, called at `:305`); what is missing is the
+member -> (package, entry) resolution through it.
+
+**Restated next step (this one is a work order, not a guess):** enumerate the RSC5 packages' entry
+tables, match the requested leaf name (`credits.xsf` etc.) to an entry, and serve that entry's data -
+replacing the substring function, not adding to it. Pass condition stays the same and is measurable
+without new instruments: `XSF-BIND size=` differing per path (today all six are 32768), then
+`W32-CONSTRUCT-CENSUS nValidTag > 0` or any `swfCMD` line firing for the first time, with `LISTLINE
+171` / `TYPINIT` 4-enters-4-returns / `C0000005 0` unchanged. If the entry table turns out to be
+encrypted (the on-disk TOC is AES per F-099), then this is the content boundary and B5's menu needs a
+different source - that is the branch point, and it is resolvable offline in one look at a package
+header rather than a soak.
+
+
+### F-167: the RSC5 package lookup is DECODED offline - a TOC record's word[2] is `(packageOffset & 0xFFFFF000) | headerLength` and word[3] is the package's own ID at `[pkg+8]`; it verifies for `legals.xsf` (the boot's first screen), `meshtextures.xtd` and `trash.xrn`, and the four remaining `.xsf` carry a `0x64…` prefix that is a volume selector, not an offset in this archive
+
+- Task:    B5 (menu) - replaces F-165's placeholder path-substring mapping with a decode
+- Type:    FACT (discovered mechanism; makes the next step a coding task, not a guess)
+- Class:   E
+- Priority: P0
+- Evidence: `build/game_data/xarchive_cache.rpf` (size `0x7F008000`) read at the offsets below,
+  cross-checked against `build/w171.log` `TOC76-XSF` record words; `src/gpu_device.cpp:288`-`:301`
+  (the function this replaces), `:329` (it already knows the `0x0FF512EF` Xcompress magic)
+
+**The test and the result.** For each UI record, take `pkg = w2 & 0xFFFFF000`, `hdrLen = w2 & 0xFFF`,
+read `[pkg+0]` (expect RSC5 `05 43 53 52`) and `[pkg+8]` (expect `== w3`):
+
+| member | `w2` | `pkg` | `hdrLen` | magic at pkg | `[pkg+8]` vs `w3` |
+|---|---|---|---|---|---|
+| `resources/ui/legals/legals.xsf` | `000A001B` | `0x000A0000` | 27 | RSC5 | `D454283D` == `D454283D` **MATCH** |
+| `resources/ui/meshtextures.xtd` | `00060009` | `0x00060000` | 9 | RSC5 | `DC2C0810` == `DC2C0810` **MATCH** |
+| `resources/city/SC/trash.xrn` | `0035A042` | `0x0035A000` | 66 | RSC5 | `C0001814` == `C0001814` **MATCH** |
+| `credits.xsf` / `garage.xsf` / `policecam.xsf` / `raceeditor.xsf` | `6496F01B` / `6498001B` / `64CA301B` / `64CB001B` | `0x649…`-`0x64CB…` | 27 | all `00000000` (unstored) | no match |
+
+Masking those four down into the file (`& 0x0FFFFFFF` -> `0x049…`) was tried and is wrong too - the
+bytes there are neither RSC5 nor their ID - so the `0x6000_0000` bits are a selector for another
+volume, not a clampable offset. That is a separate, later question.
+
+**Header layout, from the 27-byte `legals.xsf` package at `0xA0000`:**
+`05 43 53 52` magic | `00 00 00 1B` header length | `D4 54 28 3D` package ID (== TOC word[3]) |
+`0F F5 12 EF` the Xcompress magic this file's own loader already recognizes
+| `00 02 FF C9` | `10 F8 B8 20 49 40 95 4D` (reads as a Windows FILETIME) | then payload.
+`meshtextures.xtd`'s package declares `hdrLen 9` and `trash.xrn`'s `66`, so the length field is real
+and per-package - which is what F-156 read as "the `01B`/`009` low bytes are an RSC5 header length".
+
+**What this changes.** `MclaPreferredPkgOffForPath` (`src/gpu_device.cpp:288`) can be replaced by a
+decode of the record the guest already handed us: the UI members that DO live in this archive resolve
+with a verified ID instead of being collapsed onto one placeholder package by substring, and the four
+that do not can be reported as a volume mismatch rather than silently served wrong bytes. The
+testable pass condition for that change is unchanged from F-165/F-166: `XSF-BIND size=` per path
+(today six identical 32768s), then any `nValidTag > 0` / `swfCMD` line - and `legals.xsf` is the first
+screen, so it is the member that matters for B5.
