@@ -5211,3 +5211,62 @@ allows, so a per-line logging footprint changes them **without changing guest pr
 shows zero delta on the structural frontier. `STUB-SLOT` is the only instrument that names which
 vtable misses the stub is actually absorbing, which is what the eventual `+84` implementation has to
 avoid breaking.
+
+### F-179: `pgStreamer::Open` succeeds for all seven UI containers and `record+4` is a TOC **entry pointer**, not a length - so F-172's attribution of the zero to `[record+4]` is also wrong; the real byte counter is `sub_821BC140`'s `r21`, and the `cmplwi r30,32768` I read as a clamp is the branch that *selects* `r21`
+
+- Task:    B5 (menu) - supersedes part of F-172 and completes F-177/F-178's test
+- Type:    FACT (correction + measurement)
+- Class:   H
+- Priority: P0 - the previous two entries' "next step" was aimed at the wrong field
+- Evidence: `build/w186.log` lines 3609-4192 + 16917 (seven `TOC76`/`TOC76-RET`/`TOC76-XSF` triples
+  with `lr=821CC4BC`), `build/cache/mcla_pe.bin` decode at `0x821CC4B8` (`bctrl`) /
+  `0x821CC4BC` (`cmpli cr6,r3,0`) - the return point inside `sub_821CC498`, the archive device's
+  vtable+84; `generated/ppc_xenon/ppc_recomp.14.cpp:19040`-`19060`
+
+**The path is alive and it works.** `sub_821BC140`'s `+84` question forwards (through
+`sub_821CC498` → device slot `+144` = `sub_821CBFC0`) into the packfile TOC lookup, and **all seven**
+`RSC5` containers resolve there - exactly matching `STREAM-OPEN`'s seven firings:
+
+| path | `TOC76-RET` | record words | `openGateBit30` |
+|---|---|---|---|
+| `resources/ui/raceeditor/raceeditor.xsf` | `C60BF0F0` | `221B297A 00022EDD 64CB001B D4343015` | 1 |
+| `resources/ui/garage/garage.xsf` | `C60BF0A0` | `FCC35320 00104449 6498001B D574B032` | 1 |
+| `resources/ui/policecam/policecam.xsf` | `C60BF0D0` | `D7F64D61 00004B89 64CA301B D41D2810` | 1 |
+| `resources/ui/credits/credits.xsf` | `C60BF070` | `02313636 000073D7 6496F01B D4082813` | 1 |
+| `resources/ui/meshtextures.xtd` | `C60B7970` | `0597F7BB 0003AB93 00060009 DC2C0810` | 0 |
+| `resources/ui/legals/legals.xsf` | `C60B7B20` | `260847AB 0002FFC9 000A001B D454283D` | 0 |
+| `resources/city/SC/trash.xrn` | `C60C03D0` | `AD0A8B94 00002A2F 0035A042 C0001814` | 0 |
+
+Three independent confirmations in one table: the sizes are the F-168/F-171 declared lengths
+(`00022EDD` = 143,069; `00104449` = 1,066,057; `00004B89` = 19,337; `000073D7` = 29,655), the package
+words are the F-171 per-record offsets (`64CB001B` → `0x64CB0000`), and **every lookup returned a
+non-null entry pointer**. So `record+4` = that pointer, and F-177/F-178's search for "who zeroes
+`record+4`" was aimed at a field that is not a counter.
+
+**What that means for F-172's model.** `sub_821BC140` does
+```
+lwz r30,4(r28)            ; r30 = record+4 = a TOC ENTRY POINTER (non-null, per the table)
+mr  r31,r21               ; candidate count = r21
+cmplwi r30,32768
+bge  loc_821BC2F0         ; pointer >= 32768  → KEEP r31 = r21      ← this is the taken branch
+mr  r31,r30               ; (else the small value would be the count)
+...
+r7 = r31 → device Read(dst = r1+128, count = r7)
+```
+I read the comparison as a clamp of `[record+4]` and concluded the length came from that field. In
+fact the comparison *dispatches on the field's type* (pointer vs count), and because the entry
+pointer is always ≥ 0x10000, **the count is `r21`** - so `READWRAP … r7 = 0` means **`r21 == 0`**.
+The rest of F-172 survives: the 0-byte read is measured, and the derived `st+0 = 0xFFFFFFF4` /
+`st+4 = stack+12` arithmetic still explains `INFLATE-ENTER #1` exactly.
+
+**Also confirmed by this table:** the four UI `.xsf` entries carry `openGateBit30=1` while
+`legals`/`meshtextures`/`trash` carry 0 - the bit our `XSF-OPEN-GATE-SKIPPED` mitigation exists
+around - and `r5` in `STREAM-OPEN` (27/9/5442) equals each package's `+0x04` word, so the guest reads
+that field and hands it to Open as a parameter.
+
+**Corrected next step (static, one function, no instrument).** Trace `r21` in
+`sub_821BC140`'s prologue (`ppc_recomp.14.cpp:18805`-`19040`) to its source field in the 1556-byte
+queue record. `REQDUMP #1` shows that record's `{src, dst, size}` triples carry non-zero sizes
+(`50000000 A47FD000 00002000`, then `… 00080000`), so either `r21` is a *cursor* that was already
+advanced past the end, or it is a per-stream remainder the completion path never seeded. Whichever it
+is, the fix lands in what we hand the streamer, not in the container and not in a vtable stub.
