@@ -1,3 +1,29 @@
+## 2026-09-24 ~17:25 - **F-174: correcting myself twice before it costs a build - the streamer control block is `0x8283D190` (F-172's `0x8203D190` came from mis-signing a `lis`), and `sub_821867A0` is NOT the writer of the zero-count slot (F-173's mechanism withdrawn, its facts kept)**
+
+- **Address fix, use this one:** `sub_821BC140`'s `lis r10,-32124` = `-2105278464` = `0x82840000`, and
+  `addi r19,r10,-11888` -> **`r19 = 0x8283D190`**. Request-array base = `[0x8283D1C4]`, capacity-minus-one
+  mask = `[0x8283D1A8]`. F-172's conclusion is untouched (length = `[r28+4]`, `r28 = [r19+52] +
+  [task+0]*28`, and that length is 0), only the cited constant was wrong. Same failure mode as
+  F-157's phantom `0x82861740`, caught statically this time.
+- **Why F-173's writer claim fails:** every store inside `sub_821867A0` is to `r22 = r3` or
+  `idx*28 + r22`, and its ONE caller (`sub_82187150+0x1A8`) passes `r1+224 + idx*28` - a caller-local
+  buffer (visible in `REQFILL` itself: `r3=8EFFF1E0`, `r6/r7` 8 bytes apart in the same frame). So the
+  `r5 = 0` there is **not** the origin of the zero `[slot+4]`. `REQFILL` stays (2 firings/boot,
+  returns ids 3 and 4, registers-only, proven zero frontier delta) but it bounds a *request builder*,
+  not the pool.
+- **Where to look next, all static, one named starting point:** only five sites materialise
+  `0x8283D190` - `sub_821BC140+0x24`, reads at `0x821BC674`/`0x821BC680`/`0x821BC694`, and
+  `sub_821BCB10+0x44` (the `ENQ` chooser). Exactly one site materialises the array base
+  `[0x8283D1C4]`: **`sub_821BCE68+0x2C`**, un-hooked. Read `sub_821BCE68` and those three reads
+  (same code page as the inflate loop, plausibly its completion path) to find who sets a slot's
+  `[+4]`. No new instrument needed for that, and `sub_821BC140` already has an owner so a second hook
+  there would need rule 4 checked again.
+- Unchanged frontier: `w182`/`w183` == `w180`/`w181` (LISTLINE 171, Fatal 0, FATAL-SOFT 0, C0000005 0,
+  SEEK-DEAD 0, TYPINIT 3/3, GETDEV 694, CP-DRAW 166, PRESENT 34, DICTLOOKUP 22, [error] 14,
+  INFLATE-ENTER 149, XSF-INFLATE 0, swfCMD 0, **DRAW_INDEXED 0**). B4's gate and B5 criteria 1-2 are
+  still unmet; F-172's separate B4 lead (Type-0 `0x0A2F/0x0A30` size+address pair naming
+  `0x08A11000`/`0x08A15000`, and unimplemented `PM4_WAIT_REG_MEM`) is still open and unverified.
+
 ## 2026-09-24 ~17:20 - **F-173: the zero inflate count traced to its only source - `sub_821867A0` (the streamer's request registrar) has exactly ONE caller, `sub_82187150+0x1A8`, and it is called twice per boot with `r5 = 0`; the new `REQFILL` census has a proven-zero frontier delta (`w183` == `w182` on all 17 counters) so it stays in the tree**
 
 - Chain, all cited: `sub_821BC140` reads its transfer length as `[r28+4]` where

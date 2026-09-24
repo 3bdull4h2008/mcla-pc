@@ -8415,12 +8415,14 @@ PPC_FUNC(sub_821BCB10) {
                   a0, a6, ctx.r3.u32);
 }
 
-// F-173: sub_821867A0 is the writer of the streamer request slots that
-// sub_821BC140 reads (`r28 = [0x8203D190+52] + [task+0]*28`, and the count it
-// inflates is `[r28+4]`; four `stw rT,4(entry)` sites after `* 28` index math,
-// all inside this one function). F-172 proved that count is 0 at this frontier,
-// so this is the link that decides whether the request was never filled or was
-// filled with a zero length.
+// F-173/F-174: sub_821867A0 builds 28-byte streamer request records - but into
+// the array its CALLER hands it (`sub_82187150+0x1A8` passes r1+224 + idx*28,
+// and every store base inside is r22 = r3 or idx*28 + r22), NOT into the pool
+// sub_821BC140 reads (`r28 = [0x8283D190+52] + [task+0]*28`). F-174 withdrew
+// the earlier claim that this is the writer of the slot whose [+4] the inflate
+// loop takes as its length; read this census as a bound on a request BUILDER.
+// What it does establish: 2 firings per boot, returns ids 3 and 4, exactly one
+// caller, and its only non-pointer argument is 0 both times.
 // MINIMAL FORM - REGISTERS ONLY, no guest reads: an adjacent census in this
 // subsystem crashed its consumer by reading memory (the ENQ note at
 // sub_821BCB10), and the F-125/F-133 footprint rule applies anyway.

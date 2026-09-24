@@ -4885,3 +4885,41 @@ not yet traced. The next step, named: read `sub_821867A0`'s body for the store t
 in their own descriptors (`REQDUMP #1 a0=82849B2C d=[00000004 50000000 A47FD000 00002000 60000000
 B7A01000 00080000 ...]` = 3-dword records `{virtual source, destination, size}`, sizes 0x2000 and
 0x80000), so **the guest does know the lengths** - they simply do not reach the request slot.
+
+### F-174: two corrections to the last two entries - the streamer control block is `0x8283D190` (not `0x8203D190`; `lis` immediate sign), and `sub_821867A0` is NOT the writer of the zero-count slot (supersedes F-173's mechanism, keeps its facts)
+
+- Task:    B5 (menu) - self-correction of F-172's cited address and F-173's stated writer
+- Type:    FACT (correction) - the F-172 *conclusion* survives, the F-173 *mechanism* does not
+- Class:   H (an attribution artifact of mine, caught statically, before it cost a build)
+- Priority: P1 - so nobody builds a fix on the wrong function
+- Evidence: `generated/ppc_xenon/ppc_recomp.14.cpp` prologue of `sub_821BC140` (`lis r10,-32124` ->
+  `-2105278464` = `0x82840000`; `addi r19,r10,-11888` -> **`0x8283D190`**);
+  `tools/ppc_xrefs.py xref 0x8283D190` (5 sites) and `xref 0x8283D1C4` (1 site);
+  `ppc_recomp.9.cpp:2902`-`3620` (every store base inside `sub_821867A0` derives from `r22 = r3`) and
+  `ppc_recomp.9.cpp:4565`-`4596` (the sole caller passes `addi r3,r1,224` + `mulli r11,r30,28`)
+
+**1. The address in F-172 was mis-signed.** I computed the control block as `0x8203D190` by taking
+`-32124 << 16` wrongly; the generated listing's own value is `-2105278464` = `0x82840000`, so
+`r19 = 0x82840000 - 0x2E70` = **`0x8283D190`**, the request-array base is at `[0x8283D1C4]` and the
+capacity-minus-one mask at `[0x8283D1A8]`. Everything else in F-172 is unaffected: the length the
+inflate loop uses is still `[r28+4]` with `r28 = [r19+52] + [task+0]*28`, it is still 0, and the
+`r7=0` / `st+0=-12` / `st+4=stack+12` arithmetic match still holds. Same lesson as F-157's phantom
+`0x82861740`, caught here before a build instead of after three.
+
+**2. F-173's writer claim is withdrawn.** `sub_821867A0` fills whatever 28-byte array it is *handed*:
+inside it every store base is `r22 = r3` or `idx*28 + r22`, and its one call site
+(`sub_82187150+0x1A8`) passes `r1 + 224 + idx*28` - a **caller-local buffer**, confirmed by the
+`REQFILL` log itself (`r3=8EFFF1E0`, `r6/r7` 8 bytes apart in the same frame). So the `r5 = 0` it
+passes is **not** the origin of the zero `[slot+4]` that `sub_821BC140` reads. The census facts stand
+(2 firings/boot, returns ids 3 and 4, single caller, registers-only with a zero frontier delta) and
+`REQFILL` stays in the tree as a bound on what that function does - but PROGRAM_GUIDE's `REQFILL` row
+must not be read as "the registrar of the streamer's request pool".
+
+**3. What the corrected neighborhood actually is.** Only five sites materialise `0x8283D190`:
+`sub_821BC140+0x24` (the inflate executor), three reads inside `sub_821BC6xx`
+(`0x821BC674`/`680`/`694`), and `sub_821BCB10+0x44` (the enqueue-chooser our `ENQ` census already
+watches). Exactly one site materialises the array base `[0x8283D1C4]`: **`sub_821BCE68+0x2C`**, which
+is not hooked. So the manager is small and closed, and the question "who allocates and fills the
+request array, and who should set a slot's `[+4]`" now has a single named starting point:
+`sub_821BCE68` (and the three reads at `0x821BC674`-`0x821BC694`, which are in the same page of code
+as the inflate loop and may be its completion path). Static reading of those, not another instrument.
