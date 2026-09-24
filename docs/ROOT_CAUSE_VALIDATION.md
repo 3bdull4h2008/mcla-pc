@@ -4381,10 +4381,14 @@ than design; per-body slots remain the cleanup that would retire F-135/F-135b.
 - Priority: P0 - it retires the last "our parser is wrong" reading of the skinningData gate
 - Evidence: `build/game_data/xarchive_cache.rpf` inflated offline at the ten `kTypeMemberSpans`
   offsets (all ten inflate, 480-648 B each, every one starting
-  `Version: 103
-shadinggroup {
-ShadingGroup
-{
+  `Version: 103
+
+shadinggroup {
+
+ShadingGroup
+
+{
+
 	Shaders N`);
   `python tools/rpf_offline.py find ext_matteblack.mtlgeo build/toc_parsed.bin` -> 0 records
   (positive control in the same run: `find .../entity.type` -> 12 records);
@@ -5153,3 +5157,57 @@ smaller change and does not disturb F-163's re-open path. Pre-declared success c
 `READWRAP` with `r7=0 lr=821BC334` becomes a non-zero count, `INFLATE-ENTER`'s `st+0` stops being
 `0xFFFFFFF4`, `XMEM` calls appear with per-file sizes instead of our constant 7,179,936, and only
 then `swfCMD`/`XSF-INFLATE` become meaningful. Revert if `LISTLINE`/`C0000005`/`SEEK-DEAD` regress.
+
+### F-178: F-177's last step is REFUTED by measurement - `pgStreamer::Open`'s vtable call never reaches the pinned `li r3,0` stub (its four callers are elsewhere), and this soak also proves `INFLATE-ENTER`/`READWRAP` are **timed-spin counters** that must not be used as frontier evidence
+
+- Task:    B5 (menu) - tests F-177's inference and retires it; corrects the admissibility method used in F-173/F-177
+- Type:    FACT (refutation) + FACT (measurement hazard)
+- Class:   H
+- Priority: P1
+- Evidence: `build/w186.log` (`STUB-SLOT` 18 lines, `STREAM-OPEN` 7) vs `build/w185.log`;
+  raw vtable words at `0x82012BDC`/`0x82012918` in `build/cache/mcla_pe.bin`;
+  `generated/ppc_xenon/ppc_recomp.14.cpp:21231`-`21241`; `src/gpu_device.cpp:12642`-ff (the stub
+  override, now with the `STUB-SLOT` tally), `:11141`-ff (the `+144` hook)
+
+**What was predicted.** F-177 argued: `Open` stores `dev->vt[+84](dev)` into `record.length`; the
+`memory:` device's `+84` is the shared `li r3,0; blr` stub at `0x821A5CC0`; and we additionally pin
+that stub to 0, so the length is 0 by our own hand.
+
+**What was measured.** A per-`lr` tally inside the stub (`STUB-SLOT`, one line per new caller, cap
+16, first 12 calls) shows **exactly four distinct call sites per boot**:
+```
+#1 lr=8217784C r3=82008F3C r4=A00011CC r5=00000040
+#2 lr=8218C82C r3=827D838C r4=C81E0A80 r5=0000000A     ← the sub_8218C760 device+88 case the override was built for
+#3 lr=821BE67C r3=827D838C r4=00000001 r5=0000000C     ← BE8D8/BE610 family
+#4 lr=82177EF8 r3=82830B18 r4=000002D0 r5=00000001     ← hot (the remaining ~1754 calls)
+```
+**None of them is inside `sub_821BCE68` (0x821BCE68..~0x821BD094).** So `Open`'s `+84` call does not
+land on the stub, and F-177's "the zero is our pinned no-op" conclusion is **wrong**. The inference
+was reasonable and the *store site* it rests on (`stw r3,4(r29)` after `lwz r10,84(r11)`) is still
+correct - only the claim about which function answers slot +84 failed.
+
+**What the archive device's +84 actually is.** `0x82012BDC+84 = 0x821CC498` decodes to
+`r10=[dev+0]; r11=[dev+36]; r4=r11+r4; call [r10+144](dev, r4)` - i.e. it forwards to **slot +144
+with a name pointer built as `[dev+36] + arg`**, and slot +144 of that vtable is `0x821CBFC0` - the
+packfile TOC lookup we already hook (`src/gpu_device.cpp:11141`-ff, whose `TOC76`/`TOC76-XSF` census
+prints `ret=C60B7B20` = **a TOC entry pointer**). So `record+4` is fed by that lookup, and its value
+in the executed records is 0 either because the name at `[dev+36]+arg` doesn't resolve on this
+device, or because the field is a union that another phase overwrites. **That is the open question
+now, and it is one careful read of `sub_821BCE68`+0x100..+0x180 (which value reaches the `+84` call's
+`r4`) plus one `TOC76` line correlation - not another instrument.**
+
+**The method correction, which costs nothing to keep.** `w186` vs `w185`: all 17 *structural*
+counters are identical (`LISTLINE 171`, `Fatal error 0`, `FATAL-SOFT 0`, `C0000005 0`, `SEEK-DEAD 0`,
+`TYPINIT 6`, `GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `DICTLOOKUP 22`, `[error] 14`,
+`STREAM-OPEN 7`, `DRAW_INDEXED 0`) - but `INFLATE-ENTER 149 → 82` and `READWRAP 278 → 138`. Those two
+count the *same repeating spin* whose iteration count depends on how much wall-clock the 120 s timeout
+allows, so a per-line logging footprint changes them **without changing guest progress**. Therefore:
+- `INFLATE-ENTER` and `READWRAP` are **not** admissibility evidence and not progress evidence. They join
+  `INFLATE`, `fatal`-substring and `nValidTag` on the run-unstable list (F-169/F-164).
+- F-173's and F-177's admissibility claims were built partly on them. Those claims still hold because
+  the *structural* counters also matched in both cases - but the method was wrong and is corrected here.
+
+**Both censuses stay** (`STREAM-OPEN`, `STUB-SLOT`): each is registers-only/`lr`-keyed, bounded, and
+shows zero delta on the structural frontier. `STUB-SLOT` is the only instrument that names which
+vtable misses the stub is actually absorbing, which is what the eventual `+84` implementation has to
+avoid breaking.

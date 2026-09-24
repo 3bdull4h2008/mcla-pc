@@ -12641,7 +12641,57 @@ PPC_FUNC(sub_821BE0C8) {
 // Shared no-op vtable stub (li r3,0; blr). 8C760 calls device+88 after
 // GETDEV; if the function-table slot is null we AV at 0x0. Strong override.
 PPC_FUNC_IMPL(__imp__sub_821A5CC0);
+// F-178: F-177 inferred that pgStreamer::Open's size query (vtable slot +84 on
+// the `memory:` device) lands here and is answered 0 because of this override.
+// That inference is only citable once measured, and the address cannot
+// distinguish the thirteen slots that share it - so tally by `lr`, which does.
+// Bounded by construction: one line per newly-seen `lr` (max 16) and the first
+// 12 calls, so a hot stub cannot flood the log (F-057(6)/F-125).
 PPC_FUNC(sub_821A5CC0) {
+  static std::mutex s_stubMtx;
+  static uint32_t s_stubSeen = 0;
+  static uint32_t s_stubLrs = 0;
+  static uint32_t s_stubLr[16] = {0};
+  static uint32_t s_stubCount[16] = {0};
+  static std::atomic<uint32_t> s_stubCalls{0};
+  const uint32_t n = s_stubCalls.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+  bool fresh = false;
+  int slot = -1;
+  {
+    std::lock_guard<std::mutex> g(s_stubMtx);
+    s_stubSeen = n;
+    for (uint32_t i = 0; i < s_stubLrs; ++i)
+      if (s_stubLr[i] == lr) {
+        slot = static_cast<int>(i);
+        break;
+      }
+    if (slot < 0 && s_stubLrs < 16) {
+      slot = static_cast<int>(s_stubLrs++);
+      s_stubLr[slot] = lr;
+      fresh = true;
+    }
+    if (slot >= 0)
+      ++s_stubCount[slot];
+  }
+  if (fresh)
+    MCLA_LOG_WARN("STUB-SLOT #{} lr={:08X} r3={:08X} r4={:08X} r5={:08X} "
+                  "(new caller; the slot this call came through is not knowable "
+                  "from this address)",
+                  n, lr, r3, r4, r5);
+  else if (n <= 12)
+    MCLA_LOG_INFO("STUB-SLOT call #{} lr={:08X} r3={:08X}", n, lr, r3);
+  if (slot >= 0 && (n % 4096u) == 0u) {
+    std::string tail;
+    {
+      std::lock_guard<std::mutex> g(s_stubMtx);
+      for (uint32_t i = 0; i < s_stubLrs; ++i)
+        tail += fmt::format("{}{:08X}:{}", (i ? " " : ""), s_stubLr[i],
+                            s_stubCount[i]);
+    }
+    MCLA_LOG_WARN("STUB-SLOT-TALLY #{} lr_capped_at_16 [{}]", n, tail);
+  }
   ctx.r3.u32 = 0;
 }
 
