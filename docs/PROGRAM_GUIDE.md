@@ -135,6 +135,7 @@ The table below still lists 13 entries; `src/` currently carries **80** mitigati
 | label | site | effect on the guest | fires |
 |---|---|---|---|
 | `BE710-SLOT` | `src/gpu_device.cpp:11484` | answers a device Read from the host slot table, `ctx.r3=served/4; return` — `__imp__sub_821BE710` never runs | 49 |
+| `BE710-DEAD` / `BE710-MAGIC` | `src/gpu_device.cpp:12326` / `:12336` | **MITIGATION, load-bearing (F-127).** For a stream whose `[+0]` device is dead, the host writes `0x61786772` (`'axgr'` = the `rgxa` effect magic) straight into the caller's destination word and returns 1. That word is exactly what `sub_8218C760`'s rage-effect gate compares (`lwz r7,80(r1)` / `r8 = 0x61786772`; mismatch ⇒ `'Old version of rage effect found. You need to recompile your shaders!'`, `lr=8218C864`) — so **the frontier passes that gate only because of this write.** Conversion target (F-127 §5): have the `fxl_final/rage_im.fxc` stream deliver the magic at the read position. The gate is reached for the first time with real archive bodies (`w117`/`w124`/`w125`: `lr=8218C864` 0 → 31-33) | 2 |
 | `XSF-POSTOPEN-SERVE` | `:10450` | registers a host-served body and publishes its size into guest memory (`:10470` writes `[tocEntry+4]`) | 31 |
 | `P5-PHYS` | `src/task_dispatch_trace.cpp:606` | "already physical, skip fatal": `ctx.r3=0; return` | 24 |
 | `JOB2-PKG-SERVE` | `src/gpu_device.cpp:6765` | host inflates the job-2 package and returns without running `sub_821D5E10` | 22 |

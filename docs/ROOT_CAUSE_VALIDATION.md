@@ -3077,3 +3077,38 @@ So the cross-serve explanation for T41.7's collapse is **wrong** (row 4 behaves 
 **(3) What `w127` proves about the committed fix.** Only the w3 deletion is in the tree, and every gate marker is unchanged from `w115`: `LISTLINE 167`, `Fatal error 0`, `FATAL-SOFT 0`, `C0000005 0` (`fault-line lr: none`), `PRESENT 34`, `PRESENT-FB 4`, `NATIVE-PRESENT 4`, `GFx 3`, `CP-DRAW 166`, `DISCCHK2 41`, `GETDEV 694`, `TOC76 2,079`, `BE8D8-PACK 5` (no serve lost), `unavailable 166`, `[error] lines 15`, `CP truth drains=8 pub=11 put=11`. Counters that moved are throughput-shaped and I am **not** claiming them either way: `INFLATE 419 → 358`, `JOIN 83 → 34`, `PAGESLOT 27 → 9`, `READWRAP 376 → 276`, `fatal 21 → 19`, `rptrWB/PUT +~870` (the run is 18,108 lines vs 16,491). The consistency argument for keeping the change is that no consumer of the w3 index can be *missed* without a serve marker changing, and none did.
 
 **(4) Still true after all of this:** `DRAW_INDEXED 0` in every run, so B4's gate remains unmet, and B2's gate is still met only through the seam + forced-ack path (F-111/F-112), not through delivered bodies.
+
+### F-127 — **The pending-open "regressions" were an advance: serving real archive `.fxc` bodies takes the boot to a gate it had never reached — the rage-effect magic check — and the current frontier only passes that gate because we write the expected word ourselves.**
+
+- Task:        T41.7d (B4 feed / B3 honesty), read from `build/w117.log`/`w124.log`/`w125.log` (serve on) vs `build/w107.log`/`w113.log`/`w115.log`/`w127.log` (frontier, serve off); no behaviour change committed — the mitigation is now labelled in place
+- Type:        FACT + a dated correction to F-123 and F-126 + a mitigation registration (B3-style)
+- Class:       E (shader/effect serve path) + H (reading a "regression" as such)
+- Code:        `src/gpu_device.cpp:12336` (`BE710-DEAD` → the `0x61786772` write), now carrying a `MITIGATION, load-bearing (F-127)` comment; registered in PROGRAM_GUIDE §7
+
+**(1) The gate, decoded from the generated body (executed-semantics authority, rule 3).** `sub_8218C760` does:
+
+```
+// addi r4,r1,80 / mr r3,r30 / li r5,1
+// bl 0x821be710                 <- read ONE word through the stream
+// lis r9,24952   -> 0x61780000
+// lwz r7,80(r1)  / ori r8,r9,26482 (0x6772) -> r8 = 0x61786772
+// cmpw cr6,r7,r8 / beq cr6,0x8218c878       <- the ONLY way forward
+// else: addi r3, <msg> / bl 0x821bd618 (Fatal), lr=0x8218C864
+```
+
+`0x61786772` is `'axgr'` — the `rgxa` effect-package magic byte-swapped. So this is a **magic/version gate on the `fxl_final/rage_im.fxc` stream**: the first word read from it must be the magic. In `w127`/`w115` the guest opens it as `GETDEV #5 path='embedded:/fxl_final/rage_im.fxc' ret=827D838C vt=82012918` (an `embedded:` device, not the archive one).
+
+**(2) Why the frontier passes it today (the mitigation).** `BE710-DEAD` fires when that stream's object has a dead device (`[obj+0] == 0`), and the handler answers the 1-word read by **writing `0x61786772` into the caller's destination buffer itself** and returning 1 (`src/gpu_device.cpp:12336-12340`, `BE710-MAGIC #68 wrote 61786772` in every soak). The guest's `cmpw` then succeeds and `loc_8218C878` runs. This is load-bearing: without it the boot hits the fatal that F-117-era soaks never reached. It was **not** in §7 (only `BE710-SLOT` was) — it is now, and it is labelled at the site with its conversion target: make the `rage_im` stream deliver the magic word at the read position instead of having the host write it.
+
+**(3) The correction (this is the part that changes the plan).** F-123/F-126 recorded the pending-open serve (`ret==1` opens host-served) as three refuted attempts because `LISTLINE 167→1` and `GETDEV 694→196`. The counts are right, the reading was wrong: in exactly those three soaks (`w117`, `w124`, `w125`) the log reaches a site that appears **nowhere else** —
+
+| soak | `Old version of rage effect` | lines with `lr=8218C864` |
+|---|---|---|
+| `w107` / `w113` / `w115` / `w127` (frontier) | **0** | **0** |
+| `w117` / `w124` / `w125` (serve on) | 2 | 31 / 33 / 33 |
+
+So the serve **advances** the guest past everything the frontier does and stops it at the rage-effect gate; `LISTLINE`/`GETDEV` fall because the walk downstream of that gate never runs, not because list bytes were corrupted. The two explanations I offered for the collapse are both dead: the w3 registry key (F-126 row 4 behaves like row 3 with the key deleted) and allocation overlap (the served bodies occupy `C9BD7C80…CBBF2C62`, a 32 MB run far above the seam's list pages `C6157B80`/`C6167C00` — measured against `w124`, zero overlap).
+
+**(4) Why it still is not the committed frontier.** It converts a silent starvation into `Fatal error 0 → 1` / `FATAL-SOFT 0 → 1`, which breaks B5's third criterion (zero FATAL-SOFT masking), and `DRAW_INDEXED` stays 0 — so it advances the *site* but meets no gate. `w127`'s state (AV-free, fatals 0, no masking) stays committed.
+
+**(5) Next step, named precisely (T41.9).** Make the magic arrive as data rather than as a host write, then re-run the pending-open serve on top: read the word the guest's `embedded:`/`memory:$` `rage_im` stream actually holds at the position `sub_821BE710` reads, and either (a) show that the archive `fxl_final/rage_im.fxc` member carries `rgxa`/`axgr` at its head and fix our read position, or (b) record as a finding that this prototype's compiled shaders genuinely disagree with the embedded effect runtime, in which case the UI shader feed must come from the `embedded:` family and not from `xarchive_cache.rpf`. The discriminator is one census (the word at the read position vs `0x61786772`) plus one `kExpandListInArchive`-style off/on soak, and the pass condition is `lr=8218C864` reaching the frontier with `BE710-MAGIC` disabled.

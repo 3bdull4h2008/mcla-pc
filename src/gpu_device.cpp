@@ -12334,6 +12334,14 @@ PPC_FUNC(sub_821BE710) {
                   "ssize={} r4={:08X}",
                   n, obj, s_lastMemStream, sbuf, ssize, ctx.r4.u32);
     if (sbuf != 0 && ssize >= 4 && ctx.r4.u32 != 0) {
+      // MITIGATION, load-bearing (F-127): the guest's rage-effect gate at
+      // sub_8218C760 reads ONE word through sub_821BE710 and requires it to be
+      // 0x61786772 ('axgr' = the rgxa magic, LE) before loc_8218C878; anything
+      // else is the fatal 'Old version of rage effect found. You need to
+      // recompile your shaders!' (lr=8218C864, reached for the first time in
+      // w117/w124/w125 once real archive .fxc bodies were served). This write
+      // is what lets the current frontier past that gate. Conversion target:
+      // make the rage_im stream itself deliver the magic at the read position.
       mem2.WriteU32BE(ctx.r4.u32, 0x61786772u);
       MCLA_LOG_WARN("BE710-MAGIC #{} wrote 61786772", n);
       ctx.r3.u32 = 1;
