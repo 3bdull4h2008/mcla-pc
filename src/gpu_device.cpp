@@ -300,17 +300,40 @@ static uint32_t MclaPreferredPkgOffForPath(const char *path) {
   return 0;
 }
 
+// F-169: the window cap here was 0x8000, and PackageSizeAt() returns a table size
+// that is also <= 0x8000 for the UI packages, so every RSC5 body was served 32 KB
+// regardless of what its own header declares (F-168). Bound it by the largest
+// package we actually have to carry instead.
+constexpr uint32_t kPkgWindowMax = 0x400000u;  // 4 MB
+
+// F-168: an RSC5 package states its own UNCOMPRESSED length. Layout, verified
+// against xarchive_cache.rpf on three packages (legals.xsf @0xA0000 hdrLen 27 ->
+// 196,553; meshtextures.xtd @0x60000 hdrLen 9 -> 240,531; trash.xrn @0x35A000
+// hdrLen 66 -> 10,799):
+//   +00 0x05435352 "RSC5" | +04 header length | +08 package ID (== the TOC
+//   record's word[3]) | +0C 0x0FF512EF (Xcompress) | +10 uncompressed length
+// Returns 0 when the buffer is not a header we can trust, so callers keep the
+// size they already had.
+static uint32_t MclaRsc5DeclaredSize(const uint8_t *p, uint32_t n) {
+  if (!p || n < 20)
+    return 0;
+  if (MclaBE(p) != 0x05435352u || MclaBE(p + 12) != 0x0FF512EFu)
+    return 0;
+  const uint32_t sz = MclaBE(p + 16);
+  return (sz >= 0x20u && sz <= kPkgWindowMax) ? sz : 0;
+}
+
 static bool MclaLoadPkgWindow(uint32_t fileOff, uint32_t walk, uint32_t want,
                               std::vector<uint8_t> &out) {
   BuildRscPackageTable();
   const uint32_t pkgSz = PackageSizeAt(fileOff);
-  if (walk >= pkgSz + 0x8000u)
+  if (walk >= pkgSz + kPkgWindowMax)
     return false;
   uint32_t n = want ? want : 0x8000u;
-  if (n > 0x8000u)
-    n = 0x8000u;
-  if (walk + n > pkgSz + 0x8000u)
-    n = (pkgSz + 0x8000u > walk) ? (pkgSz + 0x8000u - walk) : 0;
+  if (n > kPkgWindowMax)
+    n = kPkgWindowMax;
+  if (walk + n > pkgSz + kPkgWindowMax)
+    n = (pkgSz + kPkgWindowMax > walk) ? (pkgSz + kPkgWindowMax - walk) : 0;
   if (n < 16)
     return false;
   out.resize(n);
@@ -684,12 +707,29 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
           std::strstr(path, "preload") != nullptr;
       if (wantsPkg && !isList) {
         uint32_t pkgOff = pathPkg ? pathPkg : tocPkg;
-        // Load enough of the plaintext package for several 32KB windows.
+        // F-169: ask the package how big it is before deciding the window. The
+        // table-derived size below was floored at 32 KB and capped at 256 KB, and
+        // MclaLoadPkgWindow clamped every read to 32 KB as well, so a 196 KB UI
+        // package was served as 32 KB (F-165 measured six paths all binding at
+        // exactly 32768; F-168 read the declared lengths out of the archive).
         uint32_t pkgSz = PackageSizeAt(pkgOff);
         if (pkgSz < 0x8000u)
           pkgSz = 0x8000u;
-        if (pkgSz > 0x40000u)
-          pkgSz = 0x40000u; // 256KB cap
+        if (pkgSz > kPkgWindowMax)
+          pkgSz = kPkgWindowMax;
+        {
+          std::vector<uint8_t> head;
+          if (MclaLoadPkgWindow(pkgOff, 0, 64, head)) {
+            const uint32_t declared = MclaRsc5DeclaredSize(
+                head.data(), static_cast<uint32_t>(head.size()));
+            // Replace, do not raise: w174 took max(table, declared) and the table
+            // sizes run to 2.8-4 MB, so the guest was handed neighbouring archive
+            // data after the package and Fatal error went 1->4 with [error]
+            // 28->52. The header's own number is the body's length.
+            if (declared != 0)
+              pkgSz = declared;
+          }
+        }
         std::vector<uint8_t> pkg;
         if (MclaLoadPkgWindow(pkgOff, 0, pkgSz, pkg) && pkg.size() >= 16) {
           const uint32_t pbe = MclaBE(pkg.data());

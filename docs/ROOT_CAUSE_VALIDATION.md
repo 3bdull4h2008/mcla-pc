@@ -4600,3 +4600,51 @@ and `XSF-BIND size=` stops being 32768. Pass condition as before: per-path sizes
 `W32-CONSTRUCT-CENSUS nValidTag > 0` or any `swfCMD` line, with `LISTLINE 171` / `TYPINIT` 4/4 /
 `C0000005 0` unchanged - and per F-164's hazard note, no new log lines and no per-call extra reads to
 measure it.
+
+
+### F-169: the RSC5 window fix is in (UI bodies now served at their declared length), AND the boot's outcome is **bimodal run to run** - `TYPINIT` 3-vs-4 and `Fatal error` 0-vs-1 are not effects of any change, which retro-softens several single-soak comparisons made today
+
+- Task:    B5 (menu) - implement F-168's finding; four soaks of two binaries
+- Type:    FIX + FACT (a measurement hazard)
+- Class:   E + H
+- Priority: P0 for the hazard, P1 for the fix
+- Evidence: `build/w174.log` (raise variant), `build/w175.log`, `build/w176a.log`,
+  `build/w176b.log` vs `build/w171.log`; `src/gpu_device.cpp` `MclaRsc5DeclaredSize`
+  (new, ~`:303`), `MclaLoadPkgWindow`'s `kPkgWindowMax`, the `PKG-SUBST` branch (~`:700`-`:720`)
+
+**The fix.** The substitute branch now reads the package's own header and uses its declared
+uncompressed length as the window: `XSF-BIND size=` per path went from six identical `32768` to
+`trash.xrn 10,799`, `credits/garage/policecam/raceeditor.xsf 196,553`, `meshtextures.xtd 240,531`,
+with every non-container member unchanged (`preload.list 1246`, `fog.dds 3,268,608`). Two variants were
+tested: taking `max(table, declared)` was wrong (the table sizes run to 2.8-4 MB, so the guest got
+neighbouring archive data and `Fatal error 1->4`, `[error] 28->52`); **replacing** with the declared
+length is the correct form and is what is committed.
+
+**The hazard, and it matters more than the fix.** Three soaks of the *fixed* binary and one of the
+pre-fix binary, same 120 s window:
+
+| soak | binary | `TYPINIT` enters/returns | `Fatal error` | `FATAL-SOFT` | `[error]` | `LISTLINE` | `nValidTag`>0 |
+|---|---|---|---|---|---|---|---|
+| `w171` | pre-fix (F-163) | 4 / 4 | 1 | 1 | 28 | 171 | 6 |
+| `w175` | fixed | 3 / 3 | 0 | 0 | 14 | 171 | 10 |
+| `w176a` | fixed | 3 / 3 | 0 | 0 | 14 | 171 | 11 |
+| `w176b` | **fixed** | **4 / 4** | **1** | **1** | **28** | 171 | 10 |
+
+`w176b` is the fixed binary scoring exactly the pre-fix profile, so the boot flips between two
+outcomes on its own: one entity realization either happens or does not, and when it does, the
+`skinningData` fatal fires and the soft-mask tier counts 1. Consequences, stated plainly:
+- **Do not read `TYPINIT`, `Fatal error`, `FATAL-SOFT` or `[error]` from a single soak as an effect.**
+  Two soaks minimum, and prefer markers that cannot move: `C0000005`, `SEEK-DEAD`, `LISTLINE`,
+  `XSF-BIND size=`, `GETDEV`, `CP-DRAW`, `PRESENT`, `DRAW_INDEXED`.
+- This **softens F-163's table**: `C0000005 1->0`, `SEEK-DEAD 1->0` and `TYPINIT-RET 0->4` held in
+  every post-fix soak (3 of 3, with `w176b` at 4), so the fix itself stands; but its
+  `DICTLOOKUP 14->23` and `[error] 42->28` deltas are now unproven - they may be the other mode.
+  It also means F-168's "the UI is 6x short" was real but is not yet shown to *buy* anything:
+  `swfCMD` is still 0 in all four soaks.
+- The 6-vs-10 `nValidTag` difference is likewise inside the noise band; my earlier reading of
+  `nValidTag=0` came from looking only at the first census lines.
+
+**Kept:** the size fix (it is correct by construction and degrades nothing), with the bimodality
+recorded so the next session does not spend a cycle re-deriving it. B4's `DRAW_INDEXED` and B5's
+guest-drawn `PRESENT-FB` are still unmet; the UI now has its real bytes, so the next question is what
+the guest does with a full-length `.xsf`.
