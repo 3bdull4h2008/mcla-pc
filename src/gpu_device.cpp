@@ -492,6 +492,52 @@ static bool MclaListMemberPath(const char *path) {
   return n >= 5 && std::strcmp(path + n - 5, ".list") == 0;
 }
 
+// T41.3v (F-110 fix attempt): F-110 showed the lazy registration at the first
+// TOC *query* is too late — a member page pumped before that keeps its DEFLATE
+// bytes in the guest's page cache, which is why only `city` (whose page happened
+// to be read after its mark) ever produced preload lines. The archive reads
+// start ~59 s before the first list query (`w95`: first pump read 03:53:54.409,
+// first mark 03:54:53.082), so the spans must be known at the first I/O submit.
+//
+// These twelve numbers are not host guesses: each is a `[entry+4]/[entry+8]`
+// pair the guest published from its OWN decrypted TOC (`w74`/`w95`
+// TOC76-XSF/LAYOUT lines: e.g. `[0DB1C876 00000104 001DD11C 4000007E]`), and
+// every one was re-derived independently by the raw-DEFLATE decode of F-105
+// (all six expand to name lists of exactly this length). The general key is the
+// leaf hash — all five `preload.list` records share `0DB1C876`, and
+// `globaltex.list` is `3D9B8154` — so a TOC scan could replace this table once
+// the decrypted table is reachable before the first read.
+struct MclaListMemberSpan {
+  const char *path;
+  uint32_t off;
+  uint32_t size;
+};
+constexpr MclaListMemberSpan kListMemberSpans[] = {
+    {"shaders/ui/preload.list", 0x001DD11Cu, 260u},
+    {"shaders/city/preload.list", 0x001F41FBu, 1246u},
+    {"shaders/cars/preload.list", 0x0027F1AFu, 1108u},
+    {"shaders/characters/preload.list", 0x002DB9A1u, 496u},
+    {"shaders/effects/preload.list", 0x00304E12u, 368u},
+    {"textures/global/cars/globaltex.list", 0x000D0000u, 575u},
+};
+
+// ON IS THE COMMITTED DEFAULT since F-111: it is what clears B2's gate
+// ('wasn't preloaded properly' 2 -> 0; star_glow's .dcl opens ret=1) and it costs
+// the C0000005 0 invariant — 50 AVs at the wrapper site (F-108/F-111), which are
+// logged, not masked. Set false to return to the w96/w81/w72 frontier exactly
+// (censuses then print nothing on this path).
+constexpr bool kExpandListInArchive = true;
+
+void MclaMarkKnownListMembers() {
+  if (!kExpandListInArchive)
+    return;
+  for (const auto &m : kListMemberSpans) {
+    mcla::vfs::MarkMemberExpanded(m.off, m.size);
+    MCLA_LOG_WARN("MEMBER-EXPAND-MARK-EARLY path='{}' off={:08X} stored={}",
+                  m.path, m.off, m.size);
+  }
+}
+
 static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
   outSize = 0;
   // T41.3g (F-077) refusal RETIRED by T41.3p/F-105: list paths were blocked
@@ -10153,6 +10199,11 @@ PPC_FUNC(sub_8244F4C0) {
   // caveat, PROGRAM_GUIDE s8 -- a census that reads them after prints nothing).
   const uint32_t bufG = ctx.r4.u32, cntG = ctx.r5.u32, r6G = ctx.r6.u32,
                  r7G = ctx.r7.u32;
+  // T41.3v (F-110): this is the first archive I/O the guest issues, so the list
+  // spans must be known here — registering them later leaves already-pumped
+  // pages holding DEFLATE bytes (see the table above).
+  if (n == 1)
+    MclaMarkKnownListMembers();
   __imp__sub_8244F4C0(ctx, base);
   if (ctx.r4.u32 != 0 && ctx.r4.u32 != 0xCDCDCDCDu) {
     const uint32_t idx = g_doneBufIdx.fetch_add(1) % kDoneBufCap;
@@ -10946,7 +10997,6 @@ PPC_FUNC(sub_821CBFC0) {
     // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
     // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
     // is the open question, not the transform. See F-105.
-    constexpr bool kExpandListInArchive = false;   // ON => w80..w95 branch, see F-110
     if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
         w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
       mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);
