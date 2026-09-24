@@ -12371,15 +12371,28 @@ PPC_FUNC(sub_821BE0C8) {
   if (ParseMemoryDollar(pth, &mb, &ms) && mb != 0) {
     const uint32_t st = MakeMemoryStream(kMemDeviceObj, mb, ms);
     MCLA_LOG_WARN("BE0C8-RET stream={:08X} buf={:08X} size={}", st, mb, ms);
-    // F-153/F-154: returning a guest-native OBJECT here (dev=kMemDeviceObj,
-    // +4=slot index, +8=buf, +28/+32=size) was built and soaked (w164). It did
-    // remove the fault - C0000005 1->0, SEEK-DEAD 1->0, BE0C8-OBJ 167 lines,
-    // Fatal/FATAL-SOFT still 0 - and it also LOST ground: LISTLINE 171->167 and
-    // TYPINIT/REALIZE-CAST 1->0, i.e. the four embedded effects F-135 recovers
-    // stopped loading, because a live [obj+0] sends the guest's own device
-    // methods at the memory device's OWN handle table (0x82861740+handle*16,
-    // from sub_821CB2A0's `lis -32122 / addi 1856`), which host-served bodies
-    // never populate. Reverted, not tuned (F-151's stated condition).
+    // F-155 MEASURED AND REJECTED: returning a guest-native stream OBJECT here
+    // (dev=kMemDeviceObj 0x827D838C, +4=slot index, +8=buf, +28/+32=size) does
+    // remove the fault the way F-150/F-151 predicted - C0000005 1->0, SEEK-DEAD
+    // 1->0, Fatal/FATAL-SOFT still 0 - and it also loses ground, identically in
+    // three independent builds: LISTLINE 171->167 (the four embedded:/rage_* and
+    // rmptfx_collision entries F-135 recovers are the last four and stop
+    // appearing), TYPINIT 1->0, FACTORY 1->0, DICTLOOKUP 14->2, PATHMGR-OPEN
+    // 61->60. w164 = object + writes at 0x82861740 on F-154's "second handle
+    // table" theory; F-155 then measured that theory FALSE (no instruction pair
+    // in mcla_pe.bin forms 0x82861740 at all - the only handle-table base in the
+    // image is 0x82860740, addis at 0x821CAF50), so w165 re-ran the object with
+    // those writes gone and w166 with the guest-heap footprint cut from 167
+    // allocations to one pooled block. All three score the same loss, so neither
+    // the writes nor the heap churn was the confound: the INDEX is what this
+    // branch's consumers need, and the object shape is not the fix.
+    // F-155 also corrects F-150/F-151's account of the fault. ppc_recomp.10.cpp
+    // :10912-10993 shows sub_82191040 doing `mr r31,r3` after the
+    // sub_821BE8D8 call - NOT after the open - and then using r31 as a stream
+    // object at four sites (sub_821BE4F0 kind byte, sub_821CF7B8 reader-ctor arg
+    // r5, sub_821BE610, sub_821BE568 Seek). So the object that is missing is
+    // sub_821BE8D8's return value (w161 BE8D8-HOST prints it as stream=00000001,
+    // alongside a dst=CBE40280 buffer it filled), not this function's.
     ctx.r3.u32 = st;
     return;
   }

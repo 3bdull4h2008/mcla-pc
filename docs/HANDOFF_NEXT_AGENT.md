@@ -1,3 +1,30 @@
+## 2026-09-24 ~14:10 - **F-157: the stream-object re-open question is CLOSED as measured-negative (three builds), and F-154's `0x82861740` "second handle table" is withdrawn as a phantom. Frontier unchanged: `w161` = `LISTLINE 171`, `Fatal 0`, `FATAL-SOFT 0`, `TYPINIT 1`, `C0000005 1` (VEH-masked), `DRAW_INDEXED 0`**
+
+- **What ran.** `docs/f154_staged_be0c8_object.patch` was NOT applied as written - its second-table
+  writes are aimed at `0x82861740`, and a full-image `addis`+`addi` census of
+  `build/cache/mcla_pe.bin` shows the guest forms no such constant (the only handle-table base is
+  `0x82860740`, addis at `0x821CAF50`). Re-ran the object return twice without those writes:
+  `w165` (fresh `Alloc` per open) and `w166` (one pooled `Alloc(8*64,16)`). Both reproduce `w164`
+  exactly - `C0000005 0` and `SEEK-DEAD 0`, but `LISTLINE 171->167`, `TYPINIT 1->0`, `FACTORY 1->0`,
+  `DICTLOOKUP 14->2`. Same four `embedded:/rage_*` + `rmptfx_collision` tokens lost every time.
+- **Verdict.** The object shape itself costs the ground; neither the phantom writes nor guest-heap
+  churn was the confound. Reverted (F-151's own condition); `src/gpu_device.cpp` is now
+  code-identical to HEAD (comment-only diff), so `w161` remains the frontier baseline.
+- **Corrected attribution (use this, not F-151's).** `sub_82191040` binds `r31` to **`sub_821BE8D8`**'s
+  return (`generated/ppc_xenon/ppc_recomp.10.cpp:10912-10993`) and then uses `r31` as a stream object
+  at four sites. The missing object is therefore *our host `BE8D8` return*
+  (`src/gpu_device.cpp:12160`, printed as `stream=00000001`), one layer below where F-152..F-154 were
+  editing. `sub_821BE0C8`'s index return is what its own consumers need.
+- **Do not** re-try an object return at `sub_821BE0C8`, and do not treat the single VEH-masked
+  `C0000005` as B4's blocker - `TYPINIT`/`REALIZE-CAST end=0x1E5`/`LISTLINE 171` all still happen
+  with it present. If it is revisited it belongs at `sub_821BE8D8`'s return, and that requires
+  removing the index/object duality in `MakeMemoryStream` rather than routing around it.
+- **B4 state unchanged and still the next thing:** `DRAW_INDEXED 0` in all four builds; F-139/F-140
+  measured every captured CP packet `set_const=0 load_alu=0 draw_indx=0`. Peer's F-155/F-156
+  (texture decode path) is the other live thread on this frontier.
+
+- **UPDATE 13:45 (supersedes the two bullets below on this question):** `SEEK-DEAD` ran and caught it (F-150..F-154). The `skinningData` fatal stays gone (`w160`/`w161`/`w163`: `Fatal error 0`, `FATAL-SOFT 0`), and the remaining `C0000005 1` is the guest's own `Seek`/`Read` on a value our `sub_821BE0C8` returns as a slot INDEX. `w164` measured a full fix attempt: it clears the AV but costs `LISTLINE 171->167`, so it was reverted. **Next action: `git apply docs/f154_staged_be0c8_object.patch`, build, verify `BUILD_RC`+exe mtime, soak `w165`** - it also feeds the memory device's own handle table at `0x82861740`, which is why the first attempt lost `LISTLINE`.
+
 ## 2026-09-24 ~13:00 - **F-143..F-150: the `skinningData` fatal is FIXED (commit `a654d1f`, pushed) and `w160` is the new frontier: `Fatal error 0`, `FATAL-SOFT 0` for the first time since `w138`. New blocker = the guest's own `Seek` on a stream whose device pointer is 0 (`C0000005 1`).** (Supersedes the 10:35 block, whose "content wall" premise is withdrawn.)
 
 - **What the fatal actually was.** `Required grmShaderGroupVar 'skinningData' not found.` is raised by `sub_82193AF8(group=0, "skinningData", required=1)`. `group` is **`[object+8]`** of the type object `sub_82379C68` allocates, and `sub_82611298` stores 0 there *by construction*; the only writer is `sub_826113A8`, whose first act is a resource lookup `sub_821CA6A8(0x827D7770, "entity.type", "type", 0, 1)`. That "type" argument is a **file class**, not an entity type: `0x827D7770` is the resource path manager (it is fed `$/resources/ui`, `globaltex`, `$/tune/shaders/lib` by `sub_821CA540`), it composes `a:/archive/vehicle/shared_utility/sst_trail/entity.type` and calls `sub_821BDF20` to open it.

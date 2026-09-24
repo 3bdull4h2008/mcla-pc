@@ -3971,3 +3971,156 @@ device does own. (a) is a 5-line extension of `GuestSlotTableInsert`'s call site
 to try; it is also the first time F-132's "the guest treats an open handle as a slot index"
 finding has to be applied to the *second* table, which is likely why F-134 saw `GetSize` answer
 -1 for these handles at all.
+
+**Addendum (13:45, written docs-only because a peer session is mid-experiment right now - their
+`texture_import_validator` target in `CMakeLists.txt` plus `build/texval_run.log` at 13:44).** The
+F-154 next step was implemented and then **parked uncommitted** to keep the shared tree at the
+known-compiling HEAD while they build: the patch is
+`docs/f154_staged_be0c8_object.patch` (57 lines, one hunk in `src/gpu_device.cpp`, the
+`sub_821BE0C8` `memory:$` branch). It writes `{buf,size,pos=0,flag=0}` at
+`0x82861740 + handle*16` and returns the guest-native object, and it carries the pass condition in
+its own comment. Apply it with `git apply docs/f154_staged_be0c8_object.patch`, build with
+`build_on_e.bat build`, **check `BUILD_RC` and the exe mtime before reading the soak** (F-154's
+slip), and soak as `w165`.
+
+### F-155: `CreateDecodedTexture` had **zero producers** in the whole tree, and the decoded 2D texture binds at **t1**, not the `t0` its own log line and header comment claim
+
+- Task:        external asset-import slice (not on the T41.x boot queue); `build/texval_run.log`, `build/texval_star.log`, `build/texval_dxt5.log`
+- Type:        FACT
+- Class:       F
+- Priority:    P2
+- Evidence:    `src/d3d12_backend.h:105` ("creates a shader-visible SRV at t0"), `src/d3d12_backend.cpp:834` (log string `"+ SRV t0"`), against `src/d3d12_backend.h:354` (`kTexture2DSlot = 1`), `src/d3d12_backend.cpp:825` (`srvHandle.ptr += kTexture2DSlot * m_srvDescriptorSize`), `src/renderer/shader_translator.cpp:478` (`Texture2D t2D : register(t1);`). Producer census: `grep -rn "CreateDecodedTexture(" src/ tools/` -> decl `d3d12_backend.h:108`, def `d3d12_backend.cpp:695`, and until today **nothing else**; the only call site in the tree is now `tools/validators/texture_import_validator.cpp:379`.
+
+**The consumer half of the Phase 4 texture path was built and never fed.** `BindDecodedTexture()` has
+always been wired into the draw (`src/d3d12_backend.cpp:1472`), but no code ever called
+`CreateDecodedTexture`, so the SRV table only ever held the null descriptors prefilled at
+`:419`-ff. `backend_validator.cpp:546` replicates the resource/barrier/descriptor sequence by hand and
+says so in its own comment - "*minus an actual sampling shader (none can be compiled headlessly)*" - so
+the sampling half has never been exercised by anything until now.
+
+**The slot is t1.** The new validator's PS declares `Texture2D t2D : register(t1)`
+(`tools/validators/shaders/texture_quad_ps.hlsl`) and the GPU readback comes back byte-exact, which is
+the empirical form of the same fact the constants give. The `"+ SRV t0"` log string at `:834` and the
+header comment at `:105` are therefore wrong text, not wrong behaviour: `BindDecodedTexture` passes the
+**heap base** as the descriptor-table start, and the table's range begins at t0, so an offset-1 CPU
+descriptor is correctly reached by a shader reading t1. Fix the text, not the code.
+
+**Measured, not asserted.** `build/texval_run.log` -> `== 8 passed, 0 failed ==`; with a real asset
+`build/texval_star.log` -> `== 10 passed, 0 failed ==`, `asset sampled == asset decoded (byte-exact
+import round trip) (65536/65536 texels exact)`. Three controls keep that from being vacuous: a baseline
+case with nothing imported returns **1 unique colour / 0 non-black** (so the compare can fail), the
+offscreen clear colour `(0,255,0)` appears in no chart, and a second chart differing from the first
+everywhere round-trips at `262144/262144` too, so a stale texture cannot pass either case.
+
+**Two build facts worth keeping.** (1) A `CopyTextureRegion` *destination* cannot sit on a
+`D3D12_HEAP_TYPE_UPLOAD` buffer - the debug layer says so verbatim (`build/texval_run.log`, first run:
+"The destination resource cannot be on a D3D12_HEAP_TYPE_UPLOAD heap"), which is why the validator
+allocates its readback on `HEAP_TYPE_READBACK`; the backend's own UPLOAD staging at `:757`-ff is legal
+because it is a copy *source*. (2) A full-viewport clip-space quad maps screen pixel centre `p` to
+`uv = (p+1)/W`, i.e. onto a **texel boundary**, so the backend's `MIN_MAG_MIP_LINEAR` static sampler
+(`:879`) blends two texels 50/50; the VS subtracts `0.5/texelsize` (derived via `GetDimensions`, so it
+holds for any asset size) and only then is linear sampling exact.
+
+**This proves nothing about boot.** The target is outside `mcla.exe`, opens its own window, and cannot
+touch a `CP-DRAW`/`DRAW_INDEXED` counter. Do not cite it as frontier movement.
+
+### F-156: real retail `.dds` textures are reachable **offline** at the offsets the guest publishes in `TOC76-XSF`, and the `01B`/`009` low bytes of those offsets are an **`RSC5` container header length**, not flag bits
+
+- Task:        asset supply for the host texture path (feeds F-155's validator); `tools/extract_rpf_member.py`
+- Type:        FACT
+- Class:       E
+- Priority:    P1
+- Evidence:    `python tools/extract_rpf_member.py build/w160.log .dds` -> **24 members written to `build/assets/`**, each inflated to *exactly* its TOC-declared length. Positive controls first, per the F-149 hazard: `globaltex.list` @`0x000D0000` -> 575 B `"__noise 2dnoise3
+"`, `entity.type` @`0x0035CA43` -> 480 B `"Version: 103
+shadinggroup {"`, `shaders/ui/preload.list` @`0x001DD11C` -> 260 B `"AlphaModulate.fx
+"` - all three match the spans registered in `src/gpu_device.cpp:515`-ff and `:558`-ff. Offset decode: `python tools/rpf_offline.py find meshtextures.xtd build/toc_parsed.bin` -> `0597F7BB 0003ABA7 00060009 DC2C0810`, and the archive at `0x60000` reads `05 43 53 52 | 00 00 00 09` = `RSC5` + BE header length 9, so the data really does start at `0x60009`; `legals.xsf` @`0x000A0000` reads `RSC5` + `0x1B`, matching its published `0x000A001B`.
+
+**The texture supply question is answered without a soak.** 24 `.dds` members - including
+`textures/effects/star_glow.dds`, which the preload chain has been chasing since F-063 - sit in
+`xarchive_cache.rpf` as headerless raw DEFLATE, the same family F-105 established for the `.list`
+members and F-149 for `entity.type`. Of the 368 distinct paths the guest publishes in `TOC76-XSF`
+lines, **356 inflate**; the 12 that do not are 5 `.xsf`, 1 `.xtd` and 6 `.dcl`.
+
+**Format, reconciled not assumed.** The readable ones are plain little-endian DDS holding **DXT1 and
+DXT5 with a full linear mip chain** - `star_glow.dds` is `128 + 32768 + 8192 + 2048 + 512 + 128 + 32 +
+8 + 8 + 8 == 43832`, exactly the TOC `size` word - so *these* members need no untile, and
+`texture_decode`'s tiled path stays covered separately by `backend_validator.cpp` section 8. Because
+`CreateDecodedTexture` accepts only scalar formats ("1 block/texel so the row-pitch copy is exact",
+`src/d3d12_backend.cpp:692`-ff), the BC1/BC3 expansion happens host-side in the validator before the
+import. Both a DXT1 and a DXT5 asset round-trip byte-exact (`build/texval_star.log` 65536/65536,
+`build/texval_dxt5.log` 262144/262144).
+
+**Withdraw the `01B` reading.** An earlier pass treated the low bytes of `0x64CB001B` / `0x000A001B`
+as flag bits and looked for the member at `off & ~0xFFF`. That was wrong: they are the `RSC5` header
+length, and the published offset is already the absolute data offset. Records whose *fourth* word
+carries bit31 remain what F-149 called them - unresolved encoding, not a negative result.
+
+**Still open, stated as open:** `meshtextures.xtd` (the UI texture dictionary the guest actually opens,
+`build/w160.log` `a:/archive/resources/ui/meshtextures.xtd`) is reachable at the right offset behind a
+9-byte `RSC5` header but its payload does **not** raw-inflate, and no XRN/XTD container parser exists
+in `src/` or `tools/` (`grep -rn "xrtr|XNHD|XPRM" src/ tools/` -> one comment at
+`src/gpu_device.cpp:543`). So the `.dds` route above is a real-asset route, not yet the route the
+guest itself uses for UI textures.
+
+
+### F-157: the object-shaped return of `sub_821BE0C8` is a measured loss in **three independent builds**, and F-154's "memory device owns a second handle table at `0x82861740`" mechanism is withdrawn - no instruction in the guest image forms that address
+
+- Task:    T41.5 (stream-contract line) / builds `w165`, `w166` against baseline `w161`
+- Type:    FACT (refutation of F-154's mechanism) + measurement
+- Class:   E (filesystem/device) with H (instrumentation) residue
+- Priority: P1 - it closes the re-open-shape question that F-151..F-154 spent four waves on
+- Evidence: `generated/ppc_xenon/ppc_recomp.10.cpp:10912-10993`; raw addis+addi census of
+  `build/cache/mcla_pe.bin` (method below); `src/gpu_device.cpp:12372` (the reverted branch),
+  `:12129-12160` (our `sub_821BE8D8` host return); `build/w161.log:15128-15141`, `:15733`, `:15761`
+
+**The refutation.** F-154 explained w164's loss by claiming the guest's memory device keeps its own
+16-byte handle table at `0x82861740`, and that w164's object return sent the guest's device methods
+there where host-served bodies had never written. That address does not exist in the guest. Re-run
+method: scan every word of `build/cache/mcla_pe.bin` for `addis rT,0,0x8286` and fold any `addi` /
+`ori` / `addic` on the same register within the next four words. The `0x8286xxxx` constants the image
+actually forms are `82860280, 828606F4, 82860700, 82860714, 82860740, 82860844, 82860850, 82860864,
+82860880, 82860890, 828608A0, 828608C0..82860A60, 82860AD4, 82860B00, 82860C04, 82860C18, 82860DF8,
+82868460, 8286FEA8` - the only handle-table base is **`0x82860740`**, addis at `0x821CAF50` + addi at
+`0x821CAF58`, i.e. the table `GuestSlotTableInsert` already writes. There is no second table, so
+F-154's "host-served bodies never populate it" is false and its `0x82861740` writes went into
+unowned `.data`.
+
+**The measurement, with that confound removed.** Two further builds isolate the return shape alone:
+
+| marker | `w161` (index, committed) | `w164` (object + phantom writes) | `w165` (object, no writes) | `w166` (object, one pooled alloc) |
+|---|---|---|---|---|
+| `C0000005` | 1 | 0 | 0 | 0 |
+| `SEEK-DEAD` | 1 | 0 | 0 | 0 |
+| `LISTLINE` | **171** | 167 | 167 | 167 |
+| `TYPINIT` | **1** | 0 | 0 | 0 |
+| `FACTORY` | **1** | 0 | 0 | 0 |
+| `DICTLOOKUP` | **14** | 2 | 2 | 2 |
+| `DICTFACT` | 48 | 40 | 40 | 40 |
+| `GETDEV` / `CP-DRAW` / `PRESENT` / `RD-SUBMIT` | 694/166/34/24 | same | same | same |
+| `Fatal error` / `FATAL-SOFT` | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+`w165` and `w166` are byte-for-byte the same verdict (the four lost `LISTLINE` tokens are always
+`embedded:/rage_shadowdepth`, `rage_blendshadows`, `rage_shadowcollector`, `rmptfx_collision` - the
+last four of the sequence and exactly the set F-135 recovers), so the loss is not the phantom writes
+and not the guest-heap footprint (167 `mem.Alloc(64,16)` calls in `w165` vs one `Alloc(8*64,16)` pool
+in `w166`). The object shape itself costs the ground. Reverted per F-151's own stated condition; the
+tree is back to code-identical-to-HEAD (`git diff` after the revert carries comment lines only).
+
+**Where the fault actually comes from (corrects F-151, extends F-152).** `sub_82191040` does
+`bl 0x821be8d8` / `ctx.lr = 0x82191070` then `mr r31,r3` - `r31` is **`sub_821BE8D8`'s return**, not
+the open's - and then uses `r31` as a stream object at four sites: `sub_821BE4F0` (kind byte,
+`mr r3,r31`), `sub_821CF7B8` (text-reader ctor, `mr r5,r31`), `sub_821BE610` (`mr r3,r31`) and
+`sub_821BE568` (`mr r3,r31; ctx.lr = 0x82191100`, the `cmpwi cr6,r3,13 / beq` skip-guard). So the
+`lwz r11,0(r3)` on `1` faults because *our host `sub_821BE8D8` returns the slot index as its own
+return value* (`src/gpu_device.cpp:12160` `ctx.r3.u32 = st`, printed by `BE8D8-HOST` as
+`stream=00000001`), and `w161:15141` `SEEK-DEAD obj=00000001 lr=82191100` is that call. Changing
+`sub_821BE0C8`'s branch was one layer too far upstream: the value `sub_821BE0C8` returns is the one
+the *serving* side needs as an index, which is why every object variant of it loses ground.
+
+**Consequence for the plan.** The single VEH-masked `C0000005` at `lr=821BE5F4` is not on the
+critical path: with the index return the boot still reaches `TYPINIT` (`w161:15128`,
+`name='entity'`), `REALIZE-CAST` with `end=0x1E5` (the F-149 inflated `entity.type` body) and
+`LISTLINE 171`. Do not re-open the "return an object from BE0C8" idea, and do not treat the AV as
+B4's blocker - B4's gate is still `DRAW_INDEXED 0` at all four builds. If the fault is revisited it
+must be at `sub_821BE8D8`'s return, and it then has to satisfy both consumers, which means the
+index/object duality in `MakeMemoryStream` has to go, not be routed around.
