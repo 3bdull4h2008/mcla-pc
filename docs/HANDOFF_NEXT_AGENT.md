@@ -1,3 +1,28 @@
+## 2026-09-24 ~14:40 - **F-160 (commits `1f1f653`, pushed): the slot-release mechanism is found, decoded and now used - and the frontier is unchanged, which is the honest part**
+
+- `sub_821CB2A0` decoded from raw words: rejects `h<0 || h>=16` (**the 16-entry bound is the guest's
+  own**, not our constant), indexes `0x82860740+h*16`, rejects an empty entry, frees `[entry+0]` only
+  when the flag byte at `+12` is non-zero, then `stw r11,0(r31)` - the only store in the image that
+  releases a table entry. It is a **Close**, so F-135/F-153's "device Seek at vtable+44" is wrong.
+- `w167` installed a read-only census on it **first** (rule 1): `SLOT-CLOSE 0` with every frontier
+  marker identical to `w161` (`LISTLINE 171`, `TYPINIT 1`, `C0000005 1`, `GETDEV 694`, `BE0C8 358`,
+  `CP-DRAW 166`, `SLOT-REG 24`, `SLOT-RECYCLE 30`, `SLOT-RECYCLE-SHARED 24`, `[error] 42`). Nothing
+  called it - our `BE8D8` host path was *emulating* the clear by hand.
+- `w168` replaces that hand-written clear with a call through the guest's routine (r1 moved down 256
+  bytes first because it saves LR at `-8(r1)` before its own `stwu`; flag byte left 0 so it must not
+  free our buffer). Positive control fired: `BE8D8-CLOSE #1 h=1 slot=82860750 entry0_after=00000000`,
+  `SLOT-CLOSE` 6× (`lr=8218C804`). Frontier still identical to `w161`.
+- **What it does NOT do:** retire F-135/F-135b. 6 releases vs 173 bodies served, and
+  `SLOT-RECYCLE 30` / `SLOT-RECYCLE-SHARED 24` are unchanged. Extending it means releasing on the
+  `sub_821BE250`/`SlotTableServeRead` and `PACK` paths too, which needs a consumed-the-body signal
+  (`pos` reaching `size` is not tracked for most bodies - that is exactly why F-135b's `pos>=size`
+  test recycled only 1 of 15).
+- **Committed state:** HEAD `1f1f653`, tree builds clean, `w168` = frontier. Census now tracks 136
+  markers (`SLOT-CLOSE`, `BE8D8-CLOSE` added). Ledger runs to F-160.
+- **Open plan question this session raised and did NOT resolve unilaterally:** F-159 refuted B4's
+  premise (no geometry is submitted at this frontier, so the constant-capture step has no input). B4's
+  gate is still the target but its means must change. See the F-159 entry; the user has not yet
+  re-approved a pivot.
 ## 2026-09-24 ~14:25 - **F-158/F-159: B4's premise is EMPTY (measured three ways) - the guest has submitted no geometry, so the constant-capture step has nothing to capture. The blocker is now "why does the boot stop submitting", and it is measured, not assumed**
 
 - **The three measurements (F-159, all re-verified from the log/source, not from a subagent
