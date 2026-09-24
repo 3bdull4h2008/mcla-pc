@@ -274,6 +274,9 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 | `DRAWDISP` / `SETSTREAMS` / `DRAWWRAP` / `SUBMIT` / `LOADGATE` / `DRAW-SEAM` | draw-path censuses |
 | `FRAME-END` / `NATIVE-PRESENT` / `VSYNC-ISR` / `SWAP-COMP` / `SWAP-STATUS` / `SWAP-FILL` | present-path counters + swap-table handshake |
 | `GATE-PROBE` / `DICTSLOT-ALLOC` | IO-credit gate probe (`0x827D74E0`) / slot allocator |
+| `SHGRP-VARS` | the shader-group variable binder `sub_82193AF8(group,name,required)` (`src/gpu_device.cpp:12395`-ff): group, its vtable/array/`lhz [group+12]` count, the wanted name as ASCII and the first two entries' names. Raised the `Required grmShaderGroupVar 'skinningData' not found.` fatal that is the frontier in w147-w154 (F-142…F-144). Read-only, cap 80 |
+| `TYPINIT` / `TYPINIT-RET` | `sub_826113A8` entry+return (`src/gpu_device.cpp:12476`-ff) — the only writer of the `[object+8]` group. Prints the object, its vtable, `+8`/`+12`, the requested parent name, `[0x827D7770+3072]`/`[+3076]` and `[0x8288E054]`. w152: 4 calls ('entity' x3, 'entity.type' x1), every one returning 0 with `+8` left at the ctor's zero and the scan bound at 1 (F-144) |
+| `PATHMGR-OPEN` | the resource **path** manager's own open attempts: `sub_821BDF20` calls whose return address is `0x821CA708`, i.e. inside `sub_821CA6A8`'s per-mount candidate loop (`src/gpu_device.cpp:12040`-ff, inside the existing BDF20 census). Prints the composed `a:/archive/...` path, flags, the guest's return and `lr`. First 60 plus any path containing `entity` or `.type`. **`ret` is a pointer-or-null, not an errno**: `0` and `0x82864048`/`0x82864068` (static wrappers) both occur, so read a `.dcl` pair (long form fails, short form succeeds) before calling one of them "the failure" |
 | `VECTORED exception code=0x406D1388` | benign Windows SetThreadName exception from host code — not guest |
 
 ## 10. RE tooling

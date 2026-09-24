@@ -12018,6 +12018,28 @@ PPC_FUNC(sub_821BDF20) {
   }
   __imp__sub_821BDF20(ctx, base);
   const int32_t ret = static_cast<int32_t>(ctx.r3.s32);
+  // F-144: 0x827D7770 is not a type registry, it is the resource *path* manager
+  // (w152's MSGBISECT "3-821CA540 name-insert" shows it being fed
+  // '$/resources/ui', '$/resources/ui/', '$/textures/global/cars', 'globaltex',
+  // '$/tune/shaders/lib', 'ui'), and sub_821CA6A8(mgr, name, typeName, 0,
+  // required) opens one composed candidate path per mount from its scan loop -
+  // a `bl` whose return address is 0x821CA708 (ppc_recomp.16.cpp:14210-ff:
+  // sub_821CA2F8 composes into sp+80, then sub_821BDF20). w152's TYPINIT showed
+  // 'entity' (x3) and 'entity.type' all failing with that loop's bound
+  // [0x827D7770+3076] == 1, and none of those opens passed this census's
+  // filter, so print them on their own marker: the composed path plus the
+  // guest's own open result is what says whether this is a missing mount, a
+  // missing archive member, or a path that is composed wrong.
+  static std::atomic<uint32_t> s_hPathMgrOpen{0};
+  if (lr == 0x821CA708u) {
+    const uint32_t m = s_hPathMgrOpen.fetch_add(1) + 1;
+    // w153: the first 60 candidates are globaltex/.list, 19 .dds and the ui
+    // shader dcls - the cap expired ~16 s before the entity.type lookup, so
+    // print any candidate that could BE the failing one regardless of count.
+    if (m <= 60 || std::strstr(path, "entity") || std::strstr(path, ".type"))
+      MCLA_LOG_WARN("PATHMGR-OPEN #{} path='{}' flags={:x} ret={:d} lr={:08X}",
+                    m, path, flags, ret, lr);
+  }
   if (n <= 40 || (n % 200) == 0 || std::strstr(path, "star_glow") ||
       std::strstr(path, "embedded:") || PathLooksLikeUiBody(path))
     MCLA_LOG_WARN("BDF20 #{} path='{}' flags={:x} ret={:d} lr={:08X}", n,
@@ -12355,6 +12377,171 @@ PPC_FUNC(sub_821D3070) {
     MCLA_LOG_WARN("D3070-RUN #{} obj={:08X} +8={:08X} r4={:08X} lr={:08X}",
                   n, obj, field8, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_821D3070(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// F-142 CENSUS ONLY (read-only; rule 4 checked first: addr_owners --check
+// 0x82193AF8 reported only ppc_func_mapping.cpp:2764, no owner).
+// sub_82193AF8(group=r3, name=r4, required=r5) is the guest's shader-group
+// variable binding (F-136): it walks lhz [group+12] entries of the array at
+// [group+8], resolving each entry's +20 word against `name`, and raises
+// "Required grmShaderGroupVar '%s' not found." when the flag is set and nothing
+// matched. That leaves two very different worlds and the plan branches on them:
+// the group HAS variables but none named skinningData (content, F-136's raw
+// measurement) versus the group has NO variables (our serve/parse). Print the
+// count and the names the guest actually sees.
+PPC_FUNC_IMPL(__imp__sub_82193AF8);
+static std::atomic<uint32_t> s_h93AF8{0};
+PPC_FUNC(sub_82193AF8) {
+  const uint32_t n = s_h93AF8.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t group = ctx.r3.u32;
+  const uint32_t nameA = ctx.r4.u32;
+  const uint32_t req = ctx.r5.u32 & 0xFFu;
+  const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
+  // w150 printed ZERO of these while the fatal *inside* this function printed
+  // twice, and the only filter was `group != 0` - so a null/poison group is
+  // itself the leading candidate. Log unconditionally, including r3 == 0.
+  if (n <= 80) {
+    uint32_t vt = 0, arr = 0, cntW = 0;
+    (void)mem.ReadU32BE(group + 0, &vt);
+    (void)mem.ReadU32BE(group + 8, &arr);
+    (void)mem.ReadU32BE(group + 12, &cntW);  // +12 halfword, +14 next field
+    const uint32_t nvars = cntW & 0xFFFFu;
+    char want[33] = {0};
+    {
+      unsigned char raw[32] = {0};
+      (void)mem.ReadBytes(nameA, raw, 32u);
+      int j = 0;
+      for (; j < 32 && raw[j]; ++j)
+        want[j] = (raw[j] >= 32u && raw[j] < 127u) ? (char)raw[j] : '?';
+      want[j] = 0;
+    }
+    char first[33] = {0}, second[33] = {0};
+    uint32_t e0 = 0, e1 = 0, n0 = 0, n1 = 0;
+    if (arr && nvars > 0) {
+      (void)mem.ReadU32BE(arr + 0, &e0);
+      if (e0 && e0 != 0xCDCDCDCDu) {
+        (void)mem.ReadU32BE(e0 + 20, &n0);
+        if (n0 && n0 != 0xCDCDCDCDu) {
+          unsigned char raw[32] = {0};
+          (void)mem.ReadBytes(n0, raw, 32u);
+          int j = 0;
+          for (; j < 32 && raw[j]; ++j)
+            first[j] = (raw[j] >= 32u && raw[j] < 127u) ? (char)raw[j] : '?';
+          first[j] = 0;
+        }
+      }
+      if (nvars > 1) {
+        (void)mem.ReadU32BE(arr + 4, &e1);
+        if (e1 && e1 != 0xCDCDCDCDu) {
+          (void)mem.ReadU32BE(e1 + 20, &n1);
+          if (n1 && n1 != 0xCDCDCDCDu) {
+            unsigned char raw[32] = {0};
+            (void)mem.ReadBytes(n1, raw, 32u);
+            int j = 0;
+            for (; j < 32 && raw[j]; ++j)
+              second[j] = (raw[j] >= 32u && raw[j] < 127u) ? (char)raw[j] : '?';
+            second[j] = 0;
+          }
+        }
+      }
+    }
+    MCLA_LOG_WARN("SHGRP-VARS #{} group={:08X} vt={:08X} arr={:08X} nvars={} "
+                  "req={} want='{}' e0={:08X}/'{}' e1={:08X}/'{}' lr={:08X}",
+                  n, group, vt, arr, nvars, req, want, e0, first, e1, second,
+                  lrIn);
+  }
+  __imp__sub_82193AF8(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// F-143 CENSUS ONLY (read-only; rule 4 checked first: addr_owners --check
+// 0x826113A8 → only ppc_func_mapping.cpp:31569, no owner).
+// The group that w151's SHGRP-VARS saw as 0 is NOT the object
+// sub_82379C68 allocates — it is `[allocatedObject+8]` (ppc_recomp.58.cpp:3997
+// `lwz r3,8(r11)` with r11 = [0x8288E054]). The ctor sub_82611298 stores 0
+// there by construction (ppc_recomp.123.cpp:14366 `stw r11,8(r31)`, r11 = 0),
+// so the only thing that can fill it is the virtual at vtable 0x82089568,
+// i.e. sub_826113A8 — which is also the function sub_82379C68 calls at
+// 0x82379CC4 and whose return value it then *discards*. Inside it,
+// sub_821CA6A8(0x827D7770, "entity.type", "type", 0, 1) is the parent-type
+// lookup, and if that returns 0 the function takes `li r3,0; return` at
+// loc_8261143C without ever reaching the vtable+16 realize. That fork —
+// parent lookup failed vs realize ran but did not publish +8 — is what this
+// prints. Name the three vtables holding this slot: 0x82054928, 0x82089568,
+// 0x8211e778 (raw scan of build/cache/mcla_pe.bin for the word 0x826113A8).
+PPC_FUNC_IMPL(__imp__sub_826113A8);
+static std::atomic<uint32_t> s_h6113A8{0};
+PPC_FUNC(sub_826113A8) {
+  const uint32_t n = s_h6113A8.fetch_add(1) + 1;
+  const bool show = n <= 24;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t nm = ctx.r4.u32;
+  const uint32_t a5 = ctx.r5.u32, a6 = ctx.r6.u32;
+  const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
+  uint32_t vt = 0, f8 = 0, f12 = 0, mgrCnt = 0, mgrBase = 0, obj = 0;
+  char name[49] = {0};
+  if (show) {
+    (void)mem.ReadU32BE(self + 0, &vt);
+    (void)mem.ReadU32BE(self + 8, &f8);
+    (void)mem.ReadU32BE(self + 12, &f12);
+    (void)mem.ReadU32BE(0x827D7770u + 3072, &mgrBase);
+    (void)mem.ReadU32BE(0x827D7770u + 3076, &mgrCnt);
+    (void)mem.ReadU32BE(0x8288E054u, &obj);
+    unsigned char raw[48] = {0};
+    (void)mem.ReadBytes(nm, raw, 48u);
+    int j = 0;
+    for (; j < 48 && raw[j]; ++j)
+      name[j] = (raw[j] >= 32u && raw[j] < 127u) ? (char)raw[j] : '?';
+    name[j] = 0;
+    MCLA_LOG_WARN("TYPINIT #{} self={:08X} vt={:08X} +8={:08X} +12={:08X} "
+                  "name='{}' r5={:08X} r6={:08X} mgr=[{:08X}] cnt={} "
+                  "obj@[8288E054]={:08X} lr={:08X}",
+                  n, self, vt, f8, f12, name, a5, a6, mgrBase, mgrCnt, obj,
+                  lrIn);
+  }
+  __imp__sub_826113A8(ctx, base);
+  if (show) {
+    uint32_t post8 = 0;
+    (void)mem.ReadU32BE(self + 8, &post8);
+    MCLA_LOG_WARN("TYPINIT-RET #{} self={:08X} -> r3={:08X} +8={:08X}", n,
+                  self, ctx.r3.u32, post8);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-145 CENSUS ONLY (read-only; rule 4 checked first: addr_owners --check
+// 0x821CFE80 → only ppc_func_mapping.cpp:4506, no owner).
+// w154 showed the entity.type file OPENING (PATHMGR-OPEN #406
+// a:/archive/vehicle/shared_utility/sst_trail/entity.type → the same static
+// stream object the loading .list files return), so sub_821CA6A8 succeeded,
+// sub_826113A8 did not take its early exit, and the r3 = 0 that leaves
+// [object+8] at the ctor's zero came out of the realize sub_82611018. Its first
+// gate is `sub_821CFE80(r3 = &temp, r4 = 0x82089564, r5 = 0)` with
+// `(r3 & 0xFF) == 0` jumping straight to `return 0` - and it is the only one of
+// that function's checks that can fail without any I/O, which is what w154's
+// open→return adjacency looks like. Gating on lr == 0x82611048 (the `bl` inside
+// sub_82611018, ppc_recomp.123.cpp:13929) keeps a generic helper quiet; r3 is
+// the &temp the caller built, so its vtable and +4 are readable directly.
+PPC_FUNC_IMPL(__imp__sub_821CFE80);
+static std::atomic<uint32_t> s_hRealizeCast{0};
+PPC_FUNC(sub_821CFE80) {
+  const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
+  const bool show = lrIn == 0x82611048u && s_hRealizeCast.fetch_add(1) < 24;
+  const uint32_t obj = ctx.r3.u32, ti = ctx.r4.u32, flag = ctx.r5.u32;
+  uint32_t vt = 0, w4 = 0;
+  if (show) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(obj + 0, &vt);
+    (void)mem.ReadU32BE(obj + 4, &w4);
+  }
+  __imp__sub_821CFE80(ctx, base);
+  if (show)
+    MCLA_LOG_WARN("REALIZE-CAST obj={:08X} vt={:08X} +4={:08X} ti={:08X} "
+                  "flag={} -> r3={:08X} (byte={})",
+                  obj, vt, w4, ti, flag, ctx.r3.u32, ctx.r3.u32 & 0xFFu);
 }
 
 // Stream read: [obj+0] must be a live device. Dead wrapper â†’ serve bytes from

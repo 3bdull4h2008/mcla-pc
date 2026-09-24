@@ -3369,3 +3369,278 @@ The instrument and its first result:
 
 - `PPC_FUNC(sub_82193AF8)` added at `src/gpu_device.cpp:12360`-ff (rule 4 checked first: `addr_owners --check 0x82193AF8` → only `ppc_func_mapping.cpp:2764`, no owner). Read-only; calls through to `__imp__sub_82193AF8`.
 - **`build/w150.log`: the marker printed 0 times while the fatal inside that same function printed twice.** The only filter was `group && group != 0xCDCDCDCDu`, so either the hook is not on the path that runs, or every call carries a null/poison group — and the second possibility is itself the answer F-136 needs. The filter was removed (log unconditionally, including `r3 == 0`) and `build/w151.log` is the discriminating run: 0 lines again ⇒ the hook is not on the executed path (revert it, per F-125); lines with `nvars=0` ⇒ empty group, i.e. our side; lines with `nvars>0` ⇒ the group has variables and the wanted name genuinely is not among them.
+
+### F-143: the `skinningData` group is `[object+8]`, not the allocation — and the P10-PRE short-circuit is firing 59,505 times in the runs that reach this fatal
+
+**Claim.** The `Required grmShaderGroupVar '%s' not found.` fatal that ends w147-w151 is raised
+because the entity-type registry's parent lookup for `"entity.type"` returns nothing, *not* because
+of a failed allocation and *not* because a container is missing a `skinningData` entry. The group
+passed to `sub_82193AF8` is a member field that the guest's own constructor deliberately initialises
+to zero, so `group=00000000` is the value the ctor left behind.
+
+**Evidence chain (all rule-3 raw-byte / `generated/**` reads, not IDA).**
+
+1. `build/w151.log` — the first and only firing of the now-unconditional census:
+   `SHGRP-VARS #1 group=00000000 vt=00000000 arr=00000000 nvars=0 req=1 want='skinningData'
+   e0=00000000/'' e1=00000000/'' lr=82379D04`, immediately followed by
+   `Fatal error dispatcher invoked` with `fatal-dispatch regs: lr=0x82193BA0 ... r4=0x8204A408`
+   and `fatal aux r4: 'skinningData'`. `nvars=0` is not a read of a real group — `group` is 0, so
+   every `ReadU32BE(group+n)` fails and the fields stay zeroed.
+2. `sub_82379C68` (`generated/ppc_xenon/ppc_recomp.58.cpp:3914`-ff) is the *entity-type
+   constructor*, and the value it hands `sub_82193AF8` is **not** the object it allocated:
+   - `sub_821CA540(r3=0x827D7770, r4=0x8204A424)` — intern the name being registered.
+   - `li r3,128; bl 0x82130528` → `cmplwi cr6,r3,0; beq → li r3,0` (the branch that F-142's
+     successor reading (this session, before the raw-body read below) turned into "the
+     128-byte alloc failed" - that hypothesis is refuted by points 3 and 4 and is NOT a
+     finding).
+   - `stw r3,-8108(r11)` → `[0x8288E054] = object`; then the **virtual** `lwz r11,0(r3) /
+     lwz r9,20(r11) / bctrl` = `0x826113A8(this=object, r4=0x8204A418, r5=0, r6=1)` — and its
+     return value is **discarded** (`mr r3,r30; bl sub_821C9A90` follows).
+   - `lwz r11,0(r31)` with r31=`0x8288E054` → `lwz r3,8(r11)` → `sub_82193AF8([object+8], ...)`.
+     So the printed `group` is `[object+8]`.
+3. The constructor `sub_82611298` (`ppc_recomp.123.cpp:14340`-ff) writes that field itself:
+   `li r11,0 / stw r11,8(r31)` and `stw r11,12(r31)`, plus `stw r9,0(r31)` with
+   `r9 = 0x82089554` (vtable). **`[object+8] == 0` is the constructed state**, so no allocation
+   failure is needed to explain w151.
+4. The allocation did *not* fail: at `loc_82379CB0` the instruction right after the store is
+   `lwz r11,0(r3)`, which with `r3 == 0` reads guest `0x00000000` — the deliberate `PAGE_NOACCESS`
+   null guard (`src/kernel/memory.cpp:316`-ff, the same page F-122's 50 AVs came from) — and w151
+   reports `C0000005 0`. So the ctor ran, the object is live, and `sub_826113A8` was entered.
+5. `sub_826113A8` (`generated/ppc_xenon/ppc_recomp.123.cpp:14515`-ff) has exactly two exits:
+   - `sub_821CA6A8(r3=0x827D7770, r4="entity.type", r5=0x8200CC1C, r6=0, r7=1)` → if that returns 0,
+     `loc_8261143C: li r3,0; return` — **without touching `[object+8]`**;
+   - otherwise it builds a stack temp (`sub_821D1CD0(sp+80)`, `sub_821CF7B8(sp+80, name, record)`)
+     and tail-calls the other virtual `[[object]+16] = 0x82611018(object, &temp, r5, r6)`.
+   `sub_821CA6A8` (`ppc_recomp.16.cpp:14210`) is a scan: `count = [manager+3076]`, and for each
+   index it calls `sub_821CA2F8(manager, buf, 256, name, typeName, i, ...)` then
+   `sub_821BDF20(buf, required)`. **An empty or unpopulated registry yields 0 with no other
+   observable difference** — which is precisely the F-111/F-112 shape one boot stage further on.
+6. Strings read straight from `build/cache/mcla_pe.bin` (identity map, VA-0x82000000):
+   `0x8204A3FC = "effectFade"`, `0x8204A408 = "skinningData"`, `0x8204A418 = "entity.type"`,
+   `0x8204A424 = "vehicle/shared_utility/sst_trail"`, `0x8200CC1C = "type"` (in a table
+   `"type","name","template","PostSave","PreLoad",…`). Vtables containing the slot
+   `0x826113A8`: `0x82054928`, `0x82089568`, `0x8211e778` (raw word scan). So this fatal is
+   *type registration for `vehicle/shared_utility/sst_trail`*, and `sub_82193AF8`'s
+   "grmShaderGroupVar" wording describes the parent type's variable group.
+
+**Measurement hazard this pass uncovered (F-123/F-054 class).** `P10-PRE`
+(`src/task_dispatch_trace.cpp:780`-ff) fires **59,505 times in w150/w151** (5,812 in w147, 13 in
+w148/w149), is 39 % of w151's lines per `soak_census` LOG QUALITY, and every firing is a
+**short-circuit**, not a census: `(oldAddr & 0xFF) == 0xCD || oldAddr == 0xFFFFFFFF` ⇒
+`ctx.r3 = 0; return;` — the guest's relocation-delta provider `sub_8217D890` never runs. The logged
+arguments are `id=CDCDCDCD group=CDCBA900 table=CA0F9F00 lr=821D2AD0`: a poison *group* pointer
+being used as a table handle 59k times. Any frontier claim from a run in this mode has to state the
+`P10-PRE` count next to it.
+
+**Control, not coincidence.** The fatal is the stable frontier and is not produced by the new hook:
+w148 and w149 (binary without the census) both print
+`fatal message: 'Required grmShaderGroupVar '%s' not found.'`, and all five soaks w147-w151 are the
+same mode (`RD-SUBMIT 24`, `LISTLINE 171`, `C0000005 0`, `DRAW_INDEXED 0`).
+
+**Instrument for the verdict.** `PPC_FUNC(sub_826113A8)` census (`TYPINIT` / `TYPINIT-RET`,
+`src/gpu_device.cpp:12476`-ff): read-only, cap 24, prints `self`, its vtable, `[self+8]`,
+`[self+12]`, the requested parent name as ASCII, `r5`/`r6`, `[0x827D7770+3072]`,
+`[0x827D7770+3076]` (the registry's own count), `[0x8288E054]` and the return value with
+`[self+8]` re-read after the call. Rule 4 checked first: `addr_owners --check 0x826113A8` →
+only `ppc_func_mapping.cpp:31569`, no owner.
+
+**Discrimination (w152).** `TYPINIT-RET ... r3=00000000` with `+8` still 0 ⇒ the parent-type lookup
+failed: the blocker is *upstream* (whoever must register `"entity.type"`), and the fix target is the
+registry, not the shader code. `r3 != 0` with `+8` still 0 ⇒ the lookup succeeded and the realize
+`sub_82611018` ran without publishing the group ⇒ read `sub_82611018`. `cnt=0` on any line is the
+registry-empty case stated directly.
+
+### F-144: `0x827D7770` is the resource *path* manager, not a type registry - `entity` and `entity.type` are **files** the guest composes and opens, and the composing loop has exactly **one** candidate mount
+
+*Corrects F-143's framing:* F-143 called `sub_821CA540`/`sub_821CA6A8` a "type
+registry" and its scan bound a "count of registered types". The strings settle it
+the other way - see point 2. F-143's structural findings (points 2-5: the group is
+`[object+8]`, the ctor zeroes it, `sub_826113A8` is the only writer, the alloc did
+not fail) all stand.
+
+**w152 measurement - `TYPINIT`/`TYPINIT-RET` (8 lines, cap 24, so 4 entries total):**
+
+```
+TYPINIT #1 self=CE719680 vt=82089554 +8=00000000 +12=00000000 name='entity'      r5=00000000 r6=00000001 mgr=[00000001] cnt=1 obj@[8288E054]=00000000 lr=822E72F0
+TYPINIT-RET #1 self=CE719680 -> r3=00000000 +8=00000000
+TYPINIT #2 self=CE721780 vt=82089554 ... name='entity' ... cnt=1 obj@[8288E054]=00000000 lr=822E7344
+TYPINIT-RET #2 self=CE721780 -> r3=00000000 +8=00000000
+TYPINIT #3 self=CE729880 vt=82089554 ... name='entity' ... cnt=1 obj@[8288E054]=00000000 lr=822E7398
+TYPINIT-RET #3 self=CE729880 -> r3=00000000 +8=00000000
+TYPINIT #4 self=D1163D00 vt=82089554 ... name='entity.type' ... cnt=1 obj@[8288E054]=D1163D00 lr=82379CDC
+TYPINIT-RET #4 self=D1163D00 -> r3=00000000 +8=00000000
+```
+
+#4 is F-143's case verbatim: the census object `D1163D00` **is** `[0x8288E054]`
+(so the allocation succeeded, as F-143 point 4 argued), `+8` entered as the ctor's
+zero and left as zero, and the function returned 0. Three earlier callers
+(`sub_822E70D8`, `lr=822E72F0/7344/7398`) failed the same way on `'entity'`. The
+manager's scan bound (`[0x827D7770+3076]`, printed as `cnt`) is **1** on every line.
+
+**1. What the manager really is.** The pre-existing `LogBisect` hook
+(`src/gpu_device.cpp:9756`-ff, `MCLA_BISECT_HOOK(sub_821CA540, "3-821CA540
+name-insert")`) already recorded the inserts; w152's eight lines all carry
+`r3=827D7770` and these `r4` name pointers, decoded from
+`build/cache/mcla_pe.bin` at `VA-0x82000000`:
+
+| `#` | `r4` | string | `lr` of the inserter |
+|---|---|---|---|
+| 1,2 | `0x8201BB2C` | `$/resources/ui` | 821FE4F4, 821FE5E0 |
+| 3,4 | `0x820CA5FC` | `$/resources/ui/` | 8272019C, 82720720 |
+| 5 | `0x82041D94` | `$/textures/global/cars` | 821822A4 |
+| 6 | `0x8200A060` | `globaltex` | 82182300 |
+| 7 | `0x827D5ED8` | `$/tune/shaders/lib` | **82304820** |
+| 8 | `0x8201F30C` | `ui` | 82187840 |
+
+Path prefixes, not entity types. `lr=0x82304820` is inside `sub_823047D8` - the
+same function whose `+0x374` (`0x82304B4C`) is the **only** caller of
+`sub_82379C68` (F-143's `sst_trail` ctor). So the mount insert and the failing
+lookup are two steps of one sequence in one function.
+
+**2. The lookup composes and OPENS a file.** `sub_821CA6A8`'s scan loop
+(`generated/ppc_xenon/ppc_recomp.16.cpp:14210`-ff) is
+`sub_821CA2F8(mgr, sp+80, 256, name, typeName, i)` then
+`bl 0x821bdf20` with **`ctx.lr = 0x821CA708`**, and `sub_821BDF20` is the
+file-resolve helper we already census (`src/gpu_device.cpp:12008`-ff, rule-4
+owner): GETDEV (`sub_821CB488`) then `[[dev]+4](dev, name, flags)` = an open.
+`'entity.type'` is therefore a file name, and `'type'` (the `r5` argument, string
+at `0x8200CC1C` in a table `"type","name","template","PostSave","PreLoad",...`) is
+the resource class passed alongside it.
+
+**3. The guest agrees.** Raw strings: `0x820CC164` = `'%s/entity.type'` and
+`0x820CC178` = `'Expecting fragment array to be sized optimally.  Count: %d,
+Capacity: %d.  One of the props is probably missing an entity.type file.'` - a
+missing `entity.type` **file** is a failure mode the prototype itself names.
+
+**4. The file layer is not broken in general.** w152's existing `BDF20` census
+prints 553 opens, and they succeed against real archive members:
+`a:/archive/shaders/cars/AmbientBlackMatte/dcl/AmbientBlackMatte/dcl/AmbientBlackMatte.dcl`
+(hundreds of `cars/*` and `characters/*` `.dcl`s), `a:/archive/resources/ui/garage/garage.xsf`,
+`credits.xsf`, `legals.xsf`, `policecam.xsf`, `raceeditor.xsf`, `meshtextures.xtd`.
+So this is one lookup path failing, not "the archive cannot be read".
+
+**5. Still open, and the next measurement.** Either (a) the scan bound of 1 is
+correct and the composed `entity.type` path genuinely is not in what we mount
+(consistent with the "retail content only: `xarchive_cache.rpf` + audio/music"
+constraint - `$/tune/...` and `entity.type` files may live in a table/script
+archive we never mount), or (b) the ≥8 prefix inserts do not feed the array the
+loop indexes, so only one candidate is ever composed. `PATHMGR-OPEN`
+(`src/gpu_device.cpp:12037`-ff, inside the existing BDF20 census, so rule 4 is
+already satisfied) prints the composed path and the guest's open result for every
+open whose caller is `0x821CA708` - which separates (a) from (b) in one line.
+
+**Frontier check (F-123 mode rule).** w152 vs w151/w148: same mode
+(`RD-SUBMIT 24`, `LISTLINE 171`), `C0000005 0`, `DRAW_INDEXED 0`,
+`Fatal error 1` / `FATAL-SOFT 1` - w151's 2/2 belongs to the `P10-PRE` 59,505 mode
+(w152: 495), whose second fatal is `Bad resource type %d in
+grcTextureFactoryXenon::PlaceTexture`. The `SHGRP-VARS` + `TYPINIT` censuses moved
+no frontier marker.
+
+### F-145: `a:/archive/vehicle/shared_utility/sst_trail/entity.type` **opens successfully** - so the blocker is one step later, inside the realize `sub_82611018`, and not the path manager F-144 suspected
+
+**w154 (`PATHMGR-OPEN`, cap 60 + unconditional for any path containing `entity`/`.type`).**
+Four candidate paths are composed for the `entity.type` requests, all from
+`lr=821CA708` (inside `sub_821CA6A8`'s per-mount loop), and all four come back with a
+non-zero return:
+
+```
+#384 a:/archive/vehicle/shared_utility/ao_shadow/entity.type  ret=0x82864048
+#385 a:/archive/vehicle/shared_utility/ao_sphere/entity.type  ret=0x82864048
+#386 a:/archive/vehicle/shared_utility/ao_cone/entity.type    ret=0x82864048
+#406 a:/archive/vehicle/shared_utility/sst_trail/entity.type  ret=0x82864048
+```
+
+`0x82864048` is a guest `.data` address, and it is the *same* value `sub_821BDF20`
+returned for the files we know load: `a:/archive/textures/global/cars/globaltex.list`
+and `a:/archive/shaders/ui/preload.list` (w153 #1, #20) - the two whose contents
+produce `LISTLINE` lines. The other observed value is `0x82864068`, which the short-form
+`.dcl` candidates return (w153 #22/#24/..., e.g. `a:/archive/shaders/ui/dcl/AlphaModulate.dcl`),
+while the long-form candidate for the same file (`.../AlphaModulate/dcl/AlphaModulate/dcl/AlphaModulate.dcl`)
+returns `0`. So `ret` is a static stream-object pointer, `0` = that candidate missed, and
+**`ret=0` on the long form is not an error** - it is the two-shape fallback pair. Reading
+one shape in isolation would have produced the wrong verdict, which is why §9 now says so.
+
+**The whole failing sequence is one millisecond wide** (w154, 11:58:52.147-148), and
+nothing between the open and the return carries a census line:
+
+```
+TYPINIT #4  self=D1163D00 vt=82089554 +8=00000000 +12=00000000 name='entity.type' cnt=1 obj@[8288E054]=D1163D00 lr=82379CDC
+PATHMGR-OPEN #406 path='a:/archive/vehicle/shared_utility/sst_trail/entity.type' ret=-2105144256 lr=821CA708
+TYPINIT-RET #4 self=D1163D00 -> r3=00000000 +8=00000000
+SHGRP-VARS #1 group=00000000 ... want='skinningData' lr=82379D04
+Fatal error dispatcher invoked - terminating game   (FATAL-SOFT masks it)
+```
+
+So F-144's fork resolves *against* both of its branches: the path manager is not
+mount-starved (its one candidate composed a correct `a:/archive/...` path) and the file
+is not missing (the open returned a stream). `sub_821CA6A8` returned that stream,
+`sub_826113A8` therefore did **not** take its `loc_8261143C: li r3,0` early exit, and
+the zero return came out of the realize `sub_82611018` (`ppc_recomp.123.cpp:13892`-ff),
+whose body is:
+
+1. `sub_821CFE80(r3 = temp, r4 = 0x82089564, r5 = 0)` → **if `(r3 & 0xFF) == 0` jump to
+   the `return 0` tail** (this is the only check that can fail with no I/O at all);
+2. `[[temp]+8](temp, sp+80, 128)` - a 128-byte read;
+3. `[[temp]+20](temp, 1)` must return **103**, else `sub_82130000(0x82089538,
+   [temp+4])` prints the guest's own `...version (%i)` and returns 0;
+4. only on 103: `[[object]+24](object, temp, r5, r6)` = `sub_82611448`, which is what
+   can publish `[object+8]`.
+
+**Next measurement (w155):** an `lr`-gated census on `sub_821CFE80` (rule 4:
+`addr_owners --check 0x821CFE80` → only `ppc_func_mapping.cpp:4506`, no owner) printing
+`r3`/`r4`/`r5` on entry and `r3` after, restricted to `lr == 0x82611048` (the call site
+inside `sub_82611018`). If that fires with `(r3 & 0xFF) == 0`, the realize dies on its
+type/dynamic_cast check over the object `sub_821CF7B8` built from our stream - not on
+file content. If it fires non-zero and no 128-byte read follows, the failure moved to
+step 2/3 and the `version (%i)` print is the thing to chase.
+
+**Frontier (F-123 mode rule).** w154 vs w153/w152: `RD-SUBMIT 24`, `LISTLINE 171`,
+`C0000005 0`, `DRAW_INDEXED 0`, `Fatal error 1`, `FATAL-SOFT 1`, `TYPINIT 8`,
+`SHGRP-VARS 1` - the `PATHMGR-OPEN` census (64 lines) changed nothing.
+
+### F-146: the realize dies on `sub_821CFE80(reader, "Version:", 0)` - a *token read* from the opened `entity.type` - and that function's own body shows what it asks for: `[reader.vt+8](reader, buf, 512)`, then a string compare against the key
+
+**w155 `REALIZE-CAST` (lr-gated census on `sub_821CFE80`, `src/gpu_device.cpp:12530`-ff), 4
+firings - exactly the 4 `TYPINIT` calls, and nothing else:**
+
+```
+obj=8EFFF620 vt=8201302C +4=8203E960 ti=82089544 flag=0 -> r3=00000000 (byte=0)   x3   [+4 = 'entity']
+obj=8EFFF6F0 vt=8201302C +4=8204A418 ti=82089544 flag=0 -> r3=00000000 (byte=0)        [+4 = 'entity.type']
+```
+
+`+4` is the name the caller (`sub_821CF7B8`) stored into the reader, and it matches the
+`TYPINIT` request on the same line, so this is the same four objects. `ti` = the key:
+`0x82089544` decodes to `Version:` (raw bytes at `0x82089530`:
+``'ted version (%i)' + 4 NULs + 'Version:' + 4 NULs + <vtable 0x82089554>` - the `...ted version (%i)`
+string is the *neighbour*, which is why F-144 mis-scaled it; `0x82090000-27324 =
+0x82089544`, not `...564`). **Every one of them returns 0.**
+
+**What that call is** (`generated/ppc_xenon/ppc_recomp.17.cpp:12904`-ff):
+
+```
+mr r31,r3 (reader) ; mr r30,r4 (key) ; mr r28,r5
+stb r10(=0),80(r1)              ; zero the 1-byte out-flag
+lwz r11,0(r31) ; lwz r29,16(r31) ; lwz r9,8(r11) ; bctrl  -> [reader.vt+8](reader, sp+80, 512)
+mr r5,r3 ; cmpwi cr6,r5,0 ; beq -> loc_821CFF24         ; nothing read -> fail
+<byte-by-byte compare of sp+80 against r30 ("Version:")>
+```
+
+So `sub_821CFE80` = "pull the next <=512-byte token out of the reader and test whether it is
+`Version:`", and the realize's first gate is literally **the `entity.type` file must start with
+a `Version:` token**. F-145's step-1 hypothesis is confirmed and the version/103 check (step 3)
+was never reached: `[object+8]` is therefore never published, `sub_82193AF8` gets group 0, and
+`Required grmShaderGroupVar 'skinningData' not found.` is fatal #1 - the same failure for
+`ao_shadow`, `ao_sphere`, `ao_cone` (all three `'entity'` requests, `+4=8203E960`).
+
+Two readings remain, and they need different fixes: (a) we serve bytes for
+`vehicle/shared_utility/*/entity.type` that have no `Version:` token (wrong member, undecrypted,
+or truncated - a serve defect); (b) the read at `[reader.vt+8]` returns 0 because the *stream*
+our open handed back has nothing positionable in it (the F-127/F-128 binding defect class).
+`tools/rpf_offline.py find vehicle/shared_utility/sst_trail/entity.type` cannot answer this
+(0 records is EXPECTED against the encrypted on-disk TOC, F-099). The discriminator is the
+reader's own state: `reader+16` (what `sub_821CF7B8` stored, presumably the stream/pos) plus the
+`[reader.vt+8]` return value, which is the next census.
+
+**Frontier.** w155 = w154 = w153 = w152 mode: `RD-SUBMIT 24`, `LISTLINE 171`, `C0000005 0`,
+`DRAW_INDEXED 0`, `Fatal error 1`, `FATAL-SOFT 1`, `TYPINIT 8`, `PATHMGR-OPEN 64`;
+`REALIZE-CAST` 4. Read-only census, no marker moved.
