@@ -3282,3 +3282,30 @@ The new frontier, named statically (no new instrument was needed — the fatal d
 - Not claimed: that the poison `id` values cause this fatal. The `sub_82193AF8` check is an independent "required var absent" verdict, and the group's variable list being unpopulated may be a consequence of the same missing content rather than of the rebase misses.
 - Addendum, measured before anyone chases it: **the `P10-GATE` delta-0 mitigation does not explain the `Bad resource type 0x6643 in grcTextureFactoryXenon::PlaceTexture` gate.** Histogram of the 4,030 `P10-GATE` hits in `w147` by caller: `lr=821D2AD0` 3,923, `lr=825EE56C` 83, `lr=8217EC24` (the `PlaceTexture` rebase, `ppc_recomp.*`: `lwz r4,0(r31); bl 0x8217d890; r5 = delta + [r31]; stw r5,0(r31)`) only **6**, `lr=826050D0` 3. And the ids behind those misses are small integers (`000000C0` 128×, `00000001` 104×, `00000080` 84×, `000001FF`/`00000082`/`00000040` 80× each), i.e. that population is an id/handle use of `sub_8217D890`, not pointer sliding. `PlaceTexture`'s own type field therefore still has no cause assigned — it is the next gate to name, not this one.
 - **How much the F-135 fix actually bought, measured**: the file walk advanced but the **renderer feed did not**. `tools/soak_census`-style counts are identical in `w138` and `w147` — `PKT-CAP summary 15 / 15`, `CP-REG-T 1171 / 1171`, `INDIRECT_BUFFER 11 / 11`, `DRAW-SEAM 10 / 10`, `CP-DRAW 166 / 166`, `DRAW_INDEXED 0 / 0` — and **no CP marker appears after the `skinningData` fatal line** (`w147:94881`; last CP activity `10:11:30.860`, the fatal `10:11:35.646`). So the four extra `.list` lines are real guest progress but do not yet reach the 3D state B4's gate is about, and this gate sits on the path to it.
+
+### F-137 — **The two renderer fatals are one 2 ms window, and both are the same defect class: a resource *pointer* slot holds a small integer. Decoded from raw bytes: `sub_82185190` is a type dispatcher that accepts only types 0/1/2, and at the fatal its own descriptor argument was `0x00020037` â€" which is not an address. Cause not assigned; the honest state is "named, with the value in hand".**
+
+From `build/w147.log` (all four lines inside 2 ms):
+
+- `101701` `CP: MMIO write reg=0081 offset=0207 value=80010000` (10:12:29.685)
+- `101702` `P5-84458-CENSUS #00008 obj=80010000 vt=00000000 +24=00000000 +28=00000000 res+32=00000000 arr=00000000 [arr]=00000000 rsc=0 lr=8217EC4C`
+- `101720-23` fatal `lr=82184514` â€" `'Resource '%s': %s (ptr=%p)'` with `r4=00000000`, `r5=82009840` = `'Invalid fixup, address is neither virtual nor physical'` (both strings decoded from the image at `0x82013168`/`0x82009840`)
+- `101730` fatal `lr=8217EC4C` â€" `'Bad resource type %d in grcTextureFactoryXenon::PlaceTexture'` with `r4=00006643`, `r5=00020037`
+
+What the raw bytes say about the second one (`sub_82185190`, the function that holds the string; the string has exactly one referencing instruction, `addi r3,r10,-22744` at `0x821851B4`):
+
+```
+82185190  mr   r5,r3            ; r5 keeps the descriptor pointer for the print
+82185194  lhz  r11,12(r3)       ; type = halfword at [desc+12]
+82185198  cmpli cr6,r11,1
+8218519C  bc   LT -> 821851C0   ; type 0  -> tail b 82184458  (the fixup above)
+821851A0  blr  EQ               ; type 1  -> return, nothing to do
+821851A4  cmpli cr6,r11,3
+821851A8  bc   LT -> 821851BC   ; type 2  -> tail b 8218FBB0
+821851AC..B8                    ; else    -> fatal "Bad resource type %d", r4=type
+```
+
+- So the accepted set is **{0, 1, 2}** and the observed type is `0x6643` = 26,179. But `mr r5,r3` at entry means the fatal's `r5 = 0x00020037` **is the descriptor pointer itself** â€" a 17-bit integer, not an address (above the 4 KB guard, below any arena). Reading `lhz [0x20037+12]` then returns whatever the flat guest heap happens to hold there, which is how a "type" of 26,179 appears. The type is not corrupt; the **pointer slot is**.
+- The same shape one step earlier: the fixup ran on `obj=0x80010000` (`P5-84458-CENSUS`), and `0x80010000` is *also* the value the guest OR-wrote into CP register `0x81` (`CP-REG-RMW #1 idx=081 and=FFFFFFFF or=80010000` at `10:11:28.346`, already tagged `PTR?` by our own `CP-DRAW-REGS #1 [13/54] r0081=80010000`). `grep` for `0x80010000` in `src/` returns **nothing**, so we do not synthesise it: the guest put it there.
+- Consistent-with (not proof): the `P10-GATE` population F-136 measured is also small integers (`0xC0`, `1`, `0x80`, `0x1FF`), so "an index/flag stands where this code wants an address" is a pattern in more than one place at this frontier, not a one-off.
+- Not claimed: which stage should have written a real address into `r31`/register `0x81`, and whether it is the same stage that leaves the `skinningData` group unpopulated. That is the next measurement.
