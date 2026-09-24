@@ -3020,3 +3020,21 @@ archive TOC read.
 
 **(5) Untouched by all of this:** `DRAW_INDEXED` is still 0 in every run, good or stalled, so B4's gate
 remains unmet. The stalled soaks also never reach `LISTLINE`, so they cannot be used to judge anything.
+
+### F-124 — **The stalled soaks are not deadlocks: the boot worker sits inside one guest unpacker (`sub_821E0FF0`, which assembles `0x81C1xxxx` pointers from rotated bytes) and in the stalled mode it never finishes; every other guest thread goes silent (`WAKE=0`). This is what makes half of today's measurements impossible.**
+
+- Task:        T41.7b's measurement attempt (blocked), `build/w119.log` (stalled) vs `build/w115.log` (frontier); `w114`/`w116`/`w118`/`w120`/`w121` are the same mode
+- Type:        FACT (mechanism named, root cause not yet established) + method consequence
+- Class:       D (kernel/thread path) + H (soak reliability)
+- Priority:    P0 for *measurement* — until it is understood, any single soak can be silently void
+- Evidence:    `w119` (912 lines, ends 07:34:15) vs `w115` (16,491 lines): **`WAIT[KWFSO]` 8 vs 1,309 and `WAKE[KWFSO]` 0 vs 1,307**, and `w119`'s last WAIT is at 07:32:55.9 while its log runs 80 s longer — so after the stall **no guest thread ever enters or leaves a logged wait**. The host side is alive throughout (`VSYNC-ISR`/`TICK-PROBE #60`/`RING … drains=2 swaps=0` keep printing, and the sampler keeps taking `PARK-SAMPLE`s). Where the boot worker actually is in that window: `lr=821E0FF8` in **93 of its park samples** (plus 11 × `8244D158`, 10 × `821BD668`), with the frame chain `f1=821CDA38 f2=822C4A54 f3=82131A14 f4=821BD810 f5=_xstart+0x19C`. `821E0FF8` is not a wait site — it is the elided-prologue LR write of `sub_821E0FF0` (`generated/ppc_xenon/…`: `ctx.lr = 0x821E0FF8` for the omitted `bl 0x823d91c0`), i.e. the thread is *inside that function body*, which reads bytes at `[r3+4]`, `[r3+5]`, `[r3+8]`, `rotlwi`s them by 8 and merges them against `lis r11,-32255` = **`0x81C10000`** — an unpacker that reassembles guest pointers out of stored bytes. The same function dominates the *good* `w113` too (64 samples), so it is normal work; the stalled mode simply never gets out of it.
+
+**What is ruled out, with the measurement that rules it out.**
+1. *Not an access-violation regression:* `C0000005 0`, `VEH-NEUTRAL 0`, `BE250-MEM-BADPTR 0` in the stalled runs — the F-122 fix holds there too.
+2. *Not the E: volume:* 128 MB/s sequential read, 32 MB write + `fsync` in 1.16 s, `mkdir`/`rmdir` 0.000 s, `git hash-object -w` clean — all measured during the stalled window (this corrects F-122's "contention" guess, already superseded by F-123).
+3. *Not a full render queue:* `RenderThread: queue depth` warnings appear 5-8 times in the good runs as well as the stalled ones.
+4. *Not my T41.7b change:* `XSF-BIND-REGONLY` prints **0** times in `w120`/`w121`, because the stall happens at the archive-TOC read, before any `*.fxc` open reaches the serve block. The change is therefore still unmeasured, and `src/` is back at the committed frontier.
+
+**The open question, in one line:** `sub_821E0FF0` is bounded by something it reads out of guest memory (a count or a linked-structure length, assembled from the bytes it merges with `rotlwi`); in the good mode that bound is reached in seconds, in the stalled mode it is not reached in 80 s. So the next instrument is *not* another thread dump — it is a bounded census of that loop (iteration count + the two or three guest words that feed the bound, printed every N iterations with a hard cap), plus the identity of the writer of those words. The existing B1 guard-page/DR0-DR3 machinery is the right tool for the writer question.
+
+**Consequences to apply now (already written into PROGRAM_GUIDE §9):** treat `RD-SUBMIT == 4` as the void-soak signature; a claim needs either `RD-SUBMIT >= 24` or a repeat. This also means the frontier number `w115` stands, but every *single-run* conclusion made during 06:4x-07:4x today (mine included) should be re-checked against a mode-valid soak before being built on.
