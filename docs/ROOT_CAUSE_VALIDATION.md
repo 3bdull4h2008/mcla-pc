@@ -2902,3 +2902,17 @@ in `build/cache/mcla_pe.bin`) and the `0x821E0Fxx` site to identify the request 
 object it waits on; then make *that* completion fire in the host device path. Retiring
 `kDiscChkForcedAck` (F-112's conversion target) and reaching `DRAW_INDEXED ≥ 1` both depend on this
 same site, which is the strongest reason to fix it rather than route around it.
+
+### F-120 — **Correction to F-119, and the blocker sharpens: the boot worker is not *blocked* in the device layer, it is *spinning* there.** Its host program counter sits on `std` atomic-load helpers (40 + 7 + 5 + 4 of 88 samples) reached from the guest device poll loop — i.e. the guest is busy-waiting on a register/bit that never changes. Enabled by adding `/MAP` to the link, which makes host PCs nameable at last.
+
+- Task:        T41.5c (B4/B5), `build/w111.log` vs `build/w110.log`; `CMakeLists.txt:404-410`
+- Type:        FACT + FIX (build-observability; no guest-visible behaviour change)
+- Class:       H (instrument) + D (device poll/IO behavior)
+- Priority:    P0
+- Evidence:    `build/w111.log` `PARK-SAMPLE` host rips resolved through `build/mcla.map` (149,080 symbols) against `PARK-SAMPLE base=7FF64E350000`: rva `059021` ×40 and `058FF0` ×4 inside `?_Check_load_memory_order@std@@YAXW4memory_order@1@@Z`, rva `094DBB` ×7 / `094D88` ×5 inside `?load@?$_Atomic_storage@I$03@std@@QEBAIW4memory_order@2@@Z`, plus `?PageWatchHit@@YA_NI@Z` ×5 and the `BootWorker` VEH lambda ×5; 29 distinct rips over 88 samples. Guest side unchanged from F-119: dominant chain `sub_821BD7C0 → sub_82131790+0x284 → sub_822C4630+0x424 → sub_821CD7A0+0x298`, `lr=821E0FF8` in 52 of 97 `PARK-STACK` lines.
+
+**Why F-119's wording needs correcting.** F-119 concluded "blocked in the guest's device layer waiting for an IO completion". A blocked thread's PC would sit in one kernel wait stub; instead the samples land on **`std::atomic<unsigned int>::load` and its memory-order check helper**, at several distinct sites, across the whole tail — that is a loop reading a value repeatedly. So the device-layer call is *polling*: the guest issued its request and is now spinning on state our host never advances. `swaps=0` with `CP truth pub=11 put=11 (caught up)` (F-118) is the matching host-side fact: nothing more is being published, so whatever bit the guest polls cannot change.
+
+**The observability fix, which is the reusable part.** `target_link_options(mcla PRIVATE /OPT:NOREF /MAP)` in `CMakeLists.txt` emits `build/mcla.map` (19.7 MB, 149,080 public symbols) from a **link-only** change — no compile-flag churn, so no exposure to the known clang-19/STL toolchain fragility. Resolving a log line is now: `rva = rip - <PARK-SAMPLE base>` then the greatest symbol rva ≤ it. This retires F-118's "host RVAs are not nameable" constraint; `NearestFunctionName` in the log still prints `host 0x…` because it does not read the map, so offline resolution is the path for now.
+
+**Next (T41.5c), one census then one fix.** Record *which* register indices the poll loop reads: count `CpRegPeek(index)` calls per index (and the value returned) in a small ring/map, dumped at the `PARK-SAMPLE` heartbeat. That names the exact bit the guest waits on — most likely a CP/ring or vblank-ish status given `pub=put` and `swaps=0` — and the fix is then to advance it in the host device path, which is simultaneously F-112's conversion target for retiring `kDiscChkForcedAck` and the precondition for B4's `DRAW_INDEXED ≥ 1`. No short-circuit is proposed or added here.

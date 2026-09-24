@@ -295,6 +295,13 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
   guest memory for a needle value.
 - Find subagent useful for caller mapping; keep the main window for decisions.
 
+Host PCs are now nameable (F-120): `CMakeLists.txt` links `mcla` with `/MAP`, so every
+build emits `build/mcla.map` (~149k public symbols). Resolve a logged `rawrip` as
+`rva = rawrip - <PARK-SAMPLE base=…>` then take the greatest symbol rva ≤ it (the map's `Rva+Base`
+column minus the 0x140000000 exe preferred base). `NearestFunctionName` still prints `host 0x…`
+because it does not read the map — resolve offline for now. A PDB is NOT produced (no `/Zi`, and
+adding compile flags risks the known clang-19/STL breakage).
+
 ## 11. Rules that govern all work
 
 1. **One hook owner per guest address.** Check `PPC_FUNC` /

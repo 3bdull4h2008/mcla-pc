@@ -402,7 +402,12 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/MT /O2 /Ob1 /DNDEBUG")
 set(CMAKE_C_FLAGS_RELWITHDEBINFO "/MT /O2 /Ob1 /DNDEBUG")
 
 target_compile_options(mcla PRIVATE /GS- /EHa)
-target_link_options(mcla PRIVATE /OPT:NOREF)
+# F-119 follow-up: the boot-thread sampler reports HOST rips, and with no PDB in
+# this build they were unnameable (llvm-symbolizer -> '??'), which blocked every
+# "where is the main thread parked" question. /MAP is link-time only (no recompile
+# flags change) and emits build/mcla.map with symbol addresses, so an RVA from a
+# log line resolves to a function offline.
+target_link_options(mcla PRIVATE /OPT:NOREF /MAP)
 target_compile_definitions(mcla PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
 
 # Offline validators
