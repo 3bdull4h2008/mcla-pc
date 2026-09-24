@@ -36,10 +36,16 @@ as a UNC path.
 ## 2. Build (rule 7 — tree must always compile)
 
 ```bash
-cd "E:/mcla pc" && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build_on_c.bat build > build/<wave>_build.log 2>&1; echo "BUILD_RC=$?"
+cd "E:/mcla pc" && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build_on_e.bat build > build/<wave>_build.log 2>&1; echo "BUILD_RC=$?"
 ```
 
-`build_on_c.bat` is the **only** C:-path script (bare arg = configure, `build` = ninja-only; rc 2=vcvars, 3=configure). `ninja_build.bat` and `configure.bat` hard-code `cd /d "E:\mcla pc"` — the poisoned volume — so they silently build nothing here. **Never use them.**
+`build_on_e.bat` is the only build script to use (E: has been the primary tree since the 2026-09-23
+merge; `build_on_c.bat` no longer exists — the name in older doc text is stale). Bare arg =
+configure + build, `build` = ninja-only; rc 2 = vcvars failed, 3 = configure failed.
+`ninja_build.bat` and `configure.bat` do exist and do point at `E:\mcla pc`, but they print nothing
+about the rc convention above and their output is not captured to a log, so prefer `build_on_e.bat`.
+**Never run bare `ninja` with no target** — it also builds the broken `XenosRecomp` TU (clang 19 vs
+STL 14.51) and reports a failure that has nothing to do with your change.
 
 Capture `rc=$?` **immediately** and in the same command. Piping ninja to `tail` reports `0` on a
 failed build — this has bitten the project three times.
