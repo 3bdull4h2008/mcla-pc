@@ -684,7 +684,6 @@ struct MclaServedBody {
 static std::mutex g_servedMtx;
 static std::unordered_map<std::string, MclaServedBody> g_servedByPath;
 static std::unordered_map<uint32_t, MclaServedBody> g_servedByEntry;
-static std::unordered_map<uint32_t, MclaServedBody> g_servedByW3;
 static std::unordered_map<uint32_t, MclaServedBody> g_servedByDevH;
 static std::unordered_set<std::string> g_globtexNames;
 static std::atomic<uint32_t> g_globtexServedInserted{0};
@@ -723,8 +722,11 @@ static void MclaRegisterServedBody(const char *path, uint32_t buf,
   g_servedByPath[b.path] = b;
   if (tocEntry)
     g_servedByEntry[tocEntry] = b;
-  if (w[3])
-    g_servedByW3[w[3]] = b;
+  // F-126: w[3] is the TOC record's FLAGS dword, not a file identity. Measured
+  // in w115: 40000061 is shared by 52 distinct records, 40000057 by 26,
+  // 4000004E by 22 - so a body indexed by it cross-serves another file as soon
+  // as many records are registered. Same class as the (dev,handle) demotion of
+  // F-091; this index no longer exists.
   if (dev && handle != 0xFFFFFFFFu)
     g_servedByDevH[MclaDevHandleKey(dev, handle)] = b;
 }
@@ -742,16 +744,10 @@ static bool MclaFindServedBody(uint32_t dev, uint32_t handle, uint32_t flagWord,
       return true;
     }
   }
-  if (w3) {
-    auto it = g_servedByW3.find(w3);
-    if (it != g_servedByW3.end()) {
-      *out = it->second;
-      return true;
-    }
-  }
+  // F-126: no w3 (TOC flags dword) lookup - the key is not an identity.
   // T41.3o (F-091): (dev,handle) is a per-device SLOT key, not a file
   // identity — it served legals.xsf as the body of all five
-  // shaders/*/preload.list reads. Log-only; exact tocEntry/w3 still serve.
+  // shaders/*/preload.list reads. Log-only; only tocEntry is exact (F-126).
   if (dev && handle != 0xFFFFFFFFu) {
     auto it = g_servedByDevH.find(MclaDevHandleKey(dev, handle));
     if (it != g_servedByDevH.end()) {
@@ -782,12 +778,8 @@ static bool MclaFindServedBody(uint32_t dev, uint32_t handle, uint32_t flagWord,
         break;
       }
     }
-    // joinf[0] is TOC w3 — allow flagWord to be w3 too.
-    auto it = g_servedByW3.find(flagWord);
-    if (it != g_servedByW3.end()) {
-      *out = it->second;
-      return true;
-    }
+    // F-126: flagWord may carry TOC w3; that index is retired, so nothing is
+    // served here and the family match above stays log-only.
   }
   // T41.3o (F-091): the bare-dev "last body on this device" fallback is the
   // loosest of the three — it would re-introduce exactly the legals.xsf-as-
