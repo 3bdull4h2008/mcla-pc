@@ -5001,3 +5001,43 @@ family as the inflate loop) and `sub_821BCB10+0x44` (our `ENQ` chooser). If neit
 array is filled by `pgStreamer::InitClass` sizing plus a per-request insert elsewhere, and a
 registers-only census at `sub_821BC140`'s *caller* (`sub_821BC910`, the enqueue path that produced
 `INLINE-EXEC #n`) is the cheapest admissible way to see the request as it is handed over.
+
+### F-176: the handle id that selects the zero-length record is the value `sub_821867A0` returned - `REQFILL #2 -> r3=00000004` and `ENQ a0=00000004` / `REQDUMP d[0]=00000004` are the same number, so F-173's builder and F-172's zero are now joined by a measured identity, not by an inferred field path
+
+- Task:    B5 (menu) - continues F-174/F-175's static trace and fixes what is and is not known
+- Type:    FACT (three-way log identity) + FACT (listing-derived structure) + an explicit open question
+- Class:   G
+- Priority: P1
+- Evidence: `build/w183.log`: `REQFILL sub_821867A0 #2 … -> r3=00000004`, `ENQ sub_821BCB10 #1 a0=00000004 cb=821BC548 -> r3=82849B2C`, `REQDUMP #1 a0=82849B2C d=[00000004 …]`, `INLINE-EXEC sub_821BC140 #1 a0=82849B2C`; `generated/ppc_xenon/ppc_recomp.14.cpp` (`sub_821BC910` body, `sub_821BCB10` prologue, `sub_821BC140+0x24`)
+
+**The queue record is 1556 bytes, confirmed from the listing.** `sub_821BC910` computes
+`r31 = instance*24948 + <static base>`, then `r30 = r31 + ([r31+24932] * 1556)`, and calls
+`sub_821BC140(r3 = r30, r4 = instance)` **only when `[r30+1548] != 0`**. So the request the inflate
+loop executes is a 1556-byte (0x614) queue slot - which is what Session 75n's `REQDUMP` comment
+asserted from the other direction, and it is why `d[0]` of that dump is the value `sub_821BC140`
+multiplies by 28. The ring head at `[r31+24932]` wraps at **16** (`cmpwi r11,16`), so this queue holds
+sixteen outstanding requests, and the three `INLINE-EXEC` firings correspond to three `ENQ` firings
+whose `a0` values are `4`, `0x8004`, `0x10004`.
+
+**The identity.** `sub_821BCB10` (`ENQ`, registers-only, 3 firings) takes those values as its first
+argument and returns the queue object; `sub_821BC140` then uses the same low half (`4`) as its
+handle index; and `REQFILL` records that `sub_821867A0`'s **second** call returned exactly
+`r3 = 00000004`. So the number that selects the record whose `[+4]` is 0 is the number that
+`sub_821867A0` handed back. That is a measured three-way match across `REQFILL` / `ENQ` / `REQDUMP`,
+not an inferred field path, and it is the strongest link so far between the builder and the zero.
+
+**What is still NOT known, stated so nobody over-reads this.** `sub_821BCB10` only *searches* the
+`[0x8283D1C4]`-based 28-byte array (`mulli r11,r30,28` / `lwzx r9,r11,r26` / compare against
+`record+0`), and `sub_821867A0` writes the record array it is *handed* (F-174). Whether the builder's
+local record is then copied into the global pool - which the matching id would suggest - is not
+established, and neither is the store that would put a **length** rather than the string-derived value
+seen in `pgStreamer::Open` into `[global record+4]`. The two candidate next reads, both static:
+(a) the tail of `sub_821867A0` after its four `[entry+4]` stores, looking for a copy loop into a
+pool whose base comes from `[0x8283D1C4]`; (b) `sub_821BC674`-`0x821BC694`, the three reads of the
+same class static inside the inflate family, which are the most likely completion path that would
+*advance* a record's `[+4]` as bytes are consumed.
+
+**Plan state unchanged by this entry:** B1/B2/B3 closed; B4's gate `DRAW_INDEXED >= 1` unmet
+(still 0 in `w182`/`w183`); B5 criteria 1-2 unmet, criterion 3 met. What changed is the shape of the
+remaining work: the UI route is a streamer-request question with a named identity chain, and the
+"implement a host LZX decoder"/"find the key" framings are withdrawn (F-172).
