@@ -12163,6 +12163,17 @@ PPC_FUNC(sub_821BE8D8) {
           // -96(r1) BEFORE its own stwu) and restored after. The flag byte stays
           // 0, so the routine's free path (taken only when [entry+12] != 0) is
           // not entered and our buffer survives.
+          // F-161 MEASURED: this is the only safe release point. Adding the same
+          // release at the READ sites (sub_821BE250 / sub_821BE710 once slot pos
+          // reached size, i.e. F-135 tier-1's own condition) was built and soaked
+          // as w169 and is catastrophic - Fatal error 0->2, FATAL-SOFT 0->3,
+          // fatal-shaped lines 37->5,946, INFLATE 358->168, [error] 42->61 -
+          // because while GuestSlotTableInsert's SLOT-RECYCLE-SHARED tier hands
+          // the same index to consecutive bodies, a "consumed" slot IS the one
+          // other live handles still alias. Here the body has already been
+          // duplicated into dst, so the source slot is genuinely dead. Do not
+          // re-try the read-site release without first giving each body its own
+          // slot; that is what would retire F-135/F-135b.
           const uint32_t r1In = ctx.r1.u32;
           const uint32_t r4In = ctx.r4.u32;
           ctx.r1.u32 = r1In - 256u;

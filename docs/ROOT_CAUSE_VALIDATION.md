@@ -4277,3 +4277,44 @@ it does not yet retire F-135/F-135b. Doing that needs the release to happen for 
 (the `sub_821BE250`/`SlotTableServeRead` path and the `PACK` path, not just the memory-device host
 path), and `pos` reaching `size` is not currently tracked for most bodies (F-135b measured that the
 `pos >= size` test recycled only 1 of 15 slots).
+
+
+### F-161: releasing a slot at the **read** sites when `pos` reaches `size` is catastrophic (measured, reverted) - while `SLOT-RECYCLE-SHARED` aliases one index across consecutive bodies, a "consumed" slot IS the one still in use, and that is exactly why F-135b's `pos >= size` tier recycles so little
+
+- Task:    B3-style mitigation retirement, step 2 of F-160; build `w169` against baseline `w168`
+- Type:    FACT (refutation of the obvious next fix) + FIX reverted
+- Class:   E (filesystem/device)
+- Priority: P1 - it is the blocker to retiring F-135/F-135b, and the shape of the real fix follows from it
+- Evidence: `build/w169.log` vs `build/w168.log` (census below); `src/gpu_device.cpp:11727`-ff (`pos >= size` tier), `:11757`-ff (`SLOT-RECYCLE-SHARED`), `:12153`-ff (the one safe point); the reverted form is recorded in the comment at that site
+
+F-160 established that the guest's own Close (`sub_821CB2A0`) is the only releaser and that nothing
+calls it. The obvious step 2 was to call it wherever a body finishes being served, using F-135 tier-1's
+own condition (`slot pos >= size`). `SlotTableServeRead` already advances `pos`, so the signal existed;
+the change added an `outExhausted` flag and released at both read sites (`sub_821BE250`,
+`sub_821BE710`).
+
+| marker | `w168` (release at copy-out only) | `w169` (+ release at read sites) |
+|---|---|---|
+| `Fatal error` | 0 | **2** |
+| `FATAL-SOFT` | 0 | **3** |
+| fatal-shaped lines | 37 | **5,946** |
+| `INFLATE` | 358 | **168** |
+| `[error]` lines | 42 | **61** |
+| `SLOT-CLOSE` | 6 | 12 |
+| `LISTLINE` / `TYPINIT` / `GETDEV` / `CP-DRAW` / `PRESENT` / `DRAW_INDEXED` | 171 / 1 / 694 / 166 / 34 / 0 | unchanged |
+
+The frontier counters that usually move did **not** move, which is what makes this informative rather
+than just bad: the file walk still completed, but 190 inflate calls disappeared and two new fatals
+appeared with the soft-masking tier firing. The mechanism is the aliasing F-135b introduced:
+`SLOT-RECYCLE-SHARED` returns the *same* index for consecutive bodies (legitimately, because every
+body this path serves is described by the one shared static `kMemStreamSlot`), so a slot that reads as
+"consumed" is by definition the slot some other live handle is still aliasing - releasing it revokes a
+body that is still being read. `w169` shows 6 of the 12 releases landing on `h=15` repeatedly, the
+recycled index.
+
+**Consequence, and the shape of the real fix.** The copy-out site is the only place a body is
+provably dead, because the bytes have already been duplicated into `dst`. Retiring F-135/F-135b
+therefore cannot be done by releasing better - it requires each served body to own a distinct slot
+until it is genuinely finished, i.e. the shared-static `kMemStreamSlot` aliasing has to go first (the
+16-entry bound itself is the guest's, decoded at `0x821CB2B0`-`0x821CB2BC`, so it is not the limit).
+Reverted; `src/gpu_device.cpp` is byte-identical to HEAD except for the comment that records this.
