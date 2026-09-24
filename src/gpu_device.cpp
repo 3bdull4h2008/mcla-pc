@@ -8486,6 +8486,31 @@ PPC_FUNC(sub_821BC140) {
   // (w1: thread 0xC5C parked in VEH, job #2 never INLINE-EXEC'd).
   const uint32_t slotAddr = ctx.r3.u32;
   const uint32_t queueArg = ctx.r4.u32;
+  // F-179a: F-172 says the length BC140 uses is `[[0x8283D190+52] +
+  // [slot+0]*28] + 4` and that it is 0; F-179 showed pgStreamer::Open resolving
+  // all seven containers through vtable+84 -> +144 with non-null entry pointers
+  // (w186 lr=821CC4BC). Both cannot be about the same record. Measure the
+  // record this function actually indexes, before the body runs. Bounded by
+  // construction: INLINE-EXEC fires 3x per boot, and every read is checked.
+  if (n <= 8) {
+    auto &smem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t cls = 0, cap = 0, base = 0, ident = 0, rec[7] = {0};
+    (void)smem.ReadU32BE(0x8283D190u, &cls);
+    (void)smem.ReadU32BE(0x8283D190u + 24u, &cap);
+    (void)smem.ReadU32BE(0x8283D190u + 52u, &base);
+    (void)smem.ReadU32BE(slotAddr, &ident);
+    // BC140 masks [slot+0] with (cap-1) in place unless it is -1, then indexes
+    // by *28 - mirror that exactly rather than assuming cap is already a mask.
+    const uint32_t mask = cap - 1u;
+    const uint32_t recAddr = base + (ident & mask) * 28u;
+    for (uint32_t i = 0; i < 7u; ++i)
+      (void)smem.ReadU32BE(recAddr + i * 4u, &rec[i]);
+    MCLA_LOG_WARN("BC140-REC #{} slot={:08X} q={} id={:08X} mask={:08X} "
+                  "base={:08X} rec={:08X} [{:08X} {:08X} {:08X} {:08X} {:08X} "
+                  "{:08X} {:08X}] cls={:08X}",
+                  n, slotAddr, queueArg, ident, mask, base, recAddr, rec[0],
+                  rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], cls);
+  }
   if (n <= 16 || (n % 2000) == 0)
     MCLA_LOG_INFO("INLINE-EXEC sub_821BC140 #{} a0={:08X} a1={:08X} "
                   "lr={:08X} r1={:08X} tid={:08X}",

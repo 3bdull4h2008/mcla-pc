@@ -5270,3 +5270,57 @@ queue record. `REQDUMP #1` shows that record's `{src, dst, size}` triples carry 
 (`50000000 A47FD000 00002000`, then `… 00080000`), so either `r21` is a *cursor* that was already
 advanced past the end, or it is a per-stream remainder the completion path never seeded. Whichever it
 is, the fix lands in what we hand the streamer, not in the container and not in a vtable stub.
+
+### F-180: measured at last - the streamer record is one slot at `C9A24970`, `record[+4]` really is a byte count (240,531 / 10,799), and it is **0 on the legals request**; F-179's reversal was wrong and F-172's mechanism is restored, now with the record's full field layout
+
+- Task:    B5 (menu) - settles F-172 vs F-179 by reading the record instead of inferring it
+- Type:    FACT (direct measurement) + correction of F-179
+- Class:   G
+- Priority: P0
+- Evidence: `build/w187.log` `BC140-REC #1..#3` (exe 97,570,304 @ 17:53; **16 structural counters
+  identical to `build/w186.log`** - `LISTLINE 171`, `Fatal error 0`, `FATAL-SOFT 0`, `C0000005 0`,
+  `SEEK-DEAD 0`, `TYPINIT 6`, `GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `DICTLOOKUP 22`,
+  `[error] 14`, `STREAM-OPEN 7`, `INLINE-EXEC 3`, `swfCMD 0`, `XSF-INFLATE 0`, `DRAW_INDEXED 0` - so
+  the two-checked-read census is free); `src/gpu_device.cpp` `PPC_FUNC(sub_821BC140)` `BC140-REC`
+  block; cross-checked against the F-179 table in the same log
+
+**The three rows** (base = `[[0x8283D190+52]]` = `C9A24900`, capacity 0x8000, `mask = cap-1 = 0x7FFF`):
+```
+#1 slot=82849B2C id=00000004 rec=C9A24970 [00000004 0003AB93 C60AC180 00000001 DC2C0810 000000C0 00060000]
+#2 slot=8284A140 id=00008004 rec=C9A24970 [00010004 00000000 C60AC180 00000004 D454283D 00000140 000A0000]
+#3 slot=8284A754 id=00010004 rec=C9A24970 [00010004 00002A2F C60AC180 00000001 C0001814 000006B4 0035A000]
+```
+`rec` is the **same address every time** - all three ids reduce to index 4 (`id & 0x7FFF`), and the
+high bits are a generation counter (`4`, `0x8004`, `0x10004` = index 4, generations 0/1/2). So this
+ring reuses one record, and the record's own fields identify which container it currently describes:
+
+| field | #1 | #2 | #3 | meaning, cross-checked |
+|---|---|---|---|---|
+| `+0` | `00000004` | `00010004` | `00010004` | index 4 + generation in bits 15+ |
+| **+4** | **`0003AB93` = 240,531** | **`00000000`** | **`00002A2F` = 10,799** | **the byte count** - equals the `RSC5+0x10`/TOC size of `meshtextures.xtd` and `trash.xrn` |
+| `+8` | `C60AC180` | `C60AC180` | `C60AC180` | the packfile device (`GETDEV-RET ret=`) |
+| `+12` | `1` | **`4`** | `1` | differs exactly on the zero-length request |
+| `+16` | `DC2C0810` | `D454283D` | `C0001814` | the package IDs of meshtextures / **legals** / trash (TOC word[3]) |
+| `+20` | `C0` | `140` | `6B4` | entry-relative offset (`C60B7B20-legals` is one of these entries) |
+| `+24` | `00060000` | `000A0000` | `0035A000` | the package offsets F-171 selects per record |
+
+**What this decides.** (a) F-172 was right: `sub_821BC140` takes its length from `record[+4]`, the
+`cmplwi r30,32768` test is a magnitude test on that count, and a **0** there is exactly what produces
+`READWRAP … r7=0 lr=821BC334`. (b) F-179's inference ("it must be a TOC entry pointer, so F-172 was
+wrong") is **withdrawn** - the entry pointer is what the lookup *returns elsewhere*; this field is a
+count. (c) F-175/F-177's suspicion that `pgStreamer::Open` fills this array is now confirmed: the
+record at index 4 is `C9A24900 + 4*28`, and its `+4`/`+16`/`+24` are precisely the values Open's
+`vt[+84]` and its package words carry.
+
+**The bug, narrowed to one request.** Two of the three generations get the correct size; the
+**legals** generation gets `+4 = 0` (with `+12 = 4` instead of 1) even though the same log shows
+legals resolving through the same path at `lr=821CC4BC` with entry `C60B7B20` and size word
+`0002FFC9` = 196,553. So the archive is fine, the TOC is fine, the vtable path is fine - one specific
+Open leaves its record's length at 0, and because the ring reuses index 4, the request that carries
+the boot's first screen executes with a zero-length read and then spins.
+
+**Next measurement, already scoped and cheap.** Extend the `STREAM-OPEN` census with two checked
+reads of `[0x8283D190+52] + (returnedId & 0x7FFF)*28` and print `record[+4]`/`[+12]` right after each
+of the seven Opens returns. That distinguishes "Open never wrote a length for legals" from "a later
+phase zeroed it", and `F-178`'s timing lesson means the admissibility check is the 16 structural
+counters, not `INFLATE-ENTER`/`READWRAP`.
