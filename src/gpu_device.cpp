@@ -534,6 +534,35 @@ constexpr MclaListMemberSpan kListMemberSpans[] = {
 // is the thing to fix.
 constexpr bool kExpandListInArchive = true;
 
+// F-149 (T41.11): the `entity.type` members are the same headerless raw-DEFLATE
+// family, and they are the blocker itself - `a:/archive/vehicle/shared_utility/
+// sst_trail/entity.type` is what sub_826113A8 must parse before it publishes the
+// shader group whose absent 'skinningData' variable is the frontier fatal
+// (F-143…F-148). Measured offline against the guest's own decrypted TOC dump
+// (`tools/rpf_offline.py find entity.type build/toc_parsed.bin` - control passes
+// there: the same command resolves `trash.xrn`, whose archive offset the log
+// prints in `TOC76-XSF #1365`), and against the archive bytes: member 0x35CA43
+// stores 255 deflate bytes and inflates to exactly the 0x1E0 the TOC declares,
+// beginning "Version: 103\r\nshadinggroup {". `Version:` is the token
+// sub_82611018 tests first and 103 is the constant it compares, so the format is
+// settled, not guessed. Unlike the .list spans (in == out, F-105) the stored and
+// logical lengths differ here, which is why the span is registered with the TOC
+// size - the length ApplyExpandedSpans must produce - exactly as the lazy TOC76
+// site already does. Excluded: the two records whose offset word carries bit31
+// (0x7F000EBA, 0x7EA85817); at offset & 0x3FFFFFFF they do not inflate, so their
+// offset encoding is still unknown.
+constexpr bool kExpandTypeMembersInArchive = true;
+struct MclaTypeMemberSpan {
+  uint32_t off;
+  uint32_t logical;
+};
+constexpr MclaTypeMemberSpan kTypeMemberSpans[] = {
+    {0x0032C000u, 0x1E5u}, {0x0032C729u, 0x1E2u}, {0x0032E767u, 0x1E1u},
+    {0x0035CA43u, 0x1E0u}, {0x0127E226u, 0x1E9u}, {0x0127EBB1u, 0x1ECu},
+    {0x0127FCB8u, 0x288u}, {0x03F0C65Au, 0x22Bu}, {0x055233B5u, 0x21Eu},
+    {0x055301D0u, 0x225u},
+};
+
 void MclaMarkKnownListMembers() {
   if (!kExpandListInArchive)
     return;
@@ -541,6 +570,13 @@ void MclaMarkKnownListMembers() {
     mcla::vfs::MarkMemberExpanded(m.off, m.size);
     MCLA_LOG_WARN("MEMBER-EXPAND-MARK-EARLY path='{}' off={:08X} stored={}",
                   m.path, m.off, m.size);
+  }
+  if (kExpandTypeMembersInArchive) {
+    for (const auto &m : kTypeMemberSpans) {
+      mcla::vfs::MarkMemberExpanded(m.off, m.logical);
+      MCLA_LOG_WARN("MEMBER-EXPAND-MARK-TYPE off={:08X} logical={}", m.off,
+                    m.logical);
+    }
   }
 }
 
@@ -10425,7 +10461,12 @@ PPC_FUNC(sub_821CDB88) {
     if (got < 96) pbuf[95] = 0;
   }
   __imp__sub_821CDB88(ctx, base);
-  if (n <= 96)
+  // F-148: census-only predicate extension (this hook is a peer's; behaviour is
+  // untouched). w158's DEVCLAIM stops at #96 / 12:25:15.136, 1.8 s before the
+  // entity.type opens, so the one answer F-147 needs - whether the composed
+  // a:/archive/vehicle/.../entity.type name ever reached a device's claim call -
+  // is off-screen. Print those paths at any count.
+  if (n <= 96 || std::strstr(pbuf, "entity") || std::strstr(pbuf, ".type"))
     MCLA_LOG_WARN("DEVCLAIM #{} dev={:08X} path='{}' -> r3={:08X} r4={:08X} lr={:08X}",
                   n, dev, pbuf, ctx.r3.u32, ctx.r4.u32,
                   static_cast<uint32_t>(ctx.lr));
@@ -12574,6 +12615,28 @@ PPC_FUNC(sub_821CFE80) {
                   ctx.r3.u32, ctx.r3.u32 & 0xFFu, asc, raw[0], raw[1], raw[2],
                   raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9],
                   raw[10], raw[11], tokAsc);
+    // F-148: F-147 left one thing unresolved - whether the wrapper this reader
+    // was given was actually loaded with entity.type bytes. 0x82860C40 is a
+    // *static* image-.data object from F-122's trio and is reused (BE710-SLOT
+    // has 978 firings on it), so apply F-122's own dead-wrapper test to it
+    // here: guest-native buffered shape is +0 device, +4 handle, +8 buf, +24
+    // cur, +28 end, +32 cap. Live device + end>cur means a real read happened
+    // and the problem is the body's content; a dead +0 means the guest
+    // tokenised leftovers, which is the F-127/F-128 bind-and-serve defect on a
+    // new path.
+    if (strm && strm != 0xCDCDCDCDu) {
+      uint32_t d0 = 0, h4 = 0, bf8 = 0, c24 = 0, e28 = 0, k32 = 0;
+      (void)mem.ReadU32BE(strm + 0, &d0);
+      (void)mem.ReadU32BE(strm + 4, &h4);
+      (void)mem.ReadU32BE(strm + 8, &bf8);
+      (void)mem.ReadU32BE(strm + 24, &c24);
+      (void)mem.ReadU32BE(strm + 28, &e28);
+      (void)mem.ReadU32BE(strm + 32, &k32);
+      MCLA_LOG_WARN("REALIZE-WRAP reader={:08X} wrap={:08X} dev={:08X} h={:08X} "
+                    "buf={:08X} cur={:08X} end={:08X} cap={:08X} avail={}",
+                    obj, strm, d0, h4, bf8, c24, e28, k32,
+                    (int32_t)(e28 - c24));
+    }
   }
 }
 

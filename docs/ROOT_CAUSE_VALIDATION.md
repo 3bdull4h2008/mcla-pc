@@ -3703,3 +3703,125 @@ second masking source to account for beyond `FATAL-SOFT` itself.
 **Frontier.** w157 = w156 = w155 = w154 mode and counts: `RD-SUBMIT 24`, `LISTLINE 171`,
 `C0000005 0`, `DRAW_INDEXED 0`, `Fatal error 1`, `FATAL-SOFT 1`, `TYPINIT 8`,
 `PATHMGR-OPEN 64`, `REALIZE-CAST 4`.
+
+### F-148: PROVEN at byte level - the `entity.type` member is served to the guest **verbatim as stored in `xarchive_cache.rpf`**, and the stored bytes are transformed; that is F-129's defect 2 sitting on the critical path to the menu
+
+**The chain, closed in three lines of evidence.**
+
+1. **The read happens and delivers the member's exact size.** w158 `REALIZE-WRAP`
+   (new census field, `src/gpu_device.cpp:12541`-ff) reads the wrapper F-147 identified:
+   `wrap=82860C40 dev=C60AC080 h=0 buf=82861DF8 cur=0x67|0x2B|0x06 end=0x1E2|0x1E1|0x1E0
+   cap=0x1000` - and `0x1E0`, `0x1E1`, `0x1E2` are *member sizes in the archive TOC*
+   (point 3). So the wrapper is not stale and not empty; it holds one `entity.type` body.
+   (The first `entity` request is `cur=0 end=0 avail=0` - that one call really does see
+   nothing, consistent with the tokenizer draining it before this read.)
+2. **The guest's own device path is reached, and `DEVCLAIM`'s `r3=0` is NOT a decline.**
+   Extending a peer-owned census's print predicate (census-only, `src/gpu_device.cpp:10405`
+   -ff, `n <= 96 || path contains "entity" || ".type"`) shows w159 lines #1277-#1325:
+   `DEVCLAIM #1324 dev=C60AC080 path='a:/archive/vehicle/shared_utility/sst_trail/entity.type'
+   -> r3=00000000 r4=D1163E00 lr=821CCFF0` (twice per path, the two `a:/archive/` devices).
+   The hook's own header comment states the caller loop stops on `r4 != -1`, not on `r3` -
+   `r4` is the stream object and is non-(-1), so the open proceeds. An earlier reading of
+   `r3=0` as "the device declined the file" is wrong and is not what this finding rests on.
+3. **The bytes are the stored bytes.** `build/toc_parsed.bin` (a *working* in-guest TOC dump -
+   control passes: `find trash.xrn` = 1 record, whose archive offset `0x35A042` the same soak
+   prints in `TOC76-XSF #1365`) yields **12 `entity.type` file records**, sizes
+   `0x1E5 0x1E2 0x1E1 0x1E0 0x1E9 0x1EC 0x288 0x22B 0x21E 0x225 0x21A 0x1B3`. Reading those
+   offsets straight out of `xarchive_cache.rpf`:
+
+   | member off | size | first 16 stored bytes |
+   |---|---|---|
+   | `0x32C000` | `0x1E5` | `75 50 3b 6f 83 30 10 9e 8d c4 7f 38 b1 07 db 4d` |
+   | `0x32C729` | `0x1E2` | `75 50 3b 6f c2 30 10 9e 1d 29 ff e1 94 9d 38 b4` |
+   | `0x32E767` | `0x1E1` | `75 50 4b 4f 84 30 10 3e 97 84 ff d0 70 97 16 d4` |
+   | `0x35CA43` | `0x1E0` | `75 50 cd 6e 84 20 10 3e 63 b2 ef 40 bc 57 d0 d5` |
+
+   and w157's `REALIZE-CAST` token for the matching calls:
+   `tok='uPKO.0.>....p...'` (`75 50 4B 4F 84 30 ... 30 ...`) for the `0x1E1` case and
+   `tok='uP.n.'` (`75 50 CD 6E`) for the sst_trail `0x1E0` case - **byte-identical to the
+   stored member.** F-145's "opens successfully" survives in a corrected form: the guest
+   really does get this file's body; it gets it *untransformed-by-us*.
+
+**So the missing stage, named.** `Version:` is the first token `sub_82611018` requires, the
+stored body starts `75 50 ...`, and the `.list` spans are the only members our pipeline
+expands (F-105 `MarkMemberExpanded`, F-129 defect 2). This is therefore not a shader-content
+question (F-136/F-142), not the path manager (F-144), not an allocation (F-143) and not a
+missing file: **the frontier fatal is caused by delivering `entity.type` still in its stored
+transform.** F-129 predicted exactly this and its pass condition was "locate the guest's own
+archive decode"; it is now on the critical path with a name.
+
+**Keystream fingerprint, reconfirmed on a new family** (the same signature F-129 saw on the
+effect bodies): `0x32C000` and `0x32C729` - different members, different offsets - share their
+first 4 stored bytes `75 50 3b 6f` and again bytes 5-7 (`83 30 10 9e` vs `c2 30 10 9e`), while
+everything from byte 8 diverges; every member starts `75 5x`. A position-independent repeating
+prefix cannot come from DEFLATE (which would start `78 9c`/`78 01`/`78 5e`) - it is a stream
+cipher keyed per member (or per header block), so `P1 ^ P2 = C1 ^ C2` is available offline and
+is the cheapest route to the transform. Note `0x7F000EBA` (`size 0x1B3`) is 16 zero bytes -
+either a genuinely-zero member or a hole; do not build on it.
+
+**Offline route, corrected:** `tools/rpf_offline.py find` against `build/toc_decrypted.bin`
+returns 0 records even for `trash.xrn` (control fails - that dump is not the record array the
+tool's schema assumes), while the **same tool against `build/toc_parsed.bin` is sound**. Always
+run the control before citing a `find` negative.
+
+**Frontier.** w159 (with the `DEVCLAIM` predicate extension): `RD-SUBMIT 24`, `LISTLINE 171`,
+`C0000005 0`, `DRAW_INDEXED 0`, `TYPINIT 8`, `PATHMGR-OPEN 64`, `REALIZE-CAST 4`,
+`REALIZE-WRAP 4`, `DEVCLAIM 104` (= 96 cap + 8 entity paths, by design). `Fatal error 2` /
+`FATAL-SOFT 3` - the second is `Resource '%s': %s (ptr=%p)`, i.e. this soak drew a different
+post-fatal mode (`P10-PRE 494`, as in w152/w153/w156/w157), not a new regression; the
+`skinningData` fatal is still exactly 1.
+
+### F-149: THE FIX - raw-inflating the `entity.type` members lifts the `skinningData` fatal with **nothing masked** (`Fatal error 1->0`, `FATAL-SOFT 1->0`, `SHGRP-VARS 1->0`), and exposes the next blocker: a guest null-deref at `0x821BE568` inside the parse
+
+**Change** (`src/gpu_device.cpp:537`-ff): F-105's expanded-span mechanism is
+extended from the six `.list` members to the ten `entity.type` members whose
+offset/logical-size pairs came out of the guest's own decrypted TOC dump
+(`kTypeMemberSpans`, `kExpandTypeMembersInArchive = true`), marked at the same
+place - the first archive I/O (`sub_8244F4C0` n==1 -> `MclaMarkKnownListMembers`).
+No host-written word, no gate weakened: the guest is now handed the same bytes its
+own inflate would have produced.
+
+**Proof it reaches the guest** (`build/w160.log`, 12:47:05.062, the first
+`entity` request):
+```
+REALIZE-CAST obj=8EFFF620 vt=8201302C name=8203E960 stream=82860C40 +8=1 +20=2 cur=20 cnt=9 key=82089544 flag=0 -> r3=00000001 (byte=1) buf='isreV.....)....' | tok='Version:'
+```
+The compared token is literally `Version:` and `sub_821CFE80` returns **1** where
+w155..w157 returned 0. (`buf` reads `isreV` because the tokeniser stores into
+`reader+count` with `count` descending - same reversal F-147 saw as `50 75` vs
+`75 50`.) `MEMBER-EXPAND-MARK-TYPE` prints 10 lines; `MEMBER-EXPAND` 47 -> 51.
+
+**Frontier moved, measured against `w159` (same mode: `RD-SUBMIT 24`,
+`LISTLINE 171`):**
+
+| marker | w159 | w160 |
+|---|---|---|
+| `Fatal error` | 1 | **0** |
+| `FATAL-SOFT` | 1 | **0** |
+| `SHGRP-VARS` (the skinningData raise) | 1 | **0** |
+| `TYPINIT` lines | 8 | 1 |
+| `REALIZE-CAST` | 4 (all r3=0) | 1 (**r3=1**) |
+| `C0000005` | 0 | **1** |
+| `VEH-NEUTRAL` | 0 | **1** |
+| `PRESENT` / `NATIVE-PRESENT` / `CP-DRAW` / `GETDEV` / `DRAW_INDEXED` | 34 / 4 / 166 / 694 / 0 | unchanged |
+
+`Fatal error 0` + `FATAL-SOFT 0` together for the first time since `w138` means
+B5's third criterion (no soft-fatal masking) is met at this instant, and F-136's
+"content wall" (withdrawn by F-142) is now definitively dead: the variable the
+guest asked for was never the problem - the file describing it was compressed.
+
+**New blocker, named honestly.** The one AV:
+```
+Vectored exception: code=0xC0000005 addr=0x7ff7722ea05d rva=0x8FA05D Param[1]=0x7E780000
+rip owner=guest 0x821BE568 (host+0x31D)  ppc r1=8EFF1800 lr=821BE5F4 r3=0 r4=0 r5=0 r8=82860000 r13=8F200000
+probe y=00000000 -> off32=0x7E780000 == Param[1] (base contributed 0)
+```
+`0x7E780000` is where guest address **0** lands, so the guest itself dereferenced a
+null object pointer at `0x821BE568` - inside `sub_821BE250`'s read/copy region, i.e.
+in the same buffered-stream code F-122 root-caused. It is VEH-neutralized and the
+boot continues (the log runs 22 s past it), but only one of the four entity
+registrations is ever entered (`TYPINIT` 8 -> 1 line, no `-RET`), so type
+registration stops there. **`C0000005 0` is the invariant this breaks, and it is
+the next thing to root-cause** - not paper over: `r3=r4=r5=0` at entry to that
+block says the caller passed nothing, so the question is which caller handed a null
+to the read of the now-parseable `entity.type` body.
