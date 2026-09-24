@@ -10,7 +10,7 @@ Xbox 360 (Xenon) → PC emulator: XenonRecomp static PPC→C++ recompiler + D3D1
 2. `docs/HANDOFF_NEXT_AGENT.md` — live block + session ledger (what the last session actually saw).
 3. `docs/PROGRAM_GUIDE.md` on demand — §3 build/run gotchas, §4 guest image, §5 recompiler pipeline,
    §7 host short-circuit table, §9 log-marker inventory, §11 forbidden paths.
-4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-122` (whole again on
+4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-123` (whole again on
    E: since the 09-23 merge; `C:\mcla-pc\docs` is archive only — see rule 6).
 
 Older status text anywhere else = trail, not truth. Pre-compression doc text: `git show 8f07a39:docs/<file>`.

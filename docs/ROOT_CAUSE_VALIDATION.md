@@ -2956,3 +2956,67 @@ same site, which is the strongest reason to fix it rather than route around it.
 **Correction to F-121 (dated 09-24 06:5x).** F-121 said the 50 faults were "access violations inside a guest `memcpy` at `lr=0x821BE508`" and hypothesised the guest copying from data `kDiscChkForcedAck` had pretended was resident. Two parts of that were wrong and the third is now moot: (a) `lr=0x821BE508` is not a copy site — `generated/ppc_xenon/ppc_recomp.14.cpp:24496` sets that LR for `li r5,1; addi r4,r1,80; bl 0x821be250`, i.e. a **one-byte** read whose destination is a stack slot (which is why `count=1` and `dst=8EFFF100`); (b) the copy that faulted was `MemoryStreamServeRead`'s, i.e. host code called from our hook, reached *before* the guest body could set its own LR; (c) with the shape mismatch named, F-121's `kDiscChkForcedAck` hypothesis is not needed for this site. F-121's T41.5d test did run and its result stands as recorded in the `kExpandListInArchive` comment: seam OFF (`w112`) removes the faults only because the guest never reaches the read — `LISTLINE 167 → 2` and the `'…wasn't preloaded properly'` fatal returns — so seam ON remains the committed frontier.
 
 **Next (T41.6b), narrowed to one address.** `0x82860C68` sits 0x50 past the wrapper our post-open serve does bind, and arrives with `[+0]=0` and `[+4]=FFFFFFFF`. Either bind that sibling at the same site with the guest-native fields (buffer `[+8]`, cursor `[+24]`, end `[+28]`, cap `[+32]=0x1000`) so the guest's own `sub_821BE250` serves it, or hand it to the guest body with a live device pointer. That is F-121's "ask who was supposed to write it", now pointed at one object instead of a fault.
+
+### F-123 — **The `.fxc` shader bodies are missing because the guest's own Open answers `1` (pending) and our host-serve only fires on `0`; making it fire does clear the read storm — and then breaks the boot a different way, which pins the next question. Also: F-122's "w114 was I/O contention" verdict was wrong, and the real hazard is a bimodal soak.**
+
+- Task:        T41.7 / T41.7b (B4 feed, B3 conversion direction), `build/w117.log` (the measurement) + `build/w116.log`/`w118.log`/`w119.log` (stalled) vs baseline `build/w115.log`
+- Type:        FACT + a refuted implementation attempt (reverted) + a dated correction to F-122
+- Class:       E (device/archive serve path) + H (soak reliability / attribution)
+- Priority:    P1 — this is the fork that decides whether the UI shaders can ever load, and the hazard that decides whether any single soak is citable
+
+**(1) The measured fork at the guest's Open.** Counting every printed `XSF-OPEN … ret=` in `w115`:
+`ret = -1` × 332, `ret = 0` × 33, `ret = 1` × 876 (498 of them `*.fxc`). The host-serve block
+(`src/gpu_device.cpp:11199`) fires only on `ret == 0`, so exactly the 33 successful opens get a body —
+`XSF-POSTOPEN-SERVE` prints 33 times, all `.xsf`/`.list` paths — and every shader answer gets nothing.
+The consequence chain is fully logged, one file at a time (`shaders/ui/fxl_final/AlphaModulate.fxc`):
+`BE8D8-PACK-MISS #3 … tocEntry=C60F7F90 toc+4=00000C62 (no served body)` → `CD3C8 ret=3170` (the size
+is known) → `DISCCHK2 #23 … route=guest-disc-read` → the guest allocates its own buffer
+(`MEMFMT-sub_821CB740 r5=CA5DF680`) and re-opens it as `BE0C8 pth='memory:$CA5DF680,3170,1:unavailable'`
+— the literal word **`unavailable`** comes from the guest, not from us — → `SLOT-REG idx=3` /
+`BE0C8-RET stream=3` → then ~600 one-byte reads (`BE250-MEM-BADPTR`, F-122's instrument) on a wrapper
+whose `[+4]` handle is `0xFFFFFFFF`. So the read storm F-122 stopped is the *symptom*; the cause is that
+the pending opens never receive a body.
+
+**(2) T41.7 — serve the pending opens too. Both predictions hit, and the boot broke anyway.** With
+`serveThisOpen = (ret == 0 || ret == 1)` (`w117`, 11,137 lines): `BE8D8-PACK-MISS 21 → 0`,
+`BE250-MEM-BADPTR 600 → 0`, `XSF-BIND-REGONLY`/`XSF-OPEN-PEND` confirm one inflate per TOC entry.
+But `LISTLINE 167 → 1`, `Fatal error 0 → 1`, `FATAL-SOFT 0 → 1`, and the decisive line: the guest's own
+Open answer for `AlphaModulate.fxc` **changed from 1 to 2** (`XSF-OPEN #68 … ret=2` immediately followed
+by `Fatal error dispatcher invoked`, `fatal-dispatch regs: lr=0x8218C864`). So the serve is not inert —
+the writes it performs are read back by the guest and alter its state machine.
+Reverted; `src/` is back at `7c125b4`.
+
+**(3) What that pins.** Two guest-visible writes live in that block: `WriteU32BE(tocEntry + 4, xsz)`
+(publishing the served size over the TOC record's size dword) and the `kBdf20Wrap = 0x82860C18`
+`{dev, handle}` bind (which points the *global* BDF20 stream wrapper at whichever file was served
+last — the same loose-match hazard §7 already registers for the `(dev,handle)` fallback, and the
+likely reason the preload lists went from 167 lines to 1). Registering the body alone should be
+harmless, because the guest already reads the size from `[tocEntry+4]` itself — `TOC76-LAYOUT #105`
+shows `+4=[00000C62 …]` in the guest's copy with no help from us. **T41.7b** (registration only,
+`return` before both writes when `ret != 0`) is written but **unmeasured**: the three soaks run after it
+(`w116`, `w118`, `w119`) all hit (4) below, so it neither passed nor failed — do not treat it as
+validated. Re-run it when the harness is trustworthy; if it holds `LISTLINE 167` and `Fatal 0` while
+`BE8D8-PACK-MISS` stays 0, it converts F-112's forced-ack direction into delivered bytes for shaders.
+
+**(4) Correction to F-122's control claim (dated 09-24 07:35).** F-122 recorded that `w114` (920 lines,
+`TOC76 0`, `GETDEV 12`) was host I/O contention, proven because the *same exe* produced `w115`. That
+explanation is now refuted by repetition: `w116` (920), `w118` (903) and `w119` (912) all stall at the
+identical site, on binaries that also produced full boots (`w115`, `w117`). The site is the fourth disc
+read — `RD-SUBMIT sub_8244F4C0 #4 a0=C60B7680 a1=C60B7780 a2=0005D800` /
+`NFS-CENSUS[Read] #0006 h=C60B7680 len=382976 off=0x800 evt=00000000 apc=00000000` (no event, no APC) —
+after which only `RenderThread: queue depth …` lines appear for the remaining ~70 s. The volume is fine
+(128 MB/s sequential read, 32 MB write+fsync in 1.16 s, `git hash-object -w` clean), and
+`queue depth` warnings occur in the good soaks too, so neither disk nor a full render queue explains
+the bimodality. **What is true:** this boot has a reproducible early stall at the 382,976-byte TOC read
+that hits roughly half the runs, and the read is submitted with `evt=0`, so completion depends on a poll
+we do not currently observe. **Consequence for method (this is the load-bearing part of the finding):**
+a single soak is not citable in this state — every claim needs either a repeat or the
+`LISTLINE`/`CP-DRAW`-nonzero signature that distinguishes a real frontier from a stalled run. F-122's
+`w114`-vs-`w115` control established its conclusion by accident, not by diagnosis. **The crisp
+discriminator that came out of it:** `RD-SUBMIT` separates the modes exactly — `w116`=4, `w118`=4,
+`w119`=4 (all stalled, `LISTLINE` 0) versus `w115`=24, `w117`=24 (reached the frontier). `RD-SUBMIT == 4`
+means the soak is void before any conclusion can be drawn from it; `>= 24` means the guest got past the
+archive TOC read.
+
+**(5) Untouched by all of this:** `DRAW_INDEXED` is still 0 in every run, good or stalled, so B4's gate
+remains unmet. The stalled soaks also never reach `LISTLINE`, so they cannot be used to judge anything.
