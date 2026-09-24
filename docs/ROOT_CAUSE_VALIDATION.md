@@ -4232,3 +4232,48 @@ The boot is parked in `NtDelayExecution` on a 30 ms poll (`WAIT[KWFSO] ... reaso
 (`pub=11 put=11`, `drains=8`). So the blocker between this frontier and a rendered menu is no longer
 "the renderer is fed zeros" - it is **why the guest stops submitting anything**, and B4's gate is
 only reachable through that.
+
+
+### F-160: the guest's own slot-release routine is decoded, was **never called** by anything until now, and routing our one consumption point through it is frontier-neutral but does NOT retire the recycle mitigation (6 releases vs 173 bodies served)
+
+- Task:    B3-style mitigation retirement on the F-135 slot table; builds `w167` (census only) and `w168` (the change)
+- Type:    FACT + FIX (emulation replaced by the discovered mechanism)
+- Class:   E (filesystem/device)
+- Priority: P1
+- Evidence: raw words at `0x821CB2A0` in `build/cache/mcla_pe.bin` (offset `0x1CB2A0`, listed below); `src/gpu_device.cpp:12727`-ff (the new census hook), `:12153`-ff (the replaced clear); `build/w167.log`, `build/w168.log`
+
+**Decode.** `sub_821CB2A0(r3=wrapper, r4=h)`: `cmpi cr6,r4,0` + `bc 12,24` reject, `cmpi cr6,r4,16` +
+`bc 4,24` reject - so **the 16-entry bound is the guest's own**, not our `kGuestSlotCount`; then
+`rlwinm r11,r4,sh=4` (h*16) + `lis r10,8286` / `addi r10,r10,1856` = `0x82860740` (again confirming
+F-157's phantom refutation), `lwzx r9,r11,r10` / reject if `[entry+0]==0`, `lbz r11,12(r31)` / if the
+**flag byte is non-zero** call `821BBEA8`, `lwz r3,0(r31)`, `82130588`, `821BBF00` (a free), and
+finally `li r11,0 / li r3,0 / stw r11,0(r31)` - the only store in the image that releases a table
+entry - then the epilogue. It is a **Close**, which corrects F-135/F-153's "device Seek at vtable+44".
+
+**w167 (census only, installed first per rule 1).** `SLOT-CLOSE` = **0 lines**, and the census is
+provably frontier-neutral: `LISTLINE 171`, `TYPINIT 1`, `C0000005 1`, `SEEK-DEAD 1`, `GETDEV 694`,
+`BE0C8 358`, `CP-DRAW 166`, `PRESENT 34`, `RD-SUBMIT 24`, `SLOT-REG 24`, `SLOT-RECYCLE 30`,
+`SLOT-RECYCLE-SHARED 24`, `[error] 42` - every one identical to `w161`. So the 15-entry leak that
+F-135's two recycle tiers exist to cover is not the guest being slow to close; **nothing calls the
+close at all on host-served bodies**. Our `sub_821BE8D8` host path had been *emulating* the release
+with a hand-written `mem.WriteU32BE(slot + 0, 0)` (`:12154-12155`, comment: "guest close semantics:
+CB2A0 clears the slot").
+
+**The change (w168).** That hand-written clear is replaced by a call through the guest's own routine:
+`ctx.r1` is moved down 256 bytes first (the routine stores LR at `-8(r1)` and r31 at `-96(r1)`
+*before* its own `stwu`, so it must not inherit the caller's live frame), `r4 = h`, call, restore
+`r1`/`r4`. The flag byte stays 0, so the routine's free path is not taken and our buffer survives.
+
+**Positive control passed.** `BE8D8-CLOSE #1 h=1 slot=82860750 entry0_after=00000000` and
+`SLOT-CLOSE #1 r3=82860C18 h=1 slot=[buf=827D2DD0,size=5258,pos=0,flag=00] lr=8218C804` - the hook is
+live, the entry really is cleared by guest code, and `lr=8218C804` is the same site F-135 named as
+the open-success check after `BE8D8`. `SLOT-CLOSE` fires **6** times per boot (1 ours + 5 that only
+appeared once the first release let the walk continue), against **173** `BE8D8-HOST` bodies served.
+
+**Stated plainly: the mitigation is still load-bearing.** `SLOT-RECYCLE 30`,
+`SLOT-RECYCLE-SHARED 24`, `SLOT-TABLE-FULL 0` are all unchanged from `w167`/`w161`, and every other
+frontier marker is identical - so this retires one *emulation* and proves the mechanism exists, but
+it does not yet retire F-135/F-135b. Doing that needs the release to happen for every consumed body
+(the `sub_821BE250`/`SlotTableServeRead` path and the `PACK` path, not just the memory-device host
+path), and `pos` reaching `size` is not currently tracked for most bodies (F-135b measured that the
+`pos >= size` test recycled only 1 of 15 slots).

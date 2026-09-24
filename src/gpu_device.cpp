@@ -12151,8 +12151,30 @@ PPC_FUNC(sub_821BE8D8) {
           done += chunk;
         }
         if (ok) {
-          // Slot consumed (guest close semantics: CB2A0 clears the slot).
-          mem.WriteU32BE(slot + 0, 0);
+          // F-160: release the consumed slot by calling the guest's OWN close
+          // routine (sub_821CB2A0, the entry we install at memory-device
+          // vtable+44) instead of writing 0 to [entry+0] by hand. Decoded from
+          // build/cache/mcla_pe.bin, that routine's `stw r11,0(r31)` is the only
+          // thing in the image that frees a table entry, and w167 measured
+          // SLOT-CLOSE firing 0 times - nothing calls it, which is why the
+          // guest's 16-entry table leaks and why F-135's SLOT-RECYCLE tiers were
+          // ever needed. We borrow the caller's frame, so r1 is moved to a
+          // scratch window first (the routine saves LR at -8(r1) and r31 at
+          // -96(r1) BEFORE its own stwu) and restored after. The flag byte stays
+          // 0, so the routine's free path (taken only when [entry+12] != 0) is
+          // not entered and our buffer survives.
+          const uint32_t r1In = ctx.r1.u32;
+          const uint32_t r4In = ctx.r4.u32;
+          ctx.r1.u32 = r1In - 256u;
+          ctx.r4.u32 = h;
+          sub_821CB2A0(ctx, base);
+          ctx.r1.u32 = r1In;
+          ctx.r4.u32 = r4In;
+          uint32_t entry0 = 0xFFFFFFFFu;
+          (void)mem.ReadU32BE(slot + 0, &entry0);
+          if (n <= 24 || (n % 200) == 0)
+            MCLA_LOG_WARN("BE8D8-CLOSE #{} h={} slot={:08X} entry0_after={:08X}",
+                          n, h, slot, entry0);
           const uint32_t st = MakeMemoryStream(kMemDeviceObj, dst, ssize);
           MCLA_LOG_WARN("BE8D8-HOST #{} obj={:08X} h={} buf={:08X} size={} "
                         "dst={:08X} stream={:08X}",
@@ -12711,6 +12733,39 @@ PPC_FUNC(sub_821BE568) {
                   obj, dev, h, cur, en, cap, pos, lrIn);
   }
   __imp__sub_821BE568(ctx, base);
+}
+
+// F-160 census: the guest's OWN handle-release routine. Decoded from
+// build/cache/mcla_pe.bin at 0x821CB2A0: reject h < 0 or h >= 16
+// (cmpi 0 / cmpi 16 at 821CB2B0-821CB2BC - so the 16-entry bound is the guest's,
+// not our constant), index 0x82860740 + h*16 (rlwinm sh=4 then
+// `lis 8286 / addi 1856` at 821CB2C0-821CB2C8), reject when [entry+0] == 0, and
+// when the BYTE at [entry+12] is non-zero call 821BBEA8/82130588/821BBF00 on
+// [entry+0] (a free), then unconditionally `stw r11,0(r31)` with r11=0 and
+// return 0. That last store is the only thing in the image that releases a
+// slot. So if this never fires for a host-served handle, the leak that F-135's
+// SLOT-RECYCLE tiers paper over is entirely ours.
+// Read-only census (rule 1): prints state, calls the original through.
+PPC_FUNC_IMPL(__imp__sub_821CB2A0);
+static std::atomic<uint32_t> s_hCB2A0{0};
+PPC_FUNC(sub_821CB2A0) {
+  const uint32_t n = s_hCB2A0.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t h = ctx.r4.u32;
+  uint32_t buf = 0, size = 0, pos = 0, flag = 0;
+  if (h < kGuestSlotCount) {
+    const uint32_t slot = kGuestSlotTable + h * 16;
+    (void)mem.ReadU32BE(slot + 0, &buf);
+    (void)mem.ReadU32BE(slot + 4, &size);
+    (void)mem.ReadU32BE(slot + 8, &pos);
+    (void)mem.ReadU32BE(slot + 12, &flag);
+  }
+  if (n <= 40 || (n % 500) == 0)
+    MCLA_LOG_WARN("SLOT-CLOSE #{} r3={:08X} h={} slot=[buf={:08X},size={},"
+                  "pos={},flag={:02X}] lr={:08X}",
+                  n, ctx.r3.u32, h, buf, size, pos, flag & 0xFFu,
+                  static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821CB2A0(ctx, base);
 }
 
 // Stream read: [obj+0] must be a live device. Dead wrapper â†’ serve bytes from
