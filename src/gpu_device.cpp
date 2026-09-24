@@ -10824,7 +10824,7 @@ PPC_FUNC(sub_821CBFC0) {
     // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
     // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
     // is the open question, not the transform. See F-105.
-    constexpr bool kExpandListInArchive = false;   // ON => w80/w82/w84/w86 branch, see F-108
+    constexpr bool kExpandListInArchive = false;   // ON => w80..w88 branch, see F-109
     if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
         w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
       mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);
@@ -11779,11 +11779,19 @@ PPC_FUNC(sub_821BE8D8) {
         }
         if (ok) {
           const uint32_t st = MakeMemoryStream(kMemDeviceObj, dst, ssize);
+          // T41.3t (F-107 follow-on): five of five list bodies are delivered but
+          // only two groups yield lines, so print what the loader was actually
+          // handed — text or stored bytes — next to the path.
+          char vis[33] = {0};
+          unsigned char raw[32] = {0};
+          (void)mem.ReadBytes(dst, raw, ssize < 32u ? ssize : 32u);
+          for (int k = 0; k < 32; ++k)
+            vis[k] = (raw[k] >= 32u && raw[k] < 127u) ? (char)raw[k] : '.';
           MCLA_LOG_WARN("BE8D8-PACK #{} obj={:08X} dev={:08X} vt={:08X} h={} "
                         "tocEntry={:08X} path='{}' sbuf={:08X} size={} "
-                        "dst={:08X} stream={:08X}",
+                        "dst={:08X} stream={:08X} head=[{:08X}] ascii='{}'",
                         n, obj, dev, vt, h, tocEntry, body.path, body.buf,
-                        ssize, dst, st);
+                        ssize, dst, st, MclaBE(raw), vis);
           ctx.r3.u32 = st;
           return;
         }
