@@ -2738,3 +2738,78 @@ there is no `reg_base.h` and no `REG_OFFSET` macro, so the offset enum must be l
 decode the VB/IB + float-constant state from the register file instead of from `[r5]`, and bind that
 into the CBV at `src/d3d12_backend.cpp:1462`. Not a mitigation: this completes the decode the plan
 names. `DRAW_INDEXED` must stay 0 until a real constant bank exists, so nothing was widened here.
+
+### F-117 — **The boot's last fatal was manufactured by our own host-synthesized call into the guest's fixup walker.** Retiring that fabricated execution gives the first soak in this project's history with `Fatal error 0` and `FATAL-SOFT 0` (`w107`), and triples CP draw traffic (`CP-DRAW 52 → 166` lines). The frontier is now a *wait*, not a death: the guest parks in a 30 ms kernel-object loop on `obj@40004D7C` (`lr=8242FC1C`).
+
+- Task:        T41.4d (B4 precondition / B5 criterion 3), `build/w107.log` vs baseline `build/w103.log`; commit `5094d56`
+- Type:        FIX (removal of host-fabricated execution — not a mitigation, nothing is masked)
+- Class:       H (our own instrumentation/host artifact) + D
+- Priority:    P0
+- Evidence:    chain in `build/w103.log` line-for-line — `6204 W30-ARR-FIX obj=B7B41000 arr=00000000->B7B6D9B4 n=1 cnt 0->1 vt0=82085364` → `6328 W30-PLACE obj=B7B41000 arr=B7B6D9B4 — re-dispatch 825EF100 after ARR-FIX` → `6464 P5-MISSFIX #1 … lr=8260A8B0 r13=8F200000` → `14607 P5-MISSFIX #17 … old=B7B6D9B4` → `14609 P9-B588 #3 node=B7B6D9B4 type=B7 [0]=B7982758` → `14613 fatal message: 'swfCMD::Fixup - unknown type %d'` → `14683 W30-PLACE-DONE arr=B7B6D9B4 [arr]=B7982758 cnt=2`. Code: `src/gpu_device.cpp:4560` (`arrSlot = 0xB7B6D9B4u`, hard-coded), `:4594-4596` (publishes it into `obj+12`), `:4601-4616` (synthetic `PPCContext p{ r1=0x006D8EC0, r13=0x8F200000 }` then `place(p, base)`); the guest's own reading of that field is `generated/ppc_xenon/ppc_recomp.122.cpp:34186-34193` (`lwz r4,0(r29)` → `bl 0x8260b588`), and `sub_8260B588`'s discriminator is `type = u8[node+4]` (`src/task_dispatch_trace.cpp:434-445`).
+
+**Mechanism.** `W30-ARR-FIX` treats `obj+12` as "pointer to a child array" and writes an address it
+hard-coded from a 15-day-old `w9` RSC-REBASE observation. The guest's consumer treats `obj+12` as a
+**node pointer**, so the fixup dispatcher dereferences `B7B6D9B4` as a command node and reads its type
+from `[node+4]` — which is the top byte of the array entry *we* stored there. `0xB7` is therefore a
+byte of our own pointer, printed by the game's `%d`. Then `FATAL-SOFT` masked it and paused the thread,
+which is why every log up to `w103` recorded this as a game-side fatal. Crucially the walker only runs
+at all because `W30-PLACE` **re-enters guest code** (`sub_825EF100`) on a hand-built context: the guest
+never reaches that path with `obj+12 != 0`. That is fabricated execution of the same class whose
+removal an earlier session recorded for the VEH RIP-advance recovery (PLAN_VMX128 risk R5), so the
+execution was deleted rather than its symptom masked (rule 1).
+
+**Measured after the removal** (`w107`, 120 s, log md5 `ee217a7045ac` stable across two fresh reads):
+`Fatal error 1 → 0`, `swfCMD 2 → 0`, **`FATAL-SOFT 2 → 0`** — B5's third acceptance criterion, met by
+deletion rather than by a switch. Frontier-preserving: `LISTLINE 167`, `'not preloaded properly' 0`,
+`-GATE 582` vs `588`, `NATIVE-PRESENT 4`, `PRESENT-FB 4`, `CP truth pub=11 put=11 (caught up)`,
+`DRAW_INDEXED 0`. Activity rose: `CP-DRAW 52 → 166` lines, `WAKE +95`/`WAIT +96`, host short-circuit
+lines `704 → 690`.
+
+**The new frontier is a wait, not a crash.** `w107`'s last 400 lines are 199 copies of
+`WAIT[KWFSO] … obj@40004D7C reason=3 to=30ms lr=8242FC1C put=11 rptrWB=001F wb@C71D82BC=0000001F`
+each preceded by a `WAKE`, i.e. the guest is being *timed out* rather than signalled, from the same
+`lr` that owns the CP writeback (`wb@C71D82BC` is the swap-table/writeback family `NATIVE-PRESENT`
+also reports). No `XamInput*`/menu activity appears (`xaminput 0`, `menu 0`). So the next blocker is
+**who is expected to satisfy `0x40004D7C`** — a vsync/interrupt-style event we appear to service only
+by expiry. That is the concrete next question for B4's `DRAW_INDEXED ≥ 1` gate, and it is consistent
+with the F-116 correction below: the guest has not yet programmed vertex/index buffers.
+
+**Artifact caveat, recorded because it changed what is citable.** The first run of this configuration
+(`w105`) was written while the E: volume's flush path was failing; after `taskkill /F` its log became
+`OSError 22`-unreadable, later "readable" with a *different* byte count and inconsistent marker counts
+(`LISTLINE 1`, `star_glow 0` against `167`/`58` reported by the census that had read it while the
+buffer was still live). **`w105` is therefore void and nothing here cites it**; `w107` is a clean
+re-run reproducing the same numbers, and `soak_census`/`grep` counts should be treated as unreliable
+for any log whose size changes between reads.
+
+## Correction to F-116 (dated 09-24 05:55, from the register table — supersedes F-116's naming, not its measurement)
+
+F-116 read `r01DD=071D8380`/`r01DC=00020037` as "a surface pair … where the drawn frame lands".
+Naming the batch's ids against `.research/xenia/src/xenia/gpu/register_table.inc` refutes that (the
+`0x0081` seen in the batch has no entry in that table, so it is not named here):
+
+| id | Xenia name | `w104` value |
+|---|---|---|
+| `0x01DC` / `0x01DD` | `SCRATCH_UMSK` / `SCRATCH_ADDR` | `00020037` / `071D8380` |
+| `0x057C` | `CALLBACK_ADDRESS` | `0BADF00D` |
+| `0x05C8` | `WAIT_UNTIL` | `00020000` (×3) |
+| `0x0A2F`/`30`/`31` | `COHER_SIZE_HOST`/`COHER_BASE_HOST`/`COHER_STATUS_HOST` | `00801000` / `061D8000` / `01000000` |
+| `0x0A02`…`0x0A05` | `UNKNOWN_0A02`…`0A05` | `C0100000 07F00000 C0000000 00100000` |
+| `0x0C85` | `PA_CL_ENHANCE` | `00000003` |
+| `0x0D00`/`0x0D01`/`0x0D02` | `SQ_GPR_MANAGEMENT` / `SQ_FLOW_CONTROL` / `SQ_INST_STORE_MANAGMENT` | `00040401` / `04000000` / `00010800` |
+| `0x0E42` / `0x0F01` | `UNKNOWN_0E42` / `RB_BC_CONTROL` | `00001F60` / `0000200E` |
+| `0x2082` | `PA_SC_WINDOW_SCISSOR_BR` | `00100010` |
+| `0x2100` | `VGT_MAX_VTX_INDX` | `0000FFFF` |
+| `0x2180` | `SQ_PROGRAM_CNTL` | `1000000E` |
+| `0x2204`/`05`/`06` | `PA_CL_CLIP_CNTL` / `PA_SU_SC_MODE_CNTL` / `PA_CL_VTE_CNTL` | `00010000` / `00010000` / `00000300` |
+| `0x2208` | `RB_MODECONTROL` | `00000004` |
+| `0x2280`/`0x2302`/`0x2312` | `PA_SU_POINT_SIZE` / `PA_SU_VTX_CNTL` / `PA_SC_AA_MASK` | `00080008` / `00000004` / `0000FFFF` |
+
+So the batch is CP housekeeping (`SCRATCH_*`, `WAIT_UNTIL`, `COHER_*`, `CALLBACK_ADDRESS`) plus a
+*shallow* 3D control set (window scissor, clip, point size, VTX/VTE_CNTL, `RB_MODECONTROL`) — and **no
+vertex- or index-buffer base register appears anywhere in it**. That absence is measured, not a cap
+artifact: the trace ring holds the last 64 pokes and only 54 existed at draw #1, so all of them were
+visible. F-116's headline ("the AUTO draw's 3D state IS in the file") is therefore only true of draw
+*controls*; the buffer addresses are not there, which means `DRAW_INDEXED ≥ 1` requires the guest to
+reach real scene setup — per F-117 now gated behind the `40004D7C` wait — and not merely a decoder on
+our side. `r057C = CALLBACK_ADDRESS = 0BADF00D` is unexplained and is its own open item.
