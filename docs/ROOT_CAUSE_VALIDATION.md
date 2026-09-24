@@ -2813,3 +2813,48 @@ visible. F-116's headline ("the AUTO draw's 3D state IS in the file") is therefo
 *controls*; the buffer addresses are not there, which means `DRAW_INDEXED ≥ 1` requires the guest to
 reach real scene setup — per F-117 now gated behind the `40004D7C` wait — and not merely a decoder on
 our side. `r057C = CALLBACK_ADDRESS = 0BADF00D` is unexplained and is its own open item.
+
+### F-118 — With the fatal gone the frontier is a **thread stall, and it is pre-existing**: `w103` and `w107` both end with ~2.6 k identical GPU-worker waits and `swaps=0` for the whole run. Also fixed a sampling instrument that hid this: `PARK-SAMPLE` printed only when the host RIP *changed* and only for the first 60 s, so a permanently parked main thread looked like silence.
+
+- Task:        T41.5a (B4/B5 — what blocks the guest after the fatal lifted), `build/w107.log`, `build/w108.log` vs `build/w103.log`
+- Type:        FACT + FIX (instrument only; log-only change, no guest-visible behaviour)
+- Class:       H (instrument artifact) + D (thread/kernel behavior)
+- Priority:    P0 — this is the blocker now standing between the frontier and a rendered menu
+- Evidence:    `build/w107.log` `THREAD-CREATE #12 start=8242FB88 ctx=40004D5C … lr=82460348`, `#13 start=8242FB88 ctx=40004DAC`, 13× `THREAD-CREATE start=821C91C8 ctx=8285FEA8|8285FED4 flags=00000001`; `WAIT[KWFSO] … obj@40004D7C reason=3 to=30ms lr=8242FC1C put=11 rptrWB=001F wb@C71D82BC=0000001F` ×2,716 (`w103` ×2,620 — same loop, same counts order, and **`swaps=` never leaves 0 in either**: `RING: ctx+30=C62D84BC ctx+38=C635841C head=00000000 00000000 rptrWB=00000000 drains=8 swaps=0`, `CP: VDRAIN-CENSUS #2500 … doorbells=8 drains=8 swaps=0`); `WAITHELP` stops at `#88` (05:50:43) although its cap is `n <= 400`, so the instrumented waits genuinely ended; `w108` `PARK-SAMPLE rawrip=7ff7b0489021 … vbl=1` ×57 of 122 samples, last at 06:03:08 (i.e. ~2 min after boot start). Code: sampler defect at `src/boot_host.cpp:1518` (loop bound `i < 120`, 500 ms) and the dedup `if (!ok || tc.Rip == lastRip) continue;` at `:1541`.
+
+**What the guest is doing.** After the F-117 fix the boot reaches a stable configuration: 15 guest
+threads exist, of which 13 run `sub_821C91C8` (a worker pool created with `flags=1`) and 2 run
+`sub_8242FB88` — which I read as the CP/queue consumer: it waits on the event embedded at
+`[[wait_block]+0] + 44` (hence `obj@40004D7C` = `0x40004D50+44`), with a 64-bit relative timeout of
+`0xFFFB6C20` = −300,000 × 100 ns = **30 ms**, and re-loops while `[wait_block+56] ==
+[wait_block+60]` (empty queue). So the visible tail of the log is *idle workers timing out*, not the
+main thread. The main thread is not in `sub_82135DC0` (that census stopped firing at 05:50:43) and not
+in `sub_82460270`; `PARK-SAMPLE` now shows it sitting on one host RIP for minutes, with guest frames
+resolving to `0x82131008` (the `0x8213xxxx` kernel-wait block) and `0x8244D150`.
+
+**Why this is a plateau and not a regression.** `w103` (fatal present) and `w107` (fatal removed) share
+the identical end state — same wait object, same two `start=8242FB88` workers, `swaps=0`, `drains=8`.
+So F-117 deleted a fatal *and its `FATAL-SOFT` pause* without losing progress; the thing that has
+always stopped a rendered menu is that **no buffer swap is ever requested and the main thread waits
+indefinitely** — which is where B4/B5 must now work.
+
+**Instrument lessons (both are rule 19 about our own tooling):**
+1. *A change-gated printer cannot evidence absence.* `PARK-SAMPLE` skipped every sample whose host RIP
+   equalled the previous one, so the single most diagnostic state — a thread that stops moving — was
+   exactly what it never printed. Fixed: the loop now runs 600 × 500 ms and prints every 4th sample
+   (2 s heartbeat) regardless of change (`src/boot_host.cpp:1512-1548`); `w108` shows 122 sample lines
+   spanning the whole soak where `w107` stopped at 05:50:44.
+2. *Host RIPs are not nameable in this build.* `build/mcla.pdb` does not exist (link emits no PDB), so
+   `llvm-symbolizer --obj=build/mcla.exe 0x59021` returns `??` and the log prints `nf=host 0x…`. Naming
+   the parked host function needs either a PDB-reachable link or a `.map`; until then host-side
+   stall claims must be phrased as RVAs, not functions.
+3. *Caveat for anyone reading `w108` as a frontier:* the heartbeat suspends/resumes the boot worker
+   every 500 ms for the whole run, and `w108` vs `w107` does show timing-sensitive markers moving
+   (`PAGESLOT 9 → 0`, `JOIN 34 → 10`, `INFLATE 358 → 301`). Use `w107` (2-second-capped sampler) for
+   frontier claims and `w108`-style logs only for thread-state questions.
+
+**Next step (T41.5b), stated as a question with an instrument for it:** name what the main thread waits
+on by dumping its *guest* stack chain (the sampler already has `Rsp`, `g_faultCtx->lr`, and the saved
+`lr/r30/r31` slots) every heartbeat, and resolve the innermost guest return address to a mapped
+`PPC_FUNC` — then ask who is supposed to satisfy that wait, and whether that is the same thing the 13
+`sub_821C91C8` pool workers are waiting for.

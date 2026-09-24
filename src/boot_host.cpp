@@ -1515,7 +1515,12 @@ void Start(uint32_t entryGuest)
             // the histogram quantifies which accessor dominates).
             std::unordered_map<uint32_t, uint32_t> hist;
             uint32_t samples = 0;
-            for (int i = 0; i < 120 && !g_bootDone.load(); ++i)
+            // T41.5a: the old bound was 120 x 500ms = 60s, and a line printed
+            // ONLY when the host RIP changed -- so a thread parked in one place
+            // for the rest of the boot produced total silence that read like
+            // "not stalled" (rule 19). Run for the whole soak and heartbeat
+            // every 4th sample (2s) even when the RIP is unchanged.
+            for (int i = 0; i < 600 && !g_bootDone.load(); ++i)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 CONTEXT tc;
@@ -1538,9 +1543,15 @@ void Start(uint32_t entryGuest)
                         ++hist[uint32_t((tc.Rip - g_moduleBase) >> 4)];
                 }
                 ResumeThread(workerHandle);
-                if (!ok || tc.Rip == lastRip)
+                // T41.5a: print when the host RIP moves AND as a 2 s heartbeat,
+                // so "the boot worker has not moved for 60 s" becomes a visible
+                // repeated line instead of silence. Repeated identical rawrip
+                // values are the signal, not noise.
+                const bool ripChanged = ok && tc.Rip != lastRip;
+                if (!ripChanged && !(ok && i % 4 == 3))
                     continue;
-                lastRip = tc.Rip;
+                if (ripChanged)
+                    lastRip = tc.Rip;
                 // Guest driver state via the pinned device chain
                 // **(u32**)0x82000864 (gpu_device.cpp overrides use it), plus
                 // VdSetGraphicsInterruptCallback userData object. The old
