@@ -2686,3 +2686,55 @@ node's first 8 words *at* the `swfCMD::Fixup` entry (`sub_8260A8CC`'s callee, `l
 fixup walker's return site) rather than 2 s earlier. This supersedes the loose treatment in F-111
 ("the surviving one … already existed in the old frontier") by naming its consumption chain — it does
 **not** license tightening the `alreadyPhys` predicate, which is load-bearing for the RSC-NEST design.
+
+**Addendum to F-115(b), same session (measured, not inferred).** The Fixup callee is
+`sub_8260B588(group=r3, node=r4)` and its type is `u8[node+4]` (`src/task_dispatch_trace.cpp:434-445`).
+Across the 8 firings in `w103` the healthy nodes read `type=00` (`node=B7B41000 [0]=8208521C`,
+`node=B7982758 [0]=820880BC`, twice each) while the fatal one reads `type=B7` (`node=B7B6D9B4`) — and
+`RSC-CHILD-WORD B7B6D9B4[1] = CDCDCDCD poison` at 05:01:22 shows that same `[node+4]` dword was still
+uninitialised two seconds earlier. So `0xB7` is not "the top byte of a rewritten pointer" read *as* the
+type: it is the **MSB of a B7-heap pointer that was stored into the node's type dword**, i.e. the
+`swfCMD` dispatcher was handed a heap block where it expected a command node — a type confusion one
+level up, in whatever fills the fixup list the walker iterates (`lr=8260A8B0` in `sub_8260A830`, whose
+P5 census reports the identical value as `old=B7B6D9B4`). Next question is therefore *which list entry
+produced that node*, not how to mask the type.
+
+### F-116 — B4(a) measured: the AUTO-source draw's whole 3D state IS in our Xenos register file at the moment of the packet (54 pokes, of them 10 in the `0x2xxx` shader/const region, render-target-shaped value `r01DD=071D8380`), so the missing piece is not data — it is that nothing on the render side reads the register file.
+
+- Task:        T41.4c (B4), `build/w104.log` (census-only build; `w103` = pre-census baseline)
+- Type:        FACT + FIX (log-only census added; no behaviour change)
+- Class:       F (GPU/shader translation)
+- Priority:    P1
+- Evidence:    `src/gpu_cp.cpp:64-82` (the 64-entry poke ring) + `:679-695` (the dump); `build/w104.log` `CP-DRAW-REGS #1 [00/54] r0A31=01000000` … `[08/54] r01DD=071D8380`, `[09/54] r01DC=00020037`, `[03/54] r0D02=00010800`, `[04/54] r0A02=C0100000 PTR?`, `[05/54] r0A03=07F00000`, `[06/54] r0A04=C0000000 PTR?`, `[07/54] r0A05=00100000`, `[17/54] r057C=0BADF00D`, `[13/54] r0081=80010000 PTR?`, and the `0x2xxx` group `r2082=00100010`, `r2100=0000FFFF`, `r2180=1000000E`, `r2204=00010000`, `r2205=00010000`, `r2206=00000300`, `r2208=00000004`, `r2280=00080008`, `r2302=00000004`, `r2312=0000FFFF`; frontier unchanged (`LISTLINE 167`, `'not preloaded properly' 0`, `Fatal error 1`, `C0000005 50` lines, `NATIVE-PRESENT 4`, `DRAW_INDEXED 0`, `CP truth pub=11 put=11`).
+
+**What the batch says.** Every one of the three sampled draws is preceded by the same 54 accepted
+register pokes (non-zero subset printed; `writes=54` in `CP-DRAW-STATE` is the total), so the guest *is*
+programming 3D state through the CP — it just does it through registers, not through the
+`sub_82420BA8` descriptor arguments our builder reads (F-115a: `li r5,0`). The values fall into three
+recognisable shapes, stated here as raw id/value pairs because the names are not yet cross-checked:
+
+- **A surface pair.** `r01DD=0x071D8380` with `r01DC=0x00020037` — the only `0x071Dxxxx` in the batch,
+  and `+0xC0000000 = 0xC71D8380` is exactly the swap-table/surface family that `NATIVE-PRESENT`
+  reports (`fb=C71D82C0…C71D82CC`) and that the `WAKE/WAIT` census polls at `wb@C71D82BC`. So this pair
+  is where the drawn frame is expected to land.
+- **Four `0xA02..0xA05` values forming signed-looking 16.16 pairs** (`C0100000 / 07F00000`,
+  `C0000000 / 00100000`) — consistent with a window/scissor/extents quad, and the reason F-115a's
+  `plausible` gate cannot be satisfied from `[r5]`.
+- **Ten writes in the `0x2000+` region** — the band F-090 widened the file for, and the one B4's
+  "real float-constant capture" must read. Each appears before all three draws with identical values,
+  i.e. they were programmed once and reused, not per-draw.
+
+`r057C=0BADF00D` is worth noting as its own question: that is a sentinel-shaped value sitting in the
+batch, and until it is named we cannot assume every register in the batch is real guest state.
+
+**Cap disclosure (rule 19).** `CP-DRAW-REGS` prints for `n <= 3` only, over a ring of the last 64
+pokes, and drops zero values — so `[k/54]` indices are contiguous but printed slots are a subset, and a
+register written earlier than the last 64 pokes is invisible here. Zero for a register id not shown
+means "not among the last 64 pokes", not "never written".
+
+**Next step (unchanged from F-115a, now with the address space in hand):** name these ids against the
+local Xenia tree (`.research/xenia/src/xenia/gpu/` — `xenos.h`/`packet_disassembler` in this checkout;
+there is no `reg_base.h` and no `REG_OFFSET` macro, so the offset enum must be located first), then
+decode the VB/IB + float-constant state from the register file instead of from `[r5]`, and bind that
+into the CBV at `src/d3d12_backend.cpp:1462`. Not a mitigation: this completes the decode the plan
+names. `DRAW_INDEXED` must stay 0 until a real constant bank exists, so nothing was widened here.

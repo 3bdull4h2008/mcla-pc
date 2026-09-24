@@ -63,6 +63,19 @@ std::atomic<uint32_t> g_xenosRegWrites{0};
 // widen took effect (F-090).
 std::atomic<uint32_t> g_xenosRegHiWrites{0};
 
+// T41.4c (B4, F-115a): the last 64 accepted pokes, in order. AUTO-source draws
+// (CP-DRAW src=2) carry no vertex-buffer descriptor argument at all -- the
+// observed builder call passes a literal `li r5,0` -- so whatever VB/IB/shader
+// state such a draw uses can only come from this register batch. Peeking seven
+// fixed ids was not enough to find it.
+struct CpRegTraceEntry {
+  uint32_t index;
+  uint32_t value;
+};
+constexpr uint32_t kCpTraceSize = 64u;
+std::atomic<uint32_t> g_cpTracePos{0};
+CpRegTraceEntry g_cpTrace[kCpTraceSize]{};
+
 inline uint32_t CpRegPeek(uint32_t index) {
   if (index >= kXenosRegCount) return 0u;
   return g_xenosReg[index].load(std::memory_order_relaxed);
@@ -70,6 +83,9 @@ inline uint32_t CpRegPeek(uint32_t index) {
 
 inline void CpRegPoke(uint32_t index, uint32_t value) {
   if (index >= kXenosRegCount) return;
+  const uint32_t tp =
+      g_cpTracePos.fetch_add(1, std::memory_order_relaxed) % kCpTraceSize;
+  g_cpTrace[tp] = {index, value};
   g_xenosReg[index].store(value, std::memory_order_relaxed);
   g_xenosRegWrites.fetch_add(1, std::memory_order_relaxed);
   if (index >= 0x2000u) {
@@ -660,6 +676,22 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
                   CpRegPeek(0x08Bu), CpRegPeek(0x08Cu), CpRegPeek(0x0DDu),
                   CpRegPeek(0x0D2u), CpRegPeek(0x0A2u), CpRegPeek(0x1DCu),
                   CpRegPeek(0x1DDu));
+    // T41.4c: the whole batch this draw was preceded by, in write order, so the
+    // AUTO-source VB/IB candidates are identifiable instead of guessed at
+    // (F-115a). Non-zero values only; PTR marks a value in a guest heap band.
+    if (n <= 3) {
+      const uint32_t total = g_cpTracePos.load(std::memory_order_relaxed);
+      const uint32_t first =
+          total > kCpTraceSize ? total - kCpTraceSize : 0u;
+      for (uint32_t i = first; i < total; ++i) {
+        const CpRegTraceEntry &e = g_cpTrace[i % kCpTraceSize];
+        if (e.value == 0u)
+          continue;
+        MCLA_LOG_WARN("CP-DRAW-REGS #{} [{:02}/{:02}] r{:04X}={:08X} {}", n,
+                      i - first, total - first, e.index, e.value,
+                      (e.value >= 0x40000000u) ? "PTR?" : "");
+      }
+    }
     outAdvanceDwords = count + 1u;
     return true;
   }
