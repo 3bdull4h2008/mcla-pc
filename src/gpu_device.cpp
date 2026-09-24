@@ -10436,7 +10436,10 @@ PPC_FUNC_IMPL(__imp__sub_82188E50);
 PPC_FUNC(sub_82188E50) {
   static std::atomic<uint32_t> s_lineN{0};
   const uint32_t n = s_lineN.fetch_add(1) + 1;
-  if (n <= 40) {
+  // F-107: the old `n <= 40` cap hid the real line count exactly when the
+  // loader started reading names, so a 40-line print could not be told apart
+  // from a 400-line one. Wide cap + a periodic marker to expose the total.
+  if (n <= 600 || (n % 500) == 0) {
     auto &memL = mcla::kernel::GuestMemoryHeap::Instance();
     const uint32_t buf = ctx.r3.u32;
     char text[129] = {0};
@@ -10821,7 +10824,7 @@ PPC_FUNC(sub_821CBFC0) {
     // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
     // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
     // is the open question, not the transform. See F-105.
-    constexpr bool kExpandListInArchive = false;   // ON => w80 branch, see F-106
+    constexpr bool kExpandListInArchive = false;   // ON => w80/w82/w84 branch, see F-107
     if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
         w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
       mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);
@@ -11999,6 +12002,25 @@ PPC_FUNC(sub_821BE250) {
       MCLA_LOG_WARN("BE250-SKIP #{} obj={:08X} dev={:08X}", n, obj, dev);
     ctx.r3.u32 = static_cast<uint32_t>(-1);
     return;
+  }
+  // T41.3s (F-106 follow-on) census, log-only: the fall-through hands control to
+  // the guest's real Read(), whose buffered-refill path dereferences wrapper
+  // +8/+24/+28/+32. With the archive expansion on (w80) that path faulted on a
+  // host AV reading guest 0xE17 (obj=82860C68, a sibling of the 82860C18 wrapper
+  // our post-open serve binds). Print the fields so the bad slot is named by the
+  // soak instead of by an exception.
+  if (n <= 40 || (n % 200) == 0) {
+    uint32_t f8 = 0, f16 = 0, f24 = 0, f28 = 0, f32 = 0;
+    (void)mem.ReadU32BE(obj + 8, &f8);
+    (void)mem.ReadU32BE(obj + 16, &f16);
+    (void)mem.ReadU32BE(obj + 24, &f24);
+    (void)mem.ReadU32BE(obj + 28, &f28);
+    (void)mem.ReadU32BE(obj + 32, &f32);
+    MCLA_LOG_WARN("BE250-GUEST #{} obj={:08X} dev={:08X} h={} dst={:08X} "
+                  "count={} +8={:08X} +16={:08X} +24={:08X} +28={:08X} "
+                  "+32={:08X} lr={:08X}",
+                  n, obj, dev, h, dst, count, f8, f16, f24, f28, f32,
+                  static_cast<uint32_t>(ctx.lr));
   }
   __imp__sub_821BE250(ctx, base);
 }
