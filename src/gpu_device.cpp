@@ -526,6 +526,11 @@ constexpr MclaListMemberSpan kListMemberSpans[] = {
 // the C0000005 0 invariant — 50 AVs at the wrapper site (F-108/F-111), which are
 // logged, not masked. Set false to return to the w96/w81/w72 frontier exactly
 // (censuses then print nothing on this path).
+// F-121/T41.5d measured with this OFF (w112): the 50 `NULL+0xC61` reads at
+// lr=821BE508 vanish (VEH-NEUTRAL 0, was 50) -- so the seam is what exposes
+// them, not what causes them -- but the boot loses the lists (LISTLINE 167 -> 2)
+// and regains a fatal. So ON stays the committed frontier and the null pointer
+// is the thing to fix.
 constexpr bool kExpandListInArchive = true;
 
 void MclaMarkKnownListMembers() {
@@ -11669,7 +11674,8 @@ static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
 // obj+24 (mirrors sub_821BE250's buffer shape). Serves min(count, size-cursor)
 // bytes and advances the cursor. Returns bytes served, or -1 when obj is not
 // a wrapper we recognize.
-static int64_t MemoryStreamServeRead(uint32_t obj, uint32_t dst, uint32_t count) {
+static int64_t MemoryStreamServeRead(uint32_t obj, uint32_t dst, uint32_t count,
+                                     uint32_t callerLr = 0) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t buf = 0, size = 0, pos = 0;
   if (obj == 0 || obj == 0xCDCDCDCDu)
@@ -11685,6 +11691,23 @@ static int64_t MemoryStreamServeRead(uint32_t obj, uint32_t dst, uint32_t count)
     pos = size;
   const uint32_t avail = size - pos;
   const uint32_t n = (count < avail) ? count : avail;
+  // F-122 census: this MakeMemoryStream-layout interpretation is only correct
+  // for OUR wrappers. On a guest-native buffered stream [+4] is a handle and
+  // [+8] is the buffer, so `buf + pos` lands in the null guard page — that is
+  // the read that faulted 50 times per soak. Refuse it and name the object, so
+  // the soak says which wrapper was misread instead of the VEH saying only that
+  // a copy faulted.
+  const uint32_t src = buf + pos;
+  if (src < 4096u) {
+    static std::atomic<uint32_t> s_badPtr{0};
+    const uint32_t nb = s_badPtr.fetch_add(1) + 1;
+    if (nb <= 52 || (nb % 200) == 0)
+      MCLA_LOG_WARN("BE250-MEM-BADPTR #{} obj={:08X} +4={:08X} +8={:08X} "
+                    "+24={:08X} src={:08X} dst={:08X} count={} lr={:08X} — "
+                    "not a MakeMemoryStream wrapper, refused (r3=-1)",
+                    nb, obj, buf, size, pos, src, dst, count, callerLr);
+    return -1;
+  }
   if (n != 0 && dst != 0 && dst != 0xCDCDCDCDu) {
     uint8_t tmp[512];
     uint32_t done = 0;
@@ -12222,7 +12245,8 @@ PPC_FUNC(sub_821BE250) {
     return;
   }
   if (dev == 0 || dev == 0xCDCDCDCDu) {
-    const int64_t served = MemoryStreamServeRead(obj, dst, count);
+    const int64_t served =
+        MemoryStreamServeRead(obj, dst, count, static_cast<uint32_t>(ctx.lr));
     if (served >= 0) {
       if (n <= 24 || (n % 200) == 0)
         MCLA_LOG_WARN("BE250-MEM #{} obj={:08X} served={} count={} posfield=+24",

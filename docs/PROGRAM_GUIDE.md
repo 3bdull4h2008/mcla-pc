@@ -140,7 +140,9 @@ The table below still lists 13 entries; `src/` currently carries **80** mitigati
 | `JOB2-PKG-SERVE` | `src/gpu_device.cpp:6765` | host inflates the job-2 package and returns without running `sub_821D5E10` | 22 |
 | `PKG-SUBST` | `:562` | substitutes a host package body for the TOC offset (`Alloc` + `WriteBytes` into guest) | 19 |
 | `P10-GATE` | `src/task_dispatch_trace.cpp:855` | rebase-map miss → `ctx.r3=0; return` (delta 0) | 17 |
-| `BE250-SLOT` | `src/gpu_device.cpp:11436` | slot-table read serve (same shape as `BE710-SLOT`) | 25 |
+| `BE250-SLOT` | `src/gpu_device.cpp:11720` | slot-table read serve (same shape as `BE710-SLOT`) | 25 |
+| `BE250-MEM` / `BE250-MEM-BADPTR` | `src/gpu_device.cpp:11677` / `:11700` | `MemoryStreamServeRead` serves a read for a wrapper whose `[+0]` device is dead, assuming the `MakeMemoryStream` shape (`+4`=buf, `+8`=size, `+24`=cursor). On a **guest-native** buffered wrapper that shape is wrong (`+4` is a handle, `+8` is the buffer) and `buf+pos` wraps into the null guard page — that is F-122's 50 AVs. The refusal (`BADPTR`) names the object and returns -1, exactly what the AV used to collapse to | 1 / 55 in `w115` |
+| `GuestMemoryHeap::IsValid` guard-page clause | `src/kernel/memory.cpp:321` | rejects `guestAddr < 4096` — the first page is `PAGE_NOACCESS` by design (`:218`), and without this the "checked" helpers passed a near-null pointer straight into `memcpy` and relied on SEH to survive it (F-122) | — |
 | `FDA90-GATE` | `src/task_dispatch_trace.cpp:380` | skips a fixup dispatch (`return`) | 12 |
 | `(dev,handle)` served-body fallback | `src/gpu_device.cpp:668-690` | **loose match returns one file's body for another** — offers `legals.xsf` as the body of all five `shaders/*/preload.list` (`BE8D8-PACK #2-#6`) | 5 |
 | `W30-ARR-FIX` / `W31-ARR-FIX` / `PLACE-ARR-PRE` / `PLACE-ARR-FIX` | `:4465` / `:4720` / `:8971` / `:8981` | rewrite guest child arrays (incl. a synthesised array at hard-coded `0xB7B41000`) then call the guest place | 2/1/1/1 |

@@ -313,6 +313,14 @@ bool mcla::kernel::GuestMemoryHeap::IsValid(uint32_t guestAddr, size_t size) con
     if (!m_initialized || guestAddr == 0 || size == 0)
         return false;
 
+    // The first 4 KB of the heap is a deliberate PAGE_NOACCESS null guard (set at
+    // :218/:251), and the rest of the 4 GB is committed read/write. Without this
+    // clause a "checked" helper passes IsValid for a near-null guest pointer and
+    // then faults inside memcpy - which is what F-122 measured (50 AVs reading
+    // guest 0x00000C61 from MemoryStreamServeRead's ReadBytes).
+    if (guestAddr < 4096u)
+        return false;
+
     if (guestAddr >= m_size)
         return false;
 
