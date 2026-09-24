@@ -1829,6 +1829,30 @@ uint64_t CpDrainCount() { return g_drainCount.load(std::memory_order_relaxed); }
 void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   static std::atomic<uint32_t> s_watchWrites{0};
 
+  // F-141 CENSUS ONLY (read-only; armed in boot_host.cpp for these two values).
+  // The renderer's resource "pointers" at this frontier are non-addresses
+  // (F-137/F-140): 0x80010000 is the value the AUTO draw's packet puts in CP
+  // register 0x81 and the object sub_82184458 fixs up, and 0x00020037 is
+  // r01DC, dereferenced as a descriptor by sub_82185190. Name the guest store
+  // that materialises them, so the producer is read off the log instead of
+  // deduced. Given its own counter because the generic PAGEWATCH W report is
+  // capped at 16 shared hits.
+  if (value == 0x80010000u || value == 0x00020037u) {
+    static std::atomic<uint32_t> s_refStores{0};
+    const uint32_t rn = s_refStores.fetch_add(1) + 1;
+    if (rn <= 40) {
+      uint32_t lr = 0, sp = 0;
+      if (const PPCContext *c = GetPPCContext()) {
+        lr = static_cast<uint32_t>(c->lr);
+        sp = c->r1.u32;
+      }
+      MCLA_LOG_WARN("RSC-REF-STORE #{:03} @ {:08X} = {:08X} lr={:08X} "
+                    "sp={:08X}",
+                    rn, guestAddr, value, lr, sp);
+    }
+    return;
+  }
+
   // SESSION 73: 0xCDCDCDCD store census. Static decode says the guest fills
   // memory with 0xCD in exactly these places: sub_821DE9D8's fill-on-alloc
   // tail (memset return addr 0x821DEB0C) and two startup fills of the
