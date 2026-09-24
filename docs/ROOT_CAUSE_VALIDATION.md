@@ -4371,3 +4371,59 @@ a second time, and the next question is narrow and instrumented: what is in the 
 (`obj=CE83E5C0`) - i.e. the four live realizations alias one object. 4/4 still returned, so no
 evidence of damage this boot, but the aliasing F-161 identified is the reason that is luck rather
 than design; per-body slots remain the cleanup that would retire F-135/F-135b.
+
+
+### F-164: after F-163 the `skinningData` gate is a real CONTENT gate one level up - the entity's own `.type` text declares `Template "RimMain"` / `blackmatte`, and the `.mtlgeo` material files that carry the variable list are **not in `xarchive_cache.rpf`** - plus two instrument hazards this step measured
+
+- Task:    B4's feed, after the F-163 unblock; builds `w172`/`w173` (census variants) against `w171`
+- Type:    FACT
+- Class:   G (the game's own coded content) + H (instrumentation)
+- Priority: P0 - it retires the last "our parser is wrong" reading of the skinningData gate
+- Evidence: `build/game_data/xarchive_cache.rpf` inflated offline at the ten `kTypeMemberSpans`
+  offsets (all ten inflate, 480-648 B each, every one starting
+  `Version: 103
+shadinggroup {
+ShadingGroup
+{
+	Shaders N`);
+  `python tools/rpf_offline.py find ext_matteblack.mtlgeo build/toc_parsed.bin` -> 0 records
+  (positive control in the same run: `find .../entity.type` -> 12 records);
+  `build/w172.log` / `build/w173.log` `SHGRP-VARS #1`
+
+**What the content actually says.** The four `entity.type` files the boot opens
+(`ao_cone`, `ao_shadow`, `ao_sphere`, `sst_trail`) each declare a shading group whose shaders are
+*material references*, e.g. `Shaders 1 { Vers: 2 "T:/mc4/art/veh/materials/default_mtl/
+ext_matteblack.mtlgeo" Template "BlackMatte" Bucket 0 blackmatte 0 { } }`, and the six-shader one
+declares its single real parameter inline (`RimMain 1 { shaderMaterialId { int 2 } }`). None of the
+ten contains the string `skinningData`. So the variable the game requires comes from the **material
+template**, and `ext_matteblack.mtlgeo` / `RimMain` / `BlackMatte` have no TOC record in the retail
+cache archive at all. That is also consistent with `agents.md`'s content rule (that tree is
+`mc4/art`, which we never serve).
+
+**In-guest agreement.** The binder now reaches its lookup with a live group
+(`SHGRP-VARS #1 group=A003CA30 arr=A003CA80 nvars=1 req=1 want='skinningData' lr=82379D04`) whose one
+var's name pointer is non-null but points at sixteen 0x00 bytes
+(`name=CA711488:[00000000...]`, address differs per run - it is heap). An unnamed placeholder var is
+exactly what a group built from an unresolvable template looks like. So F-136's original "content
+wall" verdict is restored *in a corrected form*: the wall is real, but it is one file higher than
+F-136 thought (the material template, not the `.type`), and F-149's compression defect was a genuine
+defect that F-136's framing had hidden.
+
+**Hazard 1 - this census moved the frontier, twice, and I reverted it.** Adding a second log line
+plus 22 extra per-call reads to `sub_82193AF8` changed `Fatal error 1->4`, `FATAL-SOFT 1->7`,
+`INFLATE 17,220->7,597`; the trimmed version (one extra read, folded into the existing line) still
+gave `INFLATE ->5,022` and `fatal-shaped lines 76->5,587` while every structural counter held. Both
+census builds are reverted; `src/gpu_device.cpp` is the F-163 code again (rebuilt exe is byte-size
+identical to the `w171` binary, 97,553,408 B).
+
+**Hazard 2 - `INFLATE` and the `fatal`-substring line count are NOT stable signals at this frontier**
+(358 / 17,220 / 7,597 / 5,022 across four consecutive boots, two of them the same binary). Cite them
+only as order-of-magnitude context, never as a gain. F-163's evidence stands on the deterministic
+counters only: `C0000005 1->0`, `SEEK-DEAD 1->0`, `TYPINIT 4 enters / TYPINIT-RET 4` (reproduced in
+`w172` and `w173`), `DICTLOOKUP 14->23`, `[error] 42->28`.
+
+**Consequence for the plan.** B4's gate cannot be met through the vehicle-material groups - the
+content that would declare their variables is not in the archive we serve. The remaining routes are
+the ones that do not need those templates: the UI/GFx path (the boot already shows `GFx 3`,
+`UILOAD 1`, `swfCMD 0`), or a group whose vars are declared inline (the `RimMain 1 { shaderMaterialId
+{ int 2 } }` shape above shows that form exists in this content).

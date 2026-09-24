@@ -1,3 +1,32 @@
+## 2026-09-24 ~15:20 - **F-163 IS THE FRONTIER NOW (`w171`, commit `0136855`): the entity-type registration completes for the first time, and F-164 shows the `skinningData` gate is a content gate one level up (the `.mtlgeo` templates are not in the archive we serve)**
+
+- **The fix.** All 179 `memory:$` re-opens come from one site (`lr=821BE988`, inside the guest's own
+  `sub_821BE8D8` tail), so F-153/F-155/F-156's blanket object return re-shaped 178 consumers that
+  legitimately store a slot handle. The dereferencing caller is exactly one - `sub_82191040`, seen as
+  `BE8D8-CALLER #4 lr=82191070 first at n=190` - so `sub_821BE8D8` now latches a one-shot flag around
+  *that* call and `sub_821BE0C8` returns a guest-shaped stream object only then (4 fires/boot).
+- **Measured (`w171` vs `w170`, deterministic counters only):** `C0000005 1->0`, `VEH-NEUTRAL 1->0`,
+  `SEEK-DEAD 1->0`, `TYPINIT` 4 enters / `TYPINIT-RET 0->4`, `DICTLOOKUP 14->23`, `REQ 135->154`,
+  `[error] 42->28`, with `LISTLINE 171`, `GETDEV 694`, `CP-DRAW 166`, `PRESENT 34`, `DRAW_INDEXED 0`
+  unchanged. Cost stated: `Fatal error 0->1` / `FATAL-SOFT 0->1` (B5 criterion 3 regresses) because the
+  `skinningData` lookup is now actually reached - `SHGRP-VARS` sees
+  `group=A003CA30 arr=A003CA80 nvars=1` instead of the `group=0` it has carried since w138.
+- **F-164 - do not re-litigate the parser.** All ten `entity.type` spans inflate cleanly offline and
+  none declares `skinningData`; they reference `Template "RimMain"` / `blackmatte 0 { }` and the
+  material files (`T:/mc4/art/.../ext_matteblack.mtlgeo`) have **0 TOC records** in
+  `xarchive_cache.rpf` (control: `entity.type` returns 12 in the same run). The group's single var
+  points at a name buffer of 16 zero bytes, i.e. an unresolved template placeholder. B4's gate is not
+  reachable through these vehicle-material groups.
+- **Two measurement hazards found the hard way (`w172`/`w173`, both reverted):** a second log line +
+  ~22 extra per-call reads in `sub_82193AF8` moved `Fatal error 1->4` and `FATAL-SOFT 1->7`; and
+  `INFLATE` / the `fatal`-substring line count swing wildly boot to boot (358 / 17,220 / 7,597 /
+  5,022, two of them the same binary) - cite them as context, never as a gain.
+- **State:** HEAD `0136855` + these docs; `src/` is exactly the F-163 code (rebuilt exe 97,553,408 B =
+  the `w171` binary). Ledger to F-164, census 138 markers.
+- **Candidate next steps, both consistent with the objective:** (a) the UI/GFx route - the boot already
+  shows `GFx 3` / `UILOAD 1` but `swfCMD 0`, i.e. the menu's own draw path; (b) a group whose vars are
+  declared inline - the `RimMain 1 { shaderMaterialId { int 2 } }` form above proves that shape exists
+  in this content, so a material that resolves without the missing templates may draw.
 ## 2026-09-24 ~14:55 - **F-161 (commit `818c158`, pushed): step 2 of the slot-release work is REFUTED by measurement and reverted - `w168`/HEAD is the frontier again**
 
 - Extending F-160's release to the **read** sites (`sub_821BE250`/`sub_821BE710`, at the exact moment
