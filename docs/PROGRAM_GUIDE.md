@@ -156,6 +156,7 @@ The table below still lists 13 entries; `src/` currently carries **80** mitigati
 | `FATAL-SOFT` / `FATAL-SOFT-RESOURCE-PARK` | `src/kernel/imports.cpp:2990` / `:3010` | a guest `Fatal` is soft-parked (`return`), so the window survives and the boot "continues" | 2 / 1 |
 | `READWRAP-SERVE` | `src/gpu_device.cpp:9818` | credits a refill + `ctx.r3=…; return` (no `__imp__sub_821CC6F0`) | 1 (`w42a` 0) |
 | `INFLATE-J2-WIN-CONT-SKIP` | `:7354` | abandons the guest's continuation walk | 1 |
+| `kHostLzxDecode` / `MclaHostXcDecodePackage` | `src/gpu_device.cpp:323` / `:4114` (use `:804-810`) | **MITIGATION, Path A (F-188; F-189/F-190).** Host libmspack LZX of an RSC5+XCompress UI package inside `HostServeUiBody` so UI `.xsf` serve expanded without guest inflate/`0x82461530`. Path B (`sub_821E5E58` descriptors) dropped after F-187. Refuses partial (w199 32KB/143069 → `XSF-LZX-FAIL`); concats multi-frame XC before one `lzxd`. Lists stay DEFLATE/`RawInflate`. Pass = `XSF-LZX >= 4` + `W34-NOGFX` falling | `XSF-LZX` 4 UI / `XSF-LZX-FAIL` in `w199` |
 
 Registered-but-dead (§7 names them, they fire 0×): `INFLATE-SKIP`, `INFLATE-EMPTY`, `TEXCREATE-SC`,
 `SLOT-READY`, `BLIT-OOB-GUARD`. §7 entries that are prose rather than labels (so no tool can verify them):
@@ -177,6 +178,21 @@ bearing — w100/w101 without it die at 4,528 lines vs 17,868) · DICT-HYDRATE (
 Poison values: `0xCDCDCDCD` = guest fill-on-alloc (uninitialized, NOT
 corruption) · `0xDD` = free-fill · `0xFF00FF00`/`0xFFFF00FF` = missing-texture
 texels, NOT poison.
+
+`kPathBHostFullDecode` (F-297, **ON by default**, `src/gpu_device.cpp:440`;
+labels `PATHB-HOSTDECODE`, `PATHB-HOSTDECODE-TOP`, `PATHB-HOSTDECODE-TOP-SKIP`,
+`PATHB-HOSTDECODE-FAIL`)
+— Path A host XMem/raw-LZX decode of the 4 UI `.xsf` (`src/xmem_lzx.h`) written
+straight into the guest dest, at the top of the inflate handler and at the
+corrupt-serve leg. It **bypasses the guest's own inflate** for those containers
+and drains `outLeft` (the caller-loop complete key), so it is a short-circuit, not
+a fix: it exists because the guest's progressive streamer only ever delivers
+window 1 and every guest-decoder re-entry collapses boot (F-288, F-290, F-293).
+Targeted by the *dynamic* dest→package map + a package-offset allowlist, so a
+flag-OFF boot never routes through it. Refuses to complete a container that does
+not fit its dest room. Verified `w271` and `w272`: 3 of 4 byte-exact, `C0000005`
+0, every structural marker +0 vs `w270`; `nGfx` still 0 (the GFx gate is
+upstream). See F-295 and the ledger's F-297 entry.
 
 ## 8. Cheat-sheet (verified; `0xCDCDCDCD` = uninitialized, not corruption)
 
@@ -247,6 +263,7 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 | `TOC76` / `TOC76-RET` | packfile TOC lookup (`sub_821CBFC0`) entry + return with elapsed time |
 | `BOOTPATH` | boot-init package processing (`sub_82187820`) with descriptor dump |
 | `INFLATE` / `-SKIP` / `-EMPTY` / `-PENDING` | inflate hook (`sub_821D5E10`): magic, sizes, retries |
+| `PATHB-HOSTDECODE` / `-TOP` / `-TOP-SKIP` / `-FAIL` | the Path A host XMem/raw-LZX decode of a UI `.xsf` (`kPathBHostFullDecode`, `src/gpu_device.cpp:440`). `-TOP` = fired at the top of the inflate handler (`:7775`), bare = fired at the corrupt-serve leg (`:8993`); both print `dest`/`pkg`/`path` (1=single stream, 2=shared per-frame walk)/`unc`/`wrote`/`room`. `-TOP-SKIP`/`-FAIL` mean the container was **left to the guest** — either it does not fit the dest room (garage, 1066057 > a 256 KiB window) or the decode/load failed — and are not errors. Target selection is the dynamic `g_destPkgOff` map (`PeekPackageForDest`/`IsUiXsfPkg`, `:311-345`), never literal dest addresses (F-297). Decoder byte-exactness is guarded at build time by `ninja -C build check_xmem_lzx`. |
 | `SLOT-READY` | page-cache slot wait (`sub_821CBE18`) state flip |
 | `DISCCHK` / `DISCCHK2` | disc-error check (`sub_821CC1E0`): `DISCCHK2` dumps `strm/fobj/len/rec/size/offs/flags/route=` (route = the executed bit30×bit31 decision, F-112) — `n <= 40 \|\| (n % 200) == 0` |
 | `DISCCHK2-WAIT` / `-RES` | the guest's own completion call inside the disc-read block (`sub_821DEE40(io, 2)`) and its return value; **only observable with `kDiscChkForcedAck = false`**, so their zero in a normal soak means the mitigation is firing, not that the path is dead |
@@ -293,6 +310,7 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 | `XSF-BIND` | what size the packfile device actually bound for a member: `path`/`dev`/`h`/`wrap`/`tocEntry`/**`size`**/`buf` (`src/gpu_device.cpp:11388`-ff, cap `n <= 16 || n % 8 == 0`, so a low count is not a low number of binds). This is the instrument that found F-165: six container members each printed `size=32768`. From F-171 on, the four UI `.xsf` must show their own declared lengths (credits 29,655 / garage 1,066,057 / policecam 19,337 / raceeditor 143,069) - if they show the same number again, the per-record package selection has regressed |
 | `PKG-SUBST` / `CC6F0-PKGSUBST` / `XSF-HOSTSERVE` | the three places a host-side plaintext RSC5 window replaces archive bytes: `src/gpu_device.cpp:763` (TOC-census serve), `:10075` (the `sub_821CC6F0` read/continuation path), `:786` (body handed to the guest). Read the `pkg=` **set**, not the count: F-171's fix is visible as seven distinct packages where every `.xsf` used to receive legals' `000A0000`. `:10032`-`10036` still prefers the path-substring map and validates nothing, so a `CC6F0-PKGSUBST` line is not yet evidence the right package was used |
 | `XSF-INFLATE` | the host expansion of an RSC5/Xcompress body (`src/gpu_device.cpp:682`-ff), keyed on the path so per-file success is visible. **0 in every soak through `w181`** while whole, ID-verified packages are being handed over - that is the current menu blocker (F-170/F-171): the payload behind `RSC5+0x0C == 0x0FF512EF` is not raw deflate in any framing tried over `+0x14..+0x2F`. `swfCMD` staying 0 is downstream of this, not independent evidence |
+| `XSF-LZX` / `XSF-LZX-FAIL` | F-188 Path A: host libmspack LZX expand of an RSC5+XCompress UI package inside `HostServeUiBody` (`MclaHostXcDecodePackage`). Success emits `XSF-LZX pkgSz=… wantOut=… produced=… frames=…`; total failure emits `XSF-LZX-FAIL`. **`XSF-LZX >= 4` with `W34-NOGFX` falling is the Path A pass signal.** Lists never take this path (they stay DEFLATE/`RawInflate`) |
 | `REQFILL sub_821867A0` | F-173, corrected by F-174: one line per call to a guest 28-byte streamer-request **builder** (`src/gpu_device.cpp:8418`-ff, registers-only, cap `n <= 24 || n % 2000`). It fires **twice per boot**, returns slot ids 3 and 4, has exactly ONE caller (`sub_82187150+0x1A8`), and its only non-pointer argument (`r5`) is 0 both times. **It is NOT the writer of the pool `sub_821BC140` reads** - its destination array is the caller's own `r1+224 + idx*28` - so do not cite it as the origin of the zero inflate length. Keep this hook register-only: a census in this subsystem once AV'd its consumer by reading guest memory (`ENQ sub_821BCB10` note)|
 | `INFLATE-ENTER` / `READWRAP` | the two lines that together diagnose the inflate door: `INFLATE-ENTER st= in= inPtr= consumed= outPtr= lr=` (our `sub_821D5E10` hook, `src/gpu_device.cpp:7067`-ff) and `READWRAP sub_821CC6F0 r3= r4=[4 words] r5= r6= r7= ret= r1in= lr=` (`:10276`-ff, the packfile device's Read wrapper). `lr=821BC334` on a READWRAP line means the read came from the streamer's inflate loop; **`r7=0` there is the F-172 finding**. `st+0 = 0xFFFFFFF4` with `st+4 = stack+12` is what a zero-byte read produces after the guest's own priming arithmetic - do not read those as real sizes
 | `STREAM-OPEN sub_821BCE68` | F-177: one line per `pgStreamer::Open` (registers-only, cap `n <= 24 || n % 500`). **7 firings per boot**, returning handle ids `0,1,2,3,4,0x8004,0x10004`; `r5` is the value read from `RSC5+0x04` (27/9/5442), and Open stores `dev->vtable[+84](dev)` into `record+4` - the length `sub_821BC140` later reads. Pair it with `REQDUMP d[0]` / `ENQ a0` to see which three requests actually execute. The `memory:` device's `+84` is the shared `li r3,0` stub (`0x821A5CC0`, which we force to 0 at `src/gpu_device.cpp:12642`-ff), so a zero length there is ours, not the archive's |

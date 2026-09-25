@@ -302,6 +302,48 @@ static uint32_t PackageSizeAt(uint32_t off) {
   return 0x40000u;
 }
 
+// F-297: the 4 UI .xsf archive package offsets (raceeditor / garage / policecam /
+// credits). The offsets are stable; the DEST each one lands on is not, so every
+// Path A host-decode site keys off the dynamically resolved package offset and
+// never off a literal dest address. These offsets only ever appear as a dest
+// mapping under Path B (s_pendingUiPkg / PATHB-PKGFIX), so a flag-OFF boot never
+// routes through the host decoder at all.
+static bool IsUiXsfPkg(uint32_t off) {
+  return off == 0x64CB0000u || off == 0x64980000u || off == 0x64CA3000u ||
+         off == 0x6496F000u;
+}
+
+// Read-only view of the dest -> package map AssignPackageForDest maintains.
+// Deliberately does NOT call it: that would consume s_pendingUiPkg and emit
+// DEST-PKG out of order, changing which dest a pending UI package lands on.
+// Caller must not hold g_destPkgMtx.
+static uint32_t PeekPackageForDest(uint32_t outPtr) {
+  std::lock_guard<std::mutex> lk(g_destPkgMtx);
+  const auto it = g_destPkgOff.find(outPtr);
+  return it == g_destPkgOff.end() ? 0u : it->second;
+}
+
+// F-297: Path A bookkeeping shared by both host-decode sites. A dest is recorded
+// complete only for the package it was completed with, so a later re-assignment
+// (PATHB-PKGFIX overwriting a PATHB-PENDING guess) decodes again instead of
+// draining outLeft over stale bytes.
+static std::mutex g_uiDecMtx;
+static std::unordered_map<uint32_t, uint32_t> g_uiDecDone; // dest -> pkg written
+static std::unordered_set<uint64_t> g_uiDecSkip;   // (dest,pkg) -> leave to guest
+static inline uint64_t UiDecKey(uint32_t dest, uint32_t pkg) {
+  return (static_cast<uint64_t>(dest) << 32) | pkg;
+}
+enum UiDecAct { kUiDecTry, kUiDecComplete, kUiDecSkipGuest };
+static UiDecAct UiDecClassify(uint32_t dest, uint32_t pkg) {
+  std::lock_guard<std::mutex> lk(g_uiDecMtx);
+  if (g_uiDecSkip.count(UiDecKey(dest, pkg)))
+    return kUiDecSkipGuest;
+  const auto it = g_uiDecDone.find(dest);
+  if (it != g_uiDecDone.end() && it->second == pkg)
+    return kUiDecComplete;
+  return kUiDecTry;
+}
+
 // ---------------------------------------------------------------------------
 // w20: plaintext RSC5 package preference + post-serve inflate re-force.
 // Retail TOC bodies for .xtd/.xsf are AES — inflate sees zeros/stack junk.
@@ -7723,7 +7765,7 @@ PPC_FUNC(sub_821D5E10) {
   }
 
   uint32_t magic = 0;
-  // F-295 Path A (unified): host XMem/raw-LZX decode of the 4 UI .xsf dests,
+  // F-295 Path A (unified): host XMem/raw-LZX decode of the UI .xsf dests,
   // fired once per dest at the very top of the inflate handler so it covers
   // BOTH the corrupt-serve leg (raceeditor, inLeft<0) and the normal
   // INFLATE-RSC5 leg (garage/policecam/credits, valid in=32768). Pure host
@@ -7731,32 +7773,24 @@ PPC_FUNC(sub_821D5E10) {
   // serve context conflict. On success the FULL byte-exact container is in the
   // dest and outLeft is drained (caller-loop complete key). Gated OFF == baseline.
   if (kPathBHostFullDecode && outPtr != 0 && outLeft != 0) {
-    uint32_t uiPkg = 0;
-    switch (outPtr) {
-      case 0xB7B01000u: uiPkg = 0x64CB0000u; break;  // raceeditor
-      case 0xB7AC1000u: uiPkg = 0x64980000u; break;  // garage
-      case 0xB7441000u: uiPkg = 0x64CA3000u; break;  // policecam
-      case 0xB74E1000u: uiPkg = 0x6496F000u; break;  // credits
-      default: uiPkg = 0; break;
-    }
-    if (uiPkg != 0) {
-      static std::mutex s_uiDecMtx;
-      static std::unordered_set<uint32_t> s_uiDecDone;  // fully written+completed
-      static std::unordered_set<uint32_t> s_uiDecSkip;  // oversized/failed → guest
-      enum Act { kTry, kComplete, kSkipGuest } act;
-      {
-        std::lock_guard<std::mutex> lk(s_uiDecMtx);
-        if (s_uiDecSkip.count(outPtr)) act = kSkipGuest;
-        else if (s_uiDecDone.count(outPtr)) act = kComplete;
-        else act = kTry;
-      }
-      if (act == kComplete) {
+    // F-297: resolve the dest through the same dynamic mapping the serve path
+    // uses (AssignPackageForDest -> g_destPkgOff, populated by the PATHB-PENDING
+    // publish and the PATHB-PKGFIX registration) and allowlist on the stable
+    // package-offset side. An UNMAPPED dest is not a failure and is not cached
+    // as one: the corrupt-serve leg below calls AssignPackageForDest, which
+    // registers the mapping mid-entry, so a later entry for the same dest hits
+    // this hook (w270: DEST-PKG B7B01000 -> 64CB0000 lands between inflate
+    // entries #1 and #2).
+    const uint32_t uiPkg = PeekPackageForDest(outPtr);
+    if (uiPkg != 0 && IsUiXsfPkg(uiPkg)) {
+      const UiDecAct act = UiDecClassify(outPtr, uiPkg);
+      if (act == kUiDecComplete) {
         // already fully decoded into this dest — keep it complete, skip re-inflate.
         (void)mem.WriteU32BE(st + 0, 0);
         (void)mem.WriteU32BE(st + 16, 0);
         return;
       }
-      if (act == kTry) {
+      if (act == kUiDecTry) {
         const uint32_t cpsz = PackageSizeAt(uiPkg);
         uint32_t want = cpsz ? cpsz : 0x200000u;
         if (want > 0x200000u) want = 0x200000u;
@@ -7784,8 +7818,8 @@ PPC_FUNC(sub_821D5E10) {
         if (fits && mem.WriteBytes(outPtr, decH.data(),
                                    static_cast<uint32_t>(decH.size()))) {
           {
-            std::lock_guard<std::mutex> lk(s_uiDecMtx);
-            s_uiDecDone.insert(outPtr);
+            std::lock_guard<std::mutex> lk(g_uiDecMtx);
+            g_uiDecDone[outPtr] = uiPkg;
           }
           MCLA_LOG_WARN("PATHB-HOSTDECODE-TOP #{} dest={:08X} pkg={:08X} "
                         "path={} unc={} wrote={} room={} ok",
@@ -7795,11 +7829,15 @@ PPC_FUNC(sub_821D5E10) {
           (void)mem.WriteU32BE(st + 0, 0);
           (void)mem.WriteU32BE(st + 8, static_cast<uint32_t>(gotH));
           (void)mem.WriteU32BE(st + 16, 0);  // outLeft -> complete
+          {
+            std::lock_guard<std::mutex> wl(g_destPkgMtx);
+            g_destPkgWalk[outPtr] = static_cast<uint32_t>(gotH);
+          }
           return;
         }
         {
-          std::lock_guard<std::mutex> lk(s_uiDecMtx);
-          s_uiDecSkip.insert(outPtr);
+          std::lock_guard<std::mutex> lk(g_uiDecMtx);
+          g_uiDecSkip.insert(UiDecKey(outPtr, uiPkg));
         }
         MCLA_LOG_WARN("PATHB-HOSTDECODE-TOP-SKIP #{} dest={:08X} pkg={:08X} "
                       "srv={} gotH={} path={} unc={} room={} → guest",
@@ -7807,7 +7845,8 @@ PPC_FUNC(sub_821D5E10) {
                       decH.empty() ? 0u : static_cast<uint32_t>(decH.size()),
                       outLeft);
       }
-      // kSkipGuest (and kTry-after-SKIP) fall through to the guest inflate path.
+      // kUiDecSkipGuest (and kUiDecTry-after-SKIP) fall through to the guest
+      // inflate path below, exactly as a non-UI dest does.
     }
   }
 
@@ -8919,8 +8958,7 @@ PPC_FUNC(sub_821D5E10) {
       // decompress yields the full container. These 4 offsets only ever appear as
       // dest mappings under Path B (s_pendingUiPkg/PATHB-PKGFIX), so baseline is
       // untouched; flag-OFF never routes here anyway.
-      if (fileOff == 0x64CB0000u || fileOff == 0x64980000u ||
-          fileOff == 0x64CA3000u || fileOff == 0x6496F000u) {
+      if (IsUiXsfPkg(fileOff)) {
         static uint32_t s_uiBig = 0;
         if (s_uiBig == 0)
           s_uiBig = mem.Alloc(0x200000, 16);
@@ -8948,21 +8986,28 @@ PPC_FUNC(sub_821D5E10) {
           // corrupt-serve context coupling that killed the guest-decoder path.
           // On success write the FULL container into the dest and drain outLeft
           // (caller-loop complete key) so the guest's partial inflate is
-          // bypassed. Gated OFF by default => exact baseline unchanged.
-          if (kPathBHostFullDecode && outPtr != 0) {
+          // bypassed. F-297: keyed off the dynamically resolved fileOff (never a
+          // literal dest), shares the top-of-handler bookkeeping, and refuses to
+          // complete a container that does not FIT the dest room — a truncated
+          // prefix marked complete is worse than leaving it to the guest.
+          if (kPathBHostFullDecode && outPtr != 0 &&
+              UiDecClassify(outPtr, fileOff) == kUiDecTry) {
             std::vector<uint8_t> dec;
             const int hpath = mcla_lzx::host_decode_ui_xsf(
                 big.data(), static_cast<size_t>(gotu), dec, kXcWindowBits);
-            if (hpath && !dec.empty()) {
-              uint32_t wr = static_cast<uint32_t>(dec.size());
-              if (wr > outLeft) wr = outLeft;  // never overflow the dest room
+            const bool fits = hpath && !dec.empty() && dec.size() <= outLeft;
+            if (fits) {
+              const uint32_t wr = static_cast<uint32_t>(dec.size());
               const bool wrote = mem.WriteBytes(outPtr, dec.data(), wr);
               MCLA_LOG_WARN(
                   "PATHB-HOSTDECODE #{} off={:08X} path={} decoded={} "
                   "wrote={} dest={:08X} outLeft={} ok={}",
-                  cn, fileOff, hpath, static_cast<uint32_t>(dec.size()), wr,
-                  outPtr, outLeft, wrote);
+                  cn, fileOff, hpath, wr, wr, outPtr, outLeft, wrote);
               if (wrote) {
+                {
+                  std::lock_guard<std::mutex> lk(g_uiDecMtx);
+                  g_uiDecDone[outPtr] = fileOff;
+                }
                 (void)mem.WriteU32BE(st + 0, 0);       // inLeft
                 (void)mem.WriteU32BE(st + 8, static_cast<uint32_t>(gotu));
                 (void)mem.WriteU32BE(st + 16, 0);      // outLeft -> complete
@@ -8974,11 +9019,14 @@ PPC_FUNC(sub_821D5E10) {
               }
             } else {
               MCLA_LOG_WARN("PATHB-HOSTDECODE-FAIL #{} off={:08X} path={} "
-                            "gotu={} dest={:08X}",
+                            "gotu={} decoded={} dest={:08X} room={} → guest",
                             cn, fileOff, hpath, static_cast<uint32_t>(gotu),
-                            outPtr);
+                            dec.empty() ? 0u : static_cast<uint32_t>(dec.size()),
+                            outPtr, outLeft);
+              std::lock_guard<std::mutex> lk(g_uiDecMtx);
+              g_uiDecSkip.insert(UiDecKey(outPtr, fileOff));
             }
-            // fall through to the guest single-window serve on any failure
+            // fall through to the guest whole-package serve on any failure
           }
           // F-288 REVERT. Tested the isolated-stack hypothesis (F-287 said the
           // synchronous decode destabilizes boot). w264 ran MclaXcDecodeFullStream

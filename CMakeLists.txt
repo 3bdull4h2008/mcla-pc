@@ -476,6 +476,23 @@ add_executable(xtr_dump_validator tools/validators/xtr_dump_validator.cpp)
 target_include_directories(xtr_dump_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(xtr_dump_validator PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
+# Build-artifact check for the Path A host XMem/raw-LZX decoder (src/xmem_lzx.h).
+# Decodes the 4 UI .xsf straight out of the RPF and byte-compares against
+# build/xmem_golden/*.bin (written by tools/xmem_decode.py). Deliberately NOT part
+# of mcla.exe and NOT a soak dependency - it never touches the guest VM, so a
+# byte-exactness regression fails here at build time instead of surfacing as a
+# silently corrupt container in a boot log. Run: ninja -C build check_xmem_lzx
+add_executable(xmem_lzx_test tools/xmem_lzx_test.cpp)
+target_compile_definitions(xmem_lzx_test PRIVATE
+    ${VALIDATOR_COMPILE_DEFS}
+    MCLA_XMEM_ARCHIVE="${CMAKE_BINARY_DIR}/game_data/xarchive_cache.rpf"
+    MCLA_XMEM_GOLDEN_DIR="${CMAKE_BINARY_DIR}/xmem_golden")
+
+add_custom_target(check_xmem_lzx DEPENDS xmem_lzx_test
+    COMMAND $<TARGET_FILE:xmem_lzx_test>
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Path A host LZX byte-exactness vs build/xmem_golden")
+
 add_executable(backend_validator
     tools/validators/backend_validator.cpp
     src/renderer/vertex_decode.cpp src/renderer/resource_cache.cpp src/renderer/texture_decode.cpp)

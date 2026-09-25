@@ -1,13 +1,22 @@
 // Offline validator for src/xmem_lzx.h: decodes the 4 UI .xsf from the RPF and
-// byte-compares against build/xmem_golden/*.bin. Build with cl (vcvars):
-//   cl /EHsc /O2 /std:c++17 tools/xmem_lzx_test.cpp /Fe:build/xmem_lzx_test.exe
+// byte-compares against the goldens written by tools/xmem_decode.py.
+// Build-artifact check (CMake target `check_xmem_lzx`), never a soak dependency.
+//   cmake --build build --target check_xmem_lzx
+// Regenerate goldens:  python tools/xmem_decode.py
 #include <cstdio>
 #include <cstdint>
 #include <vector>
 #include "../src/xmem_lzx.h"
 
-static const char* kArchive = "E:\\mcla pc\\build\\game_data\\xarchive_cache.rpf";
-static const char* kGoldenDir = "E:\\mcla pc\\build\\xmem_golden\\";
+#ifndef MCLA_XMEM_ARCHIVE
+#define MCLA_XMEM_ARCHIVE "E:/mcla pc/build/game_data/xarchive_cache.rpf"
+#endif
+#ifndef MCLA_XMEM_GOLDEN_DIR
+#define MCLA_XMEM_GOLDEN_DIR "E:/mcla pc/build/xmem_golden"
+#endif
+
+static const char* kArchive = MCLA_XMEM_ARCHIVE;
+static const char* kGoldenDir = MCLA_XMEM_GOLDEN_DIR;
 
 struct Entry { const char* name; uint32_t off; };
 static Entry kEntries[] = {
@@ -28,8 +37,8 @@ int main() {
     pkg.resize(got);
     std::vector<uint8_t> out;
     int path = mcla_lzx::host_decode_ui_xsf(pkg.data(), pkg.size(), out);
-    char gpath[256];
-    sprintf_s(gpath, "%s%s.bin", kGoldenDir, e.name);
+    char gpath[512];
+    sprintf_s(gpath, "%s/%s.bin", kGoldenDir, e.name);
     FILE* g = nullptr;
     fopen_s(&g, gpath, "rb");
     std::vector<uint8_t> gold;
@@ -42,7 +51,7 @@ int main() {
            e.name, path, out.size(), gold.size(),
            out.size() > 0 ? out[0] : 0, out.size() > 1 ? out[1] : 0,
            out.size() > 2 ? out[2] : 0, out.size() > 3 ? out[3] : 0,
-           exact ? "EXACT" : "MISMATCH");
+           exact ? "EXACT" : (gold.empty() ? "NO-GOLDEN" : "MISMATCH"));
     if (!exact) fails++;
   }
   fclose(a);
