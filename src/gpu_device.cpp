@@ -548,6 +548,17 @@ static constexpr bool kPathBSingleOpen = false;
 // enqueued UI inflate streams forward instead of re-serving sbuf+0 (the w214 INFLATE
 // #2.2M loop). Scoped to IsJob2UiDest serves. Revert with Path B if it regresses.
 // F-195: ineffective — the loop is the J2-DIST replay (j2=0), not the j2BadMag path.
+// F-315: that "ineffective" verdict was measured on the ls0/j2BadMag leg only. The
+// MclaFindLastServe leg (:8065) had the same never-written-back defect and is the one
+// every INFLATE-REFORCE pos=00000000 line comes from, so it is being tried there.
+// F-315 RESULT: tried ON in w275 and it LIVELCKED — 657,657 lines vs w274's 57,886,
+// of which 119,352 were the SAME INFLATE/XMEM iteration (in=512, identical src/dest),
+// and nGfx prints went 6->4, i.e. shallower in the same wall-clock. No crash
+// (C0000005=0, Fatal=1 = the pre-existing one), but PATHB-HOSTDECODE 5->4. So writing
+// ls.pos back is NOT sufficient: the escape at :8081 needs IsJob2UiDest(outPtr) and
+// otherwise leaves served=false with inLeft unchanged, so the guest re-enters inflate
+// on the same 512 bytes forever. REVERTED to false; the advance code stays, gated off,
+// with the diagnosis above. Do not re-try without also handling the non-Job2 exit.
 static constexpr bool kUiServeAdvance = false;
 
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
@@ -8071,7 +8082,26 @@ PPC_FUNC(sub_821D5E10) {
           const uint32_t srcSize = ls.size;
           // w21 continuation: guest consumed from stack staging only — the
           // remaining package bytes stay on the guest-heap body at pos+consumed.
-          if (consumed > 0 && inPtr != 0 && inPtr < 0xA0000000u) {
+          //
+          // F-315: this leg had the SAME defect F-195 fixed on the sibling leg at
+          // :8015-8020 — `ls` is a local copy from MclaFindLastServe and nothing
+          // here ever wrote ls.pos back, so it stayed pinned at its registration
+          // value 0 forever. Every INFLATE-REFORCE line therefore shows
+          // pos=00000000, and the only reach was ls.pos+consumed (< srcSize), so
+          // once the guest consumed a whole entry both branches failed and
+          // srcOff fell back to 0 — re-serving the same head indefinitely (the
+          // garage frame-0 stall, F-303 §2). Mirror the sibling: advance the
+          // stored cursor by what the guest consumed and persist it, which lets
+          // the `srcOff >= srcSize` escape below pull the next package chunk.
+          // Gated by kUiServeAdvance, which is otherwise redundant here because
+          // kPathBEnqueueUI already satisfies the sibling's condition — so
+          // flipping it changes THIS leg and nothing else.
+          if (kUiServeAdvance && consumed > 0 && consumed < 0x80000000u &&
+              ls.pos + consumed <= ls.size) {
+            ls.pos += consumed;
+            MclaRecordLastServe(ls);
+            srcOff = ls.pos;
+          } else if (consumed > 0 && inPtr != 0 && inPtr < 0xA0000000u) {
             const uint32_t afterPos = ls.pos + consumed;
             if (afterPos < srcSize)
               srcOff = afterPos;
