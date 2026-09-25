@@ -7324,3 +7324,27 @@ This is a genuine multi-session RE now (authorized), not a bounded fix. `nGfx` r
 **3. Residual that keeps this an inference, not a proof.** The detector sees backward `bl` loops up to 64 words with `addi` strides ≤ 0x40. A walker using a **computed** increment (`add rA,rA,rB`), a stride > 64 bytes, a `bctr` dispatch (the registry table itself is jumped through elsewhere — see `825FDAB8 mtctr`/`825FDABC bctr` in F-305), or a forward-iterating loop would be missed. **IDA would close that gap; the user's `/mcp reload` is still the cheapest way to falsify item 2.** This is also the first time this session that a negative result *removes* work rather than adding some: if item 2 holds, F-219's "escalate to the producer, needs IDA" branch has no target, and the GFx dispatch question is settled at "its entry points are dead," not "something unreachable feeds it."
 
 **4. Objective status: unchanged, and the permitted search space is now genuinely empty.** Path A delivered (3/4, full-buffer-proven, `w271`/`w272`/`w273`). Path B's four branches closed (F-304/F-305/F-306/F-307→F-308). GFx dispatch dead at both ends with fired controls (F-309/F-311) and now no hidden feeder (item 2). `MOVIE-CTOR`=0, `nGfx`=0, garage not host-decoded. **The objective's "so GFx can initialize" is not met and I have no remaining permitted, untested lever against it** — which is a finding to bring to the user, not a reason to mark the goal complete or to cross rule-2/F-055. Next ID F-314.
+
+### F-314 (2026-09-26 ~05:3x, `build/cache/mcla_pe.bin` pointer census, **no build**) — **closes F-313's residual by a route that does not need IDA: no stored pointer anywhere in the image targets any of the three handler tables.** A walker needs a base; there is none. It also costs five hand-decoded PPC field extractions before finding an instrument that worked, and that ratio is the entry's real content.
+
+- Task:        T41.10 / the #22 line, re-opened then re-closed on stronger evidence
+- Type:        FACT (control-validated negative)
+- Class:       C (guest dispatch), H (instrument design)
+- Priority:    P1
+- Evidence:    4-aligned words in `mcla_pe.bin` whose VALUE lies in a target range, instrument validated by **701** hits for the whole registry span `0x82100000..0x8212FFFF` (e.g. holder `0x820CBC1C → 0x82100038`, `0x820CC094 → 0x82100088`, 670 of them in data, 31 in code):
+
+| target range | stored pointers |
+|---|---|
+| whole registry span (control) | **701** |
+| page `0x82107xxx` — the dispatcher's table page | **0** |
+| `0x821072F0..0x82107340` — the dispatcher's own table run | **0** |
+| `0x82102A00..0x82102BFF` — the gate table holding `0x82102AC0` (`82131008↔40003B03`) | **0** |
+| `0x82113A00..0x82113BFF` — the DPC table holding `8242FD00↔40002204` | **0** |
+
+· combined with F-310 §3 (no **immediate** for these pages in `generated/`, control-validated at 4,172 hits) and F-313 (0 of 508 stride-loops touch the span)
+
+**1. The conclusion is now carried by an instrument that passes its control.** Both ways a base can exist are empty: as an **immediate** (F-310 §3, validated) and as a **stored pointer** (this entry, validated by the 701-hit control on the wider span). Whatever the 701 pointers target, it is not these three tables. **So no code can walk them, and `sub_821EBCF0` is dead for the plain reason F-311 gave — its four direct callers are dead — with no feeder behind them.** F-313's residual ("computed increments, `bctr` dispatch, forward loops") is answered not by detecting those patterns but by removing the precondition they all share: a walker must hold the table's address, and nothing does.
+
+**2. This changes last turn's recommendation, so I am saying it explicitly.** F-313 ended by calling IDA "the cheapest falsifier". It is no longer that. Three independent control-validated negatives now agree, and IDA would be confirming the shape of a thing whose anchor is absent in every representation. **IDA's remaining value here is low; `/mcp reload` is no longer the blocking item for this question** — it stays useful for the msgid/`ori` blind spot (F-301 §5), which is a different question.
+
+**3. Five hand-decoded PPC field extractions failed before one worked, and the failure signatures are worth recording.** In order: `{4}` against an 8-hex field; `\b` before a leading `-`; hex/positive-decimal against a signed-decimal emitter; `split(None,3)` putting the mnemonic in the wrong column; a `blr` test matching nothing (so every "function extent" was a fake 400-word window); an `mtctr` mask wrong enough to return **0 for a word present at `0x825FDAB8`** while `bctr` correctly returned 1059 — the asymmetry that gave the range math away as fine and the *field extraction* as broken. **None of these produced an error; all five produced confident zeros.** The two findings that survived are exactly the two whose instruments I gated on a known-positive first (F-313's stride detector on FDBF8's loop; this entry's pointer census on the 701-hit wider span). Practical rule for this repo: **do not hand-decode PPC bit fields — `tools/ppc_disasm.py` prints the mnemonics correctly and is already validated; use it, and assert a known-present case before believing any count of zero it produces.** Next ID F-315.
