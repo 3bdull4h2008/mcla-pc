@@ -14970,6 +14970,59 @@ PPC_FUNC(sub_821C91C8) {
 }
 
 // ===========================================================================
+// F-309 DPC-PRODUCER CENSUS. sub_8242FD00 is the KeInsertQueueDpc-shaped ring
+// append (body: per-CPU object via [0x82000864] + ([r13+268]&0xFF)*80, slot at
+// obj+0x2C3C indexed by obj+0x2C74 counter, store r5 then counter++), and it is
+// reached from the {handler,msgid} registry at 0x82113A90..0x82113ADC -- NOT via
+// a bl, which is why "0 static callers" (F-269/F-270/F-301) proves nothing: the
+// demonstrably-running place-pass sub_825EF100 has exactly one. No census has
+// ever been hooked here, so "the producer never runs" has never been MEASURED.
+// sub_8242F870 is the adjacent registry entry at 0x82113AB0 and DOES have a bl
+// caller, so it is the within-build control: if the mechanism works at all, one
+// of the two should print.
+// LOG-ONLY: no guest write, no behaviour change, no RegisterFile dependency.
+PPC_FUNC_IMPL(__imp__sub_8242FD00);
+PPC_FUNC(sub_8242FD00) {
+  static std::atomic<uint32_t> s_dpcIns{0};
+  const uint32_t n = s_dpcIns.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t cpuArr = 0, tlsWord = 0, gbase = 0, cnt = 0, ring = 0;
+  (void)mem.ReadU32BE(0x82000864u, &cpuArr);
+  (void)mem.ReadU32BE(ctx.r13.u32 + 268u, &tlsWord);
+  // lbz loads the byte at that address = the MSB of the BE dword there.
+  const uint32_t idx = (tlsWord >> 24) & 0xFFu;
+  if (cpuArr != 0) {
+    (void)mem.ReadU32BE(cpuArr, &gbase);
+    const uint32_t obj = gbase + idx * 80u;
+    (void)mem.ReadU32BE(obj + 0x2C74u, &cnt);
+    (void)mem.ReadU32BE(obj + 0x2C3Cu, &ring);
+    MCLA_LOG_WARN("DPC-INS-CENSUS #{} r3={:08X} r4={:08X} r5={:08X} r13={:08X} "
+                  "cpuArr={:08X} idx={} obj={:08X} cnt={} slot0={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r13.u32, cpuArr, idx,
+                  obj, cnt, ring, static_cast<uint32_t>(ctx.lr));
+  } else {
+    MCLA_LOG_WARN("DPC-INS-CENSUS #{} r3={:08X} r4={:08X} r5={:08X} r13={:08X} "
+                  "cpuArr=0 (table ptr null) lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r13.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8242FD00(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8242F870);
+PPC_FUNC(sub_8242F870) {
+  static std::atomic<uint32_t> s_dpcSib{0};
+  const uint32_t n = s_dpcSib.fetch_add(1) + 1;
+  if (n <= 12) {
+    MCLA_LOG_WARN("DPC-SIBLING-CENSUS #{} sub_8242F870 r3={:08X} r4={:08X} "
+                  "r5={:08X} r13={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r13.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8242F870(ctx, base);
+}
+
+// ===========================================================================
 // W36e TLS CHAIN INIT for boot worker (sub_8242FB88): The boot worker
 // thread uses a different entry function and its TLS table (r13=8F200000
 // -> tlsTable=8F201000) also needs the chain initialized. The boot worker
