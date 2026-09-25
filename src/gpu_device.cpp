@@ -1,5 +1,6 @@
 #include "gpu_device.h"
 #include "raw_inflate.h"  // F-130: expand a member the page-window hook can't
+#include "xmem_lzx.h"     // F-295: Path A host XMem/raw-LZX decoder (offline-proven)
 #include "gpu_cp.h"
 #include "render_queue.h"
 #include "renderer_mode.h"
@@ -15,6 +16,10 @@
 #include "logging.h"
 #include <cpu/ppc_context.h>
 #include "fs/vfs_rpf.h"
+
+// F-188: host-side LZX via libmspack (already compiled, CMakeLists.txt:354).
+#include <lzx.h>
+#include <mspack.h>
 
 #include <atomic>
 #include <chrono>
@@ -67,9 +72,40 @@ struct XsfTocInfo {
 };
 static std::mutex g_xsfMtx;
 static std::unordered_map<std::string, XsfTocInfo> g_xsfToc;
+// F-247: defined early (before IsJob2UiDest) so the job2 pstream-allowlist
+// expansion below can be gated on it — flag OFF keeps the EXACT baseline.
+// Full F-192→F-247 rationale sits at its original declaration site (~:404).
+// F-247: ON (with PATHB-PKGFIX + dynamic IsJob2UiDest) eliminated the produced=0
+// livelock (w245 12106 -> w247 2), collapsed REBASE-POISON 3.36M -> 409, and made
+// job2 dests decode real RSC5 — but the executor then soft-loops because the SHARED
+// g_job2SharedWalk is reset to 0 by JOB2-PKG-RESET on every non-RSC5 continuation
+// (w247 ×14). That is the F-195/196 J2-DIST-replay <-> inflate-re-point collision, a
+// whole-package source (F-249 premise refuted by F-250: 0xA0000 is a MULTI-.xsf
+// container). F-251: new ordering fix — publish the UI container's real pkg via
+// s_pendingUiPkg BEFORE the FDD50 call that inflates it (post-call PATHB-PKGFIX
+// was 7 ms too late). ON to test whether raceeditor/others now decompress. OFF == exact baseline.
+static constexpr bool kPathBEnqueueUI = true;
+// F-247 dynamic serve-framing predicate: defined after g_mclaRebaseMap (~:3945).
+static bool MclaIsCurrentJob2Pbase(uint32_t outPtr);
 // w18: job #2 dests are the UI/swfC set only. Shared by package assigner
 // (file-scope) and the inflate host-serve paths.
 static bool IsJob2UiDest(uint32_t outPtr) {
+  // F-247 serve-framing (route 1, gated by kPathBEnqueueUI so OFF == exact
+  // baseline). Root cause PROVEN across w245/w246: the hardcoded allowlist below
+  // is a snapshot that OMITS most job2 PSTREAM children. Every omitted pbase dest
+  // falls to the non-job2 ForceServe → AssignPackageForDest "first unclaimed
+  // rscTab entry" guess → wrong package + the stale 7 MB (destSz=7179940) inflate
+  // state via the stack-keyed LastServe re-point → produced=0 livelock. w245 proved
+  // it on B7881000 (×9554); hardcoding B7881000 into the list (fix#2) fixed THAT
+  // one but merely moved the spin to the next omitted child B7121000 (w246) —
+  // textbook whack-a-mole. FIX: derive membership dynamically from the live job2
+  // rebase map so ALL current pbase dests are served. Excludes the standalone
+  // .xsf containers (raceeditor B7B01000 / garage B7AC1000) that PATHB-PKGFIX
+  // serves from their own archive package instead.
+  if (kPathBEnqueueUI &&
+      outPtr != 0xB7B01000u && outPtr != 0xB7AC1000u &&
+      MclaIsCurrentJob2Pbase(outPtr))
+    return true;
   switch (outPtr) {
   case 0xB7B41000u: // swfC container
   case 0xB7981000u:
@@ -199,6 +235,16 @@ static std::mutex g_destPkgMtx;
 static std::unordered_map<uint32_t, uint32_t> g_destPkgOff; // dest -> file off
 static std::unordered_map<uint32_t, uint32_t> g_destPkgWalk; // dest -> bytes served
 static std::unordered_map<uint32_t, uint32_t> g_pkgUsed;     // off -> dest
+// F-251: the UI container's real archive offset, published by the Path B hook
+// JUST BEFORE it calls the guest's own sub_821FDD50. FDD50 synchronously runs
+// E5C78 (record build) + the streamer inflate, so AssignPackageForDest is hit
+// DURING that call — before the post-FDD50 PATHB-PKGFIX can register the dest.
+// (w249 proof: raceeditor B7B01000 served 8× from the WRONG guessed 0x60000,
+// PATHB-PKGFIX overwrite landed 7 ms later, then the executor starved on the
+// job2 B7841000 whole-package loop and never re-served raceeditor.) The serve
+// consumes+clears this for the first unclaimed 0xB7-band dest so the container
+// inflates its own RSC5/XMem bytes. Gated by the caller (kPathBEnqueueUI).
+static std::atomic<uint32_t> s_pendingUiPkg{0};
 
 static uint32_t AssignPackageForDest(uint32_t outPtr) {
   BuildRscPackageTable();
@@ -206,6 +252,22 @@ static uint32_t AssignPackageForDest(uint32_t outPtr) {
   auto it = g_destPkgOff.find(outPtr);
   if (it != g_destPkgOff.end())
     return it->second;
+  // F-251: consume a Path B-published UI container package BEFORE the guess,
+  // so the inflate that runs INSIDE sub_821FDD50 gets the container's real
+  // archive offset instead of the "first unclaimed rscTab" meshtexture guess.
+  {
+    const uint32_t pend = s_pendingUiPkg.load();
+    if (pend != 0 && outPtr >= 0xB0000000u && outPtr < 0xC0000000u &&
+        !IsJob2UiDest(outPtr)) {
+      g_destPkgOff[outPtr] = pend;
+      g_destPkgWalk[outPtr] = 0;
+      g_pkgUsed[pend] = outPtr;
+      s_pendingUiPkg.store(0);  // one container per publish
+      MCLA_LOG_WARN("DEST-PKG outPtr={:08X} -> off={:08X} (PATHB-PENDING real pkg)",
+                    outPtr, pend);
+      return pend;
+    }
+  }
   uint32_t chosen = 0;
   if (IsJob2UiDest(outPtr)) {
     chosen = 0xA0000u;
@@ -313,6 +375,118 @@ constexpr uint32_t kPkgWindowMax = 0x400000u;  // 4 MB
 // instead of the container head, so the guest's own magic check sees the
 // stream it documents. Flip to false to restore the container-head framing.
 static constexpr bool kServeFromXCompressHead = false;
+
+// F-188: host-side LZX decode via libmspack instead of guest 0x82461530.
+// Eliminates guest-state dependency for UI container decompression.
+// F-190 control (w204, kHostLzxDecode=false) also hit RD-SUBMIT=4 — TOC stall
+// is environmental (F-123), not this switch.
+// F-191 DISABLED: an offline harness (tools/lzx_raceeditor_proof.c) proved libmspack's
+// CAB-LZX decodes raceeditor.xsf only to 131072 B (4×32KiB) then rc=11 under EVERY
+// strategy/window — XMem LZX != CAB LZX. w207 (fresh build) confirms XSF-LZX ok=0,
+// XSF-LZX-FAIL=23. Path A is inert; turned off so it cannot stack with Path B (do-not #9).
+static constexpr bool kHostLzxDecode = false;
+// XCompress codec=1 window size in bits (17 = 128KB, standard for Xbox 360).
+static constexpr int kXcWindowBits = 17;
+
+// F-295: Path A host XMem/raw-LZX decoder (src/xmem_lzx.h), proven byte-exact
+// offline against build/xmem_golden/*.bin for all 4 UI .xsf (no guest VM
+// re-entry, so free of the F-288/290 corrupt-serve context conflict). ON by
+// default (user decision 09-25): at the corrupt-serve UI block and the unified
+// four-dest hook, decode the loaded package host-side and write the FULL
+// container into the guest dest, then drain outLeft so the guest's partial
+// inflate is bypassed. Set false to restore exact baseline.
+static constexpr bool kPathBHostFullDecode = true;
+
+// T41.9 / F-191 Path B: after sub_821E2940 opens a UI .xsf container, re-issue the
+// async ENQUEUE the way sub_821E5F48 does. E2940 already runs E5C78(record builder)+
+// BCE68(pgStreamer::Open)+BC7A0(metadata) (ppc_recomp.20.cpp:25180/25194/25218) but
+// never calls E5E58 (enqueue) — the sole missing step (F-186). We rebuild the record
+// via E5C78 (same args) and call E5E58 so the GUEST's own XMemDecompress inflates it.
+// F-192 OFF: enqueue SUCCEEDS (E5E58 returns a slot; INFLATE 45->47210, the pipeline
+// wakes) but E5C78's record is NOT the correct E5E58 `D` layout descriptor — the
+// executor livelocks producing=0 (magic=8BE44DA1) and boot never reaches W34. The
+// true `D` must be captured from a working meshtexture request (see F-192 next step).
+// F-192 v2: switched to calling the guest's own sub_821FDD50 async helper with the
+// container's E2940 args so the GUEST builds I/D/ctx. v2 CONFIRMS the enqueue gap is
+// closed (FDD50 returns real handles, streamer slots advance 0->0x8001..3, C0000005=0),
+// but the guest inflate then livelocks (INFLATE 45->44870, produced=0, magic bad) ->
+// boot never reaches W34. So the blocker MOVED from "enqueue" to "UI serve data is
+// undecodable" (F-181/182/183 data-serve). OFF to avoid the livelock regression (F-193).
+// F-194: with kInflateIntervene=false the loop vanished (re-point was the loop cause,
+// not the enqueue) but the guest's OWN inflate rejected the UI bytes ('not in XCompress
+// format') and meshtextures collapsed too — the remaining blocker is SERVE FRAMING,
+// fixable only in the dense re-point stack (peer-owned). Kept OFF (safe baseline) until
+// serve framing is fixed with the re-point still ON for meshtextures.
+// F-195 test: ON with kUiServeAdvance so the re-point stream advances and terminates.
+// F-195 RESULT: the j2BadMag pos-advance did NOT break the w214 loop — the runaway
+// inflate carries j2=0 (NOT IsJob2UiDest) + the hard-coded destSz=7179940/srcSz=7179936
+// of the peer's OWN McLaJob2/J2-DIST XMem replay (F-172 "our own replay, not guest").
+// So the loop is in the J2-DIST replay machinery, a different host-side stack than the
+// j2BadMag re-point. Reverted to OFF (safe baseline). Path B enqueue itself is proven
+// good (F-193); the residual is the peer's J2-DIST replay not terminating.
+// T41.9b test: ON with kJ2DistReplay=false — Path B enqueue + no J2-DIST collision.
+// F-196 RESULT: disabling J2-DIST did NOT break the loop (w220 INFLATE still 44802,
+// src=CAB28300/destSz=7179940) — that replay comes via the kInflateIntervene re-point
+// (INFLATE lr=821BC380), not J2-DIST. No toggle combo works → the enqueued UI record
+// does not self-advance in the guest streaming executor (F-181). Reverted to OFF.
+// F-198 diagnostic ON to dump the enqueued record[+4].
+// F-199: single-open ALSO gives +4=0 → the 0-length is intrinsic to FDD50/E5DC8's
+// BCE68 open (r4=0, different E5C78 record). F-200 FIX: pass the STATIC resource-id
+// arg0 (captured from E2940's internal E5C78) to FDD50, not the heap pathPtr.
+// F-200b (w226) NEGATIVE: capture misfired (arg0used=CDCDCDCD→fell back to pathPtr);
+// AND legals (works) uses resource-id "legals" (arg0=0x8EFFF1C0) not the heap path,
+// plus double-open re-creates a 0-length record anyway (F-198). Reconstructing the
+// exact async request (resource-id string + no double-open) is a multi-layer F-187
+// descriptor problem in the peer's active streaming code → REVERTED to OFF.
+// F-201: single-open + copied path string STILL gives +4=0 (w229) → these 4 are NOT
+// async-loadable resources; the async builder resolves their length to 0 regardless
+// of string form. Path B via FDD50/async is fundamentally blocked for them (F-187).
+// F-204 (2026-09-25, w231): tested exactly this. Enabling the post-open double-open
+// FDD50 path produced CORRECTLY-SIZED enqueued records (raceeditor +4=0x22EDD=143069,
+// garage 0x104449, policecam 0x4B89, credits 0x73D7, all with valid pkgoff 64CB0000/…)
+// — refuting F-186/198/201's "the blocker is the zero-length record" premise. Yet the
+// soak REGRESSED: INFLATE 361→47,182 (the XMEM `src=CAB28300` semaphore-handle livelock
+// = F-195/197 signature), GFx census 5→1, W34-GFX-CENSUS/W34-NOGFX 2→0, FATAL-SOFT 0→1.
+// So the correctly-sized record is NOT sufficient: the guest streaming executor livelocks
+// on the peer's `kInflateIntervene` re-point (F-194/196/201), which is load-bearing and
+// peer-owned. Path B via FDD50 double-open is CONFIRMED DEAD. (arg0used=CDCDCDCD → the
+// static-arg0 capture never fires through __imp__ E2940, so the "correct static arg0"
+// single-request variant remains untested; it is a separate hook fix and, per the above,
+// not expected to change the livelock outcome.) Reverted to OFF.
+// F-204b (2026-09-25 01:40): re-tested OFF after the un-confounded single-request
+// (w232) + record[+4]-seed (w233) experiments. Both livelocked identically to the
+// double-open (w231): INFLATE ~48K on `XMEM src=CAB28300`, GFx 5→1, W34→0, FATAL-SOFT+1.
+// w232 proved the async FDD50 open CANNOT size record[+4] even with the EXACT static
+// arg0 (+24 pkgoff resolves, +4 stays 0). w233's seed never fired because the executor
+// is stuck on the CAB28300 re-point UPSTREAM of the UI record → +4 is not the blocker.
+// Path B host-hook enqueue is CONFIRMED DEAD; the residual is the peer's kInflateIntervene
+// re-point (load-bearing, do-not #9). Stays OFF.
+// F-247 (authorized route 1): root cause found — AssignPackageForDest serves the 4 UI
+// containers the WRONG package (w231 DEST-PKG B7B01000 -> off=00060000=meshtextures,
+// not their real record +24 pkgoff), so the guest inflate reads non-XCompress bytes and
+// the re-point re-serves the CAB28300 bounce forever. The Path B hook now registers each
+// dest's TRUE archive offset (PATHB-PKGFIX) to pre-empt the guess. ON to test the fix.
+// (Definition hoisted to :77 so IsJob2UiDest can gate the job2 pstream-allowlist fix.)
+
+// F-200 v4 uses the E2940 open (runs first, captures arg0) THEN FDD50 with the
+// captured static arg0 — so single-open stays OFF (we need E2940 to run to capture).
+// F-201: single-open WITH copied path string (no capture-timing bug). Reverted OFF.
+// F-204b: re-tested via hardcoded static arg0 (w232) — +4 STILL 0. Stays OFF.
+static constexpr bool kPathBSingleOpen = false;
+
+// F-195: advance the j2BadMag LastServe pos by the guest's previous consumed amount so
+// enqueued UI inflate streams forward instead of re-serving sbuf+0 (the w214 INFLATE
+// #2.2M loop). Scoped to IsJob2UiDest serves. Revert with Path B if it regresses.
+// F-195: ineffective — the loop is the J2-DIST replay (j2=0), not the j2BadMag path.
+static constexpr bool kUiServeAdvance = false;
+
+// T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
+// (correct guest enqueue) replaces its purpose; with Path B ON this replay only
+// collides (the INFLATE #2.2M loop carries its 7179940 constants). Disabled by
+// default while testing Path B; restore to true if meshtextures depend on it.
+// F-196: J2-DIST-off did NOT break the loop (it's via the re-point, not J2-DIST).
+// Kept true = the function's original always-on behavior (gate preserved, inert).
+static constexpr bool kJ2DistReplay = true;
 
 // F-168: an RSC5 package states its own UNCOMPRESSED length. Layout, verified
 // against xarchive_cache.rpf on three packages (legals.xsf @0xA0000 hdrLen 27 ->
@@ -611,6 +785,12 @@ void MclaMarkKnownListMembers() {
   }
 }
 
+static uint32_t HostServeUiBody(const char *path, uint32_t &outSize);
+
+// F-188 Path A: host-buffer XC decode (defined after MclaHostLzxDecode).
+static uint32_t MclaHostXcDecodePackage(const uint8_t *pkg, uint32_t pkgSz,
+                                        std::vector<uint8_t> &out);
+
 static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
   outSize = 0;
   // T41.3g (F-077) refusal RETIRED by T41.3p/F-105: list paths were blocked
@@ -782,6 +962,17 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
             MCLA_LOG_WARN("PKG-SUBST path='{}' tocOff={:08X} tocHead={:08X} "
                           "-> pkg={:08X} head={:08X} n={}",
                           path, offs[c], be, pkgOff, pbe, serveBytes.size());
+            // F-188 Path A: UI .xsf never reach guest inflate (F-186 enqueue
+            // gap). Decode the RSC5+XCompress LZX payload here so the guest
+            // gets real resource bytes. Lists keep DEFLATE/`RawInflate` above.
+            if constexpr (kHostLzxDecode) {
+              std::vector<uint8_t> decoded;
+              if (MclaHostXcDecodePackage(serveBytes.data(),
+                                          static_cast<uint32_t>(serveBytes.size()),
+                                          decoded) > 0) {
+                serveBytes.swap(decoded);
+              }
+            }
           }
         }
         }
@@ -2482,8 +2673,62 @@ PPC_FUNC(sub_8244FF20) {
   // 17..99 were invisible, which is how "all XMEM are the 7 MB job" was
   // partly an instrument artifact. Dedup by (src>>16, srcSz), max 64 keys.
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  // F-253 INSTRUMENT FIX: XMemDecompress takes size POINTERS (uint32* destSize,
+  // uint32* srcSize), so ctx.r5/ctx.r7 hold ADDRESSES (e.g. stack 0x6D9004), NOT
+  // the sizes. The old "destSz=7179940" was printing a pointer value and led the
+  // whole 7-MB-contamination theory astray (F-091/F-231 field trap). Read the
+  // pointed-to values so the real in/out sizes are visible.
+  auto &xmemMem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t realDestSz = 0, realSrcSz = 0;
+  if (destSz)
+    (void)xmemMem.ReadU32BE(destSz, &realDestSz);
+  if (srcSz)
+    (void)xmemMem.ReadU32BE(srcSz, &realSrcSz);
   __imp__sub_8244FF20(ctx, base);
   const uint32_t ret = ctx.r3.u32;
+  uint32_t outDestSz = 0, outSrcSz = 0;
+  if (destSz)
+    (void)xmemMem.ReadU32BE(destSz, &outDestSz);
+  if (srcSz)
+    (void)xmemMem.ReadU32BE(srcSz, &outSrcSz);
+  // F-253: always log the 4 UI container dests (they land past the general cap).
+  const bool uiDest = dest == 0xB7B01000u || dest == 0xB7AC1000u ||
+                      dest == 0xB7441000u || dest == 0xB74E1000u;
+  if (n <= 24 || uiDest)
+    MCLA_LOG_WARN("XMEM-SZPTR #{} dest={:08X} *destSz(in)={} *srcSz(in)={} "
+                  "src={:08X} *destSz(out)={} *srcSz(out)={} ret={:08X} "
+                  "lr={:08X}",
+                  n, dest, realDestSz, realSrcSz, src, outDestSz, outSrcSz, ret,
+                  lr);
+  // F-256: dump the decompressed UI-container head once to verify a REAL .xsf
+  // (vs capacity-truncated / garbage). A valid Rage/GFx container head tells us
+  // whether sub-goal A (decompression) is actually complete, not just flowing.
+  if (uiDest && ret == 0) {
+    static std::unordered_set<uint32_t> s_dumpedUi;
+    if (s_dumpedUi.size() < 8 && s_dumpedUi.insert(dest).second) {
+      uint32_t w[8] = {0};
+      for (int i = 0; i < 8; ++i)
+        if (xmemMem.IsValid(dest + i * 4, 4))
+          (void)xmemMem.ReadU32BE(dest + i * 4, &w[i]);
+      // F-266: measure how much real (non-poison) data the decompress wrote by
+      // scanning for the first 0xCDCDCDCD run — settles whether the UI .xsf fully
+      // decompressed vs the ambiguous destSz(out)==capacity reading.
+      uint32_t valid = 0;
+      for (uint32_t off = 0; off + 4 <= 0x200000u; off += 4) {
+        uint32_t word = 0;
+        if (!xmemMem.IsValid(dest + off, 4) ||
+            !xmemMem.ReadU32BE(dest + off, &word))
+          break;
+        if (word == 0xCDCDCDCDu || word == 0u)
+          break;
+        valid = off + 4;
+      }
+      MCLA_LOG_WARN("XMEM-UIHEAD #{} dest={:08X} validbytes={} words=[{:08X} "
+                    "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                    n, dest, valid, w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                    w[7]);
+    }
+  }
   {
     static std::mutex s_t413n2Mtx;
     static std::unordered_set<uint64_t> s_seen;
@@ -3799,6 +4044,41 @@ bool MclaPtrInRebaseMap(uint32_t p)
   return false;
 }
 
+// F-247 (route 1): dynamic job2-dest membership. True if outPtr is the exact
+// physical pbase (the 0xB0-0xC inflate dest) of a region in the CURRENT job2
+// rebase map, populated from the live PSTREAM/REQDUMP (0x8004) at :9107. Replaces
+// the incomplete hardcoded IsJob2UiDest allowlist for Path B — reads the same map
+// MclaPtrInRebaseMap does (unguarded by existing precedent; a job's pbase set is
+// stable across that job's inflates).
+// F-252: the live map is RESET per Job2 (g_mclaRebaseCount=0), so a job2 pbase
+// dest whose inflate runs AFTER a later REQDUMP is missed by the current-map scan
+// → falls to the guessing non-job2 path → wrong package → the whole-7MB XMem
+// livelock that starves the shared BC140 ring before the UI containers finish
+// (w250 B7121000 11456 produced=0 spins). Accumulate every job2 pbase ever seen
+// into a persistent set so membership is stable across the whole boot.
+static std::mutex g_job2PbaseSeenMtx;
+static std::unordered_set<uint32_t> g_job2PbaseSeen;
+static void MclaNoteJob2Pbase(uint32_t pbase) {
+  if (pbase >= 0xB0000000u && pbase < 0xC0000000u) {
+    std::lock_guard<std::mutex> lk(g_job2PbaseSeenMtx);
+    g_job2PbaseSeen.insert(pbase);
+  }
+}
+static bool MclaIsCurrentJob2Pbase(uint32_t outPtr)
+{
+  if (outPtr < 0xB0000000u || outPtr >= 0xC0000000u)
+    return false;
+  for (int i = 0; i < g_mclaRebaseCount && i < kMclaRebaseMax; ++i)
+    if (g_mclaRebaseMap[i].pbase == outPtr && g_mclaRebaseMap[i].size != 0)
+      return true;
+  {
+    std::lock_guard<std::mutex> lk(g_job2PbaseSeenMtx);
+    if (g_job2PbaseSeen.count(outPtr))
+      return true;
+  }
+  return false;
+}
+
 bool MclaPtrIsKnownPhys(uint32_t p)
 {
   // 0x80+ high half = image + host guest-heap + B7 dests + CA/C2 scratch.
@@ -4002,6 +4282,241 @@ static uint32_t MclaXcFreshCtx(auto &mem, uint32_t stack) {
   return s_xcCtx;
 }
 
+// F-188: in-memory mspack_system adapter for libmspack LZX decompression.
+// Pattern from Xenia lzx.cc / XenonRecomp xex_patcher.cpp.
+namespace {
+struct MspackMemFile {
+  uint8_t *buf;
+  off_t size;
+  off_t pos;
+};
+
+static int MspackMemRead(mspack_file *f, void *buf, int n) {
+  auto *mf = reinterpret_cast<MspackMemFile *>(f);
+  const off_t rem = mf->size - mf->pos;
+  const int got = (n < rem) ? n : static_cast<int>(rem);
+  if (got > 0) std::memcpy(buf, mf->buf + mf->pos, got);
+  mf->pos += got;
+  return got;
+}
+static int MspackMemWrite(mspack_file *f, void *buf, int n) {
+  auto *mf = reinterpret_cast<MspackMemFile *>(f);
+  const off_t rem = mf->size - mf->pos;
+  const int put = (n < rem) ? n : static_cast<int>(rem);
+  if (put > 0) std::memcpy(mf->buf + mf->pos, buf, put);
+  mf->pos += put;
+  return put;
+}
+static void *MspackMemAlloc(mspack_system *, size_t n) { return std::malloc(n); }
+static void MspackMemFree(void *p) { std::free(p); }
+static void MspackMemCopy(void *s, void *d, size_t n) { std::memcpy(d, s, n); }
+
+static mspack_system g_mspackSys = {
+    nullptr,          // open
+    nullptr,          // close
+    MspackMemRead,    // read
+    MspackMemWrite,   // write
+    nullptr,          // seek
+    nullptr,          // tell
+    nullptr,          // message
+    MspackMemAlloc,   // alloc
+    MspackMemFree,    // free
+    MspackMemCopy,    // copy
+    nullptr           // null_ptr
+};
+} // namespace
+
+// F-188: decompress a single LZX stream (one XC frame payload or full stream)
+// using host libmspack. Returns bytes produced into dst; 0 = fail.
+static uint32_t MclaHostLzxDecode(const uint8_t *src, uint32_t srcLen,
+                                  uint8_t *dst, uint32_t dstCap,
+                                  uint32_t wantOut) {
+  if (!src || srcLen < 2 || !dst || dstCap < 16)
+    return 0;
+  const uint32_t outSz = (wantOut > 0 && wantOut <= dstCap) ? wantOut : dstCap;
+  MspackMemFile inFile{const_cast<uint8_t *>(src),
+                       static_cast<off_t>(srcLen), 0};
+  MspackMemFile outFile{dst, static_cast<off_t>(outSz), 0};
+  // reset_interval=0: one continuous LZX bitstream. Guest 82461010 keeps the
+  // same decoder object across XC frames (r31=r3+20, no 824614E8 reset).
+  auto *lzx = lzxd_init(&g_mspackSys,
+                         reinterpret_cast<mspack_file *>(&inFile),
+                         reinterpret_cast<mspack_file *>(&outFile),
+                         kXcWindowBits, 0, 0x8000,
+                         static_cast<off_t>(outSz), 0);
+  if (!lzx) {
+    MCLA_LOG_WARN("XC-HOST-LZX lzxd_init FAILED srcLen={} outSz={} windowBits={}",
+                  srcLen, outSz, kXcWindowBits);
+    return 0;
+  }
+  const int rc = lzxd_decompress(lzx, static_cast<off_t>(outSz));
+  const uint32_t produced = static_cast<uint32_t>(outFile.pos);
+  if (rc != MSPACK_ERR_OK && produced == 0) {
+    MCLA_LOG_WARN("XC-HOST-LZX decompress FAILED rc={} srcLen={} outSz={} inFilePos={}/{} outFilePos={}",
+                  rc, srcLen, outSz, inFile.pos, inFile.size, outFile.pos);
+  }
+  lzxd_free(lzx);
+  return (rc == MSPACK_ERR_OK || produced > 0) ? produced : 0;
+}
+
+// F-188 Path A: host-buffer XC frame walk (UI serve path). Same frame format as
+// MclaXcDecodeGuestFrames. XCompress frames are one LZX bitstream split into
+// 32 KiB chunks (guest keeps ctx+20 across frames), so payload bytes are
+// concatenated and decoded in one lzxd call. Returns decompressed bytes; 0 =
+// fail. Partial output is a fail — never serve a truncated resource.
+static uint32_t MclaHostXcDecodePackage(const uint8_t *pkg, uint32_t pkgSz,
+                                        std::vector<uint8_t> &out) {
+  out.clear();
+  if (!pkg || pkgSz < 24)
+    return 0;
+  const uint32_t ph0 = MclaBE(pkg);
+  uint32_t payloadOff = 0;
+  uint32_t wantOut = 0;
+  if (ph0 == 0x05435352u) { // RSC5
+    if (pkgSz < 20)
+      return 0;
+    const uint32_t xc = MclaBE(pkg + 12);
+    if (xc != kXCompressMagic)
+      return 0;
+    payloadOff = 20; // RSC5(12)+XC(4)+size(4)
+    wantOut = MclaBE(pkg + 16);
+    if (wantOut < 16u || wantOut > 0x400000u)
+      wantOut = 0;
+  } else if (ph0 == kXCompressMagic) {
+    payloadOff = 8;
+    wantOut = MclaBE(pkg + 4);
+    if (wantOut < 16u || wantOut > 0x400000u)
+      wantOut = 0;
+  } else {
+    return 0;
+  }
+  if (payloadOff >= pkgSz)
+    return 0;
+  if (wantOut == 0)
+    wantOut = 0x100000; // 1 MB safety cap
+
+  // Walk frames and concatenate compressed payloads (headers stripped).
+  // Keep per-frame uncompressed sizes / payload lengths for the SS fallback.
+  std::vector<uint8_t> payload;
+  std::vector<uint32_t> frameUncomp;
+  std::vector<uint32_t> framePayLen;
+  payload.reserve(pkgSz - payloadOff);
+  frameUncomp.reserve(64);
+  framePayLen.reserve(64);
+  uint32_t src = payloadOff;
+  int frameN = 0;
+  while (src + 2 <= pkgSz && frameN < 512) {
+    const uint8_t *hb = pkg + src;
+    uint32_t hdrSz = 0, uncomp = 0, payLen = 0;
+    if (hb[0] == 0xFF) {
+      if (src + 5 > pkgSz)
+        break;
+      hdrSz = 5;
+      uncomp = (uint32_t(hb[1]) << 8) | uint32_t(hb[2]);
+      payLen = (uint32_t(hb[3]) << 8) | uint32_t(hb[4]);
+    } else {
+      hdrSz = 2;
+      uncomp = 0x8000u;
+      payLen = (uint32_t(hb[0]) << 8) | uint32_t(hb[1]);
+    }
+    if (payLen == 0 || src + hdrSz + payLen > pkgSz)
+      break;
+    payload.insert(payload.end(), pkg + src + hdrSz, pkg + src + hdrSz + payLen);
+    frameUncomp.push_back(uncomp);
+    framePayLen.push_back(payLen);
+    src += hdrSz + payLen;
+    ++frameN;
+  }
+  if (payload.empty() || frameN == 0) {
+    MCLA_LOG_WARN("XSF-LZX-FAIL pkgSz={} wantOut={} frames=0 (no XC frames)",
+                  pkgSz, wantOut);
+    return 0;
+  }
+
+  out.resize(wantOut);
+  // One LZX stream over all frame payloads. reset_interval = 0x8000 matches
+  // the 32 KiB XCompress block size (per-frame lzxd_init reset_interval=0
+  // decoded frame 0 only and then returned rc=11 on frame 1).
+  const uint32_t produced =
+      MclaHostLzxDecode(payload.data(), static_cast<uint32_t>(payload.size()),
+                        out.data(), wantOut, wantOut);
+  // Require a complete resource: never swap a truncated body into the serve
+  // (w199: produced=32768 of 143069 corrupted LISTLINE/TYPINIT consumers).
+  if (produced > 0 && produced + 64u >= wantOut) {
+    out.resize(produced);
+    MCLA_LOG_WARN("XSF-LZX pkgSz={} wantOut={} produced={} frames={} payLen={}",
+                  pkgSz, wantOut, produced, frameN,
+                  static_cast<uint32_t>(payload.size()));
+    return produced;
+  }
+
+  // Fallback: shared-state incremental LZX (guest 82461010 keeps one decoder
+  // across XC frames, r31=r3+20, no 824614E8 reset). Init one lzxd_stream once
+  // (window 17, reset_interval=0, output_length=wantOut), walk XC frames
+  // appending payload and calling lzxd_decompress(lzx, frameUncomp) each time.
+  {
+    out.assign(wantOut, 0);
+    // Input size starts at 0 and grows per frame = "append payload".
+    MspackMemFile inFile{payload.data(), 0, 0};
+    MspackMemFile outFile{out.data(), static_cast<off_t>(wantOut), 0};
+    auto *lzx = lzxd_init(&g_mspackSys,
+                          reinterpret_cast<mspack_file *>(&inFile),
+                          reinterpret_cast<mspack_file *>(&outFile),
+                          kXcWindowBits, 0, 0x8000,
+                          static_cast<off_t>(wantOut), 0);
+    if (!lzx) {
+      MCLA_LOG_WARN("XSF-LZX-SS-FAIL pkgSz={} wantOut={} concatProd={} "
+                    "frames={} (lzxd_init)",
+                    pkgSz, wantOut, produced, frameN);
+      MCLA_LOG_WARN("XSF-LZX-FAIL pkgSz={} wantOut={} produced={} frames={} "
+                    "payLen={} (partial or zero)",
+                    pkgSz, wantOut, produced, frameN,
+                    static_cast<uint32_t>(payload.size()));
+      out.clear();
+      return 0;
+    }
+    int ssRc = MSPACK_ERR_OK;
+    off_t ssPayOff = 0;
+    for (int i = 0; i < frameN; ++i) {
+      ssPayOff += static_cast<off_t>(framePayLen[static_cast<size_t>(i)]);
+      inFile.size = ssPayOff; // append this frame's compressed payload
+      off_t nOut =
+          static_cast<off_t>(frameUncomp[static_cast<size_t>(i)]
+                                 ? frameUncomp[static_cast<size_t>(i)]
+                                 : 0x8000u);
+      const off_t remain = static_cast<off_t>(wantOut) - outFile.pos;
+      if (remain <= 0)
+        break;
+      if (nOut > remain)
+        nOut = remain;
+      ssRc = lzxd_decompress(lzx, nOut);
+      if (ssRc != MSPACK_ERR_OK)
+        break;
+    }
+    const uint32_t ssProduced = static_cast<uint32_t>(outFile.pos);
+    lzxd_free(lzx);
+    if (ssProduced > 0 && ssProduced + 64u >= wantOut) {
+      out.resize(ssProduced);
+      MCLA_LOG_WARN("XSF-LZX-SS pkgSz={} wantOut={} produced={} frames={} "
+                    "payLen={} concatProd={}",
+                    pkgSz, wantOut, ssProduced, frameN,
+                    static_cast<uint32_t>(payload.size()), produced);
+      return ssProduced;
+    }
+    MCLA_LOG_WARN("XSF-LZX-SS-FAIL pkgSz={} wantOut={} produced={} frames={} "
+                  "payLen={} concatProd={} rc={} inPos={}/{} (partial or zero)",
+                  pkgSz, wantOut, ssProduced, frameN,
+                  static_cast<uint32_t>(payload.size()), produced, ssRc,
+                  inFile.pos, inFile.size);
+    MCLA_LOG_WARN("XSF-LZX-FAIL pkgSz={} wantOut={} produced={} frames={} "
+                  "payLen={} (partial or zero)",
+                  pkgSz, wantOut, produced, frameN,
+                  static_cast<uint32_t>(payload.size()));
+    out.clear();
+    return 0;
+  }
+}
+
 // Parse XC frames after RSC5+XC header (payload at package+20) and call
 // guest 82461530 per frame into dest. Returns produced bytes; 0 = fail.
 // Frame format (from 82461010):
@@ -4096,6 +4611,30 @@ static uint32_t MclaXcDecodeGuestFrames(auto &mem, uint32_t pkgBounce,
     if (tryOut < 16)
       break;
 
+    uint32_t frameOut = 0;
+    uint32_t ret = 0;
+    if constexpr (kHostLzxDecode) {
+      // F-188: host-side LZX via libmspack per XC frame.
+      std::vector<uint8_t> compBuf(payLen);
+      if (!mem.ReadBytes(src + hdrSz, compBuf.data(), payLen))
+        break;
+      std::vector<uint8_t> outBuf(tryOut);
+      frameOut = MclaHostLzxDecode(compBuf.data(), payLen,
+                                   outBuf.data(), tryOut,
+                                   uncomp ? uncomp : tryOut);
+      if (frameOut > 0)
+        (void)mem.WriteBytes(dest + produced, outBuf.data(), frameOut);
+      ret = (frameOut > 0) ? 0 : 1;
+      if (frameN < 12 || (frameN % 32) == 0) {
+        uint32_t cb = 0;
+        if (payLen >= 4)
+          cb = (uint32_t(compBuf[0]) << 24) | (uint32_t(compBuf[1]) << 16) |
+               (uint32_t(compBuf[2]) << 8) | uint32_t(compBuf[3]);
+        MCLA_LOG_WARN("W27-XC-HOST-FRAME #{} payLen={} uncomp={} "
+                      "frameOut={} ret={} head={:08X}",
+                      frameN, payLen, uncomp, frameOut, ret, cb);
+      }
+    } else {
     // Fresh ctx per frame so Huffman tables match this frame.
     const uint32_t ctx = MclaXcFreshCtx(mem, stack);
     if (!ctx)
@@ -4124,9 +4663,9 @@ static uint32_t MclaXcDecodeGuestFrames(auto &mem, uint32_t pkgBounce,
     p.r9.u64 = s_xcProd;
     p.lr = 0x821BC380u;
     fn(p, mcla::kernel::g_memory.base);
-    const uint32_t ret = p.r3.u32;
-    uint32_t frameOut = 0;
+    ret = p.r3.u32;
     (void)mem.ReadU32BE(s_xcProd + 0, &frameOut);
+    } // end guest path
     if (frameN < 12 || (frameN % 32) == 0) {
       uint32_t dh[4] = {0};
       for (int k = 0; k < 4; ++k)
@@ -4172,7 +4711,8 @@ static uint32_t MclaXcDecodeGuestFrames(auto &mem, uint32_t pkgBounce,
 // Full-stream XMem via a FRESH ctx (package payload at +20).
 static uint32_t MclaXcDecodeFullStream(auto &mem, uint32_t pkgBounce,
                                        uint32_t pkgSz, uint32_t dest,
-                                       uint32_t destCap, uint32_t stack) {
+                                       uint32_t destCap, uint32_t stack,
+                                       bool forceFresh = false) {
   if (!pkgBounce || !dest || destCap < 16)
     return 0;
   uint32_t ph[6] = {0};
@@ -4205,6 +4745,24 @@ static uint32_t MclaXcDecodeFullStream(auto &mem, uint32_t pkgBounce,
   if (srcN < 8)
     return 0;
 
+  // F-188: try host-side LZX on the full payload before guest path.
+  if constexpr (kHostLzxDecode) {
+    std::vector<uint8_t> compBuf(srcN);
+    if (mem.ReadBytes(pkgBounce + payloadOff, compBuf.data(), srcN)) {
+      std::vector<uint8_t> outBuf(tryOut);
+      const uint32_t produced = MclaHostLzxDecode(
+          compBuf.data(), srcN, outBuf.data(), tryOut, tryOut);
+      if (produced > 0) {
+        (void)mem.WriteBytes(dest, outBuf.data(), produced);
+        MCLA_LOG_WARN("W27-XC-HOST-FULL srcN={} tryOut={} produced={}",
+                      srcN, tryOut, produced);
+        return produced;
+      }
+      MCLA_LOG_WARN("W27-XC-HOST-FULL-FAIL srcN={} tryOut={}, falling to guest",
+                    srcN, tryOut);
+    }
+  }
+
   static std::mutex s_xcFullMtx;
   std::lock_guard<std::mutex> lk(s_xcFullMtx);
   static uint32_t s_sz = 0;
@@ -4219,8 +4777,9 @@ static uint32_t MclaXcDecodeFullStream(auto &mem, uint32_t pkgBounce,
   // guest pointer. Fresh allocs lack the decoder window/tables the guest
   // built at boot. Soft-reset only the pending-stream fields at
   // state+12264..12304; keep Huffman tables.
-  uint32_t ctx = s_xmemCtx.load();
-  if (ctx == 0 || ctx == 0xCDCDCDCDu || ctx == 0xFFFFFFFFu) {
+  uint32_t ctx = forceFresh ? 0u : s_xmemCtx.load();
+  if (!forceFresh &&
+      (ctx == 0 || ctx == 0xCDCDCDCDu || ctx == 0xFFFFFFFFu)) {
     const uint32_t inf = s_guestInflaterR3.load();
     if (inf && inf != 0xCDCDCDCDu) {
       uint32_t w0 = 0;
@@ -6122,6 +6681,12 @@ static int MclaJ2FrameExtract(auto &mem, uint32_t pkgBounce, uint32_t pkgSz,
 // (never compressed plant, never invented vtables). Guest place still runs
 // on the decompressed image afterwards.
 static int MclaJob2DecompressAndDistribute(PPCContext &ctx) {
+  // F-195/T41.9b: this is the legacy host-side J2-DIST XMem replay of pkg 0xA0000
+  // (UI). It collides with Path B's correct guest enqueue (F-193) — the runaway
+  // INFLATE loop carries j2=0 + our 7179940 replay constants. When Path B is on,
+  // disable this replay so the guest's own streaming owns UI inflate.
+  if (!kJ2DistReplay)
+    return 0;
   static std::mutex s_j2distMtx;
   std::lock_guard<std::mutex> dlock(s_j2distMtx);
   static std::atomic<uint32_t> s_j2distRun{0};
@@ -6131,6 +6696,16 @@ static int MclaJob2DecompressAndDistribute(PPCContext &ctx) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   constexpr uint32_t kPkg = 0xA0000u;
   const uint32_t pkgSz = PackageSizeAt(kPkg);
+
+  // F-293: the safe-site guest-decoder avenue is now FULLY CLOSED. At this
+  // boot-safe J2-DIST context, both warm-ctx (F-290: garbage head=0) and
+  // forceFresh (this run: produced=0 for the 2 big containers) fail — the
+  // engine needs the live corrupt-serve inflate tables, which only exist where
+  // it collapses boot (F-288). No guest-decoder site yields both correct output
+  // and safe boot. Full decompress therefore requires the funded host XMemEx/
+  // LZX decoder (task #17); deflate ruled out (F-292), single-stream LZX ruled
+  // out (F-291). Block removed to keep the dests at the valid first-window
+  // baseline (writing garbage head=0 is a net regression).
 
   // Capture inflater family (may already be live from job1 InflateBegin).
   const uint32_t inflater = s_guestInflaterR3.load();
@@ -6277,9 +6852,18 @@ static int MclaJob2DecompressAndDistribute(PPCContext &ctx) {
         (wantOut > 0x200000u) ? 0x200000u : wantOut;
     produced = MclaXcDecodeFullStream(mem, s_pkgFull, pkgSz, s_outBuf,
                                       outCap, s_stack);
-    inflated = produced > 0;
+    // F-188: partial output (< wantOut) means the full-stream path could not
+    // decompress the entire payload (multi-frame XC with independent Huffman
+    // tables). Fall through to per-frame decode which handles each frame
+    // independently via host libmspack.
+    inflated = produced >= wantOut;
+    if (!inflated && produced > 0) {
+      MCLA_LOG_WARN("J2-DIST-PARTIAL produced={} wantOut={}, trying per-frame",
+                    produced, wantOut);
+      produced = 0;
+    }
     if (!inflated) {
-      // w27 PATH B: per-frame guest 82461530 with fresh ctx each frame.
+      // w27 PATH B: per-frame host LZX (kHostLzxDecode) or guest 82461530.
       produced = MclaXcDecodeGuestFrames(mem, s_pkgFull, pkgSz, s_outBuf,
                                          outCap, s_stack);
       inflated = produced > 0;
@@ -6961,7 +7545,13 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
   // w25: continuation window whose head is not RSC5/XC cannot be inflated
   // independently — reset job2 shared walk to the package head so guest
   // InflateStep sees a decodable stream (w24 proven path).
-  if (job2 && walkPos > 0 && pkgWin.size() >= 4) {
+  // F-248 probe (gated by kPathBEnqueueUI): this reset is what thrashes the
+  // SHARED g_job2SharedWalk back to 0 on every legitimate LZX continuation frame
+  // (compressed bytes, no RSC5 head by design), so each job2 dest re-serves the
+  // package head forever (w247 B7841000 produced=16384 loop, JOB2-PKG-RESET ×14).
+  // A mid-stream continuation does NOT need an RSC5 head, so SKIP the reset when the
+  // serve-framing stack is on and let the walk advance. Flag OFF == exact baseline.
+  if (!kPathBEnqueueUI && job2 && walkPos > 0 && pkgWin.size() >= 4) {
     const uint32_t wh = MclaBE(pkgWin.data());
     if (wh != 0x05435352u && wh != 0x0FF512EFu) {
       pkgWin.clear();
@@ -7082,6 +7672,14 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
 PPC_FUNC_IMPL(__imp__sub_821D5E10);
 // F-182: the single switch for every state rewrite this hook performs. Set to
 // false to let the guest's own zlibInflater::InflateBegin run untouched.
+// T41.9 experiment (F-194, w216): with Path B enqueue ON + this OFF, the
+// `INFLATE #2.2M` loop DISAPPEARED (6 inflates, not 11264) — proving the loop was
+// the re-point machinery, NOT the enqueue. BUT the guest's own InflateBegin then
+// printed its OWN `not in XCompress format` assert (×2) and INFLATE collapsed 361→6
+// + boot stalled at 19,964 lines: the re-point is LOAD-BEARING for meshtextures too
+// (F-182), so this combo is confounded, not viable. Restored to true. The residual
+// blocker is SERVE FRAMING (the bytes at the inflate head aren't 0x0FF512EF), which
+// must be fixed WITH the re-point kept on for meshtextures (F-169/183 line).
 static constexpr bool kInflateIntervene = true;
 static std::atomic<uint32_t> s_h5E10{0};
 static std::atomic<uint32_t> s_h5E10pt{0};
@@ -7125,6 +7723,94 @@ PPC_FUNC(sub_821D5E10) {
   }
 
   uint32_t magic = 0;
+  // F-295 Path A (unified): host XMem/raw-LZX decode of the 4 UI .xsf dests,
+  // fired once per dest at the very top of the inflate handler so it covers
+  // BOTH the corrupt-serve leg (raceeditor, inLeft<0) and the normal
+  // INFLATE-RSC5 leg (garage/policecam/credits, valid in=32768). Pure host
+  // computation — no guest VM re-entry, so free of the F-288/290/293 corrupt-
+  // serve context conflict. On success the FULL byte-exact container is in the
+  // dest and outLeft is drained (caller-loop complete key). Gated OFF == baseline.
+  if (kPathBHostFullDecode && outPtr != 0 && outLeft != 0) {
+    uint32_t uiPkg = 0;
+    switch (outPtr) {
+      case 0xB7B01000u: uiPkg = 0x64CB0000u; break;  // raceeditor
+      case 0xB7AC1000u: uiPkg = 0x64980000u; break;  // garage
+      case 0xB7441000u: uiPkg = 0x64CA3000u; break;  // policecam
+      case 0xB74E1000u: uiPkg = 0x6496F000u; break;  // credits
+      default: uiPkg = 0; break;
+    }
+    if (uiPkg != 0) {
+      static std::mutex s_uiDecMtx;
+      static std::unordered_set<uint32_t> s_uiDecDone;  // fully written+completed
+      static std::unordered_set<uint32_t> s_uiDecSkip;  // oversized/failed → guest
+      enum Act { kTry, kComplete, kSkipGuest } act;
+      {
+        std::lock_guard<std::mutex> lk(s_uiDecMtx);
+        if (s_uiDecSkip.count(outPtr)) act = kSkipGuest;
+        else if (s_uiDecDone.count(outPtr)) act = kComplete;
+        else act = kTry;
+      }
+      if (act == kComplete) {
+        // already fully decoded into this dest — keep it complete, skip re-inflate.
+        (void)mem.WriteU32BE(st + 0, 0);
+        (void)mem.WriteU32BE(st + 16, 0);
+        return;
+      }
+      if (act == kTry) {
+        const uint32_t cpsz = PackageSizeAt(uiPkg);
+        uint32_t want = cpsz ? cpsz : 0x200000u;
+        if (want > 0x200000u) want = 0x200000u;
+        auto &vfsH = mcla::vfs::RpfVirtualFileSystem::Instance();
+        mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fhH;
+        std::vector<uint8_t> bigH(want);
+        uint64_t gotH = 0;
+        bool srvH = false;
+        if (vfsH.OpenFile("xarchive_cache.rpf", fhH)) {
+          srvH = vfsH.ReadFileAt(fhH, uiPkg, bigH.data(), want, gotH) &&
+                 gotH >= 24;
+          vfsH.CloseFile(fhH);
+        }
+        int hp = 0;
+        std::vector<uint8_t> decH;
+        if (srvH)
+          hp = mcla_lzx::host_decode_ui_xsf(bigH.data(),
+                                            static_cast<size_t>(gotH), decH,
+                                            kXcWindowBits);
+        // Write+complete ONLY when the WHOLE decoded container fits the dest's
+        // current room. Garage (uncLen 1066057) exceeds a 256 KiB window; a
+        // truncated prefix marked complete would corrupt the tail, so oversized
+        // containers fall through to the guest's own progressive inflate.
+        bool fits = hp && !decH.empty() && decH.size() <= outLeft;
+        if (fits && mem.WriteBytes(outPtr, decH.data(),
+                                   static_cast<uint32_t>(decH.size()))) {
+          {
+            std::lock_guard<std::mutex> lk(s_uiDecMtx);
+            s_uiDecDone.insert(outPtr);
+          }
+          MCLA_LOG_WARN("PATHB-HOSTDECODE-TOP #{} dest={:08X} pkg={:08X} "
+                        "path={} unc={} wrote={} room={} ok",
+                        n, outPtr, uiPkg, hp,
+                        static_cast<uint32_t>(decH.size()),
+                        static_cast<uint32_t>(decH.size()), outLeft);
+          (void)mem.WriteU32BE(st + 0, 0);
+          (void)mem.WriteU32BE(st + 8, static_cast<uint32_t>(gotH));
+          (void)mem.WriteU32BE(st + 16, 0);  // outLeft -> complete
+          return;
+        }
+        {
+          std::lock_guard<std::mutex> lk(s_uiDecMtx);
+          s_uiDecSkip.insert(outPtr);
+        }
+        MCLA_LOG_WARN("PATHB-HOSTDECODE-TOP-SKIP #{} dest={:08X} pkg={:08X} "
+                      "srv={} gotH={} path={} unc={} room={} → guest",
+                      n, outPtr, uiPkg, srvH, static_cast<uint32_t>(gotH), hp,
+                      decH.empty() ? 0u : static_cast<uint32_t>(decH.size()),
+                      outLeft);
+      }
+      // kSkipGuest (and kTry-after-SKIP) fall through to the guest inflate path.
+    }
+  }
+
   // w21: read magic even when consumed>0 — continuation entries walk stack
   // zeros after the first XCompress window and magic must be visible then.
   if (inLeft >= 4 && inPtr != 0)
@@ -7218,8 +7904,27 @@ PPC_FUNC(sub_821D5E10) {
           haveLs = false;
         }
         if (haveLs) {
-          const uint32_t give0 =
-              (ls0.size - ls0.pos > 0x8000u) ? 0x8000u : (ls0.size - ls0.pos);
+          // F-195: the j2BadMag path re-served sbuf+ls0.pos with ls0.pos pinned at
+          // its registration value (0), and set served=true, so the continuation
+          // branch (:7623, which advances by `consumed`) was NEVER reached → w214
+          // `INFLATE #2.2M` loop (produced>0 each call, but pos/outPtr never moved).
+          // Advance the stored pos by the amount the guest consumed on the previous
+          // InflateBegin (local `consumed` = st+8 set by __imp__ last time) so the
+          // stream walks forward and eventually exhausts (give0==0 → fall through).
+          // F-252: also fire under kPathBEnqueueUI (route-1) — now that job2 pbase
+          // dests resolve to real 0xA0000 (persistent membership), the walk must
+          // advance past each consumed window or the whole-package inflate re-serves
+          // the head (w247 loop). flag-OFF => kUiServeAdvance=false && flag=false =>
+          // no change to baseline.
+          if ((kUiServeAdvance || kPathBEnqueueUI) && consumed > 0 &&
+              consumed < 0x80000000u &&
+              ls0.pos + consumed <= ls0.size) {
+            ls0.pos += consumed;
+            MclaRecordLastServe(ls0);
+          }
+          const uint32_t rem0 =
+              (ls0.size > ls0.pos) ? (ls0.size - ls0.pos) : 0u;
+          const uint32_t give0 = (rem0 > 0x8000u) ? 0x8000u : rem0;
           (void)mem.WriteU32BE(st + 0, give0);
           (void)mem.WriteU32BE(st + 4, ls0.sbuf + ls0.pos);
           (void)mem.WriteU32BE(st + 8, 0);
@@ -8206,6 +8911,100 @@ PPC_FUNC(sub_821D5E10) {
     const uint32_t readOff = fileOff + walkPos;
 
     if (s_hostInBuf != 0 && outPtr != 0 && outLeft != 0) {
+      // F-258 (gated to the 4 Path-B UI container pkgs): a Rage .xsf is ONE
+      // whole-buffer XMemDecompress stream; the 0x8000-window corrupt-serve fed
+      // only ~64 KB of raceeditor's 143 KB and the executor never re-entered, so
+      // each UI .xsf decompressed PARTIALLY (F-257). Serve the ENTIRE compressed
+      // package (PackageSizeAt) into a 2 MB bounce so the guest's single
+      // decompress yields the full container. These 4 offsets only ever appear as
+      // dest mappings under Path B (s_pendingUiPkg/PATHB-PKGFIX), so baseline is
+      // untouched; flag-OFF never routes here anyway.
+      if (fileOff == 0x64CB0000u || fileOff == 0x64980000u ||
+          fileOff == 0x64CA3000u || fileOff == 0x6496F000u) {
+        static uint32_t s_uiBig = 0;
+        if (s_uiBig == 0)
+          s_uiBig = mem.Alloc(0x200000, 16);
+        const uint32_t cpsz = PackageSizeAt(fileOff);
+        uint32_t want = cpsz ? cpsz : 0x8000u;
+        if (want > 0x1FF000u)
+          want = 0x1FF000u;
+        auto &vfsu = mcla::vfs::RpfVirtualFileSystem::Instance();
+        mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fhu;
+        const bool uOpen = vfsu.OpenFile("xarchive_cache.rpf", fhu);
+        uint64_t gotu = 0;
+        std::vector<uint8_t> big(want);
+        bool uServed = false;
+        if (uOpen && s_uiBig)
+          uServed = vfsu.ReadFileAt(fhu, fileOff, big.data(), want, gotu) &&
+                    gotu >= 16 &&
+                    mem.WriteBytes(s_uiBig, big.data(),
+                                   static_cast<uint32_t>(gotu));
+        if (uOpen)
+          vfsu.CloseFile(fhu);
+        if (uServed) {
+          // F-295: Path A host decode. big.data()[0..gotu) is the compressed
+          // RSC5 container. xmem_lzx decodes it byte-exact offline (all 4 UI
+          // .xsf) WITHOUT re-entering the guest VM — so it dodges the F-288
+          // corrupt-serve context coupling that killed the guest-decoder path.
+          // On success write the FULL container into the dest and drain outLeft
+          // (caller-loop complete key) so the guest's partial inflate is
+          // bypassed. Gated OFF by default => exact baseline unchanged.
+          if (kPathBHostFullDecode && outPtr != 0) {
+            std::vector<uint8_t> dec;
+            const int hpath = mcla_lzx::host_decode_ui_xsf(
+                big.data(), static_cast<size_t>(gotu), dec, kXcWindowBits);
+            if (hpath && !dec.empty()) {
+              uint32_t wr = static_cast<uint32_t>(dec.size());
+              if (wr > outLeft) wr = outLeft;  // never overflow the dest room
+              const bool wrote = mem.WriteBytes(outPtr, dec.data(), wr);
+              MCLA_LOG_WARN(
+                  "PATHB-HOSTDECODE #{} off={:08X} path={} decoded={} "
+                  "wrote={} dest={:08X} outLeft={} ok={}",
+                  cn, fileOff, hpath, static_cast<uint32_t>(dec.size()), wr,
+                  outPtr, outLeft, wrote);
+              if (wrote) {
+                (void)mem.WriteU32BE(st + 0, 0);       // inLeft
+                (void)mem.WriteU32BE(st + 8, static_cast<uint32_t>(gotu));
+                (void)mem.WriteU32BE(st + 16, 0);      // outLeft -> complete
+                {
+                  std::lock_guard<std::mutex> wl(g_destPkgMtx);
+                  g_destPkgWalk[outPtr] = static_cast<uint32_t>(gotu);
+                }
+                return;
+              }
+            } else {
+              MCLA_LOG_WARN("PATHB-HOSTDECODE-FAIL #{} off={:08X} path={} "
+                            "gotu={} dest={:08X}",
+                            cn, fileOff, hpath, static_cast<uint32_t>(gotu),
+                            outPtr);
+            }
+            // fall through to the guest single-window serve on any failure
+          }
+          // F-288 REVERT. Tested the isolated-stack hypothesis (F-287 said the
+          // synchronous decode destabilizes boot). w264 ran MclaXcDecodeFullStream
+          // on a DEDICATED stack (stk=CA128980, not the guest r1) yet STILL
+          // regressed policecam/credits to 0 and boot depth to 24,429 lines (vs
+          // w257 88,884), exactly like the guest-stack w262 and the scratch-only
+          // w258. => The regression is NOT stack corruption; it is RE-ENTERING
+          // the guest VM (<=64 sub_8244FF20 calls) from inside the corrupt-serve
+          // handler coupling the shared VM/thread state. Infeasible to apply the
+          // full-decompress from this hook regardless of stack/ctx isolation.
+          // Engine still proven offline (produced=143069). Raw serve restored.
+          (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(gotu)); // inLeft
+          (void)mem.WriteU32BE(st + 4, s_uiBig);                      // inPtr
+          (void)mem.WriteU32BE(st + 8, 0);                            // consumed
+          {
+            std::lock_guard<std::mutex> wl(g_destPkgMtx);
+            g_destPkgWalk[outPtr] = static_cast<uint32_t>(gotu);
+          }
+          MCLA_LOG_WARN("PATHB-UIFULL #{} off={:08X} pkgSz={:08X} served={} "
+                        "dest={:08X} outLeft={}",
+                        cn, fileOff, cpsz, static_cast<uint32_t>(gotu), outPtr,
+                        outLeft);
+          return;
+        }
+        // fall through to the windowed path if the full load failed
+      }
       auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
       mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
       bool ok = vfs.OpenFile("xarchive_cache.rpf", fh);
@@ -8503,7 +9302,7 @@ PPC_FUNC(sub_821BCE68) {
   // legals generation at +4 = 0 with +12 = 4, while meshtextures and trash got
   // their true sizes)? Read the record this return id selects, right here, so
   // "Open never wrote a length" separates from "a later phase zeroed it".
-  uint32_t rbase = 0, rlen = 0, rflag = 0, rid = 0, rpkg = 0;
+  uint32_t rbase = 0, rlen = 0, rflag = 0, rid = 0, rpkg = 0, rdev = 0, rent = 0;
   (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(0x8283D1C4u,
                                                             &rbase);
   rid = ctx.r3.u32;
@@ -8511,13 +9310,19 @@ PPC_FUNC(sub_821BCE68) {
     auto &m = mcla::kernel::GuestMemoryHeap::Instance();
     const uint32_t rec = rbase + (rid & 0x7FFFu) * 28u;
     (void)m.ReadU32BE(rec + 4u, &rlen);
+    (void)m.ReadU32BE(rec + 8u, &rdev);   // F-205: stream/device object (BC140
+                                          // derefs record+8 -> vt[124]; if this
+                                          // is a semaphore/0 the record cannot
+                                          // execute, independent of +4)
     (void)m.ReadU32BE(rec + 12u, &rflag);
     (void)m.ReadU32BE(rec + 16u, &rpkg);
+    (void)m.ReadU32BE(rec + 20u, &rent);
   }
   if (n <= 24 || (n % 500) == 0)
     MCLA_LOG_INFO("STREAM-OPEN sub_821BCE68 #{} r3={:08X} r4={:08X} r5={:08X} "
-                  "-> r3={:08X} rec[+4]={} [+12]={} [+16]={:08X} lr={:08X}",
-                  n, r3, r4, r5, ctx.r3.u32, rlen, rflag, rpkg, lr);
+                  "-> r3={:08X} rec[+4]={} [+8dev]={:08X} [+12]={} [+16]={:08X} "
+                  "[+20]={:08X} lr={:08X}",
+                  n, r3, r4, r5, ctx.r3.u32, rlen, rdev, rflag, rpkg, rent, lr);
 }
 
 // INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
@@ -8544,13 +9349,23 @@ PPC_FUNC(sub_821BC140) {
   // (w186 lr=821CC4BC). Both cannot be about the same record. Measure the
   // record this function actually indexes, before the body runs. Bounded by
   // construction: INLINE-EXEC fires 3x per boot, and every read is checked.
-  if (n <= 8) {
+  // F-213 A/B instrument: widen to 60 executions and add the ring task's
+  // READ-LIST COUNT (task+1540) + the slot's record +12 state / +4 len, to
+  // decide whether BC140 skips a UI slot because it has ZERO read entries
+  // (H1 read-list/staging gap) vs meshtextures' cnt>0. w230 showed BC140 JOINs
+  // UI slots 0-3 but issues NO CC6F0 read for them (only 0x60000/0xA0000, all
+  // ret=0). This is the single decisive measurement for that asymmetry.
+  if (n <= 60) {
     auto &smem = mcla::kernel::GuestMemoryHeap::Instance();
-    uint32_t cls = 0, cap = 0, base = 0, ident = 0, rec[7] = {0};
+    uint32_t cls = 0, cap = 0, base = 0, ident = 0, rlc = 0, rl0 = 0, rl1 = 0;
+    uint32_t rec[7] = {0};
     (void)smem.ReadU32BE(0x8283D190u, &cls);
     (void)smem.ReadU32BE(0x8283D190u + 24u, &cap);
     (void)smem.ReadU32BE(0x8283D190u + 52u, &base);
     (void)smem.ReadU32BE(slotAddr, &ident);
+    (void)smem.ReadU32BE(slotAddr + 1540u, &rlc);   // read-list entry count
+    (void)smem.ReadU32BE(slotAddr + 8u, &rl0);      // first entry [+0] (dest/off)
+    (void)smem.ReadU32BE(slotAddr + 12u, &rl1);     // first entry [+4] (size)
     // BC140 masks [slot+0] with (cap-1) in place unless it is -1, then indexes
     // by *28 - mirror that exactly rather than assuming cap is already a mask.
     const uint32_t mask = cap - 1u;
@@ -8559,9 +9374,10 @@ PPC_FUNC(sub_821BC140) {
       (void)smem.ReadU32BE(recAddr + i * 4u, &rec[i]);
     MCLA_LOG_WARN("BC140-REC #{} slot={:08X} q={} id={:08X} mask={:08X} "
                   "base={:08X} rec={:08X} [{:08X} {:08X} {:08X} {:08X} {:08X} "
-                  "{:08X} {:08X}] cls={:08X}",
+                  "{:08X} {:08X}] cls={:08X} RLC={} e0={:08X}/{:08X} +24={:08X}",
                   n, slotAddr, queueArg, ident, mask, base, recAddr, rec[0],
-                  rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], cls);
+                  rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], cls, rlc, rl0,
+                  rl1, rec[6]);
   }
   if (n <= 16 || (n % 2000) == 0)
     MCLA_LOG_INFO("INLINE-EXEC sub_821BC140 #{} a0={:08X} a1={:08X} "
@@ -8601,6 +9417,21 @@ PPC_FUNC(sub_821BC140) {
                   n, ctx.r3.u32, name, d[0], d[1], d[2], d[3], d[4], d[5],
                   d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14],
                   d[15]);
+    // F-205: the working meshtexture's READ-LIST so option (b) can replicate it.
+    // BC140 iterates r25=task+8 (stride 8) reading {+0 off, +4 size} and stops
+    // on size==0; entry count at task+1540 (ppc_recomp.14.cpp:19007/19030-19041).
+    {
+      uint32_t rlcnt = 0, e0o = 0, e0s = 0, e1o = 0, e1s = 0, rlid = 0;
+      (void)mem.ReadU32BE(ctx.r3.u32 + 1540u, &rlcnt);
+      (void)mem.ReadU32BE(ctx.r3.u32 + 8u, &e0o);
+      (void)mem.ReadU32BE(ctx.r3.u32 + 12u, &e0s);
+      (void)mem.ReadU32BE(ctx.r3.u32 + 16u, &e1o);
+      (void)mem.ReadU32BE(ctx.r3.u32 + 20u, &e1s);
+      (void)mem.ReadU32BE(ctx.r3.u32 + 0u, &rlid);
+      MCLA_LOG_INFO("TASK-READLIST #{} task={:08X} id+0={:08X} cnt+1540={} "
+                    "e0={:08X}/{:08X} e1={:08X}/{:08X}",
+                    n, ctx.r3.u32, rlid, rlcnt, e0o, e0s, e1o, e1s);
+    }
     // w25: Job2 REQDUMP (tag 0x8004) — seed PSTREAM map from the slot and
     // host-decompress package 0xA0000 into dest slices so place-pass has
     // real child object payload (not RSC residue at arr).
@@ -8622,6 +9453,7 @@ PPC_FUNC(sub_821BC140) {
           g_mclaRebaseMap[g_mclaRebaseCount].vbase = vbase;
           g_mclaRebaseMap[g_mclaRebaseCount].pbase = pbase;
           g_mclaRebaseMap[g_mclaRebaseCount].size = size;
+          MclaNoteJob2Pbase(pbase);  // F-252: persist membership across the boot
           ++g_mclaRebaseCount;
         }
       }
@@ -8976,6 +9808,7 @@ PPC_FUNC(sub_821BC140) {
           g_mclaRebaseMap[i].vbase = map[i].vbase;
           g_mclaRebaseMap[i].pbase = map[i].pbase;
           g_mclaRebaseMap[i].size = map[i].size;
+          MclaNoteJob2Pbase(map[i].pbase);  // F-252: persist membership
         }
         // w11: materialize the guest region table D828 walks.
         MclaPublishGuestRebaseTable();
@@ -9871,7 +10704,143 @@ PPC_FUNC(sub_821E5F48) {
                   "a3={:08X} a4={:08X} lr={:08X}",
                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                   ctx.r7.u32, static_cast<uint32_t>(ctx.lr));
+  // F-192: capture the REAL meshtexture enqueue descriptors so Path B can copy
+  // their exact layout. Per ppc_recomp.21.cpp:5585-5589, E5F48 forwards
+  //   r6 -> E5E58 r3 = I (inflate desc; filled by E5DC8 open, so near-empty here)
+  //   r7 -> E5E58 r4 = D (data/layout desc; caller-supplied, THIS is what we need)
+  // D+0/+2 = u16 counts (countA,countB), D+4 = 12-byte entry array.
+  {
+    const uint32_t dPtr = ctx.r7.u32, iPtr = ctx.r6.u32;
+    if (dPtr >= 0x80000000u && dPtr < 0xE0000000u &&
+        dPtr != 0xCDCDCDCDu && iPtr >= 0x80000000u && iPtr < 0xE0000000u) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      uint32_t dw[6] = {0}, iw[4] = {0};
+      for (int i = 0; i < 6; ++i)
+        (void)mem.ReadU32BE(dPtr + i * 4, &dw[i]);
+      for (int i = 0; i < 4; ++i)
+        (void)mem.ReadU32BE(iPtr + i * 4, &iw[i]);
+      MCLA_LOG_WARN("REQ-DESC #{} D={:08X}[{:08X} {:08X} {:08X} {:08X} {:08X} "
+                    "{:08X}] I={:08X}[{:08X} {:08X} {:08X} {:08X}] lr={:08X}",
+                    n, dPtr, dw[0], dw[1], dw[2], dw[3], dw[4], dw[5],
+                    iPtr, iw[0], iw[1], iw[2], iw[3],
+                    static_cast<uint32_t>(ctx.lr));
+    }
+  }
   __imp__sub_821E5F48(ctx, base);
+}
+
+// F-200 census: E5C78 builds a load-request record from (r3=recBuf, r4=256,
+// r5=arg0, r6=arg1, r7=count, r8=0). Captured at ENTRY for BOTH the working
+// meshtexture requests (lr~0x821E5E00, via E5DC8) and the UI opens (lr~0x821E29AC,
+// via E2940) to see whether arg0 is a path string or a static template pointer,
+// and what `count` a working request uses — the datum needed to feed FDD50/E5F48
+// correctly (my Path B used E2940's pathPtr + count=27 and got record[+4]=0).
+static std::atomic<uint32_t> s_h5C78{0};
+PPC_FUNC_IMPL(__imp__sub_821E5C78);
+// F-200: stash the STATIC resource-id arg0/arg1 that E2940's internal E5C78 uses
+// (lr=0x821E29AC), so the Path B FDD50 call can pass the same static string instead
+// of E2940's heap pathPtr (the +4=0 root cause). Reset per E2940 via the flag below.
+static std::atomic<uint32_t> s_pbE2940Arg0{0};
+static std::atomic<uint32_t> s_pbE2940Arg1{0};
+PPC_FUNC(sub_821E5C78) {
+  const uint32_t n = s_h5C78.fetch_add(1) + 1;
+  const uint32_t a0 = ctx.r5.u32, a1 = ctx.r6.u32, cnt = ctx.r7.u32;
+  const uint32_t lrc = static_cast<uint32_t>(ctx.lr);
+  if (lrc == 0x821E29ACu) {  // E2940's own E5C78 → capture its static args
+    s_pbE2940Arg0.store(a0);
+    s_pbE2940Arg1.store(a1);
+  }
+  if (n <= 24 || (n % 200) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t a0w = 0, a1w = 0;
+    if (a0 >= 0x80000000u && a0 < 0xE0000000u) (void)mem.ReadU32BE(a0, &a0w);
+    if (a1 >= 0x80000000u && a1 < 0xE0000000u) (void)mem.ReadU32BE(a1, &a1w);
+    // F-201: dump the arg0/arg1 STRING bytes — the exact resource-id/path format a
+    // working request uses (legals) vs the UI path-open, to construct a correct
+    // single async request for the 4 broken containers.
+    char s0[40] = {0}, s1[40] = {0};
+    if (a0 >= 0x80000000u && a0 < 0xE0000000u)
+      for (int i = 0; i < 32; ++i) {
+        uint8_t c = 0;
+        if (!mem.ReadBytes(a0 + i, &c, 1) || c == 0 || c > 0x7E) break;
+        s0[i] = static_cast<char>(c);
+      }
+    if (a1 >= 0x80000000u && a1 < 0xE0000000u)
+      for (int i = 0; i < 24; ++i) {
+        uint8_t c = 0;
+        if (!mem.ReadBytes(a1 + i, &c, 1) || c == 0 || c > 0x7E) break;
+        s1[i] = static_cast<char>(c);
+      }
+    MCLA_LOG_WARN("E5C78-C #{} arg0={:08X}[\"{}\"] arg1={:08X}[\"{}\"] "
+                  "count={} lr={:08X}",
+                  n, a0, s0, a1, s1, cnt, static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_821E5C78(ctx, base);
+}
+
+// F-192 census: dump the FULLY-POPULATED enqueue descriptors at sub_821E5E58
+// ENTRY for the WORKING (meshtexture) requests, which E5F48 fills during its
+// E5DC8 open BEFORE calling E5E58 (ppc_recomp.21.cpp:5565 then :5589). Path B's
+// E2940 hook calls __imp__sub_821E5E58 directly, so this weak-dispatch hook sees
+// only guest-internal (meshtexture) calls — the golden reference for I/D layout.
+static std::atomic<uint32_t> s_h5E58{0};
+PPC_FUNC_IMPL(__imp__sub_821E5E58);
+PPC_FUNC(sub_821E5E58) {
+  const uint32_t n = s_h5E58.fetch_add(1) + 1;
+  const uint32_t iPtr = ctx.r3.u32, dPtr = ctx.r4.u32;
+  if (iPtr >= 0x80000000u && iPtr < 0xE0000000u &&
+      dPtr >= 0x80000000u && dPtr < 0xE0000000u &&
+      (n <= 16 || (n % 50) == 0)) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t iw[4] = {0}, dw[8] = {0};
+    for (int i = 0; i < 4; ++i) (void)mem.ReadU32BE(iPtr + i * 4, &iw[i]);
+    for (int i = 0; i < 8; ++i) (void)mem.ReadU32BE(dPtr + i * 4, &dw[i]);
+    MCLA_LOG_WARN("ENQ-D #{} I={:08X}[{:08X} {:08X} {:08X} {:08X}] "
+                  "D={:08X}[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                  "{:08X}] r5={:08X} r6={:08X} lr={:08X}",
+                  n, iPtr, iw[0], iw[1], iw[2], iw[3], dPtr, dw[0], dw[1],
+                  dw[2], dw[3], dw[4], dw[5], dw[6], dw[7], ctx.r5.u32,
+                  ctx.r6.u32, static_cast<uint32_t>(ctx.lr));
+  }
+  // F-204b MITIGATION (labelled per do-not #9; gated by kPathBEnqueueUI): the
+  // un-confounded w232 test PROVED the async FDD50/E5DC8 open cannot size
+  // record[+4] for the 4 UI containers even with the EXACT static arg0/tag/count
+  // (+24=pkgoff resolves, +4 stays 0). record[+4] is the container's UNCOMPRESSED
+  // length (F-180; = RSC5+0x10, real data we already read at serve time), and it
+  // is the ONE field E2940's sync open fills but the async open leaves 0. This
+  // decisive test seeds that known length into the enqueued record right before
+  // BCB10 puts it on the ring, isolating whether +4 is the executor's blocker or
+  // merely necessary. Self-identifying: only fires when the slot's record has
+  // +4==0 AND +24 matches a known UI pkgoff (meshtextures/legals have +4!=0 and
+  // are untouched). pkgoff→uncompLen from F-198/E5C78-C (stable across boots).
+  if (kPathBEnqueueUI && iPtr >= 0x80000000u && iPtr < 0xE0000000u) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t slotWord = 0;
+    (void)mem.ReadU32BE(iPtr + 0, &slotWord);
+    const uint32_t slot = slotWord & 0x7FFFu;
+    uint32_t recBase = 0;
+    if (mem.ReadU32BE(0x8283D190u + 52u, &recBase) && recBase >= 0x80000000u &&
+        recBase < 0xE0000000u) {
+      const uint32_t rec = recBase + slot * 28u;
+      uint32_t r4 = 0, r24 = 0;
+      (void)mem.ReadU32BE(rec + 4, &r4);
+      (void)mem.ReadU32BE(rec + 24, &r24);
+      uint32_t seedLen = 0;
+      switch (r24) {
+        case 0x64CB0000u: seedLen = 0x00022EDDu; break;  // raceeditor 143069
+        case 0x64980000u: seedLen = 0x00104449u; break;  // garage     1065545
+        case 0x64CA3000u: seedLen = 0x00004B89u; break;  // policecam    19337
+        case 0x6496F000u: seedLen = 0x000073D7u; break;  // credits      29655
+        default: break;
+      }
+      if (r4 == 0 && seedLen != 0) {
+        (void)mem.WriteU32BE(rec + 4, seedLen);
+        MCLA_LOG_WARN("PATHB-SEED #{} slot={} rec={:08X} +24={:08X} +4:0→{:08X}",
+                      n, slot, rec, r24, seedLen);
+      }
+    }
+  }
+  __imp__sub_821E5E58(ctx, base);
 }
 
 // F-187: sub_821E2940 opens .xsf UI containers through pgStreamer::Open +
@@ -9880,6 +10849,12 @@ PPC_FUNC(sub_821E5F48) {
 // enqueue from inside this hook corrupts guest state (3/4 opens fail with
 // handle=FFFFFFFF). Need to find a safe injection point — likely at the
 // caller level (sub_821FDED8) after all four opens complete.
+// T41.9 Path B: forward-declare the enqueue primitives we call from the hook
+// below (defined in generated/ppc_xenon; same pattern as __imp__sub_821E2940).
+PPC_FUNC_IMPL(__imp__sub_821E5C78);
+PPC_FUNC_IMPL(__imp__sub_821BC7A0);
+PPC_FUNC_IMPL(__imp__sub_821E5E58);
+PPC_FUNC_IMPL(__imp__sub_821FDD50);
 PPC_FUNC_IMPL(__imp__sub_821E2940);
 static std::atomic<uint32_t> s_hE2940{0};
 PPC_FUNC(sub_821E2940) {
@@ -9887,12 +10862,87 @@ PPC_FUNC(sub_821E2940) {
   const uint32_t structPtr = ctx.r3.u32;
   const uint32_t pathPtr = ctx.r4.u32;
   const uint32_t paramR5 = ctx.r5.u32;
+  const uint32_t countR6 = ctx.r6.u32;  // = 27 for the UI containers (E5C78 count arg)
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   char pathName[68] = {0};
   if (pathPtr != 0 && pathPtr != 0xCDCDCDCDu) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     mem.ReadBytes(pathPtr, pathName, 64);
     MclaSanitizePath(pathName, sizeof(pathName));
+  }
+  // F-198/F-199 single-open path: skip the real E2940 open for UI containers so
+  // FDD50's open is the FIRST (correct-length) one; then enqueue happens in FDD50.
+  const bool isUiContainer =
+      lr >= 0x821FE520u && lr <= 0x821FE5D4u && countR6 == 27 &&
+      pathPtr != 0 && pathPtr != 0xCDCDCDCDu;
+  if (kPathBEnqueueUI && kPathBSingleOpen && isUiContainer) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    static uint32_t s_soStack = 0;
+    if (s_soStack == 0) {
+      const uint32_t raw = mem.Alloc(0x800, 16);
+      s_soStack = raw ? (raw + 0x700u) : 0u;
+    }
+    const uint32_t outSlot = mem.Alloc(8, 16);
+    if (s_soStack && outSlot) {
+      (void)mem.WriteU32BE(outSlot, 0);
+      (void)mem.WriteU32BE(outSlot + 4, 0);
+      PPCContext f{};
+      f.r1.u64 = s_soStack;
+      f.r13.u64 = 0x8F200000u;
+      f.r3.u64 = outSlot;
+      // F-204 clean test: F-192..F-201 all silently fell back to `pathPtr` because
+      // the E5C78 static-arg0 capture never fires through __imp__sub_821E2940. But
+      // E5FD0 passes FDD50's r4/r5/r6 STRAIGHT to E5C78 as (arg0, arg1, count) — no
+      // snprintf (ppc_recomp.20.cpp:1689-1703) — so feeding the EXACT static resource-id
+      // pointer E2940's own E5C78 used must reproduce record[+4]=143069. Those pointers
+      // are stable guest .data (E5C78-C, w228/w230): raceeditor=0x8201BAAC,
+      // garage=0x8201BA9C, policecam=0x8201BA88, credits=0x8201BA78, arg1=0x8201BB28
+      // "#sf", count=27. This is the first UN-confounded single-request test of the +4
+      // lever: correct static arg0 AND no E2940 double-open. If PATHB-REC now shows the
+      // enqueued record +4!=0 and the executor inflates → Path B unlocks; if +4!=0 and it
+      // STILL livelocks → F-203 refuted, residual is serve framing (F-194); if +4==0 even
+      // with the exact static arg0 → async builder cannot size these, F-201's real claim.
+      uint32_t staticArg0 = 0;
+      if (std::strcmp(pathName, "raceeditor/raceeditor") == 0)
+        staticArg0 = 0x8201BAACu;
+      else if (std::strcmp(pathName, "garage/garage") == 0)
+        staticArg0 = 0x8201BA9Cu;
+      else if (std::strcmp(pathName, "policecam/policecam") == 0)
+        staticArg0 = 0x8201BA88u;
+      else if (std::strcmp(pathName, "credits/credits") == 0)
+        staticArg0 = 0x8201BA78u;
+      f.r4.u64 = staticArg0 ? staticArg0 : pathPtr;
+      f.r5.u64 = 0x8201BB28u;  // the "#sf" tag E2940's E5C78 passed as arg1
+      f.r6.u64 = countR6;       // count = 27
+      f.r7.u64 = 0;
+      f.lr = 0x821FE6ECu;
+      __imp__sub_821FDD50(f, base);   // sole open + enqueue with the exact static arg0
+      uint32_t fhandle = 0;
+      (void)mem.ReadU32BE(outSlot, &fhandle);
+      // Give the caller a coherent struct: +0=0, +4=handle/dest, +8=0.
+      (void)mem.WriteU32BE(structPtr + 0, 0);
+      (void)mem.WriteU32BE(structPtr + 4, fhandle);
+      (void)mem.WriteU32BE(structPtr + 8, 0);
+      ctx.r3.u64 = 1;  // E2940 returns ret=1 on success
+      MCLA_LOG_WARN("PATHB-SO #{} path='{}' FDD50 ret={:08X} out0={:08X} -> "
+                    "struct+4={:08X}",
+                    n, pathName, f.r3.u32, fhandle, fhandle);
+      // Diagnostic: dump the record for this path's pkg offset (find +4!=0).
+      uint32_t recBase = 0;
+      if (mem.ReadU32BE(0x8283D190u + 52u, &recBase) &&
+          recBase >= 0x80000000u && recBase < 0xE0000000u) {
+        for (uint32_t h = 0; h < 12u; ++h) {
+          const uint32_t rec = recBase + h * 28u;
+          uint32_t w4 = 0, w24 = 0;
+          (void)mem.ReadU32BE(rec + 4, &w4);
+          (void)mem.ReadU32BE(rec + 24, &w24);
+          if (w4 != 0 || w24 != 0)
+            MCLA_LOG_WARN("PATHB-SOREC #{} id={} +4={:08X} +24={:08X}", n, h,
+                          w4, w24);
+        }
+      }
+    }
+    return;
   }
   __imp__sub_821E2940(ctx, base);
   uint32_t handle = 0xFFFFFFFFu;
@@ -9906,6 +10956,188 @@ PPC_FUNC(sub_821E2940) {
                   n, structPtr, pathName, paramR5,
                   handle, ctx.r3.u32, lr);
   }
+
+  // T41.9 / F-192 Path B v2 — re-issue the enqueue E2940 omits by calling the
+  // GUEST's own async helper sub_821FDD50 with the SAME args E2940 received, so
+  // the guest builds the inflate/data descriptors (I+0 ctx + D table) correctly.
+  // v1 hand-built them and got I+0 wrong (F-192). FDD50(r3=outSlot, r4=path,
+  // r5=tag, r6=count, r7=0) is what meshtextures call at ppc_recomp.22.cpp:15168
+  // (count=9); UI containers reach it with count=27 and their own path/tag.
+  // Gate: the 4 UI opens (lr in sub_821FDED8's E2940 sites) with count==27.
+  const bool fromUiOpenLoop = lr >= 0x821FE520u && lr <= 0x821FE5D4u;
+  if (kPathBEnqueueUI && fromUiOpenLoop && countR6 == 27 &&
+      handle != 0xFFFFFFFFu && handle != 0xCDCDCDCDu &&
+      pathPtr != 0 && pathPtr != 0xCDCDCDCDu) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    static uint32_t s_pb2Stack = 0;
+    if (s_pb2Stack == 0) {
+      const uint32_t raw = mem.Alloc(0x800, 16);
+      s_pb2Stack = raw ? (raw + 0x700u) : 0u;
+    }
+    const uint32_t outSlot = mem.Alloc(8, 16);  // FDD50 writes the load handle
+    if (s_pb2Stack && outSlot) {
+      (void)mem.WriteU32BE(outSlot, 0);
+      (void)mem.WriteU32BE(outSlot + 4, 0);
+      PPCContext f{};
+      f.r1.u64 = s_pb2Stack;
+      f.r13.u64 = 0x8F200000u;
+      f.r3.u64 = outSlot;   // out param (FDD50 :14800 stores handle here)
+      // F-200: use the STATIC resource-id string E2940's internal E5C78 used
+      // (captured during __imp__sub_821E2940 above), NOT the heap pathPtr — the
+      // pathPtr caused E5C78 to build a garbage record → record[+4]=0 (F-200).
+      const uint32_t sArg0 = s_pbE2940Arg0.load();
+      const uint32_t sArg1 = s_pbE2940Arg1.load();
+      f.r4.u64 = (sArg0 != 0 && sArg0 != 0xCDCDCDCDu) ? sArg0 : pathPtr;
+      f.r5.u64 = (sArg1 != 0 && sArg1 != 0xCDCDCDCDu) ? sArg1 : paramR5;
+      f.r6.u64 = countR6;   // count = 27
+      f.r7.u64 = 0;
+      // F-251: publish this container's REAL archive package offset BEFORE the
+      // FDD50 call, because FDD50 synchronously runs the record build + the
+      // streamer inflate (AssignPackageForDest is hit mid-call). The post-call
+      // PATHB-PKGFIX is 7 ms too late (w249: raceeditor served 8× from the wrong
+      // guessed 0x60000). Offsets verified stable in w231/w245/w249 (record +24)
+      // and match the offline RSC5 read at xarchive_cache.rpf+off. Unmapped path
+      // leaves s_pendingUiPkg=0 → AssignPackageForDest falls to prior behavior.
+      {
+        uint32_t pk = 0;
+        if (std::strstr(pathName, "raceeditor")) pk = 0x64CB0000u;
+        else if (std::strstr(pathName, "garage")) pk = 0x64980000u;
+        else if (std::strstr(pathName, "policecam")) pk = 0x64CA3000u;
+        else if (std::strstr(pathName, "credits")) pk = 0x6496F000u;
+        s_pendingUiPkg.store(pk);  // 0 = none (safe)
+        MCLA_LOG_WARN("PATHB-PKGPEND #{} path='{}' pending_pkg={:08X}", n,
+                      pathName, pk);
+      }
+      f.lr = 0x821FE6ECu;   // a real FDD50 caller's return address
+      __imp__sub_821FDD50(f, base);
+      // F-251: if FDD50's internal inflate didn't consume the pending pkg
+      // (dest already mapped, etc.), drop it so it can't leak to a later dest.
+      s_pendingUiPkg.store(0);
+      uint32_t o0 = 0, o1 = 0;
+      (void)mem.ReadU32BE(outSlot, &o0);
+      (void)mem.ReadU32BE(outSlot + 4, &o1);
+      MCLA_LOG_WARN("PATHB2 #{} path='{}' handle={:08X} -> FDD50 ret={:08X} "
+                    "out=[{:08X} {:08X}] arg0used={:08X}",
+                    n, pathName, handle, f.r3.u32, o0, o1, (uint32_t)f.r4.u32);
+      // F-198 read-only diagnostic: dump the streamer RECORD for the enqueued
+      // handle to see if record[+4] (remaining length) is 0 AT enqueue (=> Path B
+      // built a bad/zero-length record) or non-zero (=> zeroed later by the
+      // executor/re-point = F-181). Record array base = [[0x8283D190+52]];
+      // 28-byte record at base + (id&0x7FFF)*28; layout {+0 id|gen, +4 remain,
+      // +8 dev, +12 state, +16 pkgid, +20 entryoff, +24 pkgoff} (F-180).
+      uint32_t recBase = 0;
+      uint32_t pbPkgOff = 0;  // F-247: this container's real archive offset (record +24)
+      if (mem.ReadU32BE(0x8283D190u + 52u, &recBase) &&
+          recBase >= 0x80000000u && recBase < 0xE0000000u) {
+        for (uint32_t h = 0; h < 12u; ++h) {
+          const uint32_t rec = recBase + (h & 0x7FFFu) * 28u;
+          uint32_t w0 = 0, w4 = 0, w8 = 0, w12 = 0, w16 = 0, w20 = 0, w24 = 0;
+          (void)mem.ReadU32BE(rec + 0, &w0);
+          (void)mem.ReadU32BE(rec + 4, &w4);
+          (void)mem.ReadU32BE(rec + 8, &w8);
+          (void)mem.ReadU32BE(rec + 12, &w12);
+          (void)mem.ReadU32BE(rec + 16, &w16);
+          (void)mem.ReadU32BE(rec + 20, &w20);
+          (void)mem.ReadU32BE(rec + 24, &w24);
+          if (h == (handle & 0x7FFFu))
+            pbPkgOff = w24;
+          if (w4 != 0 || w8 != 0 || w24 != 0)
+            MCLA_LOG_WARN("PATHB-REC #{} id={} rec={:08X} w0={:08X} +4={:08X} "
+                          "+8={:08X} +12={:08X} +16={:08X} +20={:08X} "
+                          "+24={:08X}{}",
+                          n, h, rec, w0, w4, w8, w12, w16, w20, w24,
+                          (h == (handle & 0x7FFFu)) ? " <==ENQ" : "");
+        }
+      }
+      // F-247 SERVE-FRAMING FIX (authorized route 1; gated by kPathBEnqueueUI so
+      // flag-OFF == the exact baseline, no meshtexture regression). Root cause:
+      // AssignPackageForDest has no dest→pkgoff knowledge for the 4 UI containers
+      // (they are NOT in the IsJob2UiDest list) so it falls to a "first unclaimed
+      // g_rscTab entry" guess — w231 proved it serves the WRONG package (DEST-PKG
+      // outPtr=B7B01000 -> off=00060000 = meshtextures, not raceeditor's real
+      // 0x64CB0000). The guest inflate then reads non-XCompress bytes and the
+      // LastServe re-point re-serves the meshtexture bounce (CAB28300) forever
+      // (the F-244 livelock). Pre-empt the guess by registering this container's
+      // TRUE archive offset (its streamer record +24) keyed to the FDD50 dest base
+      // (o0), so AssignPackageForDest returns it and MclaForceServePkgForDest reads
+      // the real RSC5/XCompress head (verified offline at that file offset).
+      {
+        const uint32_t uiDest = o0;  // FDD50 wrote the load-buffer base = inflate outPtr
+        if (uiDest >= 0xB0000000u && uiDest < 0xC0000000u &&
+            pbPkgOff >= 0x1000u && pbPkgOff < 0x80000000u) {
+          std::lock_guard<std::mutex> lk(g_destPkgMtx);
+          g_destPkgOff[uiDest] = pbPkgOff;
+          g_destPkgWalk[uiDest] = 0;
+          g_pkgUsed[pbPkgOff] = uiDest;
+          MCLA_LOG_WARN("PATHB-PKGFIX #{} path='{}' dest={:08X} -> off={:08X} "
+                        "(pre-empted AssignPackageForDest guess)",
+                        n, pathName, uiDest, pbPkgOff);
+        } else {
+          MCLA_LOG_WARN("PATHB-PKGFIX-SKIP #{} path='{}' dest={:08X} off={:08X} "
+                        "(implausible)",
+                        n, pathName, uiDest, pbPkgOff);
+        }
+      }
+    } else {
+      MCLA_LOG_WARN("PATHB2-SKIP #{} alloc failed stack={:08X} out={:08X}", n,
+                    s_pb2Stack, outSlot);
+    }
+  }
+}
+
+// F-218 read-only census: sub_821EBCF0 is the function that reads/writes the GFx
+// {handler,kernelHandle} dispatch table at 0x82117828 (ctor sub_824C6F08 -> handle
+// 0x40001905, movie sub_824C6F70 -> 0x40003D03). F-217 showed the whole GFx data
+// path (LoadBytes/construct/loaders) is 0 in baseline, so the loader object is
+// never constructed. This census decides whether the table DISPATCHER sub_821EBCF0
+// ever RUNS — if 0 (with this hook as the positive control), the GFx handler
+// dispatch never executes → the terminal gate for nGfx. Log-only, no state write.
+PPC_FUNC_IMPL(__imp__sub_821EBCF0);
+static std::atomic<uint32_t> s_hEBCF0{0};
+PPC_FUNC(sub_821EBCF0) {
+  const uint32_t n = s_hEBCF0.fetch_add(1) + 1;
+  if (n <= 8 || (n % 500) == 0)
+    MCLA_LOG_WARN("GFX-TABLE-DISP sub_821EBCF0 #{} r3={:08X} r4={:08X} "
+                  "r10={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r10.u32,
+                  static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821EBCF0(ctx, base);
+}
+
+// F-219 read-only census: the 4 direct callers of sub_821EBCF0 (per
+// ppc_xrefs calls). If sub_821EBCF0 fired 0x (F-218) because NONE of these
+// ever runs, the GFx-table dispatch is cold from its entry set and the trace
+// escalates to the producer (needs IDA). If any DOES run, we found the live
+// GFx-init entry. Log-only, positive control = these are distinct hooks that
+// will fire if their function is entered.
+static std::atomic<uint32_t> s_hE7420{0}, s_hF5AA0{0}, s_h69F8C0{0}, s_h69FCC8{0};
+PPC_FUNC_IMPL(__imp__sub_821E7420);
+PPC_FUNC(sub_821E7420) {
+  const uint32_t n = s_hE7420.fetch_add(1) + 1;
+  if (n <= 6) MCLA_LOG_WARN("GFXDISP-CALLER 821E7420 #{} r3={:08X} lr={:08X}",
+                             n, ctx.r3.u32, (uint32_t)ctx.lr);
+  __imp__sub_821E7420(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_821F5AA0);
+PPC_FUNC(sub_821F5AA0) {
+  const uint32_t n = s_hF5AA0.fetch_add(1) + 1;
+  if (n <= 6) MCLA_LOG_WARN("GFXDISP-CALLER 821F5AA0 #{} r3={:08X} lr={:08X}",
+                            n, ctx.r3.u32, (uint32_t)ctx.lr);
+  __imp__sub_821F5AA0(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_8269F8C0);
+PPC_FUNC(sub_8269F8C0) {
+  const uint32_t n = s_h69F8C0.fetch_add(1) + 1;
+  if (n <= 6) MCLA_LOG_WARN("GFXDISP-CALLER 8269F8C0 #{} r3={:08X} lr={:08X}",
+                            n, ctx.r3.u32, (uint32_t)ctx.lr);
+  __imp__sub_8269F8C0(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_8269FCC8);
+PPC_FUNC(sub_8269FCC8) {
+  const uint32_t n = s_h69FCC8.fetch_add(1) + 1;
+  if (n <= 6) MCLA_LOG_WARN("GFXDISP-CALLER 8269FCC8 #{} r3={:08X} lr={:08X}",
+                            n, ctx.r3.u32, (uint32_t)ctx.lr);
+  __imp__sub_8269FCC8(ctx, base);
 }
 
 // Session 75o: async-request wrapper census + dispatcher hunt. Boot loads
@@ -12341,6 +13573,15 @@ PPC_FUNC(sub_821BDF20) {
                   path, flags, ret, lr);
 }
 
+// F-233 targeted read-only census: name the container the UI-bootstrap byte-reader
+// (sub_821CFAA8) blocks refilling. Per generated ppc_recomp.17.cpp:12420-12424, when
+// the reader's byte buffer is exhausted it calls sub_821BE4F0 (return 0x821CFB40) to
+// pull the next "kind" byte from the stream; the bootstrap parks deeper (sub_82249750)
+// when that refill never delivers. RESULT (w242, now reverted): the reader is refilling
+// SHADER/EFFECT files (AlphaModulate.fx / WheelRubber.fx / Character.fx / entity.type
+// "Version: 103" shadinggroups), NOT the UI .xsf — the bootstrap blocks in the
+// shader/effects preload, upstream of UI load. Kept as a named symbol only; the noisy
+// 2432-line dump was removed after measurement.
 // Richer BE8D8 census (replaces MCLA_T4A2_CENSUS): [obj+0]=device* [obj+4]=handle.
 //
 // Phase 2 T3 root-cause fix: sub_821BE8D8 = "load whole embedded file":
