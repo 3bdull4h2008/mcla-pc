@@ -344,6 +344,34 @@ static UiDecAct UiDecClassify(uint32_t dest, uint32_t pkg) {
   return kUiDecTry;
 }
 
+// F-298: BUF-HEAD only proves the first 16 bytes of a host-decoded container
+// survived in guest memory. This records a digest of the whole body at write
+// time so a later one-shot readback can prove residency of all of it.
+static inline uint64_t UiFnv1a(const uint8_t *p, size_t n) {
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; ++i) {
+    h ^= static_cast<uint64_t>(p[i]);
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+struct UiDecExpect {
+  uint32_t pkg = 0;
+  uint32_t unc = 0;
+  uint64_t hash = 0;
+  bool verified = false;
+};
+static std::unordered_map<uint32_t, UiDecExpect> g_uiDecExpect; // dest -> digest
+static void UiDecRecordExpect(uint32_t dest, uint32_t pkg, const uint8_t *data,
+                              size_t len) {
+  UiDecExpect ex;
+  ex.pkg = pkg;
+  ex.unc = static_cast<uint32_t>(len);
+  ex.hash = UiFnv1a(data, len);
+  std::lock_guard<std::mutex> lk(g_uiDecMtx);
+  g_uiDecExpect[dest] = ex;
+}
+
 // ---------------------------------------------------------------------------
 // w20: plaintext RSC5 package preference + post-serve inflate re-force.
 // Retail TOC bodies for .xtd/.xsf are AES — inflate sees zeros/stack junk.
@@ -3991,6 +4019,34 @@ static void DumpBufHead(const char *tag, uint32_t buf) {
   MCLA_LOG_WARN("BUF-HEAD {} @{:08X} {:08X} {:08X} {:08X} {:08X} rgxa={}", tag,
                 buf, w[0], w[1], w[2], w[3],
                 (w[0] == kRgxaMagic) ? "yes" : "no");
+}
+// F-298: one-shot per dest, log-only. Re-reads the whole host-decoded body from
+// guest memory and compares it against the digest taken at write time, so
+// "3/4 UI .xsf decompressed into guest memory" rests on the full buffer and not
+// on BUF-HEAD's 16 bytes. Marked verified even on a failed read so a bad dest
+// cannot turn this into a per-call cost.
+static void UiDecVerifyReadback(uint32_t dest) {
+  UiDecExpect ex;
+  {
+    std::lock_guard<std::mutex> lk(g_uiDecMtx);
+    const auto it = g_uiDecExpect.find(dest);
+    if (it == g_uiDecExpect.end() || it->second.verified)
+      return;
+    it->second.verified = true;
+    ex = it->second;
+  }
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  std::vector<uint8_t> body(ex.unc);
+  if (ex.unc == 0 || !mem.ReadBytes(dest, body.data(), ex.unc)) {
+    MCLA_LOG_WARN("PATHB-HOSTVERIFY dest={:08X} pkg={:08X} unc={} read=FAIL",
+                  dest, ex.pkg, ex.unc);
+    return;
+  }
+  const uint64_t got = UiFnv1a(body.data(), body.size());
+  MCLA_LOG_WARN("PATHB-HOSTVERIFY dest={:08X} pkg={:08X} unc={} want={:016X} "
+                "got={:016X} match={}",
+                dest, ex.pkg, ex.unc, ex.hash, got,
+                (got == ex.hash) ? "true" : "false");
 }
 // w9: PSTREAM virtual→physical map captured at RSC-HEAD parse time. Used by
 // sub_8217D890 (task_dispatch_trace.cpp) to resolve leftover 0x50xxxxxx
@@ -7821,6 +7877,7 @@ PPC_FUNC(sub_821D5E10) {
             std::lock_guard<std::mutex> lk(g_uiDecMtx);
             g_uiDecDone[outPtr] = uiPkg;
           }
+          UiDecRecordExpect(outPtr, uiPkg, decH.data(), decH.size());
           MCLA_LOG_WARN("PATHB-HOSTDECODE-TOP #{} dest={:08X} pkg={:08X} "
                         "path={} unc={} wrote={} room={} ok",
                         n, outPtr, uiPkg, hp,
@@ -9008,6 +9065,7 @@ PPC_FUNC(sub_821D5E10) {
                   std::lock_guard<std::mutex> lk(g_uiDecMtx);
                   g_uiDecDone[outPtr] = fileOff;
                 }
+                UiDecRecordExpect(outPtr, fileOff, dec.data(), dec.size());
                 (void)mem.WriteU32BE(st + 0, 0);       // inLeft
                 (void)mem.WriteU32BE(st + 8, static_cast<uint32_t>(gotu));
                 (void)mem.WriteU32BE(st + 16, 0);      // outLeft -> complete
@@ -9620,6 +9678,7 @@ PPC_FUNC(sub_821BC140) {
         // w9 CENSUS: dump the inflated buffer head so we can see why any
         // effect-name insert would fail the rgxa compare.
         DumpBufHead("D2308-buf", bufPtr);
+        UiDecVerifyReadback(bufPtr);
         // w9 FIX: only register names whose buffer actually starts with the
         // rgxa effect magic. The preload pack at A47FD000 is a multi-chunk
         // resource (first dword is NOT 0x61786772); registering star_glow /

@@ -181,7 +181,8 @@ texels, NOT poison.
 
 `kPathBHostFullDecode` (F-297, **ON by default**, `src/gpu_device.cpp:440`;
 labels `PATHB-HOSTDECODE`, `PATHB-HOSTDECODE-TOP`, `PATHB-HOSTDECODE-TOP-SKIP`,
-`PATHB-HOSTDECODE-FAIL`)
+`PATHB-HOSTDECODE-FAIL`; plus `PATHB-HOSTVERIFY`, a log-only one-shot readback
+that digests the whole written body and re-checks it against guest memory, F-299)
 — Path A host XMem/raw-LZX decode of the 4 UI `.xsf` (`src/xmem_lzx.h`) written
 straight into the guest dest, at the top of the inflate handler and at the
 corrupt-serve leg. It **bypasses the guest's own inflate** for those containers
@@ -264,6 +265,7 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 | `BOOTPATH` | boot-init package processing (`sub_82187820`) with descriptor dump |
 | `INFLATE` / `-SKIP` / `-EMPTY` / `-PENDING` | inflate hook (`sub_821D5E10`): magic, sizes, retries |
 | `PATHB-HOSTDECODE` / `-TOP` / `-TOP-SKIP` / `-FAIL` | the Path A host XMem/raw-LZX decode of a UI `.xsf` (`kPathBHostFullDecode`, `src/gpu_device.cpp:440`). `-TOP` = fired at the top of the inflate handler (`:7775`), bare = fired at the corrupt-serve leg (`:8993`); both print `dest`/`pkg`/`path` (1=single stream, 2=shared per-frame walk)/`unc`/`wrote`/`room`. `-TOP-SKIP`/`-FAIL` mean the container was **left to the guest** — either it does not fit the dest room (garage, 1066057 > a 256 KiB window) or the decode/load failed — and are not errors. Target selection is the dynamic `g_destPkgOff` map (`PeekPackageForDest`/`IsUiXsfPkg`, `:311-345`), never literal dest addresses (F-297). Decoder byte-exactness is guarded at build time by `ninja -C build check_xmem_lzx`. |
+| `PATHB-HOSTVERIFY` | **F-299 full-buffer residency proof for a host-decoded UI `.xsf`** (`UiDecVerifyReadback`, `src/gpu_device.cpp:4028`, called once per dest from the `D2308-buf` census site `:9681`). `want=` is the FNV-1a digest of the decoded body taken at write time (`UiDecRecordExpect`, `:365`), `got=` is the digest of `unc` bytes re-read from guest memory later in the same boot; `match=true` means the **whole** container is still byte-identical in guest memory, which `BUF-HEAD`'s 16 bytes cannot show. Log-only, one-shot per dest, and it changes no behaviour — proven zero frontier delta (`w273` vs `w271`: every structural marker +0). `read=FAIL` means the guest-memory read failed, not that the content differs. |
 | `SLOT-READY` | page-cache slot wait (`sub_821CBE18`) state flip |
 | `DISCCHK` / `DISCCHK2` | disc-error check (`sub_821CC1E0`): `DISCCHK2` dumps `strm/fobj/len/rec/size/offs/flags/route=` (route = the executed bit30×bit31 decision, F-112) — `n <= 40 \|\| (n % 200) == 0` |
 | `DISCCHK2-WAIT` / `-RES` | the guest's own completion call inside the disc-read block (`sub_821DEE40(io, 2)`) and its return value; **only observable with `kDiscChkForcedAck = false`**, so their zero in a normal soak means the mitigation is firing, not that the path is dead |
