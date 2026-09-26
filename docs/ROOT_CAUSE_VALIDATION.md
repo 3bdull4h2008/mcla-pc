@@ -9470,3 +9470,22 @@ cost one log line per refusal and are what killed this theory. Next ID **F-411**
 **3. Measured (`w432` control vs `w434`, log-only change).** `C0000005` 0=0, `LISTLINE` 171=171, `BC140-REC` 7=7, `F434-SPIN-BREAK` 1=1, `INFLATE-ENTER` 2,378 vs 2,374, `W34-GFX-CENSUS` 6=6, `nGfx=0` in all 6 rows and **zero `W34-GFX-MOVIE`/`W34-LIFE-KEYDEFER` rows** — i.e. the broadened key found nothing either, which is the (b) band-coverage result, not a contradiction. Two same-shape numbers moved within their known inter-soak spread and a log-only scan cannot cause either: garage `claimed=851968 still_present=806496 pct=94` (w430 95, w432 95, w434 94 — the F-340/F-324 variance, always quote soaks) and `Fatal error dispatcher invoked` 1→2 (0 in w433).
 
 **4. Consequence for the objective.** The honest statement is now sharper than "GFx does not initialise": **we have never had a working counter for GFx loader objects.** Any future claim about GFx must (i) scan the allocation region loader objects actually land in (`0xCF......` in this build, i.e. the host user heap) *and* (ii) key on the post-ctor vtable. That is T41.91. Next ID **F-438**.
+
+
+### F-438 (2026-09-27 01:4x, **4 builds, soaks `w435` (normal boot) and `w436` (control, gate ON)**) — **THE FIRST VALID GFx MEASUREMENT THIS PROJECT HAS HAD: the GFx loader constructor `sub_824C6F08` is NEVER entered by the guest — `F438-GFXCTOR` 0 rows in a full boot, with a fired positive control (the same hook prints 1 row when the host forces the call). So "GFx does not initialise" is now a fact about a *call that never happens*, not about a blind scan.**
+
+- Task:        T41.91 (#58) — its counter half is delivered; the band/key half is obsolete once the count is event-based
+- Type:        FACT + FIX (a log-only hook; the control soak used the gate and reverted it)
+- Class:       G (the title's call graph) + H (instrument repair)
+- Priority:    P0
+- Evidence:    `src/gpu_device.cpp:17449-17472` (the hook; rule 4: `tools/addr_owners.py --check 824C6F08` = 1 site, the function map only) · `build/w435.log` (`F438-GFXCTOR` 0 rows) · `build/w436.log` (`F438-GFXCTOR #1 obj=CF61A600 vt0=8206DFAC vt672=8206DFAC movie=00000000 lr=00000000` next to `GFX-CTOR done loader=CF61A600`)
+
+**1. Why the control was mandatory.** A new hook's zero is meaningless until the probe is shown to be able to fire (F-057(6), F-089 §6). `w436` re-opened `kF368HostDispatchGate` for exactly this purpose and the hook printed one row with the same object address the lever logged (`CF61A600`), so `w435`'s zero is a real negative, not dead text. The flag is back to `false` and the tree rebuilt.
+
+**2. Two extra facts the control gave us for free.** (a) `vt0=8206DFAC vt672=8206DFAC` re-confirms F-437 from the *inside* of the ctor rather than from the generated listing: by the time `sub_824C6F08` returns, its own tail (`sub_82482008`) has replaced both vtable slots. (b) **`movie=00000000` at ctor exit** — even a forced loader object comes back with no movie attached, so the ctor alone is not the missing step; something must hand it a movie, which is what the lifecycle routine (`sub_824C6F70`, slot 3 of the *transient* table) was meant to do.
+
+**3. Reading `lr=00000000`.** That row's caller is the host lever, which invokes `ctorFn(gfxP, base)` on a fresh context with no link register — it is not a guest return address. A future guest-side hit would print a real `0x82xxxxxx` lr, so the field still discriminates.
+
+**4. What this converts.** Until now the only GFx "evidence" was `nGfx`, which F-437 showed could never have counted anything. The claim is now: *no code path in this boot reaches the GFx loader constructor by call or by indirect dispatch through the function map.* The remaining scope of the objective is therefore precisely **"who is supposed to call it"** — which is the same chain the closed tasks #10/#11/#20-#23 circled (the `0x40003B03` record and its dead dispatcher), with F-432 §3's "Vehicle" section-lookup failure as the nearest named upstream cause. Caveat to keep: a bare `bctr` tail-jump straight to `0x824C6F08` that bypasses the map would not be counted, so this is "never called", slightly weaker than "never executed".
+
+**5. No regression from the hook.** `w435` vs its control `w434`: `C0000005` 0=0, `LISTLINE` 171=171, `BC140-REC` 7=7, `nGfx=0` 6=6, `W34-GFX-CENSUS` 6=6. Log size moved 137,756 → 145,826 lines with a hook that printed nothing — that is the known timing-driven `WAIT[KWFSO]` churn, not a behavioural change. Next ID **F-439**.

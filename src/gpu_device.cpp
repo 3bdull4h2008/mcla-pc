@@ -2127,7 +2127,7 @@ static std::atomic<uint32_t> s_821873E8_live{0};  // F-358 alive-path census
 // dispatching the UILOAD callback is not what initialises GFx. Back to false, and it must stay
 // false: while it is true, `W35-BOOT-GATE` is our own line and proves nothing about the guest
 // reaching 0x821315F4. Re-arm only to re-test that negative.
-constexpr bool kF368HostDispatchGate = false;  // F-436 measured it ON (w433); user decides whether to keep
+constexpr bool kF368HostDispatchGate = false;  // F-436/F-438: measured ON twice (w433/w436), reverted; the user still owns this lever
 PPC_FUNC(sub_821873E8) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t n = s_821873E8_hits.fetch_add(1) + 1;
@@ -17506,6 +17506,33 @@ PPC_FUNC(sub_8260C8E0) {
                   "e0={:08X} tid={}",
                   o, r31, f1532, f1536, f1540, f8, GetCurrentThreadId());
   }
+}
+
+// F-438: count GFx loader CONSTRUCTIONS, because the presence scan has never been able to do it
+// (F-437: `sub_824C6F08` replaces its own vtable key via `sub_82482008`, and the scan's bands miss
+// the region loader objects land in). This routine is the only one that installs the loader vtable
+// pair (`generated/ppc_xenon/ppc_recomp.94.cpp:3558-3571`) and its single in-image caller passes r3
+// straight through (`ppc_recomp.87.cpp:16270+`), so one enter == one constructed object. Rule 4
+// checked: 0x824C6F08 had exactly one owner (the function map) before this hook. Log-only; the lr is
+// captured BEFORE the call, because reading it after returns callee residue (F-382's trap). If this
+// prints zero rows over a full boot, "no GFx loader object is ever constructed" becomes a measured
+// fact instead of the unfalsifiable scan result it has been until now.
+PPC_FUNC_IMPL(__imp__sub_824C6F08);
+PPC_FUNC(sub_824C6F08) {
+  static std::atomic<uint64_t> s_438{0};
+  const uint64_t k = s_438.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  __imp__sub_824C6F08(ctx, base);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t v0 = 0, v672 = 0, movie = 0;
+  (void)mem.ReadU32BE(obj + 0, &v0);
+  (void)mem.ReadU32BE(obj + 672, &v672);
+  (void)mem.ReadU32BE(obj + 4, &movie);
+  if (k <= 16 || (k % 64) == 0)
+    MCLA_LOG_WARN("F438-GFXCTOR #{} obj={:08X} vt0={:08X} vt672={:08X} movie={:08X} lr={:08X} "
+                  "tid={}",
+                  k, obj, v0, v672, movie, lr, GetCurrentThreadId());
 }
 
 // F-395 (T41.72): F-394 put the boot worker's last 220 seconds in guest `sub_82397060` (its
