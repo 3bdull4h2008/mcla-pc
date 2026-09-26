@@ -13894,10 +13894,22 @@ PPC_FUNC(sub_821E2940) {
             (void)mem.ReadU32BE(bootObj + 88u + 4u * static_cast<uint32_t>(k), &d[k]);
           static std::atomic<uint32_t> s_f361{0};
           const uint32_t f1 = s_f361.fetch_add(1) + 1;
+          // F-363b: sub_822C2EA8's first act is `li r3,17000 / bl 0x821BD3C8` (an
+          // allocation) and it publishes the result -- or 0 on failure -- to the global at
+          // 0x82A6D810 (`lis r10,-32121` = 0x82A70000, `-10224` = 0x27F0; both the null
+          // path at loc_822C2EF8 and the success path store to that one address,
+          // ppc_recomp.43.cpp:23224+). Read it alongside the descriptor slot: this is the
+          // discriminator between "the UI-load init lost its allocation" and "the path
+          // diverted", since neither the enter/return censuses can tell (JUMPOUT).
+          uint32_t alloc17000 = 0, sing = 0;
+          (void)mem.ReadU32BE(0x82A6D810u, &alloc17000);
+          (void)mem.ReadU32BE(0x8287E26Cu, &sing);
           if (f1 <= 4)  // prints the FIRST 4, so any count <=4 is complete (F-317)
             MCLA_LOG_WARN("F361-BOOTOBJ #{} obj={:08X} desc[+88..+104]={:08X} {:08X} "
-                          "{:08X} {:08X} {:08X} want+92=82131008 got+92={:08X}",
-                          f1, bootObj, d[0], d[1], d[2], d[3], d[4], d[1]);
+                          "{:08X} {:08X} {:08X} want+92=82131008 got+92={:08X} "
+                          "[82A6D810 alloc17000]={:08X} [8287E26C]={:08X}",
+                          f1, bootObj, d[0], d[1], d[2], d[3], d[4], d[1], alloc17000,
+                          sing);
         } else {
           static std::atomic<uint32_t> s_f361bad{0};
           if (s_f361bad.fetch_add(1) + 1 <= 4)
@@ -14124,8 +14136,26 @@ PPC_FUNC(sub_823047D8) {
 PPC_FUNC_IMPL(__imp__sub_822C2EA8);
 static std::atomic<uint32_t> s_hC2EA8{0};
 PPC_FUNC(sub_822C2EA8) {
-  LogMsgChain("parent-822C2EA8", s_hC2EA8.fetch_add(1) + 1, ctx.r3.u32, ctx);
+  const uint32_t nC = s_hC2EA8.fetch_add(1) + 1;
+  LogMsgChain("parent-822C2EA8", nC, ctx.r3.u32, ctx);
+  // F-363: F-362's probes showed the UI-load body reaches THIS call from 0x82131554 and
+  // then never issues the next one (ret 0x8213155C), while the window between them is
+  // straight-line in ppc_recomp.43.cpp -- so the stop is inside here, not a branch. Enter
+  // and return must therefore be distinguished, with the tid, because the earlier
+  // "thread survives" evidence came from a different census and has not been tied to this
+  // call. Cap first 8 (F-317).
+  if (nC <= 8)
+    MCLA_LOG_WARN("F363-C2EA8 #{} ENTER tid={:08X} r3={:08X} r4={:08X} [8287E26C]={:08X}",
+                  nC, GetCurrentThreadId(), ctx.r3.u32, ctx.r4.u32,
+                  [] {
+                    uint32_t v = 0;
+                    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(0x8287E26Cu, &v);
+                    return v;
+                  }());
   __imp__sub_822C2EA8(ctx, base);
+  if (nC <= 8)
+    MCLA_LOG_WARN("F363-C2EA8 #{} RETURN tid={:08X} r3={:08X}", nC, GetCurrentThreadId(),
+                  ctx.r3.u32);
 }
 
 // T41.3 step 2 (w38n): sub_823047D8 is ENTERED (w38n.log:2650) but the factory

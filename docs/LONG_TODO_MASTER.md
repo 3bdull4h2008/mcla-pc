@@ -10,6 +10,24 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~15:1x (ledger through F-363; next ID F-364) — supersedes the
+> enqueue-gap framing of the two blocks below.** The UI-load enqueue gap is **not** a broken
+> or missing producer: the registration mechanism is proven to work in our build —
+> `F365-COPIER` shows `sub_82305690` writing `obj+92 = 0x821FC008` (before: 0) into
+> `[0x8288B9E8]=C61C5800`. What never happens is `sub_82131508`'s *own* registration at
+> `0x821315F4`, because the call it makes at `0x82131554` (`sub_822C2EA8`) allocates
+> 17,000 B successfully, registers that other callback, and **does not return** — its thread
+> stays alive in `PUSH sub_821BC868`. So the whole tail of `sub_82131508` is unreachable
+> while the boot runs. **T41.60**: find what that loop waits on to exit (`PUSH` stops at
+> `#7`, `q=82849518`) — a queue-completion question, not an enqueue one. Two of my own
+> entries were superseded inside the same hour (F-361 "registration never lands" → only for
+> the UI-load callback; F-362 "a branch bypasses it" → no branch exists there), for two
+> reusable reasons: a memory sample taken *before* the write reads as "never written", and a
+> probe window keyed to one caller's lr range hides a shared callee called from another.
+> Probes neutral (`w370` vs `w351`: 20 markers `+0`, errors 28=28). **(a) unchanged: 3/4
+> byte-exact + garage 12.3 %/41.3 %, ceiling closed both hook-reachable sides. (b) `nGfx`=0.
+> Goal NOT complete.**
+
 > **§0 state, 2026-09-26 ~14:2x (ledger through F-361; next ID F-362) — supersedes the
 > registration half of the block below.** The UI-load callback's registration **does not
 > complete**: `F361-BOOTOBJ` reads `[0x8288B9E8]=C61C5800` with `+88..+104` all zero at four

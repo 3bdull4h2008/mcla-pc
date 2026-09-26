@@ -1623,7 +1623,153 @@ PPC_FUNC(sub_82135150) {
 // function executes. Cap prints the first 8: a count <=8 is complete.
 PPC_FUNC_IMPL(__imp__sub_82131508);
 static std::atomic<uint32_t> s_hRegCb{0};
-// F-361: the object sub_82305690 copies the descriptor into is [0x8288B9E8] (r30 is
+// F-362: where inside `sub_82131508` does the UI-load registration path stop? F-361
+// proved the descriptor never reaches [0x8288B9E8]+88, so control does not get to guest
+// 0x821315F4. The body's internal calls each return to a unique lr inside
+// 0x82131508..0x8213178C, so an lr-filtered census names the last call ENTERED and the
+// last one that RETURNED -- which separates "a branch was never taken" from "a callee
+// never came back". Four probes bracket the sequence: A first call (ret 0x8213152C),
+// B mid (ret 0x82131580/1594), C the call immediately before the registration
+// (ret 0x821315E8), D the descriptor builder itself. The lr filter is what makes these
+// safe on hot callees; caps print the first 8 so small counts are complete (F-317).
+namespace {
+bool F362FromRegFn(uint32_t lr) {
+    // F-364: widened. The descriptor builder `sub_821C2FD8` and the copier
+    // `sub_82305690` are called from BOTH bodies -- sub_82131508 (ret 0x821315F4..) and
+    // sub_822C2EA8 (ret 0x822C2F6C / 0x822C2F7C). My first window covered only the
+    // former, which is why probe D read as "never called" when it was called from the
+    // other function. One hook per address (rule 4), so the window has to cover both.
+    return (lr >= 0x82131508u && lr < 0x8213178Cu) ||
+           (lr >= 0x822C2EA8u && lr < 0x822C3000u);
+}
+}  // namespace
+
+#define F362_CAT2(a, b) a##b
+#define F362_CAT(a, b) F362_CAT2(a, b)
+#define F362_PROBE(tag, sym)                                                     \
+    PPC_FUNC_IMPL(F362_CAT(__imp__, sym));                                       \
+    static std::atomic<uint32_t> s_f362_##sym{0};                                \
+    PPC_FUNC(sym) {                                                              \
+        const bool mine = F362FromRegFn(static_cast<uint32_t>(ctx.lr));           \
+        uint32_t n = 0;                                                          \
+        if (mine) {                                                              \
+            n = s_f362_##sym.fetch_add(1) + 1;                                   \
+            if (n <= 8 || (n % 500) == 0)                                        \
+                MCLA_LOG_WARN("F362-SEQ #{} " tag " ENTER ret={:08X} r3={:08X} " \
+                              "r4={:08X}",                                       \
+                              n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32,      \
+                              ctx.r4.u32);                                       \
+        }                                                                        \
+        F362_CAT(__imp__, sym)(ctx, base);                                       \
+        if (mine && (n <= 8 || (n % 500) == 0))                                  \
+            MCLA_LOG_WARN("F362-SEQ #{} " tag " RETURN ret={:08X} r3={:08X}",    \
+                          n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32);         \
+    }
+
+F362_PROBE("A", sub_82322C78)
+F362_PROBE("B", sub_822C4EB8)
+F362_PROBE("C", sub_822E5B00)
+F362_PROBE("D", sub_821C2FD8)// F-362b: A returned and no later probe fired, yet the entering thread is alive 2.3 s
+// later doing `PUSH sub_821BC868 #7` -- so nothing hung: the body branches away before the
+// registration. A..D left 0x82131538..0x821315D4 unprobed and the path from A's return to
+// the next call is straight-line (ppc_recomp.0.cpp: `lis/addi r31,0x82830990`,
+// `lwz r3,12(r31)`, `bl 0x82304708`), so probe every remaining internal call in address
+// order. `sub_822C2EA8` (ret 0x82131554) is deliberately SKIPPED: addr_owners reports it
+// already claimed at src/gpu_device.cpp, and rule 4 forbids a second owner.
+F362_PROBE("E", sub_82304708)   // ret 0x82131548
+F362_PROBE("F", sub_822BF880)   // ret 0x8213154C
+F362_PROBE("G", sub_822BF970)   // ret 0x8213155C
+F362_PROBE("H", sub_821FFC28)   // ret 0x82131568
+F362_PROBE("I", sub_822C4EC8)   // ret 0x82131588
+F362_PROBE("J", sub_822C52C8)   // ret 0x821315A4
+F362_PROBE("K", sub_82305740)   // ret 0x821315AC
+F362_PROBE("L", sub_821F9900)   // ret 0x821315B8
+
+// F-364: the discriminator that actually works. F-363 showed `sub_822C2EA8` is ENTERED
+// (once, from 0x82131554, r4=0x364) and never RETURNs, while its host thread stays alive
+// for another 1.4 s -- so "did it return?" is unreadable here, because this family leaves
+// through JUMPOUT tail jumps that abandon the hook's post-call code. What IS readable is
+// the *value* the guest's first act inside it produces: `li r3,17000 / li r4,5 / li r5,-1
+// / bl 0x821BD3C8` (ppc_recomp.43.cpp:23224+), whose result decides
+// `cmplwi cr6,r31,0 / beq -> loc_822C2EF8`, and both branches publish to the single global
+// 0x82A6D810 that F-363b found reading 0. So print the allocator's returned pointer: 0
+// means the UI-load init lost a 17,000-byte allocation (a host-side memory gap), non-zero
+// means the divert is elsewhere and the JUMPOUT is what to chase.
+// The lr window is sub_822C2EA8's own body, so a general allocator cannot flood this.
+namespace {
+bool F364FromC2EA8(uint32_t lr) {
+    return lr >= 0x822C2EA8u && lr < 0x822C3000u;
+}
+}  // namespace
+
+#define F364_PROBE(tag, sym)                                                      \
+    PPC_FUNC_IMPL(F362_CAT(__imp__, sym));                                        \
+    static std::atomic<uint32_t> s_f364_##sym{0};                                 \
+    PPC_FUNC(sym) {                                                               \
+        const bool mine = F364FromC2EA8(static_cast<uint32_t>(ctx.lr));            \
+        uint32_t n = 0;                                                           \
+        if (mine) {                                                               \
+            n = s_f364_##sym.fetch_add(1) + 1;                                    \
+            if (n <= 8 || (n % 500) == 0)                                         \
+                MCLA_LOG_WARN("F364-ALLOC #{} " tag " ENTER tid={:08X} ret={:08X} "\
+                              "r3={:08X} r4={:08X} r5={:08X}",                    \
+                              n, GetCurrentThreadId(),                             \
+                              static_cast<uint32_t>(ctx.lr), ctx.r3.u32,           \
+                              ctx.r4.u32, ctx.r5.u32);                            \
+        }                                                                         \
+        F362_CAT(__imp__, sym)(ctx, base);                                         \
+        if (mine && (n <= 8 || (n % 500) == 0))                                    \
+            MCLA_LOG_WARN("F364-ALLOC #{} " tag " RETURN r3={:08X}", n,            \
+                          ctx.r3.u32);                                             \
+    }
+
+F364_PROBE("ALLOCFN", sub_821BD3C8)   // the 17,000-byte request's target
+F364_PROBE("SINGLE1", sub_8268BE38)   // success path only (non-null result)
+F364_PROBE("CONVERGE", sub_822BFCC8)  // both paths continue here
+// The three guard branches inside sub_822C2EA8 that decide whether its own registration
+// runs (ppc_recomp.43.cpp:23224+):  after CONVERGE, `r11=[[r11+18332]]; if (r11 != 0)
+// goto loc_822C2F7C` skips everything; else `bl 0x822bfd48` runs, then `[r31+2836]`'s
+// `[+4]` selects sub_821F8038 vs sub_821FAA98 (mutually exclusive, so which one appears
+// tells which side of the test was taken), and at loc_822C2F48 `[r31+2836] == 0` jumps
+// to the end past BOTH the descriptor builder and the copier.
+F364_PROBE("PRECOND", sub_822BFD48)
+F364_PROBE("SIDE-A", sub_821F8038)
+F364_PROBE("SIDE-B", sub_821FAA98)
+// The copier gets its own hand-written probe: `sub_82305690` returns 1 in r3, so the
+// object pointer has to be captured BEFORE the call to read its descriptor afterwards.
+// That is the direct test of "did the copy land?" -- F365's late-sample design failed
+// because its host site is gated to UI packages and only reached ~1 time per boot.
+PPC_FUNC_IMPL(__imp__sub_82305690);
+static std::atomic<uint32_t> s_f364Copier{0};
+PPC_FUNC(sub_82305690) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+    const bool mine = lr >= 0x822C2EA8u && lr < 0x822C3000u;
+    const uint32_t obj = ctx.r3.u32, desc = ctx.r4.u32;
+    uint32_t n = 0;
+    if (mine) {
+        n = s_f364Copier.fetch_add(1) + 1;
+        uint32_t s0 = 0, s1 = 0;
+        if (n <= 8) {
+            (void)mem.ReadU32BE(obj + 88, &s0);
+            (void)mem.ReadU32BE(obj + 92, &s1);
+            uint32_t dfn = 0;
+            (void)mem.ReadU32BE(desc + 4, &dfn);
+            MCLA_LOG_WARN("F365-COPIER #{} ret={:08X} tid={:08X} obj={:08X} desc={:08X} "
+                          "desc[+4]={:08X} | before obj+88={:08X} obj+92={:08X}",
+                          n, lr, GetCurrentThreadId(), obj, desc, dfn, s0, s1);
+        }
+    }
+    __imp__sub_82305690(ctx, base);
+    if (mine && n <= 8) {
+        uint32_t a0 = 0, a1 = 0, a4 = 0;
+        (void)mem.ReadU32BE(obj + 88, &a0);
+        (void)mem.ReadU32BE(obj + 92, &a1);
+        (void)mem.ReadU32BE(obj + 104, &a4);
+        MCLA_LOG_WARN("F365-COPIER #{} AFTER obj+88={:08X} obj+92={:08X} obj+104={:08X}",
+                      n, a0, a1, a4);
+    }
+}
 // loaded from exactly that global: `lis r29,-32119` / `lwz r30,-17944(r29)` at
 // ppc_recomp.0.cpp:3618), and that copier SKIPS the copy when `[obj+4] != 0`
 // (`lbz r10,4(r31); cmplwi r10,0; bne -> 0x82305728`). F361-BOOTOBJ found +88..+104 all
