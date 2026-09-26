@@ -255,6 +255,17 @@ def main() -> int:
     ap.add_argument("--markers", help="comma-separated subset instead of the full battery")
     ap.add_argument("--unchanged", action="store_true", help="hide markers with no delta")
     ap.add_argument("--top-lr", type=int, default=8, help="guest lr values to show")
+    ap.add_argument("--json", action="store_true",
+                    help="emit machine-readable JSON instead of the table. Exists because "
+                         "the human table is a parsing trap that has repeatedly produced "
+                         "false conclusions: only NON-ZERO delta rows get a trailing "
+                         "`<<`/`>>`, so those rows have 6 whitespace fields while `+0` "
+                         "rows have 4 (awk 'NF==4' therefore CANNOT report a regression, "
+                         "F-353), and five tracked markers contain spaces "
+                         "(`Fatal error`, `skip fatal`, `boot-worker AV`, "
+                         "`fallback advance`, `VEH W0: parking thread`) which break "
+                         "column-position parsing as well. `--json` removes the whole "
+                         "class: read .markers[name].delta.")
     args = ap.parse_args()
 
     for p in (args.log, args.baseline):
@@ -272,6 +283,31 @@ def main() -> int:
 
     new = census(args.log, ordered)
     old = census(args.baseline, ordered) if args.baseline else None
+
+    if args.json:
+        import json
+        out = {"log": new["path"].name, "lines": new["lines"],
+               "levels": new["levels"], "quality": quality(new),
+               "markers": {}}
+        for m in ordered:
+            n = new["markers"].get(m, 0)
+            row = {"new": n}
+            if old:
+                o = old["markers"].get(m, 0)
+                row["base"] = o
+                row["delta"] = n - o
+            out["markers"][m] = row
+        if old:
+            out["baseline"] = old["path"].name
+            out["baseline_lines"] = old["lines"]
+            out["baseline_levels"] = old["levels"]
+        out["not_in_src"] = sorted(set(
+            dead_tracked(VEH_PATHS + SHORT_CIRCUITS_TRACKED + FRONTIER
+                         + markers_from_guide(GUIDE))))
+        out["lr"] = {"fault_lines": new.get("fault_lr", {}),
+                     "all_lines": new.get("all_lr", {})}
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return 0
 
     print(f"# soak census -- {new['path'].name}")
     print(f"#   {new['lines']:,} lines / {new['bytes']:,} bytes")
