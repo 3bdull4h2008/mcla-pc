@@ -10,6 +10,21 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~15:3x (ledger through F-367; next ID F-368) — closes the
+> UILOAD-producer direction for good.** The "non-return" is a healthy **semaphore wait-loop**
+> (`SEMA-CREATE #14 h=C61C5800-family C6137A00 init=15 max=32767`; 29 waits from the
+> registering thread plus 10 `RELSEMA` and 8 `SIGNAL` on it), so the UI-load registration site
+> at `0x821315F4` lies **after** the boot worker's loop entry and is unreachable while the
+> title runs — nothing on our side blocks it. The callback that IS installed
+> (`obj+92=821FC008`) is a threshold/status routine (`ppc_recomp.22.cpp:9173`), not a loader.
+> Both halves of the F-186/F-187 premise are now measured false: no live producer exists in
+> this image, and 3/4 containers byte-exact in guest memory already left `nGfx`=0
+> (F-299/F-302/F-325). Do not re-open "who posts 0x40003B03" or probe the wait-loop. Two
+> routes remain and they are the user's to weigh: (i) the F-055 decision on the seed-free host
+> dispatch at `src/gpu_device.cpp:2100` (acceptance `W35-BOOT-GATE` > 0, then `nGfx`), or
+> (ii) task #15's streamer re-plumb for the garage's other ~63 %. **(a) 3/4 byte-exact +
+> garage 12.3 %/41.3 %. (b) `nGfx`=0. Goal NOT complete.**
+
 > **§0 state, 2026-09-26 ~15:1x (ledger through F-363; next ID F-364) — supersedes the
 > enqueue-gap framing of the two blocks below.** The UI-load enqueue gap is **not** a broken
 > or missing producer: the registration mechanism is proven to work in our build —
