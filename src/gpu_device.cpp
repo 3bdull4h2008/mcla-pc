@@ -2805,9 +2805,16 @@ PPC_FUNC(sub_8244FF20) {
     (void)xmemMem.ReadU32BE(destSz, &outDestSz);
   if (srcSz)
     (void)xmemMem.ReadU32BE(srcSz, &outSrcSz);
-  // F-253: always log the 4 UI container dests (they land past the general cap).
-  const bool uiDest = dest == 0xB7B01000u || dest == 0xB7AC1000u ||
-                      dest == 0xB7441000u || dest == 0xB74E1000u;
+  // F-253: always log the UI container dests. F-321 INSTRUMENT FIX: this used a
+  // four-address snapshot (`B7B01000/B7AC1000/B7441000/B74E1000`) taken from some
+  // earlier boot, so it printed for stale dests and stayed SILENT for the live
+  // ones — which is how F-320 could not say whether the garage's successor slots
+  // hold real container bytes. Keyed on the dynamic dest->package map instead
+  // (directive #5); log-only, no behaviour change.
+  const uint32_t destPkg = PeekPackageForDest(dest);
+  const bool uiDest = IsUiXsfPkg(destPkg) || dest == 0xB7B01000u ||
+                      dest == 0xB7AC1000u || dest == 0xB7441000u ||
+                      dest == 0xB74E1000u;
   if (n <= 24 || uiDest)
     MCLA_LOG_WARN("XMEM-SZPTR #{} dest={:08X} *destSz(in)={} *srcSz(in)={} "
                   "src={:08X} *destSz(out)={} *srcSz(out)={} ret={:08X} "
@@ -2827,6 +2834,13 @@ PPC_FUNC(sub_8244FF20) {
       // F-266: measure how much real (non-poison) data the decompress wrote by
       // scanning for the first 0xCDCDCDCD run — settles whether the UI .xsf fully
       // decompressed vs the ambiguous destSz(out)==capacity reading.
+      // F-321: `valid` alone is a trap of the F-302/F-308 kind — a container head
+      // is legitimately followed by zero words (w277: XMEM-UIHEAD validbytes=20 on
+      // a dest whose stream demonstrably advanced), so a small `valid` is NOT
+      // evidence of an empty slot. Report coverage over the first 4 KiB too:
+      // `nzwords` counts every word that is neither poison nor zero, `runs` the
+      // number of separate non-poison regions. nzwords≈1024 ⇒ full; nzwords≈0 ⇒
+      // untouched; a real decompressed body sits in between.
       uint32_t valid = 0;
       for (uint32_t off = 0; off + 4 <= 0x200000u; off += 4) {
         uint32_t word = 0;
@@ -2837,9 +2851,29 @@ PPC_FUNC(sub_8244FF20) {
           break;
         valid = off + 4;
       }
-      MCLA_LOG_WARN("XMEM-UIHEAD #{} dest={:08X} validbytes={} words=[{:08X} "
+      uint32_t nzwords = 0, runs = 0;
+      bool inRun = false;
+      for (uint32_t off = 0; off + 4 <= 0x1000u; off += 4) {
+        uint32_t word = 0;
+        if (!xmemMem.IsValid(dest + off, 4) ||
+            !xmemMem.ReadU32BE(dest + off, &word))
+          break;
+        const bool nz = word != 0xCDCDCDCDu && word != 0u;
+        if (nz) {
+          ++nzwords;
+          if (!inRun) {
+            ++runs;
+            inRun = true;
+          }
+        } else {
+          inRun = false;
+        }
+      }
+      MCLA_LOG_WARN("XMEM-UIHEAD #{} dest={:08X} pkg={:08X} validbytes={} "
+                    "nzwords={} runs={} words=[{:08X} "
                     "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                    n, dest, valid, w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                    n, dest, destPkg, valid, nzwords, runs, w[0], w[1], w[2],
+                    w[3], w[4], w[5], w[6],
                     w[7]);
     }
   }
@@ -7807,15 +7841,111 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
   return true;
 }
 
-// F-318: is this dest a standalone UI .xsf container that still has uncompressed
-// package windows left to serve? Keys on the dynamic dest->pkg map and the stable
-// package offsets, so it survives boot-to-boot dest reassignment. The walk < size
-// bound is what makes this loop-proof: MclaLoadPkgWindow only fails at
-// walk >= pkgSz + 4 MB, which for a default-sized (0x40000) package would mean
-// ~130 re-serves of past-the-end bytes before it stopped on its own.
-static bool MclaUiXsfChunkOpen(uint32_t outPtr) {
+// F-320: a UI .xsf inflate STREAM is not one dest. w281 shows the guest walking
+// its own readlist slot by slot — `PSTREAM #1` is a contiguous virtual range
+// (s[3..9]: vbase 60000000/60020000/60040000/60060000/60080000/600A0000/600C0000
+// with size 20000,20000,20000,20000,20000,20000,10000, and vbase(k+1) ==
+// vbase(k)+size(k) exactly) over physical slots B7B41000, B7A01000, B7A21000,
+// B7A41000, B7A61000, B7A81000, B7AA1000 — and `INFLATE-ENTER` follows it:
+// #32..#40 on B7A41000 (consumed 32,748→163,820), then **#58 onward on B7A61000
+// carrying consumed=196,553 forward**, then B7A81000, then B7AA1000. Only the
+// FIRST slot ever gets a `DEST-PKG` mapping, so a dest-keyed cursor stops dead
+// at the slot boundary — that, not output capacity, is what ended F-318's run.
+// The cursor therefore has to live on the inflate state `st` (which IS the
+// stream), with the dest mapping consulted when it exists.
+static std::mutex g_uiXsfStreamMtx;
+static std::unordered_map<uint32_t, uint32_t> g_uiXsfStreamPkg;   // st -> pkg
+static std::unordered_map<uint32_t, uint32_t> g_uiXsfStreamWalk;  // st -> bytes delivered
+
+// Which UI .xsf package (0 = none) is this inflate state streaming? A dest that
+// IS mapped settles it authoritatively — including NEGATIVELY: a dest mapped to
+// a non-UI package proves this `st` has moved on to another family, so the
+// binding is dropped rather than trusted. Only an UNMAPPED dest (a successor
+// slot, which never gets a mapping) consults the stream binding.
+static uint32_t MclaUiXsfStreamPkg(uint32_t st, uint32_t outPtr) {
   const uint32_t pkg = PeekPackageForDest(outPtr);
-  if (!IsUiXsfPkg(pkg))
+  std::lock_guard<std::mutex> lk(g_uiXsfStreamMtx);
+  if (pkg != 0) {
+    if (IsUiXsfPkg(pkg)) {
+      g_uiXsfStreamPkg[st] = pkg;
+      return pkg;
+    }
+    g_uiXsfStreamPkg.erase(st);
+    g_uiXsfStreamWalk.erase(st);
+    return 0u;
+  }
+  const auto it = g_uiXsfStreamPkg.find(st);
+  return it == g_uiXsfStreamPkg.end() ? 0u : it->second;
+}
+
+// F-321: PackageSizeAt() answers the fabricated **0x40000 fallback** for any
+// package absent from g_rscTab, and garage (unc 1,066,057) is absent — which is
+// exactly where F-320's stream stopped (294,912 − 32,748 = 262,164 ≈ 0x40000)
+// with three readlist slots still unfilled. The container's own header is the
+// honest source: RSC5 `+0x10` is the uncompressed length, and an LZX stream is
+// never longer than what it expands to, so `unc` is a safe ceiling for the input
+// walk. OFF == the old fabricated bound byte-for-byte.
+static constexpr bool kUiXsfBoundUnc = true;
+
+static uint32_t MclaUiXsfWalkCeil(uint32_t pkg) {
+  const uint32_t pkgSz = PackageSizeAt(pkg);
+  if (!kUiXsfBoundUnc)
+    return pkgSz;
+  static std::mutex s_ceilMtx;
+  static std::unordered_map<uint32_t, uint32_t> s_ceil;
+  std::lock_guard<std::mutex> lk(s_ceilMtx);
+  const auto it = s_ceil.find(pkg);
+  if (it != s_ceil.end())
+    return it->second;
+  uint32_t ceil = pkgSz;
+  uint8_t hdr[24] = {0};
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+  uint64_t got = 0;
+  if (vfs.OpenFile("xarchive_cache.rpf", fh)) {
+    const bool ok = vfs.ReadFileAt(fh, pkg, hdr, 24, got) && got >= 24;
+    vfs.CloseFile(fh);
+    const uint32_t magic = MclaBE(hdr);
+    const uint32_t unc = MclaBE(hdr + 0x10);
+    if (ok && (magic == 0x05435352u || magic == 0x0FF512EFu) && unc >= 0x100u &&
+        unc <= 0x800000u) {
+      ceil = unc + 0x8000u;
+      if (ceil < pkgSz)
+        ceil = pkgSz;
+    }
+  }
+  s_ceil[pkg] = ceil;
+  return ceil;
+}
+
+// F-321: how full is a UI .xsf slot when the stream retires it?
+// XMEM-UIHEAD dumps on the FIRST call for a dest, so it reads a window that is
+// about to be filled — that is why w283 shows B7A41000 as all-poison and says
+// nothing about its end state. This measures coverage at the retirement sites
+// instead: non-poison, non-zero words over the first 4 KiB (max 1024). Log-only.
+static uint32_t MclaUiXsfSlotCov(uint32_t dest) {
+  if (dest == 0 || dest == 0xCDCDCDCDu || !IsUiXsfPkg(PeekPackageForDest(dest)))
+    return 0xFFFFFFFFu;  // not a UI .xsf dest: caller must not print
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t nz = 0;
+  for (uint32_t off = 0; off + 4 <= 0x1000u; off += 4) {
+    uint32_t word = 0;
+    if (!mem.IsValid(dest + off, 4) || !mem.ReadU32BE(dest + off, &word))
+      break;
+    if (word != 0xCDCDCDCDu && word != 0u)
+      ++nz;
+  }
+  return nz;
+}
+
+// Is this UI .xsf stream still short of its package end? Keys on the stream
+// cursor (max of the dest's own walk and the stream's), bounded by
+// MclaUiXsfWalkCeil, so it cannot spin past the package: MclaLoadPkgWindow only
+// fails at walk >= pkgSz + 4 MB, which for a default-sized (0x40000) package
+// would mean ~130 re-serves of past-the-end bytes before it stopped on its own.
+static bool MclaUiXsfChunkOpen(uint32_t st, uint32_t outPtr) {
+  const uint32_t pkg = MclaUiXsfStreamPkg(st, outPtr);
+  if (pkg == 0)
     return false;
   uint32_t walk = 0;
   {
@@ -7824,8 +7954,111 @@ static bool MclaUiXsfChunkOpen(uint32_t outPtr) {
     if (it != g_destPkgWalk.end())
       walk = it->second;
   }
-  const uint32_t lim = PackageSizeAt(pkg);
-  return walk < lim;
+  {
+    std::lock_guard<std::mutex> lk(g_uiXsfStreamMtx);
+    const auto it = g_uiXsfStreamWalk.find(st);
+    if (it != g_uiXsfStreamWalk.end() && it->second > walk)
+      walk = it->second;
+  }
+  return walk < MclaUiXsfWalkCeil(pkg);
+}
+
+// F-321: coverage says a slot is *occupied*; this says whether it holds the RIGHT
+// bytes. The Path A decoder is byte-exact offline and in-boot for these packages
+// (F-299 proved full-buffer equality for 3 of 4), so its output for a package IS a
+// golden image of the container. Re-derive it once per package, locate the slot's
+// first 64 bytes inside it, then compare forward — which answers the objective's
+// actual question ("is the .xsf decompressed in guest memory") for dests the GUEST
+// filled, not just the ones the host wrote. Log-only: no guest state is touched.
+static constexpr bool kUiXsfVerify = true;
+
+static void MclaUiXsfVerifySlot(uint32_t dest, uint32_t slotsize) {
+  if (!kUiXsfVerify)
+    return;
+  const uint32_t pkg = PeekPackageForDest(dest);
+  if (!IsUiXsfPkg(pkg) || dest == 0 || dest == 0xCDCDCDCDu)
+    return;
+  static std::mutex s_vMtx;
+  static std::unordered_map<uint32_t, std::vector<uint8_t>> s_golden;
+  static std::unordered_set<uint32_t> s_verdict;
+  std::lock_guard<std::mutex> vlk(s_vMtx);
+  if (s_verdict.size() < 24 && !s_verdict.insert(dest).second)
+    return;  // one verdict per dest
+  auto git = s_golden.find(pkg);
+  if (git == s_golden.end()) {
+    std::vector<uint8_t> empty;
+    auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+    mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+    std::vector<uint8_t> raw(0x400000);
+    uint64_t got = 0;
+    int hp = 0;
+    if (vfs.OpenFile("xarchive_cache.rpf", fh)) {
+      const bool rd =
+          vfs.ReadFileAt(fh, pkg, raw.data(), 0x400000, got) && got >= 24;
+      vfs.CloseFile(fh);
+      if (rd)
+        hp = mcla_lzx::host_decode_ui_xsf(raw.data(), static_cast<size_t>(got),
+                                          empty, kXcWindowBits);
+    }
+    if (hp && !empty.empty())
+      git = s_golden.emplace(pkg, std::move(empty)).first;
+    else
+      git = s_golden.emplace(pkg, std::vector<uint8_t>{}).first;
+  }
+  const std::vector<uint8_t> &gold = git->second;
+  if (gold.size() < 64 || slotsize < 64) {
+    MCLA_LOG_WARN("UIXSF-SLOT-VERIFY dest={:08X} pkg={:08X} goldsize={} "
+                  "slotsize={} → NO GOLDEN",
+                  dest, pkg, static_cast<uint32_t>(gold.size()), slotsize);
+    return;
+  }
+  uint8_t head[64] = {0};
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (!mem.ReadBytes(dest, head, 64))
+    return;
+  uint32_t off = 0;
+  bool found = false;
+  // Single-byte prefilter first: ~1 M byte compares is microseconds, whereas a
+  // 64-byte memcmp at every offset would cost seconds per dest and perturb a
+  // timing-sensitive boot.
+  while (off + 64 <= gold.size()) {
+    if (gold[off] == head[0] &&
+        std::memcmp(gold.data() + off, head, 64) == 0) {
+      found = true;
+      break;
+    }
+    ++off;
+  }
+  if (!found) {
+    MCLA_LOG_WARN("UIXSF-SLOT-VERIFY dest={:08X} pkg={:08X} goldsize={} "
+                  "→ HEAD NOT IN GOLDEN head={:08X} {:08X}",
+                  dest, pkg, static_cast<uint32_t>(gold.size()),
+                  MclaBE(head), MclaBE(head + 4));
+    return;
+  }
+  uint32_t cmp = slotsize;
+  if (cmp > gold.size() - off)
+    cmp = static_cast<uint32_t>(gold.size() - off);
+  if (cmp > 0x200000u)
+    cmp = 0x200000u;
+  uint32_t mismatch = 0, firstbad = 0;
+  std::vector<uint8_t> buf(cmp > 0x4000u ? 0x4000u : cmp);
+  for (uint32_t done = 0; done < cmp; done += buf.size()) {
+    const uint32_t want = cmp - done < buf.size() ? cmp - done
+                                                  : static_cast<uint32_t>(buf.size());
+    if (!mem.ReadBytes(dest + done, buf.data(), want)) {
+      mismatch = cmp - done;  // unreadable tail counts as unverifiable
+      firstbad = done;
+      break;
+    }
+    for (uint32_t i = 0; i < want; ++i)
+      if (buf[i] != gold[off + done + i] && mismatch++ == 0)
+        firstbad = done + i;
+  }
+  MCLA_LOG_WARN("UIXSF-SLOT-VERIFY dest={:08X} pkg={:08X} goldoff={:08X} "
+                "goldsize={} compared={} mismatch={} firstbad={:08X}",
+                dest, pkg, off, static_cast<uint32_t>(gold.size()), cmp,
+                mismatch, firstbad);
 }
 
 // w10 FIX: job #2 dests are the UI/swfC set only. The whole B7* range also
@@ -8395,7 +8628,7 @@ PPC_FUNC(sub_821D5E10) {
     // from the place-pass/consumer side, NOT from the serve side. UNSTUCK's
     // zero-outLeft is crude but it is what lets the rest of the boot proceed.
     if (kUiXsfTailTopup && inLeft > 0 && inLeft < 256 && outLeft > 0 &&
-        MclaUiXsfChunkOpen(outPtr)) {
+        MclaUiXsfChunkOpen(st, outPtr)) {
       static std::mutex s_tailMtx;
       static uint32_t s_tailBuf = 0;
       std::lock_guard<std::mutex> tlk(s_tailMtx);
@@ -8452,8 +8685,10 @@ PPC_FUNC(sub_821D5E10) {
       uc++;
       if (uc >= 16) {
         MCLA_LOG_WARN("INFLATE-UNSTUCK #{} outPtr={:08X} inLeft={} "
-                      "produced={} consumed={} outLeft={} — zero outLeft",
-                      uc, outPtr, inLeft, produced, consumed, outLeft);
+                      "produced={} consumed={} outLeft={} slotcov={} — zero "
+                      "outLeft",
+                      uc, outPtr, inLeft, produced, consumed, outLeft,
+                      MclaUiXsfSlotCov(outPtr));
         (void)mem.WriteU32BE(st + 0, 0);  // inLeft = 0
         (void)mem.WriteU32BE(st + 16, 0); // outLeft = 0
         uc = 0;
@@ -8717,7 +8952,7 @@ PPC_FUNC(sub_821D5E10) {
     // twice over (retries < 400, and MclaUiXsfChunkOpen goes false at
     // walk >= PackageSizeAt → the drain resumes).
     else if (j2cAnyB7 && outPtr >= 0xB7000000u &&
-             !(kUiXsfChunkFeed && MclaUiXsfChunkOpen(outPtr))) {
+             !(kUiXsfChunkFeed && MclaUiXsfChunkOpen(st, outPtr))) {
       static std::mutex s_b7cMtx;
       static std::unordered_map<uint32_t, uint32_t> s_b7cSpin;
       static std::unordered_map<uint32_t, uint32_t> s_b7cProd;
@@ -8748,8 +8983,9 @@ PPC_FUNC(sub_821D5E10) {
       if (!progressed && b7spin >= 12) {
         MCLA_LOG_WARN(
             "INFLATE-J2-DRAIN-B7 #{} dest={:08X} magic={:08X} produced={} "
-            "outLeft={} consumed={} — zero outLeft (backup)",
-            b7spin, outPtr, magic, produced, outLeft, consumed);
+            "outLeft={} consumed={} slotcov={} — zero outLeft (backup)",
+            b7spin, outPtr, magic, produced, outLeft, consumed,
+            MclaUiXsfSlotCov(outPtr));
         (void)mem.WriteU32BE(st + 0, 0);
         (void)mem.WriteU32BE(st + 16, 0);
         b7spin = 0;
@@ -8821,7 +9057,7 @@ PPC_FUNC(sub_821D5E10) {
     // than one window. Both are keyed on the dynamic dest->pkg map, not an
     // address, per directive #5; MclaUiXsfChunkOpen returns false once the walk
     // passes PackageSizeAt, so this cannot spin past the package.
-    const bool uiXsfStream = kUiXsfChunkFeed && MclaUiXsfChunkOpen(outPtr);
+    const bool uiXsfStream = kUiXsfChunkFeed && MclaUiXsfChunkOpen(st, outPtr);
     const uint32_t maxEmptyRetries =
         (needArrData || uiXsfStream)
             ? 400u
@@ -8853,6 +9089,30 @@ PPC_FUNC(sub_821D5E10) {
           walkPos = g_destPkgWalk[outPtr];
           readOff = baseOff + walkPos;
         }
+        // F-320: for a UI .xsf stream, the STREAM owns the package and the
+        // cursor. A successor PSTREAM slot has no g_destPkgOff entry, so
+        // AssignPackageForDest would guess (the F-247 wrong-package hazard that
+        // produced the produced=0 livelocks), and its g_destPkgWalk starts at 0
+        // and would re-serve bytes the guest already consumed — the w275
+        // re-serve failure in a new place. Take the stream's package and advance
+        // past everything already delivered on this inflate state.
+        const uint32_t sPkg =
+            kUiXsfChunkFeed ? MclaUiXsfStreamPkg(st, outPtr) : 0u;
+        if (sPkg != 0) {
+          uint32_t sWalk = 0;
+          {
+            std::lock_guard<std::mutex> lk(g_uiXsfStreamMtx);
+            sWalk = g_uiXsfStreamWalk[st];
+          }
+          baseOff = sPkg;
+          if (sWalk > walkPos)
+            walkPos = sWalk;
+          readOff = baseOff + walkPos;
+          // Publish the mapping for this slot too, so the top-of-hook Path A
+          // decoder and the drain exemption see it from the next entry on.
+          std::lock_guard<std::mutex> wl(g_destPkgMtx);
+          g_destPkgOff[outPtr] = baseOff;
+        }
         if (s_hsBuf == 0)
           s_hsBuf = mem.Alloc(0x8000, 16);
         if (s_hsBuf) {
@@ -8872,7 +9132,8 @@ PPC_FUNC(sub_821D5E10) {
             constexpr uint32_t kRsc5 = 0x05435352u;
             constexpr uint32_t kXCompress = 0x0FF512EFu;
             const bool isPkgHead = (be == kRsc5 || be == kXCompress);
-            const uint32_t pkgSz = PackageSizeAt(baseOff);
+            const uint32_t pkgSz = sPkg ? MclaUiXsfWalkCeil(baseOff)
+                                        : PackageSizeAt(baseOff);
             // w18: first window of a package MUST be RSC5/XC. Continuation
             // windows are raw XCompress payload — allow them while walk is
             // still inside the package size (do not walk past into junk).
@@ -8921,7 +9182,17 @@ PPC_FUNC(sub_821D5E10) {
             }
             {
               std::lock_guard<std::mutex> wl(g_destPkgMtx);
-              g_destPkgWalk[outPtr] = walkPos + 0x8000;
+              // Exact advance for a UI .xsf stream; the legacy fixed-window
+              // advance is left byte-for-byte alone for every other dest, so
+              // this change cannot perturb the shared job2 walk.
+              g_destPkgWalk[outPtr] =
+                  sPkg ? (readOff - baseOff + got) : (walkPos + 0x8000);
+            }
+            if (sPkg != 0) {
+              std::lock_guard<std::mutex> lk(g_uiXsfStreamMtx);
+              const uint32_t nw = readOff - baseOff + got;
+              if (nw > g_uiXsfStreamWalk[st])
+                g_uiXsfStreamWalk[st] = nw;
             }
             retries = 0;
             return;
@@ -9461,9 +9732,21 @@ PPC_FUNC_IMPL(__imp__sub_821D5510);
 static std::atomic<uint32_t> s_h5510{0};
 PPC_FUNC(sub_821D5510) {
   const uint32_t n = s_h5510.fetch_add(1) + 1;
+  // F-321: the golden-byte verify runs on EVERY flush, not just the printed ones —
+  // a dest that retires late would otherwise never get a verdict. It is a map
+  // lookup plus a one-shot-per-dest guard for non-UI dests, so the cost off the
+  // print path is bounded. SlotCov stays INSIDE the cap: 1,024 guest reads per
+  // call is far too much to add to a hot hook.
+  MclaUiXsfVerifySlot(ctx.r3.u32, ctx.r4.u32);
   if (n <= 64 || (n % 200) == 0) {
-    MCLA_LOG_INFO("FLUSH sub_821D5510 #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+    // slotcov is the coverage of a UI .xsf dest at its NATURAL retirement (the
+    // guest flushes after the inflate step completes) — 1024 = the whole first
+    // 4 KiB is real data, 0xFFFFFFFF = not a UI .xsf dest. XMEM-UIHEAD dumps on
+    // the FIRST call and so cannot answer "how full did it get".
+    MCLA_LOG_INFO("FLUSH sub_821D5510 #{} r3={:08X} r4={:08X} r5={:08X} "
+                  "slotcov={} lr={:08X}",
                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                  MclaUiXsfSlotCov(ctx.r3.u32),
                   static_cast<uint32_t>(ctx.lr));
   }
   __imp__sub_821D5510(ctx, base);
