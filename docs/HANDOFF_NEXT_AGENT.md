@@ -1,3 +1,10 @@
+## 2026-09-26 ~09:45x (F-345, **STATIC ONLY, zero builds**) - **the garage's failing frames are located inside the type-2 arithmetic decoder, not the framing layer.** Ledger through **F-345**; next ID **F-346**.
+
+-  has three exits to -1. For the garage's frames 11+ the logged values exclude two: type is **2** (legal, ) and  (). So the exit is the type decoder returning non-zero () - i.e. inside , **after** its table resets, which type 2 always performs ( -> ).
+- Read with F-341 (serving differently changes nothing durable), that leaves decoder-internal state as the leading candidate - the arithmetic cursor / and the history window - and F-345 §2 states the one log-only measurement that decides between the two: the per-frame cursor sequence **within a single outer call**, compared against the offline walk that already decodes these same bytes correctly.
+- Recorded as INFERENCE, deliberately: it is a deduction from two logged values and three branch addresses, not a probe. It is written because it costs nothing and it moves the target off the plumbing layer for whoever continues.
+- No code changed, tree clean at +this. Objective unchanged: (a) 3/4 + garage 5.9 %, (b) =0. **Goal NOT complete.**
+
 ## 2026-09-26 ~09:4x (F-344, **3 builds/soaks `w332`-`w334`**) - **the last hook-layer mechanism is closed: holding the shared context by skipping the other containers' inflate calls is a null - and the apparent win was a stalled boot.** Ledger through **F-344**; next ID **F-345**.
 
 - Not a repeat of F-340: that withheld *refills*, and F-341 proved refills are inert. This skipped the call that mutates the context (`r3=0`, no state touched), package-keyed, with a bounded run cap and rotating handover.

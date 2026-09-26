@@ -186,6 +186,7 @@ were aimed at is not in the image. What remains:
    turned on. `LZX-FRAME` and `XMEM-CTX` are the other two instruments worth
    keeping — between them they are the first things in the tree that see the
    decoder's own progress.
+1d. **The failure is now inside the type-2 arithmetic decoder (F-345, static deduction).** The three exits from  to  are enumerated and two are excluded by logged values (type is 2, and  = 32,768 is non-zero), so the failing garage frames die in  after its tables have already been reinstalled from / (:16008-16060). The remaining split is cursor-content vs decoder-internal state, and F-345 §2 names the log-only measurement that decides it (per-frame cursor sequence within one outer call, against the offline walk). Everything in steps 1/1b/1c is upstream of that, which is why none of it moved output.
 4. **GFx**: take §4 to the user as a decision with the elimination chain attached;
    do not spend soaks on it meanwhile.
 
