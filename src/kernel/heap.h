@@ -1,5 +1,6 @@
 #pragma once
 #include <kernel/mutex.h>
+#include <kernel/heap_arena.h>  // F-384: kUserHeapArenaVa / kUserHeapArenaEnd
 
 #include <kernel/o1heap.h>
 #include <cstdint>
@@ -71,6 +72,12 @@ struct Heap
     T* Alloc(Args&&... args)
     {
         T* obj = (T*)Alloc(sizeof(T));
+        // F-390b: `obj` is null on an honest OOM (F-390 made that path reachable for real: the SEH
+        // around o1heap now returns null instead of the VEH parking the thread). Constructing into it
+        // was a write to 0x0 -- `w394`..`w403`'s `AllocPhysical: o1heapAllocate returned null #1
+        // size=0x28 align=0x10` was immediately followed by exactly that fault.
+        if (obj == nullptr)
+            return nullptr;
         new (obj) T(std::forward<Args>(args)...);
         return obj;
     }
@@ -79,6 +86,8 @@ struct Heap
     T* AllocPhysical(Args&&... args)
     {
         T* obj = (T*)AllocPhysical(sizeof(T), alignof(T));
+        if (obj == nullptr)  // F-390b, same reason as `Alloc<T>` above
+            return nullptr;
         new (obj) T(std::forward<Args>(args)...);
         return obj;
     }

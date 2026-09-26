@@ -3,13 +3,17 @@
 #include "memory.h"
 #include "function.h"
 #include "logging.h"
+#include <boot_host.h>  // F-374: header guard arm/disarm around each operation
 #include <atomic>
 #include <unordered_set>
 #include <windows.h>
+#include <intrin.h>  // F-370: _ReturnAddress() for the heap caller census
+#include <cstdio>    // F-373: snprintf for the raw header dump
 #include <dbghelp.h>
 
+// F-412: dead -- zero code references in src/; the same value lives on as kUserHeapArenaEnd
+// (heap_arena.h:24). Kept only because heap_arena.h:25 still names it in prose.
 constexpr size_t RESERVED_BEGIN = 0x7FEA0000;
-constexpr size_t RESERVED_END = 0xA0000000;
 
 // Session 76j: exact-allocation registry for the physical arena. The guest
 // frees sub-blocks carved from ITS OWN pools via RtlFreeHeap/XFreeMem; a raw
@@ -117,14 +121,104 @@ namespace
     constexpr size_t kFragmentSizeMin = kO1HeapAlignment * 2; // 64
 }
 
+// F-370: the guest user heap keeps its own o1heap header at guest VA 0x20000 (Heap::Init binds the
+// arena there). In w373 and w374 those words turn to garbage between two consecutive Heap calls,
+// after which Heap::Alloc refuses everything (`Alloc: o1heap invariants FAIL`), the 16th guest
+// thread is never created (src/kernel/guest_thread.cpp:21 takes the null and used to AV in memset),
+// and the boot worker parks forever on counting semaphore C501FC00. `capacity` is constant, so an
+// O(1) compare against the value captured at Init brackets the corruption to one heap operation
+// without walking the allocator's tree.
+namespace
+{
+    size_t g_hdrGoldenCap = 0;
+    uint8_t *g_hdrArena = nullptr;
+
+    inline O1HeapDiagnostics HeapDiag(O1HeapInstance *h)
+    {
+        O1HeapDiagnostics d{};
+        if (h != nullptr)
+            d = o1heapGetDiagnostics(h);
+        return d;
+    }
+
+    inline uintptr_t CallerRva(void *ra)
+    {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+        return base ? reinterpret_cast<uintptr_t>(ra) - base : 0;
+    }
+
+    void CheckHeapHeader(const char *phase, size_t reqSize, O1HeapInstance *h, void *callerRa)
+    {
+        if (h == nullptr || g_hdrGoldenCap == 0)
+            return;
+        // O1HeapInstance is opaque in the public header, so the fields come through the
+        // diagnostics copy - which reads the same memory the corrupter scribbled on.
+        const O1HeapDiagnostics d = HeapDiag(h);
+        if (d.capacity == g_hdrGoldenCap && d.allocated <= g_hdrGoldenCap &&
+            d.peak_allocated <= g_hdrGoldenCap)
+            return;
+        static std::atomic<uint32_t> s_hdrBad{0};
+        const uint32_t n = s_hdrBad.fetch_add(1) + 1;
+        if (n <= 8 || (n % 500) == 0)
+        {
+            uint32_t glr = 0;
+            if (const PPCContext *c = GetPPCContext())
+                glr = static_cast<uint32_t>(c->lr);
+            MCLA_LOG_ERROR("F370-HEAP-HDR #{} phase={} subj={:#x} cap={:#x} want_cap={:#x} "
+                           "used={:#x} peak={:#x} oom={} hdr_off={:#x} glr={:08X} caller_rva={:#x}",
+                           n, phase, reqSize, d.capacity, g_hdrGoldenCap, d.allocated,
+                           d.peak_allocated, static_cast<unsigned long long>(d.oom_count),
+                           g_hdrArena ? static_cast<unsigned>(reinterpret_cast<uint8_t *>(h) -
+                                                                   g_hdrArena)
+                                      : 0u,
+                           glr, CallerRva(callerRa));
+            // F-373: "the header is garbage" has two very different causes, and the fix is
+            // opposite: (i) somebody wrote over guest 0x20000, or (ii) the host pointer we
+            // captured at Init is stale because the mapping behind 0x20000 moved, so we are
+            // reading a page that is no longer the heap. Re-Translate and read the same 40
+            // bytes through the checked path: if the mapping moved, `retrans` says so directly.
+            // The physical-arena compare is a free needle test -- if the two headers match, the
+            // "corruption" is a copy of the other heap and the writer names itself.
+            auto &gm = mcla::kernel::GuestMemoryHeap::Instance();
+            void *re = gm.Translate(mcla::kernel::kUserHeapArenaVa);
+            uint8_t raw[40] = {};
+            const bool got = gm.ReadBytes(mcla::kernel::kUserHeapArenaVa, raw, static_cast<uint32_t>(sizeof(raw)));
+            uint8_t phys[40] = {};
+            const bool gotPhys =
+                gm.ReadBytes(mcla::kernel::kPhysArenaBeginVa, phys, static_cast<uint32_t>(sizeof(phys)));
+            char hex[sizeof(raw) * 2 + 1] = {};
+            char asc[sizeof(raw) + 1] = {};
+            for (size_t k = 0; k < sizeof(raw); ++k)
+            {
+                std::snprintf(&hex[k * 2], 3, "%02x", raw[k]);
+                asc[k] = (raw[k] >= 32 && raw[k] < 127) ? static_cast<char>(raw[k]) : '.';
+            }
+            asc[sizeof(raw)] = 0;
+            MCLA_LOG_ERROR("F373-HEAP-RAW #{} phase={} base={:p} retrans={:p} moved={} "
+                           "read_ok={} phys_read_ok={} phys_same={} hex={} ascii='{}'",
+                           n, phase, (void *)g_hdrArena, re, re != (void *)g_hdrArena, got,
+                           gotPhys, got && gotPhys && std::memcmp(raw, phys, sizeof(raw)) == 0,
+                           hex, asc);
+        }
+    }
+} // namespace
+
 void Heap::Init()
 {
-    heapArenaBase = (uint8_t*)mcla::kernel::g_memory.Translate(0x20000);
-    heapArenaSize = RESERVED_BEGIN - 0x20000;
+    // F-384: this line used to hardcode 0x20000 (XenonRecomp's baseline); the address is unchanged but
+    // it now comes from `kUserHeapArenaVa`, and so do the four probes that watch this page. The
+    // relocation to 0x20000000 was tried and measured in `w395` and REVERTED: the writer followed the
+    // base (`guest=20000000 val=20000004` from the same `sub_82397060` chain), so the title is being
+    // HANDED our arena base -- that hand-off is T41.67, not a relocation.
+    heapArenaBase = (uint8_t*)mcla::kernel::g_memory.Translate(mcla::kernel::kUserHeapArenaVa);
+    heapArenaSize = mcla::kernel::kUserHeapArenaEnd - mcla::kernel::kUserHeapArenaVa;
     heap = o1heapInit(heapArenaBase, heapArenaSize);
+    g_hdrArena = heapArenaBase;
+    if (heap != nullptr)
+        g_hdrGoldenCap = o1heapGetDiagnostics(heap).capacity;  // F-370: constant from here on
 
-    physArenaBase = (uint8_t*)mcla::kernel::g_memory.Translate(RESERVED_END);
-    physArenaSize = 0x100000000 - RESERVED_END;
+    physArenaBase = (uint8_t*)mcla::kernel::g_memory.Translate(mcla::kernel::kPhysArenaBeginVa);
+    physArenaSize = 0x100000000 - mcla::kernel::kPhysArenaBeginVa;
     physicalHeap = o1heapInit(physArenaBase, physArenaSize);
 }
 
@@ -216,19 +310,84 @@ bool Heap::IsLiveAllocation(uint8_t* arenaBase, size_t arenaSize, void* ptr, Liv
     return true;
 }
 
+namespace
+{
+    // F-374 / F-412: RAII window for the header guard. F-412 replaced the old bool arms with ONE
+    // nesting depth over BOTH guard pages (g_hgDepth under g_hgMtx, boot_host.cpp:297-310): a
+    // page goes back to NOACCESS only when the LAST open window across ALL threads closes
+    // (only HeapGuardArmImpl at depth 0 re-arms; the VEH handler itself never re-arms). The
+    // old rule -- "declare this immediately after the function's std::lock_guard so it
+    // destructs before the mutex is released" -- was an attempt at the same guarantee:
+    // Heap::Alloc follows it, Heap::Free does NOT -- it opens its window before any lock,
+    // because CheckHeapHeader("pre-free") reads the guarded instance page and must run
+    // disarmed. That is harmless now (depth, not ordering) and must stay so: every instance
+    // read belongs in a window -- moving this below the lock trips F374-HEAPGUARD per free.
+    struct HeapGuardWindow
+    {
+        HeapGuardWindow() { mcla::boot::HeapGuardDisarm(); }
+        ~HeapGuardWindow() { mcla::boot::HeapGuardArm(); }
+    };
+} // namespace
+
 void* Heap::Alloc(size_t size)
 {
     std::lock_guard lock(mutex);
+    HeapGuardWindow hg;
 
     if (heap == nullptr)
         return nullptr;
+
+    // F-370: is the header already broken before this call? Paired with the post-alloc check
+    // below, a bad "pre" with a good "post" on the previous call means the corrupter was NOT a
+    // heap operation at all (an external writer into guest 0x20000..).
+    CheckHeapHeader("pre-alloc", size, heap, _ReturnAddress());
+
+    // F-370 census: who takes a >=256 KiB slice of the guest's own user heap. The host Path A
+    // fill and the guest's thread contexts (0x40e90 each) share this arena.
+    if (size >= 0x40000)
+    {
+        static std::atomic<uint32_t> s_big{0};
+        const uint32_t n = s_big.fetch_add(1) + 1;
+        if (n <= 40 || (n % 200) == 0)
+        {
+            const O1HeapDiagnostics d = HeapDiag(heap);
+            MCLA_LOG_WARN("F370-HEAP-BIG #{} size={:#x} used={:#x} peak={:#x} cap={:#x} oom={} "
+                          "caller_rva={:#x}",
+                          n, size, d.allocated, d.peak_allocated, d.capacity,
+                          static_cast<unsigned long long>(d.oom_count),
+                          CallerRva(_ReturnAddress()));
+            if (n == 1)
+            {
+                // F-100 rule: a probe that only ever fires on failure cannot tell "the header
+                // broke" from "my reader is broken". Dump the same 40 bytes while the header is
+                // provably healthy (this is the first of 15 successful thread-context allocs), so
+                // the later F373-HEAP-RAW line has a golden reference and a working reader.
+                auto &gm = mcla::kernel::GuestMemoryHeap::Instance();
+                uint8_t raw[40] = {};
+                const bool got =
+                    gm.ReadBytes(mcla::kernel::kUserHeapArenaVa, raw, static_cast<uint32_t>(sizeof(raw)));
+                char hex[sizeof(raw) * 2 + 1] = {};
+                for (size_t k = 0; k < sizeof(raw); ++k)
+                    std::snprintf(&hex[k * 2], 3, "%02x", raw[k]);
+                MCLA_LOG_WARN("F373-HEAP-GOLDEN #{} base={:p} read_ok={} cap={:#x} hex={}", n,
+                              (void *)g_hdrArena, got, d.capacity, hex);
+            }
+        }
+    }
+
     if (!o1heapDoInvariantsHold(heap))
     {
         static std::atomic<uint32_t> s_badMain{0};
         const uint32_t n = s_badMain.fetch_add(1) + 1;
         if (n <= 8 || (n % 200) == 0)
-            MCLA_LOG_ERROR("Alloc: o1heap invariants FAIL #{} size={:#x}", n,
-                           size);
+        {
+            const O1HeapDiagnostics d = HeapDiag(heap);
+            MCLA_LOG_ERROR("Alloc: o1heap invariants FAIL #{} size={:#x} cap={:#x} used={:#x} "
+                           "peak={:#x} oom={} caller_rva={:#x}",
+                           n, size, d.capacity, d.allocated, d.peak_allocated,
+                           static_cast<unsigned long long>(d.oom_count),
+                           CallerRva(_ReturnAddress()));
+        }
         return nullptr;
     }
     void* ptr = MCLA_O1_ALLOC(heap, std::max<size_t>(1, size));
@@ -237,9 +396,16 @@ void* Heap::Alloc(size_t size)
         static std::atomic<uint32_t> s_nullMain{0};
         const uint32_t n = s_nullMain.fetch_add(1) + 1;
         if (n <= 8 || (n % 100) == 0)
-            MCLA_LOG_ERROR("Alloc: o1heapAllocate returned null #{} size={:#x}",
-                           n, size);
+        {
+            const O1HeapDiagnostics d = HeapDiag(heap);
+            MCLA_LOG_ERROR("Alloc: o1heapAllocate returned null #{} size={:#x} cap={:#x} "
+                           "used={:#x} peak={:#x} oom={} caller_rva={:#x}",
+                           n, size, d.capacity, d.allocated, d.peak_allocated,
+                           static_cast<unsigned long long>(d.oom_count),
+                           CallerRva(_ReturnAddress()));
+        }
     }
+    CheckHeapHeader("post-alloc", size, heap, _ReturnAddress());
     return ptr;
 }
 
@@ -259,9 +425,119 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     }
 
     std::lock_guard lock(physicalMutex);
+    HeapGuardWindow hg;  // F-388: both header guards off while an allocator is in flight
 
     if (physicalHeap == nullptr)
         return nullptr;
+
+    // F-386 census (READ-ONLY, no behaviour change): the invariants check below PASSES in every boot
+    // that still AVs inside `o1heapAllocate` -- w394/w395/w396/w397 each log exactly one
+    // `code=0xC0000005 rva=0x206C_8 = o1heapAllocate+0x98`, Param[0]=1 (a WRITE) to 0xE49125FC with
+    // rcx=0xE49125D4. That address is a GUEST VA in the physical band being used as a host pointer,
+    // and +0x28 is the `prev_free` field of `struct Fragment` (src/kernel/o1heap.c:123-131), so the
+    // walk was following a poisoned free-list link that `o1heapDoInvariantsHold` never dereferences.
+    // Validate what the allocator is actually about to chase: the 64 bin heads (the first 512 bytes of
+    // the instance -- `O1HeapInstance{bins[], mask, diagnostics}`, o1heap.c:133-138, F-375's
+    // correction) and then the links themselves. A bad value is reported with the physical-allocation
+    // registry's own answer for "is this number a buffer we handed the guest, and who asked for it".
+    if (physArenaBase != nullptr)
+    {
+        static std::atomic<uint32_t> s_binBad{0};
+        static std::atomic<uint32_t> s_physCalls{0};
+        const uint32_t call = s_physCalls.fetch_add(1) + 1;
+        const uintptr_t lo = (uintptr_t)physArenaBase;
+        const uintptr_t hi = lo + physArenaSize;
+        uint32_t bad = 0;
+        int badSlot = -1;
+        uintptr_t badVal = 0;
+        uintptr_t bins[64] = {};
+        std::memcpy(bins, (const void *)physArenaBase, sizeof(bins));
+        for (int i = 0; i < 64; ++i)
+        {
+            const uintptr_t v = bins[i];
+            if (v != 0 && (v < lo || v >= hi))
+            {
+                ++bad;
+                if (badSlot < 0)
+                {
+                    badSlot = i;
+                    badVal = v;
+                }
+            }
+        }
+        // The links are where the poison actually lives if the bin heads look sane: follow each
+        // non-empty bin for a bounded number of hops and check every pointer.
+        // F-387: the first version walked only the first 64 calls, and `w388`-style timing means the
+        // AV happens ~10^4 calls later, so it was blind exactly when it mattered (F386 printed 0 rows
+        // in w398 while the AV still fired). Now a round-robin SAMPLER: 8 nodes per call, advancing
+        // globally, so a poison that persists in a list is found within a handful of calls while the
+        // per-call cost stays negligible. The value it is looking for has an exact signature in the
+        // fault dump: node = 0xE49125D4 with rdi = r8 = 0x1A0000000 (the arena's host base), i.e. a
+        // host pointer to physical memory (Translate(0xE49125D4) = 0x1E49125D4) that lost its high
+        // dword -- a 32-bit GUEST pointer written into a 64-bit host link field.
+        int linkHop = -1;
+        uintptr_t linkVal = 0;
+        if (bad == 0)
+        {
+            static std::atomic<uint32_t> s_walkCursor{0};
+            uint32_t cur = s_walkCursor.fetch_add(8) % 64;
+            for (int k = 0; k < 8 && linkHop < 0; ++k)
+            {
+                const int b = (int)((cur + (uint32_t)k) % 64u);
+                uintptr_t p = bins[b];
+                for (int hop = 0; p != 0 && hop < 8; ++hop)
+                {
+                    if (p < lo || p >= hi)
+                    {
+                        linkVal = p;
+                        linkHop = hop;
+                        bad = 1;
+                        badSlot = b;
+                        break;
+                    }
+                    uintptr_t nxt = 0;
+                    // Fragment = { header{next@0,prev@8,size@16,used@24}, next_free@32, prev_free@40 }
+                    // (src/kernel/o1heap.c:115-131; O1HEAP_ALIGNMENT is 32, so the header is 32 bytes).
+                    // The AV writes node+0x28 = prev_free, i.e. an unlink through a poisoned link.
+                    std::memcpy(&nxt, (const void *)(p + 32), sizeof(nxt));  // Fragment::next_free
+                    p = nxt;
+                }
+            }
+        }
+        if (bad != 0)
+        {
+            const uint32_t n = s_binBad.fetch_add(1) + 1;
+            if (n <= 4)
+            {
+                const uintptr_t gv = bad ? (badVal ? badVal : linkVal) : 0;
+                const uint32_t bogus = (uint32_t)(gv & 0xFFFFFFFFu);
+                uint32_t ab = 0, asz = 0, alr = 0;
+                bool exact = false;
+                const bool known =
+                    mcla::kernel::MclaPhysAllocInfo(bogus, &ab, &asz, &alr, &exact);
+                uint32_t nb = 0, nsz = 0;
+                const bool below =
+                    mcla::kernel::MclaPhysNearestAllocBelow(bogus, &nb, &nsz);
+                uint32_t glr = 0;
+                if (const PPCContext *c = GetPPCContext())
+                    glr = (uint32_t)c->lr;
+                MCLA_LOG_ERROR("F386-PHYSFREE #{} call={} kind={} bin={} hop={} value={:X} "
+                               "high4zero={} plusWindowInArena={} asGuestVa={:08X} allocInfo={} "
+                               "base={:08X} size={:X} reqLr={:08X} exact={} nearestBelow={} "
+                               "below={:08X}+{:X} guestLr={:08X} tid={}",
+                               n, call, (badVal != 0) ? "binhead" : "link", badSlot, linkHop,
+                               (unsigned long long)gv, gv < 0x100000000ull ? 1 : 0,
+                               (gv < 0x100000000ull && (lo + 0x0000000100000000ull) >= lo &&
+                                (gv + 0x0000000100000000ull) >= lo &&
+                                (gv + 0x0000000100000000ull) < hi)
+                                   ? 1
+                                   : 0,
+                               bogus,
+                               known ? 1 : 0, ab, asz, alr, exact ? 1 : 0, below ? 1 : 0, nb, nsz,
+                               glr, GetCurrentThreadId());
+            }
+        }
+    }
 
     // Session 72: post-present AV inside o1heapAllocate walking a corrupted
     // free list (CDCDCDCD class). Refuse the alloc instead of AVing the
@@ -344,6 +620,10 @@ void Heap::Free(void* ptr)
 {
     if (ptr == nullptr)
         return;
+
+    HeapGuardWindow hg;  // F-374: no header guard while we are inside the allocator
+
+    CheckHeapHeader("pre-free", 0, heap, _ReturnAddress());  // F-370
 
     if (physicalHeap != nullptr && ptr >= physicalHeap)
     {
@@ -444,6 +724,10 @@ void Heap::Free(void* ptr)
             return;
         }
         MCLA_O1_FREE(heap, ptr);
+        // F-370: a free of a pointer that was live but whose neighbour bookkeeping was wrong
+        // coalesces straight over the allocator's own header. If the header goes bad here rather
+        // than at an alloc, this line names the freeing caller.
+        CheckHeapHeader("post-free", reinterpret_cast<size_t>(ptr), heap, _ReturnAddress());
     }
 }
 

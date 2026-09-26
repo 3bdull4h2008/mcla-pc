@@ -1018,6 +1018,83 @@ static constexpr uint32_t kUiXsfHoldMaxRun = 24u;
 // state must be RESPECTED, not cleared -- which, with F-342 (it cannot be isolated),
 // leaves only task #15.
 static constexpr bool kUiXsfClearResumeEvery = false;
+
+// F-393: stop hijacking a stream the host has no content for.
+//
+// `sub_821BC140`'s descriptor loop is readable in generated/ppc_xenon/
+// ppc_recomp.14.cpp:19042-19170 (offsets verified against the observed
+// `lr=821BC380`):
+//   loc_821BC2D4:  if ([st+0] /*inLeft*/ != 0) goto loc_821BC374;   // else: READ
+//   loc_821BC2F0:  while ([0x827D74E0] /*credits*/ <= 0) Sleep(100);
+//   loc_821BC310:  vtable([r3+0])[28](...)      // the title's own async read
+//   loc_821BC374:  sub_821D5E10(); sub_82130000();  // inflate, then a bare blr
+//                  if ([st+16] /*outLeft*/ != 0) goto loc_821BC2D4;
+// So the ONLY exits from the inflate leg are inLeft==0 (send it reading) and
+// outLeft==0 (slot full). `sub_82130000` is `blr` (ppc_recomp.0.cpp:4-8), so the
+// inflate step alone must move one of those two fields.
+//
+// w406 measured the trap: the host refill fires exactly at inLeft==0 -- the one
+// state in which the guest was about to take its own read -- writes
+// st+0=32768/st+4=hsBuf (gpu_device.cpp:11473-11474) and diverts the loop into
+// the inflate leg. If those bytes are a package the guest cannot start (an RSC5
+// head with a stale st+8/st+12 pair, which `sub_821D5E10` refuses to re-parse
+// while consumed!=0 -- F-328), the codec returns S_OK having produced 0 and the
+// title spins: INFLATE-ENTER serial 6,747,400 in 50 s on one tid, one record
+// (st=006D8F20), one frozen state (in=32768 out=16384 consumed=6771826
+// exp=0000097D). 24 of the boot's 25 serves handed consecutive 4 KB filler
+// packages (off=01284000..01295000, all pkgSz=00001000) to readlist slots whose
+// PSTREAM sizes are 0x20000/0x4000 -- packages `AssignPackageForDest` invented
+// for them, not content the title asked for. Only 0x64980000 (pkgSz=0x10C449 =
+// the garage's exact compressed length) and 0x6496F000 are real UI .xsf.
+//
+// With this ON, a dest whose assigned package is not a UI .xsf container gets
+// NO host record write at all: the guest takes its own read path with credits=1
+// (INFLATE-PENDING prints credits=00000001 on all 23 firings). OFF == w406
+// byte-for-byte. Census marker: F393-SERVE-SKIP.
+//
+// MEASURED w407 (21:16, 714,520 lines) -- **the spin is ours and it breaks, but
+// the serve is load-bearing, so this is REJECTED.** 484 skips, and:
+//   INFLATE-ENTER max serial 6,747,400 -> 231,518 (29x) and the frozen state
+//   changed from `in=32768 consumed=6771826 exp=97D` to `in=0 consumed=262144
+//   exp=0` on 231,508 of them -- so the guest did take its own read path and
+//   filled one 0x40000 slot, then re-entered the inflate step with no input;
+//   READWRAP 1,742 -> 463,018 confirms it is reading for itself at scale.
+//   The cost: INFLATE-HOSTSERVE-PEND 25 -> 0 (every serve, the real containers
+//   included -- `inLeft==0` is shared state on the one record), LZX-FRAME
+//   2,321 -> 22, JOIN 33,942 -> 1,176, PATHB-HOSTDECODE 9 -> 1, and the
+//   garage's durable coverage 917,504 -> 143,069 of 1,066,057. `C0000005`
+//   0 -> 3 (host rvas 0x208E28/0x216107, guest=0 wild=0). `nGfx=` disappeared
+//   (0 rows vs 6): the boot never reached W34-GFX-CENSUS.
+// What this rules out: "stop serving and let the title read" is not a fix on
+// its own -- with the shared `st` record, the serve cannot be removed per-dest
+// without removing it from the containers too. The remaining form of that idea
+// is task #15 (give each stream its own record), not a gate on this one.
+static constexpr bool kF393NoHijackNonUi = false;
+
+// F-406: the CORRECTED form of the gate above, which F-393 measured and rejected for the wrong
+// reason. F-393 keyed its decision on `IsUiXsfPkg(AssignPackageForDest(outPtr))`, and that is false
+// for the garage's own dest -- so `w407` lost ALL 25 serves (`INFLATE-HOSTSERVE-PEND` 25 -> 0) and
+// durable garage bytes fell 917,504 -> 143,069. The predicate this block itself uses is the
+// stream-owned package (`sPkg`, computed from `MclaUiXsfStreamPkg(st, outPtr)`), and `w406` shows it
+// non-zero for the real containers (`pkg=64980000 pkgSz=0010C449` = the garage's exact compressed
+// length). Skipping only the dests with NO stream-owned package removes precisely the fabricated
+// 0x1284000..0x1295000 4 KiB filler windows -- the ones F-393 proved lock `sub_821BC140`'s loop
+// (INFLATE-ENTER serial 6,747,400 -> 231,518) -- while leaving container serving untouched.
+// Acceptance is NOT "the spin stops": it is a FOURTH `BC140-REC` row carrying the garage package.
+// `w406`/`w415`/`w417` all show exactly 3 records for the whole boot (pkgs 6496F000, 64CA3000,
+// 64CB0000) and never 64980000 -- that missing request is F-186's enqueue gap in its measured form.
+static constexpr bool kF406SkipFabricatedServe = true;
+
+// F-434: break the one guest loop that has NO exit for a non-UI stream. `sub_821BC140`'s place pass
+// (`sub_821D5E10`) is the only thing that can clear the `outLeft` the loop tests, and both existing
+// drains in it (INFLATE-UNSTUCK, INFLATE-J2-CONT) require `produced > 0` and/or a UI/job2 dest.
+// With F-433 removing the store storm, `w431` ends with the boot's last live thread burning 23.1 M
+// iterations of exactly that shape on `PSTREAM #5` (dest B7B01000, inLeft 20, outLeft 524288,
+// produced 0, consumed FROZEN at 32748, junk magic). ON = after 64 consecutive no-progress
+// sightings of the same (st, consumed), write the caller loop's own stream-complete key
+// (`[st+0]=0`, `[st+16]=0`), which is mechanically what UNSTUCK already does for UI dests.
+// OFF = `w431` exactly. This is a mitigation for a guest infinite loop, not a decompression fix.
+static constexpr bool kF434BreakNoProgressSpin = true;
 static std::mutex g_uiXsfPrivMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPrivCtx;  // st -> private ctx
 // F-339: the publish/restore pair. g_uiXsfSharedCtx is the value the slot held
@@ -2044,6 +2121,13 @@ PPC_FUNC_IMPL(__imp__sub_821873E8);
 static void LogFabricatedShader(const char *tag, uint32_t obj);  // defined at the MSGCHAIN block
 static std::atomic<uint32_t> s_821873E8_hits{0};
 static std::atomic<uint32_t> s_821873E8_live{0};  // F-358 alive-path census
+// RUN AND ANSWERED (F-371, `build/w377.log`): with this true the gate DID dispatch
+// (`FIX-821873E8 dispatching BOOT-GATE` → `BOOT-GATE-ENTER 82131008` → `W35-BOOT-GATE #1`), it never
+// returned (`BOOT-GATE-RETURN` 0), and **`nGfx` stayed 0 in all 6 `W34-GFX-CENSUS` rows** — so
+// dispatching the UILOAD callback is not what initialises GFx. Back to false, and it must stay
+// false: while it is true, `W35-BOOT-GATE` is our own line and proves nothing about the guest
+// reaching 0x821315F4. Re-arm only to re-test that negative.
+constexpr bool kF368HostDispatchGate = false;
 PPC_FUNC(sub_821873E8) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t n = s_821873E8_hits.fetch_add(1) + 1;
@@ -2056,60 +2140,14 @@ PPC_FUNC(sub_821873E8) {
   if (tlsOk)
     (void)mem.ReadU32BE(tlsTable + 12, &slot12);
 
-  const bool slotLive = slot12 != 0 && slot12 != 0xCDCDCDCDu;
-  if (tlsOk && slotLive) {
-    // F-358: the ONLY other exit in this hook is the TLSDEAD branch below, whose
-    // printers (`FIX-821873E8`, cap `n<=4 || n%200`) are 0 in w351/w354/w355/w356 --
-    // so either this hook never fires or it always returns here, and that difference
-    // decides whether the boot-gate dispatch at :2100 is dormant or unreachable.
-    // Uncapped-first-8: a count <=8 is complete.
-    const uint32_t nl = s_821873E8_live.fetch_add(1) + 1;
-    if (nl <= 8 || (nl % 500) == 0)
-      MCLA_LOG_WARN("F358-821873E8-ALIVE #{} of {} hits r13={:08X} tlsTable={:08X} "
-                    "slot12={:08X} lr={:08X}",
-                    nl, n, ctx.r13.u32, tlsTable, slot12,
-                    static_cast<uint32_t>(ctx.lr));
-    __imp__sub_821873E8(ctx, base);
-    return;
-  }
-
-  if (n <= 4 || (n % 200) == 0)
-    MCLA_LOG_WARN("FIX-821873E8 #{} TLSDEAD r13={:08X} tlsTable={:08X} "
-                  "slot12={:08X} lr={:08X} - host-complete alloc72 + chain init",
-                  n, ctx.r13.u32, tlsTable, slot12,
-                  static_cast<uint32_t>(ctx.lr));
-
-// Per-TLS-table chain init (global-once starved thread 2+; heal each dead table).
-  if (tlsOk && (slot12 == 0 || slot12 == 0xCDCDCDCDu)) {
-    static std::mutex s_tlsChainMtx;
-    static std::unordered_set<uint32_t> s_tlsChainDone;
-    std::lock_guard<std::mutex> lk(s_tlsChainMtx);
-    uint32_t cur = 0;
-    (void)mem.ReadU32BE(tlsTable + 12, &cur);
-    if ((cur == 0 || cur == 0xCDCDCDCDu) && s_tlsChainDone.find(tlsTable) == s_tlsChainDone.end()) {
-      MCLA_LOG_WARN("FIX-821873E8 initializing TLS chain for tlsTable={:08X}", tlsTable);
-      uint32_t allocatorObj = mem.Alloc(16, 16);
-      uint32_t vtable = mem.Alloc(16, 16);
-      if (allocatorObj != 0 && vtable != 0) {
-        for (uint32_t o = 0; o < 16; o += 4) {
-          (void)mem.WriteU32BE(vtable + o, 0);
-          (void)mem.WriteU32BE(allocatorObj + o, 0);
-        }
-        (void)mem.WriteU32BE(vtable + 8, 0x82130528); // __xtl_alloc
-        (void)mem.WriteU32BE(allocatorObj + 0, vtable);
-        (void)mem.WriteU32BE(tlsTable + 12, allocatorObj);
-      }
-      s_tlsChainDone.insert(tlsTable);
-    }
-  }
-
-  // After chain init, dispatch the REAL boot-gate (sub_82131008) on this thread.
-  // It performs init + event-gate checks and calls UILOAD itself at guest
-  // 0x821310B0 with the correct r3=[0x82830998]. Calling UILOAD directly
-  // (prior rev) bypassed the gates. Per W36 note, preset [0x8212E6F0]=1 to
-  // skip the 823043F8/4348 crash path.
-  static std::atomic<uint32_t> s_uiLoadCalled{0};
-  if (s_uiLoadCalled.fetch_add(1) == 0) {
+  // F-368 (user-approved 2026-09-26): what used to be an `if` inside the TLSDEAD branch only.
+  // Making it callable lets the ALIVE path reach it too, which is the point of the experiment:
+  // F-367 showed nothing in the image can reach the guest's own registration of sub_82131008,
+  // so the only way to test whether that callback leads to GFx is to dispatch it ourselves.
+  // It stays seed-free (T38.3f) -- flags are read, never written -- and runs at most once.
+  auto dispatchBootGateOnce = [&] {
+    static std::atomic<uint32_t> s_uiLoadCalled{0};
+    if (s_uiLoadCalled.fetch_add(1) != 0) return;
     // T41.3 / w38o: this stand-in used to run INLINE, i.e. the host forced
     // sub_82131008 re-entrantly from inside the guest's own allocator hook, on the
     // thread that was mid-way through sub_823047D8 (w38o.log:3866 -> :3868 -> :3869
@@ -2280,7 +2318,63 @@ PPC_FUNC(sub_821873E8) {
       (void)mem;
     }
     }).detach();
+  };
+
+  const bool slotLive = slot12 != 0 && slot12 != 0xCDCDCDCDu;
+  if (tlsOk && slotLive) {
+    // F-358: the ONLY other exit in this hook is the TLSDEAD branch below, whose
+    // printers (`FIX-821873E8`, cap `n<=4 || n%200`) are 0 in w351/w354/w355/w356 --
+    // so either this hook never fires or it always returns here, and that difference
+    // decides whether the boot-gate dispatch at :2100 is dormant or unreachable.
+    // Uncapped-first-8: a count <=8 is complete.
+    const uint32_t nl = s_821873E8_live.fetch_add(1) + 1;
+    if (nl <= 8 || (nl % 500) == 0)
+      MCLA_LOG_WARN("F358-821873E8-ALIVE #{} of {} hits r13={:08X} tlsTable={:08X} "
+                    "slot12={:08X} lr={:08X}",
+                    nl, n, ctx.r13.u32, tlsTable, slot12,
+                    static_cast<uint32_t>(ctx.lr));
+    // F-368: with the flag on, dispatch the gate from here too (user-approved test).
+    if (kF368HostDispatchGate) dispatchBootGateOnce();
+    __imp__sub_821873E8(ctx, base);
+    return;
   }
+
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("FIX-821873E8 #{} TLSDEAD r13={:08X} tlsTable={:08X} "
+                  "slot12={:08X} lr={:08X} - host-complete alloc72 + chain init",
+                  n, ctx.r13.u32, tlsTable, slot12,
+                  static_cast<uint32_t>(ctx.lr));
+
+// Per-TLS-table chain init (global-once starved thread 2+; heal each dead table).
+  if (tlsOk && (slot12 == 0 || slot12 == 0xCDCDCDCDu)) {
+    static std::mutex s_tlsChainMtx;
+    static std::unordered_set<uint32_t> s_tlsChainDone;
+    std::lock_guard<std::mutex> lk(s_tlsChainMtx);
+    uint32_t cur = 0;
+    (void)mem.ReadU32BE(tlsTable + 12, &cur);
+    if ((cur == 0 || cur == 0xCDCDCDCDu) && s_tlsChainDone.find(tlsTable) == s_tlsChainDone.end()) {
+      MCLA_LOG_WARN("FIX-821873E8 initializing TLS chain for tlsTable={:08X}", tlsTable);
+      uint32_t allocatorObj = mem.Alloc(16, 16);
+      uint32_t vtable = mem.Alloc(16, 16);
+      if (allocatorObj != 0 && vtable != 0) {
+        for (uint32_t o = 0; o < 16; o += 4) {
+          (void)mem.WriteU32BE(vtable + o, 0);
+          (void)mem.WriteU32BE(allocatorObj + o, 0);
+        }
+        (void)mem.WriteU32BE(vtable + 8, 0x82130528); // __xtl_alloc
+        (void)mem.WriteU32BE(allocatorObj + 0, vtable);
+        (void)mem.WriteU32BE(tlsTable + 12, allocatorObj);
+      }
+      s_tlsChainDone.insert(tlsTable);
+    }
+  }
+
+  // After chain init, dispatch the REAL boot-gate (sub_82131008) on this thread.
+  // It performs init + event-gate checks and calls UILOAD itself at guest
+  // 0x821310B0 with the correct r3=[0x82830998]. Calling UILOAD directly
+  // (prior rev) bypassed the gates. Per W36 note, preset [0x8212E6F0]=1 to
+  // skip the 823043F8/4348 crash path.
+  dispatchBootGateOnce();  // TLSDEAD path: same behaviour as before F-368
 
   uint32_t obj = mem.Alloc(72, 16);
   if (obj == 0) {
@@ -3405,14 +3499,19 @@ PPC_FUNC(sub_8244FF20) {
         (static_cast<uint64_t>(src >> 16) << 32) | srcSz;
     std::lock_guard<std::mutex> lk(s_t413n2Mtx);
     if (s_seen.size() < 64 && s_seen.insert(key).second)
-      MCLA_LOG_WARN("T413N2-XMEM #{} src={:08X} srcSz={} dest={:08X} "
-                    "destSz={} ret={:08X} lr={:08X}",
-                    n, src, srcSz, dest, destSz, ret, lr);
+      // F-385 INSTRUMENT FIX, and a trap this repo already documented (F-231): `srcSz`/`destSz` are
+      // the guest's POINTER arguments (adjacent stack slots -- which is why every row looked like
+      // `destSz = srcSz + 4`), not lengths. Today I read a 6.85 MB / 519 MB "inflate request" out of
+      // them and built a task on it. Print the pointed-to values alongside so the shape cannot be
+      // misread again.
+      MCLA_LOG_WARN("T413N2-XMEM #{} src={:08X} srcSzPtr={:08X} srcLen={} dest={:08X} "
+                    "destSzPtr={:08X} destLen={} ret={:08X} lr={:08X}",
+                    n, src, srcSz, realSrcSz, dest, destSz, realDestSz, ret, lr);
   }
   if (n <= 16 || (n % 100) == 0) {
-    MCLA_LOG_INFO("XMEM #{} ctx={:08X} dest={:08X} destSz={} src={:08X} "
-                  "srcSz={} ret={:08X} lr={:08X}",
-                  n, ctxp, dest, destSz, src, srcSz, ret,
+    MCLA_LOG_INFO("XMEM #{} ctx={:08X} dest={:08X} destLen={} src={:08X} "
+                  "srcLen={} ret={:08X} lr={:08X}",
+                  n, ctxp, dest, realDestSz, src, realSrcSz, ret,
                   static_cast<uint32_t>(ctx.lr));
   }
   if (n <= 6 && ret == 0 && dest != 0) {
@@ -4372,6 +4471,25 @@ PPC_FUNC(sub_82460270) {
   __imp__sub_82460270(ctx, base);
 }
 
+// F-370: census for semaphores created WITH PERMITS (initial count != 0), i.e. job/concurrency
+// limiters rather than pure signals. A WAIT on one of these that prints no matching RETURNED row
+// means work was handed out and never came back -- which is what parks the boot worker on
+// C501FC00 (init=31) after F-369 removed the fatal. Rows are WAIT / RETURNED / RELEASE so the
+// per-handle balance is readable straight from the log; the print budget is PER HANDLE
+// (CountingSemaAllow) because in w374 one busy limiter took 83 of 84 rows and starved the handle
+// that mattered out of the cap entirely.
+static void F370SemaRow(const char *op, uint32_t handle, uint32_t extra, uint32_t lr) {
+  uint32_t init = 0;
+  if (!mcla::boot::IsCountingSema(handle, &init))
+    return;
+  if (!mcla::boot::CountingSemaAllow(handle))
+    return;
+  static std::atomic<uint32_t> s_rows{0};
+  const uint32_t k = s_rows.fetch_add(1) + 1;
+  MCLA_LOG_WARN("F370-SEMA #{} {} h={:08X} init={} x={:08X} tid={:08X} lr={:08X}", k, op, handle,
+                init, extra, GetCurrentThreadId(), lr);
+}
+
 // ---------------------------------------------------------------------------
 // WAIT-HELPER census: sub_82135DC0(handle=r3, timeoutMs=r4, alertable=r5)
 // wraps NtWaitForSingleObjectEx in a retry-on-timeout loop
@@ -4393,7 +4511,10 @@ PPC_FUNC(sub_82135DC0) {
   if ((finite && n <= 400) || n <= 12 || (n % 1000) == 0)
     MCLA_LOG_INFO("WAITHELP sub_82135DC0 #{} h={:08X} t={} al={} lr={:08X}", n,
                   handle, timeoutArg, alertable, ctx.lr);
+  const uint32_t lrIn370 = static_cast<uint32_t>(ctx.lr);
+  F370SemaRow("WAIT", handle, timeoutArg, lrIn370);
   __imp__sub_82135DC0(ctx, base);
+  F370SemaRow("RETURNED", handle, ctx.r3.u32, lrIn370);
   const uint32_t d = s_h135DC0done.fetch_add(1) + 1;
   if (d <= 12 || (d % 1000) == 0)
     MCLA_LOG_INFO("WAITHELP RETURNED #{} r3={:08X} (257=timeout)", d,
@@ -4407,10 +4528,14 @@ PPC_FUNC_IMPL(__imp__sub_82135DB8);
 static std::atomic<uint32_t> s_h135DB8{0};
 PPC_FUNC(sub_82135DB8) {
   const uint32_t n = s_h135DB8.fetch_add(1) + 1;
+  const uint32_t lrIn370 = static_cast<uint32_t>(ctx.lr);
   if (n <= 24 || (n % 1000) == 0)
     MCLA_LOG_INFO("WAITB8 sub_82135DB8 #{} h={:08X} t={} lr={:08X}", n,
                   ctx.r3.u32, ctx.r4.u32, ctx.lr);
+  const uint32_t h370 = ctx.r3.u32;
+  F370SemaRow("WAIT-B8", h370, ctx.r4.u32, lrIn370);
   __imp__sub_82135DB8(ctx, base);
+  F370SemaRow("RETURNED-B8", h370, ctx.r3.u32, lrIn370);
 }
 
 // Sync-wait utility (TU17:10837): wait INFINITE non-alertable on r3, return
@@ -5405,6 +5530,32 @@ static uint32_t MclaXcDecodeGuestFrames(auto &mem, uint32_t pkgBounce,
   return produced;
 }
 
+// F-384: the guest's XMem state block holds TWO BASE POINTERS inside the range our soft-reset wiped.
+// sub_82461010 (reached from here through sub_8244FF20 -> sub_82460420) forms its copies as
+//     add r4,[ctx+20+12264],[ctx+20+12268]   (src base + offset)
+//     add r3,[ctx+20+12276],[ctx+20+12280]   (dst base + offset)
+// and only ever rewrites the OFFSETS (stw to 12268/12272/12280) -- nothing in the decode chain puts
+// the bases back. Zeroing them therefore sent every produced copy to 0 + offset, i.e. into the first
+// 128 KiB of the guest address space: F382-MEMCPY measured dst=00000000 len=0x1612 then dst=00001612,
+// and F383 proved the writer is the guest memcpy sub_823DA950 reached through that chain. Two results,
+// both ours: Path A's output never reached its destination buffer, and the advancing cursor walked
+// over the HOST user-heap o1heap header bound at guest 0x20000 (src/kernel/heap.cpp:213), which is
+// what made Heap::Alloc refuse every request and lose the 0x40e90 thread-#16 context (F-370).
+// Reset the offsets; preserve the bases.
+template <typename Mem>
+static void MclaXcSoftResetStream(Mem &mem, uint32_t ctx) {
+  uint32_t srcBase = 0, dstBase = 0;
+  (void)mem.ReadU32BE(ctx + 20u + 12264u, &srcBase);
+  (void)mem.ReadU32BE(ctx + 20u + 12276u, &dstBase);
+  for (uint32_t off = 12264u; off <= 12304u; off += 4)
+    (void)mem.WriteU32BE(ctx + 20u + off, 0);
+  if (srcBase != 0)
+    (void)mem.WriteU32BE(ctx + 20u + 12264u, srcBase);
+  if (dstBase != 0)
+    (void)mem.WriteU32BE(ctx + 20u + 12276u, dstBase);
+  (void)mem.WriteU32BE(ctx + 4u, 1);
+}
+
 // Full-stream XMem via a FRESH ctx (package payload at +20).
 static uint32_t MclaXcDecodeFullStream(auto &mem, uint32_t pkgBounce,
                                        uint32_t pkgSz, uint32_t dest,
@@ -5487,9 +5638,32 @@ static uint32_t MclaXcDecodeFullStream(auto &mem, uint32_t pkgBounce,
   const bool warm = (ctx != 0 && ctx != 0xCDCDCDCDu &&
                      ctx != 0xFFFFFFFFu);
   if (warm) {
-    // Soft-reset pending stream fields (r31=ctx+20 → offsets 12264+).
-    for (uint32_t off = 12264u; off <= 12304u; off += 4)
-      (void)mem.WriteU32BE(ctx + 20u + off, 0);
+    // F-380: the guest's own state block in this range is a base POINTER plus a cursor, not a pair
+    // of counters. sub_82461010 (reached from here through sub_8244FF20 -> sub_82460420) does
+    //   addi r31,r3,20 / lwz r27,12276(r31) / lbz r11,0(r27) / lwz r29,12280(r31)
+    //   add r3,r29,r27   / bl 823DA950 (memcpy)
+    // i.e. memcpy dst = [ctx+20+12276] + [ctx+20+12280]. Zeroing 12276 therefore sends the decoder's
+    // produced bytes to 0 + cursor -- which is precisely the burst F-374's guard page caught at guest
+    // 0x20000 (F-379's host backtrace names this function as that writer's ancestor, and the same
+    // burst is what killed the user-heap header and thread #16 in F-370). Print the fields on both
+    // sides of the reset so base-vs-cursor is read off the log rather than inferred.
+    static std::atomic<uint32_t> s_380pre{0};
+    const uint32_t k380 = s_380pre.fetch_add(1) + 1;
+    uint32_t pre[11] = {0};
+    uint32_t post[11] = {0};
+    for (uint32_t i = 0; i < 11; ++i)
+      (void)mem.ReadU32BE(ctx + 20u + 12264u + i * 4u, &pre[i]);
+    // Soft-reset pending stream offsets, preserving the two base pointers (F-384).
+    MclaXcSoftResetStream(mem, ctx);
+    for (uint32_t i = 0; i < 11; ++i)
+      (void)mem.ReadU32BE(ctx + 20u + 12264u + i * 4u, &post[i]);
+    if (k380 <= 3)
+      MCLA_LOG_WARN("F380-XCRESET #{} ctx={:08X} dest={:08X} pkg={:08X} pre=[{:08X} {:08X} {:08X} "
+                    "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] post=[{:08X} {:08X} "
+                    "{:08X} {:08X} {:08X}]",
+                    k380, ctx, dest, pkgBounce, pre[0], pre[1], pre[2], pre[3], pre[4], pre[5],
+                    pre[6], pre[7], pre[8], pre[9], pre[10], post[0], post[1], post[2], post[3],
+                    post[4]);
     (void)mem.WriteU32BE(ctx + 4u, 1);
     // Keep inflater-linked window if present at inflater+4.
     const uint32_t inf = s_guestInflaterR3.load();
@@ -5557,6 +5731,18 @@ static uint32_t MclaXcDecodeFullStream(auto &mem, uint32_t pkgBounce,
                     srcBase + srcAdv, destRoom, ret, dSz, sSz, consumed,
                     dh[0], dh[1], dh[2], dh[3]);
     }
+    // F-380: the state exactly as the guest left it, BEFORE the between-window reset below wipes
+    // it. The (12276,12280) pair is the base+cursor the decoder adds to form its memcpy destination,
+    // so this is what says whether the produced bytes went to dest or to 0+cursor.
+    if (call < 6) {
+      uint32_t st[6] = {0};
+      for (uint32_t i = 0; i < 6; ++i)
+        (void)mem.ReadU32BE(ctx + 20u + 12264u + i * 4u, &st[i]);
+      MCLA_LOG_WARN("F380-XCPOST #{} ctx={:08X} dstArg={:08X} dSz={} produced={} st=[{:08X} {:08X} "
+                    "{:08X} {:08X} {:08X} {:08X}]",
+                    call, ctx, dest + producedTotal, dSz, producedTotal, st[0], st[1], st[2], st[3],
+                    st[4], st[5]);
+    }
     if (dSz > 0 && dSz <= destRoom) {
       producedTotal += dSz;
     } else if (dSz > destRoom) {
@@ -5567,13 +5753,11 @@ static uint32_t MclaXcDecodeFullStream(auto &mem, uint32_t pkgBounce,
     srcAdv += consumed ? consumed : (dSz ? 4u : 0u);
     if (srcAdv >= srcN)
       break;
-    // Soft-reset pending stream between windows so the next call starts
-    // a fresh block boundary rather than a dirty continuation.
-    if (warm) {
-      for (uint32_t off = 12264u; off <= 12304u; off += 4)
-        (void)mem.WriteU32BE(ctx + 20u + off, 0);
-      (void)mem.WriteU32BE(ctx + 4u, 1);
-    }
+    // Soft-reset pending stream offsets between windows so the next call starts a fresh block
+    // boundary rather than a dirty continuation -- and preserve the base pointers while doing it
+    // (F-384: wiping [12264]/[12276] is what redirected the decode output into guest VA 0).
+    if (warm)
+      MclaXcSoftResetStream(mem, ctx);
   }
   uint32_t dh[8] = {0};
   for (int k = 0; k < 8; ++k)
@@ -9074,6 +9258,43 @@ static constexpr bool kUiXsfFillDryRun = false;
 // to the golden bytes. `false` == w342 behaviour.
 static constexpr bool kUiXsfFillOwnSlots = true;
 
+// F-427 (T41.85): start the fill run at the anchor's JOB head rather than at the
+// anchor slot itself. Measured on w426: the garage's anchor job carries 9 slots /
+// 1,179,648 B (more than its 1,066,057 B body) while the `seq >= anchor.seq` filter
+// cut the tail to 917,504 B -- 148,553 B short, i.e. exactly the coverage clause (a)
+// has been missing since F-322. `false` == the w426 rule byte-for-byte.
+// Read the plan comment at the use site for the three falsifiers; the sharp one is
+// that this mapping cannot be validated by our own audit alone (the audit computes
+// `matchA` against the offsets this same plan chose), so the gate is the OTHER three
+// containers keeping `pct=100` plus no `CLAIMED_OTHER_UNVERIFIED` from F409.
+//
+// MEASURED w428 (flag ON): it WORKED on its own terms -- `UIXSF-GOLDEN-REVERIFY
+// pkg=64980000 goldsize=1066057 claimed=1066057 still_present=1066057 pct=100
+// first_bad=FFFFFFFF`, the first time in this project that a container is 100 %
+// present and byte-exact, with `F409-FILL-GUARD` silent (0 refusals) and
+// `BC140-REC` 5 / `LISTLINE` 171 unchanged -- **and the process then EXITED about
+// 32 s into the soak (BOOT_RC=1 where every prior soak of this tree returns 124
+// because `timeout` has to kill it).** So the pre-anchor slot is live memory that
+// the F-350 own-slot bypass is not entitled to overwrite: the `continue` at the
+// claim check protects other UI .xsf packages only, and `kUiXsfFillOwnSlots` then
+// waves through anything "not already golden". OFF until that is fixed; the
+// refinement is to extend to pre-anchor slots ONLY when they are genuinely
+// untouched (no own-slot bypass on that leg) -- F-429.
+//
+// BOTH VARIANTS CRASHED, so the rule is REJECTED and the flag stays false:
+//   w428 (bypass allowed) -- garage reached `claimed=1066057 still_present=1066057
+//        pct=100 first_bad=FFFFFFFF` (the first 100 % container in this project's
+//        history) and the process exited ~32 s into the soak, BOOT_RC=1.
+//   w429 (bypass forbidden for pre-anchor slots, F-429) -- exited within ~1 s with
+//        775 log lines, `LISTLINE` 0 and `BC140-REC` 0, i.e. it died long before the
+//        VFS/streamer stage at all, parked in the boot init (`lr=821E0FF8`).
+// Reading: the garage's deficit is exactly the 262,144 B slot the `seq >=` filter
+// drops, but writing that slot -- with or without the guard -- destabilises the boot,
+// so it is NOT spare capacity belonging to this container. Host-side placement of the
+// last 14 % is therefore falsified, and clause (a) needs the guest to allocate MORE
+// destinations, which is task #15 and nothing else. `false` == the w426 rule.
+static constexpr bool kF427JobHeadAnchor = false;
+
 // F-352: every coverage number this project has printed for the garage rests on
 // an UNTESTED assumption: that the container's bytes continue into the next
 // readlist slot (F-327 chose "list order" because vbase arithmetic dead-ended at
@@ -9236,8 +9457,23 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
     // failure mode, so it is out; the spill stays in only where the guest asked
     // for the dest itself, which is the F-350 chunked path.
     std::vector<size_t> ord;
+    // F-427 (T41.85): w426 measured the ceiling exactly. The garage's anchor job
+    // (job 1) holds 9 slots totalling 1,179,648 B -- MORE than the 1,066,057 B body --
+    // but the plan starts at the anchor's own `seq` (measured 1), so it drops the job's
+    // `seq=0` slot of 262,144 B and `tail` becomes 917,504 B: a 148,553 B deficit, which
+    // IS clause (a)'s missing 14 %. The read-list of one job is a run of ascending
+    // `vbase` slots (F-320: `vbase(k+1)==vbase(k)+size(k)`), so a load whose body is
+    // 1,066,057 B spans the job from its FIRST slot, and the anchor landing on seq=1
+    // most likely means the guest's own decode of seq=0 failed -- the very thing Path A
+    // exists to repair. Anchor the run at the job head instead. FALSIFIERS, all checked
+    // below: (1) any slot claimed by another UI .xsf package is skipped as before, so a
+    // foreign container cannot be clobbered; (2) `F409-FILL-GUARD` still prints the
+    // reason for every refusal; (3) the pass gate requires the other three containers to
+    // keep `pct=100` and `claimed=1066057` for the garage in 3/3 soaks.
+    const bool jobHeadAnchor = kF427JobHeadAnchor;
     for (size_t i = 0; i < slots.size(); ++i)
-      if (slots[i].job == slots[ai].job && slots[i].seq >= slots[ai].seq)
+      if (slots[i].job == slots[ai].job &&
+          (jobHeadAnchor || slots[i].seq >= slots[ai].seq))
         ord.push_back(i);
     std::sort(ord.begin(), ord.end(), [&](size_t a2, size_t b2) {
       return slots[a2].seq < slots[b2].seq;
@@ -9271,6 +9507,52 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
     }
   }
   uint32_t slotsWritten = 0, bytesWritten = 0, skipped = 0;
+  // F-412 (T41.85 step 1, log-only): the rule above is NOT "one contiguous run" --
+  // it is every slot of the ANCHOR's own job at or after the anchor's seq. So the
+  // coverage ceiling is set by which job the anchor lands in (w420 anchored on
+  // B7EC1000 and six slots of 0x20000/0x40000 held all 1,066,057; w421/w423
+  // anchored inside a job of 0x20000 slots and stopped at 851,968/917,504).
+  // Before changing any selection, measure the CANDIDATES: per distinct job among
+  // this package's slots, how many slots, what total capacity, how much of the
+  // golden body it could carry, and who claims them. If some job the guest itself
+  // gave this container can hold the whole thing, picking it is a fix; if none can,
+  // T41.85 is a guess and F-351/F-308 is where guesses like that end up.
+  {
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> capByJob;  // job -> (slots, bytes)
+    for (const auto &S : slots) {
+      auto &e = capByJob[S.job];
+      e.first++;
+      e.second += S.size;
+    }
+    const uint32_t anchorJob = slots[ai].job;
+    const uint32_t anchorSeq = slots[ai].seq;
+    for (const auto &kv : capByJob) {
+      const uint32_t job = kv.first, nSlots = kv.second.first, bytes = kv.second.second;
+      // The plan only ever uses this job's slots at or after the ANCHOR's seq, so
+      // the number that decides clause (a)'s ceiling is not `capacity` but the
+      // capacity of that tail. w425: job 1 has 9 slots / 1,179,648 B for the
+      // garage while the claim stopped at 917,504 -- a 262,144 B deficit that is
+      // exactly the slots the `seq >=` filter drops. Print both, plus the seq
+      // bounds, so the "wrap inside one job" question is decided on numbers rather
+      // than on a placement guess (F-352's warning, F-308's failure mode).
+      uint32_t tail = 0, firstSeq = 0xFFFFFFFFu, lastSeq = 0;
+      for (const auto &S : slots) {
+        if (S.job != job)
+          continue;
+        if (S.seq < firstSeq)
+          firstSeq = S.seq;
+        if (S.seq > lastSeq)
+          lastSeq = S.seq;
+        if (job == anchorJob ? (S.seq >= anchorSeq) : true)
+          tail += S.size;
+      }
+      MCLA_LOG_WARN("F412-JOBCAP pkg={:08X} shot={} job={:08X} slots={} capacity={} tail={} "
+                    "seqRange={}-{} anchorSeq={} gold={} isAnchor={} tailCovers={}",
+                    pkg, shot, job, nSlots, bytes, tail, firstSeq, lastSeq, anchorSeq,
+                    static_cast<uint32_t>(gold.size()), job == anchorJob ? 1 : 0,
+                    tail >= static_cast<uint32_t>(gold.size()) ? 1 : 0);
+    }
+  }
   uint32_t covLo = 0xFFFFFFFFu, covHi = 0;
   for (const auto &pr : plan) {
     const size_t i = pr.first;
@@ -9291,13 +9573,28 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
       // sequence at or after the anchor's — true by how `ord` was built), the slot
       // is not claimed as some other package's completed dest, and what is there
       // now is not already the golden bytes (so a correct slot is never touched).
+      // F-429: the F-350 own-slot bypass is justified for slots AT OR AFTER the
+      // anchor -- that is the container's own forward chain whose content is the
+      // guest's failed decode of these same bytes. It is NOT justified for a slot
+      // BEFORE the anchor: w428 proved that with the bypass the garage reached
+      // `pct=100 first_bad=FFFFFFFF` and the process then exited 32 s in, so the
+      // pre-anchor slot holds somebody's live data. Pre-anchor slots are therefore
+      // only ever used when `MclaSlotUntouched` already passed (i.e. this branch is
+      // not entered for them at all), which is the honest version of T41.85.
       bool own = false;
-      if (kUiXsfFillOwnSlots && listOrder) {
+      const bool preAnchor = slots[i].seq < slots[ai].seq;
+      if (kUiXsfFillOwnSlots && listOrder && !preAnchor) {
         bool claimedByOtherPkg = false;
+        uint32_t claimPkg = 0;
+        bool claimVerified = false;
         {
           std::lock_guard<std::mutex> elk(g_uiDecMtx);
           const auto it = g_uiDecExpect.find(S.pbase);
           claimedByOtherPkg = it != g_uiDecExpect.end() && it->second.pkg != pkg;
+          if (claimedByOtherPkg) {
+            claimPkg = it->second.pkg;
+            claimVerified = it->second.verified;
+          }
         }
         if (!claimedByOtherPkg) {
           auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
@@ -9321,10 +9618,30 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
           }
           own = !alreadyGolden;
         }
-        if (!own && (skipped <= 4u))
-          MCLA_LOG_WARN("UIXSF-GOLDEN-FILL-SKIP pkg={:08X} slot[{}]={:08X} "
-                        "goldoff={:08X} reason=PROTECTED(claimed_or_golden)",
-                        pkg, i, S.pbase, off);
+        // F-409 (T41.83): the old line merged three different refusals into one
+        // `PROTECTED(claimed_or_golden)` string, which is exactly the ambiguity that
+        // made F-408's "correct refusal vs fatal refusal" unanswerable. Split it, and
+        // carry the claimant's own state: `UiDecExpect::verified` (`src/gpu_device.cpp:358-363`)
+        // is set when that package's digest matched, so
+        //   CLAIMED_OTHER_VERIFIED   = the slot legitimately holds ANOTHER container's
+        //                              correct bytes -> our list-order plan mapped the
+        //                              garage onto it (F-352's models diverge here);
+        //   CLAIMED_OTHER_UNVERIFIED = a live conflict with an unfinished stream;
+        //   GOLDEN_ALREADY_PRESENT   = nothing to fix, the bytes are already right.
+        if (!own) {
+          static std::atomic<uint32_t> s_409{0};
+          const uint32_t k409 = s_409.fetch_add(1) + 1;
+          const char *why =
+              claimedByOtherPkg
+                  ? (claimVerified ? "CLAIMED_OTHER_VERIFIED"
+                                   : "CLAIMED_OTHER_UNVERIFIED")
+                  : "GOLDEN_ALREADY_PRESENT";
+          if (k409 <= 24 || (k409 % 64) == 0)
+            MCLA_LOG_WARN("F409-FILL-GUARD #{} pkg={:08X} slot[{}]={:08X} vbase={:08X} "
+                          "goldoff={:08X} size={} reason={} claimPkg={:08X} claimVerified={}",
+                          k409, pkg, i, S.pbase, S.vbase, off, S.size, why, claimPkg,
+                          claimVerified ? 1 : 0);
+        }
       }
       if (!own) {
         ++skipped;
@@ -10687,6 +11004,42 @@ PPC_FUNC(sub_821D5E10) {
         return;
       }
     }
+    // F-434: the SAME exit key, but for a stream that produces NOTHING. The block above needs
+    // `produced > 0`, and every existing drain (this one, INFLATE-J2-CONT below) is gated on a UI
+    // .xsf / job2 destination. `w431` ends with a single guest thread (tid 602C) spending all of
+    // the remaining 105 s of the boot on one non-UI stream: `INFLATE-ENTER st=006D8F20 in=20
+    // inPtr=D2AD5CEC consumed=32748 exp=00000000 ... outPtr=B7B01000 lr=821BC380`, 23,155,400
+    // entries, `INFLATE-OUTPTR ... produced=0 inLeft=20` and `magic=3B6426F9` (not an XCompress or
+    // RSC5 header). That dest is `PSTREAM #5 s[4]` of readlist `8284B37C` (BC140-REC #5, the
+    // pkg-`0x000A0000` meshtextures stream F-318 already named as the dominant shape of the w275
+    // loop), so no UI predicate can reach it. `sub_821BC140`'s inner loop cannot leave on its own:
+    // it tests the leftover at `[r1+96]` first and, while output is owed, branches straight to the
+    // place call and never issues the next read (`ppc_recomp.14.cpp:19040-19050`, `:19128-19170`) --
+    // placement needs input, and the input read is the thing being skipped.
+    // Predicate is deliberately narrower than "produced == 0": it requires `consumed` to be
+    // FROZEN, which no legitimately progressing stream can satisfy, so an XMem call that is merely
+    // mid-frame (consumed rising, inLeft cycling) never trips it.
+    if (kF434BreakNoProgressSpin && inLeft > 0 && inLeft < 256 && outLeft > 0 &&
+        produced == 0) {
+      static std::mutex s_f434Mtx;
+      static std::unordered_map<uint64_t, uint32_t> s_f434;
+      const uint64_t key =
+          (static_cast<uint64_t>(st) << 32) | consumed;
+      uint32_t &fc = [&]() -> uint32_t & {
+        std::lock_guard<std::mutex> lk(s_f434Mtx);
+        return s_f434[key];
+      }();
+      fc++;
+      if (fc >= 64) {
+        MCLA_LOG_WARN("F434-SPIN-BREAK #{} st={:08X} outPtr={:08X} inLeft={} outLeft={} "
+                      "consumed={} magic={:08X} — zero inLeft/outLeft (frozen, produced=0)",
+                      fc, st, outPtr, inLeft, outLeft, consumed, magic);
+        (void)mem.WriteU32BE(st + 0, 0);  // inLeft = 0
+        (void)mem.WriteU32BE(st + 16, 0); // outLeft = 0 — the caller loop's stream-complete key
+        fc = 0;
+        return;
+      }
+    }
   }
 
   // w23 lever (INFLATE-J2-CONT): job2 dest spinning on non-XC continuation
@@ -11005,7 +11358,28 @@ PPC_FUNC(sub_821D5E10) {
   // key (same path a descriptor with expected==0 takes); without it the
   // guest spins on the loop forever (INFLATE-EMPTY x1663).
   if (inLeft == 0) {
-    // Session 73: empty input â€” original code spun forever (INFLATE
+    // F-393: `inLeft == 0` is precisely the state in which `sub_821BC140` sends
+    // the stream to its OWN async read (ppc_recomp.14.cpp:19047 falls through to
+    // loc_821BC2F0/310). Handing such a record a package we invented hijacks it
+    // into the inflate leg instead, and if the guest cannot start that package
+    // the loop above has no exit -- see the flag's comment for the 6,747,400-entry
+    // measurement. Return untouched for every non-UI-.xsf dest, BEFORE the retry
+    // bookkeeping, so this host code is simply not present on those streams.
+    if (kF393NoHijackNonUi && outPtr != 0u && outLeft != 0u) {
+      const uint32_t assigned = AssignPackageForDest(outPtr);
+      if (assigned != 0u && !IsUiXsfPkg(assigned)) {
+        static std::atomic<uint32_t> s_393{0};
+        const uint32_t k = s_393.fetch_add(1) + 1;
+        if (k <= 32 || (k % 512) == 0)
+          MCLA_LOG_WARN("F393-SERVE-SKIP #{} st={:08X} outPtr={:08X} outLeft={} "
+                        "pkg={:08X} lr={:08X} tid={:08X} - not a UI .xsf "
+                        "package, leaving inLeft=0 for the guest's own read",
+                        k, st, outPtr, outLeft, assigned,
+                        static_cast<uint32_t>(ctx.lr), GetCurrentThreadId());
+        return;
+      }
+    }
+    // Session 73: empty input — original code spun forever (INFLATE
     // x286600+) on a stream whose refill never delivered, so we bailed by
     // zeroing outLeft (the caller loop's exit key).
     //
@@ -11096,6 +11470,20 @@ PPC_FUNC(sub_821D5E10) {
         bool headServe = false;  // F-347: this window is the stream's preamble
         const uint32_t sPkg =
             kUiXsfChunkFeed ? MclaUiXsfStreamPkg(st, outPtr) : 0u;
+        // F-406: see the flag's comment. `sPkg == 0` means this dest has no stream-owned
+        // container, so anything we would write here is a package `AssignPackageForDest`
+        // invented -- and F-393 measured that writing it at `inLeft == 0` is what diverts
+        // `sub_821BC140` into its exitless inflate leg. Return before any record write.
+        if (kF406SkipFabricatedServe && sPkg == 0u) {
+          static std::atomic<uint32_t> s_406{0};
+          const uint32_t k406 = s_406.fetch_add(1) + 1;
+          if (k406 <= 16 || (k406 % 256) == 0)
+            MCLA_LOG_WARN("F406-SERVE-SKIP #{} st={:08X} outPtr={:08X} outLeft={} "
+                          "guessPkg={:08X} lr={:08X} tid={}",
+                          k406, st, outPtr, outLeft, baseOff,
+                          static_cast<uint32_t>(ctx.lr), GetCurrentThreadId());
+          return;
+        }
         if (sPkg != 0) {
           uint32_t sWalk = 0;
           {
@@ -13429,6 +13817,7 @@ PPC_FUNC(sub_821C9108) {
   if (n <= 40 || (n % 500) == 0)
     MCLA_LOG_INFO("RELSEMA sub_821C9108 #{} h={:08X} lr={:08X}", n, h,
                   static_cast<uint32_t>(ctx.lr));
+  F370SemaRow("RELEASE", h, 0, static_cast<uint32_t>(ctx.lr));
   __imp__sub_821C9108(ctx, base);
 }
 
@@ -17038,8 +17427,196 @@ PPC_FUNC(sub_821D3070) {
 // the group HAS variables but none named skinningData (content, F-136's raw
 // measurement) versus the group has NO variables (our serve/parse). Print the
 // count and the names the guest actually sees.
+// F-396 (T41.73): F-395 proved the boot worker is stuck below `bl sub_82130528`, whose
+// `bctr [[r3]+8]` target resolves (w413 `F389-XTLCHAIN`) to guest 0x821C08F8. Two different
+// shapes look identical from outside: one call into that allocator method that never returns
+// (a walk that does not terminate), vs the method returning and being re-entered thousands of
+// times (an outer retry loop). Enter/exit counts separate them directly -- the same shape of
+// instrument that settled F-395 in one soak. Rule 4: 0x821C08F8 had exactly one owner (the
+// function map); its sibling 0x821C29A0 is NOT touched here because it already has an override
+// at src/hooks/alloc_census.cpp:1745 registered by src/patches.cpp:415.
+PPC_FUNC_IMPL(__imp__sub_821C08F8);
+PPC_FUNC(sub_821C08F8) {
+  static std::atomic<uint64_t> s_396in{0};
+  static std::atomic<uint64_t> s_396out{0};
+  const uint64_t k = s_396in.fetch_add(1) + 1;
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t size = ctx.r4.u32;
+  const uint32_t align = ctx.r5.u32;
+  // F-397: the first cap (`k <= 8 || k % 1024`) could not distinguish "8 calls, all returned"
+  // from "a 9th still in flight" -- w414 printed exactly the cap. 64 + every 64th makes a
+  // stuck-in-flight call visible as an ENTER with no matching EXIT.
+  if (k <= 64 || (k % 64) == 0)
+    MCLA_LOG_WARN("F396-ALLOC-ENTER #{} self={:08X} size={} align={} lr={:08X} sp={:08X} "
+                  "tid={}",
+                  k, self, size, align, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                  GetCurrentThreadId());
+  __imp__sub_821C08F8(ctx, base);
+  const uint64_t o = s_396out.fetch_add(1) + 1;
+  if (o <= 64 || (o % 64) == 0)
+    MCLA_LOG_WARN("F396-ALLOC-EXIT #{} (enters={}) self={:08X} size={} ret={:08X} tid={}", o, k,
+                  self, size, ctx.r3.u32, GetCurrentThreadId());
+}
+
+// F-407 (T41.81): F-406 left the real question standing -- the garage package `0x64980000` still has
+// NO streamer record, while two new ones (`8284AD68`, `8284B37C`) appeared. The record builder is
+// `sub_8260C8E0` (generated/ppc_xenon/ppc_recomp.123.cpp:3301): it writes `rec+1536`, then calls
+// `sub_8218A568(dev, 0x82888F70, 1)` and stores the result at `rec+1532` (`:3820-3837`), then calls it
+// again with `0x82888F60` and stores THAT at `rec+1540` (`:3854`) -- and `sub_821BC140`'s descriptor
+// loop reads `[record+1540]` as its entry count and bails out of the whole request when it is <= 0
+// (ppc_recomp.14.cpp:19019-19026). So a record that comes back with `+1540 = 0` is built and then
+// silently does nothing -- which is exactly the shape an "enqueue gap" should have. Enter/exit + the
+// three produced fields answer "how many records were attempted, and which counts came back zero".
+// Rule 4: 0x8260C8E0 had exactly one owner (the function map) before this hook. Log-only.
+PPC_FUNC_IMPL(__imp__sub_8260C8E0);
+PPC_FUNC(sub_8260C8E0) {
+  static std::atomic<uint64_t> s_407{0};
+  const uint64_t k = s_407.fetch_add(1) + 1;
+  const uint32_t r31 = ctx.r3.u32;
+  if (k <= 16 || (k % 256) == 0)
+    MCLA_LOG_WARN("F407-RECBUILD-ENTER #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X} tid={}", k,
+                  ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, static_cast<uint32_t>(ctx.lr),
+                  GetCurrentThreadId());
+  __imp__sub_8260C8E0(ctx, base);
+  const uint64_t o = k;  // the body is a leaf-shaped tail; one enter == one exit here
+  if (o <= 16 || (o % 256) == 0)
+  {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t f1532 = 0, f1536 = 0, f1540 = 0, f8 = 0;
+    (void)mem.ReadU32BE(r31 + 1532u, &f1532);
+    (void)mem.ReadU32BE(r31 + 1536u, &f1536);
+    (void)mem.ReadU32BE(r31 + 1540u, &f1540);
+    (void)mem.ReadU32BE(r31 + 8u, &f8);
+    MCLA_LOG_WARN("F407-RECBUILD-EXIT #{} rec={:08X} +1532={:08X} +1536={:08X} +1540={} "
+                  "e0={:08X} tid={}",
+                  o, r31, f1532, f1536, f1540, f8, GetCurrentThreadId());
+  }
+}
+
+// F-395 (T41.72): F-394 put the boot worker's last 220 seconds in guest `sub_82397060` (its
+// `PARK-UNWIND` caller frame was a return address inside that function -- see F-395 s4, which
+// retracts the first reading of the walk as "executing its own body"). That routine is the
+// title's growable-array reserve: it frees the old blocks, rounds the count up to a power of
+// two, stores it at [r31], and reaches the XTL allocator through `sub_82130528`
+// (generated/ppc_xenon/ppc_recomp.61.cpp:17730-17848 -> ppc_recomp.0.cpp:864-886). Two
+// different bugs are indistinguishable from a sampler: an unbounded producer re-entering this
+// routine forever, and one allocation that never returns. An enter/exit pair separates them --
+// ENTER rows with no matching EXIT means the latter. Rule 4 checked first: 0x82397060 had
+// exactly one owner (the function map) before this hook. Log-only, no state change.
+// F-432: `want == 0` is a DEGENERATE argument that makes this routine never return. Its free-list
+// link loop is guarded only by `addic. r11,r30,-1 / beq skip` (ppc_recomp.61.cpp:17888-17923), so
+// count 0 enters it with r11 = -1 and runs 2^32-1 iterations, each storing `[r9+12] = r9+16` while
+// r9 accumulates a pointer-sized stride -- i.e. a garbage store every 16 bytes across the whole 4 GB
+// guest space, which is what F-371/F-384 saw landing on the heap header. The single caller is
+// `sub_823971D0` at 0x823973B4, and it reads the SAME halfword (`lhz r11,4(r28)` = [0x828CD0AC])
+// two instructions later and branches around all of its remaining work when it is 0
+// (ppc_recomp.61.cpp:18252-18258), so for want == 0 the call's result is never consumed and
+// skipping the body is downstream-equivalent. Mitigation, not a fix: the real defect is upstream --
+// the "Vehicle" section walk that must raise that count finds nothing (F-432 s3).
+static constexpr bool kF432SkipZeroCountGrow = true;
+
+PPC_FUNC_IMPL(__imp__sub_82397060);
+PPC_FUNC(sub_82397060) {
+  static std::atomic<uint64_t> s_395in{0};
+  static std::atomic<uint64_t> s_395out{0};
+  const uint64_t k = s_395in.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t want = ctx.r4.u32;
+  if (k <= 24 || (k % 512) == 0)
+    MCLA_LOG_WARN("F395-GROW-ENTER #{} obj={:08X} want={:X} lr={:08X} sp={:08X} tid={}", k,
+                  obj, want, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                  GetCurrentThreadId());
+  // F-397: the container's own words at entry. `+0` is the count this routine recomputes, `+8`
+  // the block pointer it frees and republishes, `+16` the pointer-to-minus-4 it also frees
+  // (ppc_recomp.61.cpp:17753-17774). If `+8` already holds the arena base at the FIRST enter,
+  // the hand-off happened earlier and the 0x828CD064 watch (boot_host.cpp, F-397) is what names
+  // it; if it is 0, the value is created by the allocation inside this call.
+  if (k <= 4)
+  {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t w0 = 0, w8 = 0, w16 = 0;
+    (void)mem.ReadU32BE(obj + 0, &w0);
+    (void)mem.ReadU32BE(obj + 8, &w8);
+    (void)mem.ReadU32BE(obj + 16, &w16);
+    MCLA_LOG_WARN("F397-OBJ #{} obj={:08X} [+0)={:08X} [+8)={:08X} [+16)={:08X} arena={:08X} "
+                  "tid={}",
+                  k, obj, w0, w8, w16, mcla::kernel::kUserHeapArenaVa, GetCurrentThreadId());
+    // F-401 s3: the consumer-side measurement. `sub_821C06C8` pushes every group descriptor onto
+    // a list whose head is the image global at 0x828559E4 (lis(-32123)+23012), and it is the ONLY
+    // routine in generated/ that touches that head -- so the list has been built and never walked.
+    // Walk it here instead: {+0 name, +4 = 0, +8 = the constructor's r4 (the fatal `lhz` target),
+    // +12 next}. The name VAs decode to the game-variable group names ("allgrip" = 0x82051F14,
+    // "ctfFlagLimit" = 0x82052118, ...) read out of build/cache/mcla_pe.bin.
+    uint32_t head = 0;
+    (void)mem.ReadU32BE(0x828559E4u, &head);
+    for (uint32_t e = head, gi = 0; gi < 16 && e != 0u && e != 0xCDCDCDCDu; ++gi) {
+      uint32_t nm = 0, f4 = 0, f8 = 0, nx = 0;
+      (void)mem.ReadU32BE(e + 0, &nm);
+      (void)mem.ReadU32BE(e + 4, &f4);
+      (void)mem.ReadU32BE(e + 8, &f8);
+      (void)mem.ReadU32BE(e + 12, &nx);
+      MCLA_LOG_WARN("F401-GROUP #{} enter={} entry={:08X} name={:08X} [+4)={:X} [+8)={:X} "
+                    "next={:08X}",
+                    gi, k, e, nm, f4, f8, nx);
+      if (nx == e)
+        break;
+      e = nx;
+    }
+  }
+  if (kF432SkipZeroCountGrow && want == 0u) {
+    MCLA_LOG_WARN("F432-GROW-SKIP #{} obj={:08X} want=0 lr={:08X} sp={:08X} tid={} "
+                  "(link loop would run 2^32-1 times)",
+                  k, obj, static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId());
+    ctx.r3.u64 = obj;
+    return;
+  }
+  __imp__sub_82397060(ctx, base);
+  const uint64_t o = s_395out.fetch_add(1) + 1;
+  if (o <= 24 || (o % 512) == 0)
+    MCLA_LOG_WARN("F395-GROW-EXIT #{} (enters={}) obj={:08X} want={:X} ret={:08X} tid={}", o, k,
+                  obj, want, ctx.r3.u32, GetCurrentThreadId());
+}
+
+// F-382: the guest's own memcpy, hooked only to name the argument set of the copy that lands on the
+// host user-heap header. F-379's host backtrace proved that burst is issued inside OUR Path A decode
+// chain (MclaJob2DecompressAndDistribute -> MclaXcDecodeFullStream -> guest sub_8244FF20 ->
+// sub_82460420 -> sub_82461010 -> this memcpy), and that chain runs the guest on a SYNTHETIC
+// PPCContext -- which is why F375's r3/r4/r5 printed unrelated registers and the same lr 821BC998
+// three boots running: it reads GetPPCContext(), not the context in play. A hook sees the real one.
+// Generated emits `sub_X` as a weak alias of `__imp__sub_X`, so a strong definition here takes the
+// slot without touching generated/ (same mechanism as sub_82193AF8). Log-only.
+PPC_FUNC_IMPL(__imp__sub_823DA950);
+PPC_FUNC(sub_823DA950) {
+  // F-100 rule 1 (a probe must prove it fires): an unhooked memcpy chain would print zero F382 rows
+  // and look like "the guest never copies low". This counter is the positive control.
+  static std::atomic<uint64_t> s_382all{0};
+  const uint64_t ka = s_382all.fetch_add(1) + 1;
+  if (ka == 1 || (ka % 200000) == 0)
+    MCLA_LOG_WARN("F382-MEMCPY-LIVE calls={} - this hook IS on the guest memcpy path", ka);
+  const uint32_t dst = ctx.r3.u32;
+  const uint32_t len = ctx.r5.u32;
+  // A copy that STARTS below the watched page still lands on it: dst=0 with len 0x20040 writes over
+  // the header, and a dst-only filter would miss that. Match on the span, not the base.
+  // F-384: and watch the arena WHEREVER IT LIVES -- the literal 0x20000 range below was the old host
+  // arena, which is now the guest's own heap; keeping it would have reported a false all-clear after
+  // the relocation.
+  constexpr uint32_t kHdrLo = mcla::kernel::kUserHeapArenaVa;
+  constexpr uint32_t kHdrHi = mcla::kernel::kUserHeapArenaVa + 0x240u;
+  const bool spansHeader = dst < kHdrHi && static_cast<uint64_t>(dst) + len >= kHdrLo;
+  if (spansHeader) {
+    static std::atomic<uint32_t> s_382{0};
+    const uint32_t k = s_382.fetch_add(1) + 1;
+    if (k <= 8 || (k % 512) == 0)
+      MCLA_LOG_ERROR("F382-MEMCPY #{} dst={:08X} src={:08X} len={:X} lr={:08X} sp={:08X} tid={}", k,
+                     dst, ctx.r4.u32, len, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                     GetCurrentThreadId());
+  }
+  __imp__sub_823DA950(ctx, base);
+}
+
 PPC_FUNC_IMPL(__imp__sub_82193AF8);
 static std::atomic<uint32_t> s_h93AF8{0};
+static std::atomic<uint32_t> s_93AF8soft{0};  // F-369 required->0 count
 PPC_FUNC(sub_82193AF8) {
   const uint32_t n = s_h93AF8.fetch_add(1) + 1;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -17047,6 +17624,17 @@ PPC_FUNC(sub_82193AF8) {
   const uint32_t nameA = ctx.r4.u32;
   const uint32_t req = ctx.r5.u32 & 0xFFu;
   const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
+  // F-369: the wanted name is needed by the soft-fail decision below, not just by the
+  // census line, so it is read here once for every call (checked 32-byte guest read).
+  char want[33] = {0};
+  {
+    unsigned char raw[32] = {0};
+    (void)mem.ReadBytes(nameA, raw, 32u);
+    int j = 0;
+    for (; j < 32 && raw[j]; ++j)
+      want[j] = (raw[j] >= 32u && raw[j] < 127u) ? (char)raw[j] : '?';
+    want[j] = 0;
+  }
   // w150 printed ZERO of these while the fatal *inside* this function printed
   // twice, and the only filter was `group != 0` - so a null/poison group is
   // itself the leading candidate. Log unconditionally, including r3 == 0.
@@ -17056,15 +17644,6 @@ PPC_FUNC(sub_82193AF8) {
     (void)mem.ReadU32BE(group + 8, &arr);
     (void)mem.ReadU32BE(group + 12, &cntW);  // +12 halfword, +14 next field
     const uint32_t nvars = cntW & 0xFFFFu;
-    char want[33] = {0};
-    {
-      unsigned char raw[32] = {0};
-      (void)mem.ReadBytes(nameA, raw, 32u);
-      int j = 0;
-      for (; j < 32 && raw[j]; ++j)
-        want[j] = (raw[j] >= 32u && raw[j] < 127u) ? (char)raw[j] : '?';
-      want[j] = 0;
-    }
     char first[33] = {0}, second[33] = {0};
     uint32_t e0 = 0, e1 = 0, n0 = 0, n1 = 0;
     if (arr && nvars > 0) {
@@ -17099,6 +17678,24 @@ PPC_FUNC(sub_82193AF8) {
                   "req={} want='{}' e0={:08X}/'{}' e1={:08X}/'{}' lr={:08X}",
                   n, group, vt, arr, nvars, req, want, e0, first, e1, second,
                   lrIn);
+  }
+  // F-369 MITIGATION (user-directed 2026-09-26; supersedes F-367's "healthy wait-loop").
+  // `required` is written once and read once in this body -- ppc_recomp.10.cpp:17741
+  // `mr r25,r5` -> :17804 `clrlwi r11,r25,24 / cmplwi cr6,r11,0 / beq`. So clearing it changes
+  // exactly one thing: a name the group does NOT declare returns through the guest's OWN
+  // non-fatal exit loc_82193BAC (`li r3,0; addi r1,r31,176; blr`) instead of calling the fatal
+  // dispatcher at :17821, whose host override never returns (src/kernel/imports.cpp:3028
+  // `while (true) Sleep(1000)`). That park is what froze tid=000043A4 inside sub_822C2EA8 and
+  // so kept sub_82131508 from reaching its UILOAD registration at 0x821315F4 (F-368).
+  // When the name IS declared both flag values reach the same success path (loc_82193BC0), so
+  // this cannot mask a binding that would otherwise have worked. Every softened lookup is
+  // logged with the name it applied to -- no silent short-circuit (do-not #9).
+  if (req != 0) {
+    const uint32_t k = s_93AF8soft.fetch_add(1) + 1;
+    if (k <= 16 || (k % 200) == 0)
+      MCLA_LOG_WARN("F369-SHGRP-SOFT #{} want='{}' group={:08X} req={} -> 0 lr={:08X}", k, want,
+                    group, req, lrIn);
+    ctx.r5.u64 = 0;
   }
   __imp__sub_82193AF8(ctx, base);
 }

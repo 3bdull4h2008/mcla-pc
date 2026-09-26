@@ -1,6 +1,9 @@
 #include "guest_memory.h"
+#include "kernel/heap_arena.h"  // F-384: kUserHeapArenaVa, so the census follows the arena
 #include "logging.h"
 #include <atomic>
+#include <intrin.h>   // F-374b: _ReturnAddress() for the heap-instance store report
+#include <windows.h>   // F-374b: GetModuleHandleA() to turn the caller into an RVA
 #include <cstring>
 #include <mutex>
 
@@ -9,9 +12,50 @@
 namespace mcla::gpu {
 void PageWatchOnWrite(uint32_t guestAddr, uint32_t value);
 void PageWatchOnRead(uint32_t guestAddr, uint32_t value);
+// F-375: gpu_cp.cpp owns the PPCContext includes, so the guest-side argument dump for a store
+// that reached the host heap instance lives there (see ReportHeapInstanceStore below).
+void HeapInstanceStoreReport(uint32_t guestAddr, uint32_t value);
 } // namespace mcla::gpu
 
 static constexpr uint32_t kWatchPage = 0x50000000u;
+
+// F-374b: the guest user heap's o1heap INSTANCE occupies guest 0x20000..0x20240 (src/kernel/
+// o1heap.c:133-138 -- 64 free-bin pointers, a bin mask, then the diagnostics block; `capacity` is
+// the constant at +0x208). Only o1heap writes there, and it does so through raw host pointers. A
+// store that reaches that window through the GUEST-facing checked writers is a wild destination by
+// definition: the F-374 guard page caught exactly one such store live in w382.log (17:30:56.311,
+// hostRIP = GuestMemoryView::WriteU32BE+0x7d, guest lr 821BC998), and 155 ms later Heap::Alloc
+// began refusing every request -- F-370's dead header and uncreated thread #16. This names the
+// CALLER of the store, which is the line to fix:
+//     python tools/host_rva_resolve.py build/mcla.map <caller_rva>
+namespace {
+// F-384: these two follow the arena; they are NOT a hardcoded address any more. Watching a stale
+// range after a relocated arena would read as "the corruption stopped" when it only moved out of
+// sight -- the values now come from the single definition in `src/kernel/heap.h`.
+constexpr uint32_t kHeapInstanceLo = mcla::kernel::kUserHeapArenaVa;
+constexpr uint32_t kHeapInstanceHi = mcla::kernel::kUserHeapArenaVa + 0x240u;
+
+inline bool HeapInstanceStoreHit(uint32_t guestAddr) {
+    return guestAddr >= kHeapInstanceLo && guestAddr < kHeapInstanceHi;
+}
+
+void ReportHeapInstanceStore(const char *op, uint32_t guestAddr, uint64_t val, void *ra) {
+    static std::atomic<uint32_t> s_storeN{0};
+    const uint32_t n = s_storeN.fetch_add(1) + 1;
+    // F-379: the old hard cap (`n > 16`) made the burst length unmeasurable -- w387 and w388 both
+    // printed exactly 16 rows regardless of how long the copy actually was, so "16 dwords" was the
+    // cap, not a measurement. First 16 plus every 4096th row keeps a short burst complete (cap-shape
+    // rule) while making a long one visible. tid separates bursts from different threads.
+    if (n > 16 && (n % 4096) != 0) return;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    const uintptr_t abs = reinterpret_cast<uintptr_t>(ra);
+    MCLA_LOG_ERROR("F374-HEAPSTORE #{} op={} guest={:08X} inst_off={:#x} val={:#x} "
+                   "caller_rva={:#x} tid={}",
+                   n, op, guestAddr, guestAddr - kHeapInstanceLo, val, base ? abs - base : abs,
+                   GetCurrentThreadId());
+    mcla::gpu::HeapInstanceStoreReport(guestAddr, static_cast<uint32_t>(val));
+}
+}  // namespace
 
 // Dynamic watch ranges (session 26): armed by censuses when they observe a
 // suspicious structure (e.g. empty dispatch method-object). Guest stores into
@@ -40,6 +84,17 @@ void mcla::native::RegisterGuestWatchRange(uint32_t start, uint32_t end)
     }
     if (n >= kMaxWatchRanges)
     {
+        // F-412: silent drop -> one-time warning. w430 armed only 30/64, so this is NOT exhausted
+        // today; the cap is named here for consistency with RegisterGuestWatchValue below so a
+        // future exhaustion is visible instead of a silent blind spot. ONE row ever (F-054: a
+        // per-drop log poisons the soak).
+        static bool s_warnedRange = false;  // guarded by s_watchMtx
+        if (!s_warnedRange)
+        {
+            s_warnedRange = true;
+            MCLA_LOG_WARN("WATCH: range cap kMaxWatchRanges={} hit -- dropping [{:08X},{:08X})",
+                          kMaxWatchRanges, start, end);
+        }
         return;
     }
     g_watchRanges[n].start.store(start, std::memory_order_relaxed);
@@ -51,7 +106,11 @@ void mcla::native::RegisterGuestWatchRange(uint32_t start, uint32_t end)
 // Value watch (session 27): log every store whose VALUE equals a registered
 // constant - catches pointer registration sites (e.g. who links object
 // 0x88825500 into the swf display-list chain).
-constexpr uint32_t kMaxWatchValues = 4;
+// F-412: was 4, which w430 proved exhausted -- 4 armed (CDCDCDCD, 80010000, 00020037, 88825500)
+// while src/task_dispatch_trace.cpp:84-92 registers 8 more that were dropped silently at the cap
+// below, a blind spot hiding evidence for many sessions. 16 = power of two, still a cheap scan in
+// WatchValueHit.
+constexpr uint32_t kMaxWatchValues = 16;
 std::atomic<uint32_t> g_watchValues[kMaxWatchValues];
 std::atomic<uint32_t> g_watchValueCount{0};
 
@@ -68,6 +127,17 @@ void mcla::native::RegisterGuestWatchValue(uint32_t value)
     }
     if (n >= kMaxWatchValues)
     {
+        // F-412: was a bare `return` -- w430 silently lost the 8 value watches from
+        // task_dispatch_trace.cpp at this exact site. Warn ONCE naming the cap and the dropped
+        // value so the next exhaustion is a log line, not a hole in the evidence. Never per-drop:
+        // repeated mitigation lines poison the soak (F-054).
+        static bool s_warnedValue = false;  // guarded by s_watchMtx
+        if (!s_warnedValue)
+        {
+            s_warnedValue = true;
+            MCLA_LOG_WARN("WATCH: value cap kMaxWatchValues={} hit -- dropping value {:08X}",
+                          kMaxWatchValues, value);
+        }
         return;
     }
     g_watchValues[n].store(value, std::memory_order_relaxed);
@@ -275,6 +345,8 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
     }
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint32_t));
     if (!ptr) return false;
+    if (HeapInstanceStoreHit(guestAddr))
+        ReportHeapInstanceStore("U32", guestAddr, val, _ReturnAddress());
     __try
     {
         uint32_t be = Swap32(val);
@@ -291,6 +363,8 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
 bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint64_t));
     if (!ptr) return false;
+    if (HeapInstanceStoreHit(guestAddr))
+        ReportHeapInstanceStore("U64", guestAddr, val, _ReturnAddress());
     __try
     {
         uint64_t be = Swap64(val);

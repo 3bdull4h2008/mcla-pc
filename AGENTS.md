@@ -10,7 +10,7 @@ Xbox 360 (Xenon) → PC emulator: XenonRecomp static PPC→C++ recompiler + D3D1
 2. `docs/HANDOFF_NEXT_AGENT.md` — live block + session ledger (what the last session actually saw).
 3. `docs/PROGRAM_GUIDE.md` on demand — §3 build/run gotchas, §4 guest image, §5 recompiler pipeline,
    §7 host short-circuit table, §9 log-marker inventory, §11 forbidden paths.
-4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-187` (whole again on
+4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — append-only evidence ledger `F-001…F-434` (whole again on
    E: since the 09-23 merge; `C:\mcla-pc\docs` is archive only — see rule 6).
 
 Older status text anywhere else = trail, not truth. Pre-compression doc text: `git show 8f07a39:docs/<file>`.
@@ -62,6 +62,7 @@ re-measured. That is rule 13 in practice: *no claim without a log line, raw word
 | `tools/mitigation_audit.py` | do-not #9 — diffs the `PROGRAM_GUIDE` §7 registry against the mitigation-shaped labels really in `src/` (F-047: §7 lists 13, `src/` has 81). `--tiers`, `--label X`. | **1 = unregistered/stale** |
 | `tools/ppc_xrefs.py` | static xrefs without IDA: `find-str <text>`, `xref <hexVA>` (`lis`=`addis rT,0,imm`! sliding per-register state), `calls <hexVA>`, `fn <hexVA>`. One-site messages are load-bearing attributions (F-102 named the whole preload chain this way). | 0 (informational) |
 | `tools/rpf_offline.py` | archive forensics without a soak: `header` (RPF3 TOC length/endianness), `names <toc_dump>` (GtaO-joins an **in-guest** TOC dump to real path names), `find <path> [archive\|dump]`, `member <off> <len>`, `islands <lo> <hi>`. Raw-archive `find` returns 0 by design — the on-disk TOC is AES, the in-guest copy is a hash-sorted cleartext table (F-099). | 0 (informational) |
+| `tools/host_rva_resolve.py build/mcla.map [--base <runtime image base>] <rva\|absolute>…` | names a **host** address from the VEH/PARK dumps (`rip owner=host …`, `rawrip=…`, the host stack lines), using the `/MAP` every link already writes (CMakeLists §410). This is what turned F-370's `C0000005` from "some host thread" into `memset ← GuestThreadContext ctor`. Control: a known symbol must resolve at `+0x0` — pass the map from the SAME build as the log | 0 (informational) |
 
 ## Project MCP servers (`.qoder/settings.json`, committed — first load shows a trust prompt; run `/mcp reload`)
 

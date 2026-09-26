@@ -135,6 +135,7 @@
 
 
 #include "fs/vfs_rpf.h"
+#include "kernel/heap_arena.h"  // F-412: kUserHeapArenaVa / kPhysArenaBeginVa, so the census knows our own instance
 
 
 
@@ -335,6 +336,34 @@
 
 
 extern "C" uint32_t KeReleaseSemaphore(void *, uint32_t, uint32_t, uint32_t);
+
+// F-412: is `a` inside OUR OWN o1heap instance header? Two windows, both armed between
+// HeapGuardDisarm/HeapGuardArm (src/boot_host.cpp:263 user = [kUserHeapArenaVa,+0x240),
+// :289 phys = [kPhysArenaBeginVa,+0x800) after F-391 moved the pool to 0xA0400000). The census
+// probes its own instance for slab owner/elemsize; with no heap window open that read faults the
+// guard on an address that is legitimately ours, so the guard can only report "nobody was inside
+// a heap call". Evidence w430.log:588-615: `elem=A0401020` (pool-based alloc) makes
+// `slab = elem & ~0x3FFF` = 0xA0400000, so `slab+16` = 0xA0400010 = our own bins[2], and
+// `F388-PHYSGUARD trip=2/3 off=0x10 want=R` lands next to `TSLAB-OWNER #1 elem=A0401020`.
+static bool MclaCensusAddrIsOurInstance(uint32_t a) {
+  return (a >= mcla::kernel::kUserHeapArenaVa &&
+          a < mcla::kernel::kUserHeapArenaVa + 0x240u) ||
+         (a >= mcla::kernel::kPhysArenaBeginVa &&
+          a < mcla::kernel::kPhysArenaBeginVa + 0x800u);
+}
+
+// F-412: makes the void observable without poisoning the soak (F-054 rule: a repeating mitigation
+// line dominates the log and the marker counts stop meaning anything) -- first skip, then every
+// 256th. The read is voided (zero/sentinel), never wrapped in HeapGuardWindow: that window is
+// TU-local to src/kernel/heap.cpp and opening it here would hide the real header writer this
+// guard exists to catch.
+static void MclaCensusVoidWarn(uint32_t addr) {
+  static std::atomic<uint32_t> s_censusVoid{0};
+  const uint32_t n = s_censusVoid.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n == 1u || (n % 256u) == 0u)
+    MCLA_LOG_WARN("CENSUS-VOID #{} addr={:08X} skipped: read would touch our own o1heap instance",
+                  n, addr);
+}
 
 
 
@@ -2126,7 +2155,16 @@ PPC_FUNC(sub_821C29A0) {
 
 
 
-      (void)mem73.ReadU32BE(slab + 16, &slabOwner);
+      // F-412: `slab + 16` IS our own instance's bins[2] whenever the element came from a pool
+      // allocation (w430.log:588-615: elem=A0401020 -> slab=0xA0400000 -> read 0xA0400010 with no
+      // heap window open -> F388-PHYSGUARD trip=2/3 off=0x10 want=R). Void the read instead of
+      // taking the fault: slabOwner stays 0, so the owner check below fails closed (es16 = 0).
+      if (MclaCensusAddrIsOurInstance(slab + 16)) {
+        MclaCensusVoidWarn(slab + 16);
+        slabOwner = 0;
+      } else {
+        (void)mem73.ReadU32BE(slab + 16, &slabOwner);
+      }
 
 
 
@@ -2134,7 +2172,7 @@ PPC_FUNC(sub_821C29A0) {
 
 
 
-      if (slabOwner == self + slotOff)
+      if (slabOwner == self + slotOff) {
 
 
 
@@ -2142,7 +2180,15 @@ PPC_FUNC(sub_821C29A0) {
 
 
 
-        (void)mem73.ReadU16BE(self + slotOff + 4, &es16);
+        // F-412: same class of bug -- when `self` IS one of our instances, slotOff 208..240 lands
+        // inside our own guarded header page. Void it (CENSUS-VOID) rather than fault the guard.
+        if (MclaCensusAddrIsOurInstance(self + slotOff + 4)) {
+          MclaCensusVoidWarn(self + slotOff + 4);
+          es16 = 0;
+        } else {
+          (void)mem73.ReadU16BE(self + slotOff + 4, &es16);
+        }
+      }
 
 
 
@@ -3446,7 +3492,11 @@ PPC_FUNC(sub_82130048) {
 
 
 
-  if (n <= 60 || (ptr >= 0xA0000000u && ptr < 0xA4000000u)) {
+  // F-412: F-391 moved the pool to kPhysArenaBeginVa (0xA0400000). The old
+  // 0xA0000000..0xA4000000 band over-included 4 MiB that are NOT ours (the title's own XTL
+  // region) and under-included 0xA4000000..0xFFFFFFFF -- ~75% of the pool, which w430 has live
+  // (HEAP76 buddyA/B @A4401000/A5401000). uint32_t tops out at 0xFFFFFFFF, so no upper bound.
+  if (n <= 60 || ptr >= mcla::kernel::kPhysArenaBeginVa) {
 
 
 
@@ -3470,7 +3520,8 @@ PPC_FUNC(sub_82130048) {
 
 
 
-                  (ptr >= 0xA0000000u && ptr < 0xA4000000u) ? " LOWPOOL" : "");
+                  // F-412: same band as the gate above (pool begins at kPhysArenaBeginVa).
+                  (ptr >= mcla::kernel::kPhysArenaBeginVa) ? " LOWPOOL" : "");
 
 
 

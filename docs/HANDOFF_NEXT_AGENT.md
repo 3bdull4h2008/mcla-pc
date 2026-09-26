@@ -1,3 +1,244 @@
+## 2026-09-27 00:4x (F-432..F-434, **4 builds, soaks `w430`..`w432`; TWO MITIGATIONS KEPT, both verified**) — the wave's biggest advance, and it was not a decompression fix: **two guest infinite loops were the wall.**
+
+- **Loop 1 (F-432/F-433) — the count-0 store storm.** `sub_82397060` (the title's free-list/array builder) is entered with `count=0`, and its link loop at `generated/ppc_xenon/ppc_recomp.61.cpp:17888-17923` is guarded on `beq` only: count 0 enters with r11 = -1 and runs **2^32-1 times**, storing `[r9+12] = r9+16` with a pointer-sized stride across the whole 4 GB. That is the same thing as (a) F-395's "entered once, never returned" boot-worker livelock and (b) the F-371/F-384 "deterministic garbage on the user-heap header". Mitigation `kF432SkipZeroCountGrow` (`src/gpu_device.cpp:17469`, gate `:17519-17525`).
+- **Loop 2 (F-434) — the non-UI inflate spin.** Once the storm was gone, the boot's last live thread burned 23,155,400 iterations of `sub_821BC140`'s place pass on the shared `st=006D8F20` state (`outPtr=B7B01000`, `inLeft=20`, `outLeft=524288`, `produced=0`, `consumed` frozen at 32,748, `magic=3B6426F9`). Neither existing drain can reach it: `INFLATE-UNSTUCK` requires `produced > 0`, `INFLATE-J2-CONT` requires a UI/job2 dest. Mitigation `kF434BreakNoProgressSpin` (`src/gpu_device.cpp:1088-1097`, gate `:11007-11042`) writes the caller loop's own stream-complete key after 64 frozen-`consumed` sightings. It fired **once**.
+- **Measured (`w430`→`w432`):** `C0000005` 4→**0**, `F379-HEAPSTORE-BT` 19→**0**, `INFLATE-ENTER` 26,285→117,229→**2,378** rows, **`BC140-REC` 5→**7**** (`8284B990 RLC=17`, `8284BFA4 RLC=2` — first time either reaches the streamer), `W34-GFX-CENSUS` 3→6 rows with the first non-poison object (`vt=82085364 nLiveDest=4 tagNv=2`), garage `claimed=917504 still_present=872032 pct=95` (F-433's −65,536 recovered), `LISTLINE` 171 unchanged, and **the soak now ends in ordinary `WAIT[KWFSO]` polling instead of a loop.**
+- **Two readings to carry, both cheap and both wrong if guessed:** (i) `grep -ic UILOAD` rose 3→6 but that string is *inside* the `W34-NOGFX` message — nothing UILOAD-related armed; (ii) `nGfx` 0 is partly an instrument choice: the scan at `src/gpu_device.cpp:6999-7014` accepts only `0x82073xxx` vtables, so `0x82085364` is invisible to it. Before claiming either way, check whether `0x82085364` is a GFx-family vtable (`sub_825EF028`/`sub_825EF100` materialise it).
+- **The remaining route to `nGfx > 0` is the user's, not the next agent's:** the host-forced boot gate at `src/gpu_device.cpp:2214` (which is what calls the GFx loader ctor `0x824C6F08`) has `GATE-WAIT` / `BOOT-GATE started` / `GFX-ALLOC` / `GFX-CTOR` all at **0 rows** in `w432` — it never runs, and rule-2/**F-055** reserves that decision. Do not default to it.
+- **Standing:** `kF432SkipZeroCountGrow=true`, `kF434BreakNoProgressSpin=true`, `kF406SkipFabricatedServe=true` (all kept), `kF427JobHeadAnchor=false`, `kF393NoHijackNonUi=false`, `kF368HostDispatchGate=false`. Nothing committed this session (31+ paths dirty; commit only on request). Next ID **F-435**, next task **T41.89 (#56)**.
+
+## 2026-09-26 23:1x (F-406, **1 build, soaks `w418`+`w419` = 2/2 reproduced; ONE FIX KEPT**) — the enqueue gap moved for the first time: `sub_821BC140` now builds 5 records per boot instead of 3, and F-393's rejection was my own wrong predicate
+
+- **The fix:** `kF406SkipFabricatedServe` (`src/gpu_device.cpp:1086`, gate `:11292-11305`) returns before
+  any record write when the dest has **no stream-owned package** (`MclaUiXsfStreamPkg(st, outPtr) == 0`) —
+  i.e. only for the 4 KiB filler packages `AssignPackageForDest` invents (`0x1284000..0x1295000`). The
+  three containers are still served (`INFLATE-HOSTSERVE-PEND` = `64980000`, `64CA3000`, `6496F000`).
+- **Measured (both soaks, same exe):** `BC140-REC` **3 → 5** with identical slots and read-list counts —
+  the new ones are `8284AD68 id=4 cls=3 pkg=000A0000 RLC=4` and `8284B37C id=0x8004 cls=2 RLC=7`;
+  garage `still_present` **917,504 flat**, `C0000005` 4, `LISTLINE` 171, `W34-GFX-CENSUS` 3 rows,
+  `nGfx=0`, `INFLATE-ENTER` serial ~5.1 M (still spinning).
+- **Correction you must carry:** F-393's gate used `IsUiXsfPkg(AssignPackageForDest(outPtr))`, which is
+  false for the garage's own dest, so `w407` switched off all 25 serves and coverage fell to 143,069.
+  **F-393 rejected its implementation; the hypothesis was right** and F-406 is its corrected form. Do not
+  re-run F-393's predicate, and read the two entries as a pair.
+- **Still open (this is the objective's own subject):** the garage has **no record of its own** — the two
+  new ones carry `0x000A0000` (legals.xsf). T41.81 (task #51): what *enqueues* a package into
+  `sub_821BC140`? Start at the read-list-count writer `stw r3,1540(r31)`
+  (`generated/ppc_xenon/ppc_recomp.123.cpp:3854`) and the `q`/`id`/`cls` args the `BC140-REC` printer
+  already captures. Clause (b) is unchanged and on another thread (F-397/F-405).
+- **Standing:** `kF406SkipFabricatedServe=true` (kept), `kF393NoHijackNonUi=false`,
+  `kF368HostDispatchGate=false`, do not patch the title's loops, attach soak counts to coverage numbers.
+
+## 2026-09-26 22:4x (F-396..F-400, **3 builds, soaks `w414`/`w415`/`w416`; three log-only probes, no behaviour change**) — clause (b) is a 4.3-billion-iteration loop fed by a zero-length game-variable group: NOT our heap, NOT the UI chain
+
+- **Mechanism (F-397/F-400).** `sub_823971D0` calls `sub_82397060(r3=0x828CD064, r4=lhz [r28+4])` with
+  `r28 = 0x828CD0C8` (`ppc_recomp.61.cpp:18240-18247`, `:18143-18147`); the link loop at `loc_82397184`
+  (`:17907-17923`) guards **only** `count-1 == 0`. Measured count = **0** → `r11` starts `0xFFFFFFFF` →
+  4 294 967 295 iterations of `[X+12] = X+16`, which is exactly the F374 evidence
+  (`guest=0x20000 val=0x20004`, `guest=0x20010 val=0x20014` ⇒ `X = 0x1FFF4`).
+- **Three things it retires.** F-370's "deterministic garbage" and F-384's "the writer follows the arena
+  base" (a sweep passing through whatever base we choose); **tasks #41/#43** — `grep -rn kUserHeapArenaVa
+  src/` is probe sites only, no hand-off exists; and F-395's "stuck in the XTL allocator" — `sub_821C08F8`
+  served 512+ balanced enter/exit pairs in `w415`, all returning blocks.
+- **The zero's identity (F-399/F-400).** The four companion descriptors are **game-variable group names**
+  read from `mcla_pe.bin` ("allgrip/allzone/allroar/devonlycars", "ctfFlagLimit/ctfTimeLimit/
+  forcePowerupsOn/Auto"), registered by static ctor `sub_827AF370` as
+  `sub_821C06C8(0x828CD094, r4=0, 0x82051F14, r6=0)` — zero **by construction**, to be raised by whatever
+  defines the group's variables; nothing does, and `w416` shows no failed open. **So clauses (a) and (b)
+  are independent blockers** — F-398's hope they were the same four things is refuted.
+- **T41.76 (task #49), no build needed:** read `sub_821C06C8`'s field writes (which parameter becomes the
+  `+0` count), then find the append-a-variable routine via `tools/ppc_xrefs.py find-str devonlycars` /
+  `xref 0x82051F24` and the callers that pass a non-zero count.
+- **Instruments worth reusing:** `PARK-UNWIND` (`src/boot_host.cpp:1536-1580`, module RVAs — the old
+  `PARK-SAMPLE nf=` was ~94 KB off), enter/exit hooks `F395-GROW-*`/`F396-ALLOC-*`
+  (`src/gpu_device.cpp:17197-17236`), watch `[828CD064,828CD0D8)`. A direct enter/exit count settled in one
+  soak what an inferred 2-frame unwind could not; a depth-2 unwind row is a *return address*, not a caller.
+- **Standing:** do not buy clause-(b) evidence with longer soaks (300 s ≡ 120 s, marker-identical); do not
+  patch or skip the title's loop; `kF393NoHijackNonUi=false`; `kF368HostDispatchGate=false`; clause (a)
+  garage 917,504/1,066,057 (`w411`/`w415`) inside a 55–86 % boot spread.
+
+## 2026-09-26 22:0x (F-394 + F-395, **5 builds — 1 failed on the 10.0.26100 `RtlVirtualUnwind` signature and was NOT soaked — soaks `w409`..`w413`, no behaviour change in the tree**) — clause (b) is ONE never-returning 4-byte allocation, and it is inside the title's allocator walking OUR arena
+
+- **What the boot worker is doing.** Not waiting, and never in `sub_82131508`. `PARK-SAMPLE nf=` is
+  `NearestFunctionName` and was ~94 KB past what it named. Two new instruments replaced it in two
+  builds: `PARK-UNWIND` (`src/boot_host.cpp:1536-1580` + `:1951`, `RtlLookupFunctionEntry` +
+  `RtlVirtualUnwind` on the *suspended* thread, printing module RVAs to resolve with
+  `tools/host_rva_resolve.py` against each soak's own `PARK-SAMPLE base=`) named guest
+  **`sub_82397060`** at three sites (`+0x2ad/+0x2ba/+0x2f5`) continuously from ~40 s to ~260 s; then one
+  enter/exit `PPC_FUNC` hook on that function (`src/gpu_device.cpp:17222-17247`, rule-4 checked first)
+  gave the decisive count: **1 enter, 0 exits in 120 s** — `obj=828CD064 want=0 lr=823973C0`.
+- **Why that is the answer.** `want=0` makes the routine's own round-up chain ask for **4 bytes**
+  twice, and the second call's return site is `lr=0x82397124` — the exact value `PARK-SAMPLE` had been
+  printing frozen for 90 s. The callee chain is already named by `F389-*` in the same log:
+  `sub_82130528 → [[r13]+28] → 0x82830B18 → allocFn 0x821C08F8`, bank `0x82830CD8`, method
+  **`sub_821C29A0`**, head `[+4]=A0401010 [+8]=A0401000 [+20]=A042FFC0` — a ~192 KB bank inside the
+  physical arena **we** publish (`kPhysArenaBeginVa=0xA0400000`, `physArenaSize=4Gi-0xA0400000`).
+  While stuck it writes `[p]=p+4` over `0xA0106000..0xA01067F0`, ~3 passes of the same 128 slots.
+- **The control that kills the "it's just slow" theory:** `w412` at 300 s is marker-identical to
+  `w411` at 120 s (`still_present` 917,504 = 917,504, `REVERIFY` 21 = 21, `LISTLINE` 171 = 171,
+  `C0000005` 4 = 4, `nGfx=0` both, `W35-BOOT-GATE` 0 both) and printed *fewer* lines. Blocked, not
+  slow — do not spend another soak on a longer timeout.
+- **Two instrument rules this bought (both in the ledger, F-394 §1 / F-395 §4):** on 10.0.26100
+  `RtlVirtualUnwind`'s last parameter is `PKNONVOLATILE_CONTEXT_POINTERS`, **and a NULL return does not
+  end the chain** (it still fills the caller RIP for functions with no unwind codes) — recording only
+  on non-NULL made every row `frames=1`. And a depth-2 unwind row gives the last *resolvable return
+  address*, not the caller: I over-read it as "executing `sub_82397060`'s own body" and the enter/exit
+  count retracted it an hour later. A direct count beats an inferred stack.
+- **T41.73 (task #48) is the next move, one soak:** inside `sub_821C08F8`/`sub_821C29A0`, is the walk
+  (a) finite-but-enormous because a bound word is wrong, or (b) a genuine cycle in the link table?
+  Per-call iteration count + the head/limit words + the link value at each visited slot of
+  `0xA0106000..0xA0106800`. `addr_owners.py --check 0x821C08F8 / 0x821C29A0` first.
+- **Standing state to preserve:** `kF393NoHijackNonUi=false` (measured, rejected, comment carries the
+  numbers); `kF368HostDispatchGate=false`; F-383's `MclaXcSoftResetStream` and F-391's arena bounds
+  unchanged; everything in `w411`/`w412`/`w413` is uncommitted.
+
+
+
+## 2026-09-26 21:3x (F-393, **3 builds, soaks `w407`/`w408`, one fix measured and REVERTED**) — the 6.7 M-iteration spin is the title's own loop, and the host serve is what locks it
+
+- **F-392's premise died on a `grep -c`:** `INFLATE-HOSTSERVE-PEND` fires **25** times in `w406`, one
+  32 KiB window per destination — the `#1933810` inside it is the shared *entry* serial, not a serve
+  count (same line-vs-count class as F-340). 22 of those 25 handed **4 KiB filler packages**
+  (`off=0x1284000..0x1295000`, all `pkgSz=00001000`) that `AssignPackageForDest` invented for readlist
+  slots whose own `PSTREAM` sizes are 0x20000/0x4000. Only `0x64980000` (`pkgSz=0010C449` = the
+  garage's exact compressed length) and `0x6496F000` are real UI .xsf containers.
+- **The loop, read statically (`generated/ppc_xenon/ppc_recomp.14.cpp:19042-19170`)** — this is the
+  reusable map, no instrument needed: `loc_821BC2D4` tests `inLeft`, `loc_821BC2F0` waits on credits
+  `[0x827D74E0]` (**it reads 1 in all 23 `INFLATE-PENDING` rows, so it never blocks**), `loc_821BC310`
+  calls the title's own async read at `vtable[28]`, `loc_821BC374` is
+  `{ inflate; sub_82130000; if (outLeft) goto 2D4; }` and **`sub_82130000` is a bare `blr`**
+  (`ppc_recomp.0.cpp:4-8`). So `ret=00000000, produced=0` gives an unconditional hang: only the
+  inflate step can move `inLeft`/`outLeft`. The **output** descriptors are 12 bytes at `record+8+i*12`
+  with the count at `record+1540` — distinct from the 28-byte join entries
+  (`gpu_device.cpp:11650`) and from F-376's 1,556-byte record slots; all three coexist.
+- **The experiment and its verdict:** `kF393NoHijackNonUi` (`src/gpu_device.cpp:1072`, gate
+  `:11174-11188`) makes the `inLeft == 0` leg a no-op for any dest whose package is not UI .xsf. It
+  *confirmed the mechanism* — `INFLATE-ENTER` max serial 6,747,400 → 231,518, `READWRAP`
+  1,742 → 463,018, `consumed` reaching exactly one 0x40000 slot — and *failed the objective*:
+  `INFLATE-HOSTSERVE-PEND` 25 → 0, `LZX-FRAME` 2,321 → 22 and the garage's durable bytes
+  917,504 → **143,069**. Reason is structural and now proven: the decision point lives on the **one
+  shared record** `st=006D8F20` (the only `st` in all 34,607 sampled entries), so serving cannot be
+  turned off per destination. Reverted; `w408` re-verified `C0000005` 4=4, `fatal` 60=60,
+  `LISTLINE` 171=171, `UIXSF-GOLDEN-REVERIFY` 21=21.
+- **Read the caveat before quoting any coverage number:** `w408` is *identical code* to `w406` and its
+  garage `still_present` is 589,824. F-391's "86.1 %" was one observation; the defensible statement is
+  "41.3 % → 55–86 % range", and per F-340 a coverage claim needs its soak count attached.
+- **T41.71 (next move, replaces #46):** task #15's only surviving form, stated now that the loop is
+  readable — give a stream its own record, or append output descriptors to the request's own array
+  (`record+8+i*12`, count `record+1540`) so the garage's remaining ~148 KB has a slot the loop will
+  walk. `sub_821D5510([r25+0], [r25+4], 0)` is the per-descriptor finish step: read it before adding a
+  slot. Do **not** re-attempt a per-dest gate on the `inLeft == 0` leg — F-393 measured it. Clause (b)
+  is untouched (`W34-GFX-CENSUS`: one row in `w406` with `nGfx=0 vt=CDCDCDCD`, none in `w408`), and the
+  boot worker's `PARK-SAMPLE nf=0x82131508` in both is a **nearest-name artifact 94 KB off** — the
+  real parked sites resolve to `GuestMemoryView::Read/WriteU32BE`/`IsValidRange`.
+
+ soaks `w388`..`w394`, 1 real FIX in the tree**) - **THE HOST-HEAP DESTROYER WAS OUR OWN PATH A DRIVER: `MclaXcDecodeFullStream` "soft-resets" the guest xmem state block `[ctx+20+12264..12304]`, and two of those words are BASE POINTERS the guest never restores. With the base zeroed, every produced copy went to `0 + offset` -- so Path A's output never reached its destination buffer, and the advancing offset walked over the host `o1heap` instance at guest `0x20000`. Preserving the bases ends the allocator death (`F370-HEAP-HDR` 1->0, `F370-THREAD-CTX-NULL` 1->0) and exposes the real residual: the TITLE'S OWN HEAP IS AT GUEST `0x20000`, i.e. exactly where we bind our arena.** Ledger through **F-383**; next ID **F-384**.
+
+## 2026-09-26 19:0x (F-378 -> F-383, **6 builds**) — the host-heap destroyer was our own Path A driver; `MclaXcSoftResetStream` fixes it. *(Heading re-anchored at 21:3x: a `### F-393` insert truncated this block's original title line, which read "6 builds -- 1 failed on fmt arg-count/`WORD` args and was NOT soaked -- …"; the five bullets below it are unmodified.)*
+
+- How it was named (reusable method): a **host backtrace** at the corrupting store (`RtlCaptureStackBackTrace` + `python tools/host_rva_resolve.py build/mcla.map <rva>`) beat every guest-side instrument we had. `w389`: frames resolve to `__imp__sub_823DA950`(store) <- `sub_82461010` <- `sub_82460420` <- `sub_8244FF20` <- **`MclaXcDecodeFullStream+0xccd`** <- **`MclaJob2DecompressAndDistribute+0xacb`** <- our `sub_821BC140` hook <- `GuestThread::Start`. The guest stack under the writer was useless (`F378-HEAPSTACK`: 1 back-chain word + 23 zeros), and the guest registers in `F375` were *the wrong context's* -- Path A runs the guest on a synthetic `PPCContext p{}` (`src/gpu_device.cpp:5568`), which is why `lr=821BC998`/`r3=8284BFA4` repeated identically across four boots.
+- Proof of the mechanism, with the args (`w393`): hooking the guest memcpy and reading *its* ctx gives `F382-MEMCPY #1 dst=00000000 src=CAFB6DEE len=1612 lr=82461228` then `#2 dst=00001612 len=14 lr=82461160` -- base 0 + advancing offset. `F380-XCRESET` shows the reset itself: `pre=[40032EA9 00006000 00002000 4003AEA9 ...] post=[0 0 0 0 0]`. Guest code settles the field types: `sub_82461010` does `add r3,[ctx+20+12276],[ctx+20+12280]` for the dst and only ever stores to the *offsets* (12268/12272/12280).
+- The fix: `MclaXcSoftResetStream` (`src/gpu_device.cpp:5464-5479`) reads the two bases, zeroes the range, writes the bases back, then `ctx+4=1`; called at both reset sites (`:5575`, `:5678`). Outcome vs `w393`: HDR/CTX-NULL both 1->0, `INFLATE-ENTER` 6,016->3,615, structural set flat (`LISTLINE` 171=171, `GETDEV` 698=698, `XSF-HOSTSERVE` 79=79). **Goal markers unchanged: `nGfx=0`, `W35-BOOT-GATE=0`.**
+- The residual, named in the same soak (`w394`): 16 rows `F374-HEAPSTORE guest=00020000..000200F0 stride 0x10, val=addr+4` from `__imp__sub_82397060+0x345` with `r5=0x10` -- the title's own allocator filling a 16-byte-block free list at guest `0x20000`, reached `_xstart -> sub_82131508 -> sub_822C2EA8 -> sub_822C54D8 -> sub_822D4878 -> sub_823971D0 -> sub_82397060`. No host code hands out `0x20000`. Cost measured: `code=0xC0000005 rva=0x206CC8` = **`o1heapAllocate+0x98`**, and the VEH parked thread 21388 for it. So `heap.cpp:213` (`Translate(0x20000)`, XenonRecomp's baseline) sits on the guest's heap.
+- **T41.66 (next move):** relocate the host user-heap arena out of the guest heap, and *first* widen the header check -- `F370-HEAP-HDR` compares only `diagnostics.capacity`, which is constant after `o1heapInit`, so a destroyed `bins[64]` reads as healthy (that is exactly the w394 blind spot). F-377's "relocation cannot fix this" is superseded: it was measured while the misdirected burst dominated the window *and* a 16-row hard cap hid every other writer.
+- Two instrument landmines recorded in F-378/F-382: `if (n > 16) return;` had been reporting the cap as the burst length for several soaks; and a **destination-only** filter on a copy window misses a copy that starts below the window and runs into it (first F382 printed 0 rows and looked like a refutation). Without a PDB, nearest-public symbol resolution is not identity -- `RtlLookupFunctionEntry` (the `.pdata` table) gives the real containing function.
+
+## 2026-09-26 20:5x (F-387 -> F-391, **8 builds, soaks `w402`..`w406` + 4 instrument soaks, 3 fixes in the tree**) - **MILESTONE ON CLAUSE (a): the garage UI container is now 917,504 of 1,066,057 bytes present and byte-exact in guest memory (was 440,720 / 41.3 %, `first_bad=00020005` -> none, `recs_whole` 4 -> 16), and `INFLATE-ENTER` went 3,615 -> 34,607. Cause was ours: the host PHYSICAL heap arena was bound at guest `0xA0000000`, which is where the title's own XTL dual-buddy allocator lives (`0xA0001000..0xA002FFC0`).** Ledger through **F-391**; next ID **F-392**. `nGfx` is still 0 and `W35-BOOT-GATE` still 0, so **clause (b) is NOT met**.
+
+- How it was found (no guessing, two new censuses fired at the corrupting store): `F389-XTLCHAIN` read the XTL thunk's own operands — `r13=8F200000 [r13]=8F201000 obj=[[r13]+28]=82830B18 vt=820114C4 allocFn=821C08F8` — and `sub_821C08F8` turned out to be only a dispatcher over `m_Allocators[(r6+1)*4]`, so `F389-BANK` dumped the selected object: `head=[82011884 A0001010 A0001000 0 0 A002FFC0 0 0]`. That region is inside our old physical arena; the title's slab metadata was overwriting o1heap fragment headers, which is exactly the once-per-boot `o1heapAllocate+0x98` write to `0xE49125FC` with `rcx` = a guest VA and `rdi=r8=Translate(0xA0000000)`.
+- The three fixes: (1) `kPhysArenaBeginVa = 0xA0400000` in `src/kernel/heap_arena.h`, read by `heap.cpp:15/187` and by the physical guard page + watch range in `boot_host.cpp`; (2) F-390 in `boot_host.cpp`: a `C0000005` whose faulting function IS `o1heapAllocate`/`o1heapFree` now continues the search so the existing `SehO1Allocate`/`SehO1Free` SEH absorbs it — the VEH was parking the thread before its own `__except` could run; (3) F-390b in `src/kernel/heap.h`: `Alloc<T>`/`AllocPhysical<T>` return null on OOM instead of placement-new'ing into null (that was `w404`'s second fault at `AllocPhysical<Semaphore>+0x46`, then `QueryKernelObject<Semaphore>+0x217`).
+- Controls that the change is real, not noise: `F388-PHYSGUARD SELFTEST done page=1A0400000` (the guard moved with the arena, so the probe is still sighted), `F390-SEHPASS` 0 and `o1heapAllocate returned null` 0 in `w406` (the AV is gone, not hidden), and `LISTLINE` 171=171 / `GETDEV` 698=698 / `XSF-HOSTSERVE` 79=79 across `w405` -> `w406`.
+- What `w406` now blocks on (T41.69, task #45): two parked threads, both newly reachable — a READ of `0xFE78C248` at `rva=0x16FEFAF = __imp__sub_82419718+0x23f` (that thread publishes `ppc ctx=nil`, so name it by host backtrace, not by `lr`), and `addr=0x0 rva=0x0` = a transfer to address zero. Recommended instrument: extend the F379 host-backtrace recipe to the park decision so each park prints its own chain once. Do not skip instructions or fabricate returns.
+- Standing state to preserve: `kF368HostDispatchGate=false`; the F-383 xmem base-pointer fix (`MclaXcSoftResetStream`, `src/gpu_device.cpp:5464`) stays; the `F38x`/`F379` instruments are log-only and registered in `PROGRAM_GUIDE` §7/§9; all of this session's work is **uncommitted** (commit only when asked). Retractions to keep in mind: F-385 (XMem `srcSz`/`destSz` are pointer args — the F-231 trap), F-386 (the physical guard's own-writer trips: `HeapGuardArm/Disarm` is one global flag shared by both heaps and all threads — depth counter still owed), F-384's "the title is handed our arena base" (it follows the *user* arena base, and that remains unexplained; the physical half is now explained).
+
+## 2026-09-26 19:3x (F-384, **3 builds -- 1 failed on a header that does not compile in the checked-writer TU -- soaks `w395`/`w396`, value REVERTED, refactor kept**) - **THE ARENA RELOCATION WAS RE-TESTED WITH THE PATH A FIX IN THE TREE, AND THE WRITER FOLLOWED THE BASE AGAIN: the title is being HANDED our arena base. This corrects F-383's "the title's own heap lives at 0x20000" and vindicates F-377's original observation.** Ledger through **F-384**; next ID **F-385**.
+
+- `w395` (arena at `0x20000000`, proven by the positive controls `F373-HEAP-GOLDEN base=0x120000000 cap=0x1feffdc0` and `F374-HEAPGUARD SELFTEST page=120000000`): `F374-HEAPSTORE #1 guest=20000000 val=0x20000004 caller_rva=0x1415c65` -- the *same* `__imp__sub_82397060+0x345` chain with the same `r4=4 r5=0x10`, while `sp`/`r13` stayed put. After the revert, `w396` reproduces `w394` on every structural marker (`F382-MEMCPY` 5->1 is only the predicate change to a span test).
+- So the destination is derived from a value we supply: the guest lays out 16-byte entries (`val = dst+4`) starting at **exactly `heapArenaBase`**, not at the first block o1heap would hand out. **T41.67 = find that hand-off** (heap handle / process slice / seeded pointer). No `RtlCreateHeap` exists in `src/` and no literal `0x20000` hand-off exists -- it is computed.
+- Separate and more urgent, visible in both soaks: the host AV is in `o1heapAllocate+0x98` (`rva=0x206CD8`), `Param[0]=1` = a **write** to `0xE49125FC`, with `r8=0x1A0000000` (= `Translate(RESERVED_END)` = the **physical** arena's host base) and `rcx=0xE49125D4` -- a *guest VA* being used as a host metadata pointer. It fires 14 s BEFORE the free-list writes, so it is not caused by them, and the line printed immediately before it in both boots is `T413N2-XMEM #416 srcSz=543919776 destSz=543919780` -- one event in `w394`, `w395`, `w396` and `w397`, so it survives both fixes. **T41.68: find who runs over the physical heap's header.**
+- **F-385 CORRECTION - read before citing anything about inflate sizes.** The "wild XMem lengths" I first wrote here (`srcSz=543919776`, and `destSz = srcSz + 4` in every row) were **pointer arguments, not sizes**: two adjacent stack slots. The repo had already recorded that exact trap (F-231; the comment at `src/gpu_device.cpp:3255`). The printers now show both forms - `w397`: `T413N2-XMEM #1 srcSzPtr=006D8EA0 srcLen=32748 destSzPtr=006D8EA4 destLen=65536` - and the real inflate requests are sane (32 KiB window in, 64 KiB out). The AV above is unaffected by the correction.
+- Kept deliberately: `src/kernel/heap_arena.h` now holds `kUserHeapArenaVa`/`kUserHeapArenaEnd`, and the five copies of the literal are gone -- `heap.cpp:214-215/182/184/361`, `guest_memory.cpp:35-36`, `boot_host.cpp:263/1492`, `gpu_device.cpp:17160-17167`. Value = the original `0x20000`.
+- Goal state after all of it: `nGfx=0` in every `W34-GFX-CENSUS` row, `W35-BOOT-GATE=0` -- **objective NOT achieved.** The F-383 fix did not move the goal markers; it removed a real host bug and, in doing so, produced two honest new leads (T41.67, T41.68) that are both upstream of the UI load.
+
+## 2026-09-26 ~18:0x (F-376 + F-377, **3 builds, 2 soaks `w386`/`w387`, 1 experiment reverted**) - **The record field blamed in F-375 was the wrong one -- `[job+8]` holds a valid stream object -- and moving the host arena to `0x30000` did NOT help: the stray writer FOLLOWED the arena base. So the guest is being handed (or is deriving) an arena-relative address and writing a 0x40-byte allocator header over our o1heap instance.** Ledger through **F-377**; next ID **F-378**. **SUPERSEDED BY F-383 ABOVE: the writer was our own Path A driver, and the follow-the-arena reading is void.**
+
+- `F376-REC` (`src/gpu_cp.cpp`, fires on the first corrupting store) gives the streamer job-record table for free: 1,556-byte records from image-static `0x8284AD68` -- exactly the `slot=` values `PUSH sub_821BC868` has always printed. Fields read at the event: `[+0]` tag (4 / 0x8004 / 0x10004 / 0x18004 by index), `[+4]`=`0x50000000`, `[+8]` = stream OBJECT (B74E1000 / A47E3000 / B7521000 / B5049000), `[+24]` = byte count, `[+1540]` counter, `[+1548]`=`821BC548`; slots 4-7 zero. `B7521000` is a guest object (`EF100 obj=`, `FB0D8-DTOR childVt=82085364`), **not** one of our Path A destinations -- so "we scribbled over a live object" is dead as well.
+- `w387` (arena at `0x30000`): 16 x `F374-HEAPSTORE guest=00030000..0003003C`, same `caller_rva` (`__imp__sub_823DA950+0xcb1`), same record in `r3`, same outcome (`invariants FAIL` 1, thread #16 lost, `nGfx`=0 x6, `W35-BOOT-GATE` 0, `LISTLINE` 171, `C0000005` 0). Reverted; the result is written into `src/kernel/heap.cpp:215-222` instead of leaving a dead change.
+- Open question, now precise: **which hand-off lets the guest write allocator metadata at our arena base?** Census `RtlCreateHeap` / `RtlAllocateHeap` / `LocalStorageAlloc` / `XamAlloc` for any call that returns an arena-base-relative address the guest then sub-allocates. T41.65 -- same subsystem as task #15, so the objective's two open halves are now demonstrably one problem.
+- Frontier numbers unchanged through all of it: (a) 3/4 byte-exact + garage 12.3 %/41.3 %; (b) `nGfx`=0, `W35-BOOT-GATE`=0, `[obj+92]` != `0x82131008`. **Goal NOT complete.**
+
+## 2026-09-26 ~17:4x (F-373 -> F-375, **10 builds -- 1 segfaulted the host, 3 failed to link or were not soaked -- soaks `w379`/`w382`/`w384`/`w385`) - **THE HEAP-HEADER WRITER IS THE GUEST ITSELF: a streamer job record's object field `[job+8]` holds the SIZE `0x20000` instead of a pointer, the guest loads a "vtable" from the HOST heap header sitting at that address, `bctrl`s into whatever word it finds (its own memcpy), and that writes 16+ dwords back over `0x20000` -- which kills `Heap::Alloc` forever (F-370) and loses guest thread #16.** Ledger through **F-375**; next ID **F-376**.
+
+- Chain, one step per line: `PUSH sub_821BC868` builds `r30 = index*1556 + r31` -> `bl 0x821bc140` with `lr=0x821BC998` (`ppc_recomp.14.cpp:20142`) -> inside it `obj=[r28+8]` = **0x20000**, `vt=[obj+0]`, `bctrl [vt+124]` / `[vt+8]` (`:18882-18893`, `:18899-18911`) -> lands in `__imp__sub_823DA950` (the guest memcpy) -> writes `0x20000..0x2003C`+ (`w384.log`: 16 x `F374-HEAPSTORE`, all one `caller_rva=0x1575ec1`) -> 155 ms later `F370-HEAP-HDR` + `invariants FAIL` + `F370-THREAD-CTX-NULL` (`w382.log:50294`).
+- `0x20000` = 131072 = the same figure as every `room=131072` PATHB row: a **size where a stream pointer belongs**, in the 28-byte-descriptor machinery **task #15 owns**. So the UI inflate gap and this crash are the same subsystem, and the question is now narrow: who publishes `[job+8]`, and does the record handed to the streamer carry a size there.
+- Instruments left in the tree (log-only; `w385`: 3 guard trips per boot, `LISTLINE` 171, `C0000005` 0, `Fatal error` 0): `F374-HEAPGUARD` (guard page over the arena's first page, **mandatory SELFTEST row**, offsets classified `cap<8` / `hdr<0x28` / `frag`), `F374-HEAPSTORE` (caller RVA of any checked store into `0x20000..0x20240`), `F375-HEAPSTORE` (guest `lr/sp/r3..r7/r13` of the same store). Registered in `PROGRAM_GUIDE` §7 with its risk: the handler claims ANY `C0000005` on that page and continues, so a real crash inside the arena's first 4 KB would be absorbed as a trip.
+- Three of this session's own readings are retracted in F-375 section 2: the dumped 40 bytes are `bins[]`, not the diagnostics fields (`src/kernel/o1heap.c:133-138`: 64 bin pointers, then the mask, then diagnostics at `+0x208`), so "deterministic garbage per build" (F-370 section 2 / F-372 section 3) and "the checked and raw views disagree" (F-373) are both void. What survives: `Translate(0x20000)` never moved, the physical-arena header was not copied, and the bytes equal what the guest wrote.
+- Two reusable traps: re-arming a guard page INSIDE the VEH handler re-faults the same instruction and **segfaults the host** (`w380`, `BOOT_RC=139`, 32-line log); and a function defined inside `boot_host.cpp`'s file-local `namespace {` (lines 63..708) has internal linkage, so `heap.cpp` cannot link to it -- which is why `B1GuardArm` exists only as a wrapper.
+- Frontier unchanged: `W35-BOOT-GATE` 0, `[obj+92]` != `0x82131008`, `nGfx` 0 (and 0 even under the forced dispatch, F-371). Next (T41.64): census who writes `[job+8]` -- acceptance `F370-HEAP-HDR` 0, `F370-THREAD-CTX-NULL` 0, thread #16 alive -- then re-read the UILOAD chain.
+- **Objective:** (a) 3/4 byte-exact + garage 12.3 %/41.3 %; (b) `nGfx`=0, now with the boot's stopping point root-caused to a guest record field that holds a size. **Goal NOT complete.**
+
+## 2026-09-26 ~17:0x (F-372, **3 builds — 2 diagnostic, both reverted — 1 soak `w378`**) - **F-370's host chunked fill is EXCLUDED as the heap-header writer, and the "deterministic garbage" claim was per-BUILD, not absolute: the next binary corrupts with completely different bytes, so there is no needle to grep for.** Ledger through **F-372**; next ID **F-373**.
+
+- Control: `kUiXsfChunkedHostFill=false` (`src/gpu_device.cpp:506`) → `w378.log` @17:02:37.678 still prints `F370-HEAP-HDR #1 phase=pre-alloc cap=0xd2285853978e3af9 want_cap=0x7fe7fdc0` + `F370-THREAD-CTX-NULL #1` + `invariants FAIL #1`, with `C0000005` 0, `Fatal error` 0, `LISTLINE` 171, `nGfx=0`, same park `sp=8EFFF550 lr=82135DF8`. Reverted and re-linked (exe+map 17:06:37) so the binary matches the source.
+- Scope: `PATHB-HOSTDECODE` still printed 11 rows in that soak (different switch: `kPathBHostFullDecode`), so only the chunked-fill path is cleared.
+- Supersedes F-370 §2's inference: identical bytes across `w374`/`w375`/`w376` were three soaks of ONE binary. Neither build's garbage contains a printable byte in either endianness → **do not search archives/goldens for it**.
+- Also excluded statically: nothing else in `src/` binds guest `0x20000` by address (only `heap.cpp:178`), so there is no second explicit owner of that page.
+- Four causes now excluded with fired instruments (heap operation, foreign free, checked guest store, host chunked fill). Remaining: an indirect host pointer into the 4 GB mapping, or a raw `PPC_STORE_U32`. The next real instrument is the DR0-DR3 data watchpoint (B1/F-094 machinery; per F-100 it needs a self-test trip + a neutrality census before anything it says is citable, and DR0/DR1 are currently owned by the globaltex watch — coordinate with whoever runs it).
+- **Objective unchanged:** (a) 3/4 byte-exact + garage 12.3 %/41.3 %; (b) `nGfx`=0 and now also `nGfx`=0 under a forced UILOAD dispatch (F-371). **Goal NOT complete.**
+
+## 2026-09-26 ~16:5x (F-371, **2 builds, 1 soak `w377` + revert**) - **THE USER-APPROVED HOST-DISPATCH TEST IS DONE AND THE ANSWER IS NO: forcing `sub_82131008` (UILOAD) to run does NOT initialise GFx — `nGfx` stays 0 in all six census rows while the gate is verifiably entered and never returns.** Ledger through **F-371**; next ID **F-372**.
+
+- **It ran:** `w377.log` @16:55:54.112 `FIX-821873E8 dispatching BOOT-GATE` → own guest stack (`GATE-STACK r1=007E0220`, not the caller's `8EFFF920`) → `GATE-WAIT [8287E26C]=CF2DBE00 after 210 ms` (F-366's publication reproduces) → `GFX-ALLOC loader=CF37D300` → ctor `0x824C6F08` → `BOOT-GATE-ENTER 82131008 … (no seeds, T38.3f)` → `W35-BOOT-GATE #1`. `BOOT-GATE-RETURN` **0**. Cost: none — `C0000005` 0, `Fatal error` 0, `LISTLINE` 171, `skip fatal` 153, `FLUSH` 64 all `+0` vs `w376`.
+- **So both ends of the F-186/F-187 framing are now measured inert:** content side (F-299/F-302/F-325: 3/4 UI `.xsf` byte-exact in guest memory, `nGfx`=0) and dispatch side (this). What is left on the causal chain is F-370: this boot cannot create its 16th guest thread because the user-heap header at guest `0x20000` is trashed.
+- **Two instrument warnings:** (1) `GFx` 13→19 in this soak is the substring colliding with our own new `GFX-*` lines, **not** progress — the domain field `nGfx=` is 0 in both. (2) `W35-BOOT-GATE` now has two meanings; the lever is back to `false` (`src/gpu_device.cpp:2047`) so a future non-zero must say which fired it.
+- **Also recorded, not pursued:** the loader object our host block builds has `vt0=vt672=8206DFAC` where the faithful value is `0x820736DC/0x820736B0` (and `W34-NOGFX` scans for `0x82073xxx`). Fixing that shape is not on the goal's path while entering the gate itself changes nothing.
+- **Next (T41.63 / F-372):** name the writer that trashes the user-heap header. First control already queued: rebuild with `kUiXsfChunkedHostFill=false` and see whether `F370-HEAP-HDR`/`F370-THREAD-CTX-NULL` disappear — i.e. is our own Path A fill the writer? (`F-340` precedent: less host interference helped the guest.)
+- **Objective:** (a) 3/4 byte-exact + garage 12.3 %/41.3 %; (b) `nGfx`=0 — **now including the forced-dispatch case**, so the gap is not a missing enqueue or a missing dispatch. **Goal NOT complete.**
+
+## 2026-09-26 ~16:3x (F-370, **4 builds — one failed on an opaque type and was not soaked — 3 soaks `w374`/`w375`/`w376`, 1 new tool**) - **F-369's new AV is our own unchecked allocation in `src/kernel/guest_thread.cpp:21` (now guarded, `C0000005` back to 0) — and the reason it failed is the real find: the guest user-heap allocator header at guest VA `0x20000` is overwritten with deterministic garbage, after which `Heap::Alloc` refuses everything and the guest's 16th thread is never created.** Ledger through **F-370**; next ID **F-371**.
+
+- **Named by the link map, not guessed:** `tools/host_rva_resolve.py build/mcla.map --base <image base> <rva>` (every link already writes `mcla.map`, `CMakeLists.txt:410`) resolves the `w373` fault to `memset` ← `GuestThreadContext::GuestThreadContext+0x129` ← `GuestThread::Start`. The ctor did `thread = g_userHeap.Alloc(0x40E70); memset(thread, 0, 0x40E70);` with no null check → write through `null+0x20` (exactly the reported `Param[1]=0x20`). Guard + `Start` refusal added; `C0000005` 2→**0**, structural set (`GFx` 13, `LISTLINE` 171, `INFLATE` 17,784, `CP-DRAW` 166, `GETDEV` 698) `+0`.
+- **Why the alloc failed:** `w376.log:50327 F370-HEAP-HDR #1 phase=pre-alloc cap=0x96e48487fd98c8e0 want_cap=0x7fe7fdc0 used=0x2cd4142a0f504a2 hdr_off=0x0` — the 40-byte `O1HeapInstance` at the arena start (guest `0x20000`, `src/kernel/heap.cpp:178`) is no longer a heap. **Not exhaustion:** `want_cap` is ~2.04 GB, `oom=0` on every healthy row, and `o1heapAllocate returned null` occurs 0 times; 15 thread contexts succeeded first (`F370-HEAP-BIG #1..#15`, `used` 0x0→0x700000, `:2874`). The garbage is **byte-identical in all three soaks** → deterministic writer.
+- **Excluded, each with its own control:** not any heap operation (`pre-alloc`/`post-alloc`/`post-free` bracket — only `pre-alloc` ever fires, and `rejected non-live pointer` 0 times, so not the Session-72/76j foreign-free shape); not a guest store through the checked accessors (`w376.log:30 WATCH: range armed [00020000,00020100)` reported nothing); no host code writes guest `0x20000` (grep). Left: a **raw** store — the recompiler's `PPC_STORE_U32(ea,…)` bypasses the watched accessor path entirely — or a host overrun across the arena start.
+- **F-369 §5 is superseded:** the boot worker's waits on `C501FC00` are NOT stuck. `w376.log:50309-50311` + 21 rows: 6 `WAIT`/6 `RETURNED` (status 0) pairs in one millisecond, same shape on `C6137A00`. The 54 `PARK-SAMPLE lr=82135DF8` rows are a later wait of the same loop. (The first version of this census had one shared cap of 80 and gave 83 rows to the busy handle and **0** to the handle that mattered — a cap hiding an answer, F-089/F-317 again. It is per-handle now: 24 then every 200.)
+- **Still true from F-369:** `Fatal error` 0, `FATAL-SOFT` 0, and the frontier markers unchanged — `W35-BOOT-GATE` 0, `sub_822C2EA8` ENTER with no RETURN, `[obj+92]` ≠ `0x82131008`, `nGfx` 0. Whether a live 16th thread would have carried the chain to `0x821315F4` is **not shown** — it is the first question T41.63 answers.
+- **T41.63 (next):** name the raw writer to guest `0x20000`. The instrument that can do it is a data watchpoint (`B1ArmGuestThread`/DR0-DR1, `src/boot_host.cpp`, F-094) — but **DR0/DR1 are currently owned by the B1 globaltex watch**, so coordinate or extend the register count rather than stealing a live watch. Alternative: route a bounded window of guest stores through the checked accessors so the existing range watch can see them.
+- `kF368HostDispatchGate` is still `false` (`src/gpu_device.cpp:2047`): the user-approved host-dispatch test remains un-run and needs its own soak.
+- **Objective:** (a) 3/4 byte-exact + garage 12.3 %/41.3 %; (b) `nGfx`=0, `W35-BOOT-GATE`=0, with the reason now narrowed to a corrupted host-side allocator header that kills guest thread #16. **Goal NOT complete.**
+
+## 2026-09-26 ~15:5x (F-369, **1 build, 1 soak `w373`, control `w371`**) - **THE F-368 FIX IS IN AND IT WORKS: the `skinningData` park is gone (`Fatal error` 1→0, `FATAL-SOFT` 1→0) and the boot worker now runs ≥1000 wait/release iterations it never reached before. But F-368's prediction only half held: `0x821315F4` is STILL not reached - the chain stops at a NEW place, an INFINITE wait on exhausted semaphore `C501FC00` (init=31), and the fix costs one new host-side `C0000005`.** Ledger through **F-369**; next ID **F-370**. *(§5's "INFINITE wait" is superseded by F-370 §4: those waits return.)*
+
+- **The mitigation:** `src/gpu_device.cpp:17121-17138` clears `sub_82193AF8`'s `required` argument. Byte-verified narrow: `r5` is written once (`ppc_recomp.10.cpp:17741`) and read once (`:17804`) and that read only gates the fatal call at `:17821` → so a missing name now exits through the guest's own `loc_82193BAC` (`li r3,0; blr`). Present names take the identical success path either way, so nothing that could bind is masked.
+- **Do NOT narrow it to `skinningData`:** `w373.log:49846/49848` show TWO softened lookups, `want='skinningData' lr=82379D04` and `want='effectFade' lr=82379D24`, both `req=1`, both issued by `sub_82379C68` with `li r5,1` (`ppc_recomp.58.cpp:3996/4016`), and F-136 measured `effectFade` absent from the image too. Fixing only the named one re-parks the same thread one call later.
+- **Advanced:** park signature moved from `sp=8EFFF890 lr=82193BA0`+`NtDelayExecution` to `w373.log:50279 sp=8EFFF550 lr=82135DF8`+`ZwWaitForAlertByThreadId` (deeper frame), whose stack contains the never-before-seen `0x82465194/0x82465674/0x824662A0` region. `WAITB8` reached `#1000` and `RELSEMA` reached `#1000` where w371 never passed `#24`/`#40` (caps `n<=24||n%1000` and `n<=40||n%500`, so those are real thresholds, not truncated output).
+- **Neutral on the structural set:** `GFx` 13, `W34-GFX-CENSUS` 6, `INFLATE` 17,784, `LISTLINE` 171, `CP-DRAW` 166, `GETDEV` 698, `BE0C8` 368, `READWRAP` 12,020, `UILOAD` 6 all `+0` vs w351/w371.
+- **Still blocked (T41.62, the next question):** `w373.log:197 SEMA-CREATE #8 h=C501FC00 init=31 max=32767 lr=8244ECC8` - in w371 that handle occurs once (its creation); in w373 it is the boot worker's wait target for the rest of the soak. Name who is supposed to release `C501FC00` (i.e. which async job completion never fires) - a producer/consumer question, not an enqueue question. `W35-BOOT-GATE` is still 0 and `sub_822C2EA8` still ENTERs without RETURN (`:2851`).
+- **Cost:** one new `C0000005` (`:52294`, `:52313`), a **host write through null+0x20** on tid=19912 with `ppc ctx=nil tag=none` (the boot worker is tid=0000147C, so not a guest frame), 569 ms after the soft-fail. Suspected but UNCONFIRMED: the two null returns the caller stores into globals (`ppc_recomp.58.cpp:4008/4024`) get used as a pointer by a host helper. Baseline is 0, so this is a real (small) regression to characterise, not to wave away.
+- **Lever state:** `kF368HostDispatchGate = false` (`src/gpu_device.cpp:2047`) so `W35-BOOT-GATE` stays an honest guest signal. The user-approved host-dispatch experiment is therefore **still un-run**; it needs its own soak with the lever true, or its result is ambiguous with ours.
+- **Objective:** (a) 3/4 byte-exact + garage 12.3 %/41.3 %; (b) `nGfx`=0, `W35-BOOT-GATE`=0, with the fatal park removed and the gap relocated to an exhausted loader semaphore. **Goal NOT complete.**
+
+## 2026-09-26 ~15:38 (F-368, **STATIC + LOG EVIDENCE from w371.log:49866-65076**) - **SUPERSEDES F-367: tid=000043A4 is NOT in a healthy consumer loop. It exited the semaphore waits, progressed to `0x82304B50`, and is FROZEN IN A FATAL ERROR on `Required grmShaderGroupVar 'skinningData' not found.`!** Ledger through **F-368**; next ID **F-369**.
+
+- **The smoking gun in `build/w371.log`:**
+  1. `w371.log:49866` @15:25:05.103: `SHGRP-VARS #1 group=A003CA30 vt=8200C4C0 arr=A003CA80 nvars=1 req=1 want='skinningData' e0=A003CA90/'' e1=00000000/'' lr=82379D04`. The group has 1 declared variable whose name is empty; `skinningData` is not found!
+  2. `w371.log:61561-65076` @15:25:05.408..15:26:50.540 (every 2.0s until timeout):
+     `PARK-SAMPLE rawrip=7ffd014e1444 nf=NtDelayExecution+0x14 ... | r3=8200C4C4 r4=8204A408 lr=82193BA0`
+     `r3=0x8200C4C4` = `"Required grmShaderGroupVar '%s' not found."`
+     `r4=0x8204A408` = `"skinningData"`
+     `PARK-STACK sp=8EFFF890 lr=82193BA0: f0=82193B60 f1=82379CA8 f2=82304B50 f3=822C2F7C f4=8213154C f5=82131B54 f6=821BD810 f7=82132454`
+- **Call-stack breakdown:**
+  - `f4 = 8213154C`: inside `sub_82131508` (calling `sub_822C2EA8` at line 3524)
+  - `f3 = 822C2F7C`: inside `sub_822C2EA8` (calling `sub_823047D8` at line 23376)
+  - `f2 = 82304B50`: inside `sub_823047D8` (calling `sub_82379C68` at line 6956 in `ppc_recomp.50.cpp`)
+  - `f1 = 82379CA8`: inside `sub_82379C68` (calling `sub_82611298` at line 3960 in `ppc_recomp.58.cpp`)
+  - `f0 = 82193B60`: inside `sub_82193AF8` (looping over shader vars in `ppc_recomp.10.cpp:17783`)
+  - `lr = 82193BA0`: inside `sub_82193AF8` calling `sub_821BD618` (line 17821)
+  - `sub_821BD618` is the fatal dispatcher, which enters `loc_821BD640: goto loc_821BD640;` (`b .` infinite loop, `ppc_recomp.14.cpp:22095`), where the thread parks/sleeps forever.
+- **Why this changes everything:**
+  F-367 concluded that `0x821315F4` is "post-loop" and that no live producer exists. That is false. The thread is NOT looping normally; it hit a **fatal error** inside `sub_82193AF8` because `skinningData` is missing! That fatal error aborted the call chain, so control never returned to `sub_823047D8` -> `sub_822C2EA8` -> `sub_82131508`.
+- **The actual blocker for Deliverable (b):**
+  The missing shader group variable `skinningData` (the known F-143..F-149 / F-164 issue: retail archive `xarchive_cache.rpf` lacks `.mtlgeo` / `RimMain` / `skinningData`, or `sub_82193AF8` needs a soft-pass / non-fatal return or dummy var). If `sub_82193AF8` does not fatal out on `skinningData`, `sub_823047D8` can complete, `sub_822C2EA8` can complete, and `sub_82131508` will reach `0x821315F4` and register the UI-load callback!
+
 ## 2026-09-26 ~15:3x (F-367, **zero builds — log reads + one compiled-body read**) - **the "non-return" is a healthy wait-loop, so the UI-load registration site is post-loop and this direction is closed.** Ledger through **F-367**; next ID **F-368**.
 
 - `h=C6137A00` is a **semaphore** (`SEMA-CREATE #14 init=15 max=32767 lr=8244ECC8`). On that handle: 31 `WAIT[NTWFSO]` — **29 from tid=000043A4**, the registering thread — plus 10 `RELSEMA sub_821C9108` and 8 `SIGNAL`. One stuck wait cannot coexist with 29 waits and releases from the same tid: that thread is cycling a consumer loop.

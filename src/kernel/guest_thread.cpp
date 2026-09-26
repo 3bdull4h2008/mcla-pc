@@ -5,6 +5,8 @@
 #include <kernel/function.h>
 #include "ppc_context.h"
 #include <boot_host.h>  // B1ArmGuestThread (F-094 discriminator)
+#include "logging.h"    // F-370: failed thread-context allocation must be named, not AV'd
+#include <atomic>
 
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
@@ -19,6 +21,20 @@ GuestThreadContext::GuestThreadContext(uint32_t cpuNumber)
     assert(thread == nullptr);
 
     thread = (uint8_t*)g_userHeap.Alloc(TOTAL_SIZE);
+    if (thread == nullptr)
+    {
+        // F-370: this used to fall straight into `memset(nullptr, 0, 0x40E70)`, which is the
+        // 2026-09-26 w373 host C0000005 (write to 0x20 inside memset, called from
+        // GuestThread::Start -> this ctor) and it killed the new thread silently. Logging the
+        // failure makes "the guest asked for N threads and got M<N" answerable from the log;
+        // GuestThread::Start below refuses to run the entry point when the context has no stack.
+        static std::atomic<uint32_t> s_ctxNull{0};
+        const uint32_t n = s_ctxNull.fetch_add(1) + 1;
+        if (n <= 16 || (n % 100) == 0)
+            MCLA_LOG_ERROR("F370-THREAD-CTX-NULL #{} size=0x{:X} cpu={} - thread NOT started", n,
+                           static_cast<unsigned>(TOTAL_SIZE), cpuNumber);
+        return;
+    }
     memset(thread, 0, TOTAL_SIZE);
 
     *(uint32_t*)thread = ByteSwap(mcla::kernel::g_memory.MapVirtual(thread + PCR_SIZE)); // tls pointer
@@ -153,6 +169,10 @@ uint32_t GuestThread::Start(const GuestThreadParams& params)
 
     GuestThreadContext ctx(cpuNumber);
     ctx.ppcContext.r3.u64 = params.value;
+
+    if (ctx.thread == nullptr)
+        return 0;  // F-370: no stack window was allocated, so the entry point would fault on its
+                   // very first store; the ctor already logged F370-THREAD-CTX-NULL.
 
     auto func = mcla::kernel::g_memory.FindFunction(params.function);
     if (!func) return 0;

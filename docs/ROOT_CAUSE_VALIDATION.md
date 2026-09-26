@@ -8274,4 +8274,1163 @@ The second garage shape is `XMEM-SZPTR #14,#16,#18,#20,#22,#24`: `*srcSz(in)=20`
 
 **4. Objective state.** (a) three byte-exact; garage 41.3 %/12.3 %; ceiling closed from both hook-reachable sides (F-356/F-357) — **not complete**. (b) `nGfx`=0, and the assumed mechanism is now shown unreachable-by-construction rather than merely unfound — **not complete**. No further probe in the `sub_82131508` direction. Next ID F-368.
 
+### F-368 (2026-09-26 ~15:38, **STATIC + LOG EVIDENCE from w371.log:49866-65076**) — **SUPERSEDES F-367: tid=000043A4 is NOT in a healthy consumer loop. It completed its semaphore work, progressed to `0x82304B50`, and is FROZEN IN A FATAL ERROR on `Required grmShaderGroupVar 'skinningData' not found.` inside `sub_82193AF8`!**
 
+- Task:        T41.60 — re-scoped to the true blocker of the registration chain.
+- Type:        FACT (+ supersession of F-367's post-loop premise)
+- Class:       G / D
+- Priority:    P0
+- Evidence:    `build/w371.log` (65,144 lines):
+  1. `w371.log:49866` @15:25:05.103: `SHGRP-VARS #1 group=A003CA30 vt=8200C4C0 arr=A003CA80 nvars=1 req=1 want='skinningData' e0=A003CA90/'' e1=00000000/'' lr=82379D04`. The group has 1 declared variable whose name is empty; `skinningData` is not found.
+  2. `w371.log:61561-65076` @15:25:05.408..15:26:50.540 (every 2.0s until timeout):
+     `PARK-SAMPLE rawrip=7ffd014e1444 nf=NtDelayExecution+0x14 ... | r3=8200C4C4 r4=8204A408 lr=82193BA0`
+     `r3=0x8200C4C4` = `"Required grmShaderGroupVar '%s' not found."`
+     `r4=0x8204A408` = `"skinningData"`
+     `PARK-STACK sp=8EFFF890 lr=82193BA0: f0=82193B60 f1=82379CA8 f2=82304B50 f3=822C2F7C f4=8213154C f5=82131B54 f6=821BD810 f7=82132454`
+
+**1. Call-stack breakdown of the frozen boot thread (`tid=000043A4`):**
+- `f4 = 8213154C`: inside `sub_82131508` (calling `sub_822C2EA8` at line 3524, `ppc_recomp.0.cpp`)
+- `f3 = 822C2F7C`: inside `sub_822C2EA8` (calling `sub_823047D8` at line 23376, `ppc_recomp.43.cpp`)
+- `f2 = 82304B50`: inside `sub_823047D8` (calling `sub_82379C68` at line 6956 in `ppc_recomp.50.cpp`)
+- `f1 = 82379CA8`: inside `sub_82379C68` (calling `sub_82611298` at line 3960 in `ppc_recomp.58.cpp`)
+- `f0 = 82193B60`: inside `sub_82193AF8` (looping over shader vars in `ppc_recomp.10.cpp:17783`)
+- `lr = 82193BA0`: inside `sub_82193AF8` calling `sub_821BD618` (line 17821, `ppc_recomp.10.cpp`)
+- `sub_821BD618` is the fatal dispatcher, which enters `loc_821BD640: goto loc_821BD640;` (`b .` infinite loop, `ppc_recomp.14.cpp:22095`), where the thread parks/sleeps forever.
+
+**2. Why F-367's "unreachable-by-construction" premise is false.**
+F-367 observed the thread performing 29 semaphore waits on `C6137A00` before 15:25:05 and deduced that the thread is in a healthy consumer loop, concluding that `0x821315F4` is placed after this loop and therefore unreachable by design.
+In fact, the thread completed that semaphore work, moved forward to `0x82304B50`, and crashed into the fatal error on `skinningData`. The non-return of `sub_822C2EA8` and `sub_82131508` is NOT a normal loop; it is a fatal error freeze aborting the call chain before reaching `0x821315F4`.
+
+**3. The true blocker for Deliverable (b):**
+The missing shader group variable `skinningData` (the known F-143..F-149 / F-164 issue: retail archive `xarchive_cache.rpf` lacks `.mtlgeo` / `RimMain` / `skinningData`, or `sub_82193AF8` needs a soft-pass / non-fatal return or dummy var). If `sub_82193AF8` does not fatal out on `skinningData`, `sub_823047D8` can complete, `sub_822C2EA8` can complete, and `sub_82131508` will reach `0x821315F4` and register the UI-load callback! Next ID F-369.
+
+### F-369 (2026-09-26 ~15:5x, **1 build, 1 soak; the soft-fail is byte-verified against the body before it was written**) — **THE F-368 FIX: clearing `sub_82193AF8`'s `required` flag removes the park, and the boot worker runs hundreds of iterations further — but F-368's prediction is only half right: the chain still does not reach `0x821315F4`. It now stops at a NEW place, an INFINITE wait on exhausted semaphore `C501FC00` (init=31), and the fix costs one new host-side `C0000005`.**
+
+- Task:        T41.61 (user-directed soft-fail), soak `build/w373.log` (65,495 lines) vs control `build/w371.log` (65,144, same probes) and committed baseline `build/w351.log`.
+- Type:        FIX (labelled mitigation, registered in PROGRAM_GUIDE §7)
+- Class:       G + D
+- Priority:    P0
+- Evidence:    `src/gpu_device.cpp:17121-17138` (the mitigation itself; hook opens at `:17059`) · `build/w373.log:49846`, `:49848`, `:50123`, `:50133`, `:50279/50281`, `:52294/52313`, `:197`, `:2851`, `:6903` · raw words `ppc_recomp.10.cpp:17741/17804/17821`, `ppc_recomp.58.cpp:3996-4029`
+
+**1. The mitigation and why it is provably narrow (raw-byte check, not IDA).** `sub_82193AF8(group=r3, name=r4, required=r5)` writes `r5` exactly once — `ppc_recomp.10.cpp:17741 mr r25,r5` — and reads it exactly once — `:17804 clrlwi r11,r25,24 / cmplwi cr6,r11,0 / beq cr6,0x82193BAC` — that branch being the only thing standing between "name not found" and `:17821 bl 0x821bd618`, whose host override parks the thread forever (`src/kernel/imports.cpp:3028 while (true) Sleep(1000)`). So `ctx.r5 = 0` at entry cannot change anything except: a missing name now returns through the guest's OWN exit `loc_82193BAC` (`li r3,0; addi r1,r31,176; blr`). When the name IS present, both flag values reach the same `loc_82193BC0` success work, so a binding that would have succeeded is not masked.
+
+**2. Two names, not one — the literal instruction would have parked 20 bytes later.** `w373.log:49846 F369-SHGRP-SOFT #1 want='skinningData' group=A003CA30 req=1 -> 0 lr=82379D04` and `:49848 F369-SHGRP-SOFT #2 want='effectFade' … lr=82379D24`. `sub_82379C68` issues both calls with `li r5,1` (`ppc_recomp.58.cpp:3996` and `:4016`), and F-136 measured `effectFade` (`0x8204A3FC`) absent from the image exactly like `skinningData` (`0x8204A408`). Soft-failing only `skinningData` would therefore have re-parked the same thread one call later and looked like a failed fix. The hook softens **any** `required` lookup and **prints every one with its name** — the widening is explicit, not silent.
+
+**3. What advanced (all four are cap-honest).**
+- The park is gone: `Fatal error` 1→**0**, `FATAL-SOFT` 1→**0** (w351/w371 both 1). Park signature changed from `sp=8EFFF890 lr=82193BA0` + `NtDelayExecution` (w371:61561-65076) to `w373.log:50279/50281 sp=8EFFF550 lr=82135DF8` + `ZwWaitForAlertByThreadId` — a *deeper* frame (0x8EFFF550 < 0x8EFFF890) and a real guest wait instead of a host sleep.
+- The boot worker reached code it had never reached: its new stack is `f0=70660000 f1=821C9138 f2=824662A0 f3=8EFFF815 f4=821C976C f5=82465674 f6=82465194 f7=822D48D8` — the `0x82465xxx/0x8246xxxx` region appears nowhere in w371's boot-worker stack.
+- Guest kernel traffic multiplied: `w373.log:50123 WAITB8 sub_82135DB8 #1000` (printer cap `n<=24 || n%1000==0`; w371's last row is `#24` → **w371 <1000, w373 ≥1000**) and `:50133 RELSEMA sub_821C9108 #1000` (cap `n<=40 || n%500==0`; w371's last is `#40` → **w371 <500, w373 ≥1000**).
+- Everything structural held: `GFx` 13=13, `W34-GFX-CENSUS` 6=6, `INFLATE` 17,784=17,784, `LISTLINE` 171=171, `CP-DRAW` 166=166, `GETDEV` 698=698, `BE0C8` 368=368, `READWRAP` 12,020=12,020, `UILOAD` 6=6, `PATHB-HOSTDECODE` 13=13.
+
+**4. What did NOT happen, so F-368 §3 stays unproven.** `W35-BOOT-GATE` **0**, `sub_822C2EA8` still ENTER-with-no-RETURN (`w373.log:2851`, tid=0000147C — the same probe pair as w371), `F365-COPIER` still only the `desc[+4]=821FC008` registration (`:6903`), and `[obj+92]` never becomes `0x82131008` (`F361-BOOTOBJ` prints `want+92=82131008 got+92=00000000`, which is the printer's own literal text, not evidence of a registration). So removing the fatal park did **not** by itself let `sub_82131508` reach its UI-load registration — the chain simply has a new stop.
+
+**5. New frontier (T41.62): the boot worker blocks INFINITE on `C501FC00`, a semaphore created with `init=31`.** `w373.log:197 SEMA-CREATE #8 h=C501FC00 init=31 max=32767 lr=8244ECC8` — in w371 that handle appears exactly once (its creation); in w373 it is the parked waiter's `r3` in every PARK-SAMPLE from 15:52:16.342 to the end of the soak. A 31-count semaphore + `≥1000` releases means the boot worker consumed every permit and is waiting for a job completion that is not arriving — the same shape as F-317's "waits are all timeouts, nobody signals", now on the *boot* thread rather than a worker. This is the next thing to name, and it is a producer/consumer question, not an enqueue question.
+
+**6. Cost, stated plainly: one new `C0000005`.** `w373.log:52294 Vectored exception: code=0xC0000005 … thread=19912` with `Param[0]=0x1` (write) and `Param[1]=0x20` → a **host write through a null object at +0x20**, `ppc ctx=nil tag=none tid=19912` (not a guest-executing thread; the boot worker in this run is tid=0000147C), and `:52313 VEH W0: parking thread 19912 … process stays alive`. Baseline w351/w371 = 0. Timing is 569 ms after the soft-fail. Consistent with the caller storing the two now-null returns (`stw r3,-8116(r7)` / `-8112(r5)`, `ppc_recomp.58.cpp:4008/4024`) into globals that some host-side helper later uses as a pointer — **unconfirmed**: no fault context exists to publish, so naming the site needs a new probe, and this entry does not claim it.
+
+**7. Instrument state.** `F369-SHGRP-SOFT` (cap `k<=16 || k%200==0`) stays in the tree. `kF368HostDispatchGate` is deliberately **false** (`src/gpu_device.cpp:2047`) so `W35-BOOT-GATE` remains a genuine guest signal; the user-approved host-dispatch test is therefore still un-run and needs its own soak with the lever true. Next ID F-370.
+
+### F-370 (2026-09-26 ~16:3x, **4 builds — one failed on `O1HeapInstance` being an opaque type and was NOT soaked, per the stale-exe rule — 3 soaks `w374`/`w375`/`w376`, 1 new tool**) — **F-369 §6's new AV is OURS and is now fixed, and the thing behind it is bigger: the guest's user-heap allocator header (guest VA `0x20000`) is overwritten with deterministic garbage during boot, after which `Heap::Alloc` refuses everything, the guest's 16th thread is never created, and the loader stalls. It is provably not a heap operation and not a checked guest store.** Supersedes F-369 §5's "INFINITE wait on an exhausted semaphore" wording.
+
+- Task:        T41.62 (started as "who releases `C501FC00`"; the answer turned out to be upstream of that).
+- Type:        FACT (+ FIX: one null-check guard, one census budget) + supersession of F-369 §5.
+- Class:       D (host runtime implementation) with a G (guest wild store) half still open.
+- Priority:    P0
+- Evidence:    `build/w376.log:30`, `:2874`, `:50309-50311`, `:50327`, `:50332`, `:50334`, `:50335` · `build/w373.log:52294`/`:52313` (the AV this explains) · `src/kernel/guest_thread.cpp:21-22` (unchecked alloc), `:154` · `src/kernel/heap.cpp:121-215` (the header bracket), `:178-180` (arena = guest `0x20000`) · `tools/host_rva_resolve.py` (new) resolving `build/mcla.map`
+
+**1. The AV is named, and it is our code.** `build/w373.log:52294` (`Param[0]=0x1` write, `Param[1]=0x20`, `ppc ctx=nil`) resolves through the link map — `rip → memset`'s vector loop, caller chain `GuestThreadContext::GuestThreadContext+0x129` → `GuestThread::Start` → `GuestThreadFunc` → `std::thread::_Invoke`. `src/kernel/guest_thread.cpp:21` is `thread = (uint8_t*)g_userHeap.Alloc(TOTAL_SIZE);` with `TOTAL_SIZE = 0x40E70`, immediately followed at `:22` by `memset(thread, 0, TOTAL_SIZE)` — **no null check**, so a refused allocation became a write through `null+0x20`. Fixed: the ctor now logs `F370-THREAD-CTX-NULL` and `GuestThread::Start` refuses to run an entry point whose context has no stack window. Result `w374`/`w375`/`w376`: `C0000005` **0** (= baseline), `VEH W0: parking thread` **0**, while `GFx` 13, `LISTLINE` 171, `INFLATE` 17,784, `CP-DRAW` 166, `GETDEV` 698 all stay `+0`.
+
+**2. What made the allocation fail: the allocator's own header is garbage.** `w376.log:50327 F370-HEAP-HDR #1 phase=pre-alloc subj=0x40e90 cap=0x96e48487fd98c8e0 want_cap=0x7fe7fdc0 used=0x2cd4142a0f504a2 peak=0xd9eecb51fa816790 hdr_off=0x0 glr=00000000`. The user heap is bound at `src/kernel/heap.cpp:178` to guest `0x20000`, so `hdr_off=0x0` means the **first 40 bytes of guest memory at `0x20000`** — the `O1HeapInstance` — no longer describe a heap. `want_cap=0x7FE7FDC0` = `RESERVED_BEGIN-0x20000` captured at `Init`, i.e. the arena is ~2.04 GB: this is **not exhaustion** (`oom=0` on every healthy row, and `Heap::Alloc` would have logged `returned null`, which occurs **0** times). `w376.log:50332 F370-HEAP-BIG #16` shows the same garbage one line later, and `:2874 F370-HEAP-BIG #15` two seconds earlier shows `used=0x700000 cap=0x7fe7fdc0 oom=0` — perfectly healthy. So 15 thread contexts (0x40E90 each, `caller_rva` resolving inside the ctor) succeeded, then the header went bad before the 16th.
+**The garbage is byte-identical in `w374`, `w375` and `w376`** (different ASLR bases, same 40 bytes) → a deterministic writer, not a random scribble.
+
+**3. What the instrument excludes (each exclusion has a fired control).**
+- **Not a heap operation.** `CheckHeapHeader` runs on `pre-alloc`, `post-alloc` AND `post-free` (`src/kernel/heap.cpp:287`, `:317`, Free's user-heap branch). Across three soaks only the `pre-alloc` row ever fires: every alloc and every free leaves the header sane, so the corruption happens *outside* the allocator. `Heap::Free` also logged `rejected non-live pointer` **0** times, so it is not the Session-72/76j foreign-free shape.
+- **Not a guest store through the checked accessors.** `w376.log:30 WATCH: range armed [00020000,00020100)` — the existing range watch was armed and reported nothing all soak. (Session 72 had armed a 0x200 window here and seen nothing; that run never reached this stage — this one does, and it still sees nothing.)
+- **Not an explicit host write:** `grep -rn "0x20000\b" src/` finds only `Heap::Init`'s arena binding and this session's comments.
+- What is left, unnamed: a **raw** store — the recompiler's `PPC_STORE_U32(ea, …)` indexes the guest heap directly and therefore bypasses the checked-accessor watch entirely — or a host buffer overrun crossing the arena start. Naming it needs a per-store instrument (hardware DR watchpoint on `0x20000`, which the B1 machinery already implements for other pages, or checked-store coverage in the recompiler) — that is T41.63, and the DR0/DR1 pair is currently owned by B1 (F-094), so it needs coordination, not a silent steal.
+- **Not a logged serve destination either.** All 62 distinct `dest=` values in `w376.log` (the `JOB2-PKG-SERVE`/`PATHB-HOSTDECODE`/`BE710-SLOT` family — 5,394 job-2 serves fire inside the 2.06 s corruption window alone) are ≥ `0xA47F9000`; none is anywhere near `0x20000`. So the writer does not go through any destination this census prints.
+- **First observed now, and that is weak evidence, not proof of cause.** Scanning 40 soaks (`w19x`…`w37x`) for `invariants FAIL` or `o1heapAllocate returned null`: **zero hits outside `w373`+**, i.e. this is the first time the failure is visible. It is equally consistent with "the corruption always happened, but no soak ever reached a 16th `Heap::Alloc` to see it" — the pre-F-369 boots parked long before that. Do not record it as "F-369 caused the corruption" on this evidence.
+
+**4. F-369 §5 corrected, with the reason.** F-369 said the boot worker "blocks INFINITE on `C501FC00` … waiting for a job completion that is not arriving". The per-handle census shows the waits are **not** stuck: `w376.log:50309-50311` and 21 more rows — 6 `WAIT` + 6 `RETURNED` (status `x=00000000`) pairs on `C501FC00` inside one millisecond, and the same shape on `C6137A00`. The 54 `PARK-SAMPLE sp=8EFFF550 lr=82135DF8` rows are the thread sitting in a *later* wait of that same loop. So F-367 was right that a loop exists, and wrong for a different reason than F-368/F-369 gave: the loop is real, but the work it is chewing through is capped by the dead allocator. Why the budget mattered: the original single cap (`k<=80`) gave 83 of 84 rows to the busy handle and **0** to `C501FC00`'s WAIT row — the instrument's own cap had hidden the answer (F-089/F-317's shape again, this time as a false negative rather than a false zero).
+
+**5. Consequence chain actually measured (the part that matters for the goal).** Header corrupted (≤16:39:44.512) → `Heap::Alloc` returns null for the 16th thread context → with F-369's guard the failure is now *named* instead of AV-ing (`F370-THREAD-CTX-NULL #1`, `w376.log:50335`) → `W35-BOOT-GATE` still 0, `sub_822C2EA8` still ENTER-without-RETURN, `[obj+92]` still ≠ `0x82131008`. Whether the guest would have reached `0x821315F4` with a live 16th thread is **not yet shown** — it is now the first question T41.63 can answer, and the honest state is: this boot stops because the host's allocator header is trashed, not because a producer is missing.
+
+**6. Instruments added (all log-only, all regression-neutral on the structural set).** `tools/host_rva_resolve.py` (names a host RVA/absolute address from `build/mcla.map`, which every link already writes — `CMakeLists.txt:410` `/MAP`; validated on `mcla_ApplyPatches` → `+0x0`); `F370-HEAP-BIG` (user-heap allocations ≥256 KiB, with `cap/used/peak/oom` + `caller_rva`, first 40 then every 200); `F370-HEAP-HDR` (the O(1) header bracket, first 8 then every 500); `F370-SEMA` (`WAIT`/`RETURNED`/`RELEASE` rows for every semaphore created with a non-zero initial count, registry at `src/boot_host.cpp` F-370 block, **per-handle** budget 24 then every 200); `F370-THREAD-CTX-NULL`. None of these change guest state; the two behaviour changes are the thread-ctx null guard + `Start` refusal (registered in `PROGRAM_GUIDE` §7). Next ID F-371.
+
+### F-371 (2026-09-26 ~16:5x, **2 builds, 1 soak `w377` + the revert**) — **THE USER-APPROVED HOST-DISPATCH TEST IS RUN AND IT ANSWERS NO: forcing `sub_82131008` (the UILOAD gate) to execute DOES NOT initialise GFx. `nGfx` stays 0 in all six census rows while the gate is verifiably entered.** This closes the last lever that F-186/F-187 framed as "registration → dispatch", and it retires a marker's meaning.
+
+- Task:        T41.61/T41.62 follow-up — the door F-358 §3 and F-367 §5 left to the user ("acceptance: `W35-BOOT-GATE` > 0, then `nGfx`").
+- Type:        FIX-test (a measurement of an approved experiment) + FACT.
+- Class:       G (the guest's own coded behaviour once forced).
+- Priority:    P0
+- Evidence:    `build/w377.log` @16:55:54.112 `FIX-821873E8 dispatching BOOT-GATE (sub_82131008) on its own thread` → `:54.113 GATE-STACK own guest stack r1=007E0220 (caller's was 8EFFF920)` → `:54.333 GATE-WAIT [8287E26C]=CF2DBE00 after 210 ms` → `GFX-ALLOC loader=CF37D300 null=false` → `GFX-CTOR entering/done loader=CF37D300 vt0=8206DFAC vt672=8206DFAC` → `GFX-CTOR-VT-MISMATCH … want 820736DC/820736B0` → `BOOT-GATE-ENTER 82131008 r1=007DF220 r13=8F200000 lr=822FBC28 (no seeds, T38.3f)` → `W35-BOOT-GATE #00001 r3=0 r4=0 r5=0`. `BOOT-GATE-RETURN` **0**. `grep -oE "nGfx=[0-9]+"` → `6 × nGfx=0`, identical to `w376`.
+
+**1. What was forced, and it really ran.** `kF368HostDispatchGate=true` (`src/gpu_device.cpp:2047`) lets the alive path of `PPC_FUNC(sub_821873E8)` reach `dispatchBootGateOnce()`, which the F-358 census had shown unreachable (every hit took the alive exit, and the dispatch sat in the TLSDEAD branch). The gate got its **own** guest stack (0x007E0220, not the caller's 0x8EFFF920), waited 210 ms for `[0x8287E26C]` and found `CF2DBE00` — i.e. F-366's "[0x8287E26C] IS eventually published" reproduces from this site — then allocated the GFx loader, called its ctor `0x824C6F08`, and entered `sub_82131008` seed-free. No crash was needed to get there: `C0000005` **0**, `Fatal error` **0**, `LISTLINE` 171, `skip fatal` 153, `FLUSH` 64, `REQFILL` 2 all `+0` vs `w376`.
+
+**2. The answer.** `nGfx=0` everywhere, and `W34-NOGFX` still reads "no GFx loader objects (vt 0x82073xxx) in scan bands; UILOAD/EF220 never armed after inflate". So the F-186/F-187 premise — that the containers fail to reach GFx because the enqueue/dispatch never happens — is now measured **inert from the dispatch side too**, mirroring F-299/F-302/F-325 on the content side (3/4 UI `.xsf` byte-exact in guest memory also left `nGfx`=0). What is left standing after this session's chain is F-370: this boot cannot even create its 16th guest thread because the user-heap header is trashed.
+
+**3. Two instrument warnings this run produced.** (a) **`GFx` 13 → 19 is not progress** — it is the substring collision in the census: `grep -ic GFx` matches our own new `GFX-ALLOC`/`GFX-CTOR*`/`GFX-BLOCK` lines (F-321(1)/F-051 class; the domain value `nGfx=` is unchanged at 0). (b) **`W35-BOOT-GATE` now has two possible meanings** and only one of them is news: while the lever is true the marker is printed by our dispatch. It is therefore set back to `false` with this comment, and any future non-zero must state which produced it.
+
+**4. The GFx loader object our host code builds is not shaped like a real one.** The ctor at `0x824C6F08` wrote `vt0=8206DFAC / vt672=8206DFAC`; the block's own faithful expectation (from `generated/ppc_recomp.94.cpp:3559-3587`) is `0x820736DC / 0x820736B0`, and `W34-NOGFX` scans for `0x82073xxx`. Same value at both offsets is its own smell (a single-word write into a 1024-byte zero-filled buffer, not a vtable pair). **Not pursued here** — it is a *consequence* of the forced dispatch, and with `nGfx=0` even entering the gate, fixing the object shape is not on the goal's critical path. Recorded so the next session does not re-derive it. Next ID F-372.
+
+### F-372 (2026-09-26 ~17:0x, **3 builds: control build, its soak, then revert+rebuild; 1 soak `w378`**) — **F-370's host fill is EXCLUDED as the heap-header writer, and F-370 §2's "deterministic garbage" is corrected: the bytes are deterministic per BUILD, not across builds.**
+
+- Task:        T41.63 step 1 (the cheapest discriminator on the candidate list).
+- Type:        FACT (+ supersession of F-370 §2's determinism claim).
+- Class:       D — the writer is still unnamed.
+- Priority:    P1
+- Evidence:    `build/w378.log` @17:02:37.678 — `F370-HEAP-HDR #1 phase=pre-alloc cap=0xd2285853978e3af9 want_cap=0x7fe7fdc0 used=0x7176c9c124c4bc4e peak=0xc40c3f272d1e0dab`, then `F370-HEAP-BIG #16` with the same values, then `F370-THREAD-CTX-NULL #1 size=0x40E90 cpu=0 - thread NOT started`. Switch: `kUiXsfChunkedHostFill` (`src/gpu_device.cpp:506`) compiled `false` for this build only, then reverted; `build/mcla.exe` and `build/mcla.map` both re-linked 17:06:37 so the tree's binary matches its source.
+
+**1. The control ran and the corruption survived.** With the chunked host fill compiled out, the boot still finds a dead allocator header and still refuses thread #16, and nothing else moved either: `C0000005` 0, `Fatal error` 0, `LISTLINE` 171, `nGfx=0` (all 6 census rows), boot worker park unchanged at `sp=8EFFF550 lr=82135DF8`. So **the largest single host writer of UI bytes is not what trashes the header**, and F-340's "less host interference helped the guest" does not extend to this failure.
+
+**2. Scope of the exclusion, stated narrowly.** `PATHB-HOSTDECODE` printed **11** rows in `w378`, not 0 — that traffic is gated by a *different* switch (`kPathBHostFullDecode`). This control therefore clears the chunked-fill path only; the other host decode/placement paths stay live candidates.
+
+**3. F-370 §2 corrected.** "Byte-identical in `w374`/`w375`/`w376` ⇒ deterministic writer" was three soaks of **one binary**. `w378` is the next binary and every field differs (`cap` `0x96e48487fd98c8e0` → `0xd2285853978e3af9`, plus the other three). Decoded little- and big-endian, neither set contains a printable byte. The invariance is per build, which argues against "a fixed guest content blob is copied over the header" and toward something derived from the build's own layout. **Consequence for T41.63: do not go looking for this byte pattern in archives, goldens or the XEX — the needle does not exist.**
+
+**4. One more static exclusion.** Restricting `Translate(0x…)`/`MapVirtual(0x…)` to short addresses in `src/` returns exactly one hit — `src/kernel/heap.cpp:178`, the arena binding itself. No other host code binds guest `0x20000` by address, so a second explicit owner of that page is ruled out; what remains is an indirect pointer (a wild or negative offset from another host pointer into the 4 GB mapping) or a raw recompiler store, which is where T41.63 already stood.
+
+**5. Cost, so the next move can be weighed.** Two of this stretch's builds were diagnostic-only and both were reverted, and F-371's approved dispatch test consumed one more. Four candidate causes are now excluded with fired instruments (any heap operation, foreign free, checked guest store, host chunked fill), and none of the six soaks since F-369 moved `nGfx` or the guest's own `W35-BOOT-GATE`. The next instrument with real power is a data watchpoint over those 40 header bytes — the B1/DR0-DR1 machinery (F-094), which per F-100 is only citable with a self-test trip AND a neutrality census, and whose two registers are currently owned by another instrument. Next ID F-373.
+
+### F-373 (2026-09-26 ~17:1x, **1 build, 1 soak `w379`**) — **an instrument-integrity result, and its own conclusion was wrong (corrected in F-375 §2): a checked read of guest `0x20000` returned 40 zero bytes while `o1heapGetDiagnostics` reported `cap=0x7FE7FDC0`, which I read as "the checked path and the raw base disagree". They never measured the same bytes.**
+
+- Task:        T41.63 step 2 (fix the F-370 instrument before believing its output).
+- Type:        FACT + self-correction (superseded in interpretation by F-375 §2; the raw rows stand).
+- Evidence:    `build/w379.log` `F373-HEAP-GOLDEN #1 base=0x100020000 read_ok=true cap=0x7fe7fdc0 hex=00…00` (positive control: the reader fires while the heap is healthy) and `F373-HEAP-RAW #1 phase=pre-alloc base=0x100020000 retrans=0x100020000 moved=false read_ok=true phys_read_ok=true phys_same=false hex=ef651220ccdf230c…`.
+- What stands: `moved=false` proves the host page behind `Translate(0x20000)` did **not** change, so "our cached allocator pointer went stale" is excluded — the corruption is in the bytes, not in the pointer. `phys_same=false` excludes a copy of the physical-arena header. The 40 raw bytes are identical to the values F-374 later caught the guest writing, i.e. the dump was telling the truth about content and I mis-assigned which fields it was.
+- What is void: the inference that the checked and raw views of guest `0x20000` differ. `src/kernel/o1heap.c:133-138` puts `bins[64]` first and the diagnostics at `+0x208`, so the dumped window is the free-bin array, not `capacity`/`allocated`. Next ID F-374.
+
+### F-374 (2026-09-26 ~17:2x-17:3x, **4 builds: 1 segfaulted the host, 1 failed to link, 2 soaked; soaks `w380`(void)/`w382`/`w384`**) — **the guard page works and the SELFTEST fires: a write into the host user-heap's first page is caught with its host RIP and guest `lr`, and it is our own checked writer `GuestMemoryView::WriteU32BE`.**
+
+- Task:        T41.63 step 3 (the instrument that F-373's conclusion made necessary: recompiler stores bypass the checked-accessor watch, and `SetThreadContext(CONTEXT_DEBUG_REGISTERS)` on a running thread is a no-op — F-100 — so a page guard is the only thing that can see this).
+- Type:        FIX (a labelled instrument, registered in `PROGRAM_GUIDE` §7) + FACT.
+- Evidence:    `build/w382.log:505` `F374-HEAPGUARD trip=1 off=0X0 want=R live=true selftest=true … (cap=1,hdr=0,frag=0)` then the arm line `SELFTEST done page=100020000 trips=1 selftests=1` — the self-test the F-100 rule demands; `:50047` `trip=4-style row off=0X0 want=W hostRIP=… rva=0X1AED8D guestLR=821BC998` = `GuestMemoryView::WriteU32BE+0xa1` (17:30:56.311), with `F370-HEAP-HDR #1` at 17:30:56.466; `build/w384.log` @17:37:45.823 then 16 rows of `F374-HEAPSTORE … guest=00020000 → 0002003C, caller_rva=0x1575ec1` (all one burst, one caller).
+- Both failures are recorded because each is a reusable trap: (a) **re-arming the page inside the VEH handler makes the faulting instruction re-fault** — the host died with `BOOT_RC=139` 34 ms into `w380` and produced a 32-line log; (b) a function defined inside `boot_host.cpp`'s file-local `namespace {` (opened at line 63, closed at 708) has internal linkage, so the linker rejected `mcla::boot::HeapGuardArm` — the same reason `B1GuardArm` exists only as a wrapper. Next ID F-375.
+
+### F-375 (2026-09-26 ~17:4x, **5 builds — 2 of them failed and were NOT soaked — 3 soaks `w382`/`w384`/`w385`, 1 instrument chain**) — **THE HEAP-HEADER WRITER IS THE GUEST ITSELF, and it is a vtable dispatch through a bogus object pointer: a streamer job record's object field `[job+8]` holds the SIZE `0x20000` instead of a pointer, the guest reads a "vtable" from host-heap memory at that address, `bctrl`'s into whatever word it finds (there: its own `memcpy`), and that routine writes back through `0x20000` — which is where the HOST's user-heap arena begins. This is the root cause of F-370's dead allocator, and it retires F-370 §2/F-372 §3's "deterministic garbage" reading entirely.**
+
+- Task:        T41.63 — answered.
+- Type:        FACT (root cause) + instruments (`F374-HEAPGUARD`, `F374-HEAPSTORE`, `F375-HEAPSTORE`).
+- Class:       G (the title's own coded behaviour) + D (the host put its allocator inside the guest's address space).
+- Priority:    P0
+- Evidence:    `build/w382.log:505` (SELFTEST trip), `:49529` (trip want=R), `:50047` (trip want=W, `rva=0x1AED8D`), `:50294` (`F370-HEAP-HDR #1`, 155 ms later) · `build/w384.log` @17:37:45.823 — 16 `F374-HEAPSTORE` rows marching `guest=00020000 → 0002003C`, all `caller_rva=0x1575ec1` · `build/w385.log` @17:43:39.469 — 8 `F375-HEAPSTORE` rows, `lr=821BC998 sp=006E0FC0 r3=8284BFA4 r4=0 r5=0 r7=B5061000 r13=006A0260` · resolution: `tools/host_rva_resolve.py build/mcla.map 0x1575ec1` → `__imp__sub_823DA950 + 0xcb1` (the guest's memcpy family, `ppc_recomp.69.cpp:22055`), `0x1AEDB1` → `GuestMemoryView::WriteU32BE+0xa1` · call site: `ppc_recomp.14.cpp:20138-20142` → `bl 0x821bc140` at `ctx.lr = 0x821BC998`, with the record computed at `:20120-20125` (`mulli r11,r11,1556 / add r30,r11,r31`) · the dispatch that consumed the bogus pointer: `ppc_recomp.14.cpp:18882-18893` and `:18899-18911` — `lwz r3,8(r28); lwz r11,0(r3); lwz r10,124(r11); mtctr r10; bctrl`.
+
+**1. The mechanism, in guest order.** `sub_821BC868` (the streamer queue-push already censused as `PUSH sub_821BC868`) computes a 1,556-byte job record as `r30 = index*1556 + r31` and calls `sub_821BC140(record, …)` (`ppc_recomp.14.cpp:20142`). Inside it, `[record+8]` is treated as a stream OBJECT: the guest loads `obj = [r28+8]`, then `vt = [obj+0]`, then calls `[vt+124]` and `[vt+8]` (`:18882-18893`, `:18899-18911`). Here `obj` was **`0x00020000`** — a *size*, not a pointer — so the "vtable" it read was the first words of the host's `O1HeapInstance` (arena bound at `src/kernel/heap.cpp:178`), and the `bctrl` target was whatever fragment pointer lived in those bytes. That landed in the guest's own `memcpy`, whose destination cursor was `0x20000`, and it wrote ≥16 consecutive dwords over the allocator header. 155 ms later `o1heapDoInvariantsHold()` failed and `Heap::Alloc` returned null for everything — F-370's dead heap, uncreated thread #16, and the stall that F-369 §5/F-370 §4 attributed to semaphore `C501FC00`.
+
+**2. Corrections to this session's own earlier claims, all three caused by a wrong assumption about the instance layout.**
+- F-370 §2 / F-372 §3 ("the garbage is byte-identical across three soaks → deterministic writer", then "per-build, not absolute"): **both readings were of `bins[]`, not of diagnostics fields.** `O1HeapInstance` (`src/kernel/o1heap.c:133-138`) is `Fragment* bins[64]` + `nonempty_bin_mask` + an `O1HeapDiagnostics`, so `capacity` sits at instance `+0x208`, and the first 40 bytes are free-bin pointers. My F-373 raw dump read those 40 bytes and I called them "high-entropy garbage"; they are pointers, and `w379`/`w384` show the same values because the *guest's* copy source is the same. No needle, no per-build mystery — there was never a data blob to identify.
+- F-373's premise that "a checked read of `0x20000` returns zeros while the allocator's own pointer sees `cap=0x7FE7FDC0`, therefore the checked path and the raw base disagree": **false**. `HeapDiag()` returns the *diagnostics* struct; the raw first-40-bytes window is `bins[]`. The two never measured the same field, so they could not disagree. The checked read was right all along, and `F374-HEAPGUARD` trip=2 proves the checked path does reach this page (`ReadU64BE` with a guest `lr`).
+- The guard's own first design was wrong twice, both caught by the log rather than by argument: the first build re-armed inside the handler → **the host segfaulted 34 ms in** (`w380`, `BOOT_RC=139`), because the faulting instruction re-executed into a page that was NOACCESS again; and the second build failed to link because the definitions sat in `boot_host.cpp`'s file-local namespace (internal linkage) — the same trap that `B1GuardArm` has a wrapper for.
+
+**3. What this changes for the objective.** `0x20000` is the guest's own buffer-size constant (`131072`, the same figure as every `PATHB-… room=131072` row), so the field `[job+8]` is not random: it is a *size* stored where a stream pointer belongs. That is a **record-construction defect in the same 28-byte-descriptor machinery task #15 is about** — i.e. the UI inflate gap and this crash are the same subsystem, and the next question is now concrete and narrow: who is supposed to publish `[job+8]`, and was the record we hand the streamer filled with a size at that offset. Acceptance for the next step, unchanged: `F370-HEAP-HDR`/`F370-THREAD-CTX-NULL` → 0 with thread #16 alive, then `W35-BOOT-GATE`, then `nGfx`.
+
+**4. Instruments left in the tree, and the one behaviour risk.** `F374-HEAPGUARD` (page guard + mandatory SELFTEST row + per-offset classification `cap/hdr/frag`), `F374-HEAPSTORE` (checked-writer caller RVA for any store into `0x20000..0x20240`), `F375-HEAPSTORE` (guest `lr/sp/r3..r7/r13` at those stores). Cost measured: **3 trips in a whole boot** (`w385`), `LISTLINE` 171, `C0000005` 0, `Fatal error` 0 — regression-neutral. The honest risk, registered in `PROGRAM_GUIDE` §7: the handler claims **any** `C0000005` on that page and returns `EXCEPTION_CONTINUE_EXECUTION`, so a genuine crash inside the arena's first page would be absorbed as a trip instead of reaching the VEH census. Next ID F-376.
+
+### F-376 (2026-09-26 ~17:5x, **1 build, 1 soak `w386`**) — **the streamer job-record table is now read out of the guest's own memory, and it refutes F-375's field attribution: `[job+8]` holds a valid stream OBJECT (`B5049000` in the faulting record); the size `0x20000` is `[+24]` of the PREVIOUS record. The layout itself is the durable result.**
+
+- Task:        T41.64.
+- Type:        FACT + supersession of F-375 §1's "`[job+8]` holds the size".
+- Class:       G / D.
+- Priority:    P0
+- Evidence:    `build/w386.log` @17:56:57.439 `F376-REC #0..#7` (instrument `src/gpu_cp.cpp::HeapInstanceStoreReport`, which fires on the first corrupting store, so the table is sampled *at* the event):
+  `#0 rec=8284AD68 [+0]=4 [+4]=50000000 [+8]=B74E1000 [+24]=00004000 [+1540]=4 [+1548]=821BC548`
+  `#1 rec=8284B37C … [+8]=A47E3000 [+24]=00080000 [+1540]=7`
+  `#2 rec=8284B990 … [+8]=B7521000 [+24]=00020000 [+1540]=00000011`
+  `#3 rec=8284BFA4 … [+0]=00018004 [+8]=B5049000 [+24]=00002000 [+1540]=2 <=r3` — the record F-375 caught
+  `#4..#7` all zero (free slots)
+- Layout as read (not inferred): records are 1,556 B (`mulli r11,r11,1556`, `ppc_recomp.14.cpp:20120`) from image-static `0x8284AD68` — the same addresses the `PUSH sub_821BC868` census has always printed as `slot=`; `#3` is `PUSH #7 slot=8284BFA4`, pushed 170 ms before the store. `[+0]` = a tag that steps 4 → 0x8004 → 0x10004 → 0x18004 with the slot index, `[+4]` = constant `0x50000000`, `[+8]` = the stream object the dispatch loads first, `[+24]` = the byte count passed in `r4`, `[+1540]` = a per-record counter, `[+1548]` = `sub_821BC548`.
+- What is withdrawn and what survives: `B7521000` is **not** a Path A destination we scribbled over — it is a guest object (`EF100 obj=B7521000`, `FB0D8-DTOR child=B7521000 childVt=82085364`), and no record field holds a stray size. So "the guest read a size as a pointer inside the record" is gone; what stands is the mechanical fact: the write came from inside `sub_821BC140`'s virtual dispatch (`ppc_recomp.14.cpp:18882-18893`, `:18899-18911`) with that record in `r3`, and its destination was the arena base. Next ID F-377.
+
+### F-377 (2026-09-26 ~18:0x, **2 builds, 1 soak `w387`, reverted**) — **the collision is not a fixed address. Moving the host user-heap arena from guest `0x20000` to `0x30000` made the stray writer FOLLOW it (`guest=00030000…0003003C`), and the 16 dwords are exactly the first `0x40` bytes of the arena — allocator-header shaped. Relocation cannot fix this.**
+
+- Task:        T41.64 follow-up; the cheapest test of "is our allocator just parked in the blast radius?".
+- Type:        FIX-attempt, measured, **REVERTED**. The result replaces the change in place at `src/kernel/heap.cpp:215-222`; the revert was not re-soaked because it restores an already-soaked configuration.
+- Class:       D.
+- Priority:    P0
+- Evidence:    `build/w387.log` @18:01:12.018 `F374-HEAPGUARD SELFTEST done page=100030000 … selftests=1` (the guard moved with the arena, so the instrument is still valid) → @18:01:24.529 16 rows `F374-HEAPSTORE … guest=00030000 → 0003003C, caller_rva=0x1576f01` (the same `__imp__sub_823DA950+0xcb1`) and `F375-HEAPSTORE #1 guest=00030000 … r3=8284BFA4` (the same record as F-376) → @18:01:24.665 `F370-HEAP-HDR #1 phase=pre-alloc cap=0x0 want_cap=0x7fe6fdc0` + `F370-THREAD-CTX-NULL #1`.
+- Effect of the move on the outcome: **none.** `invariants FAIL` 1, thread #16 lost, `LISTLINE` 171, `C0000005` 0, `Fatal error` 0, `nGfx`=0 in all six rows, `W35-BOOT-GATE` 0 — and only the zeroed field differs (`cap=0x0` here vs garbage before), which is what "the pointer is derived from where the arena lives" predicts.
+- Rules out / implies: the framing "the title scribbles at the low constant 0x20000, so move aside" is dead. The live lead instead: **something gives the guest (or the guest derives) an address relative to our arena base and then writes its own 0x40-byte allocator header there, using `base+0x40` as the usable block** — the signature of a *secondary* allocator being handed an arena. First place to look: the host calls that return heap/arena addresses to the guest (`RtlCreateHeap`, `RtlAllocateHeap`, `LocalStorageAlloc`, `XamAlloc` families). That census is T41.65, and it sits in the same streamer subsystem as task #15 — so the objective's two open halves are now demonstrably one problem. Next ID F-378.
+
+### F-378 (2026-09-26 ~18:1x, **2 builds (1 failed on fmt arg-count/`WORD` formatting and was NOT soaked), soaks `w388`/`w389`**) — **two instrument corrections that each void an earlier number: the guest stack under the writer carries no chain at all, and a hard `n > 16` cap had been reporting the cap, not the burst.**
+
+- Task:        T41.65 (opened from F-377's residual lead).
+- Type:        FACT (instrument integrity + a negative measurement).
+- Class:       H.
+- Priority:    P1
+- Evidence:    `build/w388.log:50054` `F378-HEAPSTACK #0 sp=006E0FC0 [0]=+0x0 006E1040 raw` and `#1`..`#23` all `00000000` — i.e. under the writer's `sp` there is only the back-chain word and 23 zeros, so the "walk the saved link registers on the guest stack" plan (task #41's draft instrument) could never have named a caller. `src/guest_memory.cpp:45` was `if (n > 16) return;` — a hard cap — and w387 (arena at `0x30000`) and w388 (arena at `0x20000`) each printed **exactly 16** `F374-HEAPSTORE` rows, which F-377 read as "16 dwords". Cap-shape rule: that cap hides everything above 16, so the burst length was never measured. Now `n > 16 && (n % 4096) != 0` returns, and the row carries `tid=` so bursts from different threads separate.
+- Also:        `caller_rva` was the *only* basis for "the writer is the guest memcpy". It is `_ReturnAddress()` taken inside `GuestMemoryView::WriteU32BE`, so it names WriteU32BE's caller — one level, and resolved against **publics only** (no PDB is produced by this build), i.e. nearest-preceding-public, which is not proof of a function identity. F-382 settles it.
+
+### F-379 (2026-09-26 ~18:3x, **1 build, soak `w389`, RVAs resolved against the same build's `mcla.map`**) — **THE HOST BACKTRACE NAMES THE WRITER'S CHAIN, AND THE TOP OF IT IS OUR OWN PATH A DRIVER: `MclaJob2DecompressAndDistribute` → `MclaXcDecodeFullStream` → guest `sub_8244FF20` → `sub_82460420` → `sub_82461010` → `sub_823DA950`. The corruptor of the host heap header is not a guest wild store; it is our decode driver.**
+
+- Task:        T41.65 — answered in the opposite direction from how it was framed.
+- Type:        FACT.
+- Class:       D (host runtime) / G (guest coded behaviour).
+- Priority:    P0
+- Evidence:    `build/w389.log:50054-50073` `F379-HEAPSTORE-BT frame=N/20 rva=… inmod=1` (18 frames, `RtlCaptureStackBackTrace` in `src/gpu_cp.cpp:1860`), resolved with `python tools/host_rva_resolve.py build/mcla.map` (map 18:15:28 = the same exe): `3→__imp__sub_823DA950+0xcb1` (the store), `4→__imp__sub_82461010+0x47b`, `5→__imp__sub_82460420+0x59`, `6→__imp__sub_8244FF20+0x55`, `7→MclaXcDecodeFullStream<GuestMemoryHeap>+0xccd`, `8→MclaJob2DecompressAndDistribute+0xacb`, `9→sub_821BC140(hook)+0xc1d`, `10→__imp__sub_821BC910+0x215`, `12→__imp__sub_821C91C8+0x26f`, `14→GuestThread::Start+0x90`.
+- Explains, and therefore retires, three readings that depended on them: **`F375`'s registers were never the writer's.** The Path A chain runs the guest on a *synthetic* `PPCContext p{}` built at `src/gpu_device.cpp:5568` (`p.r3=ctx, p.r4=dest+producedTotal, p.lr=0x821D5EBC`), while `GetPPCContext()` returns the boot worker's context — which is exactly why `lr=821BC998` and `r3=8284BFA4` repeated byte-identically across w387/w388/w389/w390 while the store addresses and values changed (F-091 rule 1 in a new costume: the census read the wrong context). F-375's "vtable dispatch through `[job+8]`" and F-376's record framing are therefore *not* the mechanism (F-376 already refuted its own field attribution).
+- Method note worth keeping: a host backtrace + a linker map is the cheapest way to name a guest-side writer when the guest is being driven from host code, and it needs no new hook, no guard page and no DR registers.
+
+### F-380 (2026-09-26 ~18:4x, **1 build, soak `w390`**) — **OUR WARM-CONTEXT SOFT-RESET ZEROES THE XMEM STATE BLOCK'S BASE POINTERS. Before the reset `[ctx+20+12264]=40032EA9` and `[ctx+20+12276]=4003AEA9`; after it, both are 0.**
+
+- Task:        T41.65, following F-379's frame 7 (`MclaXcDecodeFullStream+0xccd` sits immediately after the reset).
+- Type:        FACT.
+- Class:       D.
+- Priority:    P0
+- Evidence:    `build/w390.log:14881` `F380-XCRESET #1 ctx=4000FD80 dest=CBE0A700 pkg=CC20A700 pre=[40032EA9 00006000 00002000 4003AEA9 0…0 00020000] post=[00000000 ×5]` (printer at `src/gpu_device.cpp:5579`, the reset it wraps at `:5573-5575`, and the second, in-loop reset at `:5676-5678`); `:49824` `F380-XCRESET #2 … pre=[00000000 00132000 FFECE000 00000000 … 00027777]`.
+- Field types, from the guest's own code (not inferred): `sub_82461010` computes `add r4,[12264],[12268]` (src base + offset) at `0x82461080` and `add r3,[12276],[12280]` (dst base + offset) at `0x82461158`, and dereferences the base (`lwz r27,12276(r31)` then `lbz r11,0(r27)`). The only stores the whole decode chain makes into that range are to **12268 / 12272 / 12280** — the offsets. **Nothing restores 12264 or 12276 once we have zeroed them.**
+- Next ID F-381.
+
+### F-381 (2026-09-26 ~18:4x, **1 build, soak `w391`**) — **my own arithmetic for F-380 is refuted by measurement: at the store the destination base is 0 as predicted, but the companion offset is `0x919D`, not `0x20000`, so "dst = 0 + cursor = 0x20000" was wrong as stated.**
+
+- Task:        T41.65.
+- Type:        FACT (a self-refutation, recorded rather than deleted).
+- Class:       H.
+- Priority:    P2
+- Evidence:    `build/w391.log:50097` `F381-XCSTATE ctx=4000FD80 c4=00000001 c8=000006B9 st=[00000000 00000000 00000000 00000000 0000919D 0 …]` (printer `src/gpu_cp.cpp:1911`) at the same instant as `:50075` `F374-HEAPSTORE #1 guest=00020000 … val=0xef651220`; `:50098` `F381-LOWVA head=[00000000 ×8]` — nothing had been written at guest `0x0..0x1C`, so the misdirected copies were not simply landing at zero either.
+- What it does *not* show: which of the many `0+offset` copies crossed the watched page, and therefore the copy's own arguments. That is exactly what F-382 measured. Keeping the `c8=0x6B9` reading too: the field we deliberately set to `wsz ? wsz : 0x80000` (`src/gpu_device.cpp:5544`) holds a *different* value at store time, so our window-size poke does not survive the guest's use of it either.
+
+### F-382 (2026-09-26 ~18:5x, **3 builds, soaks `w392`(blind instrument)/`w393`**) — **PROVEN, WITH THE ARGS: the guest memcpy that trashes the host heap header is called with `dst=00000000`, and its destination advances as `base(0) + offset` — `dst=0 len=0x1612`, then `dst=00001612`. Hooking the guest function and reading *its* context is what made this visible; the base is the field our soft-reset zeroed.**
+
+- Task:        T41.65 — CLOSED, and it supersedes F-377 and F-375's mechanism.
+- Type:        FACT (with an instrument lesson).
+- Class:       D.
+- Priority:    P0
+- Evidence:    `build/w393.log:16881` `F382-MEMCPY #1 dst=00000000 src=CAFB6DEE len=1612 lr=82461228 sp=006D8D00 tid=22728` and `:16885` `F382-MEMCPY #2 dst=00001612 src=CAFB83EC len=14 lr=82461160` (hook at `src/gpu_device.cpp:17159-17177`; `lr` values are the two `bl 823DA950` fall-throughs inside `sub_82461010` — `0x82461160` is the instruction right after `0x8246115C bl 823DA950`, whose dst was set by `add r3,r30,r27` at `0x82461158` with `r27=[ctx+20+12276]`). Positive control fired: `:132` `F382-MEMCPY-LIVE calls=1`. `:50073` `F383-WRITEROWNER frame3=157acd1 owner=157a020 off=cb1 have=1` with `owner → __imp__sub_823DA950 +0x0`, i.e. the unwind table (which needs no PDB) confirms the store really is inside that function's body — the nearest-public map lookup was right for the wrong reason.
+- Two instrument lessons, both cost a soak:
+  1. **A destination-only filter misses a copy that starts below the window and runs into it.** The first version filtered `dst ∈ 0x10000..0x30000`, printed **zero** rows, and looked like a refutation of F-379 — the actual copies had `dst=0` and `dst=0x1612`. The filter is now a *span* test (`src/gpu_device.cpp:17163-17167`). "A zero from an instrument whose predicate can't match is not a negative result" — here the predicate was the bug.
+  2. `SymFromAddr`/nearest-public naming is not identity: there is no PDB in this build, so generated `static` bodies are invisible and any address resolves to the last public symbol before it. `RtlLookupFunctionEntry` reads the `.pdata` unwind table and returns the true containing-function start; use it (as `boot_host.cpp:736 NearestFunctionName` already does) before believing a symbol-offset claim.
+- Mechanism, whole: `MclaXcDecodeFullStream` reuses the guest's live xmem context (`ctx=0x4000FD80`, `s_xmemCtx`) and "soft-resets" `[ctx+20+12264..12304]` before every window (`src/gpu_device.cpp:5573-5575` and `:5676-5678`). Two of those words are **base pointers**, and the guest only ever rewrites the offsets. So the decoder's output copies went to `0 + offset` — the first 128 KiB of the guest address space — which (a) means **Path A's produced bytes never reached their destination buffer** (the honest explanation for F-322/F-326's 3.1 %/5.9 % guest coverage and for the garage never filling, task #15), and (b) as the offset advanced past `0x20000` it walked over the host user-heap `o1heap` instance bound at `Translate(0x20000)` (`src/kernel/heap.cpp:213`), destroying `bins[64]` — which is F-370's dead allocator, refused `0x40e90` thread context and stalled loader. F-377's "the destination follows the arena" is re-read as what it was: our own driver's buffer arithmetic, plus a second, unrelated writer (F-383).
+
+### F-383 (2026-09-26 19:0x, **1 build, soak `w394`; the fix is IN the tree**) — **THE FIX (preserve the two base pointers across the soft-reset) ENDS THE HOST-HEAP DEATH — `F370-HEAP-HDR` 1→0 and `F370-THREAD-CTX-NULL` 1→0 — AND EXPOSES THE REAL RESIDUAL: the guest's OWN heap lives at guest `0x20000`, the page we bind our `o1heap` instance to, and its free-list init is now what scribbles over our allocator and faults `o1heapAllocate`.**
+
+- Task:        T41.65 → T41.66. Fix at `src/gpu_device.cpp:5464-5479` (`MclaXcSoftResetStream`: read `[12264]`/`[12276]`, zero the range, write the bases back, then `ctx+4=1`), called from both reset sites `:5575` and `:5678`. This is a fix of our own code, not a mitigation; the faithful alternative (never have bound the host arena at a guest-used VA) is now the open half.
+- Type:        FIX, measured.
+- Class:       D.
+- Priority:    P0
+- Evidence:    `build/w394.log` counts vs `w393`: `F370-HEAP-HDR` **1 → 0**, `F370-THREAD-CTX-NULL` **1 → 0**, `F373-HEAP-RAW` 1 → 0, `INFLATE-ENTER` **6,016 → 3,615**, `LISTLINE` 171 = 171, `GETDEV` 698 = 698, `XSF-HOSTSERVE` 79 = 79, `PATHMGR-OPEN` 64 = 64, `F369-SHGRP-SOFT` 2 = 2 — and the goal markers are unchanged: `nGfx=0` in all rows, `W35-BOOT-GATE` 0. The state is now preserved at store time: `:36841` `F381-XCSTATE … st=[40032EA9 00002000 00006000 4003AEA9 …]`.
+- The residual, named: `:36820-36897` 16 rows `F374-HEAPSTORE guest=00020000…000200F0 stride 0x10, val=addr+4, caller_rva=0x1415c55`, and `0x1415c55 → __imp__sub_82397060+0x345` with `F375-HEAPSTORE #1 … r4=00000004 r5=00000010 r6=00020004` — a 16-byte-block free-list fill by the *title's own* allocator. Its host chain (`F379-HEAPSTORE-BT`, resolved): `BootThreadProc → BootWorker → __imp___xstart → __imp__sub_821BD7C0+0x322 → sub_82131790 → sub_82131508(hook) → sub_822C2EA8(hook)+0x730 → sub_822C54D8 → sub_822D4878 → sub_823971D0 → sub_82397060`. So the guest heap base is the guest's own choice, not handed to it by us (`grep` finds no host writer of `0x20000` in `src/kernel/imports.cpp`), and our arena sits on top of it. Consequence measured in the same soak: `:36768` `Vectored exception: code=0xC0000005 … rva=0x206CC8` → `o1heapAllocate+0x98`, `:36789` `VEH W0: parking thread 21388 code=0xC0000005 guest=0 wild=0` — **a host fault inside our own allocator, and a thread parked for it.** The boot then idles with `PARK-SAMPLE … nf=0x82131508 (+0x16d1d)`.
+- Supersedes: F-377's "relocation cannot fix this" — that conclusion was measured while (i) the misdirected Path A burst dominated the same window and (ii) the 16-row hard cap hid every other writer. With F-383 in the tree, moving the host user-heap arena out of the guest's heap is the indicated next step (T41.66), and `F370-HEAP-HDR`'s golden check is too narrow for it: it compares only `diagnostics.capacity` (constant after `o1heapInit`), so a destroyed `bins[64]` reads as healthy — that is why w394 shows `F370-HEAP-HDR=0` while `o1heapAllocate` still faults. Next ID F-384.
+
+### F-384 (2026-09-26 19:2x-19:3x, **3 builds — 1 failed because `kernel/heap.h` does not compile inside the checked-writer TU — soaks `w395`(experiment)/`w396`(control), 1 new header, value REVERTED, plumbing kept**) — **THE RELOCATION WAS RE-TESTED PROPERLY AND THE WRITER FOLLOWED THE ARENA BASE AGAIN. So the title is not initialising its own heap at a constant `0x20000` — SOMETHING HANDS IT OUR ARENA BASE. This refutes F-383's "residual" reading and vindicates F-377's original observation.**
+
+- Task:        T41.66 — answered: relocation is not a fix, and the reason is now measured. New tasks T41.67 (the hand-off) and T41.68 (the physical-heap AV) come out of it.
+- Type:        FACT + FIX-attempt, measured, **value REVERTED (the refactor stays)**.
+- Class:       D / C (a host↔guest pointer hand-off).
+- Priority:    P0
+- Evidence:    proof the move actually took effect — `build/w395.log:503` `F373-HEAP-GOLDEN #1 base=0x120000000 read_ok=true cap=0x1feffdc0` and `:508` `F374-HEAPGUARD SELFTEST done page=120000000 trips=1 selftests=1` (the probe re-validated at the new page, F-100 rule 1) → `:36829` `F374-HEAPSTORE #1 op=U32 guest=20000000 inst_off=0x0 val=0x20000004 caller_rva=0x1415c65` from the **same** `__imp__sub_82397060+0x345` site with the **same** `F375-HEAPSTORE … r4=00000004 r5=00000010 r6=20000004` (w394: the identical row one level down, `guest=00020000 val=00020004`), while `sp=8EFFF5D0` and `r13=8F200000` did **not** move. After reverting, `build/w396.log:503/507` show `base=0x100020000 cap=0x7fe7fdc0` / `SELFTEST done page=100020000` and `:36816` the same write back at `guest=00020000` — and `soak_census w396 vs w394` shows every structural marker equal (only `F382-MEMCPY` 5→1, because the hook's predicate is now span-based on the arena's real home).
+- What it proves: the destination is **a value we supply**, not a constant the title happens to use. With `r4=4`, `r5=0x10` and `val=dst+4` the guest is laying out 16-byte entries whose base is exactly `heapArenaBase` — the first byte of the arena, not the first block o1heap would hand out (≈`+0x240`). So T41.67 must look for something that returns or seeds **the arena base itself** (a heap handle, a process slice, a pointer written into a guest structure), not an allocation from it. `RtlCreateHeap` does not exist in `src/`, and `grep` finds no literal `0x20000` hand-off — it is derived.
+- Independent result in the same fault, unaffected by the relocation: `w395:36756` / `w394:36768` `code=0xC0000005 rva=0x206CD8 = o1heapAllocate+0x98`, `Param[0]=1` (**a write**), `Param[1]=0xe49125fc`, host `rcx=0xE49125D4`, `r8=0x1A0000000` = `Translate(RESERVED_END=0xA0000000)` = the **physical** arena's host base, `r10=0x1D42591C0` = `Translate(0xD42591C0)`. The AV precedes the free-list write by 14 s in both soaks, so it is a *different* allocator failure: `o1heapAllocate` is dereferencing metadata that holds a **guest VA** (0xE49125D4 is in the physical band) as a host pointer. The line printed immediately before it in both soaks is an insane XMem request — `w395:36751` `T413N2-XMEM #416 src=D3460194 srcSz=543919776 dest=B5049000 destSz=543919780 ret=00000000`, a 519 MiB length for a ~1 MiB container (the F-133 family). **T41.68: the physical heap's header is being run over by a wild inflate, and that is what actually refuses an allocation in these boots.**
+- Decision, labelled: the value is reverted because (a) it fixes nothing, (b) 511 MiB against the ~2 GiB baseline is an unforced capacity risk, and (c) the whole evidence base was produced on the soaked baseline. The five duplicated `0x20000` literals are gone permanently: `src/kernel/heap_arena.h` defines `kUserHeapArenaVa`/`kUserHeapArenaEnd`, read by `heap.cpp:214-215`, `:182/184/361`, `guest_memory.cpp:35-36`, `boot_host.cpp:263/1492` and `gpu_device.cpp:17160-17167`. Next ID F-385.
+
+### F-385 (2026-09-26 19:4x, **1 build, soak `w397`; neutral — `soak_census w397 vs w396` has no marker delta at all**) — **CORRECTION TO F-384's THIRD BULLET, AND A TRAP THIS REPO HAD ALREADY DOCUMENTED: the "wild XMem inflate lengths" (6.85 MB / 519 MB, `destSz = srcSz + 4`) were never lengths — `srcSz`/`destSz` are the guest's POINTER arguments to XMem, two adjacent stack slots. The task I opened on that reading (T41.68) is re-scoped, and the census lines are fixed so it cannot be re-misread.**
+
+- Task:        T41.68 (re-scoped by this entry).
+- Type:        FACT (a self-retraction) + INSTRUMENT FIX.
+- Class:       H.
+- Priority:    P1
+- Evidence:    the printer I misread carried the warning in its own comment block (`src/gpu_device.cpp:3255-3258`: *"the old `destSz=7179940` was printing a pointer value and led the whole 7-MB-contamination theory astray (F-091/F-231 field trap)"*) — F-231 is the same mistake, already recorded. After printing the pointed-to values, `build/w397.log` `T413N2-XMEM #1 src=C9CF8314 srcSzPtr=006D8EA0 **srcLen=32748** dest=B7B61000 destSzPtr=006D8EA4 **destLen=65536** ret=00000000 lr=821D5EBC` — a sane 32 KiB-window request into a 64 KiB output, and `srcSzPtr`/`destSzPtr` are exactly 4 bytes apart on the guest stack, which is the whole "destSz = srcSz + 4" signature.
+- What SURVIVES of F-384 §3, unchanged and still the sharpest lead: the host AV is real, reproducible and independent of the arena relocation — `w394`/`w395`/`w396`/`w397` each log exactly one `code=0xC0000005 rva=0x206C_8 = o1heapAllocate+0x98`, `Param[0]=1` (a **write**), `Param[1]=0xE49125FC`, `rcx=0xE49125D4` (a guest VA in the physical band) with `r8=0x1A0000000` = `Translate(RESERVED_END)` (the physical arena's host base) and `r10=0x1D42591C0` = `Translate(0xD42591C0)`, and the VEH parks the thread for it. So o1heap's own metadata holds a guest address being used as a host pointer, i.e. the **physical** heap's header has been run over. T41.68 = find who writes it (its census is now honest: `XMEM`/`T413N2-XMEM` print `srcLen`/`destLen`).
+- Process lesson worth the ink: I built a task description on a marker field whose name matched my hypothesis, and the file I read to build it contained the refutation four lines above the printer. **Before a log field becomes a claim, check whether the printer reads the value or points at it** — and grep the docs for the field name before calling a shape a finding (`destSz` was burned on exactly this in F-231). Next ID F-386.
+
+### F-386 (2026-09-26 19:5x-20:1x, **3 builds, soaks `w398`/`w399`/`w400`**) — **TWO PRE-CHECKS ON THE PHYSICAL HEAP ARE CLEAN WHILE THE AV KEEPS FIRING, AND THE SECOND GUARD PAGE CAUGHT OUR OWN ALLOCATOR — an instrument defect with a named cause. The strongest goal-relevant line in the whole soak is the parked boot worker's GUEST stack: it is inside the title's own heap manager, reached from `sub_82131508` — the UILOAD registration function.**
+
+- Task:        T41.68 — instrumented, not yet answered; and it links T41.67 to the goal.
+- Type:        FACT (two negative measurements + one instrument defect).
+- Class:       H, with a G finding attached.
+- Priority:    P0
+- Evidence — the negatives: `src/kernel/heap.cpp:417-500` (`F386-PHYSFREE`) validates all 64 bin heads of the physical `O1HeapInstance` (`o1heap.c:133-138`, `NUM_BINS_MAX = sizeof(size_t)*8 = 64`, the first 512 bytes) on **every** `AllocPhysical`, and follows `Fragment::next_free` (at `+32`, not `+24` — the header is 32 bytes because `O1HEAP_ALIGNMENT` is 32) with a round-robin 8-node-per-call sampler. It printed **0 rows** in `w398` (bin heads only) and `w399` (heads + sampler), while `o1heapAllocate+0x98` still AVs exactly once per boot (`w398 rva=0x207938`, `w399 rva=0x207A68`, both → `o1heapAllocate+0x98`), and `o1heap invariants FAIL` count is **0** — so `o1heapDoInvariantsHold` also passes. Conclusion: the poison is created **between the check and the dereference**, or lives deeper in a list than the sample reached. A pre-check cannot answer this; only a write watch can.
+- Evidence — the defect: the F-388 guard over the physical instance page is **live and proven** (`w400:150-151` `F388-PHYSGUARD SELFTEST trip=1 page=1A0000000` + `SELFTEST done … selftests=1`), but trips 2 and 3 are `off=0XB8 want=W live=true hostRVA=0x207ad9` and its backtrace resolves to `o1heapAllocate+0xb9 ← SehO1Allocate+0x28 ← Heap::AllocPhysical+0x4ee ← GuestThread::Start+0x24 ← ExCreateThread+0x52f ← HostToGuestFunction<ExCreateThread> ← __imp__sub_82460300+0xbf ← __imp__sub_821C9308` — **our own allocator**, writing `bins[23]`. Cause, and it is the same one that made F-374 print `LATE` rows: `HeapGuardArm/Disarm` flip **one global flag shared by both heaps and all threads**, so thread A finishing a heap operation re-arms the page while thread B is still inside `AllocPhysical`. The guard as built therefore cannot distinguish "own write during a window that was stolen" from a foreign writer.
+- Fix specified, NOT built (next session): make the window a **depth counter** (`atomic<int>`: `Disarm` increments, `Arm` decrements, page live only at 0) so no thread can re-arm under another's in-flight operation, and classify a trip by whether its RIP lies inside the o1heap/`SehO1*` range (own → silently re-arm, foreign → log + backtrace). Only then is a zero meaningful.
+- The G finding, and the reason this matters for the objective: `w399`/`w400` `PARK-STACK sp=8EFFF5D0 lr=82397124: f0=821C9138 f1=823973AC f2=822D48DC f3=822C5518 f4=822C3094 f5=8213154C f6=82131B54 f7=821BD810` — the **boot worker's own guest stack** (same `sp` as F375's) reads bottom-up `_xstart → sub_821BD810 → sub_82131B54 → sub_8213154C (inside sub_82131508, the UILOAD registration function) → sub_822C3094 → sub_822C5518 → sub_822D48DC → sub_823973AC`, i.e. it is parked **inside the title's own heap manager** — the very `sub_823971D0/sub_82397060` pair that writes `val=addr+4` at our arena base (T41.67, F-384). So the heap collision and the UILOAD stall are now the *same thread in the same call*, which is the first direct link between the allocator problem and `nGfx`=0. Code labels inside this one entry: `F386-PHYSFREE` (bin/link validator, `src/kernel/heap.cpp:417-500`; its comments say F-386/F-387 for the two revisions) and `F388-PHYSGUARD` (the physical guard page, `src/boot_host.cpp:276-380` + `heap.cpp:418`). Next ledger ID **F-389**.
+
+### F-387 (2026-09-26 20:1x-20:2x, **0 productive builds — 1 failed at compile and was NOT soaked; 1 static-only pass + one stale-exe control**) — **T41.67 HALF-ANSWERED WITHOUT A BUILD, and the answer is a vtable chain: the title's XTL allocator thunk `sub_82130528` resolves its target as `[[[r13]+28]+8]` and tail-calls it, and the block the 16-byte fill writes is the pointer stored at `[ctrl+16]` by that callee. The remaining unknown is narrow and named: who writes `[r13]+28`.**
+
+- Task:        T41.67 — narrowed, not closed. Zero source changes left in the tree from this pass.
+- Type:        FACT (static) + a recorded instrument/build failure.
+- Class:       C/D.
+- Priority:    P0
+- Evidence (all raw-byte, `offset = VA - 0x82000000`, rule 3): the writer's caller chain is
+  `sub_823971D0+0x...: 823973A8 bl 821BE610 / 823973AC lis r11,828D / 823973B4 addi r31,r11,-12188
+  (=0x828DD064) / 823973B8 mr r31,r3 / 823973BC bl 82397060` — so the loop entered with r31 =
+  `sub_821BE610`'s return value (that function is a *close/cleanup*: `li r3,0; stw r8,0(r31);
+  stw r9,4(r31)` → returns 0). Inside `sub_82397060` (`0x82397060`-`0x823971C0`): it frees
+  `[r31+8]`/`[r31+16]` through `sub_82130588`, **allocates via `bl 82130528` and stores the result at
+  `[r31+8]`** (`823970F0 bl 82130528` → `823970F8 stw r3,8(r31)`), then links 16-byte entries with
+  `addi r10,r10,16 / addi r6,r9,16 / stw r6,12(r9)` (the align/round ladder at `0x8239709C-0x823970D4`
+  computes the block size). That matches `F375-HEAPSTORE … r4=4 r5=0x10 r6=00020004` exactly: `r5=16`
+  is the entry size and `r6` the `addr+4` link value.
+- The thunk, decoded: `82130528 lwz r11,0(r13) / li r10,28 / mr r3,r4 / li r5,16 (alignment!) /
+  li r6,0 / lwzx r3,r10,r11 / lwz r9,0(r3) / lwz r8,8(r9) / mtctr r8 / bctr` — i.e. the allocator
+  object is **`[[r13]+28]`** and its method is **`[obj+8]`**, tail-called. `r13 = 0x8F200000` in the
+  F375 rows ✓ the same TLS base. So the base the title fills at guest `0x20000` is produced by
+  whatever vtable sits at `[[0x8F200000]+28]`, and `li r5,16` is where the 16 comes from — which is
+  why the stride in `F374-HEAPSTORE` is 16 and not a property of our arena.
+- What is NOT the answer (checked and rejected): our own `FIX-821873E8` TLS-chain seeding
+  (`src/gpu_device.cpp:2281-2289`) writes **`tlsTable+12`**, not `+28`, so the object this chain
+  resolves is not the one we synthesize; and `grep -rn "return .*MapVirtual" src/` finds only
+  `heap.cpp:745/763/827` (block pointers), `memory.cpp:343` and `xdm.cpp:22 GetKernelHandle` — none
+  of which can produce the arena base itself.
+- Next measurement (one census, cheap, already scoped): read `[[0x8F200000]+28]` and `[[that]+8]` at
+  the moment of the store (extend `F375-HEAPSTORE` with those two dereferences) and ask whether
+  `[obj+8]` is a host-implemented function whose return value is the arena base. If it is, T41.67 is
+  closed by naming that import.
+- Build/instrument hygiene: my first edit of this pass put the census log line **before** the
+  `allocatorObj`/`vtable` declarations it printed → `BUILD_RC=1` (`error: use of undeclared
+  identifier`), the edit was reverted, and the soak I then ran (`w401`, F374 rows identical to
+  `w396`) executed the **previous exe** (`build/mcla.exe` still 20:08:46). It is therefore a
+  same-binary control, not a test of anything, and is excluded from comparisons (the stale-exe rule,
+  `agents.md` rule 12). Next ID **F-389**.
+
+### F-391 (2026-09-26 20:2x-20:5x, **5 builds, soaks `w402`/`w403`/`w404`/`w405`/`w406`; 3 fixes in the tree**) — **THE GOAL'S (a) HALF MOVED FOR THE FIRST TIME IN THIS ARC: the garage is now 917,504 of 1,066,057 bytes present and byte-exact in guest memory (`pct=100` of claimed, `first_bad=FFFFFFFF`), against 440,720 / 41.3 % before — and it did so because the host PHYSICAL heap was moved off the region the title uses as its own XTL heap. `nGfx` is still 0: clause (b) is NOT met.**
+
+- Task:        T41.67 CLOSED (the chain is named), T41.68 CLOSED as a cause (the collision, not a wild
+  inflate), new T41.69 for the two faults `w406` now exposes.
+- Type:        FIX × 3, each measured. Not mitigations: no path is skipped and no value is fabricated.
+- Class:       D (host runtime) / C (address-space contract).
+- Priority:    P0
+- The chain, resolved in three steps without guessing: (1) `F389-XTLCHAIN` (`src/gpu_cp.cpp`, fires
+  with the first corrupting store) reads the XTL thunk's own operands — `r13=8F200000`,
+  `[r13]=8F201000`, `obj=[[r13]+28]=82830B18`, `vt=[obj]=820114C4`, `allocFn=[vt+8]=821C08F8`;
+  (2) `sub_821C08F8` is only a dispatcher (`addi r11,r6,1 / rlwinm *4 / lwzx r3,r10,r3 /
+  lwz r9,0(r3) / lwz r8,8(r9) / bctr` → `m_Allocators[(r6+1)*4]`), so `F389-BANK` dumped that object:
+  `alloc=[bank+4]=82830CD8 vt=82011884 fn=821C29A0 head=[82011884 A0001010 A0001000 0 0 A002FFC0 0 0]`
+  — the title's allocator region is **guest 0xA0001000..0xA002FFC0**; (3) that is *inside* the host
+  physical arena as bound at `Translate(RESERVED_END=0xA0000000)` with the o1heap instance at the base
+  and the first blocks at 0xA0001000+, so the title's slab metadata overwrote our fragment headers —
+  which is the measured explanation for the once-per-boot `o1heapAllocate+0x98` write to
+  `0xE49125FC` with `rcx=0xE49125D4` (a guest VA read as a host pointer) and `rdi=r8=Translate(0xA0000000)`.
+- Fix 1 — `kPhysArenaBeginVa = 0xA0400000` (`src/kernel/heap_arena.h`, used by `heap.cpp:15`
+  `RESERVED_END`, `heap.cpp:187`, `boot_host.cpp` `kPhysHdrVa` and the instance watch range):
+  **the physical-heap AV is gone** — `w406` logs `F390-SEHPASS` 0 and `o1heapAllocate returned null` 0
+  (positive control that the guard moved: `F388-PHYSGUARD SELFTEST done page=1A0400000`).
+- Fix 2 — F-390 (`src/boot_host.cpp`, before the W0 park): a `C0000005` whose faulting function *is*
+  `o1heapAllocate`/`o1heapFree` now returns `EXCEPTION_CONTINUE_SEARCH` so the existing
+  `SehO1Allocate`/`SehO1Free` SEH (`src/kernel/heap.cpp:74-102`) absorbs it, instead of the VEH
+  parking the thread first (VEH runs before `__except`). Proven working in `w404`: `F390-SEHPASS` 1 →
+  `AllocPhysical: o1heapAllocate returned null #1 size=0x28 align=0x10` → no process death.
+- Fix 3 — F-390b (`src/kernel/heap.h`, both `Alloc<T>` and `AllocPhysical<T>` templates): they
+  placement-new'd into the result without a null check, so the honest OOM that Fix 2 makes reachable
+  became a write to `0x0` / `0x18` and parked the thread anyway (`w404`'s second fault was
+  `Heap::AllocPhysical<Semaphore>+0x46`, `w405`'s `QueryKernelObject<Semaphore>+0x217`).
+- Effect on the objective, `w406` vs `w405` (same tree except the arena move): garage
+  `UIXSF-GOLDEN-REVERIFY pkg=64980000 recs 5→16, recs_whole 4→16, claimed 458,752→917,504,
+  still_present 440,720→917,504, first_bad 0x20005→none`, i.e. **41.3 % → 86.1 % of the 1,066,057-byte
+  container present and byte-exact**, and F-354's "every UI container gets exactly TWO inflate
+  destinations" ceiling is broken (`recs=16`). `INFLATE-ENTER` 3,615→34,607, log 38k→208k lines.
+  Unchanged and honest: `LISTLINE` 171=171, `GETDEV` 698=698, `XSF-HOSTSERVE` 79=79, and **`nGfx=0` in
+  every census row with `W35-BOOT-GATE=0`** — clause (b) is still unmet.
+- What `w406` now blocks on (T41.69): two parked threads, both newly visible because the boot got
+  this far — (i) 20:48:15.909 `C0000005` `Param[0]=0` (a READ) of `0xFE78C248` at
+  `rva=0x16FEFAF = __imp__sub_82419718+0x23f`, with `ppc ctx=nil` on that thread; (ii) 20:48:39.032
+  `addr=0x0 rva=0x0` — control transfer to address zero. Neither existed in `w405`, where the physical
+  AV parked the thread first. Next ID **F-392**.
+
+### F-392 (2026-09-26 20:5x, **0 builds — read of `w406` only**) — **THE DOMINANT COST IN THE POST-FIX BOOT IS NOT THE PARKS: it is our own serve re-presenting the SAME 32 KiB window forever on a job-1 stream (24,068 + 9,664 `INFLATE-ENTER` rows at counter ~#4.02M and `INFLATE-HOSTSERVE-PEND` at #1,933,810), and the reason is measurable: the package at `off=0x1295000` is 4 KiB in the RSC table while the window is served with `walk=00000000` and `buf=CAF08200` never advancing.**
+
+- Task:        T41.70 (opened by this entry). Also bounds how F-391's milestone should be read.
+- Type:        FACT.
+- Class:       D (our serve bookkeeping), touching task #15's per-stream-record problem.
+- Priority:    P0
+- Evidence:    `build/w406.log:135750-135763` immediately before the first park —
+  `INFLATE-ENTER #4021400 st=006D8F20 in=32768 inPtr=CAF08200 consumed=6771826 exp=0000097D
+  ihdr=[05435352 00000013] outPtr=A4BF1000 lr=821BC380 j2=0` +
+  `XMEM #4021000 ctx=4000FD80 dest=A4BF1000 destLen=16384 src=CAF08200 srcLen=32768 ret=00000000
+  lr=821D5EBC`, and the serve row
+  `INFLATE-HOSTSERVE-PEND #1933810 off=01295000 got=32768 headBE=05435352 buf=CAF08200
+  outPtr=A4BF1000 outLeft=16384 (pkg=01295000 walk=00000000 pkgSz=00001000 serve=1 frame=0 whole=0)`.
+  Aggregated shapes over the whole soak: 24,068 rows `in=32768 inPtr=CAF08200 exp=0000097D` and 9,664
+  rows `in=30319 inPtr=CAF08B91 exp=0000097D` (32768-30319 = 2449 ≈ the 0x97D = 2429-byte frame the
+  guest keeps expecting), i.e. the window is re-presented from its start every time.
+- Not a table bug: `PackageSizeAt` (`src/gpu_device.cpp:295-303`) returns the table entry when the
+  offset is a package head and `0x40000` otherwise, so `pkgSz=0x1000` means the RSC table really does
+  list a 4 KiB package at `0x1295000` — a small resource. What is wrong is that the *continuation*
+  state stays at `walk=0` and `buf` stays at the same host address, so we serve the same bytes for
+  ~4M inflate entries; the per-stream walk map is keyed on `st` (`src/gpu_device.cpp:11537-11543`,
+  `g_uiXsfStreamWalk[st]`, `s_contPerDest[outPtr]`) and `st=006D8F20` is the **per-JOB** record
+  (F-338/F-342 measured that per-stream identity does not exist below the guest's job loop).
+- How to read F-391's milestone honestly: the garage byte-exact coverage 440,720 → 917,504 is real
+  and read-back-verified, but this boot spends most of its 120 s in the spin above, and only
+  **1** `W34-GFX-CENSUS` row was reached (`nGfx=0` there) versus 5-6 in `w396`. So `nGfx=0` in `w406`
+  is partly "did not get there", not a fresh negative. The two parks (F-391) remain the hard stops.
+- Do not do: add another no-progress cap or a re-serve clamp — that is a short-circuit without the
+  root cause (do-not #9), and F-327/F-333/F-343 already measured that erasing or re-keying this walk
+  state makes coverage worse. The root question is the same one task #15 asks: give the stream its own
+  record, or stop serving a window whose `walk` cannot advance. Next ID **F-393**.
+
+### F-393 (2026-09-26 21:1x-21:2x, **3 builds, soaks `w407`/`w408`; the change is REVERTED (flag off) and the revert is re-soaked**) — **F-392's "we re-serve the same window forever" is FALSE (25 serves in the whole boot, not 1.9 M). The 6,747,400-iteration cost is the title's own descriptor loop in `sub_821BC140`, which has exactly two exits and neither is reachable while the codec produces 0 — and the loop is entered because OUR serve writes `inLeft` at the one moment the guest was about to issue its own read. Suppressing that serve does break the spin (29×) and is REJECTED anyway: garage coverage falls 917,504 → 143,069.**
+
+- Task:        T41.70 (re-scoped from F-392's premise), objective clause (a).
+- Type:        FIX-attempt — measured, **REJECTED**, reverted and the revert verified. Facts below stand on their own.
+- Class:       G (the game's own coded behavior) with a C half (our ABI hand-off).
+- Priority:    P0
+- Evidence:    `build/w406.log` (grep counts) · `generated/ppc_xenon/ppc_recomp.14.cpp:19042-19170` · `generated/ppc_xenon/ppc_recomp.0.cpp:4-8` · `build/w407.log` @21:16:19 · `build/w408.log` @21:2x · `src/gpu_device.cpp:1021-1072` (the flag + its measured comment), `:11174-11188` (the gate, dead under the flag).
+
+**1. F-392 is refuted by its own marker.** `grep -c "INFLATE-HOSTSERVE-PEND "` on `w406` = **25**, not
+1.9 M. The `#1933810` in that line is the *shared inflate-entry serial*, not a serve count — F-392 read
+a counter as a quantity, the same class as F-340's line-vs-count error. All 25 serves are on **24
+different `outPtr`s, one window each, every one at `walk=00000000 frame=0 whole=0`**, and their
+`off=`/`pkg=` values are a consecutive 4 KiB run `0x1284000, 0x1285000 … 0x1295000` all with
+`pkgSz=00001000`. Only `0x64980000` (`pkgSz=0010C449` = the garage's exact compressed length) and
+`0x6496F000` are real UI .xsf containers; the other 22 are packages `AssignPackageForDest` invented for
+readlist slots whose own sizes are 0x20000/0x4000 (`PSTREAM #1/#2/#3 s[i] @82849B30… vbase=…
+pbase=… size=…`, 40 lines, stride 12 bytes).
+
+**2. The loop, read out of the generated code (all three facts new).** `ppc_recomp.14.cpp:19042-19170`:
+
+    loc_821BC2D4:  if ([st+0] inLeft  != 0) goto loc_821BC374      // else fall through to the READ
+    loc_821BC2F0:  while ([0x827D74E0] credits <= 0) { Sleep(100) } // credits=00000001, never blocks
+    loc_821BC310:  vtable([[r28+8]+0])[28](r4=r20, r5=[r1+80], r6=r1+128, r7=min(rem,32768))
+    loc_821BC374:  sub_821D5E10(r24, &st);  sub_82130000(r24, &st);
+                   if ([st+16] outLeft != 0) goto loc_821BC2D4
+    loc_821BC398:  sub_821D5510(...);  idx++; desc += 12;  if (idx < [r26+1540]) goto loc_821BC2BC
+
+`sub_82130000` **is a bare `blr`** (`ppc_recomp.0.cpp:4-8`), so between the inflate step and the loop
+test nothing but the inflate step can move `inLeft` or `outLeft`. Two consequences worth saying out
+loud: (a) the spin has **no exit in the title's code at all** — `ret=00000000` with `produced=0` on
+6.75 M entries is an unconditional hang, and the only host-side exit we have ever used is the
+`outLeft = 0` abandonment at `gpu_device.cpp:11758` ("zeroing outLeft is the caller-loop exit key");
+(b) the *output* descriptors are **12** bytes at `record+8+i*12` with the count at `record+1540` —
+that is a different array from the **28**-byte join-table entries at `gpu_device.cpp:11650`
+(`eBase + ji*28`) and from F-376's 1,556-byte record slots. None of those three refutes another;
+task #15's "28-byte descriptor" wording names the join table, and the walk this loop performs is the
+12-byte one.
+
+**3. The experiment (one variable) and its numbers.** Gate added at the top of the `inLeft == 0`
+block, before the retry bookkeeping: if `AssignPackageForDest(outPtr)` is not a UI .xsf package,
+return without touching the record (`F393-SERVE-SKIP`, 484 rows in `w407`).
+
+| | `w406` (off) | `w407` (on) |
+|---|---|---|
+| `INFLATE-ENTER` max serial | 6,747,400 | **231,518** |
+| frozen record state | `in=32768 consumed=6771826 exp=97D` | `in=0 consumed=262144 exp=0` |
+| `READWRAP` | 1,742 | **463,018** |
+| `INFLATE-HOSTSERVE-PEND` | 25 | **0** |
+| garage `still_present` / 1,066,057 | 917,504 | **143,069** |
+| `LZX-FRAME` / `JOIN` / `PATHB-HOSTDECODE` | 2,321 / 33,942 / 9 | 22 / 1,176 / 1 |
+| `C0000005` / `fatal` / `LISTLINE` | 4 / 60 / 171 | 3 / 53 / 171 |
+
+So the hypothesis was right about the mechanism — the guest **does** take its own read path at scale
+(`READWRAP` ×266, `consumed` reaches exactly one 0x40000 slot) and the spin **does** break — and right
+that it is not a fix: the same gate removes the serve from the containers themselves, because
+`inLeft == 0` is a property of the **one shared record** (`st=006D8F20`, the only `st` value in all
+34,607 sampled entries), so a per-dest decision cannot be made there. `C0000005` did not rise
+(4→3), so the faults are not the regression signal; coverage is. Reverted; `w408` confirms the
+structural set is back to `w406` exactly (`C0000005` 4=4, `fatal` 60=60, `Fatal error` 1=1,
+`LISTLINE` 171=171, `UIXSF-GOLDEN-REVERIFY` 21=21).
+
+**4. Caveat this puts on F-391's headline.** `w408` is the *same code* as `w406` and its garage
+`still_present` is **589,824, not 917,504** — a 55.3 %/86.1 % spread between two soaks of one binary.
+F-340's rule therefore applies to the post-fix number too: **"the garage is at 86.1 %" is a
+single-observation claim, not a property of the arena fix.** The defensible statement is "the arena
+fix moved durable garage coverage from a 41.3 % observation to a 55–86 % observation range". Anyone
+quoting a coverage figure must say how many soaks it came from.
+
+**5. What is left of T41.70.** The spin is now explained, so the only remaining form of "let the title
+read for itself" is task #15's real content: **a per-stream record**, because every key the serve has
+(`st`, `s_emptyRetries[st]`, `g_uiXsfStreamWalk[st]`) is per-record and there is one record. Do not
+re-attempt a per-dest gate on the `inLeft == 0` leg — F-393 measured it. Next ID **F-394**.
+
+### F-394 (2026-09-26 21:4x-21:5x, **4 builds (1 header-signature failure, not soaked), soaks `w409`/`w410`/`w411`/`w412`; one new durable instrument, no behaviour change**) — **THE BOOT WORKER IS NOT WAITING AND WAS NEVER IN `sub_82131508`: a table unwind names it inside guest `sub_82397060` (a growable-array reserve that tail-calls the XTL allocator thunk) at three call sites, continuously from ~40 s to ~260 s. A 300 s soak buys nothing — same `still_present=917,504`, same `C0000005=4`, same 171 `LISTLINE`. Clause (b) is blocked by a spin, not by a slow boot.**
+
+- Task:        T41.71 (objective clause (b) — "so GFx can initialize").
+- Type:        FACT + INSTRUMENT.
+- Class:       G (the game's own coded behavior), reached by H (a broken instrument, fixed).
+- Priority:    P0
+- Evidence:    `build/w411.log` + `build/w412.log` `PARK-UNWIND` rows · `python tools/host_rva_resolve.py build/mcla.map 0x1419d0d 0x1419d1a 0x1419d55 0x6b525d 0x6b4c2a` (map base `0x140000000`; load bases from each log's `PARK-SAMPLE base=`) · `generated/ppc_xenon/ppc_recomp.61.cpp:17730-17848` · `generated/ppc_xenon/ppc_recomp.0.cpp:864-886` · instrument at `src/boot_host.cpp:1536-1580` (`ParkUnwindCapture`) + its call/print sites `:1886`, `:1951-1977`.
+
+**1. The instrument that was lying, and the one that replaced it.** `PARK-SAMPLE`'s `nf=` field comes
+from `NearestFunctionName(rip)` — a nearest-preceding lookup. It printed `nf=0x82131508 (+0x17171)` on
+every boot-worker row in `w406`, i.e. **94,577 bytes past that function's entry**: the raw RVAs resolve
+to `mcla::native::GuestMemoryView::ReadU32BE/WriteU32BE/IsValidRange`, not to `sub_82131508` at all.
+The sampler's other half was worse: it read `[Rsp+8k]` as return addresses, which is stack *data*
+(`s0=host 0x2d3ff940` — a stack slot), and `RtlCaptureStackBackTrace` cannot walk another thread.
+`ParkUnwindCapture` instead does `RtlLookupFunctionEntry` + an `RtlVirtualUnwind` loop **while the
+thread is suspended** and prints module RVAs for offline resolution. Two SDK facts cost a build each
+and are now recorded in the code comment: 10.0.26100 declares the last parameter as
+`PKNONVOLATILE_CONTEXT_POINTERS` (not the documented history table), and **a NULL return does not end
+the chain** — for a function with no unwind codes it still fills the caller's RIP from the machine
+frame, so recording only on a non-NULL return gave `frames=1` on every row in `w410`.
+
+**2. What it says (this is the finding).** 200 sampled rows in `w411` (120 s) and 520 in `w412` (300 s).
+Every row after roughly sample #80 (`w411` @21:46:10, ~40 s in) through the last row of `w412`
+(@21:54:53, ~260 s) has the same two frames: a `GuestMemoryView` accessor + **one of exactly three
+sites in `__imp__sub_82397060`**: `+0x2ad` (0x1419d0d), `+0x2ba` (0x1419d1a), `+0x2f5` (0x1419d55).
+So `PPC_LOAD_U32`/`PPC_STORE_U32` in generated code really are direct calls to the checked accessors,
+and the thread is executing `sub_82397060`'s own body — over and over, for the rest of the boot.
+
+**3. What `sub_82397060` is** (`ppc_recomp.61.cpp:17730-17848`): a growable-array/hash reserve.
+`r31`=the container, `r30`=the requested count; it frees `[r31+8]`/`[[r31+16]-4]` via `sub_82130588`,
+computes a next power of two with the classic `rlwinm`/`or` chain against `0x7FFFFFFF`, stores the new
+count to `[r31+0]`, then at `+0x2ad` and `+0x2ba` calls **`sub_82130528`** — which
+(`ppc_recomp.0.cpp:864-886`) is exactly the XTL chain F-389 named: `r3 = [[r13]+28]`, then
+`bctr [[r3]+8]` with `(size, 16, 0)`. So the boot worker's last 220 seconds are spent entering the
+title's own allocator from a table-growth routine, and the frozen guest context agrees: `r3` holds a
+returned block pointer (`D3CDF880`, and `CCAEC680`/`CBF00443`/`B68D170A` at other moments), `lr` holds
+`0x82397124` = the return site of the **second** `bl sub_82130528`, and the frame's saved link is
+`0x821C9138` — so `sub_821C9134` is the repeated caller.
+
+**4. The 300 s control that makes this a spin and not slow progress.** `w412` ran 2.5× longer and is
+marker-identical to `w411` on everything that matters: `still_present` 917,504 = 917,504 (garage),
+`UIXSF-GOLDEN-REVERIFY` 21 = 21, `LISTLINE` 171 = 171, `code=0xC0000005` 4 = 4, `nGfx=0` in both
+(one `W34-GFX-CENSUS` row, `w412` 1 / `w411` 3), `W35-BOOT-GATE` 0 in both — and *fewer* total lines
+(220,615 vs 254,689). A boot that is quiescent at 120 s and still quiescent at 300 s is blocked, not
+slow. **Do not spend soaks on longer timeouts for clause (b).**
+
+**5. Also settled here:** `w411` reproduces `w406`'s `still_present=917,504` with the same binary, so
+`w408`'s 589,824 was the outlier boot, not the new normal — but F-393 §4's rule stands (three identical
+soaks gave 917,504 / 589,824 / 917,504). And `INFLATE-ENTER`'s serial reached 7,481,000 (`w411`) and
+7,317,200 (`w412`) with `kF393NoHijackNonUi=false`, re-confirming the F-393 spin from the other side.
+
+**6. T41.72, the next move, stated as one instrumented question:** is `sub_82397060` being *re-entered*
+(counting calls per second with `r30` and the returned `r3`), or is a single `sub_82130528` call never
+returning? Those two are different bugs — the first is an unbounded producer (a table fed forever,
+`r30` climbing), the second is the allocator's own walk. A `PPC_FUNC` counter on `sub_82397060`
+(enter/exit + `r30`/`r3` at the first 40 and every 512th) answers it in one soak, and `tools/addr_owners.py
+--check 0x82397060` must be run first (rule 4 — the hook may already have an owner). Next ID **F-395**.
+
+### F-395 (2026-09-26 21:5x-22:0x, **1 build, soak `w413`; one log-only hook in the tree, no behaviour change**) — **CLAUSE (b) IS ONE CALL THAT NEVER RETURNS: `sub_82397060` was entered exactly ONCE in a 120 s boot and never exited, with a zero count argument, and it is stuck below the title's XTL allocator whose bank bounds (`0xA0401000..0xA042FFC0`) are addresses INSIDE OUR physical arena. This supersedes F-394 §2's "the thread is executing `sub_82397060`'s own body".**
+
+- Task:        T41.72 (objective clause (b)).
+- Type:        FACT (+ one log-only hook).
+- Class:       D (our runtime supplies the region) with G (the title's allocator walk) inside it.
+- Priority:    P0
+- Evidence:    `build/w413.log` — `F395-GROW-ENTER #1 obj=828CD064 want=0 lr=823973C0 sp=8EFFF640 tid=19384`, **`grep -c F395-GROW-EXIT` = 0**, `F389-XTLCHAIN r13=8F200000 [r13]=8F201000 obj=[[r13]+28]=82830B18 vt=[obj]=820114C4 allocFn=[vt+8]=821C08F8`, `F389-BANK bank=82830B18 alloc=[bank+4]=82830CD8 vt=82011884 fn=821C29A0 head=[82011884 A0401010 A0401000 00000000 00000000 A042FFC0 00000000 00000000]`, and 400 `PARAM-STORE @A0106000…A01067F0 = +4 lr=82397124` rows · hook at `src/gpu_device.cpp:17222-17247` · probe at `src/gpu_cp.cpp:2117-2129` · `generated/ppc_xenon/ppc_recomp.61.cpp:17730-17848`, `ppc_recomp.0.cpp:864-886`.
+
+**1. Re-entry vs never-return — settled, and it is the second.** The enter/exit pair fired **1 enter,
+0 exits** for the whole soak, on tid 19384, with `r3(obj)=0x828CD064` (an image-static container) and
+`r4(want)=0`. So there is no unbounded producer: the boot worker went into this routine once and never
+came out. `want=0` matters because the round-up chain at `ppc_recomp.61.cpp:17776-17813` turns a count
+of 0 into count 1 and `r3 = 1<<2 = 4`, so both allocation calls ask for **4 bytes** — the smallest
+possible request in the boot — and the second one (`lr` return site `0x82397124`, the exact value the
+`PARK-SAMPLE` guest context carried frozen for 90 s) is the one that never returns.
+
+**2. Where it is stuck, by name.** `sub_82130528` is the thunk `r3 = [[r13]+28]; bctr [[r3]+8]` with
+`(size, 16, 0)`; `F389-XTLCHAIN` resolves that to guest **`0x821C08F8`**, and `F389-BANK` one level
+deeper to bank object `0x82830CD8`, vtable `0x82011884`, method **`0x821C29A0`**, whose head words are
+`[+4]=A0401010`, `[+8]=A0401000`, `[+20]=A042FFC0`. **Those are inside the physical arena we hand the
+title** — `kPhysArenaBeginVa = 0xA0400000` is F-391's own fix. So the never-returning allocation is the
+title's allocator walking a bank whose extent our heap provider published.
+
+**3. What it is doing while stuck.** `PARAM-STORE` (the pre-existing Session-73 watch over
+`0xA0106000..0xA0107000`, `src/gpu_cp.cpp:2117`) records stores of the form `[p] = p+4` at stride
+`0x10`, and its first 400 rows sweep `0xA0106000 → 0xA01067F0` about **three times over the same 128
+slots**. A free-list *builder* would march upward; a fixed 2 KB table relinked in place is a loop that
+restarts. **Read the cap honestly: that printer is `pn <= 400 || pn % 5000`, so 400 is the cap, not
+the total — the store count is unknown and only the cycling addresses are evidence.**
+
+**4. Correction to F-394 §2 (mine, one hour old).** It inferred from `PARK-UNWIND`'s
+`rip=[accessor, sub_82397060+0x2f5]` that the thread was executing `sub_82397060`'s own body. With
+1-enter/0-exit that reading is wrong: `frame[1]` is a **return address** into `sub_82397060`, and the
+frames in between (the allocator method) either have no unwind codes or were skipped by the "no unwind
+info ⇒ take `[Rsp]` as the caller" path. The walk is still far better than `NearestFunctionName`, but
+**its depth-2 output must be read as "the last resolvable return address", not "the caller"**. The
+enter/exit hook is what actually settled it — a direct count beats an inferred stack, and it cost the
+same one build.
+
+**5. Consequence for the objective.** Clause (b) has never been gated on GFx content or on the UI
+containers: **the thread that would run the UILOAD path is inside a 4-byte allocation that does not
+terminate**, which is also why `nGfx` is 0 in every census row ever printed and why the 300 s control
+(F-394 §4) changed nothing. Any further clause-(b) work that does not start from
+`sub_821C29A0`/`sub_821C08F8` and the `0xA0401000..0xA042FFC0` bank is aimed at the wrong thread.
+
+**6. T41.73, next move.** Two hypotheses remain and they are separable in ONE soak: the walk is
+(a) finite but enormous — because the bank extent we publish (0xA0400000..end of the 4 GB mapping?) is
+far larger than the 0x2FFC0 the title's own XTL region used — or (b) a genuine cycle in the link table
+(a corrupted `next` pointing backwards). Instrument `sub_821C08F8`/`sub_821C29A0` enter/exit with a
+per-call iteration count and the head/limit words it is walking (`[bank+8]`, `[bank+4]`,
+`[bank+0x14]`), and print the *link* value at each visited slot of `0xA0106000..0xA0106800` for the
+first 400 visits: a monotonically advancing cursor that reaches a huge bound is (a); a cursor that
+lands on an address already visited is (b). Run `tools/addr_owners.py --check 0x821C08F8` and
+`--check 0x821C29A0` first (rule 4). Also in scope and cheaper: re-read what `kPhysArenaBeginVa`
+tells the title's `XexGetPhysicalMemory`/page-list consumers — F-391 moved a bound that this bank
+clearly reads. Next ID **F-396**.
+
+### F-396 (2026-09-26 22:1x, **2 builds, soak `w414`; one log-only hook in the tree**) — **T41.67'S PREMISE IS WRONG: nothing hands the guest our arena base. The title reaches it through an ALLOCATION WE GAVE IT, and the routine that never returns is the one writing its list there — so the host heap header at guest `0x20000` and the title's free list are the same memory.**
+
+- Task:        T41.73 (clause (b)); supersedes the framing of T41.65/T41.67 (tasks #41/#43) and F-384's "a hand-off publishes the base".
+- Type:        FACT (+ one log-only hook), and a re-framing.
+- Class:       D (our runtime's address-space choice).
+- Priority:    P0
+- Evidence:    `build/w414.log` — `F395-GROW-ENTER #1 obj=828CD064 want=0 lr=823973C0 sp=8EFFF640 tid=23268` @22:12:13.547 with **0 exits** (F-395 reproduced in a new binary) · 8 `F396-ALLOC-ENTER/EXIT` pairs, all `self=82830B18`, sizes 496/131128/48/32768/4/4/4/4 → returns `A0401020 A0401220 A0424020 A0427FD0 A0430020 A0430024 A0430028 A043002C` · `F374-HEAPSTORE #1..#16 op=U32 guest=00020000…000200F0 val=guest+4 caller_rva=0x141b425 tid=23268` @22:12:21.826 · `python tools/host_rva_resolve.py build/mcla.map 0x141b425` → **`__imp__sub_82397060 + 0x345`** · hook at `src/gpu_device.cpp:17197-17222` · `src/kernel/heap.cpp:213-215`.
+
+**1. What the new hook ruled out.** `sub_82130528`'s `bctr` target (`sub_821C08F8`, the bank method on
+`self=0x82830B18`) is **working**: eight enter/exit pairs, every one returned a fresh block inside the
+physical arena, four of them the 4-byte class. So the non-termination is not "the bank allocator fails
+to answer", and the sweep F-395 saw is performed by `sub_82397060` itself, not by a callee that hangs.
+**Instrument limit, stated plainly:** the printer is `k <= 8 || (k % 1024) == 0`, so a ninth call in
+flight prints nothing — "8 pairs" is not "8 calls total", and the last printed exit is 2.4 s before the
+`F395-GROW-ENTER`, so those two facts do not yet touch.
+
+**2. The hand-off question (tasks #41/#43) was mis-framed.** F-384 measured that moving the arena makes
+the writer follow the base, and concluded the title is HANDED our arena base. There is no such hand-off:
+`grep -rn kUserHeapArenaVa src/` returns only probe sites (`heap.cpp:183/185/360`,
+`gpu_device.cpp:17301-17302`, `boot_host.cpp`, `guest_memory.cpp`) and no literal-`0x20000` store into
+guest-visible state anywhere in `src/`. What §1 plus `src/kernel/heap.cpp:213-215`
+(`heapArenaBase = Translate(kUserHeapArenaVa)`; `heap = o1heapInit(heapArenaBase, …)`) actually imply is
+the ordinary case: **we hand the title blocks from an arena whose control block sits at the arena's own
+first bytes, at guest VA `0x20000`** — so when the title initialises the list it was given, the stores
+land on the page our probes watch, and moving the arena moves them. F-371's "we parked in memory the
+title uses" and F-384's "the writer follows the base" are then both true and the contradiction that cost
+two tasks dissolves.
+
+**3. Where the loop sits now.** The stores are `stw [p]=p+4` at stride 0x10 from
+`sub_82397060 + 0x345` — the reserve routine's own list-build tail — on tid 23268, 8 s after it entered
+and never exited. `F374-HEAPSTORE` is capped (`#1..#16`, then every 4096th), so the length of that
+sweep is still unknown: the same cap shape that misled F-382. `PARAM-STORE` shows the analogous sweep at
+`0xA0106000..0xA01067F0` under the frozen `lr=82397124`.
+
+**4. T41.74 — the question that decides the fix, one small probe.** Is the block the title is writing
+a block **we** gave it? At the `F374-HEAPSTORE` site, ask the heap that already exists —
+`Heap::LiveProbe`/`IsLiveAllocation` (`src/kernel/heap.h`, used at `heap.cpp:709/731`) — about the guest
+VA being stored to, and print `found/base/size/used`. Both outcomes are actionable:
+- *live allocation at/near the arena base* → our `Alloc` is handing out memory that overlaps the o1heap
+  control block; fix by keeping the instance out of the allocatable, guest-visible range.
+- *no such allocation* → the guest derived `0x20000` itself, and our host heap must not live in
+  guest-writable address space at all (which is what F-366's relocation attempted, for the wrong reason).
+Next ID **F-397**.
+
+### F-397 (2026-09-26 22:2x, **2 builds, soaks `w414`/`w415`; two log-only probes in the tree**) — **CLAUSE (b) IS FULLY ROOT-CAUSED. The boot worker's "hang" is the title's own free-list initialiser `sub_82397060` entered with a count of 0: its only guard is `count-1 == 0`, so `r11` starts at `-1` and the link loop at `loc_82397184` cannot terminate until 4 294 967 295 iterations — and the stores it performs match the observed garbage at our heap header word for word (`[p+12] = p+16`, so `guest=0x20000 val=0x20004`, `guest=0x20010 val=0x20014`, …). F-370's "deterministic garbage", F-384's "the writer follows the arena base" and F-394/5's "never returns" are this one loop.**
+
+- Task:        T41.73/T41.74 (objective clause (b)); supersedes F-396 §3's "the sweep length is unknown" and closes tasks #41/#43 (the hand-off) as a *consequence*, not a cause.
+- Type:        FACT (+ two log-only probes).
+- Class:       G (the game's own coded behaviour) — reached through C/D facts.
+- Priority:    P0
+- Evidence:    `build/w415.log` — `WATCH: range armed [828CD064,828CD074)` @22:22:00.690 → `F395-GROW-ENTER #1 obj=828CD064 want=0 lr=823973C0` @22:22:14.517 → `F397-OBJ #1 obj=828CD064 [+0)=00000000 [+8)=00000000 [+16)=00000000` → `PAGEWATCH W #05 @ 828CD064 = 00000001 lr=82397068` → `PAGEWATCH W #06 @ 828CD06C = D3CDF800 lr=823970F4` → 8.24 s later `F374-HEAPSTORE #1..#16 guest=00020000,00020010,… val=0x20004,0x20014,… caller_rva=0x141bb85 tid=19432` · `python tools/host_rva_resolve.py build/mcla.map 0x141bb85` → `__imp__sub_82397060 + 0x345` · code: `generated/ppc_xenon/ppc_recomp.61.cpp:17888-17923` (the loop), `:18240-18250` (the only call site, in `sub_823971D0`) · probes: `src/gpu_device.cpp:17208-17236` (F397-OBJ + widened F396 cap), `src/boot_host.cpp:1706-1717` (the `0x828CD064` watch).
+
+**1. The loop, verbatim (`ppc_recomp.61.cpp:17888-17923`).** `r30` is the second argument:
+
+    loc_82397164:  r11 = r30 - 1;  [r31+12] = r10; [r31+4] = r8; [r31+16] = r10;
+                   if (r11 == 0) goto loc_823971A0;          // <-- the ONLY guard: count == 1
+                   r10 = r8;  r7 = r11;
+    loc_82397184:  r9  = [r31+16];  r11 = r11 - 1;  r9 = r9 + r10;
+                   r10 = r10 + 16;  r6 = r9 + 16;  [r9+12] = r6;
+                   if (r11 != 0) goto loc_82397184;          // bne on CR0.EQ of r11-1
+
+With `r30 = 0`, `r11` starts at `0xFFFFFFFF`; the branch is on equality with zero, so the loop runs
+**4 294 967 295 times** and each iteration writes a link `[X+12] = X+16` while `X` advances by 16 from
+the freshly-allocated block. The measured F374 rows are exactly that shape: store at `0x20000` with
+value `0x20004` ⇒ `X = 0x1FFF4`, `X+12 = 0x20000`, `X+16 = 0x20004`; store at `0x20010` value
+`0x20014` ⇒ `X` advanced by 16. **Two claims I am NOT making:** the sweep's *step* is not constant
+(`r9` is `[r31+16] + r10`, and `[r31+16]` is rewritten inside the loop, so the address sequence is not
+a plain 16-byte march and I have not worked out its closed form), and the iteration count is an
+arithmetic consequence of the guard, not a measurement.
+
+**2. Where the zero comes from.** The only call site in the whole image is
+`ppc_recomp.61.cpp:18240-18250`, inside `sub_823971D0`:
+
+    lis  r11, -32115 ; addi r31, r11, -12188   -> r31 = 0x828CD064   (the static container)
+    lhz  r4, 4(r28)                            -> the count, a 16-bit field of *r28*
+    mr   r3, r31 ; bl 0x82397060
+    lhz  r11, 4(r28) ; cmplwi r11, 0            <-- the caller checks for ZERO only AFTER the call
+
+So `sub_823971D0` legitimately expects `[r28+4]` to be able to read 0 — and the callee's guard makes a
+0 fatal-but-silent. Measured: it is 0 in this boot (`want=0`), and the container was empty at entry
+(`[+0]/[+8]/[+16]` all 0), so nothing about this container was ever populated.
+
+**3. What this retroactively explains.** (a) F-370's "deterministic garbage at the o1heap header" —
+it is a link list being built through it. (b) F-384's "move the arena and the writer follows it" — the
+sweep passes through whatever base we chose, so the follower was never a hand-off; **tasks #41/#43 were
+asking the wrong question and are closed by this.** (c) F-394/F-395's one-enter/never-exit and the
+`PARAM-STORE` cycle at `0xA0106000..0xA01067F0` (same `[p]=p+4` shape, under the frozen
+`lr=82397124`). (d) Why a 300 s soak changes nothing (F-394 §4): 4.3e9 iterations at any plausible
+recomp speed is minutes-to-hours.
+
+**4. Consequence for the objective — and it is good news for clause (a).** Clause (b) is *not* gated on
+GFx, not on the UILOAD registration, not on the shared inflate record: it is gated on
+**`[r28+4] != 0`**. Everything the F-186/F-187 line has been chasing (enqueue, descriptors, records) sits
+behind a thread that is busy for the rest of the process. T41.75: identify the object `r28` is (read
+upward in `sub_823971D0` from line 17957, where the function starts, to 18242 for its assignment) and
+then determine who is supposed to fill its `+4` halfword — that name, not another inflate instrument, is
+the next thing to write down. If it is one of the UI .xsf consumers, clause (a) and clause (b) finally
+become the same task. Next ID **F-398**.
+
+### F-398 (2026-09-26 22:3x, **1 build, soak `w416`; watch range widened, log-only**) — **THE ZERO COUNT IS REGISTERED, NOT LOST: a boot-time table at return site `0x821327F8` stamps four sibling entries across `0x828CD07C..0x828CD0D0` in the first 0.5 s of the boot, writing each count word as `00000000` alongside a descriptor pointer (`0x82051F14 / 0x82051F24 / 0x82052118 / 0x82052138`). So the field `sub_82397060` cannot survive is a to-be-filled slot of a four-entry resource table — and this boot has exactly four UI .xsf containers.**
+
+- Task:        T41.75 (clause (b)'s upstream).
+- Type:        FACT.
+- Class:       G, with the fix landing in whatever consumer fills the field.
+- Priority:    P0
+- Evidence:    `build/w416.log` @22:32:06.769 — 16 consecutive rows `PAGEWATCH W #01..#16 @ 828CD09C/094/098/0A0, 828CD088/080/084/08C, 828CD0B8/0B0/0B4/0BC, 828CD0CC/0C4/0C8/0D0`, **every one `lr=821327F8`**, values `{0, 82051F14, 0, 828CD028}`, `{0, 82051F24, 0, 828CD03C}`, `{0, 82052118, 0, 828CD014}`, `{0, 82052138, 0, 828CD0D8}`; watch armed @22:32:06.233 (`WATCH: range armed [828CD064,828CD0D8)`, probe `src/boot_host.cpp:1706-1717`). The two struct addresses are read straight out of the recomp: `r3 = lis(-32115)-12188 = 0x828CD064` (`ppc_recomp.61.cpp:18240-18247`) and `r28 = lis(-32115)-12120 = 0x828CD0C8` (`:18143-18147`), so the halfword `lhz r4,4(r28)` is at **`0x828CD0CC`**.
+
+**1. What this refines in F-397.** F-397 §2 said the count "has to be written at runtime and never is".
+`w416` shows it *is* written at runtime — **to zero, deliberately, by the registration routine** — as one
+field of a 16-byte-per-entry table stamped 0.5 s into the boot, ~46 s before the fatal
+`sub_82397060(obj, 0)`. A zero at registration is normal; the defect is that no consumer ever *raises*
+it, and each entry carries a pointer (`+4` of the second word, e.g. `0x82052138`) that says what should.
+
+**2. Why this is the objective's seam.** Four entries, four UI .xsf containers, and the routine that
+consumes the field is the one the boot worker is stuck in. **T41.75 therefore continues, unchanged in
+shape:** read the four descriptor VAs out of `build/cache/mcla_pe.bin` (offset = VA − 0x82000000, words
+big-endian, rule 3) and/or `tools/ppc_xrefs.py xref 0x82052138`, and name what each describes. If any is
+a `.xsf`, then clause (a)'s remaining 14 % and clause (b)'s `nGfx=0` are the *same* missing producer, and
+the whole F-186 line has been standing behind one unfilled count field.
+
+**3. Do not re-derive these.** Registration return site is `0x821327F8`. The non-terminating loop is
+`sub_82397060` at `loc_82397184` (`ppc_recomp.61.cpp:17907-17923`) — **title code**: do not patch it, do
+not skip it, do not add a host short-circuit around the memory damage it causes (F-383 and F-391 already
+fixed the two real host bugs on that path, and F-393 measured that gating the serve makes things worse).
+`kF393NoHijackNonUi` stays `false`. Next ID **F-399**.
+
+### F-399 (2026-09-26 22:3x, **0 builds — raw image + `w416` reads**) — **THE FOUR DESCRIPTORS ARE GAME-VARIABLE NAMES, NOT .XSF CONTAINERS: `0x82051F14`→"allgrip/allzone/allroar/devonlycars", `0x82052118`→"ctfFlagLimit/ctfTimeLimit/forcePowerupsOn/Auto". So the count the boot worker needs is a *variable-group* entry count, and F-398 §2's hope that clauses (a) and (b) are one task is REFUTED — they are different producers.**
+
+- Task:        T41.75, answered at the "name it" step.
+- Type:        FACT (supersedes F-398 §2's expectation only; F-398's measurements stand).
+- Class:       G.
+- Priority:    P0
+- Evidence:    `python` dump of `build/cache/mcla_pe.bin` at `VA − 0x82000000` (rule 3): `0x82051F14` = `allgrip\0allzone\0allroar\0devonlycars\0`, `0x82051F24` = `allroar\0devonlycars\0`, `0x82052118` = `ctfFlagLimit\0ctfTimeLimit\0forcePowerupsOn\0Auto\0`, `0x82052138` = `forcePowerupsOn\0Auto\0` · negative control on the same soak: `grep -aoiE "(open|read|find|load).*(fail|miss|not found)" build/w416.log` → **no rows**, and `grep -aoiE "[a-z0-9_./\\\\-]*variab[a-z0-9_./\\\\-]*" build/w416.log` → **no rows**.
+
+**1. What the table therefore is.** The four `0x828CD0xx` entries registered at `lr=0x821327F8` are
+game-variable / option group descriptors (MCLA's `varList`-style registry: per-group name, then a count),
+and `sub_823971D0` → `sub_82397060(container, count)` is sizing a container for the group's variables.
+`count == 0` means **the group was registered with no variables**, which is a content/parse question in the
+variable system — not an inflate, not a descriptor, not the shared `st` record, and not the UI .xsf chain.
+
+**2. Consequences, stated plainly.** (a) The objective's two clauses are **independent blockers**: clause
+(a)'s remaining garage bytes live behind task #15 (per-stream record) as before, and clause (b) lives
+behind a zero-length variable group. Neither can be closed by the other. (b) The long-running "nGfx=0"
+mystery is now a *specific, findable* thing: whoever fills `[0x828CD0CC]`. (c) Nothing in the boot log
+suggests a failed file open, so the next move is static, not another soak.
+
+**3. T41.76 (next move, no build needed to start).** `python tools/ppc_xrefs.py find-str allgrip` and
+`xref 0x82051F14` to reach the code that registers these groups, then read where it takes the group's
+variable count from (an RPF member? a `variables.x`? a static table?). If a *content* read returns 0, that
+is the fix site; if a *host* stub returns 0, that is the fix site. Either way the target is now a name, not
+a search. Next ID **F-400**.
+
+### F-400 (2026-09-26 22:3x, **0 builds — `tools/ppc_xrefs.py` + generated-code reads**) — **THE ZERO IS PASSED BY THE TITLE'S OWN STATIC CONSTRUCTOR: `sub_827AF370` registers the "allgrip" group as `sub_821C06C8(slot=0x828CD094, r4=0, name=0x82051F14, r6=0)` and it is one of a family (`sub_827AF390` = "allgrip"+8, …). So the count is 0 at registration BY CONSTRUCTION and is meant to be raised later by whatever defines the group's variables — and nothing does. Clause (b) is a missing variable-definition producer, one static read away from a name.**
+
+- Task:        T41.76 (in progress; F-399 §3's first two commands were run and are recorded here).
+- Type:        FACT.
+- Class:       G.
+- Priority:    P0
+- Evidence:    `python tools/ppc_xrefs.py find-str allgrip` → `0x82051f14`; `xref 0x82051F14` → **one** site, `0x827af378 addi r5,r11` in `sub_827AF370 +0x8` · body at `generated/ppc_xenon/ppc_recomp.169.cpp:718-735`: `lis r11,-32251` (→ `0x82050000`), `addi r5,r11,7956` (→ **`0x82051F14`**), `lis r10,-32115` (→ `0x828D0000`), `addi r3,r10,-12140` (→ **`0x828CD094`**), `li r4,0`, `li r6,0`, `b 0x821C06C8` · matches `w416`'s `PAGEWATCH W #02 @ 828CD094 = 82051F14 lr=821327F8` byte for byte.
+
+**1. Two things this pins.** (a) The runtime slot the constructor writes (`0x828CD094`) is the same slot
+the registration routine stamps at boot, so `sub_821C06C8` (reached through `0x821327F8`) is the
+register-the-group routine, and `0x828CD0CC` — the fatal halfword — is in its sibling entry four slots
+down. (b) `r4 = 0` and `r6 = 0` are *constants in the constructor's own code*, so a zero count is what
+registration produces on real hardware too; the count is an append-style field that variable definitions
+raise. Nothing in this boot raises it.
+
+**2. Honest limit.** `r4`/`r6` are read as "count/flags" from their positions and from the fact that the
+registered slot pair `(+0, +8)` receives zeros while `(+4, +12)` receive a name and a link — that is
+inference from the store pattern (`w416`), not a decoded struct. `sub_821C06C8`'s body is the next read and
+it will settle which parameter becomes which field.
+
+**3. T41.76 continues, unchanged:** read `sub_821C06C8` (whose are the field writes), then find the
+routine that *appends* a variable to a group (search for callers that pass a non-zero `r4`/`r5` into the
+same family, or `find-str` another variable name such as `devonlycars` and follow its xref). The producer
+that never runs is clause (b), and it is now a name-able function rather than a 4.3-billion-iteration loop.
+Next ID **F-401**.
+
+### F-401 (2026-09-26 19:4x, **0 builds — generated-code reads + the `w416` watch already in the tree**) — **THE FIELD IS `[slot+8]`, NOT `+4`: `sub_821C06C8(slot, arg, name, byte)` writes `{+0 name, +4 = 0, +8 = arg, +12 = list-next, +16 = byte}` and every group constructor passes `arg = 0` as an immediate. The fatal `lhz [r28+4]` at `r28 = 0x828CD0C8` therefore reads the *constructor's second argument* of the entry based at `0x828CD0C4` — and the whole-boot watch proves nothing ever writes that word except the registration.**
+
+- Task:        T41.76 first half; **corrects F-400 §2's field identification**.
+- Type:        FACT (+ retraction of my own wording).
+- Class:       G.
+- Priority:    P0
+- Evidence:    `generated/ppc_xenon/ppc_recomp.15.cpp:5076-5100` — `sub_821C06C8`: `stw r5,0(r3)` (name), `stw r9(=0),4(r3)`, `stw r4,8(r3)` (the arg), `stb r6,16(r3)`, `stw r11,12(r3)` + `stw r3,23012(r10)` pushing onto the list head `lis(-32123)+23012` = **`0x828559E4`** · `grep -rn "23012(" generated/ppc_xenon/*.cpp` → **only** `ppc_recomp.15.cpp:5091`/`:5095`, i.e. the list is built and never walked by anything in `generated/` · 4th stamped entry in `build/w416.log` @22:32:06.769: `@828CD0C4 = 82052138` (name), `@828CD0C8 = 0` (`+4`), `@828CD0CC = 0` (`+8`), `@828CD0D0 = 828CD0D8` (`+12`) · the reader at `ppc_recomp.61.cpp:18242` with `r28 = lis(-32115)-12120 = 0x828CD0C8` (`:18143-18147`) · the zero is a literal: `li r4,0` at `ppc_recomp.169.cpp:728-731` inside `sub_827AF370`.
+
+**1. The arithmetic, because F-400 aimed at the wrong word.** Entry base `0x828CD0C4` (its `+0` is where
+`w416` shows the name `0x82052138`), so `entry+4 = 0x828CD0C8` and `entry+8 = 0x828CD0CC`. The read is
+`lhz 4(r28)` with `r28 = 0x828CD0C8` ⇒ **`0x828CD0CC` = `entry+8`** = the constructor's `r4`. So the field
+is the *third parameter of the `sub_821C06C8` call* and it is `0` in the static constructor's own code,
+not something lost at runtime. F-400 §2's "which parameter becomes the `+0` count" is closed, and its
+point at `[slot+4]` is retracted here.
+
+**2. The negative result is the finding.** The `[828CD064,828CD0D8)` watch armed by F-398 recorded **every**
+store into that block for a whole 120 s soak: 16 rows, all from `lr=0x821327F8` (the registration), nothing
+else. There is no late appender to find — no path in this boot raises `entry+8` off zero. Combined with §1
+(the zero is a compile-time immediate) the only remaining readings are: the sizing pass runs on a group
+whose variables are defined by a step that never happened, **or** `entry+8` is a "grow-on-demand, 0 = none
+yet" sentinel and the title's own `sub_82397060` simply cannot tolerate it — in which case real hardware
+never reaches that call with 0 because the defining step ran first.
+
+**3. Next move, and it is not another xref (both remaining ones are exhausted: the head is touched by one
+routine, and the four names have one materialiser each).** Instrument the *consumer* side, log-only, one
+soak: inside the existing `F395-GROW-ENTER` hook (`src/gpu_device.cpp:17197-17236`) walk the list from
+`0x828559E4` and print each entry's `{name, +4, +8, +12}`, then print which entry `r28` was. That answers
+how many groups exist, whether any has a non-zero `+8`, and where in the walk the boot stopped — the first
+measurement of the pass rather than of the registration. Rule 4 is satisfied (0x82397060 has our hook only).
+Do not chase `[slot+4]`, do not patch the title's loop, do not buy a longer soak. Next ID **F-402**.
+
+### F-402 (2026-09-26 22:4x, **1 build, soak `w417`; the group-list walk requested by F-401 §3, log-only**) — **NOTHING IN THIS BOOT BINDS THOSE FIELDS: the `0x828559E4` registry is a ≥16-entry CONSOLE-COMMAND / TUNABLE table ("noambientdamage", "fragdebug", "fragdebug2", "drawfollow", "rubberband", "norubberband", "localpoweruptuning", "oneprop", "testprop", "propaudiospew", "fragtune", `tunexml`) and EVERY entry reads `[+4]=0 [+8]=0`. So the zero the boot worker dies on is the normal state of a binding step that never ran in this boot at all — and the name of that step is in the strings: `tunexml`.**
+
+- Task:        T41.76 second half (F-401 §3's measurement, run).
+- Type:        FACT.
+- Class:       G + E (the content the binding needs).
+- Priority:    P0
+- Evidence:    `build/w417.log` @22:47:25.231 — `F395-GROW-ENTER #1 obj=828CD064 want=0` (still exactly one enter, F-395 reproduced in a third binary) then `F401-GROUP #0..#15 enter=1 entry=8290F430/8290AD4C/8290AD60/8290AC38/8290AC10/8290AC24/8290ABEC/8290ABB0/8290AB9C/8290AB70/8290AA3C/8290AA14… name=820D90DC/820D4A74/820D4A68/820CF0DC/820CEC64/820CEC54/820CDFC0/820CC20C/820CC200/820CBC3C/820CBAD0/820CBAC8 [+4)=0 [+8)=0` (16 rows = the walk's own `gi < 16` cap, so the list is longer than 16) · the names decoded from `build/cache/mcla_pe.bin` at `VA − 0x82000000` · instrument `src/gpu_device.cpp:17208-17260`.
+
+**1. Two distinct structures, now separated (this is the part worth keeping).** The four group entries at
+`0x828CD07C..0x828CD0D0` (F-398) are **static**, registered by the `sub_827AF3xx` constructors, and their
+`entry+8` is a compile-time `0` (`li r4,0`). The list whose head is `0x828559E4` is a **different,
+dynamic** table — the same `sub_821C06C8` pusher, but its entries live at `0x8290Axxx`+ and are
+command/tunable names. Both show the same thing: `[+4]` and `[+8]` are zero for **every** entry of a
+≥16-long table after a full 120 s boot. That is not a lost write to one field; it is a *binding phase* that
+never executed.
+
+**2. The lead is in the data.** `0x820CBAC8` is the string `tunexml`, immediately followed by `fragtune`,
+and the pattern repeats (a source tag plus a tunable name per entry). RAGE-family titles bind tunables and
+game variables from XML data loaded out of the RPF; `allgrip`/`ctfFlagLimit`/`forcePowerupsOn` are
+game-variable names of exactly that kind. So clause (b)'s upstream is now: **the tunexml / game-variable
+load-bind step never ran to completion** — a content/IO question, not an inflate question, and F-399
+already showed it is independent of clause (a)'s UI .xsf containers.
+
+**3. What NOT to do next.** Do not instrument `sub_82397060` further (its loop is understood and it is
+title code); do not re-derive the group list; do not look for a writer of `[0x828CD0CC]` — F-401 §2 and
+`w416`'s whole-boot watch already proved there is none. T41.77 is the content question: find the tunexml
+loader (`tools/ppc_xrefs.py find-str tunexml`, then follow its file-open path through
+`src/fs/vfs_rpf.h`) and ask whether the member it wants is in `xarchive_cache.rpf` at all, or is being
+served empty. If the answer is "served empty/absent", clause (b) becomes an E-class fix and the loop never
+had to be touched. Next ID **F-403**.
+
+### F-403 (2026-09-26 22:5x, **0 builds — `w417` reads**) — **THE TUNING ARCHIVES ARE OPENED, AND ONE OF THEIR READS STARTS ON A NON-HEADER WORD: `preload/xarchive_cameratune.rpf` (4 128 768 B at `off=00068000`), `preload/xarchive_carconfigs.rpf` and `preload/xarchive_bootscripts.rpf` all reach `XSF-OPEN ret=0` with a valid TOC, but the host serve for cameratune prints `head=6655A8B1` — neither RSC5 (`05435352`) nor XCompress (`0FF512EF`). Clause (b)'s content lead is therefore a *served-offset* question on the preload archives, not a missing file.**
+
+- Task:        T41.77 (opened by F-402 §3).
+- Type:        FACT (partial — the consequence is not yet traced).
+- Class:       E (filesystem/device) pending confirmation.
+- Priority:    P1
+- Evidence:    `build/w417.log` @22:47:25.085 — `TOC76-XSF #1428 ret=C650CED0 path='preload/xarchive_cameratune.rpf' [E2D132A2 00068000 003F0000 400503CF] openGateBit30=0 zeros=0 lr=821CCED0`; `XSF-OPEN #1354 dev=C64AC100 flags=1 path='preload/xarchive_cameratune.rpf' ret=0 toc=[E2D132A2 00068000 003F0000 400503CF] lr=821CCFF0`; `XSF-HOSTSERVE path='preload/xarchive_cameratune.rpf' off=00068000 size=4128768 buf=D2EFA880 head=6655A8B1 pkgSubst=00000000 pass=1` · distinct archive paths named in the same soak: `xarchive_cache.rpf` 258, `preload/xarchive_bootscripts.rpf` 12, `preload/xarchive_carconfigs.rpf` 11, `preload/xarchive_cameratune.rpf` 11, `xarchive_audlo.rpf` 6.
+
+**1. What is solid.** The three preload archives exist and open (a TOC entry is found and `ret=0`), so F-402
+§3's "the member is absent" branch is **not** the story. What is visible instead is a serve whose first
+word is `0x6655A8B1`. `0x6655A8B1` is already a known shape in this tree — the
+`INFLATE-HOSTSERVE-STOP 6655A8B1` family (F-25x era, "shared sequential walks after the first package
+head") was exactly this value, produced by walking past a package head into whatever follows.
+
+**2. What is NOT claimed.** That these archives carry the tunable/variable definitions; that the
+`6655A8B1` read is what leaves the binding step short; or that fixing it unblocks `sub_82397060`. F-402 §1
+establishes only that the binding never ran. **T41.77's first step is to check whether the `cameratune` /
+`carconfigs` / `bootscripts` reads complete or return the wrong bytes** — for each: what does the guest
+ask for (`TOC76-LAYOUT` already prints `+4=[size, off, flags, …]`), what does it get, and does a
+`tunexml`-class consumer ever run after it. That is log-only against the existing `TOC76-*` / `XSF-*`
+markers. Next ID **F-404**.
+
+### F-404 (2026-09-26 19:5x, **0 builds — on-disk byte check + `w417` reads**) — **F-403 §1'S LEAD IS REFUTED BY MY OWN BYTE CHECK: the serve for `preload/xarchive_cameratune.rpf` is byte-faithful (raw `xarchive_cache.rpf` @0x68000 = `6655a8b1 b5c6427a …` == the served `head=6655A8B1`), so there is no served-offset bug at our layer — and that word is high-entropy because the member is a compressed blob, which means the tuning archive can only be opened by the title's OWN pgStreamer. Clause (b) is therefore behind the same inflate machinery as clause (a).**
+
+- Task:        T41.77 first half; **retracts F-403 §1's lead** and qualifies F-399 §2.
+- Type:        FACT + retraction of my own prior claim.
+- Class:       E investigated; conclusion is C/G.
+- Priority:    P0
+- Evidence:    `build/game_data/xarchive_cache.rpf` (2 130 739 200 B) read at `0x68000` → `6655a8b1b5c6427a582db74d0d3fbfaa…`; scans of the first 200 MB find **no** `RPF\x03`, **no** `cameratune`, **no** `preload`, and the on-disk file set is `xarchive_{audio,audlo,cache,music}.rpf` only — so the preload archives are members, not files · `build/w417.log` @22:47:25.096 `XSF-HOSTSERVE path='preload/xarchive_cameratune.rpf' off=00068000 size=4128768 buf=D2EFA880 head=6655A8B1 pkgSubst=00000000 pass=1` + `XSF-POSTOPEN-SERVE … buf=D2EFA880 size=4128768` · serve code `src/gpu_device.cpp:1534-1605`.
+
+**1. What the check kills.** F-403 suspected a wrong serve origin because `head` was neither RSC5 nor
+XCompress. It isn't: we hand exactly the archive bytes at the offset **the guest's own TOC entry supplies**,
+and `pkgSubst=00000000` is correct — a raw member start has no container magic because the member is a
+compressed blob, not an RSC5 package. The `INFLATE-HOSTSERVE-STOP 6655A8B1` association in F-403 §1 was a
+coincidence of appearance, not a mechanism. **Do not re-open "the VFS serves the wrong offset for the
+preload archives."**
+
+**2. The synthesis the objective needs (and it qualifies F-399 §2).** The four group descriptors are
+game-variable/tunable names, not .xsf containers, so the two clauses have **different consumers** — but a
+nested RPF member reaches the guest as compressed bytes that only the title's `pgStreamer`/XMem path can
+turn into a parseable archive, and F-402 proved the binder that would consume it never ran. So they are
+**two consumers of one broken producer**: the three small containers decode today only because Path A
+places their bodies (F-331/F-350, `kPathBHostFullDecode`), and everything downstream of an *undecoded*
+archive — tuning, game variables, hence `sub_82397060`'s count — stays zero. Path A's scope is 4 UI .xsf
+paths; the preload archives are outside it.
+
+**3. Unexplained, deliberately unattributed.** The same guest TOC entry `C650CED0` prints
+`toc=[E2D132A2 00068000 003F0000 400503CF]` at 22:47:25.085 and `[E2D132A2 003F0000 003F0000 400503CF]`
+at 22:47:25.097 — its second word became the size. `XSF-OPEN-GATE-SKIPPED` is **host-cache-only** (the
+guest-visible write was removed by T41.3h / F-079, `src/gpu_device.cpp:15802-15817`), so this is not our
+write. Logged as unexplained, nothing more.
+
+**4. T41.78 — back to the objective's centre, and it starts offline.** Can `src/xmem_lzx.h` (or the XMem
+path `MclaHostXcDecodePackage` uses) turn `xarchive_cache.rpf @0x68000, 0x3F0000 B` into a nested `RPF3`
+image? Offline, no boot, and it is the first clause-(b) route that is not "repair the title's inflate":
+extend Path A to the preload archives. If the scheme is one `xmem_lzx.h` does not implement, that is a
+measured stop and clause (b) genuinely needs task #15. Next ID **F-405**.
+
+### F-405 (2026-09-26 19:5x, **0 builds — offline byte survey of `xarchive_cache.rpf`**) — **T41.78 ANSWERED WITH A STOP: the `preload/xarchive_cameratune.rpf` member is NOT an RSC5/XMem container. It carries no `RSC\x05`, `XMPK`, `RPF\x03` or XMem-magic word anywhere in the first 256 KiB at any alignment, and its entropy is flat (5.8-5.9/8 per 64-byte sample at +0x000/+0x1000), while the known-good UI members 100 MB away begin `05435352 … 0ff512ef` ('RSC5' + XMem magic at +0x0C). So Path A cannot be extended to the tuning archive, and clause (b) does need the guest's own inflate — task #15.**
+
+- Task:        T41.78 (F-404 §4), answered.
+- Type:        FACT (negative).
+- Class:       E/G boundary.
+- Priority:    P0
+- Evidence:    `python` survey of `build/game_data/xarchive_cache.rpf`: `@0x68000 = 6655a8b1 b5c6427a 582db74d 0d3fbfaa`, `@0x69000 = b813fa0a…`, `@0x3F0000 = ecfd53b0…`, `@0x3F8000 = 6e49d7e9…`; magic scans over `[0x68000, +0x40000)` → `XMPK` none, `RSC\x05` none, `RPF\x03` none, `\xef\x12\xf5\x00`/`\x00\xf5\x12\xef` none. Positive control in the same read: `@0x64980000 = 054353520000001bd574b0320ff512ef` and `@0x6496F000 = 054353520000001bd40828130ff512ef` → 'RSC5' header + `0x0FF512EF` at +0x0C, exactly the framing F-331 documents (`src/xmem_lzx.h:531-552`), so the survey method sees containers when they are there.
+
+**1. What is settled.** The archive mixes member kinds: the four UI .xsf members are plaintext RSC5+XMem
+(that is why Path A can decode them byte-exactly offline) and the preload tuning member is not. The
+uniform high entropy with no header at any of four sample points is what an encrypted or non-XMem
+compressed member looks like; **which of the two it is, this survey cannot say**, and the TOC flags word
+(`400503CF`) has not yet been decoded against the RPF3 model in `src/fs/vfs_rpf.h`.
+**2. What follows for the objective.** There is no host-side bypass for the tuning archive. Clause (b) —
+the tunable/variable binding whose absence produces the zero count that hangs the boot worker (F-397/
+F-402) — requires the *title's own* decompression path to work on that member. That makes task #15 (a
+per-stream record and codec context inside `sub_821BC140`, so the guest's inflate can actually run) the
+critical path for **both** clauses, and it retires F-404 §2's phrasing "two consumers of one broken
+producer" only in the sense that the producer cannot be substituted host-side.
+**3. Next, in priority order.** (i) Decode the member's flags against `src/fs/vfs_rpf.h` to learn whether
+the title expects an AES/Xmem/other scheme here — if it expects a scheme we do implement elsewhere in
+`src/fs/`, this stop is revisited with a real candidate instead of a guess. (ii) Otherwise commit to
+task #15 for both clauses. Next ID **F-406**.
+
+### F-406 (2026-09-26 23:0x, **1 build, soaks `w418` AND `w419` — reproduced 2/2; change KEPT: `kF406SkipFabricatedServe = true`) — **THE ENQUEUE GAP WAS PARTLY OURS: gating the fabricated 4 KiB filler serve on the STREAM-OWNED package (`sPkg == 0`) instead of F-393's `IsUiXsfPkg(AssignPackageForDest(...))` takes `sub_821BC140` from exactly 3 records per boot (`w406`/`w415`/`w417`) to **5**, identically in both soaks, with garage coverage flat at 917,504 and the structural set unchanged.**
+
+- Task:        T41.79/T41.80 (both done in this entry). Corrects F-393's self-rejection. **KEPT.**
+- Type:        FIX (validated, 2 soaks) + FACT.
+- Class:       C (the state we publish into the guest's record).
+- Priority:    P0
+- Evidence:    `build/w418.log` and `build/w419.log`, same exe (`57404416 B`, 23:06) — `BC140-REC` = **5 in both**, same five slots and same read-list counts: `82849B2C RLC=10`, `8284A140 RLC=52`, `8284A754 RLC=6`, and the two NEW ones `8284AD68 id=00000004 cls=3 pkg=000A0000 RLC=4 e0=B78E1000/00020000`, `8284B37C id=00008004 cls=2 RLC=7 e0=A4BE3000/00002000` · `INFLATE-HOSTSERVE-PEND` = **3 in both**, and the three are exactly the containers: `pkg=64980000 pkgSz=0010C449` (garage), `64CA3000`, `6496F000` · `F406-SERVE-SKIP` 16 (its own cap `k406 <= 16 || %256`) · controls: `still_present=917504` both, `code=0xC0000005` 4 both (= `w406`/`w408`/`w417`), `LISTLINE` 171 both, `W34-GFX-CENSUS` 3 rows both with `nGfx=0`, `INFLATE-ENTER` max serial 5,100,400 / 5,101,200 · code: gate `src/gpu_device.cpp:11292-11305`, flag + rationale `:1074-1086`.
+
+**1. The one-line correction to F-393.** Its predicate was `IsUiXsfPkg(AssignPackageForDest(outPtr))`, and
+`AssignPackageForDest` is the routine that *invents* a package for a dest that has none — so it answered
+false for the garage's own dest and switched **all 25** serves off (garage 917,504 → 143,069). The
+stream-owned package `MclaUiXsfStreamPkg(st, outPtr)` — already the key used everywhere else in this block
+— is non-zero for the containers. **F-393 rejected its own implementation, not the hypothesis, and I
+recorded it as if it had rejected the hypothesis.** Anyone re-reading F-393 should read this entry with it.
+
+**2. What moved, precisely.** The streamer gets past the point where three independent prior soaks froze at
+3 records and builds **readlists #4 and #5** (slot `0x8284AD68` is the record address F-376 identified).
+Deterministic: identical slots, identical RLC values, 2/2 soaks. Garage coverage is exactly flat, which is
+what makes it keepable rather than merely interesting.
+
+**3. What is NOT closed.** (a) Records #4/#5 carry pkg `0x000A0000` (`legals.xsf`, F-168's three-package
+note), **not** `0x64980000` — so the garage still has no record of its own and F-186's gap is *narrowed*,
+not closed. (b) `INFLATE-ENTER` still spins to ~5.1 M entries, so the filler serve was a lock, not the only
+lock. (c) Clause (b) is untouched: the boot worker's zero-count 4.3-billion-iteration loop (F-397) is a
+different thread. (d) `recs_whole` printed 7 and 8 here vs 8 and 16 in `w417` — that is the run-to-run
+spread F-393 §4 documents, not a change.
+
+**4. T41.81, next.** Ask what creates a readlist at all: `#4` has `id=4 cls=3 RLC=4` and `#5` has
+`id=0x8004 cls=2 RLC=7`, both reached only after the filler spin stopped. Read the record-creation path in
+`sub_821BC140`'s caller (the `q`/queue argument the `BC140-REC` printer already captures) and find what
+enqueues a package — then ask why `0x64980000` is not on that list while `0x000A0000` now is. That is the
+direct route to the garage's own record. Next ID **F-407**.
+
+### F-407 (2026-09-26 23:2x-23:3x, **1 build, soaks `w420`/`w421`/`w422` — three soaks of ONE exe; one log-only hook kept**) — **F-406'S RECORD INCREASE IS REAL (5 records in 5/5 soaks now vs 3 in 3/3 before), AND THE GARAGE'S LAST CHUNK HAS A STABLE DEFECT: `first_bad=00040005` in all three soaks while `claimed` varies 1,066,057 / 851,968 / 851,968 and `still_present` 1,038,617 (97.4 %) / 806,496 / 806,496 (94.6 %). `sub_8260C8E0` is NOT the record builder — that inference of mine is retracted.**
+
+- Task:        T41.81; retracts my own F-406 §4 lead, keeps the census.
+- Type:        FACT + INSTRUMENT (hook kept, log-only).
+- Class:       C (offset arithmetic in the placed image), with a G part for the record question.
+- Priority:    P0
+- Evidence:    `build/w420.log`, `build/w421.log`, `build/w422.log` — `UIXSF-GOLDEN-REVERIFY pkg=64980000 … goldsize=1066057`: `w420 claimed=1066057 still_present=1038617 pct=97 first_bad=00040005`; `w421` and `w422` both `claimed=851968 still_present=806496 pct=94 first_bad=00040005` · `BC140-REC` = **5 in all three** (and in `w418`/`w419`) against **3** in `w406`/`w415`/`w417` · `C0000005` 4, `LISTLINE` 171, `nGfx=0` in 3 `W34-GFX-CENSUS` rows, `INFLATE-ENTER` max serial 4,757,200–5,101,200 · hook `src/gpu_device.cpp:17249-17282`.
+
+**1. Retracted, and why it matters.** F-406 §4 proposed that the `stw r3,1540(r31)` in
+`ppc_recomp.123.cpp:3854` (inside `sub_8260C8E0`, `:3301`) was the streamer record's entry-count writer.
+The hook says no: `sub_8260C8E0` ran **once in the whole boot** (enter = exit = 1) on `rec=CCAEC700` with
+`+1532=23 +1536=22 +1540=26` — a 26-entry list elsewhere, not a per-record builder. So the
+`[record+1540]` count that `sub_821BC140` reads still has no located writer. Recorded so nobody re-derives it.
+
+**2. The one stable number is the useful one.** `first_bad=0x40005` — identical in all three soaks — is
+**262,149**, i.e. 4 bytes past `0x40000` = 2 × 131,072. The placed garage image is therefore correct
+through its first 256 KiB and wrong from the start of the next chunk. That is a chunk-boundary defect in
+what we place, distinct from durability (the `pct` term, 94–97 % of what was claimed stays present and
+byte-exact).
+
+**3. Variance, with its count.** Within ONE binary: `claimed` was 1,066,057 once and 851,968 twice;
+`still_present` 1,038,617 / 806,496 / 806,496. `w421` and `w422` agree exactly, so this is a **bimodal
+boot outcome**, not measurement noise — probably whether the host refill reaches the last chunks before
+the streamer stops. The honest sentence is now: **"75.6 %–97.4 % of the garage's 1,066,057 bytes are
+durably present and byte-exact, `first_bad` pinned at 0x40005; 5 streamer records in 5/5 soaks with
+`kF406SkipFabricatedServe=true` vs 3 in 3/3 without."** Clause (b) is unmoved (`nGfx=0`, 3 census rows).
+
+**4. T41.82, the concrete next question.** Why does the placed image break at `+0x40005`? Dump the 64
+bytes at `dest+0x40000` and at the gold `pkg+0x40000` in the same soak — `MclaUiXsfCompareGuestCopy`
+(`src/gpu_device.cpp:11429`) already reads both sides — and check whether `0x40000` coincides with a
+`PackageSizeAt`/`MclaUiXsfWalkCeil` bound or with the 262,144-byte destination limit F-354 measured. If it
+is the latter, the last 14 % is a destination-chain problem again and task #15 stays the route. Next ID
+**F-408**.
+
+### F-408 (2026-09-26 23:3x, **0 builds — reads of `w420`/`w421`/`w422` + the existing `UIXSF-LAYOUT-AUDIT`**) — **THE LAST 14 % IS NOT A DECODE DEFECT: where the garage's slots hold our bytes they are 100 % byte-exact (`modelA 851968/851968 match`, every slot `matchA == size`), and the shortfall is the DESTINATION CHAIN plus our own fill guard — 7 garage slots at 131,072 (851,968 of 1,066,057) in `w421`/`w422` versus a complete chain in `w420`, and 8 `UIXSF-GOLDEN-FILL-SKIP reason=PROTECTED(claimed_or_golden)` / `NOT_UNTOUCHED` rows in exactly those two soaks, 0 in `w420`.**
+
+- Task:        T41.82 (answered at the diagnosis level).
+- Type:        FACT.
+- Class:       C (slot ownership/aliasing), not G (decode).
+- Priority:    P0
+- Evidence:    `build/w421.log` @23:23:57.929 — `UIXSF-LAYOUT-AUDIT pkg=64980000 slot[2..8]=B7F41000,B7E01000,B7E21000,B7E41000,B7E61000,B7E81000,B7EA1000 vbase=60000000..600C0000 size=131072(×6),65536 modelA_off=00000000..000C0000 matchA=131072 each` and the summary `anchor=B7F41000 slots=7 modelA 851968/851968 bytes match modelB 851968/851968 bytes match winner=TIE` · `UIXSF-GOLDEN-FILL-SKIP pkg=64980000 slot[3]=B7E01000 goldoff=00020000 reason=PROTECTED(claimed_or_golden)` and the same slot `reason=NOT_UNTOUCHED` · row counts: `FILL-SKIP` **0 / 8 / 8** and `still_present` **1,038,617 / 806,496 / 806,496** across `w420`/`w421`/`w422`.
+
+**1. The overlap that explains the guard firing.** Two of the garage's slots are *also* another
+container's serve destination in the same boot: `w418`'s serves name `outPtr=B7E01000` for pkg
+`64CA3000` and `outPtr=B7E81000` for pkg `6496F000`, and `B7E01000`/`B7E81000` are the garage's
+`slot[3]`/`slot[7]` at golden offsets `0x20000`/`0x60000`. So `first_bad=0x40005` is not "our decode
+diverges" — it is "the first slot whose bytes are legitimately somebody else's". This is F-324/F-325's
+slot re-use, now visible at slot granularity, and it is why `MclaSlotUntouched`/`PROTECTED` exists.
+
+**2. Why the coverage is bimodal.** With 0 fill-skips (`w420`) the chain reached the full 1,066,057; with 8
+(`w421`, `w422`) it stopped at 851,968. The guard's outcome therefore, not the decoder, sets the number —
+so `kUiXsfFillOwnSlots=true` (F-350) is not actually overriding the own-chain case for `slot[3]`, because
+that slot is *claimed by a different package's completed dest* and the three-way guard
+(`:9239-9248`) refuses it for exactly that reason. **The refusal is correct for another stream's data and
+fatal for the garage's coverage — which is a scheduling/ownership question, not a decode question.**
+
+**3. Consequence for the objective, stated without over-claiming.** Clause (a)'s remaining 14 % needs the
+garage's slots to be *its own* — i.e. either the chain must be allocated disjointly (task #15's per-stream
+construction, the only route that removes the conflict rather than trading it) or the host must place the
+conflicting chunks after that other container's dest is done (an ordering change on a shared record, which
+F-356/F-357 showed is how this bed gets made). Both are consistent with keeping Path A's byte-exact decode
+untouched: `PATHB-HOSTDECODE` + `LAYOUT-AUDIT` already show 100 % match where bytes are placed.
+
+**4. T41.83 (next, cheap and decisive).** In one soak, print for each of the garage's 7 slots: who claims
+it (`g_destPkgOff`), whether the claim's package is still incomplete, and the exact guard branch taken —
+the `FILL-SKIP` line already carries `reason`, so add the *claimant pkg* and its own `recs_whole`. That
+converts §2's "correct refusal vs fatal refusal" into a count, and tells task #15 whether it needs
+disjoint slots, an ordering rule, or both. Next ID **F-409**.
+
+### F-410 (2026-09-26 23:3x, **1 build, soak `w423`; guard-split instrument KEPT**) — **F-408 §1/§2 ARE REFUTED BY THE INSTRUMENTUMENT I BUILT TO TEST THEM: all five garage fill refusals in `w423` read `reason=GOLDEN_ALREADY_PRESENT claimPkg=00000000`. No slot is aliased, no foreign stream claims one, and nothing correct is being withheld — the guard is NOT the coverage limiter. The shortfall is that the plan has fewer bytes than the container: `claimed` is 1,066,057 / 917,504 / 851,968 across soaks while every planned slot is already golden.**
+
+- Task:        T41.83 (answered) — **supersedes F-408 §1 and §2**; keeps §3's routing conclusion, now on correct grounds.
+- Type:        FACT + retraction of my own prior interpretation.
+- Class:       C (destination chain length), not the ownership conflict F-408 proposed.
+- Priority:    P0
+- Evidence:    `build/w423.log` @23:35:28.061-.062 — `F409-FILL-GUARD #1..#5 pkg=64980000 slot[2]/[4]/[5]/[7]/[8]=B7F41000/B7E21000/B7E41000/B7E81000/B7EA1000 vbase=60000000/60040000/60060000/600A0000/600C0000 goldoff=00010000/00030000/00050000/00070000/00090000 size=131072(×4)/65536 **reason=GOLDEN_ALREADY_PRESENT claimPkg=00000000**` · `UIXSF-GOLDEN-REVERIFY pkg=64980000 claimed=917504 still_present=872032 pct=95 first_bad=00030005` · `BC140-REC` = 5 (unchanged, 6/6 soaks now with the gate) · instrument `src/gpu_device.cpp:9467-9519`, `UiDecExpect::verified` at `:358-363`.
+
+**1. What was wrong in F-408.** I read `UIXSF-GOLDEN-FILL-SKIP` rows whose paired line said
+`PROTECTED(claimed_or_golden)` as evidence of a *claim*, because the merged string permits both readings, and
+I then cross-matched two `pbase` values (`B7E01000`, `B7E81000`) against `INFLATE-HOSTSERVE-PEND` rows from
+**a different soak** (`w418`) to invent an aliasing story. Splitting the reason and printing the claimant's
+own `pkg`/`verified` answers it directly: **`claimPkg == 0` on every refusal**, so there is no claim at all —
+the byte-for-byte check just before it found the slot already golden, which is the guard working as
+designed. The `w418` cross-match was the error: a serve destination in one boot is not a claim in another.
+
+**2. So what limits clause (a)?** The plan. `claimed` varies 1,066,057 / 917,504 / 851,968 across soaks of
+one binary and *every planned byte is golden*; `first_bad` therefore marks the first offset with **no plan
+row at all**, not a wrong write, and it moves with the chain (`0x40005`, `0x30005`) rather than with a
+decode boundary. That is F-354's destination-chain ceiling in its clean form, and it is the reason task #15
+(per-stream record / longer chain for one container) is the route rather than any fill-path tuning: there is
+nothing left to unblock in the fill path.
+
+**3. Durability, restated with counts.** Of what is planned, 872,032 / 917,504 = **95 %** survives in
+`w423` (against 94–97 % in `w420`..`w422`), so the guest re-use loss F-324/F-325 measured is now a few
+percent, not a third. The whole clause-(a) gap is: the chain does not reach 1,066,057.
+
+**4. Kept instruments.** `F409-FILL-GUARD` (cap `k <= 24 || k % 64`) and the claimant fields stay — they
+cost one log line per refusal and are what killed this theory. Next ID **F-411**.
+
+### F-411 (2026-09-26 23:4x, **0 builds — comparison of `w420`/`w421`/`w423`, one binary**) — **CLAUSE (a)'S LAST 14 % IS OUR PLAN'S CONTIGUOUS-RUN RULE, NOT THE GUEST'S CHAIN: the garage's read-list is identical in all three soaks (52 `PSTREAM` rows), and what changes is which slot the audit picks as `anchor` and how many slots it walks forward from it — `anchor=B7EC1000 slots=6 modelA 1066057/1066057` (`w420`, the WHOLE container from six slots), `anchor=B7F41000 slots=7 …851968` (`w421`), `anchor=B7F61000 slots=8 …917504` (`w423`). The destinations exist; we only ever fill one forward run.**
+
+- Task:        T41.84, answered at diagnosis level; the fix is T41.85.
+- Type:        FACT.
+- Class:       C/D (our planner's coverage rule).
+- Priority:    P0
+- Evidence:    `build/w420.log` / `w421.log` / `w423.log`, same exe — `PSTREAM` row count 52 in all three; `UIXSF-LAYOUT-AUDIT pkg=64980000 anchor=B7EC1000 slots=6 modelA 1066057/1066057 bytes match … winner=TIE` (`w420`) vs `anchor=B7F41000 slots=7 modelA 851968/851968` (`w421`) vs `anchor=B7F61000 slots=8 modelA 917504/917504` (`w423`); the per-soak slot sets are disjoint-by-position: `w420` used `slot[9..14] = B7EC1000,B7C01000,B7C41000,B7F71000,B7C81000,B7CA1000`, `w421` used `slot[2..8] = B7F41000,B7E01000,B7E21000,B7E41000,B7E61000,B7E81000,B7EA1000`, `w423` used `slot[1..8]` (same plus `B7F61000`) · planner: `MclaUiXsfSlot`/plan build around `src/gpu_device.cpp:9400-9520` (anchor index `ai`, `plan` of `{slot index, goldoff}`), F-327's "list order" choice and F-352's model audit (`:9250-9266`).
+
+**1. Why this is not the F-354 ceiling.** F-354 concluded "every UI container gets exactly TWO inflate destinations of 262,144–393,216 B, so 41.3 % is the ceiling". That measured the *guest's* inflate step. This is a different object: the read-list already carries 52 destinations for the garage, and 6 of them are demonstrably enough to hold all 1,066,057 bytes correctly — `w420` did exactly that. So the container is not short of destinations; our fill plan is short of *reach*.
+
+**2. The rule that limits us.** The plan is built as one contiguous forward run in list order from a single anchor, and the audit's `slots=N` is that run's length. When the anchor lands late in the list (`w420`, index 9) the run is short in count but the slots there are large enough to cover the container; when it lands early (`w421`/`w423`) the run stops before the end of the list and coverage caps at 851,968/917,504. Nothing wraps to the remaining slots. **This is a host-side policy, so it is fixable without touching the guest's record, the shared `st`, or any of the thirteen closed Path B variants.**
+
+**3. T41.85 — the implementation, and its pass gate.** Extend the plan builder to consume the whole read-list for this package instead of one forward run: order the 52 slots by list position, assign `goldoff` cumulatively from the anchor in both directions (or from the list head, which F-352's model-A tie makes safe), keep the existing three-way guard (`F409-FILL-GUARD` reports the reason), and keep skipping any slot another package has *claimed and unverified*. Pass gate, stated before building: **`UIXSF-GOLDEN-REVERIFY pkg=64980000 claimed=1066057` in 3/3 consecutive soaks**, `still_present/claimed >= 0.94`, `first_bad` at or beyond the current best (`0x40005`), `code=0xC0000005` 4, `LISTLINE` 171, `BC140-REC` 5. Reject and revert if `claimed` rises while the other three containers' `pct=100` rows fall, or if `F409-FILL-GUARD` starts printing `CLAIMED_OTHER_UNVERIFIED` (that would mean we are now overwriting a live foreign stream, which is exactly what the guard exists to prevent). Next ID **F-412**.
+
+### F-430 (2026-09-26 23:5x, **4 builds, soaks `w424`..`w430`; two census markers KEPT, the FIX IS REJECTED and the revert is verified**) — **THE GARAGE'S DEFICIT IS ONE NAMED SLOT, AND FILLING IT BREAKS THE BOOT: `F412-JOBCAP` measures the anchor's own job at 9 slots / 1,179,648 B with `tail=917,504` because `anchorSeq=1` drops the `seq=0` slot of 262,144 B — 148,553 B short of 1,066,057, which is clause (a)'s entire remaining gap. Both ways of filling it crashed; one of them first produced this project's FIRST 100 %-of-golden container (`claimed=1066057 pct=100 first_bad=FFFFFFFF`).**
+
+- Task:        T41.85 — attempted, **REJECTED**, reverted, revert verified (`w430` healthy).
+- Type:        FIX-attempt + FACT.
+- Class:       C (slot mapping/ownership).
+- Priority:    P0
+- Evidence:    `build/w426.log` (census only, flag off) `F412-JOBCAP pkg=64980000 job=1 slots=9 capacity=1179648 tail=917504 seqRange=0-9 anchorSeq=1 gold=1066057 tailCovers=0`, and the same job printed for a 143,069 B container with `anchorSeq=0 … tailCovers=1` · `build/w428.log` (flag on, F-350 own-slot bypass allowed): `pkg=64980000 goldsize=1066057 claimed=1066057 still_present=1066057 pct=100 first_bad=FFFFFFFF`, `BC140-REC` 5, `LISTLINE` 171, `F409-FILL-GUARD` **0** rows — then `BOOT_RC=1` at ~32 s (healthy soaks of this tree return 124 because `timeout` must kill them) · `build/w429.log` (flag on + F-429 pre-anchor bypass disabled): `BOOT_RC=1` after **775** lines with `LISTLINE` 0 and `BC140-REC` 0, already parked at `lr=821E0FF8` · `build/w430.log` (shipped state): `BOOT_RC=124`, 267,860 lines, `C0000005` 4, `LISTLINE` 171, `BC140-REC` 5, `F409` 5, `pkg=64980000 claimed=917504 still_present=917504 pct=100 first_bad=FFFFFFFF` · code: `kF427JobHeadAnchor` at `src/gpu_device.cpp:9250-9275` (now `false`), plan rule `:9411-9434`, pre-anchor guard `:9482-9492`, census `:9457-9487`.
+
+**1. The pattern that makes this worth exactly one more read.** Every container that reaches `pct=100` has `anchorSeq=0`; the garage's anchor is `anchorSeq=1`, and the single slot that filter drops IS the deficit. So the job is not too small (1,179,648 B for a 1,066,057 B body) — **this container's plan does not start at its job head, while all four successful ones do.**
+
+**2. Why the two rejections are not the same failure.** `w428` proves the placement is content-correct *by our own measure* and nothing more: the audit compares against the offsets this very plan chose, so `pct=100` there cannot falsify the mapping (F-308's rule). `w429` is the stronger signal — using only pre-anchor slots that pass `MclaSlotUntouched` killed the boot ~1 s in, before the VFS/streamer stage ran at all, so at least one of those writes lands on memory something else needs from the start. Neither crash is explained, and that is precisely why no third attempt is worth running before ownership is known.
+
+**3. Shipped state.** `kF406SkipFabricatedServe=true` (validated: `BC140-REC` = 5 in `w418`/`w419`/`w423`/`w425`/`w426`/`w430` vs 3 in `w406`/`w415`/`w417`), `kF427JobHeadAnchor=false`, `kF393NoHijackNonUi=false`, `kF368HostDispatchGate=false`; `F412-JOBCAP` + `F409-FILL-GUARD` stay as log-only census. Clause (a): garage 917,504/1,066,057 claimed, **100 % of claimed durable and byte-exact** in `w430` (`first_bad=FFFFFFFF`); the other three containers at `pct=100`. Clause (b) unmoved (`nGfx=0`).
+
+**4. T41.86 — a read, not a write.** Who owns `job 1 / seq 0` for this package? Compare, in one soak: the `PSTREAM` inventory of the garage's job (vbase/size per seq), the `g_uiDecExpect` claim map, and — decisive — **the destination the GUEST itself asked for first** (`INFLATE-HOSTSERVE-PEND outPtr=` / `XMEM dest=` rows, which are the guest's request, not our placement). If the guest's first dest is seq 1, the chain really starts there and clause (a)'s last 14 % is only reachable through task #15 (more destinations from the enqueue side). If it is seq 0, F-427 returns — with an ownership guard, never the F-350 bypass. Next ID **F-431**.
+
+### F-431 (2026-09-26 21:0x, **0 builds — reads of `w430`**) — **T41.86 ANSWERED, AND IT CLOSES THE HOST-PLACEMENT ROUTE FOR GOOD: the slot F-427 wanted to use is `PSTREAM #1 s[0] vbase=50000000 pbase=B7F01000 size=00040000`, i.e. at a LOWER `vbase` than the garage's anchor (`s[1]`, `vbase=50040000`). A stream's slots ascend in vbase (F-320), so `s[0]` is the PREVIOUS load's buffer — that is why both F-427 variants crashed. The garage's own chain really is `s[1..8] = 917,504 B < 1,066,057 B`: the title allocated too little destination space, so clause (a)'s last 14 % can ONLY come from the guest enqueue side — task #15.**
+
+- Task:        T41.86 (answered); terminates the F-427 direction with a mechanism.
+- Type:        FACT.
+- Class:       G (the title's own allocation) — the host cannot substitute for it.
+- Priority:    P0
+- Evidence:    `build/w430.log` — `PSTREAM #1 s[0] @82849B30 vbase=50000000 pbase=B7F01000 size=00040000` and `s[1] @82849B3C vbase=50040000 pbase=B7F61000 size=00010000` (contiguous: `0x50000000+0x40000 == 0x50040000`) · `UIXSF-LAYOUT-AUDIT pkg=64980000 slot[1]=B7F61000 vbase=50040000 … modelA_off=00000000 matchA=65536` through `slot[8]=B7EA1000 vbase=600C0000 … matchA=65536`, summary `anchor=B7F61000 slots=8 modelA 917504/917504 bytes match modelB 65536/65536 bytes match winner=SEQUENTIAL` · `F412-JOBCAP … anchorSeq=1 tail=917504 tailCovers=0` · and the host side already holds the whole body: `XSF-HOSTSERVE path='resources/ui/garage/garage.xsf' off=64980000 size=1066057 buf=CA508180 head=05435352 pkgSubst=64980000 pass=1` (twice, `CA708180` on pass 2).
+
+**1. Why this is the end of the placement argument.** Three candidate explanations for the 148,553 B deficit existed after F-430: (a) the guard withholds capacity (falsified by F-410: every refusal is `GOLDEN_ALREADY_PRESENT`), (b) the plan walks too narrow a run (falsified here — the run is the whole ascending-vbase chain), (c) the guest's chain is genuinely short (confirmed: `s[1..8]` sums to 917,504 B). And F-427's crash is now *explained* rather than merely observed: writing 262,144 B below the container's own start overwrote the previous load's buffer.
+
+**2. The asymmetry worth keeping.** We hold all 1,066,057 correct bytes in a host buffer (`size=1066057` from `XSF-HOSTSERVE`) and can only place 917,504 because that is how much destination the title asked for. So Path A is not "wrong" — it is **destination-bound**, and the only way to raise clause (a) to 100 % is to make the guest ask for more, which is the definition of task #15 (per-stream record / descriptor construction inside `sub_821BC140`, whose 12-byte `{outPtr, outLeft, …}` slots at `record+8+i*12` with count at `record+1540` are now fully read, F-393 §2).
+
+**3. For the record on task #15's feasibility.** F-354 measured the two-destination bound from the hook-reachable side, F-356/F-357 closed per-request-record marking and repeat-loading, F-342/F-343 closed context isolation and walk-state clearing. What has NOT been tried, and is now the only candidate: writing additional 12-byte descriptors into the request's own array and raising `[record+1540]` (the array has room for 127), so `sub_821BC140`'s loop walks more destinations itself and allocates/fills them on the guest's terms. The writer of `[record+1540]` is still unlocated (F-407 §1), so that is the first read. Next ID **F-432**.
+
+### F-432 (2026-09-27 00:2x, **0 builds — static reads of `generated/` + the raw image, plus a re-read of `w430`**) — **THE BOOT-WORKER LivelOCK AND THE HEAP-HEADER STORM ARE THE SAME BUG: `sub_82397060` is entered with `count == 0`, and its free-list link loop is guarded on `EQ` only, so it then runs 2^32-1 times storing `[r9+12] = r9+16` over the whole 32-bit guest space.**
+
+- Task:        T41.87 (this supersedes its declared first step — the writer of `[record+1540]` turned out not to be the blocker; the count-0 storm was), and it closes the open half of #48 / the F-371/F-384 hunt.
+- Type:        FACT
+- Class:       G (the title's own coded behaviour) with a D consequence
+- Priority:    P0
+- Evidence:    `build/w430.log` `F395-GROW-ENTER #1 obj=828CD064 want=0 lr=823973C0 sp=8EFFF640` (the only ENTER row in the soak, `F395-GROW-EXIT` 0) · `generated/ppc_xenon/ppc_recomp.61.cpp:17859-17923` (the two loops), `:18237-18258` (the caller) · `build/cache/mcla_pe.bin` VA 0x82051E90 = `"Vehicle"` (offset 0x51E90, bytes read directly)
+
+**1. The caller is single and it passes a zero halfword.** `sub_82397060` has exactly one call site reached in this boot, inside `sub_823971D0` at `0x823973B4`: `lis r11,-32115` + `addi r28,r11,-12120` = **0x828CD0A8**, and the argument is `lhz r4,4(r28)`. `0x828CD0A8` is zero-fill (the eight words there read `00000000` straight out of `mcla_pe.bin`), so `want` is 0 unless something raises it first.
+
+**2. Why 0 is catastrophic, in the routine's own words.** With `r30 = count`: the zero-fill loop (`ppc_recomp.61.cpp:17859-17886`) is entered only after `addic. r11,r30,-1` + `blt skip` — a *signed* test, so count 0 (r11 = -1) skips it. The link loop at `loc_82397184` (`:17888-17923`) is guarded by `addic. r11,r30,-1` + **`beq` skip** — equality only. Count 1 skips, count 0 falls in with r11 = -1 and `bne` keeps looping until the counter wraps: 4,294,967,294 iterations. Each stores `[r9+12] = r9+16` with `r9 = [r31+16] + r10` and `r10 += 16`, i.e. a stride walk by `(allocPtr+4)` through the *entire* guest address range, wrapping. That is the "deterministic garbage" F-371 named, and the reason F-384 observed "the writer follows the arena base" — the stride *is* the freshly allocated pointer. It also explains F-395's enter-without-exit, and why everything downstream of it in the boot was uninterpretable.
+
+**3. Why the halfword is 0 (F-405's question, answered one level up).** The walk that raises it is `loc_82397328` in the same function: `sub_821CFF40(&[r1+144], r29, 0)` with `r29 = 0x82051E90` = the string `"Vehicle"`, and only when that lookup returns non-zero does the caller reach `mr r3,r28; li r4,16; bl sub_82396DF8` — **add 16 entries per found section** (`:18199-18206`). The lookup returns 0, so it jumps straight to the grow call with the count still 0. `tools/ppc_xrefs.py xref 82051E90` gives exactly one site (0x823972ec), so this is the only consumer of that name in the image. Neighbouring strings at 0x82051EA0 / 0x82051EC8 are `AllocateCarData - %s.lst not found` and `/vehicle/vehicle%04d`.
+
+**4. Consistent with, and sharpening, F-400/F-401/F-405.** `F401-GROUP` at the same millisecond shows >= 16 group descriptors already linked on the head at `0x828559E4` (that walk is capped at 16 rows, so read it as "at least"), each with `[+4)=0 [+8)=0` — the groups are *registered* and never *bound*, which is exactly what a failed section lookup produces. So task #49/T41.76's "producer that must raise the count" is now named: `sub_82396DF8(0x828CD0A8, 16)`, gated on the "Vehicle" section lookup, and nothing in `src/` publishes that field.
+
+**5. What this does NOT establish.** No evidence yet that the "Vehicle" lookup is *supposed* to succeed at this point in the boot (an ordering question), nor which archive feeds it; and no evidence that removing the storm is sufficient for GFx — F-433 measures what actually happens when it does not run.
+
+### F-433 (2026-09-27 00:2x, **1 build, soak `w431`**) — **MITIGATION `kF432SkipZeroCountGrow` (return from `sub_82397060` without executing its body when `want == 0`) removes the store storm outright — `C0000005 4 -> 0`, `F379-HEAPSTORE-BT 19 -> 0` — and lets the guest do 4.4x more inflate work in the same 120 s. It does NOT raise coverage (garage durable bytes 872,032 -> 806,496) and `nGfx` is still 0; the new top blocker is the descriptor loop's placement spin at `produced=0 inLeft=20`.**
+
+- Task:        T41.87 -> T41.88 (new head)
+- Type:        FIX (a named mitigation, not a root-cause fix — the root cause is F-432 s3, upstream of `src/`)
+- Class:       G + D
+- Priority:    P0
+- Evidence:    `src/gpu_device.cpp:17449-17469` (flag + rationale) and the gate at `src/gpu_device.cpp:17519-17525` · `build/w431.log` (`F432-GROW-SKIP` x3) vs `build/w430.log`, via `tools/soak_census.py build/w431.log build/w430.log`
+
+**1. Why skipping is downstream-equivalent (what makes this a mitigation and not a fabrication).** The caller re-reads the *same* halfword two instructions after the call — `lhz r11,4(r28) / cmplwi cr6,r11,0 / beq 0x8239744c` (`ppc_recomp.61.cpp:18252-18258`) — and branches around every remaining use of the container when it is 0. So for `want == 0` the call's result is never consumed, and leaving the container words at their `.bss` zero is what the caller's own zero-count branch already implies. `ctx.r3` is set to the container because the call site discards it.
+
+**2. Measured, one variable changed, `w430` -> `w431` (both 120 s, `BOOT_RC=124`).**
+
+| marker | w430 | w431 | reading |
+|---|---|---|---|
+| `F395-GROW-ENTER` / `EXIT` | 1 / 0 | 3 / 0 | all three enters are `want=0`; `F432-GROW-SKIP` = 3, so the gate fired on every one and the worker survived to reach two more |
+| `C0000005` | 4 | **0** | the storm was the only source of that fault class |
+| `F379-HEAPSTORE-BT` | 19 | **0** | nothing lands on the user-heap header any more |
+| `INFLATE-ENTER` (capped printer) | 26,285 | 117,229 | its counter reaches #23,155,400 — the guest spends its time inflating instead of store-storming |
+| `rptrWB` / `PUT=` | 1,657 / 1,663 | 6,632 / 6,592 | CP truth `drains=8 pub=11 put=11 (caught up)` |
+| `PARK-SAMPLE` | 200 | 75 | |
+| log lines | 267,860 | 832,527 | |
+| `LISTLINE` / `GFx` / `UILOAD` / `BC140-REC` | 171 / 7 / 3 / 5 | 171 / 7 / 3 / 5 | no structural change |
+| garage `UIXSF-GOLDEN-REVERIFY` | `claimed=917504 still_present=872032 pct=95` (recs 9/7) | `claimed=851968 still_present=806496 pct=94` (recs 8/6) | **a real regression: -65,536 durable bytes, one record shorter**, because the boot took a different path |
+| `pkg=64CB0000` | `143069 / 100 %` | `143069 / 100 %` | unchanged |
+| `nGfx` | 0 | 0 | GFx still does not initialise |
+| `fatal` (substring: `P5-GATE ... no Resource fatal`) | 23,924 | 24,048 | benign pre-existing message that scales with CP traffic, not a new error class |
+
+**3. The newly-revealed top blocker (F-186/F-187 in its current form).** The tail of `w431` is one stream spinning in `sub_821BC140`'s placement branch: `INFLATE-OUTPTR #23154400 outPtr=B7B01000 outLeft=524288 produced=0 inLeft=20 consumed=32748 magic=3B6426F9`, with `INFLATE-ENTER st=006D8F20 ... exp=00000000 lr=821BC380`, and the guest's own `XMemDecompress` (dispatcher `sub_8244FF20`, hooked log-only) returning `ret=00000000 srcLen=20 destLen=524288`. The loop cannot leave: `loc_821BC2D4` tests `[r1+96] != 0` first and, while output is still owed, branches straight to the place call at `loc_821BC374` and **never takes the read branch** (`ppc_recomp.14.cpp:19040-19050`, `:19128-19170`) — placement needs input, and the read that would supply it is skipped. `exp=00000000` says our Path A expect-record has no entry for this stream, so the host serves nothing either. Same signature as F-326/F-327's `inLeft=2051` stall, now at `inLeft=20`; `w430` already carried 26k rows of it, so F-433 did not create it — it removed the thing that was hiding it.
+
+**4. Keep or revert?** Kept: it deletes a fault class and a heap-corruption class with no new failure mode, and the coverage delta is one chain length on a container that is still 94 % served, on a boot that now does several times the useful work. Recorded as a mitigation with its `file:line` per rule 1. Next ID **F-434**.
+
+### F-434 (2026-09-27 00:4x, **2 builds, soaks `w431`/`w432`; MITIGATION KEPT, VERIFIED**) — **BREAKING THE NON-UI INFLATE SPIN IS THE BIGGEST SINGLE ADVANCE OF THIS WAVE: the boot stops burning its last 105 s in one loop and the pipeline continues — `BC140-REC` 5 -> 7 (two new streamer records reach `sub_821BC140` for the first time), `W34-GFX-CENSUS` 3 -> 6 with the first NON-POISON GFx object ever seen here (`vt=82085364`, `nLiveDest=4`, `tagNv=2`), and the garage's coverage regression from F-433 disappears. `nGfx` is still 0.**
+
+- Task:        T41.88 (new head; T41.87's premise is superseded by F-432)
+- Type:        FIX (a named mitigation of a guest infinite loop, not a decompression fix)
+- Class:       G + D
+- Priority:    P0
+- Evidence:    `src/gpu_device.cpp:1088-1097` (flag `kF434BreakNoProgressSpin`), gate + drain at `src/gpu_device.cpp:11007-11042` · `build/w432.log` (`F434-SPIN-BREAK` at 1 firing) vs `build/w431.log`, `tools/soak_census.py build/w432.log build/w431.log` and `.. build/w193.log`
+
+**1. The loop had no exit because every existing exit is UI-only.** Both drains in the place pass require either `produced > 0` (`INFLATE-UNSTUCK`, `src/gpu_device.cpp:10986-10995`) or a UI/job2 dest (`INFLATE-J2-CONT`, `:11008+`). `w431`'s spinner is `PSTREAM #5 s[4]` of readlist `8284B37C` — `BC140-REC #5`, the stream whose record field `+24` is `0x000A0000` — F-318 §1 called that stream "meshtextures" and the `w418/w419` handoff block called it "legals.xsf", so **its name is unsettled in our own docs**; what is settled is that `0x000A0000` is a *length* field (655,360), not a package VA, and that F-318 identified this same `st=006D8F20` shape as the dominant one — with `produced=0`, `inLeft=20`, `outLeft=524288`, `consumed` frozen at 32,748 and `magic=3B6426F9` (neither `0x05435352` RSC5 nor an XCompress header). `sub_821BC140` cannot leave by itself: `loc_821BC2D4` tests the owed-output word at `[r1+96]` first and branches straight to the place call, so while output is owed it never issues the next read (`ppc_recomp.14.cpp:19040-19050`, `:19128-19170`) — placement needs input and the input read is the skipped step. 23,155,400 iterations of that.
+
+**2. What the mitigation does, and the predicate that keeps it honest.** After 64 consecutive sightings of the *same* `(st, consumed)` with `0 < inLeft < 256`, `outLeft > 0`, `produced == 0`, it writes `[st+0] = 0` and `[st+16] = 0` — the caller loop's own stream-complete key, mechanically identical to what `INFLATE-UNSTUCK` already does for UI dests, in the same scope, same `mem` accessor, same guest-stack object. Requiring `consumed` to be **frozen** (not merely "produced 0") is what makes it unable to fire on a legitimately mid-frame stream, where `consumed` rises and `inLeft` cycles. It fired **once** in the whole boot.
+
+**3. Measured `w431` -> `w432` (both 120 s, `BOOT_RC=124`, one variable changed).**
+
+| marker | w431 | w432 | reading |
+|---|---|---|---|
+| `INFLATE-ENTER` | 117,229 rows / #23,155,400 | 2,378 rows | the spin is gone |
+| log lines | 832,527 | 132,165 | |
+| last lines of the soak | `INFLATE-OUTPTR`/`XMEM` at the spin | ordinary `WAIT[KWFSO] to=30ms` polling | **first boot of this project that ends idle instead of stuck in a loop** |
+| `BC140-REC` | 5 | **7** | new: `#6 slot=8284B990 RLC=17`, `#7 slot=8284BFA4 RLC=2`, both on the `0x0035A000` stream — i.e. the enqueue gap F-186/F-187 named is now two records narrower |
+| `W34-GFX-CENSUS` | 3 (`vt=CDCDCDCD nLiveDest=0 tagNv=0`) | 6, and the new rows read **`vt=82085364 d0=82085364 nLiveDest=4 tagDest=B7981000 tagBase=B79811F8 tagNv=2`** | the GFx display object is populated for the first time — but **`nGfx` is still 0** |
+| `GFx` / `W34-NOGFX` / `UILOAD` | 7 / 3 / 3 | 13 / 6 / 6 | |
+| garage `UIXSF-GOLDEN-REVERIFY` | `claimed=851968 still_present=806496 pct=94` | **`claimed=917504 still_present=872032 pct=95`** (recs 9/7) | F-433's -65,536 regression is gone |
+| `pkg=64CB0000` | `143069 / 100 %` | `143069 / 100 %` | unchanged |
+| `C0000005` / `LISTLINE` / `STREAM-OPEN` | 0 / 171 / 11 | 0 / 171 / 11 | no fault, no structural change |
+| `PRESENT` / `FENCE` / `TASKJOIN` / `P10-PRE` | 61 / 14 / 14 / 3,699 | 62 / 14 / 14 / 3,707 | |
+
+**4. Against the objective's named baseline `w193`.** Everything structural moved forward: `GFx` +8, `W34-GFX-CENSUS` +4, `PRESENT` +28, `PUT=` +3,631, `INFLATE-SKIP/EMPTY/PENDING` +37/+16/+63, `C0000005` 0=0, `LISTLINE` 171=171. The one line-count regression is `Fatal error dispatcher invoked - terminating game` (w193 0 -> 1) — and it is **not** from this change: the same line is present in `w431` at line 100,379 (`w432`: 100,388), and our `FATAL-SOFT` soft-park (2 rows) is what lets the boot continue past it.
+
+**5. What is NOT established.** `nGfx` 0 means GFx still does not initialise, so the objective is not met by this. The drained stream is left *incomplete*: the guest was owed 524,288 bytes at `B7B01000` and got 0, so this mitigation trades a spin for a short container — if that container is later consumed as if complete, its contents are whatever was already in the slot. Nothing in `w432` shows a consumer reading it, which is why it is kept as a mitigation and not presented as a fix. Next ID **F-435**.
+
+
+### F-435 (2026-09-27 00:5x, **0 builds — raw words from `build/cache/mcla_pe.bin` plus `tools/ppc_xrefs.py`**) — **`nGfx` 0 IS NOT AN INSTRUMENT ARTIFACT: the `0x82085364` vtable that F-434 exposed is a stub-heavy object, not a GFx-family one, so the honest reading of `w432` is that no GFx loader object exists and the only remaining route to `nGfx > 0` is the user's `rule-2`/`F-055` decision.**
+
+- Task:        T41.89 (#56), answered by its first half
+- Type:        FACT (a negative result)
+- Class:       H (suspected instrument) resolved as G
+- Priority:    P1
+- Evidence:    `build/cache/mcla_pe.bin` VA 0x82085364 / 0x820736DC / 0x820736B0 (offset = VA-0x82000000, big-endian words read directly) · `src/gpu_device.cpp:6999-7014` (the scan filter) · `src/gpu_device.cpp:2214` (the forced boot gate) · `build/w432.log` (`GATE-WAIT`, `BOOT-GATE started`, `GFX-ALLOC`, `GFX-CTOR`, `GFX-BLOCK` all 0 rows)
+
+**1. The two vtables, word for word.** Known GFx loader vtables (written by ctor `sub_824C6F08`, per the comment at `src/gpu_device.cpp:2230-2231`): `0x820736DC` = `824CA948 82481D30 824CF420 824C6F70 824CA9B0 820EEF6C 824CAAB0 824C70B0` — real methods, and `824C6F70` is precisely the lifecycle routine the census drives. The object F-434 surfaced: `0x82085364` = `825EF0B0 82130000 82130000 82130000 825FDB30 82130000 821A5CC0 821A5CC0` — **five of its first eight slots are `sub_82130000` (a bare `blr`) and `sub_821A5CC0` (the shared no-op vtable stub the `STUB-SLOT` marker already counts)**. Different family, different ctor (`sub_825EF028`/`sub_825EF100` are the only sites materialising it), and the `vt`/`obj` fields of `W34-GFX-CENSUS` come from the census's own object at `B7B41000`, not from the scan, so the row cannot be read as a scan hit.
+
+**2. Therefore the scan is right and the gap is real.** Broadening the `0x82073xxx` filter would count stub objects as GFx loaders and produce exactly the F-308 failure mode (a marker that moves because the predicate was widened, not because the guest advanced). The correct conclusion is F-434's: the streamer pipeline advanced two records and the store storm/heap corruption are gone, but GFx still never initialises because **nothing in the guest reaches the GFx loader ctor** — its one call site is `sub_82482F78+0x1c` (`tools/ppc_xrefs.py calls 824C6F08` → 1 site), and the only thing that has ever made a GFx object appear in this project is the host-forced boot gate at `src/gpu_device.cpp:2214`, which is the user's reserved `F-055` decision. Next ID **F-436**.

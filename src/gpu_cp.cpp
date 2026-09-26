@@ -5,6 +5,7 @@
 
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "guest_memory.h"
+#include "kernel/heap_arena.h"  // F-412: kPhysArenaBeginVa, so this probe follows the pool
 #include "kernel/memory.h"
 #include "logging.h"
 #include <cpu/ppc_context.h>
@@ -1826,6 +1827,175 @@ uint64_t CpDrainCount() { return g_drainCount.load(std::memory_order_relaxed); }
 
 // PAGE-WATCH (session 24): attribution probes for the async-task work buffer
 // at guest 0x50000000 - called from GuestMemoryView checked accessors.
+// F-375: the guest's own memcpy (recompiled sub_823DA950) was caught by F-374's guard page writing
+// 16+ consecutive dwords starting at guest 0x20000 -- which is where the HOST keeps its user-heap
+// o1heap instance (src/kernel/heap.cpp:178 binds the arena there). That is the writer behind F-370's
+// dead allocator and uncreated thread #16. What the guard cannot say is the argument set: r3=dst,
+// r4=src, r5=len, i.e. whether 0x20000 arrived as a destination from a caller whose buffer-pointer
+// field actually holds a size. Read-only, own counter, capped at 8 (the burst is 16 dwords).
+void HeapInstanceStoreReport(uint32_t guestAddr, uint32_t value) {
+  static std::atomic<uint32_t> s_hi{0};
+  const uint32_t n = s_hi.fetch_add(1) + 1;
+  if (n > 8) return;
+  uint32_t lr = 0, sp = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r13 = 0;
+  if (const PPCContext *c = GetPPCContext()) {
+    lr = static_cast<uint32_t>(c->lr);
+    sp = c->r1.u32;
+    r3 = c->r3.u32;
+    r4 = c->r4.u32;
+    r5 = c->r5.u32;
+    r6 = c->r6.u32;
+    r7 = c->r7.u32;
+    r13 = c->r13.u32;
+  }
+  MCLA_LOG_ERROR("F375-HEAPSTORE #{} guest={:08X} val={:08X} lr={:08X} sp={:08X} r3={:08X} "
+                 "r4={:08X} r5={:08X} r6={:08X} r7={:08X} r13={:08X}",
+                 n, guestAddr, value, lr, sp, r3, r4, r5, r6, r7, r13);
+  if (n == 1 && r13 != 0) {
+    // F-389 (T41.67): the writer's allocator is resolved by the XTL thunk `sub_82130528` as
+    //     lwz r11,0(r13) / li r10,28 / lwzx r3,r10,r11 / lwz r9,0(r3) / lwz r8,8(r9) / bctr
+    // -- object = [[r13]+28], method = [object+8], and `li r5,16` there is the 16-byte entry stride
+    // the F374 rows show. Print both dereferences so the supplier of the base is named at the event
+    // instead of inferred from the disassembly.
+    auto &gt = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t vec = 0, obj = 0, meth = 0, fn = 0;
+    (void)gt.ReadU32BE(r13, &vec);
+    if (vec != 0 && vec != 0xCDCDCDCDu) {
+      (void)gt.ReadU32BE(vec + 28u, &obj);
+      if (obj != 0 && obj != 0xCDCDCDCDu) {
+        (void)gt.ReadU32BE(obj, &meth);
+        if (meth != 0 && meth != 0xCDCDCDCDu)
+          (void)gt.ReadU32BE(meth + 8u, &fn);
+      }
+    }
+    MCLA_LOG_ERROR(
+        "F389-XTLCHAIN r13={:08X} [r13]={:08X} obj=[[r13]+28]={:08X} vt=[obj]={:08X} "
+        "allocFn=[vt+8]={:08X}",
+        r13, vec, obj, meth, fn);
+    // F-389b: `sub_821C08F8` is only a dispatcher -- `addi r11,r6,1 / rlwinm r10,r11,*4 /
+    // lwzx r3,r10,r3 / lwz r9,0(r3) / lwz r8,8(r9) / bctr`, i.e. the real allocator object is
+    // `[bank + (r6+1)*4]` and its method is `[obj+8]` (the existing 76j census documents r6=0 -> the
+    // dual-buddy bank). Dump that object's head so the region it allocates FROM is readable at the
+    // event: if its base is guest 0x20000 it is OUR user-heap arena, which is the last link T41.67
+    // needs. r6 is unknown at store time, so index 1 (`(0+1)*4`) is the one printed.
+    uint32_t bank = obj, a1 = 0, vt1 = 0, fn1 = 0, w[8] = {0};
+    if (bank != 0 && bank != 0xCDCDCDCDu) {
+      (void)gt.ReadU32BE(bank + 4u, &a1);
+      if (a1 != 0 && a1 != 0xCDCDCDCDu) {
+        (void)gt.ReadU32BE(a1, &vt1);
+        if (vt1 != 0 && vt1 != 0xCDCDCDCDu)
+          (void)gt.ReadU32BE(vt1 + 8u, &fn1);
+        for (uint32_t i = 0; i < 8; ++i)
+          (void)gt.ReadU32BE(a1 + i * 4u, &w[i]);
+      }
+    }
+    MCLA_LOG_ERROR("F389-BANK bank={:08X} alloc=[bank+4]={:08X} vt={:08X} fn={:08X} "
+                   "head=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                   bank, a1, vt1, fn1, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+  }
+  if (n == 1) {
+    // F-379: ctx->lr names only the innermost return address, and the guest stack above sp is empty
+    // (F-378: every word but the back-chain read 00000000), so the caller chain has to come from the
+    // host side. Every recompiled guest function is a PUBLIC __imp__sub_X in the link map, so a host
+    // return address resolves offline to the guest function that owns it:
+    //     python tools/host_rva_resolve.py build/mcla.map <rva> <rva> ...
+    void *frames[20] = {};
+    const WORD nf = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
+    const uintptr_t mb = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    for (WORD i = 0; i < nf; ++i) {
+      const uintptr_t f = reinterpret_cast<uintptr_t>(frames[i]);
+      const uintptr_t rva = mb ? f - mb : f;
+      const bool inModule = mb && f >= mb && f < mb + 0x08000000u;
+      MCLA_LOG_ERROR("F379-HEAPSTORE-BT frame={}/{} rva={:x} inmod={}", static_cast<int>(i),
+                     static_cast<int>(nf), static_cast<unsigned long long>(rva),
+                     inModule ? 1 : 0);
+    }
+
+    // F-383: F-382 settled the question the symbol lookup could not. The guest memcpy WAS hooked and
+    // its live-entry control fired (F382-MEMCPY-LIVE calls=1), yet not one memcpy in the whole boot
+    // had a destination inside 0x10000..0x30000 -- so "the writer is the recompiled sub_823DA950" was
+    // an artifact of nearest-preceding PUBLIC symbol resolution (no PDB here, so generated statics are
+    // invisible to the map). The unwind table is complete without symbols, so ask it directly: the
+    // containing function's real start, resolved offline with
+    //     python tools/host_rva_resolve.py build/mcla.map <owner_rva>
+    if (nf > 3) {
+      DWORD64 ib = 0;
+      const uintptr_t f3 = reinterpret_cast<uintptr_t>(frames[3]);
+      const uintptr_t mb3 = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+      const PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry((DWORD64)f3, &ib, nullptr);
+      MCLA_LOG_ERROR("F383-WRITEROWNER frame3={:x} owner={:x} off={:x} have={}",
+                     static_cast<unsigned long long>(mb3 ? f3 - mb3 : f3),
+                     static_cast<unsigned long long>(rf && ib ? (mb3 ? ib + rf->BeginAddress - mb3
+                                                                      : ib + rf->BeginAddress)
+                                                              : 0),
+                     static_cast<unsigned long long>(rf ? f3 - (ib + rf->BeginAddress) : 0),
+                     rf ? 1 : 0);
+    }
+
+    // F-381: F-379's host backtrace put this burst inside OUR OWN Path A driver
+    // (MclaJob2DecompressAndDistribute -> MclaXcDecodeFullStream -> guest sub_8244FF20 ->
+    // sub_82460420 -> sub_82461010 -> guest memcpy sub_823DA950), and F-380 showed the xmem state the
+    // decoder uses was zeroed by our warm-context soft-reset immediately before. sub_82461010 forms
+    // its copy destination as   lwz r27,12276(r31) / lwz r29,12280(r31) / add r3,r29,r27 / bl memcpy
+    // -- base pointer + cursor. If our reset wiped the BASE, dst degenerates to 0 + cursor, and the
+    // first watched address above that null-based block is exactly 0x20000. Read the state back at
+    // the store: [12276]==0 with [12280]==0x20000 proves it, and the low-VA sample shows whether the
+    // bytes also landed at 0x0.. (unwatched until now). ctx is the value F380-XCRESET printed in this
+    // same boot; the head check keeps a wrong constant from being read as a result.
+    static constexpr uint32_t kXcCtx = 0x4000FD80u;
+    {
+      auto &gm = mcla::kernel::GuestMemoryHeap::Instance();
+      uint32_t c4 = 0, c8 = 0;
+      (void)gm.ReadU32BE(kXcCtx + 4u, &c4);
+      (void)gm.ReadU32BE(kXcCtx + 8u, &c8);
+      uint32_t st[11] = {0};
+      for (uint32_t i = 0; i < 11; ++i)
+        (void)gm.ReadU32BE(kXcCtx + 20u + 12264u + i * 4u, &st[i]);
+      MCLA_LOG_ERROR("F381-XCSTATE ctx={:08X} c4={:08X} c8={:08X} st=[{:08X} {:08X} {:08X} {:08X} "
+                     "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                     kXcCtx, c4, c8, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8],
+                     st[9], st[10]);
+      uint32_t low[8] = {0};
+      for (uint32_t i = 0; i < 8; ++i)
+        (void)gm.ReadU32BE(i * 4u, &low[i]);
+      MCLA_LOG_ERROR("F381-LOWVA head=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                     low[0], low[1], low[2], low[3], low[4], low[5], low[6], low[7]);
+    }
+
+    // F-378: the destination is arena-RELATIVE (F-377: move the arena, the writes follow), so the
+    // question is not "which constant" but "whose frame computed it". The burst happens inside the
+    // guest's own memcpy, so the interesting callers are only reachable through the saved link
+    // registers on the guest stack -- dump them once, classified. A word is called "code" only if
+    // it lies in the loaded image range (0x82000000..0x82800000); everything else is printed as a
+    // raw value, because that is the one thing that could make an arena-relative 0x20000 visible.
+    static constexpr uint32_t kRecBase = 0x8284AD68u;
+    static constexpr uint32_t kRecSize = 1556u;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    for (uint32_t i = 0; i < 8; ++i) {
+      const uint32_t rec = kRecBase + i * kRecSize;
+      uint32_t f0 = 0, f4 = 0, f8 = 0, f24 = 0, f1540 = 0, f1548 = 0;
+      (void)mem.ReadU32BE(rec + 0u, &f0);
+      (void)mem.ReadU32BE(rec + 4u, &f4);
+      (void)mem.ReadU32BE(rec + 8u, &f8);
+      (void)mem.ReadU32BE(rec + 24u, &f24);
+      (void)mem.ReadU32BE(rec + 1540u, &f1540);
+      (void)mem.ReadU32BE(rec + 1548u, &f1548);
+      MCLA_LOG_ERROR("F376-REC #{} rec={:08X} [+0]={:08X} [+4]={:08X} [+8]={:08X} [+24]={:08X} "
+                     "[+1540]={:08X} [+1548]={:08X}{}",
+                     i, rec, f0, f4, f8, f24, f1540, f1548, (r3 == rec) ? " <=r3" : "");
+    }
+    if (sp != 0) {
+      for (uint32_t i = 0; i < 24; ++i) {
+        uint32_t w = 0;
+        if (!mem.ReadU32BE(sp + i * 4u, &w)) break;
+        const bool code = w >= 0x82000000u && w < 0x82800000u;
+        MCLA_LOG_ERROR("F378-HEAPSTACK #{} sp={:08X} [{}]=+{:#x} {:08X} {}", i, sp, i, i * 4u, w,
+                       code ? "CODE?" : "raw");
+      }
+    }
+  }
+}
+
 void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   static std::atomic<uint32_t> s_watchWrites{0};
 
@@ -1873,7 +2043,14 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
     // no handed-out allocation covers is writing o1heap metadata / free
     // space — the AV-storm corruptor. Page-granular check cache; the scan
     // only runs once per 4KB page.
-    if (guestAddr >= 0xA0000000u) {
+    //
+    // F-412: the gate used to read `>= 0xA0000000u`, which after F-391 is a
+    // SUPERSET of our arena (pool now begins at kPhysArenaBeginVa = 0xA0400000, see
+    // src/kernel/heap_arena.h:40). Stores in the registered title-heap watch ranges
+    // (0xA0018028, 0xA008261C, 0xA0106xxx, 0xB7B6xxxx) can never be
+    // MclaPhysRangeEverAllocated -- we never owned them -- so they were counted as our-arena
+    // overruns and burned the 64-row cap. Follow the constant, like HEAPHDR-STORE below.
+    if (guestAddr >= mcla::kernel::kPhysArenaBeginVa) {
       static std::mutex s_pgMtx;
       static std::unordered_set<uint32_t> s_checkedPages;
       const uint32_t page = guestAddr >> 12;
@@ -1909,8 +2086,13 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   // device-vector (A008261C..24) get scribbled with the kernel "uninitialized"
   // pattern FF00FF00 right before the GetDevice crash. The guest LR here is
   // misleading (slab-wrapper return site), so capture the HOST callstack once.
+  // F-412: the holder moved with the title XTL heap when F-391 shifted the physical pool to
+  // kPhysArenaBeginVa (0xA0400000): w430 `F389-BANK head=[... A0401010 A0401000 ... A042FFC0]`
+  // vs w403 `A0001010/A0001000/A002FFC0`, i.e. +0x400000. The second window
+  // (0xA008261C..24) is left armed at its old address on purpose: it sits in the now-unowned gap
+  // 0xA0030000..0xA0400000, and w430 has 0 FFBT rows, so it is armed-but-inert, not a false hit.
   if (value == 0xFF00FF00u &&
-      ((guestAddr >= 0xA0018028u && guestAddr < 0xA0018030u) ||
+      ((guestAddr >= 0xA0418028u && guestAddr < 0xA0418030u) ||
        (guestAddr >= 0xA008261Cu && guestAddr < 0xA0082624u))) {
     static std::atomic<uint32_t> s_ffbt{0};
     if (s_ffbt.fetch_add(1) < 1) {
@@ -1959,10 +2141,20 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
     return;
   }
 
-  // SESSION 73 probe: the o1heap instance + first physical fragments
-  // (A0000000..A0000800). The instance is host-only memory — ANY guest
-  // store here is the heap corruptor. Logged with guest LR attribution.
-  if (guestAddr < 0xA0000800u && guestAddr >= 0xA0000000u) {
+  // SESSION 73 probe: the o1heap instance + first physical fragments. The instance is
+  // host-only memory — ANY guest store here is the heap corruptor. Logged with guest LR
+  // attribution.
+  //
+  // F-412: F-391 moved the physical pool to kPhysArenaBeginVa (was 0xA0000000, which sits
+  // inside the title's own XTL heap) and the range armed in boot_host.cpp followed it, but this
+  // test did not — it stayed on the old band and became unreachable. That zero is not evidence
+  // of health: HEAPHDR-STORE printed its 200-row cap in EVERY soak w394..w405 and exactly 0 in
+  // w406..w420, and the path it falls through to (PAGEWATCH W below) only ever prints its first
+  // 16 rows, which w418/w419/w420 show already spent on 0x828CD0xx. So after F-391 a guest store
+  // of the shape `@ <phys base> = <base+4>` had no logging route at all. Follow the constant.
+  // This branch returns before the 16-row PAGEWATCH cap, so it stays the uncapped channel.
+  if (guestAddr >= mcla::kernel::kPhysArenaBeginVa &&
+      guestAddr < mcla::kernel::kPhysArenaBeginVa + 0x800u) {
     static std::atomic<uint32_t> s_heapHdrStores{0};
     const uint32_t hn = s_heapHdrStores.fetch_add(1) + 1;
     if (hn <= 200 || (hn % 5000) == 0) {

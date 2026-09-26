@@ -87,6 +87,27 @@ const BootReport& GetReport();
 // Returns register value rN (0-31). Returns 0 if context unavailable.
 uint32_t GetBootWorkerReg(unsigned regIndex);
 
+// F-370: registry of semaphore handles created with a NON-ZERO initial count. Those are
+// job/concurrency limiters (permits), so "a thread waits on one and never returns" means work
+// was handed out and never completed - the census that names it needs the handle set, which
+// only exists at create time (imports.cpp::NtCreateSemaphore records into it; the wait/release
+// hooks in gpu_device.cpp ask it). Log-only, bounded, no behaviour change.
+// F-374: guard-page watch over the user heap's o1heap header (guest 0x20000). The guest writes
+// through `base[va]`, which never passes a checked accessor, and DR registers cannot be set on a
+// running thread (F-100), so a page guard is the only thing that can name the writer of the
+// corruption in F-370. Heap::Alloc/Heap::Free call these around each operation: the page is
+// writable while the allocator itself is writing its header, guarded the rest of the time. The
+// first arm proves the watch lives with a deliberate self-test read (F374-HEAPGUARD SELFTEST).
+void HeapGuardArm();
+void HeapGuardDisarm();
+
+void RegisterCountingSema(uint32_t handle, uint32_t initCount);
+bool IsCountingSema(uint32_t handle, uint32_t *initOut = nullptr);
+// Per-handle print budget: one busy limiter (C6137A00) must not starve a quiet one out of a
+// shared cap, which is exactly how C501FC00's own WAIT row got lost in w374. Bumps the handle's
+// counter and says whether this row should be printed.
+bool CountingSemaAllow(uint32_t handle);
+
 // Log bridge for the SEH-bearing boot TU. boot_host.cpp contains __try/__except
 // and cannot instantiate spdlog/fmt templates in the same TU (clang 19.1.7
 // ICEs in the X86 assembler); these forward to spdlog from a separate TU.

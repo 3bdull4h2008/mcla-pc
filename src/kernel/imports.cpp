@@ -10,6 +10,7 @@
 #include "xam.h"
 #include "xdm.h"
 #include "kernel_objects.h"
+#include <boot_host.h>  // F-370: counting-semaphore registry
 #include "logging.h"
 #include <bit>
 #include <gpu_cp.h>
@@ -2794,6 +2795,9 @@ uint32_t NtCreateSemaphore(be<uint32_t> *Handle,
                     static_cast<uint32_t>(*Handle), InitialCount, MaximumCount,
                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
+    // F-370: a non-zero initial count means this is a permit pool (a job/concurrency
+    // limiter), so the wait/release hooks can ask later whether a given handle is one.
+    mcla::boot::RegisterCountingSema(static_cast<uint32_t>(*Handle), InitialCount);
   }
   return STATUS_SUCCESS;
 }
