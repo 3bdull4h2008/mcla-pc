@@ -17634,11 +17634,33 @@ PPC_FUNC(sub_821BE4F0) {
     (void)mem.ReadU32BE(inr + 24, &i24);
     (void)mem.ReadU32BE(inr + 28, &i28);
   }
-  if (k <= 64 || (k % 512) == 0 || got == -1)
+  // F-450: reading all of `sub_821BE250` (ppc_recomp.14.cpp:24080-24200) shows the -1 comes from
+  // loc_821BE2F4: when `pos == end` it makes an indirect read on `[[obj+0]+24]` and, if that returns
+  // negative, reports -1. `sub_821BDD28` is NOT on that path (it is reached only when end==0 and
+  // pos!=0), which is why BDD28 printed 0 rows -- so the real question is what those `end` bytes of
+  // config text CONTAIN. Dump the head of the buffer the reader consumed: if it is text without a
+  // "Vehicle" section, clause (b) is a content gap in the shipped tune file; if it is some other
+  // file's text, the reader is pointed at the wrong one.
+  char head[57] = {0};
+  const bool consumed = o24 != 0u && o24 == o28;
+  if (consumed) {
+    uint32_t base = 0;
+    (void)mem.ReadU32BE(obj + 8, &base);
+    if (base != 0u && base != 0xCDCDCDCDu)
+      (void)mem.ReadBytes(base, head, sizeof(head) - 1);
+    for (char &ch : head) {
+      const unsigned char uc = static_cast<unsigned char>(ch);
+      if (uc == 0u)
+        break;
+      if (uc < 32u || uc > 126u)
+        ch = '.';
+    }
+  }
+  if (k <= 64 || (k % 512) == 0 || (got == -1 && consumed))
     MCLA_LOG_WARN("F447-REFILL #{} obj={:08X} got={:d} byte={:02X} eof={} obj[+24/+28]={}/{} "
-                  "inner={:08X} inner[+24/+28]={}/{} lr={:08X} tid={}",
+                  "inner={:08X} inner[+24/+28]={}/{} buf='{}' lr={:08X} tid={}",
                   k, obj, got, static_cast<unsigned>(ctx.r3.u32 & 0xFFu), s_447eof.load(), o24, o28,
-                  inr, i24, i28, lr, GetCurrentThreadId());
+                  inr, i24, i28, head, lr, GetCurrentThreadId());
 }
 
 // F-438: count GFx loader CONSTRUCTIONS, because the presence scan has never been able to do it
