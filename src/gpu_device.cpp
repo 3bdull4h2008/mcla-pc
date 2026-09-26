@@ -17508,6 +17508,52 @@ PPC_FUNC(sub_8260C8E0) {
   }
 }
 
+// F-442 (T41.94): discriminate the two remaining explanations for clause (b). F-432 s3 showed the
+// walk that must raise the tunable-group count is gated on `sub_821CFF40(&it, "Vehicle", 0)`
+// returning non-zero, and F-405 showed the tuning archive `preload/xarchive_carconfigs.rpf` IS opened
+// and served. Either (i) the section table is populated but has no "Vehicle" entry (a content
+// question), or (ii) nothing is populated yet, so EVERY lookup misses (an ordering/parse question).
+// Those need opposite fixes, and only the lookup's own return value separates them -- so log every
+// lookup with the name it asked for, the return, and the caller. Rule 4: 0x821CFF40 had one owner
+// (the function map). Log-only; the result is read after __imp__ because r3 is the answer.
+PPC_FUNC_IMPL(__imp__sub_821CFF40);
+PPC_FUNC(sub_821CFF40) {
+  static std::atomic<uint64_t> s_442{0};
+  static std::atomic<uint64_t> s_442hits{0};
+  const uint64_t k = s_442.fetch_add(1) + 1;
+  const uint32_t it = ctx.r3.u32;
+  const uint32_t namePtr = ctx.r4.u32;
+  const uint32_t arg5 = ctx.r5.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  char nm[40] = {0};
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (namePtr != 0u && namePtr != 0xCDCDCDCDu)
+    (void)mem.ReadBytes(namePtr, nm, sizeof(nm) - 1);
+  for (char &ch : nm) {
+    const unsigned char uc = static_cast<unsigned char>(ch);
+    if (uc < 32u || uc > 126u)
+      ch = uc == 0u ? ch : ' ';
+  }
+  // F-443: the body's first move is `r11=[r31+0]` then an indirect call through `[[r11]+8]` with
+  // r5=512, and it bails when that returns 0 (ppc_recomp.17.cpp, sub_821CFF40+0x2c..+0x50). So the
+  // iterator's own object pointer is the discriminator between "the caller never opened the table"
+  // and "the table is open but empty" -- capture it before the call, since `it` is a stack cursor.
+  uint32_t i0 = 0, vt = 0, meth = 0;
+  (void)mem.ReadU32BE(it + 0, &i0);
+  if (i0 != 0u && i0 != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(i0 + 0, &vt);
+    (void)mem.ReadU32BE(i0 + 8, &meth);
+  }
+  __imp__sub_821CFF40(ctx, base);
+  const uint32_t res = ctx.r3.u32 & 0xFFu;
+  if (res != 0u)
+    (void)s_442hits.fetch_add(1);
+  if (k <= 200 || (k % 1000) == 0)
+    MCLA_LOG_WARN("F442-SECTION #{} it={:08X} [it]_0={:08X} vt={:08X} meth={:08X} name='{}' "
+                  "r5={:08X} ret={:08X} hits={} lr={:08X} tid={}",
+                  k, it, i0, vt, meth, nm, arg5, res, s_442hits.load(), lr, GetCurrentThreadId());
+}
+
 // F-438: count GFx loader CONSTRUCTIONS, because the presence scan has never been able to do it
 // (F-437: `sub_824C6F08` replaces its own vtable key via `sub_82482008`, and the scan's bands miss
 // the region loader objects land in). This routine is the only one that installs the loader vtable
