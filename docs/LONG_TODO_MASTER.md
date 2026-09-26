@@ -10,6 +10,46 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~11:4x (ledger through F-353; next ID F-354).**
+> **F-353 corrects the gate evidence of everything before it today.** My neutrality
+> filter `awk 'NF==4 && $4!="+0"'` was self-defeating: `soak_census.py` tags only
+> non-zero deltas with `<<`/`>>`, giving those rows 6 fields, so the filter can never
+> show a regression. Correctly filtered, `w346` vs `w340` keeps every structural/fault
+> marker at `+0` (14 named, incl. `C0000005` 0, `LISTLINE` 171, `GFx` 13) but moves
+> `INFLATE` 14,492 -> 17,784 and `PRESENT` 46 -> 51, where same-behaviour controls move
+> `INFLATE` by +1 - so F-350's Path A placement is a real behavioural change, not the
+> "invisible" thing F-350 §4 claimed. `PUT=`/`rptrWB` turned out to swing +242 on an
+> identical binary (`w347`), so that one was timing noise - while `INFLATE 17,784` is
+> bit-identical across `w346`/`w347`, proving +3,292 is a real, reproducible effect.
+> The deliverable number itself is unaffected (garage **41.3 %** = 440,720/1,066,057,
+> from guest-memory readback against the decoded body, not from the filter), and the
+> three banked containers still verify `match=true`. New rule in `PROGRAM_GUIDE` §9:
+> neutrality claims need the corrected filter + named structural counts + a
+> same-behaviour control pair. **Goal (a) 3/4 + garage 41.3 %, (b) `nGfx`=0 - NOT
+> complete.**
+
+> **§0 state, 2026-09-26 ~11:3x (ledger through F-352; next ID F-353).** UI inflate
+> enqueue: **the garage finally moves — 5.9 % → 41.3 % of its decompressed body is
+> resident in guest memory.** The blocker was never the decoder: the single-shot host
+> decode refused to place the container unless all 1,066,057 bytes fit one 131,072-byte
+> dest, so it fell through to a guest that manages exactly ten frames (F-348/F-349).
+> F-350 places the body across the destination chain the guest itself requests
+> (`PATHB-HOSTDECODE-CHUNK`, verified by reading guest memory back, not by trusting the
+> write) and `w346` reports `claimed=458,752 still_present=440,720 pct=96`. Gate clean:
+> `soak_census w346 w340` — **no tracked marker differs at all**; vs `w193` only
+> `PRESENT 51 vs 34` moves (forward), while `GFx 13/5` and the single `Fatal` pre-date it
+> (`w337`/`w340`); the three banked containers still report `match=true`.
+> Two limits found the hard way: **F-351 crossed readlists** to reach a bigger number and
+> wrote credits' byte-exact destination `B7801000` on a mapping nothing in this boot can
+> observe — withdrawn (a coverage figure needs a falsifier). **F-352's layout audit**
+> shows sequential and vbase-delta offsets coincide inside a readlist
+> (`winner=TIE`, 458,752/458,752 under both), so placement there is model-independent.
+> Remaining 58.7 % needs the guest to keep requesting garage destinations = task #15's
+> (record, context) per descriptor in `sub_821BC140`'s walk. Also: headless IDA is now
+> genuinely usable — `idalib-mcp.exe -v build/cache/mcla_pe.bin` (NOT default.xex) +
+> `tools/ida_rpc.py` (Accept pair + SSE reading; the stdio proxy breaks tools/call).
+> **Goal (a) 3/4 + garage 41.3 %, (b) `nGfx`=0 — NOT complete.**
+
 > **§0 state, 2026-09-26 ~10:4x (ledger through F-349; next ID F-350).** UI inflate
 > enqueue: **source availability is closed as the garage's cause, and Path B is down to
 > one untried shape.** `LZX-FRAME` now prints the decoder's own walk state, and because

@@ -8770,6 +8770,9 @@ static void MclaUiXsfNoteSlot(uint32_t job, uint32_t seq, uint32_t vbase,
 static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                                 const std::vector<MclaUiXsfSlot> &slots,
                                 uint32_t shot);
+static void MclaUiXsfLayoutAudit(uint32_t pkg, const std::vector<uint8_t> &gold,
+                                 const std::vector<MclaUiXsfSlot> &slots,
+                                 uint32_t anchorPbase);
 static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
                               uint32_t shot);
 
@@ -8798,6 +8801,7 @@ static void MclaUiXsfGoldenHunt(uint32_t pkg, uint32_t shot, uint32_t anchor) {
   // (w290 filled 819,200 bytes and still printed 0, because the scan had already
   // run). Each package is filled at most once per shot, so this cannot loop.
   MclaUiXsfGoldenFill(pkg, gold, slots, shot);
+  MclaUiXsfLayoutAudit(pkg, gold, slots, anchor);
   MclaUiXsfReverify(pkg, gold, shot);
   uint32_t hits = 0, scanned = 0, skip_range = 0, skip_poison = 0,
            skip_read = 0;
@@ -9017,6 +9021,100 @@ static constexpr bool kUiXsfFillDryRun = false;
 // to the golden bytes. `false` == w342 behaviour.
 static constexpr bool kUiXsfFillOwnSlots = true;
 
+// F-352: every coverage number this project has printed for the garage rests on
+// an UNTESTED assumption: that the container's bytes continue into the next
+// readlist slot (F-327 chose "list order" because vbase arithmetic dead-ended at
+// 0xC8000). The alternative is that a slot's position in the container is its
+// VBASE DELTA from the chain's first slot. The two models agree while slots are
+// contiguous and equal-sized, and diverge exactly where they are not — job #1
+// s[2] is 0x4000 among 0x10000/0x20000 neighbours and the table jumps from the
+// 0x50000000 block to 0x60000000 at s[3], so this is measurable, not
+// philosophical. Log-only; run it with `kUiXsfFillDryRun=true` so the bytes
+// being compared are the GUEST's own output and not something we wrote (F-308:
+// a marker that echoes our own mitigation is not a measurement).
+static constexpr bool kUiXsfLayoutAudit = true;
+
+static void MclaUiXsfLayoutAudit(uint32_t pkg, const std::vector<uint8_t> &gold,
+                                 const std::vector<MclaUiXsfSlot> &slots,
+                                 uint32_t anchorPbase) {
+  if (!kUiXsfLayoutAudit || gold.size() < 0x10000u)
+    return;
+  static std::mutex s_auditMtx;
+  static std::unordered_set<uint32_t> s_audited;
+  {
+    std::lock_guard<std::mutex> elk(s_auditMtx);
+    if (!s_audited.insert(pkg).second)
+      return;  // once per package per boot
+  }
+  int ai = -1;
+  for (int i = 0; i < static_cast<int>(slots.size()); ++i)
+    if (slots[i].pbase == anchorPbase) {
+      ai = i;
+      break;
+    }
+  if (ai < 0) {
+    MCLA_LOG_WARN("UIXSF-LAYOUT-AUDIT pkg={:08X} anchor={:08X} NOT IN INVENTORY",
+                  pkg, anchorPbase);
+    return;
+  }
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t job = slots[ai].job, vAnchor = slots[ai].vbase;
+  std::vector<uint8_t> rb(0x1000u);
+  uint32_t totA = 0, cmpA = 0, totB = 0, cmpB = 0, seq = 0, considered = 0;
+  for (size_t i = static_cast<size_t>(ai); i < slots.size(); ++i) {
+    if (slots[i].job != job)
+      continue;  // the chain under test is one readlist
+    if (considered >= 12u || seq >= gold.size())
+      break;
+    ++considered;
+    const uint32_t sz = slots[i].size;
+    const uint32_t offB = slots[i].vbase >= vAnchor ? slots[i].vbase - vAnchor
+                                                   : 0xFFFFFFFFu;
+    // Model A: sequential — this slot holds gold[seq .. seq+sz).
+    // Model B: vbase delta — this slot holds gold[offB .. offB+sz).
+    uint32_t sameA = 0, sameB = 0;
+    for (int m = 0; m < 2; ++m) {
+      const uint32_t off = m == 0 ? seq : offB;
+      if (off >= gold.size())
+        continue;
+      const uint32_t len =
+          (gold.size() - off) < sz ? static_cast<uint32_t>(gold.size() - off)
+                                   : sz;
+      uint32_t same = 0, seen = 0;
+      for (uint32_t done = 0; done < len; done += rb.size()) {
+        const uint32_t want =
+            (len - done) < rb.size() ? (len - done) : static_cast<uint32_t>(
+                                                         rb.size());
+        if (!mem.IsValid(slots[i].pbase + done, want) ||
+            !mem.ReadBytes(slots[i].pbase + done, rb.data(), want))
+          break;
+        if (std::memcmp(rb.data(), gold.data() + off + done, want) == 0)
+          same += want;
+        seen += want;
+      }
+      if (m == 0) {
+        totA += same;
+        cmpA += seen;
+        sameA = same;
+      } else {
+        totB += same;
+        cmpB += seen;
+        sameB = same;
+      }
+    }
+    MCLA_LOG_WARN("UIXSF-LAYOUT-AUDIT pkg={:08X} slot[{}]={:08X} vbase={:08X} "
+                  "size={} modelA_off={:08X} matchA={} modelB_off={:08X} "
+                  "matchB={}",
+                  pkg, i, slots[i].pbase, slots[i].vbase, sz, seq, sameA, offB,
+                  sameB);
+    seq += sz;
+  }
+  MCLA_LOG_WARN("UIXSF-LAYOUT-AUDIT pkg={:08X} anchor={:08X} slots={} "
+                "modelA {}/{} bytes match  modelB {}/{} bytes match  winner={}",
+                pkg, anchorPbase, considered, totA, cmpA, totB, cmpB,
+                totA == totB ? "TIE" : (totA > totB ? "SEQUENTIAL" : "VBASE"));
+}
+
 static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                                 const std::vector<MclaUiXsfSlot> &slots,
                                 uint32_t shot) {
@@ -9069,26 +9167,27 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
   const bool listOrder = kUiXsfFillListOrder;
   std::vector<std::pair<size_t, uint32_t>> plan;  // (slot index, golden offset)
   if (listOrder) {
-    // F-351: the chain does NOT end with the anchor's readlist. w343 measured the
-    // consequence of stopping there: the garage's own table has 10 slots and only
-    // 4 of them sit at or after the anchor (B7A41000), so the plan covered
-    // 458,752 of 1,066,057 bytes and 607,305 had nowhere to go — while the guest's
-    // OWN inflate requests crossed into the next table at B7AC1000 (`PSTREAM #2
-    // s[0]`, 0x40000) and #2 runs to s[19]+ with 0x20000 per slot. So order by
-    // (job, seq) across the whole inventory and keep walking past the end of the
-    // anchor's list, skipping any slot another UI package already owns: spilling
-    // into credits'/policecam's claimed slots would corrupt a container that is
-    // already verified at 100 %, which is worse than a short garage.
-    const uint32_t aJob = slots[ai].job, aSeq = slots[ai].seq;
+    // F-352 WALKS ONLY WITHIN THE ANCHOR'S OWN READLIST. F-351 crossed into later
+    // tables because the guest's own inflate requests did (it asked for B7A41000,
+    // then B7AC1000, which is `PSTREAM #2 s[0]`), and that raised the claim from
+    // 458,752 to 934,985. It also put garage bytes into slots belonging to a
+    // DIFFERENT load — `UIXSF-SLOT-VERIFY dest=B7801000 pkg=6496F000 mismatch=0`
+    // says that slot is credits' — and the new layout audit cannot adjudicate it:
+    // within one readlist the slots tile contiguously (`vbase(k+1)==vbase(k)+
+    // size(k)`, F-320), so the sequential and vbase-delta models are the same
+    // function there and the audit reports `winner=TIE` (w345, 458,752/458,752
+    // under both). Across tables vbase restarts at 0x50000000, so continuing the
+    // sequential run is a guess about a mapping nothing observes — the guest never
+    // reads these slots, because `nGfx` is still 0. Placing a container into
+    // another container's verified memory to raise a percentage is the F-308
+    // failure mode, so it is out; the spill stays in only where the guest asked
+    // for the dest itself, which is the F-350 chunked path.
     std::vector<size_t> ord;
     for (size_t i = 0; i < slots.size(); ++i)
-      if (slots[i].job > aJob ||
-          (slots[i].job == aJob && slots[i].seq >= aSeq))
+      if (slots[i].job == slots[ai].job && slots[i].seq >= slots[ai].seq)
         ord.push_back(i);
     std::sort(ord.begin(), ord.end(), [&](size_t a2, size_t b2) {
-      return slots[a2].job != slots[b2].job
-                 ? slots[a2].job < slots[b2].job
-                 : slots[a2].seq < slots[b2].seq;
+      return slots[a2].seq < slots[b2].seq;
     });
     uint32_t run = 0;
     for (size_t idx : ord) {
