@@ -1588,3 +1588,27 @@ PPC_FUNC(sub_82131008) {
     }
 }
 
+// F-358: log-only census on the title's own init body `sub_82135150`, which IDA shows
+// as the SOLE caller of `sub_82134D08` (call site guest 0x82135358) -- the boot pump
+// that builds an async item around the UILOAD callback (`sub_821C67D8(&item,
+// 0x82131008)` at 0x82134df8) and posts it (`sub_82308E90(dword_8288B9E8, item, 0)`),
+// then pumps until its own exit condition. Why this is the question: `W35-BOOT-GATE` is
+// 0 in w351/w354/w355 (uncapped first 32, so a real zero) and the host's only forced
+// dispatch of that callback sits at gpu_device.cpp:2100 behind a TLSDEAD guard whose own
+// printer (`FIX-821873E8`) is also 0 -- so nothing in this boot reaches the UI-load
+// producer. This separates "the producer's caller never ran" from "it ran and nothing
+// drained the post". Args are read BEFORE the passthrough (F-091). Cap prints the first
+// 8, so any count <=8 is complete.
+PPC_FUNC_IMPL(__imp__sub_82135150);
+static std::atomic<uint32_t> s_hTitleInit{0};
+PPC_FUNC(sub_82135150) {
+    const uint32_t n = s_hTitleInit.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F358-TITLE-INIT #{} lr={:08X} r1={:08X} r3={:08X} r13={:08X}",
+                      n, static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r3.u32,
+                      ctx.r13.u32);
+    __imp__sub_82135150(ctx, base);
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F358-TITLE-INIT-POST #{} r3={:08X}", n, ctx.r3.u32);
+}
+

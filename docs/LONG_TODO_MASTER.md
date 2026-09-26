@@ -10,6 +10,29 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~13:3x (ledger through F-358; next ID F-359) — the deliverable-(b)
+> blocker is LOCATED, and two standing beliefs about it are false.** (1) **`0x40003B03` is not
+> a message to be posted**: exactly one dword in the image equals `0x82131008`, at
+> **`0x82102AC0`**, and its pair field is that constant — it is a `{handler-code-VA,
+> 0x4000xxxx-tag}` record in a stride-8 table (contiguous `0x821065B0..0x82112160`, 6,005
+> records). Tasks #11/#20/#21/#22 were tracing a compile-time field. **New queue item
+> T41.58: find the consumer that walks that table** — no branch in the image reaches the
+> handler, so the walker is the only route to UILOAD `0x82131008` → `0x822C0980` →
+> `0x821FD640` → `0x822012E8`. (2) **The host's forced dispatch of that callback has not been
+> running**: it lives behind the TLS-dead branch of `PPC_FUNC(sub_821873E8)`
+> (`src/gpu_device.cpp:2100`) and the new census `F358-821873E8-ALIVE` shows **every** hit
+> taking the alive exit (`slot12=82830B18`), while `FIX-821873E8` and `W35-BOOT-GATE` read 0
+> in five soaks. Re-arming it is mechanical but is the fabrication T38.3f deleted on principle
+> (F-055) — **user's decision, do not default to it.** (3) **IDA refuted twice by rule 3 in one
+> window** (`0x82135358` is `addi r11,r29,-32` not a `bl` to `sub_82134D08`, which nothing in
+> the image targets; its "data xref" at `0x82134df4` is a `cmpw` in a list walk), voiding the
+> "boot pump posts UILOAD" narrative; byte-check every IDA claim in `0x8210xxxx`–`0x8213xxxx`.
+> (4) `sub_82135150` (title init) **does** run — once, returning 1 (`F358-TITLE-INIT`), so
+> downstream silence is a consumer problem, not an init problem. Instruments kept after a
+> neutrality census (`w358` vs `w351`: `C0000005` 0, `GFx` 13, `INFLATE` 17,784, `LISTLINE`
+> 171, `CP-DRAW` 166 all `+0`). **(a) unchanged: 3/4 byte-exact + garage 12.3 %/41.3 %, ceiling
+> not request-side (F-356/F-357). (b) `nGfx`=0. Goal NOT complete.**
+
 > **§0 state, 2026-09-26 ~12:5x (ledger through F-357; next ID F-358) — supersedes the
 > "raising the ceiling needs more inflate requests per container" line above.** The
 > request-side route is now **measured closed**: repeating `sub_821FDD50` for an

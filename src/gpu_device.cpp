@@ -2043,6 +2043,7 @@ PPC_FUNC_IMPL(__imp__sub_82413588);
 PPC_FUNC_IMPL(__imp__sub_821873E8);
 static void LogFabricatedShader(const char *tag, uint32_t obj);  // defined at the MSGCHAIN block
 static std::atomic<uint32_t> s_821873E8_hits{0};
+static std::atomic<uint32_t> s_821873E8_live{0};  // F-358 alive-path census
 PPC_FUNC(sub_821873E8) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t n = s_821873E8_hits.fetch_add(1) + 1;
@@ -2057,6 +2058,17 @@ PPC_FUNC(sub_821873E8) {
 
   const bool slotLive = slot12 != 0 && slot12 != 0xCDCDCDCDu;
   if (tlsOk && slotLive) {
+    // F-358: the ONLY other exit in this hook is the TLSDEAD branch below, whose
+    // printers (`FIX-821873E8`, cap `n<=4 || n%200`) are 0 in w351/w354/w355/w356 --
+    // so either this hook never fires or it always returns here, and that difference
+    // decides whether the boot-gate dispatch at :2100 is dormant or unreachable.
+    // Uncapped-first-8: a count <=8 is complete.
+    const uint32_t nl = s_821873E8_live.fetch_add(1) + 1;
+    if (nl <= 8 || (nl % 500) == 0)
+      MCLA_LOG_WARN("F358-821873E8-ALIVE #{} of {} hits r13={:08X} tlsTable={:08X} "
+                    "slot12={:08X} lr={:08X}",
+                    nl, n, ctx.r13.u32, tlsTable, slot12,
+                    static_cast<uint32_t>(ctx.lr));
     __imp__sub_821873E8(ctx, base);
     return;
   }
