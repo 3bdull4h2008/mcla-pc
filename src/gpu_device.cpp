@@ -641,6 +641,24 @@ static constexpr bool kUiXsfClearResume = false;
 // our position model is wrong.
 static constexpr bool kUiXsfLocate = true;
 
+// F-335: give each UI .xsf stream ONE append-only input window sized for its whole
+// container, and after installing it move only `st+0` — never `st+4` again (plan
+// §5 step 1b). The serve otherwise rewrites the same host buffer from offset 0
+// while walkPos advances, which is exactly what F-333 showed breaks the frame
+// driver's absolute-position bookkeeping. If the window cannot be built or the
+// cursor leaves it, this returns false and the legacy path runs unchanged.
+// F-335 MEASURED = false: the window opens (cap 1,098,825 at CAF28300) and appends
+// cleanly, but on the NEXT call the guest's `st+4` is back to `st + 0x20` (its own
+// stack scratch, exactly what F-334 found), so `inside` is false and the code
+// re-points anyway — continuity across calls is not available to any buffer
+// design. w311: 682,178 log lines vs 58,217, INFLATE-ENTER 109,072 vs 4,901,
+// cumprod still frozen at 327,680, and `UIXSF-GOLDEN-REVERIFY pkg=64980000`
+// printed ZERO times (10 reverify lines total vs w310's 12, none for the garage,
+// i.e. the boot stopped sampling the container it was supposed to measure).
+// Reverted; the surviving candidate is a per-stream re-init of the codec ctx
+// (sub_82460F88 / sub_82461840), not another window shape.
+static constexpr bool kUiXsfAppendWindow = false;
+
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
 // (correct guest enqueue) replaces its purpose; with Path B ON this replay only
 // collides (the INFLATE #2.2M loop carries its 7179940 constants). Disabled by
@@ -8201,6 +8219,93 @@ static void MclaUiXsfLocateStream(uint32_t st, uint32_t pkg, uint32_t inPtr,
                 static_cast<int64_t>(walkPos) - static_cast<int64_t>(want));
 }
 
+// F-335 (plan §5 step 1b): ONE append-only window per UI .xsf stream.
+// F-332/F-333 together say the frame driver keeps absolute positions
+// (`[S+12276]` saved cursor and `[S+12280]` byte offset into the current frame)
+// and that they are the stream position, not stale junk — but the serve has
+// always written each window over the SAME host buffer from offset 0 while
+// `walkPos` advanced, so every absolute position the driver kept silently
+// changed meaning between calls. This gives a stream one window sized for its
+// whole container, fills it forward from the package and never rewrites a byte
+// the driver has already seen; after the first install, only `st+0` (input
+// remaining) moves. Returns true = handled, caller must not run the legacy path.
+struct MclaUiXsfWin {
+  uint32_t buf = 0, cap = 0, base = 0, fill = 0;
+};
+static std::mutex g_uiXsfWinMtx;
+static std::unordered_map<uint32_t, MclaUiXsfWin> g_uiXsfWin;
+
+static bool MclaUiXsfAppendServe(uint32_t n, uint32_t st, uint32_t pkg,
+                                uint32_t walkPos, uint32_t inPtr,
+                                uint32_t inLeft) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  std::lock_guard<std::mutex> lk(g_uiXsfWinMtx);
+  MclaUiXsfWin &w = g_uiXsfWin[st];
+  if (w.buf == 0u) {
+    uint32_t c = MclaUiXsfWalkCeil(pkg);
+    if (c < 0x10000u)
+      c = 0x10000u;
+    if (c > 0x400000u)
+      c = 0x400000u;
+    w.buf = mem.Alloc(c, 16);
+    if (w.buf == 0u) {
+      MCLA_LOG_WARN("UIXSF-APPEND #{} st={:08X} ALLOC FAILED cap={}", n, st, c);
+      w.buf = 0;
+      return false;
+    }
+    w.cap = c;
+    w.base = walkPos;
+    w.fill = 0;
+    MCLA_LOG_WARN("UIXSF-APPEND #{} st={:08X} pkg={:08X} OPENED buf={:08X} "
+                  "cap={} base={:08X}",
+                  n, st, pkg, w.buf, w.cap, w.base);
+  }
+  if (walkPos < w.base || walkPos > w.base + w.cap) {
+    MCLA_LOG_WARN("UIXSF-APPEND #{} st={:08X} walk={:08X} OUTSIDE window "
+                  "base={:08X} cap={} — legacy path",
+                  n, st, walkPos, w.base, w.cap);
+    return false;
+  }
+  const uint32_t have = walkPos - w.base;  // bytes of the window already consumed
+  if (have > w.fill) {
+    MCLA_LOG_WARN("UIXSF-APPEND #{} st={:08X} GAP have={} filled={} — legacy",
+                  n, st, have, w.fill);
+    return false;
+  }
+  uint32_t got = 0;
+  if (w.fill < w.cap) {
+    auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+    mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+    const uint32_t want =
+        w.cap - w.fill < 0x10000u ? w.cap - w.fill : 0x10000u;
+    std::vector<uint8_t> tmp(want);
+    uint64_t g64 = 0;
+    if (vfs.OpenFile("xarchive_cache.rpf", fh)) {
+      const bool okf =
+          vfs.ReadFileAt(fh, pkg + w.base + w.fill, tmp.data(), want, g64);
+      vfs.CloseFile(fh);
+      if (okf && g64 > 0 &&
+          mem.WriteBytes(w.buf + w.fill, tmp.data(),
+                         static_cast<uint32_t>(g64)))
+        got = static_cast<uint32_t>(g64);
+    }
+    w.fill += got;
+  }
+  // Where is the guest inside the window? First install sets st+4 once; after
+  // that the pointer is the guest's own and must not be touched again.
+  const bool inside = inPtr >= w.buf && (inPtr - w.buf) < w.cap && inLeft <= w.cap;
+  const uint32_t pos = inside ? (inPtr - w.buf) : have;
+  const uint32_t room = w.fill > pos ? w.fill - pos : 0u;
+  if (!inside)
+    (void)mem.WriteU32BE(st + 4, w.buf + have);
+  (void)mem.WriteU32BE(st + 0, room);
+  MCLA_LOG_WARN("UIXSF-APPEND #{} st={:08X} pkg={:08X} walk={:08X} pos={} "
+                "appended={} filled={} inLeft={} st0={} re-pointed={}",
+                n, st, pkg, walkPos, pos, got, w.fill, inLeft, room,
+                inside ? 0 : 1);
+  return true;
+}
+
 // Is this UI .xsf stream still short of its package end? Keys on the stream
 // cursor (max of the dest's own walk and the stream's), bounded by
 // MclaUiXsfWalkCeil, so it cannot spin past the package: MclaLoadPkgWindow only
@@ -10046,6 +10151,11 @@ PPC_FUNC(sub_821D5E10) {
           }
           MclaUiXsfLocateStream(st, sPkg, inPtr, inLeft, lwalk);
         }
+        // F-335: the append-only window takes this stream over entirely; the
+        // legacy re-point below keeps serving everything else.
+        if (kUiXsfAppendWindow && sPkg != 0u &&
+            MclaUiXsfAppendServe(n, st, sPkg, walkPos, inPtr, inLeft))
+          return;
         if (s_hsBuf == 0)
           // F-327: 0x8400 so a full frame plus its header always fits.
           s_hsBuf = mem.Alloc(0x8400, 16);
