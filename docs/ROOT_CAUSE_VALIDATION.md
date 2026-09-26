@@ -9570,3 +9570,23 @@ cost one log line per refusal and are what killed this theory. Next ID **F-411**
 **3. Consequence, stated for the objective.** The GFx chain's first broken link is now: the title's config-section container is queried empty by five consumers → the tunable-group count at `0x828CD0AC` stays 0 (F-432) → and separately the msgid layer never posts and the handler registry is never read (F-440/F-441). Decompressing UI .xsf cannot fix any of that, which is why F-434's headline result (a 4.4×-quieter boot, two fault classes gone, `BC140-REC` 5→7) did not move `nGfx`. The next instrument is the **insert side**: what adds a section to a container with vtable `0x8201302C`, and what sets `[obj+16]`.
 
 **4. Kept, and regression-free.** The `F442-SECTION` probe stays (log-only, cap `k <= 200 || k % 1000 == 0`). `w441` vs `w444` vs `w445`: `LISTLINE` 171=171=171, `C0000005` 0, `BC140-REC` 7, `F434-SPIN-BREAK` 1, `F441-QUEUE-STORE` 45, `F440-REGREAD` 0, `nGfx=0` 6, garage `claimed=917504 still_present=872032 pct=95` (recs 9/7). Next ID **F-444**.
+
+
+### F-444 (2026-09-27 02:2x, **2 builds, soaks `w446`/`w447`**) — **SUPERSEDES F-443 §2: the tokenizer's buffer is NOT "empty for every lookup". Measured per lookup, it is in one of three states — real config text, an empty buffer (`pos=0 len=0`), or **another file's compressed bytes** — and in all three the enumeration returns 0. The correct statement is that the shared static reader never holds the config text at the moment a vehicle/city section is enumerated.**
+
+- Task:        T41.95 (new head) — corrects F-443
+- Type:        FACT
+- Class:       E (file/VFS plumbing) + G
+- Priority:    P0
+- Evidence:    `src/gpu_device.cpp:17520-17572` (`F442-SECTION` extended to print `mode/inner/data/pos/len` and 32 bytes of the buffer at the cursor and at its head) · `build/w446.log`, `build/w447.log` · `generated/ppc_xenon/ppc_recomp.17.cpp` (`sub_821CFAA8` = byte read over `inner = [obj+12]`, `[inner+8]` data, `+24` pos, `+28` len, refill call `sub_821BE4F0`; `sub_821CFF40`'s caller treats return 0 as "stop the walk", which is the F-432 branch)
+
+**1. The three measured states (`w447`, all 14 rows, all `ret=0`, `hits=0`).**
+- `#1-#4 name='shadinggroup' r5=1`: `mode=13 inner=82860C40 data=82861DF8 pos=46 len=485..480`, and the buffer is **real config text** — `head='Version: 103..shadinggroup {..Sh'`. So a section literally named in the buffer still ends the enumeration.
+- `#6/#8/#10 name='Vehicle'`: `mode=32 pos=37|16|189 len=4096|4096|2839`, but `at=`/`head=` are **binary, not text** (`'...R.J...{"..|'`, `'...M.....J.j'`, `'...O.M.....]Y'`). The neighbouring log lines identify whose bytes these are: `JOB2-PKG-SERVE ... pkg=000A0000 ... n=32768 head=ED7C0D70`, `READWRAP sub_821CC6F0 ... r5=0035A000`, `INFLATE-ENTER st=006D8F20 ihdr=[05435352 0000001B]` — the meshtextures/UI stream, i.e. the **same static reader object is being reused across different files**.
+- `#5/#7/#9 Manufacturer`, `#11-#13 sample`, `#14 City`: `pos=0 len=0` — the reader's inner buffer is **empty**, so the refill path `sub_821BE4F0(inner)` is what gets called and produces nothing usable.
+
+**2. What that means for clause (b), stated precisely.** The section enumeration is driven by a single static tokenizer (`inner=0x82860C40`, buffer `0x82861DF8`). At the vehicle/city lookups it holds either nothing or a different file's compressed bytes. So F-432 §3's "the lookup fails" is right, but the reason is a **file/reader sequencing problem**: whatever is supposed to load the vehicle config text into that reader has not done so (and something else has claimed the buffer). F-443's "the container is empty" was too strong — `#1-#4` disprove it — and is superseded here.
+
+**3. Semantics caution, kept on the record.** `sub_821CFAA8` returns a byte (sign-extended) on the read path and a status on the refill path; `sub_821CFF40` maps `r30 != 0` to the return-0 path. I am NOT claiming to know the tokenizer's full grammar; the caller-side fact (return 0 → the walk stops → count stays 0) is what F-432 verified at `0x823973C0`, and it is unchanged.
+
+**4. Next (T41.95).** Instrument the refill primitive and the reader's file handle: `sub_821BE4F0(inner)` (called exactly when `pos >= len`) plus a census of which path the reader's handle has open at each lookup. Verdict target: name the file that must supply the vehicle config text, and whether our VFS hands it compressed bytes where the tokenizer expects text. Structural state is unchanged by this probe: `w447` vs `w446`/`w444`/`w441` — `LISTLINE` 171, `C0000005` 0, `BC140-REC` 7, `F434-SPIN-BREAK` 1, `F441-QUEUE-STORE` 45, `F440-REGREAD` 0, `nGfx=0` 6. Next ID **F-445**.

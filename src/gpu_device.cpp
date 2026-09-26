@@ -17544,14 +17544,55 @@ PPC_FUNC(sub_821CFF40) {
     (void)mem.ReadU32BE(i0 + 0, &vt);
     (void)mem.ReadU32BE(i0 + 8, &meth);
   }
+  // F-444: `sub_821CFAA8` is not a section lookup -- read its body and it is a BYTE READER over an
+  // attached buffer: `[obj+16]` is a delimiter/mode state (0, 9, 10, 13, 32), and the read path walks
+  // `inner = [obj+12]` with `inner+8` = data pointer, `inner+24` = position, `inner+28` = length
+  // (ppc_recomp.17.cpp, sub_821CFAA8+0x4c..+0xa8). So `sub_821CFF40(it, name, ...)` is pulling the
+  // next section NAME out of config TEXT, and it misses for every name when the buffer is not
+  // attached or already consumed. Print the reader's own state so the next soak says which of those
+  // it is -- "no buffer" (a file that was never read) and "pos >= len" (a file that was read to the
+  // end, or is empty) need different fixes.
+  uint32_t inner = 0, ipos = 0, ilen = 0, idat = 0, mode = 0;
+  (void)mem.ReadU32BE(it + 16, &mode);
+  (void)mem.ReadU32BE(it + 12, &inner);
+  if (inner != 0u && inner != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(inner + 8, &idat);
+    (void)mem.ReadU32BE(inner + 24, &ipos);
+    (void)mem.ReadU32BE(inner + 28, &ilen);
+  }
+  // F-445: w446 showed the reader IS attached (inner=82860C40, data=82861DF8, pos/len advancing:
+  // Vehicle rows had len=4096 at pos 37/16/189) and the lookup STILL misses -- so the question is no
+  // longer "is there a buffer" but "is the buffer the text this parser expects". Dump what it is
+  // actually looking at, both at the cursor and at the start of the buffer. 32 bytes is enough to
+  // tell plaintext ("SHADERGROUP", "Vehicle") from compressed or wrong-offset bytes.
+  char txt[33] = {0}, txt0[33] = {0};
+  if (idat != 0u && idat != 0xCDCDCDCDu) {
+    (void)mem.ReadBytes(idat + ipos, txt, sizeof(txt) - 1);
+    (void)mem.ReadBytes(idat, txt0, sizeof(txt0) - 1);
+  }
+  for (char &ch : txt) {
+    const unsigned char uc = static_cast<unsigned char>(ch);
+    if (uc == 0u)
+      break;
+    if (uc < 32u || uc > 126u)
+      ch = '.';
+  }
+  for (char &ch : txt0) {
+    const unsigned char uc = static_cast<unsigned char>(ch);
+    if (uc == 0u)
+      break;
+    if (uc < 32u || uc > 126u)
+      ch = '.';
+  }
   __imp__sub_821CFF40(ctx, base);
   const uint32_t res = ctx.r3.u32 & 0xFFu;
   if (res != 0u)
     (void)s_442hits.fetch_add(1);
   if (k <= 200 || (k % 1000) == 0)
-    MCLA_LOG_WARN("F442-SECTION #{} it={:08X} [it]_0={:08X} vt={:08X} meth={:08X} name='{}' "
-                  "r5={:08X} ret={:08X} hits={} lr={:08X} tid={}",
-                  k, it, i0, vt, meth, nm, arg5, res, s_442hits.load(), lr, GetCurrentThreadId());
+    MCLA_LOG_WARN("F442-SECTION #{} it={:08X} mode={} inner={:08X} data={:08X} pos={} len={} "
+                  "at='{}' head='{}' name='{}' r5={:08X} ret={:08X} hits={} lr={:08X} tid={}",
+                  k, it, mode, inner, idat, ipos, ilen, txt, txt0, nm, arg5, res,
+                  s_442hits.load(), lr, GetCurrentThreadId());
 }
 
 // F-438: count GFx loader CONSTRUCTIONS, because the presence scan has never been able to do it
