@@ -588,6 +588,20 @@ static constexpr bool kUiServeAdvance = false;
 // serve=N per dest (no new literal).
 static constexpr bool kUiXsfChunkFeed = true;
 
+// F-329: also construct the descriptor field the guest actually clamps on.
+// `sub_821D5E10` (generated/ppc_xenon/ppc_recomp.18.cpp:10832+) limits every
+// XMemDecompress call's input to ([st+12] - [st+8]) — `expected` minus
+// `consumed`. w302 shows why that matters: on the garage stream `exp` is
+// 0x0002FFC9 = 196,553 and CONSTANT across five successive entries while
+// `consumed` runs 32,748 -> 163,820, i.e. the field is a STALE leftover of the
+// shared stack state 006D8F20 (whose previous owner was the pkg 0xA0000 walk,
+// which stalled at exactly that value in w277), and neither ForceServe nor the
+// refill ever writes st+12. The container declares its real total at pkg+0x10
+// (0x00104449 = 1,066,057 for garage, read from the RPF in w297's header dump),
+// so the honest descriptor value is available. ON = publish it when serving a UI
+// .xsf stream. OFF == the exact w302 behaviour.
+static constexpr bool kUiXsfSetExpected = true;
+
 // F-319: the tail top-up that goes with kUiXsfChunkFeed. OFF — it addressed the
 // wrong resource. See the block at the `inLeft > 0 && inLeft < 256` UNSTUCK site
 // for the full diagnosis: the leftover there means the dest window is OUTPUT-full,
@@ -7904,6 +7918,32 @@ static uint32_t MclaUiXsfStreamPkg(uint32_t st, uint32_t outPtr) {
 // walk. OFF == the old fabricated bound byte-for-byte.
 static constexpr bool kUiXsfBoundUnc = true;
 
+// The container's own declared uncompressed length (RSC5 header +0x10, BE),
+// cached per package. 0 when the header is missing or implausible.
+static uint32_t MclaUiXsfUnc(uint32_t pkg) {
+  static std::mutex s_uncMtx;
+  static std::unordered_map<uint32_t, uint32_t> s_unc;
+  std::lock_guard<std::mutex> lk(s_uncMtx);
+  const auto it = s_unc.find(pkg);
+  if (it != s_unc.end())
+    return it->second;
+  uint32_t unc = 0;
+  uint8_t hdr[20] = {0};
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+  uint64_t got = 0;
+  if (vfs.OpenFile("xarchive_cache.rpf", fh)) {
+    const bool ok = vfs.ReadFileAt(fh, pkg, hdr, 20, got) && got >= 20;
+    vfs.CloseFile(fh);
+    const uint32_t magic = MclaBE(hdr);
+    const uint32_t v = MclaBE(hdr + 0x10);
+    if (ok && (magic == 0x05435352u || magic == 0x0FF512EFu) && v >= 0x100u &&
+        v <= 0x800000u)
+      unc = v;
+  }
+  return s_unc.emplace(pkg, unc).first->second;
+}
+
 static uint32_t MclaUiXsfWalkCeil(uint32_t pkg) {
   const uint32_t pkgSz = PackageSizeAt(pkg);
   if (!kUiXsfBoundUnc)
@@ -8680,11 +8720,24 @@ PPC_FUNC(sub_821D5E10) {
     const bool j2Ent = IsJob2UiDest(outPtr);
     const bool stackCont =
         (inPtr != 0 && inPtr < 0xA0000000u && consumed > 0);
+    // F-328: `exp` (st+12) and the 8 bytes at inPtr are the guest's OWN block
+    // header parse. Read from generated/ppc_xenon/ppc_recomp.18.cpp:10832+
+    // (`sub_821D5E10`): when [st+8]==0 it compares [inPtr+0] against 0x0FF512E0,
+    // copies [inPtr+4] into st+12, then advances inPtr+=8 / inLeft-=8, and clamps
+    // every XMemDecompress call's input to ([st+12] - [st+8]). So `exp` alone
+    // decides how much buffered input the guest will accept, and a wrong `exp`
+    // gives exactly F-327's symptom (a non-zero inLeft the guest refuses to
+    // consume). Folded into this line rather than adding one (F-133).
+    uint8_t ih[8] = {0};
+    if (inPtr)
+      (void)mem.ReadBytes(inPtr, ih, 8);
     if (n <= 16 || (n % 200) == 0 || j2Ent || stackCont)
       MCLA_LOG_WARN("INFLATE-ENTER #{} st={:08X} in={} inPtr={:08X} "
-                    "consumed={} outPtr={:08X} lr={:08X} j2={}",
-                    n, st, inLeft, inPtr, consumed, outPtr,
-                    static_cast<uint32_t>(ctx.lr), j2Ent ? 1 : 0);
+                    "consumed={} exp={:08X} ihdr=[{:08X} {:08X}] "
+                    "outPtr={:08X} lr={:08X} j2={}",
+                    n, st, inLeft, inPtr, consumed, expected, MclaBE(ih),
+                    MclaBE(ih + 4), outPtr, static_cast<uint32_t>(ctx.lr),
+                    j2Ent ? 1 : 0);
   }
 
   MclaUiXsfLateReverify(n);  // F-325 persistence sampler (read-only)
@@ -9770,6 +9823,14 @@ PPC_FUNC(sub_821D5E10) {
                                  static_cast<uint32_t>(got));
             (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got));
             (void)mem.WriteU32BE(st + 4, s_hsBuf);
+            if (kUiXsfSetExpected && sPkg != 0u) {
+              // F-329: publish the block's declared total into the field the
+              // guest clamps against, so a stale value inherited on the shared
+              // stack state cannot truncate the stream at 196,553 bytes.
+              const uint32_t unc = MclaUiXsfUnc(sPkg);
+              if (unc)
+                (void)mem.WriteU32BE(st + 12, unc);
+            }
             if (!isPkgHead) {
               uint32_t consumedNow = 0;
               (void)mem.ReadU32BE(st + 8, &consumedNow);
