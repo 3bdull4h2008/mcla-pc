@@ -8231,6 +8231,13 @@ static bool MclaSlotUntouched(uint32_t pbase, uint32_t size) {
 // F-323 span behaviour byte-for-byte.
 static constexpr bool kUiXsfFillListOrder = true;
 
+// F-326: DRY RUN builds the same plan and records the same claims but writes
+// NOTHING, so `UIXSF-GOLDEN-REVERIFY` then reports how much of the container the
+// GUEST put there by itself. That is the only admissible baseline for Path B:
+// with the fill on, `still_present` conflates host placement and guest output,
+// and F-325's 64.9 % is a mixture of the two.
+static constexpr bool kUiXsfFillDryRun = true;
+
 static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                                 const std::vector<MclaUiXsfSlot> &slots,
                                 uint32_t shot) {
@@ -8337,6 +8344,13 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
       const uint32_t want = cmp - done < buf.size() ? cmp - done
                                                    : static_cast<uint32_t>(
                                                          buf.size());
+      if (kUiXsfFillDryRun) {
+        // Claim the range without touching memory: the reverify that reads it
+        // back then measures the guest's own bytes against the golden layout.
+        wrote += want;
+        bytesWritten += want;
+        continue;
+      }
       std::memcpy(buf.data(), gold.data() + off + done, want);
       if (!mem.WriteBytes(S.pbase + done, buf.data(), want))
         break;
@@ -8358,9 +8372,10 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
   }
   MCLA_LOG_WARN("UIXSF-GOLDEN-FILL-SUMMARY pkg={:08X} shot={} goldsize={} "
                 "anchor={:08X} slots_written={} bytes_written={} skipped={} "
-                "gold_span=[{:08X},{:08X})",
+                "dryrun={} gold_span=[{:08X},{:08X})",
                 pkg, shot, static_cast<uint32_t>(gold.size()),
                 slots[ai].pbase, slotsWritten, bytesWritten, skipped,
+                kUiXsfFillDryRun ? 1u : 0u,
                 covLo == 0xFFFFFFFFu ? 0u : covLo, covHi);
 }
 
