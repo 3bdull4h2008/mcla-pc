@@ -738,6 +738,30 @@ static constexpr uint32_t kUiXsfCtxStallCap = 40u;
 static std::mutex g_uiXsfOwnerMtx;
 static uint32_t g_uiXsfCtxOwner = 0;  // pkg offset holding the context
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfStalls;  // pkg -> stalls
+
+// F-342: a context per PACKAGE, published per entry from the entry's own destination.
+// F-339 failed because it keyed the publish on `st`, and `st` is the job's record, so
+// every stream of the job got the one private context and the healthy ones died. The
+// destination is per slot and the package binding of a destination is per container, so
+// keying on the package gives the isolation F-339 was reaching for without starving or
+// hijacking anything: each entry publishes its own container's context, and any entry
+// that is not a UI .xsf container gets the guest's original shared context back.
+// Contexts are created by the guest's own Open replay (F-337 §2: r7 unread, r6 = the
+// size) and capped so this cannot exhaust the guest heap; the shared value is captured
+// before the first swap and is the only thing ever restored.
+// F-342 MEASURED = false, and it is the strongest of the three negatives: publishing
+// the slot per entry, keyed on that entry's own package binding (not on the per-job st
+// that defeated F-339), opens one private context for the garage and swaps it in -- and
+// the UI decode then stops entirely: 27,467 lines vs 57,685, INFLATE-ENTER 32 vs 4,901,
+// and LZX-FRAME failtotal 0, i.e. not one frame decoded after the swap, rather than
+// frames failing. The slot at 0x8283D190+0x20 is therefore the streamer object's own
+// current-context field, read by the job loop outside the inflate call as well; anything
+// that writes it corrupts the streamer, not just the decode. Task #15 has to construct
+// the (record, context) pair at the source instead of redirecting this global.
+static constexpr bool kUiXsfPerPkgCtx = false;
+static std::mutex g_uiXsfPkgMtx;
+static std::unordered_map<uint32_t, uint32_t> g_uiXsfPkgCtx;  // pkg -> private ctx
+static std::atomic<uint32_t> g_uiXsfOrigCtx{0};
 static std::mutex g_uiXsfPrivMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPrivCtx;  // st -> private ctx
 // F-339: the publish/restore pair. g_uiXsfSharedCtx is the value the slot held
@@ -9206,6 +9230,61 @@ PPC_FUNC(sub_821D5E10) {
   // *obj as the context; r3 is the return value by the time the refill runs, so
   // capture it here.
   const uint32_t objAtEntry = ctx.r3.u32;
+  // F-342: publish the container's own codec context for the duration of this entry.
+  if (kUiXsfPerPkgCtx) {
+    auto &cmem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t pst = ctx.r4.u32;
+    uint32_t pdest = 0;
+    (void)cmem.ReadU32BE(pst + 20u, &pdest);
+    const uint32_t ppkg = pdest != 0u ? PeekPackageForDest(pdest) : 0u;
+    const bool ui = ppkg != 0u && IsUiXsfPkg(ppkg);
+    const bool slotOK = objAtEntry >= 0x40000000u && objAtEntry < 0xF0000000u &&
+                        cmem.IsValid(objAtEntry, 4u);
+    if (slotOK) {
+      uint32_t want = 0, cur = 0;
+      {
+        std::lock_guard<std::mutex> plk(g_uiXsfPkgMtx);
+        if (ui) {
+          const auto it = g_uiXsfPkgCtx.find(ppkg);
+          want = it != g_uiXsfPkgCtx.end() ? it->second : 1u;  // 1 = need one
+        } else {
+          want = g_uiXsfOrigCtx.load();
+        }
+      }
+      (void)cmem.ReadU32BE(objAtEntry, &cur);
+      if (want == 1u && g_uiXsfPkgCtx.size() < 8u) {
+        const uint32_t raw = cmem.Alloc(0x6A000u, 16);
+        const uint32_t blk = raw != 0u ? raw + 0x35000u : 0u;
+        if (blk != 0u) {
+          if (g_uiXsfOrigCtx.load() == 0u && cur != 0u && cur != 0xCDCDCDCDu)
+            g_uiXsfOrigCtx.store(cur);
+          PPCContext q{};
+          q.r1.u64 = ctx.r1.u32 - 0x400u;
+          q.r13.u64 = 0x8F200000u;
+          q.r3.u64 = 0x8EFFF990u;
+          q.r4.u64 = 1u;
+          q.r5.u64 = blk;
+          q.r6.u64 = 0x3492Eu;
+          q.lr = 0x824613D4u;
+          __imp__sub_82461378(q, base);
+          std::lock_guard<std::mutex> plk(g_uiXsfPkgMtx);
+          g_uiXsfPkgCtx[ppkg] = blk;
+          want = blk;
+          MCLA_LOG_WARN("UIXSF-PKGCTX pkg={:08X} opened ctx={:08X} (shared "
+                        "{:08X})", ppkg, blk, g_uiXsfOrigCtx.load());
+        }
+      }
+      if (want != 0u && want != cur) {
+        (void)cmem.WriteU32BE(objAtEntry, want);
+        static uint32_t s_plog = 0;
+        if (s_plog < 12u) {
+          ++s_plog;
+          MCLA_LOG_WARN("UIXSF-PKGCTX obj={:08X} pkg={:08X} ctx {:08X} -> "
+                        "{:08X}", objAtEntry, ppkg, cur, want);
+        }
+      }
+    }
+  }
   // F-339: F-338 showed that writing a private context into the shared per-job
   // slot takes down the job's OTHER streams too, because they read the same word.
   // So the publish has to be paired: hold the private ctx only while this entry
