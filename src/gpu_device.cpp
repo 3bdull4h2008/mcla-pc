@@ -2815,7 +2815,20 @@ PPC_FUNC(sub_8244FF20) {
   const bool uiDest = IsUiXsfPkg(destPkg) || dest == 0xB7B01000u ||
                       dest == 0xB7AC1000u || dest == 0xB7441000u ||
                       dest == 0xB74E1000u;
-  if (n <= 24 || uiDest)
+  // F-327 INSTRUMENT BUG I introduced in F-321: making `uiDest` dynamic was
+  // right (the hardcoded four-address snapshot was blind to live dests), but
+  // this hook fires ~200 times per inflate entry, so "print for every UI dest"
+  // turned w298 into 5,531,016 XMEM-SZPTR lines out of 5.7 M total and the boot
+  // never reached the measurement I built it for. Bound it per dest instead of
+  // per call: the census wants a sample per dest, not every step.
+  static std::mutex s_uiCntMtx;
+  static std::unordered_map<uint32_t, uint32_t> s_uiCnt;
+  bool uiLogged = false;
+  {
+    std::lock_guard<std::mutex> clk(s_uiCntMtx);
+    uiLogged = uiDest && s_uiCnt[dest]++ < 8u;
+  }
+  if (n <= 24 || uiLogged)
     MCLA_LOG_WARN("XMEM-SZPTR #{} dest={:08X} *destSz(in)={} *srcSz(in)={} "
                   "src={:08X} *destSz(out)={} *srcSz(out)={} ret={:08X} "
                   "lr={:08X}",
@@ -7856,6 +7869,10 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
 static std::mutex g_uiXsfStreamMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfStreamPkg;   // st -> pkg
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfStreamWalk;  // st -> bytes delivered
+// F-327: package offset of the NEXT frame header for this inflate state. 0 means
+// "not started" -> the container header occupies pkg+0..19, so the first frame
+// begins at 20 (the guest is served from pkg+0 and skips the header itself).
+static std::unordered_map<uint32_t, uint32_t> g_uiXsfStreamFrame;
 
 // Which UI .xsf package (0 = none) is this inflate state streaming? A dest that
 // IS mapped settles it authoritatively — including NEGATIVELY: a dest mapped to
@@ -7936,6 +7953,40 @@ static uint32_t MclaUiXsfSlotCov(uint32_t dest) {
       ++nz;
   }
   return nz;
+}
+
+// F-327: parse one entry of a UI .xsf container's own frame table. The layout is
+// copied from the validated offline decoder (`src/xmem_lzx.h:531-552`): frames
+// start at pkg+0x14, each with a 2-byte header {uncomp fixed at 0x8000, pay as
+// be16} or the escape 0xFF followed by {uncomp be16, pay be16} for five bytes.
+// Returns false if the header cannot be read or the payload size is not
+// plausible, in which case the caller must fall back to the legacy stride.
+static bool MclaUiXsfFrameAt(uint32_t pkg, uint32_t pos, uint32_t &hdrLen,
+                             uint32_t &payLen, uint32_t &uncLen) {
+  hdrLen = payLen = uncLen = 0;
+  if (pos >= 0x4000000u)
+    return false;
+  uint8_t h[5] = {0};
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+  uint64_t got = 0;
+  bool ok = false;
+  if (vfs.OpenFile("xarchive_cache.rpf", fh)) {
+    ok = vfs.ReadFileAt(fh, pkg + pos, h, 5, got) && got >= 5;
+    vfs.CloseFile(fh);
+  }
+  if (!ok)
+    return false;
+  if (h[0] == 0xFF) {
+    hdrLen = 5;
+    uncLen = (static_cast<uint32_t>(h[1]) << 8) | h[2];
+    payLen = (static_cast<uint32_t>(h[3]) << 8) | h[4];
+  } else {
+    hdrLen = 2;
+    uncLen = 0x8000u;
+    payLen = (static_cast<uint32_t>(h[0]) << 8) | h[1];
+  }
+  return payLen > 0u && payLen <= 0x8000u && uncLen > 0u && uncLen <= 0x8000u;
 }
 
 // Is this UI .xsf stream still short of its package end? Keys on the stream
@@ -8230,6 +8281,37 @@ static bool MclaSlotUntouched(uint32_t pbase, uint32_t size) {
 // F-324: list-order placement (see the comment at the plan builder). OFF == the
 // F-323 span behaviour byte-for-byte.
 static constexpr bool kUiXsfFillListOrder = true;
+
+// F-327: serve the UI .xsf streams FRAME-ALIGNED instead of in fixed 0x8000
+// slices. The container is a sequence of self-delimiting frames starting at
+// pkg+0x14 (2-byte header {uncomp=0x8000, pay_be16}, or 0xFF + {uncomp,pay} for
+// five bytes), each decoded by one shared decoder with 16-bit re-alignment --
+// that is the recipe `src/xmem_lzx.h:527-552` validates byte-exact offline. The
+// refill ignored it: it advanced by exactly 0x8000, so window 1 (pkg+0, 32,768
+// B) carried the 20-byte container header + 2-byte frame header + 32,726 B of
+// frame 0, which the guest consumed to `consumed=32,748` and turned into exactly
+// one correct 32,768-byte output window (F-321 `firstbad=00008000`, F-326
+// `first_bad=00008000`), and window 2 then started 20 bytes INSIDE frame 1. From
+// there the guest reads a frame header that is payload, decodes nothing, and
+// keeps eating input -- which is the whole 63,072-of-1,066,057 plateau.
+//
+// So the cursor is the FRAME TABLE, not a fixed stride: per inflate state,
+// remember the package offset of the next frame header, serve exactly
+// hdr+pay bytes, and stop at the end of the declared uncompressed length.
+// F-327 RESULT: tried ON in w298/w299 and REVERTED. It does walk the frame
+// table correctly (32 frame-sized serves, `off` advancing 64980000 -> 649A6F7A
+// with per-frame sizes 9572/5206/3344/... instead of a fixed 0x8000), and the
+// stream got further into the package than the fixed stride ever had — but the
+// guest then STALLS on a partial frame with `inLeft` NONZERO
+// (w299: `INFLATE-ENTER #20,364,800 st=006D8F20 in=2051 consumed=196553
+// outPtr=B7A41000` at 20 MILLION inflate entries, 659,319 log lines vs w297's
+// 57,866) and never reaches retirement, so the garage produced no verdict at all
+// in the soak. Because inLeft != 0, the refill cannot even help: its trigger is
+// an empty buffer. So the container's byte offsets were never the obstacle —
+// the guest's per-call frame/outLeft accounting is, which is Path B's
+// descriptor-construction side (task #15), not serve framing. Keep the parser
+// and the cursor: they are what makes that side measurable.
+static constexpr bool kUiXsfFrameServe = false;
 
 // F-326: DRY RUN builds the same plan and records the same claims but writes
 // NOTHING, so `UIXSF-GOLDEN-REVERIFY` then reports how much of the container the
@@ -8555,7 +8637,10 @@ static std::atomic<uint32_t> s_h5E10empty{0};
 // re-reads the recorded claims and reports how much of each container is still
 // byte-exact in guest memory at that moment. Read-only; bounded by the counter.
 static void MclaUiXsfLateReverify(uint32_t n) {
-  if (!kUiXsfReverify || n < 1000u || (n % 1000u) != 0u)
+  // Bounded: w299 hit 20 MILLION inflate entries while the guest spun, and
+  // "every 1,000th" printed 20,365 reverify lines. Eight samples per package is
+  // plenty to answer "did it survive".
+  if (!kUiXsfReverify || n < 1000u || (n % 1000u) != 0u || n > 9000u)
     return;
   static constexpr uint32_t kPkgs[4] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
                                         0x6496F000u};
@@ -9580,6 +9665,7 @@ PPC_FUNC(sub_821D5E10) {
         // and would re-serve bytes the guest already consumed — the w275
         // re-serve failure in a new place. Take the stream's package and advance
         // past everything already delivered on this inflate state.
+        uint32_t frLen = 0;  // F-327: frame-aligned window size, 0 = legacy
         const uint32_t sPkg =
             kUiXsfChunkFeed ? MclaUiXsfStreamPkg(st, outPtr) : 0u;
         if (sPkg != 0) {
@@ -9592,21 +9678,45 @@ PPC_FUNC(sub_821D5E10) {
           if (sWalk > walkPos)
             walkPos = sWalk;
           readOff = baseOff + walkPos;
+          // F-327: replace the fixed stride with THIS frame's byte count. The
+          // first window keeps the 20-byte container header in front of frame 0
+          // because that is what the guest successfully consumed in w277/w297
+          // (`consumed=32748` = 20 + 2 + 32,726); every later window starts
+          // exactly on a frame header.
+          if (kUiXsfFrameServe) {
+            uint32_t fpos = 0;
+            {
+              std::lock_guard<std::mutex> lk(g_uiXsfStreamMtx);
+              fpos = g_uiXsfStreamFrame[st];
+            }
+            const bool first = (fpos == 0u);
+            uint32_t hl = 0, pay = 0, uf = 0;
+            if (MclaUiXsfFrameAt(baseOff, first ? 20u : fpos, hl, pay, uf)) {
+              const uint32_t len = (first ? 20u : 0u) + hl + pay;
+              if (len <= 0x8400u) {
+                walkPos = first ? 0u : fpos;
+                readOff = baseOff + walkPos;
+                frLen = len;
+              }
+            }
+          }
           // Publish the mapping for this slot too, so the top-of-hook Path A
           // decoder and the drain exemption see it from the next entry on.
           std::lock_guard<std::mutex> wl(g_destPkgMtx);
           g_destPkgOff[outPtr] = baseOff;
         }
         if (s_hsBuf == 0)
-          s_hsBuf = mem.Alloc(0x8000, 16);
+          // F-327: 0x8400 so a full frame plus its header always fits.
+          s_hsBuf = mem.Alloc(0x8400, 16);
         if (s_hsBuf) {
           auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
           mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
-          std::vector<uint8_t> tmp(0x8000);
+          const uint32_t winLen = frLen ? frLen : 0x8000u;
+          std::vector<uint8_t> tmp(winLen);
           uint64_t got = 0;
           bool ok = vfs.OpenFile("xarchive_cache.rpf", fh);
           if (ok) {
-            ok = vfs.ReadFileAt(fh, readOff, tmp.data(), 0x8000, got);
+            ok = vfs.ReadFileAt(fh, readOff, tmp.data(), winLen, got);
             vfs.CloseFile(fh);
           }
           if (ok && got > 16) {
@@ -9651,9 +9761,11 @@ PPC_FUNC(sub_821D5E10) {
             }
             MCLA_LOG_WARN("INFLATE-HOSTSERVE-PEND #{} off={:08X} got={} "
                           "headBE={:08X} buf={:08X} outPtr={:08X} outLeft={} "
-                          "(pkg={:08X} walk={:08X} pkgSz={:08X} serve={})",
+                          "(pkg={:08X} walk={:08X} pkgSz={:08X} serve={} "
+                          "frame={})",
                           n, readOff, got, be, s_hsBuf, outPtr, outLeft,
-                          baseOff, walkPos, pkgSz, serves + 1);
+                          baseOff, walkPos, pkgSz, serves + 1,
+                          frLen != 0u ? 1 : 0);
             (void)mem.WriteBytes(s_hsBuf, tmp.data(),
                                  static_cast<uint32_t>(got));
             (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got));
@@ -9677,6 +9789,12 @@ PPC_FUNC(sub_821D5E10) {
               const uint32_t nw = readOff - baseOff + got;
               if (nw > g_uiXsfStreamWalk[st])
                 g_uiXsfStreamWalk[st] = nw;
+            }
+            if (frLen != 0u) {
+              // F-327: the frame cursor advances by the WHOLE frame just
+              // served, so the next refill lands on the next frame header.
+              std::lock_guard<std::mutex> lk(g_uiXsfStreamMtx);
+              g_uiXsfStreamFrame[st] = readOff - baseOff + frLen;
             }
             retries = 0;
             return;
