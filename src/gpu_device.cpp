@@ -8532,6 +8532,23 @@ static constexpr bool kInflateIntervene = true;
 static std::atomic<uint32_t> s_h5E10{0};
 static std::atomic<uint32_t> s_h5E10pt{0};
 static std::atomic<uint32_t> s_h5E10empty{0};
+
+// F-325: does the placement SURVIVE, or did F-324 only prove it landed? The
+// reverify fired once, immediately after the fill, so it could not see a later
+// guest write over any of these slots. The inflate hook is the natural sampler:
+// it runs ~4,900 times spread across the whole boot, so every 1,000th entry
+// re-reads the recorded claims and reports how much of each container is still
+// byte-exact in guest memory at that moment. Read-only; bounded by the counter.
+static void MclaUiXsfLateReverify(uint32_t n) {
+  if (!kUiXsfReverify || n < 1000u || (n % 1000u) != 0u)
+    return;
+  static constexpr uint32_t kPkgs[4] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
+                                        0x6496F000u};
+  const uint32_t sample = n / 1000u;
+  for (const uint32_t p : kPkgs)
+    MclaUiXsfReverify(p, MclaUiXsfGolden(p), 99u + sample);
+}
+
 PPC_FUNC(sub_821D5E10) {
   const uint32_t n = s_h5E10.fetch_add(1) + 1;
   const uint32_t st = ctx.r4.u32;
@@ -8570,6 +8587,7 @@ PPC_FUNC(sub_821D5E10) {
                     static_cast<uint32_t>(ctx.lr), j2Ent ? 1 : 0);
   }
 
+  MclaUiXsfLateReverify(n);  // F-325 persistence sampler (read-only)
   uint32_t magic = 0;
   // F-295 Path A (unified): host XMem/raw-LZX decode of the UI .xsf dests,
   // fired once per dest at the very top of the inflate handler so it covers
