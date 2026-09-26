@@ -148,7 +148,7 @@ target turned out not to exist**: the static read of `sub_82461010` /
 F-332) are what produced the diagnosis above, and the `0x828D38D8` singleton they
 were aimed at is not in the image. What remains:
 
-1. **Serve in place — stop moving `src`** (F-333 §5 is the reason). In the
+1. ~~**Serve in place — stop moving `src`**~~ — **WITHDRAWN by F-334 before it was implemented.** At the refill trigger the guest's `inPtr` is `st + 0x20`, i.e. inside its own stack-resident inflate record with `inLeft = 0` (`UIXSF-LOCATE` ×6 in `w310`, needle matches nowhere in 4 MB of the package), so there is no container window belonging to the guest to extend in place. The text is kept because it documents the assumption that failed. In the
    refill, at the `WriteU32BE(st + 0, got)` / `WriteU32BE(st + 4, s_hsBuf)` pair
    immediately above the `kUiXsfClearResume` block
    (`src/gpu_device.cpp:10003`), for a UI `.xsf` stream write the container's
@@ -165,6 +165,8 @@ were aimed at is not in the image. What remains:
    line closes too, and the remaining candidate is making the guest reach its
    own reset (`sub_82460F88` / `sub_82461840`, which zero exactly this state)
    between streams — a different mechanism, not another framing knob.
+1b. **Append-only window per UI stream** (F-334 §4 — the surviving form of the serve idea). Each refill today overwrites the same `s_hsBuf` from its start while `walkPos` advances, so any absolute position the frame driver kept refers to different bytes than it did one call earlier, and F-332 showed the driver's own saved cursor sits in the ctx's staging area (`0x4003xxxx`), never in our window. Change: allocate ONE window per UI stream, big enough for the whole container (garage: 1,066,057 + header), fill it **append-only** starting at the container's frame 0, and let `*srcSize` be the only moving part — never re-point `st+4` to another base and never overwrite bytes the driver has already seen. Evidence that one call can carry many frames: `LZX-FRAME #1..#10` decoded ten consecutive frames out of one contiguous ~23 KB run and produced 327,680 bytes. Acceptance: `LZX-FRAME` successes past the tenth (`cumprod` beyond 327,680), and `UIXSF-GOLDEN-REVERIFY … still_present` past 63,072 with `kUiXsfFillDryRun=true`. If that fails, the remaining candidate is the shared ctx's LZX table/history across streams (F-331 §7's type-1/2 self-reset), i.e. making the guest reach `sub_82460F88` /
+    `sub_82461840` per stream — a different subsystem, not a serve knob.
 2. **Do not re-run the redirect family.** F-318, F-320, F-327, F-329 and F-333
    cover re-pointing `src` with five different offsets, latches and framings;
    correct output moved in none of them and went *down* in the last. A further

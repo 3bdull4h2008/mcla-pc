@@ -630,6 +630,17 @@ static constexpr bool kUiXsfTailTopup = false;
 // extend the buffer in place. Keep OFF until that is what is being tested.
 static constexpr bool kUiXsfClearResume = false;
 
+// F-334 (MEASUREMENT ONLY, writes nothing): where in the package IS the guest's
+// buffer? F-333 closed "move src and reset the driver's position" by showing the
+// LZX decode is one continuous bit stream, so the surviving Path B design is to
+// extend the buffer the guest already points at — and that is only possible if
+// the guest-address ↔ package-offset mapping is *known*. Every serve so far has
+// ASSUMED it from our own walkPos. This reads 48 bytes at the stream's current
+// `inPtr`, finds that byte string inside the package image, and prints how far
+// our bookkeeping is from it. One number decides whether the data is missing or
+// our position model is wrong.
+static constexpr bool kUiXsfLocate = true;
+
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
 // (correct guest enqueue) replaces its purpose; with Path B ON this replay only
 // collides (the INFLATE #2.2M loop carries its 7179940 constants). Disabled by
@@ -8101,6 +8112,95 @@ static bool MclaUiXsfFrameAt(uint32_t pkg, uint32_t pos, uint32_t &hdrLen,
   return payLen > 0u && payLen <= 0x8000u && uncLen > 0u && uncLen <= 0x8000u;
 }
 
+// F-334: locate the stream's current guest buffer inside its own package image.
+// Log-only; see the kUiXsfLocate comment for what question this answers. The
+// needle is 16 bytes (a whole 48-byte run can legitimately diverge if the guest
+// re-used part of the buffer), and the scan is a byte prefilter over 64 KiB
+// chunks, so a miss costs microseconds rather than a stalled boot.
+static void MclaUiXsfLocateStream(uint32_t st, uint32_t pkg, uint32_t inPtr,
+                                  uint32_t inLeft, uint32_t walkPos) {
+  static std::mutex s_locMtx;
+  static std::unordered_map<uint32_t, uint32_t> s_locSeen;
+  uint32_t nth = 0;
+  {
+    std::lock_guard<std::mutex> lk(s_locMtx);
+    nth = ++s_locSeen[st];
+  }
+  if (nth > 6u || pkg == 0u)
+    return;
+  // The interesting moment is inLeft == 0 — that is when the serve fires — and
+  // then there is nothing left IN the buffer to search. So take the needle from
+  // the last 16 bytes the guest actually consumed (the 16 ending at inPtr) and
+  // carry the offset forward to inPtr+inLeft. w309 proved this the hard way:
+  // the first version required inLeft >= 16 and therefore printed nothing at
+  // all, which is the same zero-with-no-printer error F-057(6) warns about.
+  const uint32_t nbase = inLeft >= 16u ? inPtr : (inPtr - 16u);
+  if (inPtr < 0x1000u) {
+    MCLA_LOG_WARN("UIXSF-LOCATE #{} st={:08X} pkg={:08X} inPtr={:08X} "
+                  "inLeft={} — NOT SEARCHABLE",
+                  nth, st, pkg, inPtr, inLeft);
+    return;
+  }
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  std::vector<uint8_t> head(16, 0);
+  if (!mem.IsValid(nbase, 16) || !mem.ReadBytes(nbase, head.data(), 16)) {
+    MCLA_LOG_WARN("UIXSF-LOCATE #{} st={:08X} pkg={:08X} nbase={:08X} "
+                  "NEEDLE UNREADABLE walk={:08X}",
+                  nth, st, pkg, nbase, walkPos);
+    return;
+  }
+  bool dead = true;
+  for (uint8_t b : head)
+    if (b != 0x00u && b != 0xCDu)
+      dead = false;
+  if (dead) {
+    MCLA_LOG_WARN("UIXSF-LOCATE #{} st={:08X} pkg={:08X} nbase={:08X} "
+                  "NEEDLE DEAD (zero/poison) walk={:08X}",
+                  nth, st, pkg, nbase, walkPos);
+    return;
+  }
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+  if (!vfs.OpenFile("xarchive_cache.rpf", fh)) {
+    MCLA_LOG_WARN("UIXSF-LOCATE #{} st={:08X} RPF NOT OPENABLE", nth, st);
+    return;
+  }
+  const uint32_t chunk = 0x10000u;
+  std::vector<uint8_t> win(chunk + 16);
+  uint32_t found = 0xFFFFFFFFu;
+  for (uint32_t off = 0; off < 0x400000u && found == 0xFFFFFFFFu; off += chunk) {
+    uint64_t got = 0;
+    if (!vfs.ReadFileAt(fh, pkg + off, win.data(), win.size(), got) ||
+        got < head.size())
+      break;
+    for (uint64_t i = 0; i + head.size() <= got; ++i) {
+      if (win[i] == head[0] &&
+          std::memcmp(win.data() + i, head.data(), head.size()) == 0) {
+        found = off + static_cast<uint32_t>(i);
+        break;
+      }
+    }
+  }
+  vfs.CloseFile(fh);
+  if (found == 0xFFFFFFFFu) {
+    MCLA_LOG_WARN("UIXSF-LOCATE #{} st={:08X} pkg={:08X} inPtr={:08X} "
+                  "inLeft={} walk={:08X} → NOT IN PACKAGE (scanned 4 MB)",
+                  nth, st, pkg, inPtr, inLeft, walkPos);
+    return;
+  }
+  // If our bookkeeping agrees with the guest's buffer, then the byte at
+  // inPtr+inLeft is the byte at pkg+want, which is exactly what walkPos should
+  // be right now. The needle started at nbase, so carry it forward to the end
+  // of the guest's valid data.
+  const uint32_t want = found + (inPtr + inLeft - nbase);
+  MCLA_LOG_WARN("UIXSF-LOCATE #{} st={:08X} pkg={:08X} inPtr={:08X} inLeft={} "
+                "nbase={:08X} found_at={:08X} want_walk={:08X} walk={:08X} "
+                "AGREE={} delta={}",
+                nth, st, pkg, inPtr, inLeft, nbase, found, want, walkPos,
+                want == walkPos ? 1 : 0,
+                static_cast<int64_t>(walkPos) - static_cast<int64_t>(want));
+}
+
 // Is this UI .xsf stream still short of its package end? Keys on the stream
 // cursor (max of the dest's own walk and the stream's), bounded by
 // MclaUiXsfWalkCeil, so it cannot spin past the package: MclaLoadPkgWindow only
@@ -9933,6 +10033,18 @@ PPC_FUNC(sub_821D5E10) {
           // decoder and the drain exemption see it from the next entry on.
           std::lock_guard<std::mutex> wl(g_destPkgMtx);
           g_destPkgOff[outPtr] = baseOff;
+        }
+        // F-334: ask the guest's own buffer where it is, before deciding what to
+        // write. Log-only, ≤6 lines per inflate state. This is the reachability
+        // fix after w309 showed the first version's guard (inLeft >= 16) made it
+        // print nothing at the one moment that matters.
+        if (kUiXsfLocate && sPkg != 0u) {
+          uint32_t lwalk = 0;
+          {
+            std::lock_guard<std::mutex> lk(g_uiXsfStreamMtx);
+            lwalk = g_uiXsfStreamWalk[st];
+          }
+          MclaUiXsfLocateStream(st, sPkg, inPtr, inLeft, lwalk);
         }
         if (s_hsBuf == 0)
           // F-327: 0x8400 so a full frame plus its header always fits.
