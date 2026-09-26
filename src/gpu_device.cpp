@@ -691,9 +691,25 @@ static constexpr bool kUiXsfAppendWindow = false;
 // republishing its +0 hijacks every stream in that job, including the ones that
 // were decoding fine. A per-stream context therefore needs its own object, i.e.
 // the enqueue side (task #15), not a serve-side rewrite of a shared slot.
+// F-339 MEASURED = false, and it closes this avenue rather than the hypothesis:
+// there is no per-stream handle to key a publish/restore on. st (006D8F20, F-329/F-334)
+// AND obj (0x8283D1B0, F-338) are BOTH per-JOB records, and the four UI containers are
+// multiplexed through that one record by the guest job loop (sub_821BC140 walks
+// 28-byte descriptors inside the job). w320 proves it directly: publish fired 0 times
+// and restore fired 0 times, because every entry that reached this code found priv != 0
+// for its own st -- the garage's private context had become the whole job's context.
+// A private context per stream therefore needs a per-stream RECORD, i.e. re-plumbing
+// the streamer's job loop (task #15), not another hook intervention.
 static constexpr bool kUiXsfPrivateCtx = false;
 static std::mutex g_uiXsfPrivMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPrivCtx;  // st -> private ctx
+// F-339: the publish/restore pair. g_uiXsfSharedCtx is the value the slot held
+// before we ever touched it (0x4000FD80 in every soak), and g_uiXsfPrivSet is the
+// set of contexts WE created -- a restore is only allowed onto one of ours, so a
+// record that legitimately holds the guest's other real context (0x400446C0) is
+// never overwritten.
+static std::atomic<uint32_t> g_uiXsfSharedCtx{0};
+static std::unordered_set<uint32_t> g_uiXsfPrivSet;
 
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
 // (correct guest enqueue) replaces its purpose; with Path B ON this replay only
@@ -9153,6 +9169,53 @@ PPC_FUNC(sub_821D5E10) {
   // *obj as the context; r3 is the return value by the time the refill runs, so
   // capture it here.
   const uint32_t objAtEntry = ctx.r3.u32;
+  // F-339: F-338 showed that writing a private context into the shared per-job
+  // slot takes down the job's OTHER streams too, because they read the same word.
+  // So the publish has to be paired: hold the private ctx only while this entry
+  // belongs to the stream it was opened for, and put the shared ctx back for
+  // every other entry. Keyed on the inflate record (`st`), never on an address.
+  if (kUiXsfPrivateCtx) {
+    auto &pmem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t stx = ctx.r4.u32;
+    uint32_t priv = 0;
+    {
+      std::lock_guard<std::mutex> pl(g_uiXsfPrivMtx);
+      const auto it = g_uiXsfPrivCtx.find(stx);
+      if (it != g_uiXsfPrivCtx.end())
+        priv = it->second;
+    }
+    if (objAtEntry >= 0x40000000u && objAtEntry < 0xF0000000u &&
+        pmem.IsValid(objAtEntry, 4u)) {
+      uint32_t cur = 0;
+      if (pmem.ReadU32BE(objAtEntry, &cur)) {
+        if (priv != 0u && cur != priv) {
+          (void)pmem.WriteU32BE(objAtEntry, priv);
+          static uint32_t s_pubLog = 0;
+          if (s_pubLog < 6u) {
+            ++s_pubLog;
+            MCLA_LOG_WARN("UIXSF-PRIVCTX publish obj={:08X} {} -> {} (st={:08X})",
+                          objAtEntry, cur, priv, stx);
+          }
+        } else if (priv == 0u && cur != 0u) {
+          bool mine = false;
+          {
+            std::lock_guard<std::mutex> pl(g_uiXsfPrivMtx);
+            mine = g_uiXsfPrivSet.count(cur) != 0u;
+          }
+          const uint32_t shared = g_uiXsfSharedCtx.load();
+          if (mine && shared != 0u && shared != cur) {
+            (void)pmem.WriteU32BE(objAtEntry, shared);
+            static uint32_t s_resLog = 0;
+            if (s_resLog < 6u) {
+              ++s_resLog;
+              MCLA_LOG_WARN("UIXSF-PRIVCTX restore obj={:08X} {} -> {} "
+                            "(st={:08X})", objAtEntry, cur, shared, stx);
+            }
+          }
+        }
+      }
+    }
+  }
   const uint32_t n = s_h5E10.fetch_add(1) + 1;
   const uint32_t st = ctx.r4.u32;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -10254,6 +10317,13 @@ PPC_FUNC(sub_821D5E10) {
               priv = blk;
               std::lock_guard<std::mutex> pl(g_uiXsfPrivMtx);
               g_uiXsfPrivCtx[st] = priv;
+              g_uiXsfPrivSet.insert(priv);
+              if (g_uiXsfSharedCtx.load() == 0u) {
+                uint32_t cur0 = 0;
+                if (mem.ReadU32BE(objAtEntry, &cur0) && cur0 != 0u &&
+                    cur0 != 0xCDCDCDCDu)
+                  g_uiXsfSharedCtx.store(cur0);
+              }
               MCLA_LOG_WARN("UIXSF-PRIVCTX #{} st={:08X} pkg={:08X} opened "
                             "private ctx={:08X} (shared is 4000FD80)",
                             n, st, sPkg, priv);

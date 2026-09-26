@@ -1,3 +1,11 @@
+## 2026-09-26 ~08:2x (F-339, **BUILT + SOAKED `w320` + REVERTED + RE-VERIFIED `w321`**) - **the private-context avenue is CLOSED, and Path B's remaining scope is one thing: task #15's streamer re-plumb.** Ledger through **F-339**; next ID **F-340**.
+
+- The paired publish/restore keyed on `st` was built and **both branches printed zero**. `st = 0x6D8F20` is the *job's* record, not the stream's, so the garage's private context was already the whole job's context on every entry - F-338's collapse, explained.
+- That one fact accounts for all eight closed serve variants (F-318, 320, 327, 329, 333, 335, 337/338, 339): none can create the (record, context) pair the continuous-bit-stream decoder needs. Path B's rest is **not** a descriptor field - it is constructing a stream-private record + context where `sub_821BC140` (`ppc_recomp.14.cpp:18805`) walks its 28-byte descriptors, i.e. a streamer re-plumb.
+- Acceptance test for whoever does it, unchanged and the only admissible one: `LZX-FRAME` successes past `frameIdx=10` with `cumprod` climbing, and `UIXSF-GOLDEN-REVERIFY pkg=64980000 still_present` past 63,072 **with `kUiXsfFillDryRun=true`**. Everything above the frame decoder reports `ret=00000000` regardless (F-331 §6).
+- Revert verified the strong way: `w321` 58,002 lines / `INFLATE-ENTER` 4,901 / `REVERIFY` 12 / `still_present=63072` / `LISTLINE` 171 / `C0000005` 0, and the exe returned to **57,206,784 bytes, identical to the `w317`/`w319` binaries**, so the branch compiles fully out.
+- Objective: (a) 3/4 byte-exact + garage 5.9 %, (b) `nGfx`=0. **Goal NOT complete.** The two doors left are task #15 (large, ours) and `rule-2`/`F-055` (the user's).
+
 ## 2026-09-26 ~08:1x (F-338, **BUILT + SOAKED `w318` + REVERTED + RE-VERIFIED `w319`**) — **the disjoint-allocation retry ran and F-337 §4 was wrong: aliasing was not the cause. The context slot is per-JOB.** Ledger through **F-338**; next ID **F-339**.
 
 - `ctx=CAF5D300` from `raw=CAF28300..CAF92300`, serve windows in the same boot at  `C8A0xxxx` — provably disjoint — and the boot still stopped progressing 6 ms after the republish (27,810 lines vs 58,270, `INFLATE-ENTER` 32 vs 4,901, one reverify line, no fault). So F-337's “prime suspect” is refuted by the check built for it.
