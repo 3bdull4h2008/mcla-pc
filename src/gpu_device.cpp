@@ -8019,6 +8019,8 @@ static constexpr bool kUiXsfHunt = true;
 // Accumulated across jobs (deduped, capped) because F-322 asks "in ANY slot",
 // not "in this job's slots".
 struct MclaUiXsfSlot {
+  uint32_t job;   // which readlist announced it (PSTREAM #n)
+  uint32_t seq;   // its index inside that readlist
   uint32_t vbase;
   uint32_t pbase;
   uint32_t size;
@@ -8026,7 +8028,18 @@ struct MclaUiXsfSlot {
 static std::mutex g_uiXsfSlotsMtx;
 static std::vector<MclaUiXsfSlot> g_uiXsfSlots;
 
-static void MclaUiXsfNoteSlot(uint32_t vbase, uint32_t pbase, uint32_t size) {
+// F-324: what the fill CLAIMED, in (dest, golden-range) terms, so a later pass
+// can prove the bytes are STILL there instead of trusting the write call's
+// return. `gold_span` only ever reported what we asked to be written; the guest
+// inflates into the same slots, so presence has to be re-read.
+struct MclaUiXsfFillRec {
+  uint32_t pkg, pbase, off, len;
+};
+static std::mutex g_uiXsfFillLogMtx;
+static std::vector<MclaUiXsfFillRec> g_uiXsfFillLog;
+
+static void MclaUiXsfNoteSlot(uint32_t job, uint32_t seq, uint32_t vbase,
+                              uint32_t pbase, uint32_t size) {
   if (pbase < 0xB0000000u || pbase >= 0xC0000000u || size < 64)
     return;
   std::lock_guard<std::mutex> lk(g_uiXsfSlotsMtx);
@@ -8035,7 +8048,7 @@ static void MclaUiXsfNoteSlot(uint32_t vbase, uint32_t pbase, uint32_t size) {
   for (const auto &e : g_uiXsfSlots)
     if (e.pbase == pbase)
       return;
-  g_uiXsfSlots.push_back({vbase, pbase, size});
+  g_uiXsfSlots.push_back({job, seq, vbase, pbase, size});
 }
 
 // `anchor` is the dest the caller just got a byte-exact (or at least named)
@@ -8049,6 +8062,8 @@ static void MclaUiXsfNoteSlot(uint32_t vbase, uint32_t pbase, uint32_t size) {
 static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                                 const std::vector<MclaUiXsfSlot> &slots,
                                 uint32_t shot);
+static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
+                              uint32_t shot);
 
 static void MclaUiXsfGoldenHunt(uint32_t pkg, uint32_t shot, uint32_t anchor) {
   const std::vector<uint8_t> &gold = MclaUiXsfGolden(pkg);
@@ -8075,6 +8090,7 @@ static void MclaUiXsfGoldenHunt(uint32_t pkg, uint32_t shot, uint32_t anchor) {
   // (w290 filled 819,200 bytes and still printed 0, because the scan had already
   // run). Each package is filled at most once per shot, so this cannot loop.
   MclaUiXsfGoldenFill(pkg, gold, slots, shot);
+  MclaUiXsfReverify(pkg, gold, shot);
   uint32_t hits = 0, scanned = 0, skip_range = 0, skip_poison = 0,
            skip_read = 0;
   std::vector<std::pair<uint32_t, uint32_t>> runs;
@@ -8211,6 +8227,10 @@ static bool MclaSlotUntouched(uint32_t pbase, uint32_t size) {
   return seen > 0;
 }
 
+// F-324: list-order placement (see the comment at the plan builder). OFF == the
+// F-323 span behaviour byte-for-byte.
+static constexpr bool kUiXsfFillListOrder = true;
+
 static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                                 const std::vector<MclaUiXsfSlot> &slots,
                                 uint32_t shot) {
@@ -8252,16 +8272,52 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                   pkg, shot, v0);
     return;
   }
+  // Two placement hypotheses. `span` (F-323, shipped) maps a slot by its
+  // distance from the anchor's vbase — which dead-ended the garage at golden
+  // offset 0xC8000 in w293/w294, because a job's virtual ranges are
+  // DISCONTINUOUS (readlist #2: vbase 50000000..500C8000 then 60000000.., so the
+  // span test excludes the second block). `list` treats the readlist as what it
+  // is for a stream bigger than one slot: an ORDERED list of destinations, so
+  // container bytes continue into the next `seq` regardless of vbase. Both agree
+  // on the first four slots; they differ exactly in the region that is missing.
+  const bool listOrder = kUiXsfFillListOrder;
+  std::vector<std::pair<size_t, uint32_t>> plan;  // (slot index, golden offset)
+  if (listOrder) {
+    std::vector<size_t> ord;
+    for (size_t i = 0; i < slots.size(); ++i)
+      if (slots[i].job == slots[ai].job && slots[i].seq >= slots[ai].seq)
+        ord.push_back(i);
+    std::sort(ord.begin(), ord.end(), [&](size_t a2, size_t b2) {
+      return slots[a2].seq < slots[b2].seq;
+    });
+    uint32_t run = 0;
+    for (size_t idx : ord) {
+      if (run >= gold.size())
+        break;
+      plan.push_back({idx, run});
+      uint32_t take = slots[idx].size;
+      if (take > gold.size() - run)
+        take = static_cast<uint32_t>(gold.size() - run);
+      run += take;
+    }
+  } else {
+    for (size_t i = 0; i < slots.size(); ++i) {
+      const MclaUiXsfSlot &S = slots[i];
+      if (S.vbase < v0 || S.vbase >= v0 + static_cast<uint32_t>(gold.size()))
+        continue;
+      const uint32_t off = S.vbase - v0;
+      if (off >= gold.size())
+        continue;
+      plan.push_back({i, off});
+    }
+  }
   uint32_t slotsWritten = 0, bytesWritten = 0, skipped = 0;
   uint32_t covLo = 0xFFFFFFFFu, covHi = 0;
-  for (size_t i = 0; i < slots.size(); ++i) {
+  for (const auto &pr : plan) {
+    const size_t i = pr.first;
     const MclaUiXsfSlot &S = slots[i];
     const bool isAnchor = (static_cast<int>(i) == ai);
-    if (S.vbase < v0 || S.vbase >= v0 + static_cast<uint32_t>(gold.size()))
-      continue;
-    const uint32_t off = S.vbase - v0;
-    if (off >= gold.size())
-      continue;
+    const uint32_t off = pr.second;
     if (!isAnchor && !MclaSlotUntouched(S.pbase, S.size)) {
       // The protection that keeps the three verified containers untouched, made
       // visible: w290 placed 819,200 of 1,066,057 bytes and the remaining
@@ -8276,6 +8332,7 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
     if (cmp > gold.size() - off)
       cmp = static_cast<uint32_t>(gold.size() - off);
     std::vector<uint8_t> buf(0x4000);
+    uint32_t wrote = 0;
     for (uint32_t done = 0; done < cmp; done += buf.size()) {
       const uint32_t want = cmp - done < buf.size() ? cmp - done
                                                    : static_cast<uint32_t>(
@@ -8283,7 +8340,12 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
       std::memcpy(buf.data(), gold.data() + off + done, want);
       if (!mem.WriteBytes(S.pbase + done, buf.data(), want))
         break;
+      wrote += want;
       bytesWritten += want;
+    }
+    if (wrote) {
+      std::lock_guard<std::mutex> llk(g_uiXsfFillLogMtx);
+      g_uiXsfFillLog.push_back({pkg, S.pbase, off, wrote});
     }
     if (off < covLo)
       covLo = off;
@@ -8300,6 +8362,71 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                 pkg, shot, static_cast<uint32_t>(gold.size()),
                 slots[ai].pbase, slotsWritten, bytesWritten, skipped,
                 covLo == 0xFFFFFFFFu ? 0u : covLo, covHi);
+}
+
+// F-324: how many claimed container bytes are STILL in guest memory right now.
+// The fill's `bytes_written`/`gold_span` only report what we asked to be stored;
+// the guest inflates into the same slots afterwards, so "decompressed in guest
+// memory" has to be answered by reading the slots back. Per claim we mark the
+// golden range it covers, then count bytes that actually match — so overlapping
+// claims cannot inflate the number, and a later guest write that disagrees shows
+// up as a drop on the next shot.
+static constexpr bool kUiXsfReverify = true;
+
+static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
+                              uint32_t shot) {
+  if (!kUiXsfReverify || gold.size() < 0x10000u)
+    return;
+  std::vector<MclaUiXsfFillRec> recs;
+  {
+    std::lock_guard<std::mutex> llk(g_uiXsfFillLogMtx);
+    for (const auto &r : g_uiXsfFillLog)
+      if (r.pkg == pkg && r.off < gold.size() &&
+          r.len <= gold.size() - r.off)
+        recs.push_back(r);
+  }
+  if (recs.empty())
+    return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  std::vector<uint8_t> claimed(static_cast<size_t>(gold.size()), 0);
+  std::vector<uint8_t> present(static_cast<size_t>(gold.size()), 0);
+  std::vector<uint8_t> buf(0x4000);
+  uint32_t recsOk = 0, firstBadOff = 0xFFFFFFFFu;
+  for (const auto &r : recs) {
+    uint32_t good = 0;
+    for (uint32_t done = 0; done < r.len; done += buf.size()) {
+      const uint32_t want =
+          r.len - done < buf.size() ? r.len - done
+                                    : static_cast<uint32_t>(buf.size());
+      if (!mem.ReadBytes(r.pbase + done, buf.data(), want))
+        break;
+      for (uint32_t i = 0; i < want; ++i) {
+        claimed[r.off + done + i] = 1;
+        if (buf[i] == gold[r.off + done + i]) {
+          present[r.off + done + i] = 1;
+          ++good;
+        } else if (firstBadOff == 0xFFFFFFFFu) {
+          firstBadOff = r.off + done + i;
+        }
+      }
+    }
+    if (good == r.len)
+      ++recsOk;
+  }
+  uint32_t nClaimed = 0, nPresent = 0;
+  for (size_t i = 0; i < gold.size(); ++i) {
+    if (claimed[i]) {
+      ++nClaimed;
+      if (present[i])
+        ++nPresent;
+    }
+  }
+  MCLA_LOG_WARN("UIXSF-GOLDEN-REVERIFY pkg={:08X} shot={} recs={} recs_whole={}"
+                " goldsize={} claimed={} still_present={} pct={} "
+                "first_bad={:08X}",
+                pkg, shot, static_cast<uint32_t>(recs.size()), recsOk,
+                static_cast<uint32_t>(gold.size()), nClaimed, nPresent,
+                nClaimed ? (nPresent * 100u) / nClaimed : 0u, firstBadOff);
 }
 
 static void MclaUiXsfVerifySlot(uint32_t dest, uint32_t slotsize) {
@@ -10407,7 +10534,8 @@ PPC_FUNC(sub_821BC140) {
         (void)mem.ReadU32BE(sAddr + 0, &vbase);
         (void)mem.ReadU32BE(sAddr + 4, &pbase);
         (void)mem.ReadU32BE(sAddr + 8, &size);
-        MclaUiXsfNoteSlot(vbase, pbase, size);  // F-322 inventory for the hunt
+        MclaUiXsfNoteSlot(n, si, vbase, pbase,
+                          size);  // F-322 inventory for the hunt
         MCLA_LOG_WARN("PSTREAM #{} s[{}] @{:08X} vbase={:08X} pbase={:08X} "
                       "size={:08X}",
                       n, si, sAddr, vbase, pbase, size);
