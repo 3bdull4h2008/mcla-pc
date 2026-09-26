@@ -224,6 +224,8 @@ F-333 §3: the LZX decode is one continuous bit stream, so moving `src` under th
 wrong in both directions, and the surviving Path B design is to extend the buffer the guest is
 already pointing at (`UI_INFLATE_PLAN.md` §5 step 1).
 
+**F-341 A/B on `kUiXsfChunkFeed` (ON, `src/gpu_device.cpp:589`): turning the UI refill off reproduced `w322`'s fingerprint (`UIXSF-LOCATE` 0, `PEND` 2) and left durable coverage identical - garage 63,072, raceeditor 143,069/143,069 - so this serve is INERT with respect to the deliverable and the default stays ON for want of a positive reason to move it (two 120 s soaks under-sample retirement behaviour, F-315/F-325).**
+
 `kUiXsfLocate` (**ON**, `src/gpu_device.cpp:642`) is log-only: it locates the stream's
 current input buffer inside its own package image and prints whether our bookkeeping
 agrees. It exists because F-333 could not say whether the data was missing or our

@@ -586,6 +586,11 @@ static constexpr bool kUiServeAdvance = false;
 // mid-stream: refill every empty retry while walk < PackageSizeAt, and give it the
 // 400-retry budget. OFF == exact baseline. Census marker: INFLATE-HOSTSERVE-PEND
 // serve=N per dest (no new literal).
+// F-341 tested OFF and it is back to ON: with the refill disabled the garage is still
+// 63,072 (w326_1/_2, LOCATE 0 / PEND 2 confirming the mode) and raceeditor stays
+// 143,069/143,069, so the interference lead is refuted and there is no POSITIVE reason
+// to move a shipped default on two 120 s soaks -- what the experiment established is
+// that this serve is inert with respect to the deliverable, which is itself the result.
 static constexpr bool kUiXsfChunkFeed = true;
 
 // F-329: also construct the descriptor field the guest actually clamps on.

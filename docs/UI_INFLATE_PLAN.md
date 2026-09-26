@@ -11,7 +11,7 @@ from an earlier summary.
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| (a) UI `.xsf` containers decompressed **in guest memory** | **3 of 4 at 100 %, garage 5.9 % by the guest / 64.9 % with host placement** | `w285`/`w295`: raceeditor `compared=143069 mismatch=0`, policecam `19337/0` ×2, credits `29655/0`; `w297`: garage `still_present=63072 pct=5`, `w296`: `pct=64` |
+| (a) UI `.xsf` containers decompressed **in guest memory** | **3 of 4 at 100 %, garage 5.9 % by the guest (63,072, now measured stable across 11 of 12 boots; one 121,946 outlier) / 64.9 % with host placement** | `w285`/`w295`: raceeditor `compared=143069 mismatch=0`, policecam `19337/0` ×2, credits `29655/0`; `w297`: garage `still_present=63072 pct=5`, `w296`: `pct=64` |
 | (b) **…so GFx can initialize** | **NOT achieved**, and NOT downstream of (a) | `MOVIE-CTOR` = 0 and `UILOAD-census` = 0 in every soak `w273`→`w308`, including the one where all four containers were placed (`w295`) |
 | Evaluate Path A (host LZX) | done, §2 | F-295…F-333 |
 | Evaluate Path B (guest descriptor construction) | done, §3 — mechanism identified (F-332 §4); eight variants closed by measurement; cause is structural: `obj` and `st` are per-job (F-339) | F-318…F-335 |
@@ -89,6 +89,7 @@ mechanism that a soak killed.
 | latch clear + frame-aligned serving | clear `[ctx+20+12276]`/`[+12280]` (the driver's saved cursor and its **byte offset inside the current frame**) when installing a frame-sized window - `kUiXsfClearResume` + `kUiXsfFrameServe` | un-stuck (the garage's real frames 9572/5206/3344/4072 B at offsets 0/0x2564/0x39BA/0x46CA) and coverage got **worse**: 63,072 -> 43,732, ~89,000 failed frames | `w307`, reverted in `w308` (F-333) |
 | append-only window | one window per stream sized for the whole container, filled forward, `st+4` written once | the window opened and appended correctly; on the next call `st+4` was back at `st + 0x20` - the record is re-armed every call, so buffer layout cannot carry continuity | `w311`, reverted in `w312` (F-335) |
 | private codec context per stream (three forms) | replay the guest's own Open (`sub_82461378(0x8EFFF990, 1, block, 0x3492E)`, `r7` unread) and republish `*obj`; disjoint allocation; then a publish/restore pair keyed on `st` | all three took the job's healthy streams down: **`obj` (`0x8283D1B0`) and `st` (`0x6D8F20`) are BOTH per-job records**, so per-stream identity does not exist at this layer - F-339's publish count 0 / restore count 0 is the direct proof | `w316`/`w318`/`w320`, reverted in `w317`/`w319`/`w321` (F-337/338/339) |
+| **the serve itself** | turn the whole UI refill off (`kUiXsfChunkFeed=false`), which reproduces `w322`'s fingerprint deliberately (`UIXSF-LOCATE` 0, `PEND` 2) instead of waiting for another outlier boot | durable coverage **identical** - garage 63,072, raceeditor 143,069/143,069 - so the serve feeds nothing that reaches the outcome, and F-320/F-329's `consumed` gains were bookkeeping | `w325`/`w326` A/B, default restored in `w327` (F-341) |
 
 **The wall, localised by measurement (F-330, then re-read by F-331/F-332/F-333).** At container offset `0x8000` the
 guest's 32 bytes appear **nowhere** in the golden within ±4 KiB
