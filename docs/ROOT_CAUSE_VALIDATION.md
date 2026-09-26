@@ -9633,3 +9633,18 @@ cost one log line per refusal and are what killed this theory. Next ID **F-411**
 **2. The sibling reader is healthy.** `0x82860C18` returns real delimiter bytes in sequence, so the mechanism, this hook, and the guest's stream layer all work — which doubles as the probe's positive control and rules out "the refill is broken for everyone".
 
 **3. Structural state unchanged; probe kept.** `w450` vs `w447`: `LISTLINE` 171=171, `C0000005` 0=0, `BC140-REC` 7=7, `F432-GROW-SKIP` 3=3, `F442-SECTION` 14=14. Next question, narrowed to one call: what makes the stream behind `0x82860C68` report length 0 — `sub_821BE250`'s own object fields (`[obj+12]` inner, `+24` pos, `+28` len) at the moment of the −1, and which handle that object holds. Next ID **F-448**.
+
+
+### F-448 (2026-09-27 02:4x, **2 builds, soak `w451`**) — **THE −1s ARE NOT "EMPTY STREAM": the starved tokenizer reader `0x82860C68` reports `obj[+24/+28] = 3170/3170` (equal, i.e. at-end *if* those fields are position/length), while the healthy reader `0x82860C18` that does return bytes reports `0/0`. That pairing means my field reading is NOT established — 0/0 cannot mean "starved" for an object that yields bytes — so this entry records the measurement and explicitly does not interpret it.**
+
+- Task:        T41.97 (#64), first step
+- Type:        FACT + a withheld inference
+- Class:       H (instrument/field meaning unresolved) over E
+- Priority:    P1
+- Evidence:    `build/w451.log` · extended `F447-REFILL` print, `src/gpu_device.cpp:17460-17483` (now also `obj[+24]/obj[+28]`, `[obj+12]` and its `+24/+28`) · `ppc_recomp.14.cpp:24080-24118` (`sub_821BE250` tests `[r31+28]` then `[r31+24]` — that `r31` is *its* argument, which is the object we see as `obj` here only if the caller passes the same one)
+
+**1. What was printed.** `#1-#3 obj=82860C18 got=3|255|3 ... obj[+24/+28]=0/0 inner=00000000` (the working reader: no inner object, both fields zero, and it still returns bytes). `#193 obj=82860C40 got=-1 obj[+24/+28]=0/0 inner=00000000 lr=821CFDB8` (the early tokenizer). `#195-#197 obj=82860C68 got=-1 obj[+24/+28]=3170/3170 inner=00000000` from `lr=8218C1DC / 8218C23C / 8218C2B0` (the later tokenizer, the same lrs as the working C18 rows). `inner` is 0 in every row, so `[obj+12]` is not the inner-buffer path for these objects at all.
+
+**2. Why the obvious reading is refused.** Equality of the two fields suggests "position reached length", but the working reader shows the same fields at `0/0` — also equal — and it returns bytes. So equality per se is not the discriminator, and no field in this print has a verified meaning. F-447's phrase "the stream has zero length" is therefore **withdrawn as an interpretation**; what stands is only the counting (684 refills returned −1 while a sibling reader of the same static block kept returning bytes) and the `3170/3170` vs `0/0` contrast.
+
+**3. What would settle it, without guessing again.** The fields must be named by the code that writes them, not inferred from a hook: find the writers of `[obj+24]`/`[obj+28]` for objects whose vptr is this family (a `lis`/`addi`-relative `stw r?,24(r?)`/`28(r?)` inside the routines reached from `sub_821BE250`'s callees), and only then re-measure. That is a static read of the stream class, then one soak — not a third round of field guessing. Next ID **F-449**.

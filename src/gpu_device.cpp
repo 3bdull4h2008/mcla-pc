@@ -17620,10 +17620,25 @@ PPC_FUNC(sub_821BE4F0) {
   const int32_t got = static_cast<int32_t>(ctx.r3.s32);
   if (got == -1)
     (void)s_447eof.fetch_add(1);
-  if (k <= 64 || (k % 512) == 0)
-    MCLA_LOG_WARN("F447-REFILL #{} obj={:08X} got={:d} byte={:02X} eof={} lr={:08X} tid={}", k, obj,
-                  got, static_cast<unsigned>(ctx.r3.u32 & 0xFFu), s_447eof.load(), lr,
-                  GetCurrentThreadId());
+  // F-448: `sub_821BE250(stream, dst, count)` begins `r11=[stream+28]; if (r11) ...` then
+  // `r11=[stream+24]; if (r11) ...` (ppc_recomp.14.cpp:24080-24118), so a stream with BOTH +28
+  // (length) and +24 zero cannot yield a byte at all -- which is what F-447's -1s mean. Print the
+  // fields for the object at the refill AND for its inner stream, so the healthy sibling (0x82860C18)
+  // and the starved tokenizer readers (0x82860C40/0x82860C68) can be told apart in one soak.
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t o24 = 0, o28 = 0, inr = 0, i24 = 0, i28 = 0;
+  (void)mem.ReadU32BE(obj + 24, &o24);
+  (void)mem.ReadU32BE(obj + 28, &o28);
+  (void)mem.ReadU32BE(obj + 12, &inr);
+  if (inr != 0u && inr != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(inr + 24, &i24);
+    (void)mem.ReadU32BE(inr + 28, &i28);
+  }
+  if (k <= 64 || (k % 512) == 0 || got == -1)
+    MCLA_LOG_WARN("F447-REFILL #{} obj={:08X} got={:d} byte={:02X} eof={} obj[+24/+28]={}/{} "
+                  "inner={:08X} inner[+24/+28]={}/{} lr={:08X} tid={}",
+                  k, obj, got, static_cast<unsigned>(ctx.r3.u32 & 0xFFu), s_447eof.load(), o24, o28,
+                  inr, i24, i28, lr, GetCurrentThreadId());
 }
 
 // F-438: count GFx loader CONSTRUCTIONS, because the presence scan has never been able to do it
