@@ -10,6 +10,27 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~10:4x (ledger through F-349; next ID F-350).** UI inflate
+> enqueue: **source availability is closed as the garage's cause, and Path B is down to
+> one untried shape.** `LZX-FRAME` now prints the decoder's own walk state, and because
+> `sub_82461530` sets `srcEnd = src + available + 4` (`ppc_recomp.82.cpp:14906`,
+> `:14918-14920`), `srcEnd - srcp - 4` reads directly as **bytes presented to that
+> frame**: all ten successes end with the source drained to the last 2 bytes,
+> `savedcur` is pinned at `stagbase+0x8000` in every frame, and frame 10 is presented
+> **zero** bytes with its cursor already on the staging end (`w338`). F-349 tested the
+> obvious remedy by handing one inflate call the whole 1,098,825-byte container - it
+> demonstrably landed (`got=1098825 whole=1`) and frame 10 failed **identically**, while
+> `INFLATE-ENTER` ran 106,697 times vs 4,901 and the garage reverify never printed;
+> reverted and per-marker verified in `w340`. So the three content-side causes are each
+> excluded by measurement now - bytes (F-346 `match=1`), recognition (F-347 the preamble
+> check fires), supply (F-349) - leaving decoder-internal walk state (F-345's candidate
+> (ii)) as the standing conclusion. Task #15: its arming-order shape is now **predicted
+> null by F-344** (holding one container at a time moved every frontier number by 0);
+> only the per-descriptor (record, context) construction inside `sub_821BC140`'s walk
+> remains untried, and that is a new build class. Reading cautions this block adds:
+> `LZX-FRAME` line counts are throughput not progress, and `grep whole=1` also matches
+> `recs_whole=1`. **Goal (a) 3/4 + garage 5.9 %, (b) `nGfx`=0 - NOT complete.**
+
 > **§0 state, 2026-09-26 ~10:2x (ledger through F-347; next ID F-348).** UI inflate
 > enqueue: **Path B's serve content is now excluded, and so is head recognition.**
 > New log-only comparator `UIXSF-GUESTCOPY` (`src/gpu_device.cpp:517`) proves every

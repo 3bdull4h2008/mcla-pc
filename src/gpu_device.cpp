@@ -458,19 +458,39 @@ static constexpr bool kUiXsfCompareGuestCopy = true;
 // serve a UI .xsf stream's first window from its XCompress sub-header
 // (pkg+0x0C) instead of the container head (pkg+0), and reset the shared
 // record's `consumed` so that check actually runs.
-// MEASURED (w336) AND REVERTED — the mechanism is real and insufficient. It did
-// what it was built to do: `XMEM-SRCHEAD #5` shows the guest taking its own 8-byte
-// preamble skip on our buffer for the first time in the project (`src CAF28300 ->
-// CAF28308`, `srcSz 32768 -> 32760`), so "the guest never recognizes our head" is
-// now closed as a cause. It moved the deliverable not at all: `UIXSF-GOLDEN-REVERIFY
-// pkg=64980000 still_present=63072 first_bad=00008000`, identical to `w335` on the
-// same binary, and every structural marker +0. That residual is the continuous-bit
-// stream problem F-333/F-343 already measured (a window may not be moved under the
-// driver unless its resume offset and saved cursor agree), so the pair
-// kUiXsfStreamHeadServe+kUiXsfFrameServe is predicted-worse and was not re-run.
-// Kept in-tree, OFF, because the reasoning is the cheapest known route to the one
-// datum that closed a cause. `false` == the F-346 serve framing byte-for-byte.
+// MEASURED (w336): the mechanism is real — `XMEM-SRCHEAD #5` shows the guest
+// taking its own 8-byte preamble skip on our buffer for the first time in the
+// project (`src CAF28300 -> CAF28308`, `srcSz 32768 -> 32760`) — but on its own
+// it moved nothing (`still_present=63072`, `first_bad=00008000`, every marker
+// +0), because recognition is not what the ten-frame ceiling turns on.
+// RE-ENABLED briefly by F-349 as the precondition of the whole-stream window,
+// which is itself refuted (see below), so this is OFF again: it is a measured
+// null on its own and the tree ships the F-346 framing. The pair
+// kUiXsfStreamHeadServe + kUiXsfFrameServe is still predicted-worse
+// (F-333/F-343 measured it twice) and is not being re-run.
+// `false` == the F-346 serve framing byte-for-byte.
 static constexpr bool kUiXsfStreamHeadServe = false;
+
+// F-349: hand the first inflate call the WHOLE stream instead of one 32 KiB
+// window. w338 seemed to pin why ten frames is the ceiling: at frame 10 — the
+// first failure — `srcEnd - srcp == 4`, and `sub_82461530` computes
+// `srcEnd = src + available + 4`
+// (`generated/ppc_xenon/ppc_recomp.82.cpp:14906`, `:14918-14920`), so
+// `available == 0`: the frame driver was handed an EMPTY source.
+// TESTED (w339) AND REFUTED BY ITS OWN SUCCESS. The whole container was
+// presented — `INFLATE-HOSTSERVE-PEND #32 got=1098825 headBE=0FF512EF …
+// whole=1` — and frame 10 died exactly as before: same `frameoff=5698`, same
+// cursor `4003C4D5` inside the context's own staging, same `srcEnd=4003C4EF`
+// (available 0), same frozen `cumprod=327680`, still 10 successes in the whole
+// boot. So the empty source is a SYMPTOM: by frame 10 the driver has already
+// abandoned the caller's buffer and is walking from `savedcur=4003AEA9`
+// (= `stagbase+0x8000`), which no amount of available input can influence.
+// Worse, presenting 1 MB made the caller re-enter forever: `INFLATE-ENTER`
+// 106,697 vs 4,901 and the garage's late reverify never ran at all — the
+// progress-starvation shape of F-315/F-325/F-344, not a crash (every tracked
+// marker +0, `C0000005` 0). `false` == the `w338` behaviour.
+static constexpr bool kUiXsfWholeStreamWindow = false;
+static constexpr uint32_t kUiXsfWholeCap = 0x200000u;  // 2 MB guest window
 
 // Path -> package name-match, factored out of the PATHB-PKGPEND site so the
 // comparator and the serve can never disagree. Package offsets are RPF content
@@ -9375,13 +9395,33 @@ PPC_FUNC(sub_82461B98) {
   // failure 25+ and every successful frame past n=16 — their totals are on the
   // tally line, so a missing per-frame line never means a zero count
   // (F-089 §6 / F-321 the same trap twice).
-  if (n <= 16 || tally || (n % 500u) == 0u)
+  if (n <= 16 || tally || (n % 500u) == 0u) {
+    // F-348: the staging block, read after the frame so it describes what the
+    // NEXT frame resumes from. `w334 XMEM-CTX #4` showed the last successful
+    // call draining `leftover` 16384->0 while `stagpos` filled 16384->32768, and
+    // the very next frame's cursor (`4003C4CB`) sits past the staging window
+    // (`stagbase=40032EA9`, `w12296=4003AEA9` = base+0x8000). If that pairing
+    // holds on every boot, the failure is source AVAILABILITY at the moment the
+    // decoder's 32 KiB staging drains — not content (F-346) and not
+    // recognition (F-347) — and the fix has a name: keep enough contiguous
+    // payload in front of the driver that staging never has to read past it.
+    const uint32_t stagBase = peekS(12264u), stagPosW = peekS(12268u);
+    const uint32_t stagLeft = peekS(12272u), savedCur = peekS(12276u);
+    const uint32_t frameOff = peekS(12280u), srcEnd = peekS(11016u);
+    const uint32_t srcp = peekS(11012u);
+    const bool inStaging = stagBase != 0u && srcp >= stagBase &&
+                           srcp < stagBase + 0x8000u;
     MCLA_LOG_WARN("LZX-FRAME #{} S={:08X} frameIdx={} want={} type={} "
                   "fsize={} state={} ret={} srcp={:08X} bitbuf={:08X} "
-                  "cumprod={} failtotal={}",
+                  "cumprod={} failtotal={} stag=[{:08X} pos={} left={}] "
+                  "savedcur={:08X} frameoff={} srcEnd={:08X} inStag={} "
+                  "pastEnd={}",
                   n, S, frameIdxPre, want, peekS(11984u), peekS(11980u),
-                  peekS(11988u), ret, peekS(11012u), peekS(11952u),
-                  peekS(11024u), s_h461B98fail.load());
+                  peekS(11988u), ret, srcp, peekS(11952u), peekS(11024u),
+                  s_h461B98fail.load(), stagBase, stagPosW, stagLeft, savedCur,
+                  frameOff, srcEnd, inStaging ? 1 : 0,
+                  srcEnd != 0u && srcp > srcEnd ? 1 : 0);
+  }
 }
 
 PPC_FUNC_IMPL(__imp__sub_821D5E10);
@@ -10612,6 +10652,10 @@ PPC_FUNC(sub_821D5E10) {
       if (hsThisRetry) {
         static std::mutex s_hsMtx;
         static uint32_t s_hsBuf = 0;
+        // F-349: a separate buffer for the whole-stream window, so a failed or
+        // disabled whole-stream serve cannot shrink what the legacy 0x8400 path
+        // hands to non-UI dests.
+        static uint32_t s_wsBuf = 0;
         std::lock_guard<std::mutex> hlk(s_hsMtx);
         // w18: per-dest package cursor. Job2 UI dests stay on 0xA0000; other
         // B7* dests each get an unused RSC5 package from the host table.
@@ -10818,13 +10862,28 @@ PPC_FUNC(sub_821D5E10) {
         if (kUiXsfAppendWindow && sPkg != 0u &&
             MclaUiXsfAppendServe(n, st, sPkg, walkPos, inPtr, inLeft))
           return;
+        // F-349: the whole-stream window, used only when this is a UI .xsf
+        // stream's first presentation. `s_wsBuf` is separate from `s_hsBuf` so a
+        // failed 2 MB allocation leaves the legacy 0x8400 path exactly as it was.
+        if (kUiXsfWholeStreamWindow && headServe && s_wsBuf == 0)
+          s_wsBuf = mem.Alloc(kUiXsfWholeCap, 16);
         if (s_hsBuf == 0)
           // F-327: 0x8400 so a full frame plus its header always fits.
           s_hsBuf = mem.Alloc(0x8400, 16);
-        if (s_hsBuf) {
+        const bool wholeWin =
+            kUiXsfWholeStreamWindow && headServe && s_wsBuf != 0u;
+        const uint32_t hsBuf = wholeWin ? s_wsBuf : s_hsBuf;
+        if (hsBuf) {
           auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
           mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
-          const uint32_t winLen = frLen ? frLen : 0x8000u;
+          uint32_t winLen = frLen ? frLen : 0x8000u;
+          if (wholeWin) {
+            // The container's own declared length plus one window, bounded by the
+            // allocation actually made. Reading past the member end returns a short
+            // `got`, which the existing advance (`readOff - baseOff + got`) handles.
+            const uint32_t need = MclaUiXsfWalkCeil(baseOff);
+            winLen = need < kUiXsfWholeCap ? need : kUiXsfWholeCap;
+          }
           std::vector<uint8_t> tmp(winLen);
           uint64_t got = 0;
           bool ok = vfs.OpenFile("xarchive_cache.rpf", fh);
@@ -10882,14 +10941,14 @@ PPC_FUNC(sub_821D5E10) {
             MCLA_LOG_WARN("INFLATE-HOSTSERVE-PEND #{} off={:08X} got={} "
                           "headBE={:08X} buf={:08X} outPtr={:08X} outLeft={} "
                           "(pkg={:08X} walk={:08X} pkgSz={:08X} serve={} "
-                          "frame={})",
-                          n, readOff, got, be, s_hsBuf, outPtr, outLeft,
+                          "frame={} whole={})",
+                          n, readOff, got, be, hsBuf, outPtr, outLeft,
                           baseOff, walkPos, pkgSz, serves + 1,
-                          frLen != 0u ? 1 : 0);
-            (void)mem.WriteBytes(s_hsBuf, tmp.data(),
+                          frLen != 0u ? 1 : 0, wholeWin ? 1 : 0);
+            (void)mem.WriteBytes(hsBuf, tmp.data(),
                                  static_cast<uint32_t>(got));
             (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got));
-            (void)mem.WriteU32BE(st + 4, s_hsBuf);
+            (void)mem.WriteU32BE(st + 4, hsBuf);
             // F-347: the preamble check only runs when this record reports a
             // fresh stream. `st` is the shared stack record 0x6D8F20, so it
             // arrives here carrying the PREVIOUS container's `consumed`
