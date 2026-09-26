@@ -133,6 +133,24 @@ def cmd_xref(img, words, starts):
                         break
             hi[rt] = None
             continue
+        if op == 24:                     # ori rT,rA,IMM  -- the dominant low-half form
+            # `lis rT,0,HI` + `ori rT,rT,LO` builds an address WITHOUT sign-extending
+            # the low half, so addi alone misses most materialisations: 72,344 of the
+            # 90,192 addis in mcla_pe.bin have rA==0 (`lis`), and the compiler pairs
+            # them with ori far more often than with addi. Added 2026-09-26 (F-359)
+            # after this blind spot made a table look unreferenced.
+            if hi[ra] is not None or ra == 0:
+                basev = 0 if ra == 0 else hi[ra]
+                val = (basev & 0xFFFF0000) | imm
+                if val == target:
+                    e = enclosing(starts, pc)
+                    print(f"  {pc:#010x} ori r{rt},r{ra},{imm:#x}  in " +
+                          (f"sub_{e[0]:08X} +{e[1]:#x}" if e and e[1] < 0x4000 else "non-code/data"))
+                    found += 1
+                    if found >= limit:
+                        break
+            hi[rt] = None
+            continue
         if op in (32, 33, 34, 35, 36, 37, 40, 41, 42, 43, 44, 45, 46, 47):
             # loads into GPR/FPR: destination is no longer a known immediate
             hi[rt] = None

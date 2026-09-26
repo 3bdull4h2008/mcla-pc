@@ -10,6 +10,31 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~14:0x (ledger through F-360; next ID F-361) — supersedes the
+> "0x40003B03 is a table tag / find the table's consumer" frontier of the two blocks below.**
+> **The UI-load callback is registered by live guest code.** `sub_82131508+0xec` forms
+> `0x82131008` with `lis`+`addi` and hands it to `sub_821C2FD8(&out, fn)`, then
+> `sub_82305690(r30, result, 0)` (`ppc_recomp.0.cpp:3616-3633`, caller `sub_82131790`), and
+> `F360-REGCB #1 tid=000055A4 lr=82131B5C` proves it executes each boot — while
+> `W35-BOOT-GATE` remains 0, so the break sits **between registration and dispatch**. New
+> queue item **T41.59** (replaces the closed-as-wrong T41.58): census `sub_821C2FD8` then
+> `sub_82305690`, and look for the object in the existing `PUSH sub_821BC868` rows
+> (`src/gpu_device.cpp:13395`, already prints `q= tag= cb=` + a 5-deep `chain[]`).
+> Acceptance: `W35-BOOT-GATE` > 0, then `nGfx`. Three method rules earned: (1) a
+> dword-equality pointer scan cannot see an address built by `lis`+`addi`, so "nothing
+> references X" requires the arithmetic instrument — F-359's headline was wrong for exactly
+> this reason; (2) my first branch decoder was broken (18-bit LI mask, missing `<<2`) — the
+> corrected one matches 270,559 branches and validates twice, and `tools/ppc_xrefs.py` was
+> right all along (its only gap, `lis`+`ori`, is now handled; no prior conclusion voided by
+> it); (3) **an entry-only hook census cannot prove a function failed to return**, because
+> this code family leaves via `JUMPOUT` tail jumps that skip post-call code — the missing
+> `F360-REGCB-POST` is not a hang, and the same tid is visible 2.5 s later in `PUSH`. Also
+> checked and dismissed as a blocker: `VdInitializeEngines: GPU context pointer not set at
+> 0x82839254` is count 1 in `w351`/`w358`/`w359`/`w360`. All three new hooks neutral against
+> `w351` (13 named markers `+0`, `[error]` 28). **(a) unchanged: 3/4 byte-exact + garage
+> 12.3 %/41.3 %, ceiling closed from both hook-reachable sides (F-356/F-357). (b) `nGfx`=0.
+> Goal NOT complete.**
+
 > **§0 state, 2026-09-26 ~13:3x (ledger through F-358; next ID F-359) — the deliverable-(b)
 > blocker is LOCATED, and two standing beliefs about it are false.** (1) **`0x40003B03` is not
 > a message to be posted**: exactly one dword in the image equals `0x82131008`, at

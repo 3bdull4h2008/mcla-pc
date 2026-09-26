@@ -17,6 +17,7 @@
 #include "guest_memory.h"
 #include "kernel/memory.h"
 #include "patches.h"
+#include <windows.h>  // F-360: GetCurrentThreadId(), to tie a hook entry to WAIT[..] rows
 
 #include <atomic>
 #include <vector>
@@ -1610,5 +1611,27 @@ PPC_FUNC(sub_82135150) {
     __imp__sub_82135150(ctx, base);
     if (n <= 8 || (n % 500) == 0)
         MCLA_LOG_WARN("F358-TITLE-INIT-POST #{} r3={:08X}", n, ctx.r3.u32);
+}
+
+// F-360: census on `sub_82131508`, found by the FIXED tools/ppc_xrefs.py to be the only
+// code in the image that materialises the address of the UI-load callback: at guest
+// 0x821315F4 it does `lis r11,-32237` (0x82130000) + `addi r4,r11,4104` (0x82131008) and
+// calls `sub_821C2FD8(&stack_out, 0x82131008)`, then feeds the result to
+// `sub_82305690(r30, result, 0)` (ppc_recomp.0.cpp:3616-3633, caller `sub_82131790`).
+// That is a live, compiled registration of the callback -- the thing the whole
+// F-186/F-187 thread said never happens -- so the first question is simply whether this
+// function executes. Cap prints the first 8: a count <=8 is complete.
+PPC_FUNC_IMPL(__imp__sub_82131508);
+static std::atomic<uint32_t> s_hRegCb{0};
+PPC_FUNC(sub_82131508) {
+    const uint32_t n = s_hRegCb.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F360-REGCB #{} tid={:08X} lr={:08X} r3={:08X} r13={:08X} r1={:08X}",
+                      n, GetCurrentThreadId(), static_cast<uint32_t>(ctx.lr),
+                      ctx.r3.u32, ctx.r13.u32, ctx.r1.u32);
+    __imp__sub_82131508(ctx, base);
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F360-REGCB-POST #{} tid={:08X} r3={:08X}", n,
+                      GetCurrentThreadId(), ctx.r3.u32);
 }
 
