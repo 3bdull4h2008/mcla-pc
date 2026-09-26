@@ -1839,6 +1839,13 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     mcla::native::RegisterGuestWatchRange(0xA0106000u, 0xA0107000u);
     mcla::native::RegisterGuestWatchRange(0xA0197E00u, 0xA0197F00u);
 
+    // F-440 (T41.92): watch the {handler, msgid} registry so PageWatchOnRead can answer whether any
+    // guest code ever reads it -- the question F-313 could only answer statically ("no walker
+    // materialises the base", which does not exclude a computed one). Read-side probe lives in
+    // gpu_cp.cpp as F440-REGREAD. Covers the IDA pair table at 0x82102aa0 and the two arrays beyond
+    // F-358's 0x82112160 limit that F-439 found holding the GFx ctor/wrapper entries.
+    mcla::native::RegisterGuestWatchRange(0x82102AA0u, 0x82118000u);
+
     // Session 76f: watch the "ui" preload-list global (0x827D7770, 32 bytes)
     // — the boot init reads it before anything fills it (BOOTPATH crash).
     mcla::native::RegisterGuestWatchRange(0x827D7770u, 0x827D7790u);

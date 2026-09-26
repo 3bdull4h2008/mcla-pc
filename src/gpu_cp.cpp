@@ -2178,6 +2178,25 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
 }
 
 void PageWatchOnRead(uint32_t guestAddr, uint32_t value) {
+  // F-440 (T41.92): the question this answers is whether ANY guest code ever reads the
+  // {handler, msgid} registry. `PPC_LOAD_U32` is `mcla::native::ReadGuestU32`
+  // (src/ppc_context.h:57 -> src/guest_memory.h:84), so every recompiled guest load really does pass
+  // through this accessor -- which is what makes a read-watch a valid instrument here at all, and it
+  // is why the registry probe gets its own counter instead of sharing the 8-row global cap below.
+  // Range = 0x82102AA0..0x82118000: the pair table IDA read at 0x82102aa0 (gate 0x82131008 ->
+  // msgid 0x40003B03) plus the two arrays F-439 found beyond F-358's census limit -- 0x82115F60
+  // (GFx wrapper 0x82482F78 -> 0x40001405) and 0x82117820 (GFx ctor 0x824C6F08 -> 0x40001905).
+  if (guestAddr >= 0x82102AA0u && guestAddr < 0x82118000u) {
+    static std::atomic<uint32_t> s_regReads{0};
+    const uint32_t rn = s_regReads.fetch_add(1) + 1;
+    if (rn <= 24 || (rn % 500) == 0) {
+      uint32_t lr = 0;
+      if (const PPCContext *c = GetPPCContext())
+        lr = static_cast<uint32_t>(c->lr);
+      MCLA_LOG_WARN("F440-REGREAD #{:06} @ {:08X} -> {:08X} lr={:08X}", rn, guestAddr, value, lr);
+    }
+    return;
+  }
   static std::atomic<uint32_t> s_watchReads{0};
   const uint32_t n = s_watchReads.fetch_add(1) + 1;
   if (n <= 8) {
