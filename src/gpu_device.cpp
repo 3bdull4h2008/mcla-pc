@@ -505,6 +505,22 @@ static constexpr uint32_t kUiXsfWholeCap = 0x200000u;  // 2 MB guest window
 // guest memory back, not by echoing the write.
 static constexpr bool kUiXsfChunkedHostFill = true;
 
+// F-356: advance the inflate record the way the guest's own post-call code does
+// instead of declaring the destination finished. See the use site for the
+// instruction-by-instruction basis (`ppc_recomp.18.cpp:10960-10995`) and for the
+// revert condition; F-354 measured the two-destination ceiling this was aimed at.
+// TESTED (w350) AND REVERTED — it does not add a destination. The chain census still
+// printed exactly two (`n=1 B7A41000`, `n=2 B7AC1000`), while inflate effort tripled:
+// `INFLATE 41,246 vs 17,784`, `READWRAP 27,340 vs 12,020`, `INFLATE-ENTER 13,653 vs
+// 6,016`, `INFLATE-SKIP 283 vs 127` (F-344's rule: read a quality gain beside
+// throughput — the durability did improve, `still_present 458,752 pct=100` vs
+// 440,720/96, but for 47,388 more log lines and a 2.3x inflate rate that is the
+// same shape F-349 showed becoming a livelock). Verdict that matters for task #15:
+// **how we mark the record is not what bounds the chain** — the destination list is
+// fixed upstream by the load request, so record-marking variants should not be
+// explored further.
+static constexpr bool kUiXsfChunkFaithfulAdvance = false;
+
 // Path -> package name-match, factored out of the PATHB-PKGPEND site so the
 // comparator and the serve can never disagree. Package offsets are RPF content
 // facts (verified stable in w231/w245/w249); user directive #5's ban on
@@ -10082,8 +10098,30 @@ PPC_FUNC(sub_821D5E10) {
                           static_cast<uint32_t>(body.size()), outLeft,
                           static_cast<uint32_t>(s_bodyClaims[uiPkg].size()),
                           exact, off >= body.size() ? 1 : 0);
-            (void)mem.WriteU32BE(st + 0, 0);
-            (void)mem.WriteU32BE(st + 16, 0);  // this dest is full: advance
+            // F-356: `sub_821D5E10` advances the record itself after every call
+            // (`generated/ppc_xenon/ppc_recomp.18.cpp:10960-10995`):
+            // `st+20 outPtr += written`, `st+16 outLeft -= written`,
+            // `st+24 produced += written`, `st+0 inLeft -= consumed`,
+            // `st+4 inPtr += consumed`. F-350 instead wrote `outLeft = 0`, which is
+            // the guest's own signal that the destination is FINISHED — so the
+            // caller stops asking and the chain dies at two requests (F-354). Mimic
+            // the real advance so the record stays self-consistent and the caller
+            // keeps going. If the neighbouring slot belongs to another container the
+            // `match=true` checks on raceeditor/policecam/credits will show it, and
+            // this reverts. `false` == F-350's completion marking exactly.
+            if (kUiXsfChunkFaithfulAdvance) {
+              uint32_t oLeft = 0, oPtr = 0, prod = 0;
+              (void)mem.ReadU32BE(st + 16, &oLeft);
+              (void)mem.ReadU32BE(st + 20, &oPtr);
+              (void)mem.ReadU32BE(st + 24, &prod);
+              (void)mem.WriteU32BE(st + 16, oLeft > took ? oLeft - took : 0u);
+              (void)mem.WriteU32BE(st + 20, oPtr + took);
+              (void)mem.WriteU32BE(st + 24, prod + took);
+              (void)mem.WriteU32BE(st + 0, 0);  // input consumed: caller refills
+            } else {
+              (void)mem.WriteU32BE(st + 0, 0);
+              (void)mem.WriteU32BE(st + 16, 0);  // this dest is full: advance
+            }
             return;
           }
         }

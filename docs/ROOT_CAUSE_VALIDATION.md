@@ -8100,3 +8100,20 @@ The second garage shape is `XMEM-SZPTR #14,#16,#18,#20,#22,#24`: `*srcSz(in)=20`
 
 **5. Objective state unchanged** (F-354 §5). Goal remains OPEN. Next ID F-356.
 
+### F-356 (2026-09-26 ~12:2x-12:3x, **BUILT + SOAKED `w350` + REVERTED + RE-VERIFIED `w351`**) — **what bounds the destination chain is NOT how we mark the inflate record: advancing `outLeft/outPtr/produced` faithfully instead of declaring the destination finished adds no destination and triples inflate effort for +18 KB of durability.**
+
+- Task:        UI inflate enqueue (F-186 objective), deliverable (a) — the last cheap hypothesis about F-354's ceiling.
+- Type:        FIX (measured, reverted)
+- Class:       C
+- Priority:    P2
+- Evidence:    `build/w350.log` `PATHB-HOSTDECODE-CHAIN pkg=64980000 n=1 … n=2`, still two, with `UIXSF-GOLDEN-REVERIFY pkg=64980000 … claimed=458752 still_present=458752 pct=100 recs_whole=5 first_bad=FFFFFFFF`; `soak_census --json w350 w346` → `INFLATE 41,246 vs 17,784 (+23,462)`, `READWRAP +15,320`, `INFLATE-ENTER +7,637`, `INFLATE-SKIP +156`, all core/fault markers `+0` (`C0000005` 0, `Fatal error` 1, `FATAL-SOFT` 1, `LISTLINE` 171, `GFx` 13, `REBASE-POISON` 37, `VEH` 36, `DISCCHK` 42, `TASKJOIN` 14, `W34-GFX-CENSUS` 6). Revert `build/w351.log`: `still_present=440720 pct=96`, chain `n=2`, and `INFLATE` absent from the delta list, i.e. the tripling is gone; remaining 9 deltas are the timing set (`PUT=`/`WAIT`/`WAKE`/`rptrWB` +278..+280, inside the ±280 same-binary band of F-353 §6) plus the `CHAIN` marker itself, which `w346`'s binary predates. Code: `src/gpu_device.cpp` `kUiXsfChunkFaithfulAdvance` (**false**), the advance arithmetic mirroring `ppc_recomp.18.cpp:10960-10995`.
+
+**1. The reading that motivated it.** `sub_821D5E10`'s post-call block advances the record itself: `st+20 outPtr += written`, `st+16 outLeft −= written`, `st+24 produced += written`, `st+0 inLeft −= consumed`, `st+4 inPtr += consumed`. F-350 wrote `outLeft = 0` instead, which in the guest's own vocabulary means "destination finished" — so the plausible cause of F-354's two-request chain was our completion marking. It is not: the chain length is identical either way.
+
+**2. What this removes from the search space.** Sixteen Path B interventions plus now the record-marking family: the destination budget is fixed by the **load request / destination list** upstream of the inflate loop, not by anything the inflate hook can signal. Task #15's remaining shape is therefore narrowed to constructing that list per descriptor inside `sub_821BC140`'s walk, and any further experiment on `st+0/st+8/st+16` marking is spent work.
+
+**3. Side result worth keeping.** Faithful advance did raise durability to `pct=100` of the claim (`458,752/458,752`, `recs_whole=5`, `first_bad=FFFFFFFF` = no bad byte found) — evidence that the guest's own arithmetic and ours agree when we mirror it. Kept as the reference for why that agreement is not worth 2.3× inflate effort.
+
+**4. Objective state.** (a) raceeditor/policecam/credits byte-exact; garage `claimed=458,752`, `still_present=440,720` = 41.3 % (12.3 % unambiguous per F-354 §2), ceiling = two destinations. (b) `nGfx`=0. Goal remains OPEN. Next ID F-357.
+
+
