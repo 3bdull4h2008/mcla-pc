@@ -608,6 +608,28 @@ static constexpr bool kUiXsfSetExpected = true;
 // so more input only spins (w280: 704,373 lines vs w279's 57,892).
 static constexpr bool kUiXsfTailTopup = false;
 
+// F-333: the frame driver resumes a PARTLY-CONSUMED frame from its OWN state,
+// not from the src we hand it. sub_82461010 takes `cursor = src` only while
+// [S+12280] == 0 (generated/ppc_xenon/ppc_recomp.82.cpp:14181-14184 jumps to
+// loc_8246117C at :14286-14288), and [S+12280] is a byte offset inside the
+// current frame — the code computes a frame's total length as
+// `headerLength + payload` and stores it there (:14248-14277, :14409-14410).
+// A stale non-zero value from whatever stream last used this shared ctx sends
+// the walk to the saved cursor [S+12276] in a DIFFERENT buffer, and the call
+// then consumes 0 input, writes 0 output and returns S_OK: build/w306.log
+// XMEM-SZPTR #5..#12, eight identical `srcSz(in)=32768 srcSz(out)=32768
+// destSz(out)=0 ret=0` lines for the garage. Our own W27 driver has always
+// soft-reset this exact range before driving the same function
+// (src/gpu_device.cpp:5045-5049); the guest-driven path never got that
+// treatment. ON = clear the resume latch when we install a frame-aligned
+// window for a UI .xsf stream.
+// F-333 MEASURED: ON with kUiXsfFrameServe ON = w307, garage coverage
+// 63,072 → 43,732 and ~89,000 failing frame decodes. The latch is real, but
+// clearing it is the wrong use of that knowledge: the decoder is one CONTINUOUS
+// bit stream, so the correct move is to leave `src` where the guest put it and
+// extend the buffer in place. Keep OFF until that is what is being tested.
+static constexpr bool kUiXsfClearResume = false;
+
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
 // (correct guest enqueue) replaces its purpose; with Path B ON this replay only
 // collides (the INFLATE #2.2M loop carries its 7179940 constants). Disabled by
@@ -2812,6 +2834,36 @@ PPC_FUNC(sub_8244FF20) {
     (void)xmemMem.ReadU32BE(destSz, &realDestSz);
   if (srcSz)
     (void)xmemMem.ReadU32BE(srcSz, &realSrcSz);
+  // F-331 CENSUS (log-only, zero behaviour change): the frame driver's OWN
+  // context, which no instrument of ours has ever read. The chain is
+  // sub_821BC140 -> sub_821D5E10 (ppc_recomp.18.cpp:10832) -> sub_8244FF20
+  // (:10933, with r3 = *obj, i.e. THIS ctxp) -> sub_82460420 -> sub_82461010
+  // (ppc_recomp.82.cpp:14065), and sub_82461010 keeps its walk state at
+  // ctx+20, so its r31+N fields are ctxp+(20+N): staging base +12284, staging
+  // read position +12288, UNDRAINED staging bytes +12292, frame cursor +12296,
+  // frame-header bytes consumed +12300, src-size latch byte +12304.
+  // sub_82461530 (:14885) writes the last frame's src +11032, src end +11036,
+  // decode dest +11040, cumulative produced +11044 and its own frame counter
+  // at +11992. Pre/post because the counters are per-ctx, not per-call.
+  auto peekW = [&xmemMem](uint32_t a) {
+    uint32_t v = 0;
+    if (a != 0u && xmemMem.IsValid(a, 4))
+      (void)xmemMem.ReadU32BE(a, &v);
+    return v;
+  };
+  struct CtxSnap {
+    uint32_t codec, frames, produced, leftover, cursor, hdrpos, latch, stagbase,
+        stagpos, lastsrc, lastdst;
+  };
+  auto snapCtx = [&peekW, ctxp]() {
+    return CtxSnap{peekW(ctxp + 4u),      peekW(ctxp + 11992u),
+                   peekW(ctxp + 11044u),  peekW(ctxp + 12292u),
+                   peekW(ctxp + 12296u),  peekW(ctxp + 12300u),
+                   peekW(ctxp + 12304u),  peekW(ctxp + 12284u),
+                   peekW(ctxp + 12288u),  peekW(ctxp + 11032u),
+                   peekW(ctxp + 11040u)};
+  };
+  const CtxSnap pre = snapCtx();
   __imp__sub_8244FF20(ctx, base);
   const uint32_t ret = ctx.r3.u32;
   uint32_t outDestSz = 0, outSrcSz = 0;
@@ -2848,6 +2900,26 @@ PPC_FUNC(sub_8244FF20) {
                   "lr={:08X}",
                   n, dest, realDestSz, realSrcSz, src, outDestSz, outSrcSz, ret,
                   lr);
+  // F-331: same gate as the line above (per-dest bound, so this cannot repeat
+  // w298's 5.5 M-line flooding), one line per call pair showing the frame
+  // driver's own progress. `frames`/`ctxprod` are cumulative over the ctx's
+  // life, so a call that decoded nothing leaves them flat; `leftover>0` marks
+  // the staging-deferral path (ppc_recomp.82.cpp:14436-14444).
+  if (n <= 24 || uiLogged) {
+    const CtxSnap post = snapCtx();
+    // F-331 §9: ctx+12296 and ctx+12300 do NOT behave as the disasm implies
+    // (the first is constant, the second exceeds the 0..5 bound the only two
+    // writers allow), so they are printed as raw words, not as cursor/hdr.
+    MCLA_LOG_WARN(
+        "XMEM-CTX #{} ctx={:08X} codec={} dest={:08X} pkg={:08X} "
+        "frames {}->{} ctxprod {}->{} leftover {}->{} w12296={:08X} "
+        "w12300 {}->{} latch {}->{} stagbase={:08X} stagpos={}->{} "
+        "lastsrc={:08X} lastdst={:08X}",
+        n, ctxp, post.codec, dest, destPkg, pre.frames, post.frames,
+        pre.produced, post.produced, pre.leftover, post.leftover, post.cursor,
+        pre.hdrpos, post.hdrpos, pre.latch, post.latch, post.stagbase,
+        pre.stagpos, post.stagpos, post.lastsrc, post.lastdst);
+  }
   // F-256: dump the decompressed UI-container head once to verify a REAL .xsf
   // (vs capacity-truncated / garbage). A valid Rage/GFx container head tells us
   // whether sub-goal A (decompression) is actually complete, not just flowing.
@@ -8351,6 +8423,22 @@ static constexpr bool kUiXsfFillListOrder = true;
 // the guest's per-call frame/outLeft accounting is, which is Path B's
 // descriptor-construction side (task #15), not serve framing. Keep the parser
 // and the cursor: they are what makes that side measurable.
+// F-333 SUPERSEDES the paragraph above, and it is the latch that paragraph
+// could not see: `inLeft` stayed 2,051 because the frame driver never touched
+// our window at all — it resumed a stale mid-frame offset from the saved
+// cursor (see kUiXsfClearResume), so it consumed nothing and our refill
+// trigger (an EMPTY buffer) could not fire. Framing and the latch are one
+// mechanism and must be tested as a pair.
+// TESTED AS THAT PAIR IN w307 AND REVERTED: the latch really does clear (four
+// UIXSF-RESUME-CLEAR lines walked the garage's own frame table at offsets 0,
+// 0x2564, 0x39BA, 0x46CA with frames of 9,572/5,206/3,344/4,072 bytes), and the
+// result was WORSE — garage coverage 63,072 → 43,732, INFLATE-ENTER 4,890 →
+// 17,703, and ~89,000 failing frame decodes on the shared ctx. Reading that
+// back: the decoder is a CONTINUOUS bit stream, so a window that starts on a
+// container frame boundary is only correct if the driver's own resume offset
+// and saved cursor agree with it. Moving `src` under it is wrong in both
+// directions. The next step is therefore to stop moving `src` at all — see
+// kUiXsfServeInPlace.
 static constexpr bool kUiXsfFrameServe = false;
 
 // F-326: DRY RUN builds the same plan and records the same claims but writes
@@ -8700,6 +8788,48 @@ static void MclaUiXsfVerifySlot(uint32_t dest, uint32_t slotsize) {
 // using package base 0x60000 — routing them to the job #2 walk at 0xA0000
 // starved job #1 and never delivered the job #2 package head.
 // (IsJob2UiDest now lives at file scope near the XSF helpers — w18.)
+// F-332: per-frame LZX decoder census. sub_82461B98
+// (generated/ppc_xenon/ppc_recomp.82.cpp:15846) is the frame decode called
+// once per frame by sub_82461530 (:14943). Its -1 return is what makes
+// sub_82461530 produce 0 bytes while its frame counter still advances, and
+// sub_82461010 discards that return (F-331 §6) — so until now every failure
+// this decoder ever raised was invisible. r3 = the decoder state base S, i.e.
+// ctx+20 of the codec ctx, so S+N is what XMEM-CTX prints as ctxp+N+20.
+// Log-only: no register and no guest byte is touched.
+PPC_FUNC_IMPL(__imp__sub_82461B98);
+static std::atomic<uint32_t> s_h461B98{0};
+static std::atomic<uint32_t> s_h461B98fail{0};
+PPC_FUNC(sub_82461B98) {
+  const uint32_t n = s_h461B98.fetch_add(1) + 1;
+  const uint32_t S = ctx.r3.u32;
+  const uint32_t want = ctx.r4.u32;
+  auto &bmem = mcla::kernel::GuestMemoryHeap::Instance();
+  auto peekS = [&bmem, S](uint32_t off) {
+    uint32_t v = 0;
+    if (S != 0u && bmem.IsValid(S + off, 4))
+      (void)bmem.ReadU32BE(S + off, &v);
+    return v;
+  };
+  const uint32_t frameIdxPre = peekS(11972u);
+  __imp__sub_82461B98(ctx, base);
+  const int32_t ret = static_cast<int32_t>(ctx.r3.u32);
+  bool tally = false;
+  if (ret < 0)
+    tally = (s_h461B98fail.fetch_add(1) + 1) <= 24u;
+  // Caps: the first 16 frames of any kind, the first 24 FAILURES (the signal
+  // this was built for), a tally line every 500 frames. What the caps hide:
+  // failure 25+ and every successful frame past n=16 — their totals are on the
+  // tally line, so a missing per-frame line never means a zero count
+  // (F-089 §6 / F-321 the same trap twice).
+  if (n <= 16 || tally || (n % 500u) == 0u)
+    MCLA_LOG_WARN("LZX-FRAME #{} S={:08X} frameIdx={} want={} type={} "
+                  "fsize={} state={} ret={} srcp={:08X} bitbuf={:08X} "
+                  "cumprod={} failtotal={}",
+                  n, S, frameIdxPre, want, peekS(11984u), peekS(11980u),
+                  peekS(11988u), ret, peekS(11012u), peekS(11952u),
+                  peekS(11024u), s_h461B98fail.load());
+}
+
 PPC_FUNC_IMPL(__imp__sub_821D5E10);
 // F-182: the single switch for every state rewrite this hook performs. Set to
 // false to let the guest's own zlibInflater::InflateBegin run untouched.
@@ -9876,6 +10006,41 @@ PPC_FUNC(sub_821D5E10) {
               const uint32_t unc = MclaUiXsfUnc(sPkg);
               if (unc)
                 (void)mem.WriteU32BE(st + 12, unc);
+            }
+            if (kUiXsfClearResume && sPkg != 0u && frLen != 0u) {
+              // F-333: this window starts exactly on a frame header, so "resume
+              // byte N of the previous frame" is now WRONG information, and
+              // while that field is non-zero the frame driver ignores this src
+              // entirely and walks from its saved cursor — which belongs to
+              // whichever stream last used the shared ctx (see the flag's
+              // comment for the branch and the w306 signature). Clear it on the
+              // ctx the guest is about to use, and only if the word really is a
+              // codec ctx (its +4 must read 1, the same value the guest's own
+              // gate at sub_8244FF20 tests).
+              uint32_t xctx = s_xmemCtx.load();
+              if (xctx == 0u) {
+                const uint32_t inf = s_guestInflaterR3.load();
+                if (inf != 0u)
+                  (void)mem.ReadU32BE(inf, &xctx);
+              }
+              uint32_t codec = 0;
+              const bool sane =
+                  xctx != 0u && mem.ReadU32BE(xctx + 4u, &codec) && codec == 1u;
+              static std::atomic<uint32_t> s_resumeClears{0};
+              static std::atomic<uint32_t> s_resumeSkips{0};
+              if (sane) {
+                (void)mem.WriteU32BE(xctx + 20u + 12280u, 0);
+                (void)mem.WriteU32BE(xctx + 20u + 12276u, 0);
+                const uint32_t c = s_resumeClears.fetch_add(1) + 1;
+                if (c <= 4u || (c % 200u) == 0u)
+                  MCLA_LOG_WARN("UIXSF-RESUME-CLEAR #{} ctx={:08X} pkg={:08X} "
+                                "frameoff={:08X} frlen={}",
+                                c, xctx, baseOff, walkPos, frLen);
+              } else if (s_resumeSkips.fetch_add(1) < 2u) {
+                MCLA_LOG_WARN("UIXSF-RESUME-CLEAR-SKIP xctx={:08X} codec={:08X} "
+                              "s_xmemCtx={:08X} — latch left set",
+                              xctx, codec, s_xmemCtx.load());
+              }
             }
             if (!isPkgHead) {
               uint32_t consumedNow = 0;

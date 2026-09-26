@@ -1,9 +1,9 @@
 # UI `.xsf` inflate — consolidated plan and Path A / Path B evaluation
 
-Written 2026-09-26 (ledger through **F-330**). This is the single reference the
+Written 2026-09-26, updated the same day through **F-333**. This is the single reference the
 objective asked for ("evaluate Path A and Path B, produce a concrete plan with
 file:line citations"). Evidence lives in `docs/ROOT_CAUSE_VALIDATION.md`
-(F-244…F-330); flags/short-circuits in `docs/PROGRAM_GUIDE.md` §7; markers in §9.
+(F-244…**F-333**); flags/short-circuits in `docs/PROGRAM_GUIDE.md` §7; markers in §9.
 Every claim below carries a log line or a `file:line`; nothing here is inferred
 from an earlier summary.
 
@@ -12,11 +12,11 @@ from an earlier summary.
 | Requirement | Status | Evidence |
 |---|---|---|
 | (a) UI `.xsf` containers decompressed **in guest memory** | **3 of 4 at 100 %, garage 5.9 % by the guest / 64.9 % with host placement** | `w285`/`w295`: raceeditor `compared=143069 mismatch=0`, policecam `19337/0` ×2, credits `29655/0`; `w297`: garage `still_present=63072 pct=5`, `w296`: `pct=64` |
-| (b) **…so GFx can initialize** | **NOT achieved**, and NOT downstream of (a) | `MOVIE-CTOR` = 0 and `UILOAD-census` = 0 in every soak `w273`→`w304`, including the one where all four containers were placed (`w295`) |
-| Evaluate Path A (host LZX) | done, §2 | F-295…F-330 |
-| Evaluate Path B (guest descriptor construction) | done, §3 | F-318…F-330 |
+| (b) **…so GFx can initialize** | **NOT achieved**, and NOT downstream of (a) | `MOVIE-CTOR` = 0 and `UILOAD-census` = 0 in every soak `w273`→`w308`, including the one where all four containers were placed (`w295`) |
+| Evaluate Path A (host LZX) | done, §2 | F-295…F-333 |
+| Evaluate Path B (guest descriptor construction) | done, §3 — mechanism now identified (F-332 §4) | F-318…F-333 |
 | Concrete implementation plan with file:line citations | this document | — |
-| Implement + validate vs `w193` by soak census | done: 8 changes built/soaked/censused, 3 reverted on evidence | `w274`–`w304`, `tools/soak_census.py` |
+| Implement + validate vs `w193` by soak census | done: 11 changes built/soaked/censused, 4 reverted on evidence (latest `w307`→`w308`) | `w274`–`w308`, `tools/soak_census.py` |
 
 **Score: goal NOT achieved.** Two independent blockers remain, and only one of
 them is mine to work on (§4).
@@ -87,21 +87,44 @@ mechanism that a soak killed.
 | leftover | top up the input at the 35-byte leftover (`kUiXsfTailTopup`, `:609`) | livelock 704,373 lines; **reverted** — that leftover turned out to be a *slot* end, not a container end | `w280` |
 | descriptor clamp | publish the container's declared total into `st+12` (`MclaUiXsfUnc`, `kUiXsfSetExpected`, `:603`) — it had never been written, so the stream inherited the **previous** stream's value (196,553 = the pkg `0xA0000` stall point) on shared stack state `006D8F20` | consumed reaches 262,124; **output unchanged** | `w302`/`w303` |
 
-**The wall, localised by measurement (F-330).** At container offset `0x8000` the
+**The wall, localised by measurement (F-330, then re-read by F-331/F-332/F-333).** At container offset `0x8000` the
 guest's 32 bytes appear **nowhere** in the golden within ±4 KiB
-(`NOT-IN-GOLDEN-NEIGHBOURHOOD`) — not a shift, so not our slicing. The guest
-decodes exactly one `0x8000` block and then produces unrelated bytes at the
-block boundary. Remaining suspects, all guest-side:
+(`NOT-IN-GOLDEN-NEIGHBOURHOOD`) — not a shift, so not our slicing. What the
+three later entries establish is *where* that comes from, and they retire the
+suspects this section used to list:
 
-- the lazily-initialised **single decoder instance** at `0x828D38D8`
-  (`sub_82460420`, `generated/ppc_xenon/ppc_recomp.82.cpp:12099`, guarded by
-  `lis r31,-32115; lwz r11,14552(r31); if (r11 != 0) reuse`) — one shared
-  decoder for every stream;
-- the per-block call the real streamer makes at a block boundary
-  (`XMemDecompressEx`-style frame step) that `sub_821D5E10`
-  (`ppc_recomp.18.cpp:10832+`) is not making;
-- `[ctx+4]` codec gating in `sub_8244FF20` (`ppc_recomp.80.cpp:15600`) is
-  **excluded** — `ret=00000000` in `XMEM-SZPTR` proves it passes.
+- **RETRACTED (F-331 §1): there is no decoder instance at `0x828D38D8`.** That
+  address appears nowhere in `generated/` (`grep` for `14552`, the `ori` half,
+  returns 0 hits) and `ppc_recomp.82.cpp:12099` is `sub_82460420`, a
+  status-mapping wrapper. Likewise "`[ctx+4]` codec gating is excluded because
+  `ret=0`" was void: `ret=0` is the success value of the whole chain.
+- **The chain is one call graph, and it is now fully mapped** (F-331 §2):
+  `sub_821BC140` (streamer job loop, `ppc_recomp.14.cpp:18805`, 28-byte
+  descriptors) → `sub_821D5E10` (`ppc_recomp.18.cpp:10832`, our
+  `INFLATE-ENTER`) → **calls** `sub_8244FF20` at `:10933` → `sub_82460420` →
+  `sub_82461010` (`ppc_recomp.82.cpp:14065`, the frame-table driver, state at
+  `ctx+20`) → per frame `sub_82461530` (`:14885`) → `sub_82461E68` +
+  `sub_82461B98` (`:15846`, the LZX frame decode). Its guest framing code is
+  byte-identical to the offline recipe in `src/xmem_lzx.h:531-552`.
+- **The guest decodes frame 0 and then fails every frame, silently** (F-331 §6,
+  F-332 §2): `sub_82461530` bumps its frame counter unconditionally but
+  accumulates produced only on success, and `sub_82461010` **discards the return
+  value**, so a −1 frame costs nothing and reports S_OK. ~95 % of all frames in
+  a boot return −1.
+- **For the garage specifically** (F-332 §4): the frame driver is entered with
+  its per-frame byte offset `[S+12280]` non-zero (left over from whichever
+  stream last used the shared `ctx 4000FD80`; the routines that would clear it,
+  `sub_82460F88` / `sub_82461840`, are not reached between streams), so it
+  resumes mid-frame from the stale saved cursor `[S+12276]` in another buffer,
+  **consumes 0 input, writes 0 output and returns S_OK** — and because
+  `*srcSize(out)=0` the caller can never advance. Eight byte-identical
+  `XMEM-SZPTR` lines in `w306`, with the garage's served bytes sitting right at
+  the advertised `src`.
+- **And the obvious reading of that is a trap** (F-333): clearing the latch and
+  handing the driver a frame-aligned window *does* unstick it and makes coverage
+  **worse** (63,072 → 43,732, ~89,000 failed frames), because the decoder is one
+  continuous bit stream — `[S+12276]`/`[S+12280]` are not junk, they *are* the
+  stream position, and moving `src` under them is wrong in both directions.
 
 ## 4. The GFx half is a different problem, and it is the user's to open
 
@@ -119,23 +142,40 @@ not have been the fix anyway.
 
 ## 5. Plan, in order, with acceptance tests
 
-1. **Read the guest's block-boundary path** (static, zero builds): `sub_82460420`'s
-   body after the singleton guard, and `sub_82461010`. Acceptance: name the field
-   or call that differs between block 0 and block 1, or record that none exists.
-2. **Observe the singleton**: log-only census of `0x828D38D8` per inflate entry
-   (fold into `INFLATE-ENTER`, per F-133). Acceptance: show whether one decoder
-   instance serves both the garage and other containers, interleaved.
-3. **Only then** attempt a per-block re-init — the intervention this session
-   deliberately did *not* make, because every prior attempt varied input while
-   F-330 says the input was already correct. Acceptance:
-   `UIXSF-GOLDEN-REVERIFY … still_present` rising past 63,072 **with
-   `kUiXsfFillDryRun=true`**, i.e. guest-only output. Anything measured with the
-   fill active is not evidence of guest progress.
-4. **Keep the placement instruments** (`kUiXsfGoldenFill` + dry run) as the
+**Steps 1 and 2 of the 09-26 morning version of this plan are done, and their
+target turned out not to exist**: the static read of `sub_82461010` /
+`sub_82461B98` (F-331 §2, §7) and the census of the decoder's own state (F-331 §6,
+F-332) are what produced the diagnosis above, and the `0x828D38D8` singleton they
+were aimed at is not in the image. What remains:
+
+1. **Serve in place — stop moving `src`** (F-333 §5 is the reason). In the
+   refill, at the `WriteU32BE(st + 0, got)` / `WriteU32BE(st + 4, s_hsBuf)` pair
+   immediately above the `kUiXsfClearResume` block
+   (`src/gpu_device.cpp:10003`), for a UI `.xsf` stream write the container's
+   continuation bytes at `inPtr + inLeft` **into the buffer the guest is already
+   pointing at** and raise `st+0` by the count, leaving `st+4` untouched, so the
+   driver's `[S+12276]`/`[S+12280]` pair stays consistent with the bytes under
+   it. The only genuinely new derivation is mapping the guest's current buffer
+   position to a package offset — do it by locating the tail (≥16 distinctive
+   bytes) of what is already in that buffer inside the host-side package image,
+   never by assuming a window base. Guard with `IsValid` plus a check that the
+   target is not one of the readlist slots. Acceptance: `LZX-FRAME … ret=32768`
+   lines after the first ten, and `UIXSF-GOLDEN-REVERIFY … still_present` rising
+   past 63,072 **with `kUiXsfFillDryRun=true`**. If coverage does not rise, this
+   line closes too, and the remaining candidate is making the guest reach its
+   own reset (`sub_82460F88` / `sub_82461840`, which zero exactly this state)
+   between streams — a different mechanism, not another framing knob.
+2. **Do not re-run the redirect family.** F-318, F-320, F-327, F-329 and F-333
+   cover re-pointing `src` with five different offsets, latches and framings;
+   correct output moved in none of them and went *down* in the last. A further
+   variant needs new evidence, not a new flag.
+3. **Keep the placement instruments** (`kUiXsfGoldenFill` + dry run) as the
    measurement harness, not as a fix: they are what make "who produced these
    bytes" answerable, which is the question three of this session's reversions
-   turned on.
-5. **GFx**: take §4 to the user as a decision with the elimination chain attached;
+   turned on. `LZX-FRAME` and `XMEM-CTX` are the other two instruments worth
+   keeping — between them they are the first things in the tree that see the
+   decoder's own progress.
+4. **GFx**: take §4 to the user as a decision with the elimination chain attached;
    do not spend soaks on it meanwhile.
 
 ## 6. Validation recipe (do not improvise this)
@@ -160,14 +200,15 @@ non-evidence).
 `kPathBEnqueueUI=true` `:87` · `kPathBHostFullDecode=true` `:468` ·
 `kPathBSingleOpen=false` `:545` · `kUiServeAdvance=false` `:571` ·
 `kUiXsfChunkFeed=true` `:589` · `kUiXsfSetExpected=true` `:603` ·
-`kUiXsfTailTopup=false` `:609` · `kUiXsfBoundUnc=true` `:7919` ·
-`kUiXsfVerify=true` `:8064` · `kUiXsfHunt=true` `:8102` ·
-`kUiXsfGoldenFill=true` `:8304` · `kUiXsfFillListOrder=true` `:8323` ·
-`kUiXsfFrameServe=false` `:8354` · `kUiXsfFillDryRun=true` `:8361` ·
-`kUiXsfReverify=true` `:8511`.
+`kUiXsfTailTopup=false` `:609` · `kUiXsfClearResume=false` `:631` ·
+`kUiXsfBoundUnc=true` `:7991` · `kUiXsfVerify=true` `:8136` ·
+`kUiXsfHunt=true` `:8174` · `kUiXsfGoldenFill=true` `:8376` ·
+`kUiXsfFillListOrder=true` `:8395` ·
+`kUiXsfFrameServe=false` `:8442` · `kUiXsfFillDryRun=true` `:8449` ·
+`kUiXsfReverify=true` `:8599` · `kUiXsfClearResume=false` `:631`.
 
 **Net shipped effect:** Path A hosts 3 containers outright; the feed follows the
 stream and publishes the correct `st+12`; the third container's placement is
 **measuring, not writing** (`kUiXsfGoldenFill=true` + `kUiXsfFillDryRun=true`),
-and frame-aligned serving is off. No unregistered short-circuit: §7 of
-`PROGRAM_GUIDE` carries each of these.
+and frame-aligned serving is off (tested and reverted, F-333). No unregistered
+short-circuit: §7 of `PROGRAM_GUIDE` carries each of these.

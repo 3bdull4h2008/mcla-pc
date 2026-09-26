@@ -10,6 +10,22 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~07:0x (ledger through F-333; next ID F-334).** UI `.xsf`
+> inflate: the plan is `docs/UI_INFLATE_PLAN.md` and it now carries the whole
+> mechanism. The decode chain is mapped end to end
+> (`sub_821BC140` → `sub_821D5E10` → `sub_8244FF20` → `sub_82460420` →
+> `sub_82461010` → `sub_82461530` → `sub_82461B98`, F-331 §2), the guest's frame
+> decoder fails ~95 % of frames with a return value its caller discards (F-331 §6,
+> F-332 §2 — new markers `XMEM-CTX`, `LZX-FRAME`), and the garage's exact
+> no-op-and-can't-advance livelock is identified (F-332 §4). **T41.11 and the
+> whole "re-point `st+4`" serve family (F-318/320/327/329/333) are closed by
+> mechanism, not by count**: F-333 tested latch-clear + frame-aligned serving, it
+> un-stuck the driver and coverage went 63,072 → 43,732, reverted and re-verified
+> in `w308`. The one remaining Path B design that respects the continuous bit
+> stream is **serve in place** (`UI_INFLATE_PLAN.md` §5 step 1). Deliverable (a)
+> is 3/4 containers byte-exact + garage 5.9 %; GFx (b) is unmoved and gated
+> upstream of decompression, with rule-2/F-055 reserved to the user.
+
 
 ## 0-newest2. State (2026-09-26 ~00:05, verified — **F-295→F-297: Path A is ALIVE and SHIPPED; 3 of the 4 UI `.xsf` are now decompressed byte-exact into guest memory**) — supersedes two claims in the 05:08 block below: "Path A DEAD (F-191, XMem LZX≠CAB)" and "the UI `.xsf` are provably NEVER decompressed (F-235)". Also supersedes T41.10's "Path A (host-side LZX): DEAD" line.
 
