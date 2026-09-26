@@ -144,6 +144,12 @@ static bool PathLooksLikeArchiveContent(const char *path) {
   return std::strstr(path, ".xsf") != nullptr ||
          std::strstr(path, ".xtd") != nullptr ||
          std::strstr(path, ".list") != nullptr ||
+         // F-446 MEASURED AND REVERTED: adding ".lst"/"tune/" here did engage our serve machinery for
+         // the tuning files (mentions of `tune/vehicle` in the log went 1 -> 142 in `w448`) and
+         // changed nothing else: still 14 F442-SECTION rows all ret=0 with hits=0, the Vehicle rows
+         // still holding the previous stream's compressed bytes, F432-GROW-SKIP 3, LISTLINE 171,
+         // C0000005 0, BC140-REC 7. So the config tokenizer is NOT fed by this host-serve path --
+         // do not re-try widening this predicate as a route to clause (b).
          std::strstr(path, "globaltex") != nullptr ||
          std::strstr(path, "preload") != nullptr ||
          std::strstr(path, "shaders/") != nullptr ||
