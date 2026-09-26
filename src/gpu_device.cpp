@@ -9001,6 +9001,47 @@ static void MclaUiXsfVerifySlot(uint32_t dest, uint32_t slotsize) {
 // this decoder ever raised was invisible. r3 = the decoder state base S, i.e.
 // ctx+20 of the codec ctx, so S+N is what XMEM-CTX prints as ctxp+N+20.
 // Log-only: no register and no guest byte is touched.
+// F-336: is the codec ctx ever OPENED, or only ever driven? Step 1c of the plan
+// needs the guest's own reset (`sub_82460F88` / `sub_82461840`), and both are
+// reached only from the Open wrapper `sub_82461378` (generated/ppc_xenon/
+// ppc_recomp.82.cpp:14590), which has exactly ONE call site in the whole image
+// (`0x8246039c` inside `sub_82460370`, per tools/ppc_xrefs.py) and 0 sites
+// materialising its address. So this measures three things in one build: the
+// wrapper, its only caller, and `sub_82460420` as the CONTROL — the control is
+// known-live because every container call goes through it, which is what makes
+// a zero from the other two a measurement rather than an absence (F-309's
+// discipline; a bare zero from a brand-new hook is uninterpretable).
+extern "C" void __imp__sub_82461378(PPCContext &ctx, uint8_t *base);
+extern "C" void __imp__sub_82460370(PPCContext &ctx, uint8_t *base);
+extern "C" void __imp__sub_82460420(PPCContext &ctx, uint8_t *base);
+static std::atomic<uint32_t> s_openWrap{0}, s_openCaller{0}, s_openCtrl{0};
+static void MclaOpenCensus(const char *site, uint32_t n, uint32_t r3,
+                           uint32_t r4, uint32_t r5, uint32_t ctrlNow,
+                           uint32_t wrapNow, uint32_t callerNow) {
+  if (n <= 4u || (n % 2000u) == 0u)
+    MCLA_LOG_WARN("XMEM-OPEN-CENSUS site={} #{} r3={:08X} r4={:08X} r5={:08X} "
+                  "[wrapper={} caller={} control={}]",
+                  site, n, r3, r4, r5, wrapNow, callerNow, ctrlNow);
+}
+PPC_FUNC(sub_82461378) {
+  const uint32_t n = s_openWrap.fetch_add(1) + 1;
+  MclaOpenCensus("wrapper", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                 s_openCtrl.load(), n, s_openCaller.load());
+  __imp__sub_82461378(ctx, base);
+}
+PPC_FUNC(sub_82460370) {
+  const uint32_t n = s_openCaller.fetch_add(1) + 1;
+  MclaOpenCensus("caller", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                 s_openCtrl.load(), s_openWrap.load(), n);
+  __imp__sub_82460370(ctx, base);
+}
+PPC_FUNC(sub_82460420) {
+  const uint32_t n = s_openCtrl.fetch_add(1) + 1;
+  MclaOpenCensus("control", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, n,
+                 s_openWrap.load(), s_openCaller.load());
+  __imp__sub_82460420(ctx, base);
+}
+
 PPC_FUNC_IMPL(__imp__sub_82461B98);
 static std::atomic<uint32_t> s_h461B98{0};
 static std::atomic<uint32_t> s_h461B98fail{0};
