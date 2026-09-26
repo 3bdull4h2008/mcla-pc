@@ -659,6 +659,32 @@ static constexpr bool kUiXsfLocate = true;
 // (sub_82460F88 / sub_82461840), not another window shape.
 static constexpr bool kUiXsfAppendWindow = false;
 
+// F-337: open a PRIVATE codec context per UI .xsf stream (plan step 1c). F-336
+// measured the whole cause: two Open calls in an entire boot (r5 = 4000FD80 and
+// 400446C0, ~215 KB apart) against 4,901 inflate entries, so every container
+// decodes into a context whose walk state and history belong to whatever ran
+// before it. That is why six serve designs moved `consumed` and none moved
+// correct output. The replay below is the exact observed call:
+//   sub_82461378(r3 = 0x8EFFF990 owner, r4 = 1 flags, r5 = block, r6 = 0x3492E)
+// and r7 is live at the call but never read by the wrapper
+// (generated/ppc_xenon/ppc_recomp.82.cpp:14611-14650). obj+0 is republished on
+// every refill because F-335 §2 showed the caller re-arms the record between
+// calls. Known hazard, named rather than hidden: this calls guest code from
+// inside a guest hook, which is the re-entrancy that collapsed boot depth ~3x
+// once before (F-285/286) -- here it is at most four calls per boot.
+// F-337 MEASURED = false: the republish works (obj=0x8283D1B0 held *obj =
+// 0x4000FD80 and took the private ctx), and the boot then DIED 6 ms later --
+// 27,760 log lines vs 58,119 and INFLATE-ENTER 32 vs 4,901, with no fault line
+// and no garage reverify sample at all. The prime suspect is named rather than
+// guessed around: mem.Alloc(0x35000) returned 0xCAF28300, which is the SAME
+// address the XSF serve window uses in w310/w315, so the frame driver was
+// writing its input over its own context (or vice versa). Before this is
+// retried, the private ctx must be allocated in a block that cannot alias the
+// serve buffer and the aliasing checked, not assumed away.
+static constexpr bool kUiXsfPrivateCtx = false;
+static std::mutex g_uiXsfPrivMtx;
+static std::unordered_map<uint32_t, uint32_t> g_uiXsfPrivCtx;  // st -> private ctx
+
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
 // (correct guest enqueue) replaces its purpose; with Path B ON this replay only
 // collides (the INFLATE #2.2M loop carries its 7179940 constants). Disabled by
@@ -9016,28 +9042,29 @@ extern "C" void __imp__sub_82460370(PPCContext &ctx, uint8_t *base);
 extern "C" void __imp__sub_82460420(PPCContext &ctx, uint8_t *base);
 static std::atomic<uint32_t> s_openWrap{0}, s_openCaller{0}, s_openCtrl{0};
 static void MclaOpenCensus(const char *site, uint32_t n, uint32_t r3,
-                           uint32_t r4, uint32_t r5, uint32_t ctrlNow,
+                           uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7,
+                           uint32_t ctrlNow,
                            uint32_t wrapNow, uint32_t callerNow) {
   if (n <= 4u || (n % 2000u) == 0u)
-    MCLA_LOG_WARN("XMEM-OPEN-CENSUS site={} #{} r3={:08X} r4={:08X} r5={:08X} "
+    MCLA_LOG_WARN("XMEM-OPEN-CENSUS site={} #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} "
                   "[wrapper={} caller={} control={}]",
-                  site, n, r3, r4, r5, wrapNow, callerNow, ctrlNow);
+                  site, n, r3, r4, r5, r6, r7, wrapNow, callerNow, ctrlNow);
 }
 PPC_FUNC(sub_82461378) {
   const uint32_t n = s_openWrap.fetch_add(1) + 1;
-  MclaOpenCensus("wrapper", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+  MclaOpenCensus("wrapper", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
                  s_openCtrl.load(), n, s_openCaller.load());
   __imp__sub_82461378(ctx, base);
 }
 PPC_FUNC(sub_82460370) {
   const uint32_t n = s_openCaller.fetch_add(1) + 1;
-  MclaOpenCensus("caller", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+  MclaOpenCensus("caller", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
                  s_openCtrl.load(), s_openWrap.load(), n);
   __imp__sub_82460370(ctx, base);
 }
 PPC_FUNC(sub_82460420) {
   const uint32_t n = s_openCtrl.fetch_add(1) + 1;
-  MclaOpenCensus("control", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, n,
+  MclaOpenCensus("control", n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, n,
                  s_openWrap.load(), s_openCaller.load());
   __imp__sub_82460420(ctx, base);
 }
@@ -9112,6 +9139,10 @@ static void MclaUiXsfLateReverify(uint32_t n) {
 }
 
 PPC_FUNC(sub_821D5E10) {
+  // F-337: the caller passes the codec *object* in r3 and the inflate reads
+  // *obj as the context; r3 is the return value by the time the refill runs, so
+  // capture it here.
+  const uint32_t objAtEntry = ctx.r3.u32;
   const uint32_t n = s_h5E10.fetch_add(1) + 1;
   const uint32_t st = ctx.r4.u32;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -10179,6 +10210,59 @@ PPC_FUNC(sub_821D5E10) {
           // decoder and the drain exemption see it from the next entry on.
           std::lock_guard<std::mutex> wl(g_destPkgMtx);
           g_destPkgOff[outPtr] = baseOff;
+        }
+        if (kUiXsfPrivateCtx && sPkg != 0u && mem.IsValid(objAtEntry, 4u)) {
+          uint32_t priv = 0;
+          {
+            std::lock_guard<std::mutex> pl(g_uiXsfPrivMtx);
+            const auto it = g_uiXsfPrivCtx.find(st);
+            if (it != g_uiXsfPrivCtx.end())
+              priv = it->second;
+          }
+          if (priv == 0u) {
+            const uint32_t blk = mem.Alloc(0x35000u, 16);
+            if (blk != 0u) {
+              PPCContext q{};
+              q.r1.u64 = ctx.r1.u32 - 0x400u;
+              q.r13.u64 = 0x8F200000u;
+              q.r3.u64 = 0x8EFFF990u;
+              q.r4.u64 = 1u;
+              q.r5.u64 = blk;
+              q.r6.u64 = 0x3492Eu;
+              q.lr = 0x824613D4u;
+              __imp__sub_82461378(q, mcla::kernel::g_memory.base);
+              priv = blk;
+              std::lock_guard<std::mutex> pl(g_uiXsfPrivMtx);
+              g_uiXsfPrivCtx[st] = priv;
+              MCLA_LOG_WARN("UIXSF-PRIVCTX #{} st={:08X} pkg={:08X} opened "
+                            "private ctx={:08X} (shared is 4000FD80)",
+                            n, st, sPkg, priv);
+            } else {
+              MCLA_LOG_WARN("UIXSF-PRIVCTX #{} st={:08X} ALLOC FAILED", n, st);
+            }
+          }
+          static uint32_t s_privSeen = 0;
+          if (s_privSeen < 4u) {
+            ++s_privSeen;
+            uint32_t c0 = 0;
+            (void)mem.ReadU32BE(objAtEntry, &c0);
+            MCLA_LOG_WARN("UIXSF-PRIVCTX #{} st={:08X} pkg={:08X} obj={:08X} "
+                          "*obj={:08X} priv={:08X}",
+                          n, st, sPkg, objAtEntry, c0, priv);
+          }
+          if (priv != 0u) {
+            uint32_t cur = 0;
+            if (mem.ReadU32BE(objAtEntry, &cur) && cur != priv && cur != 0u &&
+                cur != 0xCDCDCDCDu) {
+              (void)mem.WriteU32BE(objAtEntry, priv);
+              static uint32_t s_swLog = 0;
+              if (s_swLog < 8u) {
+                ++s_swLog;
+                MCLA_LOG_WARN("UIXSF-PRIVCTX #{} obj={:08X} ctx {:08X} -> "
+                              "{:08X}", n, objAtEntry, cur, priv);
+              }
+            }
+          }
         }
         // F-334: ask the guest's own buffer where it is, before deciding what to
         // write. Log-only, ≤6 lines per inflate state. This is the reachability

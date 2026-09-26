@@ -238,6 +238,15 @@ re-arms its inflate record every call (see `UIXSF-APPEND`'s `re-pointed=1`). The
 candidate is a per-stream codec-ctx re-init (`sub_82460F88` / `sub_82461840`), not
 another window shape.
 
+`kUiXsfPrivateCtx` (**OFF**, `src/gpu_device.cpp:674`) implements plan step 1c: open a
+private codec context per UI .xsf stream by replaying the guest's own Open call
+`sub_82461378(0x8EFFF990, 1, block, 0x3492E)` and republish the stream's `*obj` (the slot
+is `0x8283D1B0`, and it held the shared `0x4000FD80`). Registered as a **tested and
+reverted** intervention: the mechanism was observed working and the boot then went
+shallower (27,760 lines vs 58,119, `INFLATE-ENTER` 32 vs 4,901) because `Alloc(0x35000)`
+returned `0xCAF28300` — the same address `XSF-HOSTSERVE` uses. Retry only after the
+context is allocated at an address asserted disjoint from every serve window.
+
 `kUiXsfGoldenFill` (F-323, **ON by default**) — **the third and most invasive host
 write: it fills guest slots the guest never filled.** Find the slot mapped to a UI
 `.xsf` package whose head equals golden offset 0 (the anchor), take the container's

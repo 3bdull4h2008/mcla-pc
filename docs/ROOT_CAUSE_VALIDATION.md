@@ -7754,3 +7754,24 @@ The second garage shape is `XMEM-SZPTR #14,#16,#18,#20,#22,#24`: `*srcSz(in)=20`
 **5. Neutrality.** `w313` vs `w312`: 58,126 vs 58,119 lines, `INFLATE-ENTER` 4,901 both, `still_present=63072` ×5 both, `LISTLINE` 171, `C0000005` 0, `UIXSF-LOCATE` 6 both. Three new guest-function wrappers, and the boot is unchanged — the wrappers add a frame per call, which at 4,901 control calls is free.
 
 **6. Objective state.** (a) 3/4 byte-exact + garage 63,072/1,066,057 = 5.9 %, unchanged. (b) `nGfx=0`, unchanged. **Goal remains OPEN.** Next ID F-337.
+
+
+### F-337 (2026-09-26 ~08:0x, **BUILT + SOAKED three times** `w315` (probe mute, my guard), `w316` (mechanism fires, boot collapses), `w317` (reverted, restored)) — **plan step 1c was implemented and it does republish the context — and the boot dies 6 ms later. Two new facts came out of it: the slot the stream reads its codec context from is a static one at `0x8283D1B0` (`*obj` was `0x4000FD80`), and `mem.Alloc(0x35000)` handed back `0xCAF28300`, the SAME address the XSF serve window uses, so the private context and the compressed input aliased each other.** `kUiXsfPrivateCtx = false`.
+
+- Task:        #29 follow-on; the objective's last named Path B mechanism.
+- Type:        FIX (implemented, regressed, reverted) + FACT
+- Class:       D (host memory allocation) on top of C (context ownership)
+- Priority:    P0
+- Evidence:    `build/w316.log` `UIXSF-PRIVCTX #32 st=006D8F20 pkg=64980000 opened private ctx=CAF28300 (shared is 4000FD80)`, `UIXSF-PRIVCTX #32 obj=8283D1B0 *obj=4000FD80 priv=CAF28300`, `UIXSF-PRIVCTX #32 obj=8283D1B0 ctx 4000FD80 -> CAF28300`; 27,760 lines total, `INFLATE-ENTER` 32, no `C0000005`, **no `UIXSF-GOLDEN-REVERIFY` line at all**; `build/w315.log` (`PRIVCTX=0`, guard rejected); `build/w317.log` (restored). Serve-window identity: `build/w310.log` `XSF-HOSTSERVE ... buf=CAF28300` and `build/w315.log` same.
+
+**1. The Open replay is correct and complete.** The call the guest makes to create a context is reproducible from the census alone: `sub_82461378(r3=0x8EFFF990, r4=1, r5=block, r6=0x3492E)` — `r7` is live at the call site but the wrapper never reads it (it forwards `r6` into a stack slot that becomes `sub_82461840`'s `r4`, `ppc_recomp.82.cpp:14611-14650`). `r6` is the context size: the two real contexts sit `0x34940` apart, and `r6 = 0x3492E`. That closes the argument question F-336 §4 left open.
+
+**2. The republish worked.** `obj = 0x8283D1B0` — a **static slot inside the guest image's data area**, holding `0x4000FD80` — was rewritten to the private context. So "which object points at the shared codec ctx" is now answerable statically, and the answer for this stream is one word at `0x8283D1B0`. That is worth more to the next session than the fix itself.
+
+**3. And the boot collapsed immediately after** — 27,760 lines vs 58,119, `INFLATE-ENTER` 32 vs 4,901, no fault line, and the garage reverify never sampled. This is a *shallower* boot, not a crashing one, which per F-315's lesson is progress starvation, not an AV.
+
+**4. The likely cause is mine and it is named, not assumed: `mem.Alloc(0x35000)` returned `0xCAF28300`.** That is the address `XSF-HOSTSERVE` has been using as the garage's compressed-input window in `w310`/`w315` (and the append window in F-335). A context and its own input buffer sharing a 215 KB region means the frame driver writes decoded output and walk state over the bytes it is reading. So `w316` does **not** refute the shared-context hypothesis; it refutes my allocation. Before this is retried: place the private context at an address provably disjoint from every serve window (allocate it once at startup and assert non-overlap), and re-check with the same acceptance test.
+
+**5. My second silent-guard instrument error this session.** `w315` printed nothing because the range check I wrote (`objAtEntry >= 0x40000000 && < 0x80000000`) excluded legitimate high guest pointers such as `0x8283D1B0`. Fixed in `w316` by using `mem.IsValid` plus a print of `obj`/`*obj`/`priv` on every path. The rule I keep re-learning: a probe's rejection branch must print, or a rejected probe reads as a negative result (same failure mode as F-334 §3, one entry earlier).
+
+**6. Objective state after this entry.** (a) 3 of 4 containers byte-exact in guest memory; garage 63,072/1,066,057 = 5.9 % guest-only — **unchanged, (a) NOT met.** (b) `nGfx`=0, `MOVIE-CTOR`=0 — unchanged. Seven Path B variants are now closed or blocked with mechanisms named, and the one that is *not* refuted (per-stream context) is blocked by a host-side allocation bug of ours with a concrete pre-flight check. Revert verified: `w317` = 58,764 lines, `INFLATE-ENTER` 4,901, `PRIVCTX` 0, `REVERIFY` 12, `still_present=63072`, `LISTLINE` 171, `C0000005` 0, and the exe returned to 57,206,784 bytes — identical to the pre-F-337 binary. **Goal remains OPEN.** Next ID F-338.
