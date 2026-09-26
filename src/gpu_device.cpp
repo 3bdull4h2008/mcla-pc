@@ -2127,7 +2127,7 @@ static std::atomic<uint32_t> s_821873E8_live{0};  // F-358 alive-path census
 // dispatching the UILOAD callback is not what initialises GFx. Back to false, and it must stay
 // false: while it is true, `W35-BOOT-GATE` is our own line and proves nothing about the guest
 // reaching 0x821315F4. Re-arm only to re-test that negative.
-constexpr bool kF368HostDispatchGate = false;
+constexpr bool kF368HostDispatchGate = false;  // F-436 measured it ON (w433); user decides whether to keep
 PPC_FUNC(sub_821873E8) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t n = s_821873E8_hits.fetch_add(1) + 1;
