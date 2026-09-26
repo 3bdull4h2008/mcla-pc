@@ -420,6 +420,23 @@ allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 ## 10. RE tooling
 
 - **IDA MCP** on `127.0.0.1:8745`. **Two ways in, and the safe one is usually not the configured one.**
+  **F-350 SUPERSEDES the rest of this bullet — three facts, now all implemented in
+  `tools/ida_rpc.py`.** (a) Analyze **`build/cache/mcla_pe.bin`**, *not*
+  `build/game_data/default.xex`: on the .xex the loader dies with
+  `RuntimeError: failed to analyze input file` (verified 09-26 11:04). The working database
+  answers `get_metadata` with `base 0x82000000 size 0xad3000 md5 3f2510c1…`.
+  (b) **`ida-pro-mcp.exe --transport stdio` is a dead end** — it forwards `tools/call` without
+  the `Accept` pair and the server replies `-32600 Not Acceptable`; `tools/list` succeeds, which
+  is what makes it look alive. (c) The JSON-RPC answer is streamed back as **SSE on the same
+  response**, so `read()` yields an empty string and looks like a broken server — read lines
+  until a `data:` payload.
+  Start when nothing is listening (`tasklist | grep -i idalib` first, rule 11):
+  `"C:/Users/abdul/.local/share/mcp/idamcp-venv/Scripts/idalib-mcp.exe" -v "E:/mcla pc/build/cache/mcla_pe.bin"`,
+  then `python tools/ida_rpc.py list` (48 tools) ·
+  `python tools/ida_rpc.py call decompile_function '{"address":"0x821BC140"}'` ·
+  `call get_xrefs_to '{"address":"0x82461378"}'`. Verified end to end 09-26 11:11.
+  `ida-bridge.py` also runs `taskkill /F /IM idalib-mcp.exe`, so never start it against a live
+  server. The old instructions below are kept as trail.
   `idalib-mcp.exe "<workspace>\build\game_data\default.xex"` already serves MCP over HTTP there, so if
   a process by that name exists, **attach to it** (POST `/mcp` with
   `Accept: application/json, text/event-stream`, keep the `Mcp-Session-Id`, then `initialize` →
