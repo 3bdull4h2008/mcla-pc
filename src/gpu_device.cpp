@@ -588,6 +588,12 @@ static constexpr bool kUiServeAdvance = false;
 // serve=N per dest (no new literal).
 static constexpr bool kUiXsfChunkFeed = true;
 
+// F-319: the tail top-up that goes with kUiXsfChunkFeed. OFF — it addressed the
+// wrong resource. See the block at the `inLeft > 0 && inLeft < 256` UNSTUCK site
+// for the full diagnosis: the leftover there means the dest window is OUTPUT-full,
+// so more input only spins (w280: 704,373 lines vs w279's 57,892).
+static constexpr bool kUiXsfTailTopup = false;
+
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
 // (correct guest enqueue) replaces its purpose; with Path B ON this replay only
 // collides (the INFLATE #2.2M loop carries its 7179940 constants). Disabled by
@@ -8363,6 +8369,72 @@ PPC_FUNC(sub_821D5E10) {
               }
             }
           }
+        }
+      }
+    }
+    // F-319 (REVERTED OFF — keep for the diagnosis, do not re-try in this form):
+    // a UI .xsf stream with a tiny leftover is NOT complete — it has filled its
+    // current dest window and the refill at the `inLeft == 0` block can only
+    // trigger on exactly zero. w279 measured the collision: garage dest
+    // B7A41000 consumed five consecutive windows (32,748 → 196,588 = 32,748 +
+    // 5×32,768, 20 XMem calls vs one in w274), filled its whole 131,072-byte
+    // PSTREAM window (XMEM-SZPTR `*destSz 131072->0`), then sat at inLeft=35
+    // until UNSTUCK zeroed outLeft.
+    // Tried: re-read the package at walkPos-inLeft and re-prime st+0/st+4 — the
+    // offset arithmetic was RIGHT (w280: `readAt=649A7FDD` = 0x64980000+0x2FFDD,
+    // exactly walkPos-35, `got=32768`) and it fired once, but the boot then
+    // spun to **704,373 lines vs w279's 57,892**, of which **451,084 name this
+    // dest** and 112,786 are INFLATE-ENTER at `consumed=196553` FROZEN.
+    // **Why it fails, and this is the useful part: the wall there is OUTPUT
+    // capacity, not input starvation.** The dest window is full, so every
+    // InflateStep writes 0 bytes, outLeft never reaches its caller-loop exit key
+    // on its own, and removing UNSTUCK's exit leaves the guest's own loop
+    // spinning. So the garage needs the consumer to drain the window and hand the
+    // stream a NEW dest — which is exactly T41.11's multi-window fill (closed
+    // not-viable in F-303 on frame-0 cursor reset + slot clobber), reachable only
+    // from the place-pass/consumer side, NOT from the serve side. UNSTUCK's
+    // zero-outLeft is crude but it is what lets the rest of the boot proceed.
+    if (kUiXsfTailTopup && inLeft > 0 && inLeft < 256 && outLeft > 0 &&
+        MclaUiXsfChunkOpen(outPtr)) {
+      static std::mutex s_tailMtx;
+      static uint32_t s_tailBuf = 0;
+      std::lock_guard<std::mutex> tlk(s_tailMtx);
+      uint32_t pkgOff = 0, walkPos = 0;
+      {
+        std::lock_guard<std::mutex> wl(g_destPkgMtx);
+        pkgOff = g_destPkgOff[outPtr];
+        walkPos = g_destPkgWalk[outPtr];
+      }
+      if (walkPos >= inLeft) {
+        if (s_tailBuf == 0)
+          s_tailBuf = mem.Alloc(0x8000, 16);
+        std::vector<uint8_t> tmp(0x8000);
+        auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+        mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+        uint64_t got = 0;
+        bool ok = vfs.OpenFile("xarchive_cache.rpf", fh);
+        if (ok) {
+          ok = vfs.ReadFileAt(fh, pkgOff + walkPos - inLeft, tmp.data(),
+                              0x8000, got) && got >= 0x8000;
+          vfs.CloseFile(fh);
+        }
+        if (ok && s_tailBuf &&
+            mem.WriteBytes(s_tailBuf, tmp.data(), static_cast<uint32_t>(got))) {
+          const uint32_t newWalk = walkPos - inLeft + static_cast<uint32_t>(got);
+          {
+            std::lock_guard<std::mutex> wl(g_destPkgMtx);
+            g_destPkgWalk[outPtr] = newWalk;
+          }
+          (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got));
+          (void)mem.WriteU32BE(st + 4, s_tailBuf);
+          static std::atomic<uint32_t> s_tailN{0};
+          const uint32_t tn = s_tailN.fetch_add(1) + 1;
+          MCLA_LOG_WARN("UIXSF-TAIL-TOPUP #{} dest={:08X} pkg={:08X} "
+                        "wasInLeft={} readAt={:08X} got={} → in={} walk={:08X} "
+                        "consumed={}",
+                        tn, outPtr, pkgOff, inLeft, pkgOff + walkPos - inLeft,
+                        got, got, newWalk, consumed);
+          return;  // don't run InflateStep on a 35-byte unusable buffer
         }
       }
     }
