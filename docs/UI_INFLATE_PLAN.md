@@ -208,11 +208,11 @@ non-evidence).
 `kPathBSingleOpen=false` `:545` · `kUiServeAdvance=false` `:571` ·
 `kUiXsfChunkFeed=true` `:589` · `kUiXsfSetExpected=true` `:603` ·
 `kUiXsfTailTopup=false` `:609` · `kUiXsfClearResume=false` `:631` ·
-`kUiXsfBoundUnc=true` `:7991` · `kUiXsfVerify=true` `:8136` ·
-`kUiXsfHunt=true` `:8174` · `kUiXsfGoldenFill=true` `:8376` ·
-`kUiXsfFillListOrder=true` `:8395` ·
-`kUiXsfFrameServe=false` `:8442` · `kUiXsfFillDryRun=true` `:8449` ·
-`kUiXsfReverify=true` `:8599` · `kUiXsfClearResume=false` `:631` · `kUiXsfLocate=true` `:642` · `kUiXsfAppendWindow=false` `:660` · `kUiXsfPrivateCtx=false` `:703` · `kUiXsfSerializeCtx=false` `:731`.
+`kUiXsfBoundUnc=true` `:8104` · `kUiXsfVerify=true` `:8425` ·
+`kUiXsfHunt=true` `:8463` · `kUiXsfGoldenFill=true` `:8665` ·
+`kUiXsfFillListOrder=true` `:8684` ·
+`kUiXsfFrameServe=false` `:8731` · `kUiXsfFillDryRun=true` `:8738` ·
+`kUiXsfReverify=true` `:8888` · `kUiXsfClearResume=false` `:631` · `kUiXsfLocate=true` `:642` · `kUiXsfAppendWindow=false` `:660` · `kUiXsfPrivateCtx=false` `:703` · `kUiXsfSerializeCtx=false` `:731`.
 
 **Net shipped effect:** Path A hosts 3 containers outright; the feed follows the
 stream and publishes the correct `st+12`; the third container's placement is
