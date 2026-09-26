@@ -681,6 +681,16 @@ static constexpr bool kUiXsfAppendWindow = false;
 // writing its input over its own context (or vice versa). Before this is
 // retried, the private ctx must be allocated in a block that cannot alias the
 // serve buffer and the aliasing checked, not assumed away.
+// F-338 MEASURED = false, and it corrects F-337 §4: the collapse was NOT the
+// allocation aliasing. With the context placed in the second half of a doubled
+// allocation (raw=CAF28300..CAF92300, ctx=CAF5D300) the serve windows were at
+// C8A0xxxx -- provably disjoint -- and the boot still stopped progressing 6 ms
+// after the republish (w318: 27,810 lines vs w317's 58,764, INFLATE-ENTER 32 vs
+// 4,901, one reverify line, no fault line). The reason is in the slot itself:
+// obj = 0x8283D1B0 is a per-JOB record (F-323 showed vbase is per-job), so
+// republishing its +0 hijacks every stream in that job, including the ones that
+// were decoding fine. A per-stream context therefore needs its own object, i.e.
+// the enqueue side (task #15), not a serve-side rewrite of a shared slot.
 static constexpr bool kUiXsfPrivateCtx = false;
 static std::mutex g_uiXsfPrivMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPrivCtx;  // st -> private ctx
@@ -10220,7 +10230,17 @@ PPC_FUNC(sub_821D5E10) {
               priv = it->second;
           }
           if (priv == 0u) {
-            const uint32_t blk = mem.Alloc(0x35000u, 16);
+            // F-338: w316 died because that allocation returned 0xCAF28300 -- the
+            // garage's LIVE serve window -- so each private context aliased its own
+            // input. Ask for twice what is needed and use the SECOND half: the block
+            // the allocator hands out first is the one the legacy serve keeps using,
+            // so the two ranges cannot overlap. Both are printed to make the claim
+            // checkable in the log rather than asserted in a comment.
+            const uint32_t raw = mem.Alloc(0x6A000u, 16);
+            const uint32_t blk = raw != 0u ? raw + 0x35000u : 0u;
+            if (raw != 0u)
+              MCLA_LOG_WARN("UIXSF-PRIVCTX #{} alloc raw={:08X}..{:08X} ctx={:08X}",
+                            n, raw, raw + 0x6A000u, blk);
             if (blk != 0u) {
               PPCContext q{};
               q.r1.u64 = ctx.r1.u32 - 0x400u;
