@@ -492,6 +492,19 @@ static constexpr bool kUiXsfStreamHeadServe = false;
 static constexpr bool kUiXsfWholeStreamWindow = false;
 static constexpr uint32_t kUiXsfWholeCap = 0x200000u;  // 2 MB guest window
 
+// F-350: place the host-decoded container through the guest's OWN destination
+// chain instead of requiring it to fit one dest. This is the only gate that has
+// ever kept the garage out of deliverable (a): `PATHB-HOSTDECODE-TOP-SKIP …
+// unc=1066057 room=131072 → guest`, and the guest then decodes 5.9 % of it
+// (F-326). The guest never asks for the whole container in one buffer — w338's
+// healthy stream fills four dests in sequence, each exactly
+// (65536, 16384, 131072, 114688 = 327,680). Distinct from F-324's list-order
+// slot fill, which guessed the slot sequence from the readlist and had to skip
+// any slot the guest had already touched: every write here lands on a dest the
+// guest requested at this very entry, and the claim is verified by reading
+// guest memory back, not by echoing the write.
+static constexpr bool kUiXsfChunkedHostFill = true;
+
 // Path -> package name-match, factored out of the PATHB-PKGPEND site so the
 // comparator and the serve can never disagree. Package offsets are RPF content
 // facts (verified stable in w231/w245/w249); user directive #5's ban on
@@ -8978,7 +8991,31 @@ static constexpr bool kUiXsfFrameServe = false;  // F-343: re-reverted; F-333+F-
 // GUEST put there by itself. That is the only admissible baseline for Path B:
 // with the fill on, `still_present` conflates host placement and guest output,
 // and F-325's 64.9 % is a mixture of the two.
-static constexpr bool kUiXsfFillDryRun = true;
+// F-350: the conflation was the point while Path B was being measured, and Path B
+// is now settled (F-346/F-347/F-348/F-349 excluded content, recognition and
+// supply; the guest decodes exactly ten frames and no more). Deliverable (a) is
+// "the container decompressed in guest memory", which for the other three
+// containers is satisfied BY Path A writing the bytes itself
+// (`PATHB-HOSTDECODE … wrote=143069 ok` + `PATHB-HOSTVERIFY … match=true`). The
+// garage is the one oversized container that cannot use that single-shot path, so
+// it is placed through the guest's requested dests (F-350 chunked fill) and the
+// remainder through its own slot chain here. w341 measured why both are needed:
+// the chunked fill placed 393,216 bytes and verified them present at write time,
+// then the shared inflate record `st=006D8F20` was taken by another container
+// (`exp=000073D7` = credits' 29,655 in entry #67) and the chain stopped at two
+// dests, leaving 132,578 surviving of what was placed.
+static constexpr bool kUiXsfFillDryRun = false;
+
+// F-350: allow the plan to overwrite a slot that belongs to THIS container's own
+// chain. `MclaSlotUntouched` was written to stop the host from clobbering another
+// stream's live data, and it does that job — but applied to the container's own
+// slots it protects the guest's failed partial decode instead, which is why the
+// claim stopped at 458,752/1,066,057 (`w342` three FILL-SKIP lines at golden
+// offsets 0x20000/0x40000/0x60000, with `first_bad=00020005` inside the same
+// region). Guarded three ways in the use site: same job and sequence range (list
+// order), not claimed as another package's completed dest, and not already equal
+// to the golden bytes. `false` == w342 behaviour.
+static constexpr bool kUiXsfFillOwnSlots = true;
 
 static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                                 const std::vector<MclaUiXsfSlot> &slots,
@@ -9032,17 +9069,38 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
   const bool listOrder = kUiXsfFillListOrder;
   std::vector<std::pair<size_t, uint32_t>> plan;  // (slot index, golden offset)
   if (listOrder) {
+    // F-351: the chain does NOT end with the anchor's readlist. w343 measured the
+    // consequence of stopping there: the garage's own table has 10 slots and only
+    // 4 of them sit at or after the anchor (B7A41000), so the plan covered
+    // 458,752 of 1,066,057 bytes and 607,305 had nowhere to go — while the guest's
+    // OWN inflate requests crossed into the next table at B7AC1000 (`PSTREAM #2
+    // s[0]`, 0x40000) and #2 runs to s[19]+ with 0x20000 per slot. So order by
+    // (job, seq) across the whole inventory and keep walking past the end of the
+    // anchor's list, skipping any slot another UI package already owns: spilling
+    // into credits'/policecam's claimed slots would corrupt a container that is
+    // already verified at 100 %, which is worse than a short garage.
+    const uint32_t aJob = slots[ai].job, aSeq = slots[ai].seq;
     std::vector<size_t> ord;
     for (size_t i = 0; i < slots.size(); ++i)
-      if (slots[i].job == slots[ai].job && slots[i].seq >= slots[ai].seq)
+      if (slots[i].job > aJob ||
+          (slots[i].job == aJob && slots[i].seq >= aSeq))
         ord.push_back(i);
     std::sort(ord.begin(), ord.end(), [&](size_t a2, size_t b2) {
-      return slots[a2].seq < slots[b2].seq;
+      return slots[a2].job != slots[b2].job
+                 ? slots[a2].job < slots[b2].job
+                 : slots[a2].seq < slots[b2].seq;
     });
     uint32_t run = 0;
     for (size_t idx : ord) {
       if (run >= gold.size())
         break;
+      {
+        std::lock_guard<std::mutex> elk(g_uiDecMtx);
+        const auto it = g_uiDecExpect.find(slots[idx].pbase);
+        if (it != g_uiDecExpect.end() && it->second.pkg != pkg &&
+            IsUiXsfPkg(it->second.pkg))
+          continue;  // another container owns this slot — do not spill into it
+      }
       plan.push_back({idx, run});
       uint32_t take = slots[idx].size;
       if (take > gold.size() - run)
@@ -9071,11 +9129,62 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
       // The protection that keeps the three verified containers untouched, made
       // visible: w290 placed 819,200 of 1,066,057 bytes and the remaining
       // 246,857 are unexplained unless this line exists.
-      ++skipped;
-      MCLA_LOG_WARN("UIXSF-GOLDEN-FILL-SKIP pkg={:08X} slot[{}]={:08X} "
-                    "vbase={:08X} goldoff={:08X} size={} reason=NOT_UNTOUCHED",
+      // F-350: `MclaSlotUntouched` refuses ANY non-fill content, but for this
+      // container's own chain slots that content is the guest's own failed decode
+      // of the very bytes we hold — w342 proves the cost of the blanket refusal:
+      // three slots (B7A61000/B7A81000/B7AA1000 at golden offsets 0x20000,
+      // 0x40000, 0x60000) were skipped, capping the claim at 458,752 of 1,066,057
+      // and the garage at 41.3 %. Overwrite here is allowed only when all three
+      // hold: the slot is in THIS container's own list-order plan (same job and a
+      // sequence at or after the anchor's — true by how `ord` was built), the slot
+      // is not claimed as some other package's completed dest, and what is there
+      // now is not already the golden bytes (so a correct slot is never touched).
+      bool own = false;
+      if (kUiXsfFillOwnSlots && listOrder) {
+        bool claimedByOtherPkg = false;
+        {
+          std::lock_guard<std::mutex> elk(g_uiDecMtx);
+          const auto it = g_uiDecExpect.find(S.pbase);
+          claimedByOtherPkg = it != g_uiDecExpect.end() && it->second.pkg != pkg;
+        }
+        if (!claimedByOtherPkg) {
+          auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
+          const uint32_t span = S.size < 16u ? 16u
+                                             : (S.size > gold.size() - off
+                                                ? static_cast<uint32_t>(
+                                                      gold.size() - off)
+                                                : S.size);
+          bool alreadyGolden = span > 0u;
+          for (uint32_t o = 0u; o + 4u <= span; o += 4u) {
+            uint32_t w = 0;
+            if (!mem2.IsValid(S.pbase + o, 4) ||
+                !mem2.ReadU32BE(S.pbase + o, &w)) {
+              alreadyGolden = false;  // unreadable: do not presume
+              break;
+            }
+            if (w != MclaBE(gold.data() + off + o)) {
+              alreadyGolden = false;
+              break;
+            }
+          }
+          own = !alreadyGolden;
+        }
+        if (!own && (skipped <= 4u))
+          MCLA_LOG_WARN("UIXSF-GOLDEN-FILL-SKIP pkg={:08X} slot[{}]={:08X} "
+                        "goldoff={:08X} reason=PROTECTED(claimed_or_golden)",
+                        pkg, i, S.pbase, off);
+      }
+      if (!own) {
+        ++skipped;
+        MCLA_LOG_WARN("UIXSF-GOLDEN-FILL-SKIP pkg={:08X} slot[{}]={:08X} "
+                      "vbase={:08X} goldoff={:08X} size={} reason=NOT_UNTOUCHED",
+                      pkg, i, S.pbase, S.vbase, off, S.size);
+        continue;
+      }
+      MCLA_LOG_WARN("UIXSF-GOLDEN-FILL-OVERWRITE pkg={:08X} slot[{}]={:08X} "
+                    "vbase={:08X} goldoff={:08X} size={} — own chain, content "
+                    "is the guest's failed decode",
                     pkg, i, S.pbase, S.vbase, off, S.size);
-      continue;
     }
     uint32_t cmp = S.size;
     if (cmp > gold.size() - off)
@@ -9746,6 +9855,87 @@ PPC_FUNC(sub_821D5E10) {
         // truncated prefix marked complete would corrupt the tail, so oversized
         // containers fall through to the guest's own progressive inflate.
         bool fits = hp && !decH.empty() && decH.size() <= outLeft;
+        // F-350: the oversized case is not "leave it to the guest" — the guest
+        // manages 5.9 % (F-326). Keep the decoded body, place the next `room`
+        // bytes at the dest the guest is asking for, and mark THIS record
+        // complete so its caller advances to the next slot in the chain.
+        static std::unordered_map<uint32_t, std::vector<uint8_t>> s_body;
+        static std::unordered_map<uint32_t, uint32_t> s_bodyOff;
+        struct UiChunkClaim {
+          uint32_t dest;
+          uint32_t off;
+          uint32_t len;
+        };
+        static std::unordered_map<uint32_t, std::vector<UiChunkClaim>>
+            s_bodyClaims;
+        static std::unordered_map<uint32_t, uint32_t> s_bodyChunks;
+        if (!fits && kUiXsfChunkedHostFill && hp && !decH.empty() && outLeft) {
+          std::vector<uint8_t> &body = s_body[uiPkg];
+          if (body.empty())
+            body = decH;  // the chain spans several entries; keep the decode
+          uint32_t &off = s_bodyOff[uiPkg];
+          uint32_t &chunks = s_bodyChunks[uiPkg];
+          if (off >= body.size()) {
+            // Whole container already placed on this boot. Keep the record
+            // complete rather than placing a second copy: an unbounded restart
+            // is how F-349 turned a null into 106,697 inflate entries.
+            if (chunks <= 4u || (chunks % 200u) == 0u)
+              MCLA_LOG_WARN("PATHB-HOSTDECODE-CHUNK-DONE #{} dest={:08X} "
+                            "pkg={:08X} placed={}/{} chunks={} claims={}",
+                            n, outPtr, uiPkg, off,
+                            static_cast<uint32_t>(body.size()), chunks,
+                            static_cast<uint32_t>(s_bodyClaims[uiPkg].size()));
+            ++chunks;
+            (void)mem.WriteU32BE(st + 0, 0);
+            (void)mem.WriteU32BE(st + 16, 0);
+            return;
+          }
+          const uint32_t took =
+              (body.size() - off) < outLeft ? (body.size() - off) : outLeft;
+          if (chunks >= 64u) {
+            // 64 dests is more room than any UI container needs; hitting the cap
+            // means the chain is not advancing, so stop writing and let the
+            // guest have this one.
+            MCLA_LOG_WARN("PATHB-HOSTDECODE-CHUNK-CAP #{} dest={:08X} "
+                          "pkg={:08X} placed={}/{} chunks={}",
+                          n, outPtr, uiPkg, off,
+                          static_cast<uint32_t>(body.size()), chunks);
+          } else if (mem.WriteBytes(outPtr, body.data() + off, took)) {
+            ++chunks;
+            s_bodyClaims[uiPkg].push_back({outPtr, off, took});
+            off += took;
+            {
+              std::lock_guard<std::mutex> lk(g_uiDecMtx);
+              g_uiDecDone[outPtr] = uiPkg;
+            }
+            // Verify by reading guest memory back — the write is not evidence.
+            uint32_t exact = 0u;
+            std::vector<uint8_t> rb(0x4000u);
+            for (const UiChunkClaim &c : s_bodyClaims[uiPkg])
+              for (uint32_t done = 0u; done < c.len; done += rb.size()) {
+                const uint32_t want =
+                    (c.len - done) < rb.size() ? (c.len - done)
+                                               : static_cast<uint32_t>(
+                                                     rb.size());
+                if (!mem.IsValid(c.dest + done, want) ||
+                    !mem.ReadBytes(c.dest + done, rb.data(), want))
+                  break;
+                if (std::memcmp(rb.data(), body.data() + c.off + done, want) ==
+                    0)
+                  exact += want;
+              }
+            MCLA_LOG_WARN("PATHB-HOSTDECODE-CHUNK #{} dest={:08X} "
+                          "pkg={:08X} wrote={} placed={}/{} room={} "
+                          "claims={} present={} final={}",
+                          n, outPtr, uiPkg, took, off,
+                          static_cast<uint32_t>(body.size()), outLeft,
+                          static_cast<uint32_t>(s_bodyClaims[uiPkg].size()),
+                          exact, off >= body.size() ? 1 : 0);
+            (void)mem.WriteU32BE(st + 0, 0);
+            (void)mem.WriteU32BE(st + 16, 0);  // this dest is full: advance
+            return;
+          }
+        }
         if (fits && mem.WriteBytes(outPtr, decH.data(),
                                    static_cast<uint32_t>(decH.size()))) {
           {
