@@ -2167,6 +2167,26 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
     return;
   }
 
+  // F-441 (T41.93): is the title's boot-worker queue EVER written? The worker spins on
+  // `a1[15] == a1[14]` and the census reads the queue words as 0 (`W36b-QUEUE qWrite=0 qRead=0
+  // delta=0`, w435 and w440), and no code in the image materialises 0x40004B40/0x40004D5C as an
+  // address (searched: the only `lis r?,16384` sites use it as a 0x40000000 *value*, and the
+  // `+19264` hits resolve to 0x82834B40/0x82044B40), so the object pointer is runtime-supplied and
+  // static search cannot name the poster. This watch names it dynamically or proves none writes.
+  // Separate counter, because the shared PAGEWATCH cap below is already spent by other ranges.
+  if (guestAddr >= 0x40004B40u && guestAddr < 0x40004DC0u) {
+    static std::atomic<uint32_t> s_qStores{0};
+    const uint32_t qn = s_qStores.fetch_add(1) + 1;
+    if (qn <= 32 || (qn % 500) == 0) {
+      uint32_t lr = 0;
+      if (const PPCContext *c = GetPPCContext())
+        lr = static_cast<uint32_t>(c->lr);
+      MCLA_LOG_WARN("F441-QUEUE-STORE #{:05} @ {:08X} = {:08X} lr={:08X}", qn, guestAddr, value,
+                    lr);
+    }
+    return;
+  }
+
   const uint32_t n = s_watchWrites.fetch_add(1) + 1;
   if (n <= 16) {
     uint32_t lr = 0;

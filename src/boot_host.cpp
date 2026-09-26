@@ -1846,6 +1846,10 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // F-358's 0x82112160 limit that F-439 found holding the GFx ctor/wrapper entries.
     mcla::native::RegisterGuestWatchRange(0x82102AA0u, 0x82118000u);
 
+    // F-441 (T41.93): the title's boot-worker queue object (words seen at 0x40004B40 qBase and
+    // 0x40004D5C = the worker's a1). Store-side probe F441-QUEUE-STORE lives in gpu_cp.cpp.
+    mcla::native::RegisterGuestWatchRange(0x40004B40u, 0x40004DC0u);
+
     // Session 76f: watch the "ui" preload-list global (0x827D7770, 32 bytes)
     // — the boot init reads it before anything fills it (BOOTPATH crash).
     mcla::native::RegisterGuestWatchRange(0x827D7770u, 0x827D7790u);
