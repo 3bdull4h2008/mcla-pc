@@ -10,6 +10,26 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~12:5x (ledger through F-357; next ID F-358) — supersedes the
+> "raising the ceiling needs more inflate requests per container" line above.** The
+> request-side route is now **measured closed**: repeating `sub_821FDD50` for an
+> already-requested container returns `00000000` and creates no record and no destination,
+> and with a private out slot per request the attempt is **completely inert** — `w354` vs
+> `w351` reproduces `recs=5 recs_whole=4`, both garage chunks (131,072 then 393,216 of
+> 1,066,057), `claimed=458752 still_present=440720 pct=96`, 18 `XMEM` rows, and `GFx` 13 /
+> `W34-GFX-CENSUS` 6 / `INFLATE` 17,784 / `LISTLINE` 171 / `Fatal error` 1 / `C0000005` 0 all
+> at `+0` (F-357). Reverted and re-verified neutral (`w355`). **Trap recorded with it:** the
+> first attempt (`w352`) shared the primary call's out slot — FDD50 *stores the destination
+> there* — so it erased the handle, minted the project's first
+> `PATHB-PKGFIX-SKIP … dest=00000000`, cost a record and a chunk, and turned the boot into a
+> 238,672-row re-drive of `B7841000`; every downstream reading of `w352` is void (F-357 §3,
+> F-308's class). Combined with F-356 (record marking is not the limiter), **neither side of
+> the request the hook layer can reach moves the two-destination ceiling**, so deliverable
+> (a)'s remaining path for the garage's other 63 % is task #15's per-request record *inside*
+> the streamer walk, or the consumer that would legitimately ask again — `nGfx`=0, which is
+> deliverable (b) and the user's `rule-2`/`F-055` boundary. **Goal (a) 3/4 byte-exact +
+> garage 12.3 %/41.3 % unchanged, (b) `nGfx`=0 — NOT complete.**
+
 > **§0 state, 2026-09-26 ~14:1x (ledger through F-355; next ID F-356).** UI inflate
 > enqueue: **the binding limit is destination supply, now measured.** The guest issues
 > exactly **two** inflate destinations per UI container (262,144–393,216 B) and a 300-second

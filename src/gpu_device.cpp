@@ -521,6 +521,31 @@ static constexpr bool kUiXsfChunkedHostFill = true;
 // explored further.
 static constexpr bool kUiXsfChunkFaithfulAdvance = false;
 
+// F-357: can the hook layer make the guest supply MORE than two inflate destinations for
+// one UI container? Enqueue the same resource once per ~256 KiB of its decompressed length
+// (bounded at 6 passes) so the loader's own descriptor builder would allocate a fresh
+// destination chain per request and F-350's chunked fill would have somewhere to put the
+// rest of the body. Motivated by F-354 (exactly two destinations per UI container,
+// unchanged at 300 s) and F-356 (record marking is not the limiter).
+// ANSWER: NO, measured twice. `sub_821FDD50` returns 0 for a repeat request and creates no
+// record and no destination (`PATHB-ENQ-EXTRA #2 pass=1..4 pkg=64980000 unc=1066057
+// prim=B7AC1000 ret=00000000 out=[00000000 00000000]`, w354) — and the attempt is
+// otherwise COMPLETELY inert: w354 vs w351 reproduces `recs=5 recs_whole=4`, both chunk rows
+// (#33 131,072/claims=1 and #64 393,216 of 1,066,057/claims=2), `claimed=458752
+// still_present=440720 pct=96 first_bad=00020005`, 18 XMEM rows, `GFx` 13, W34-GFX-CENSUS 6,
+// INFLATE 17,784, LISTLINE 171, Fatal 1, C0000005 0 — all +0.
+// w352 (the first attempt, before the slot fix) is VOID as evidence about the loader: its
+// loop shared the primary call's out slot, and FDD50 WRITES THE DESTINATION THERE (w351 and
+// w354 `PATHB2 #2 path='garage/garage' … out=[B7AC1000 00000000]`), so the repeats erased
+// the handle — minting the project's first `PATHB-PKGFIX-SKIP … dest=00000000`, dropping a
+// record (recs 5->4), costing a chunk (393,216 -> 131,072) and turning the boot into a
+// 238,679-row re-drive of destination B7841000 (18 rows in w351) that never reached the
+// GFX-CENSUS rows. F-308's class; the rule it teaches is F-357b at the call site: never
+// reuse a guest call's out param.
+// Consequence for the objective: the ceiling is not request-side, so deliverable (a)'s only
+// remaining path is the consumer that would ask again — `nGfx`=0.
+static constexpr bool kUiXsfMultiEnqueue = false;
+
 // Path -> package name-match, factored out of the PATHB-PKGPEND site so the
 // comparator and the serve can never disagree. Package offsets are RPF content
 // facts (verified stable in w231/w245/w249); user directive #5's ban on
@@ -13786,6 +13811,54 @@ PPC_FUNC(sub_821E2940) {
       }
       f.lr = 0x821FE6ECu;   // a real FDD50 caller's return address
       __imp__sub_821FDD50(f, base);
+      // F-357: enqueue the SAME container more than once when it is bigger than one
+      // destination chain. `w351`'s PATHB-REC dump shows why this is the right knob:
+      // each container gets a data record carrying its FULL length
+      // (`+4=00104449` = 1,066,057 for the garage, `+24=64980000`) plus a consumer
+      // record at `+4=0`, so the streamer knows the size and allocates destination
+      // lazily per request -- and F-354 measured that it stops after two requests
+      // (262,144-393,216 B) because the consumer that would ask for more (GFx) never
+      // runs. F-356 proved the record-marking is not the limiter. One enqueue call
+      // per pass is the guest's OWN descriptor construction (`sub_821FDD50` also runs
+      // the record build + inflate synchronously, F-251), so the hope was that each
+      // pass yields a fresh record, a fresh destination chain, and a fresh `kUiDecTry`
+      // for the F-350 chunked fill to place the NEXT chunk of the body into.
+      {
+        const uint32_t pkEnq = MclaUiXsfPkgForPath(pathName);
+        const uint32_t uncEnq = pkEnq != 0u ? MclaUiXsfUnc(pkEnq) : 0u;
+        uint32_t passes = 1u;
+        if (kUiXsfMultiEnqueue && uncEnq > 0x40000u) {
+          passes = (uncEnq + 0x3FFFFu) / 0x40000u;  // ~256 KiB of dest per pass
+          if (passes > 6u)
+            passes = 6u;
+        }
+        // F-357b: the PRIMARY call stores its destination in `outSlot` (w351 garage
+        // `PATHB2 #2 … out=[B7AC1000 00000000]`), so a repeat must never share it. w352
+        // zeroed it once per pass and left it 0, which is what made
+        // `PATHB-PKGFIX-SKIP … dest=00000000` appear for the first time in the project and
+        // let the streamer re-drive one destination 238,672 times (11 in w351). Read the
+        // primary handle for the record, then give every repeat its own slot.
+        uint32_t primH = 0;
+        (void)mem.ReadU32BE(outSlot, &primH);
+        for (uint32_t p = 1u; p < passes; ++p) {
+          const uint32_t slotX = mem.Alloc(8, 16);
+          if (!slotX)
+            break;
+          (void)mem.WriteU32BE(slotX, 0);
+          (void)mem.WriteU32BE(slotX + 4, 0);
+          s_pendingUiPkg.store(pkEnq);
+          PPCContext g = f;  // same args, same calling convention, new request
+          g.r3.u64 = slotX;
+          __imp__sub_821FDD50(g, base);
+          s_pendingUiPkg.store(0);
+          uint32_t h0 = 0, h1 = 0;
+          (void)mem.ReadU32BE(slotX, &h0);
+          (void)mem.ReadU32BE(slotX + 4, &h1);
+          MCLA_LOG_WARN("PATHB-ENQ-EXTRA #{} pass={} pkg={:08X} unc={} "
+                        "prim={:08X} ret={:08X} out=[{:08X} {:08X}]",
+                        n, p, pkEnq, uncEnq, primH, g.r3.u32, h0, h1);
+        }
+      }
       // F-251: if FDD50's internal inflate didn't consume the pending pkg
       // (dest already mapped, etc.), drop it so it can't leak to a later dest.
       s_pendingUiPkg.store(0);
