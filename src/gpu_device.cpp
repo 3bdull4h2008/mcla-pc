@@ -763,6 +763,36 @@ static std::mutex g_uiXsfPkgMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPkgCtx;  // pkg -> private ctx
 static std::atomic<uint32_t> g_uiXsfOrigCtx{0};
 
+// F-344: hold the shared codec context by not letting another container's INFLATE CALL
+// run, instead of withholding its bytes. F-340 deferred non-owner refills and F-341 then
+// showed the refill is inert for the outcome -- so F-340's null never tested the idea.
+// What actually mutates the context's walk state is the call into sub_8244FF20, so this
+// skips the guest call itself for entries whose destination binds to a UI .xsf package
+// other than the current owner, and returns the benign "consumed nothing" (r3 = 0, no
+// state touched). Ownership rotates after kUiXsfHoldOwnerEntries of the owner's entries
+// so a blocked container is guaranteed to be served eventually -- this cannot livelock.
+// F-344 MEASURED = false, and it catches a trap worth recording: the first run looked
+// like the session best result (failtotal 6 against a ~5,280 baseline) but that was only
+// because the livelocked boot completed 40 inflate entries in 120 s -- fewer frames, not
+// better ones, and cumprod had not passed the baseline either. With the bounded handover
+// the mechanism engages 5 times, hands over 0 times, and every frontier number is exactly
+// baseline (garage 63,072, raceeditor 100 %, cumprod 884,736, failtotal 5,280). So
+// container contention on the shared context is NOT what costs the garage its frames --
+// which removes the last hook-layer mechanism on the list.
+static constexpr bool kUiXsfHoldCtx = false;
+static constexpr uint32_t kUiXsfHoldOwnerEntries = 400u;
+static std::atomic<uint32_t> g_uiXsfHoldOwner{0};
+static std::atomic<uint32_t> g_uiXsfHoldCount{0};
+static std::atomic<uint32_t> g_uiXsfHoldBlocked{0};
+// F-344b: w332 blocked 1,161,883 times in 120 s -- a livelock of exactly the F-315/w275
+// shape, because the cap was only on the OWNER's entries and a blocked container's job
+// loop re-calls inflate immediately. Ownership now also rotates on a run of consecutive
+// blocks against the same package, so no container can be starved for more than
+// kUiXsfHoldMaxRun calls.
+static std::atomic<uint32_t> g_uiXsfHoldLast{0};
+static std::atomic<uint32_t> g_uiXsfHoldRun{0};
+static constexpr uint32_t kUiXsfHoldMaxRun = 24u;
+
 // F-343: the one combination F-333 never ran. F-333 cleared the frame driver's resume
 // pair once, at refill time, and coverage moved the wrong way -- but F-335 then
 // established that the caller RE-ARMS the inflate record on every call, so a clear that
@@ -9254,6 +9284,50 @@ PPC_FUNC(sub_821D5E10) {
   // *obj as the context; r3 is the return value by the time the refill runs, so
   // capture it here.
   const uint32_t objAtEntry = ctx.r3.u32;
+  // F-344: one container at a time inside the shared context, by skipping the CALL.
+  if (kUiXsfHoldCtx) {
+    auto &hm = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t hst = ctx.r4.u32;
+    uint32_t hdest = 0;
+    (void)hm.ReadU32BE(hst + 20u, &hdest);
+    const uint32_t hpkg = hdest != 0u ? PeekPackageForDest(hdest) : 0u;
+    if (hpkg != 0u && IsUiXsfPkg(hpkg)) {
+      uint32_t owner = g_uiXsfHoldOwner.load();
+      if (owner == 0u) {
+        g_uiXsfHoldOwner.store(hpkg);
+        g_uiXsfHoldCount.store(1);
+        MCLA_LOG_WARN("UIXSF-HOLD-CTX pkg={:08X} takes the context", hpkg);
+      } else if (owner == hpkg) {
+        if (g_uiXsfHoldCount.fetch_add(1) + 1 >= kUiXsfHoldOwnerEntries) {
+          g_uiXsfHoldOwner.store(0);
+          g_uiXsfHoldCount.store(0);
+          MCLA_LOG_WARN("UIXSF-HOLD-CTX pkg={:08X} releases after {} entries",
+                        hpkg, kUiXsfHoldOwnerEntries);
+        }
+      } else {
+        const uint32_t run =
+            g_uiXsfHoldLast.load() == hpkg ? g_uiXsfHoldRun.fetch_add(1) + 1 : 1u;
+        g_uiXsfHoldLast.store(hpkg);
+        g_uiXsfHoldRun.store(run);
+        const uint32_t blocked = g_uiXsfHoldBlocked.fetch_add(1) + 1;
+        if (run >= kUiXsfHoldMaxRun) {
+          g_uiXsfHoldOwner.store(hpkg);
+          g_uiXsfHoldCount.store(1);
+          g_uiXsfHoldRun.store(0);
+          if (blocked <= 8u || (blocked % 2000u) == 0u)
+            MCLA_LOG_WARN("UIXSF-HOLD-CTX hand over {:08X} -> {:08X} (blocked={})",
+                          owner, hpkg, blocked);
+        } else {
+          if (blocked <= 4u || (blocked % 2000u) == 0u)
+            MCLA_LOG_WARN("UIXSF-HOLD-CTX pkg={:08X} blocked by owner {:08X} "
+                          "run={} (blocked={})", hpkg, owner, run, blocked);
+          ctx.r3.u32 = 0u;  // the caller reads r3 as the status; 0 == S_OK, no bytes
+          return;
+        }
+      }
+    }
+  }
+
   // F-343: clear the frame driver's walk state on every UI-container entry.
   if (kUiXsfClearResumeEvery) {
     auto &wm = mcla::kernel::GuestMemoryHeap::Instance();
