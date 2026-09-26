@@ -10,6 +10,28 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~10:2x (ledger through F-347; next ID F-348).** UI inflate
+> enqueue: **Path B's serve content is now excluded, and so is head recognition.**
+> New log-only comparator `UIXSF-GUESTCOPY` (`src/gpu_device.cpp:517`) proves every
+> served window is byte-identical to the guest's own in-memory copy of the container
+> (`w335:2578`, `match=1` on six garage windows, both at `walk=0` and `walk=0x0C`);
+> `w335` vs `w334` is every tracked marker `+0`, so the instrument is inert.
+> F-347 then positioned the window where the guest's own preamble check looks
+> (`pkg+0x0C`, + `st+8=0`) and **provably made that check fire** (`XMEM-SRCHEAD`:
+> `src +8`, `srcSz 32768→32760`) — durable coverage unmoved at `63,072` /
+> `first_bad=00008000`, so it is reverted and recognition is closed as a cause too.
+> The frontier is now binary-invariant and specific: **exactly 10 successful
+> `LZX-FRAME` decodes in `w335`/`w336`/`w337`, then type-1 attempts with `bitbuf=0`,
+> frozen `fsize`/`cumprod`, 102,275 failures.** Two instrument corrections worth
+> re-citing before any argument: `*srcSize(out)` is *bytes consumed* (the caller
+> advances `src` by exactly it; `9526+0+9254+13968 = 32748 = consumed`), and the
+> `exp=196,553` a UI record prints is a stale inherited value on the shared stack
+> record, not that stream's total. Task #15 stands, narrowed to one shape: serialise
+> the streamer's arming at `sub_821BC140`'s descriptor walk, where the
+> (record, context) pair is born — fourteen hook-layer interventions are now
+> measured exclusions, and `rule-2`/`F-055` remain the user's to open.
+> **Goal (a) 3/4 + garage 5.9 %, (b) `nGfx`=0 — NOT complete.**
+
 > **§0 state, 2026-09-26 ~07:0x (ledger through F-333; next ID F-334).** UI `.xsf`
 > inflate: the plan is `docs/UI_INFLATE_PLAN.md` and it now carries the whole
 > mechanism. The decode chain is mapped end to end

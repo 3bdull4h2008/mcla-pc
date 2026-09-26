@@ -441,6 +441,134 @@ static uint32_t MclaPreferredPkgOffForPath(const char *path) {
 // package we actually have to carry instead.
 constexpr uint32_t kPkgWindowMax = 0x400000u;  // 4 MB
 
+// F-346: each UI .xsf container has TWO copies in this boot — the bytes we read
+// out of `xarchive_cache.rpf` at a package offset, and the whole body
+// `HostServeUiBody` already placed in guest memory when the file was opened.
+// Nothing has ever compared them, so "the guest's decoder rejects the bytes we
+// serve" and "we are reading the wrong region" have been indistinguishable for
+// the whole life of Path B. w334 makes the question sharp: the same inflate
+// state decoded 327,680 bytes successfully from a guest-heap source (calls
+// #1..#4) and then produced 0 from 32,768 bytes of ours (call #5 onward), and
+// both sources were 32,748-byte windows beginning with RSC5.
+// Log-only comparator. `kUiXsfCompareGuestCopy=false` == byte-identical
+// baseline behaviour.
+static constexpr bool kUiXsfCompareGuestCopy = true;
+
+// F-347: present the stream where the guest's own preamble check looks, i.e.
+// serve a UI .xsf stream's first window from its XCompress sub-header
+// (pkg+0x0C) instead of the container head (pkg+0), and reset the shared
+// record's `consumed` so that check actually runs.
+// MEASURED (w336) AND REVERTED — the mechanism is real and insufficient. It did
+// what it was built to do: `XMEM-SRCHEAD #5` shows the guest taking its own 8-byte
+// preamble skip on our buffer for the first time in the project (`src CAF28300 ->
+// CAF28308`, `srcSz 32768 -> 32760`), so "the guest never recognizes our head" is
+// now closed as a cause. It moved the deliverable not at all: `UIXSF-GOLDEN-REVERIFY
+// pkg=64980000 still_present=63072 first_bad=00008000`, identical to `w335` on the
+// same binary, and every structural marker +0. That residual is the continuous-bit
+// stream problem F-333/F-343 already measured (a window may not be moved under the
+// driver unless its resume offset and saved cursor agree), so the pair
+// kUiXsfStreamHeadServe+kUiXsfFrameServe is predicted-worse and was not re-run.
+// Kept in-tree, OFF, because the reasoning is the cheapest known route to the one
+// datum that closed a cause. `false` == the F-346 serve framing byte-for-byte.
+static constexpr bool kUiXsfStreamHeadServe = false;
+
+// Path -> package name-match, factored out of the PATHB-PKGPEND site so the
+// comparator and the serve can never disagree. Package offsets are RPF content
+// facts (verified stable in w231/w245/w249); user directive #5's ban on
+// hardcoding applies to guest addresses, which stay dynamically keyed.
+static uint32_t MclaUiXsfPkgForPath(const char *path) {
+  if (!path)
+    return 0u;
+  if (std::strstr(path, "raceeditor"))
+    return 0x64CB0000u;
+  if (std::strstr(path, "garage"))
+    return 0x64980000u;
+  if (std::strstr(path, "policecam"))
+    return 0x64CA3000u;
+  if (std::strstr(path, "credits"))
+    return 0x6496F000u;
+  return 0u;
+}
+
+struct MclaUiXsfGuestCopy {
+  uint32_t buf = 0u;
+  uint32_t size = 0u;
+};
+static std::mutex g_uiXsfCopyMtx;
+static std::unordered_map<uint32_t, MclaUiXsfGuestCopy> g_uiXsfGuestCopy;
+
+static void MclaUiXsfRecordGuestCopy(const char *path, uint32_t buf,
+                                     uint32_t size) {
+  const uint32_t pkg = MclaUiXsfPkgForPath(path);
+  if (pkg == 0u || buf == 0u || size == 0u)
+    return;
+  {
+    std::lock_guard<std::mutex> lk(g_uiXsfCopyMtx);
+    g_uiXsfGuestCopy[pkg] = MclaUiXsfGuestCopy{buf, size};
+  }
+  MCLA_LOG_WARN("UIXSF-GUESTCOPY-REG pkg={:08X} buf={:08X} size={} path='{}'",
+                pkg, buf, size, path);
+}
+
+// Compare the window just read from the archive against the guest's own copy at
+// the same package offset. Bounded to 6 lines per package so it cannot repeat
+// the w298 flood; a recycled guest buffer stays interpretable because the
+// guest's head word is printed alongside.
+static void MclaUiXsfCompareGuestCopy(uint32_t n, uint32_t pkg, uint32_t walk,
+                                      const uint8_t *ours, uint32_t len) {
+  if (!kUiXsfCompareGuestCopy || pkg == 0u || len < 16u)
+    return;
+  uint32_t buf = 0u, size = 0u;
+  {
+    std::lock_guard<std::mutex> lk(g_uiXsfCopyMtx);
+    const auto it = g_uiXsfGuestCopy.find(pkg);
+    if (it == g_uiXsfGuestCopy.end())
+      return;
+    buf = it->second.buf;
+    size = it->second.size;
+  }
+  static std::mutex s_cntMtx;
+  static std::unordered_map<uint32_t, uint32_t> s_cnt;
+  uint32_t seen = 0u;
+  {
+    std::lock_guard<std::mutex> ck(s_cntMtx);
+    seen = ++s_cnt[pkg];
+  }
+  if (seen > 6u)
+    return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (buf == 0u || walk >= size || !mem.IsValid(buf + walk, 4))
+    return;
+  uint32_t cmp = size - walk;
+  if (cmp > len)
+    cmp = len;
+  std::vector<uint8_t> theirs(cmp, 0u);
+  if (!mem.ReadBytes(buf + walk, theirs.data(), cmp))
+    return;
+  uint32_t diff = 0u, first = cmp;
+  for (uint32_t i = 0u; i < cmp; ++i) {
+    if (theirs[i] != ours[i]) {
+      ++diff;
+      if (i < first)
+        first = i;
+    }
+  }
+  uint32_t oh1 = 0u, gh1 = 0u;
+  if (first + 4u <= cmp) {
+    oh1 = static_cast<uint32_t>((ours[first] << 24) | (ours[first + 1] << 16) |
+                                (ours[first + 2] << 8) | ours[first + 3]);
+    gh1 = static_cast<uint32_t>(
+        (theirs[first] << 24) | (theirs[first + 1] << 16) |
+        (theirs[first + 2] << 8) | theirs[first + 3]);
+  }
+  MCLA_LOG_WARN("UIXSF-GUESTCOPY #{} pkg={:08X} walk={:08X} cmp={} diff={} "
+                "firstdiff={} match={} ours_at_first={:08X} "
+                "guest_at_first={:08X} guest_head={:08X} guest_buf={:08X} "
+                "guest_size={}",
+                n, pkg, walk, cmp, diff, first, diff == 0u ? 1 : 0, oh1, gh1,
+                MclaBE(theirs.data()), buf, size);
+}
+
 // F-183: serve an RSC5 member from its XCompress sub-header (RSC5+0x0C)
 // instead of the container head, so the guest's own magic check sees the
 // stream it documents. Flip to false to restore the container-head framing.
@@ -3030,6 +3158,18 @@ PPC_FUNC(sub_8244FF20) {
     (void)xmemMem.ReadU32BE(destSz, &realDestSz);
   if (srcSz)
     (void)xmemMem.ReadU32BE(srcSz, &realSrcSz);
+  // F-346: the bytes at the source. w334 calls #1..#4 read from a guest-heap
+  // buffer and produced 327,680 bytes; call #5 onward read from our bounce
+  // buffer and produced 0. Both windows are 32,748/32,768 bytes long, so size
+  // alone cannot tell them apart — only the head words can. Log-only, 12 lines.
+  if (n <= 12 && src != 0u && realSrcSz >= 16u && xmemMem.IsValid(src, 16u)) {
+    uint32_t sh[4] = {0};
+    for (int i = 0; i < 4; ++i)
+      (void)xmemMem.ReadU32BE(src + i * 4u, &sh[i]);
+    MCLA_LOG_WARN("XMEM-SRCHEAD #{} src={:08X} srcSz={} head=[{:08X} {:08X} "
+                  "{:08X} {:08X}]",
+                  n, src, realSrcSz, sh[0], sh[1], sh[2], sh[3]);
+  }
   // F-331 CENSUS (log-only, zero behaviour change): the frame driver's OWN
   // context, which no instrument of ours has ever read. The chain is
   // sub_821BC140 -> sub_821D5E10 (ppc_recomp.18.cpp:10832) -> sub_8244FF20
@@ -10493,6 +10633,7 @@ PPC_FUNC(sub_821D5E10) {
         // re-serve failure in a new place. Take the stream's package and advance
         // past everything already delivered on this inflate state.
         uint32_t frLen = 0;  // F-327: frame-aligned window size, 0 = legacy
+        bool headServe = false;  // F-347: this window is the stream's preamble
         const uint32_t sPkg =
             kUiXsfChunkFeed ? MclaUiXsfStreamPkg(st, outPtr) : 0u;
         if (sPkg != 0) {
@@ -10505,6 +10646,29 @@ PPC_FUNC(sub_821D5E10) {
           if (sWalk > walkPos)
             walkPos = sWalk;
           readOff = baseOff + walkPos;
+          // F-347: present the stream where the guest's own preamble check
+          // looks. `sub_821D5E10` (generated/ppc_xenon/ppc_recomp.18.cpp:10832,
+          // the algorithm read in F-328) tests [inPtr+0] against the XCompress
+          // magic, takes the stream total from [inPtr+4], and skips 8 bytes —
+          // and w335 `XMEM-SRCHEAD #5` shows both facts of that layout in this
+          // container: 0x0FF512EF at pkg+0x0C and the declared total 1,066,057
+          // at pkg+0x10, so the check fires at +0x0C and the skip lands the
+          // walk on pkg+0x14, which is exactly where the byte-exact offline
+          // decoder (`src/xmem_lzx.h:531-552`) starts. Serving pkg+0 instead —
+          // what every Path B refill has done since F-251 — hands the frame
+          // driver the 20-byte RSC5 container header as if it were a frame
+          // header, and w334 shows the result: `w12300` (header position)
+          // 5650→23001→55769→24659→1680, i.e. nonsense, and every frame from
+          // the first returning −1 while the container call still says S_OK.
+          // The window advance below already computes `readOff - baseOff + got`,
+          // so continuation windows line up with the 8 bytes the guest skips.
+          // MEASURED w336: the skip does happen (src +8, srcSz -8) and coverage
+          // is unmoved — the flag's comment carries the whole result.
+          if (kUiXsfStreamHeadServe && sWalk == 0u) {
+            headServe = true;
+            walkPos = 12u;
+            readOff = baseOff + walkPos;
+          }
           // F-327: replace the fixed stride with THIS frame's byte count. The
           // first window keeps the 20-byte container header in front of frame 0
           // because that is what the guest successfully consumed in w277/w297
@@ -10675,6 +10839,13 @@ PPC_FUNC(sub_821D5E10) {
             constexpr uint32_t kRsc5 = 0x05435352u;
             constexpr uint32_t kXCompress = 0x0FF512EFu;
             const bool isPkgHead = (be == kRsc5 || be == kXCompress);
+            // F-346: bytes-vs-state decider, log-only. If this prints
+            // `match=1` the archive region we serve IS the container the guest
+            // already holds, so the produced=0 failure cannot be a content
+            // problem; if it prints a small `firstdiff`, the package offset in
+            // the path table is wrong and that is the whole bug.
+            MclaUiXsfCompareGuestCopy(n, baseOff, walkPos, tmp.data(),
+                                      static_cast<uint32_t>(got));
             const uint32_t pkgSz = sPkg ? MclaUiXsfWalkCeil(baseOff)
                                         : PackageSizeAt(baseOff);
             // w18: first window of a package MUST be RSC5/XC. Continuation
@@ -10719,6 +10890,13 @@ PPC_FUNC(sub_821D5E10) {
                                  static_cast<uint32_t>(got));
             (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got));
             (void)mem.WriteU32BE(st + 4, s_hsBuf);
+            // F-347: the preamble check only runs when this record reports a
+            // fresh stream. `st` is the shared stack record 0x6D8F20, so it
+            // arrives here carrying the PREVIOUS container's `consumed`
+            // (w334: `consumed=32748` straight into the garage's first window),
+            // which makes the guest treat the head as mid-stream payload.
+            if (headServe)
+              (void)mem.WriteU32BE(st + 8, 0u);
             if (kUiXsfSetExpected && sPkg != 0u) {
               // F-329: publish the block's declared total into the field the
               // guest clamps against, so a stale value inherited on the shared
@@ -13163,11 +13341,7 @@ PPC_FUNC(sub_821E2940) {
       // and match the offline RSC5 read at xarchive_cache.rpf+off. Unmapped path
       // leaves s_pendingUiPkg=0 → AssignPackageForDest falls to prior behavior.
       {
-        uint32_t pk = 0;
-        if (std::strstr(pathName, "raceeditor")) pk = 0x64CB0000u;
-        else if (std::strstr(pathName, "garage")) pk = 0x64980000u;
-        else if (std::strstr(pathName, "policecam")) pk = 0x64CA3000u;
-        else if (std::strstr(pathName, "credits")) pk = 0x6496F000u;
+        const uint32_t pk = MclaUiXsfPkgForPath(pathName);
         s_pendingUiPkg.store(pk);  // 0 = none (safe)
         MCLA_LOG_WARN("PATHB-PKGPEND #{} path='{}' pending_pkg={:08X}", n,
                       pathName, pk);
@@ -14955,6 +15129,9 @@ PPC_FUNC(sub_821CCEA0) {
       auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
       MclaRegisterServedBody(path, xbuf, xsz, dev,
                              static_cast<uint32_t>(ret), tocEntry, tw);
+      // F-346: remember the guest's own copy of a UI container so the Path B
+      // serve can byte-compare its archive read against it (log-only).
+      MclaUiXsfRecordGuestCopy(path, xbuf, xsz);
       // CD3C8 GetSize returns [tocEntry+4]. Publish the served size so
       // alloc+Read consumers get the body we actually hold.
       if (tocEntry && tocEntry != 0xCDCDCDCDu)
