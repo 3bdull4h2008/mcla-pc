@@ -7003,10 +7003,16 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
       uint32_t w0 = 0;
       if (!mem.ReadU32BE(a, &w0))
         continue;
-      if ((w0 & 0xFFFFFF00u) != 0x82073600u && (w0 & 0xFFFF0000u) != 0x82070000u)
-        continue;
-      // Tighten: accept 0x82073xxx vtables only.
-      if ((w0 & 0xFFFFF000u) != 0x82073000u)
+      // F-437 INSTRUMENT FIX: the `0x82073xxx` key could never match a constructed object. The ctor
+      // `sub_824C6F08` installs [obj+0]=0x820736DC / [obj+672]=0x820736B0 (ppc_recomp.94.cpp:3559-3571)
+      // and then, before returning, calls `sub_82482008` on obj+672 AND on obj -- whose FIRST store is
+      // `lis r10,-32249 / addi r9,r10,-8276 / stw r9,0(r3)` = [obj+0] = **0x8206DFAC**, unconditionally
+      // and before any branch (ppc_recomp.87.cpp:16270+). So 0x820736DC is transient mid-ctor and the
+      // table a live loader object actually carries is 0x8206DFAC -- which is exactly what w433's
+      // forced ctor reported (GFX-CTOR-VT-MISMATCH at 8206DFAC/8206DFAC): the expectation was wrong,
+      // not the object. Accept both families so `nGfx` stops asserting an unfalsifiable zero.
+      const uint32_t vpage = w0 & 0xFFFFF000u;
+      if (vpage != 0x82073000u && vpage != 0x8206D000u)
         continue;
       uint32_t movie = 0;
       (void)mem.ReadU32BE(a + 4, &movie);
@@ -7047,6 +7053,15 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
     const uint32_t liveDev = mcla::gpu::DeviceGuestAddr();
     auto *lifeFn = mcla::kernel::g_memory.FindFunction(0x824C6F70u);
     for (int gi = 0; gi < nGfx; ++gi) {
+      // F-437: the scan key above just widened, and THIS loop mutates guest state (arms [obj+12]
+      // and dispatches sub_824C6F70). Keep the widening observation-only -- the drive stays limited
+      // to the vtable it was designed against, so the instrument fix changes nothing the guest can
+      // feel. Without this, a broader count would silently arm a lever on objects never vetted for it.
+      if ((gfx[gi].vt & 0xFFFFF000u) != 0x82073000u) {
+        MCLA_LOG_WARN("W34-LIFE-KEYDEFER #{} obj={:08X} vt={:08X} — counted, not driven", n,
+                      gfx[gi].obj, gfx[gi].vt);
+        continue;
+      }
       uint32_t st28 = 0, dev12 = 0, fl664 = 0, w816 = 0;
       (void)mem.ReadU32BE(gfx[gi].obj + 28, &st28);
       (void)mem.ReadU32BE(gfx[gi].obj + 12, &dev12);
@@ -7293,7 +7308,7 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
                     "ids; parse still gated (do not invent)",
                     n, nGfx, nMoviesLive);
   } else {
-    MCLA_LOG_WARN("W34-NOGFX #{} — no GFx loader objects (vt 0x82073xxx) in "
+    MCLA_LOG_WARN("W34-NOGFX #{} — no GFx loader objects (vt 0x82073xxx/0x8206Dxxx) in "
                   "scan bands; UILOAD/EF220 never armed after inflate",
                   n);
   }

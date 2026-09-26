@@ -395,6 +395,8 @@ hit) · XCompress `0x0FF512EF`; RSC5 `05'CSR'+0`, payload +0xC (`inLeft=read−1
 
 ## 9. Census / marker inventory (log-line vocabulary)
 
+>**F-437 CORRECTION (verified 01:3x): `nGfx` has never been a working GFx loader-object counter. `sub_824C6F08` writes `[obj+0]=0x820736DC` and then calls `sub_82482008`, which unconditionally overwrites `[obj+0]` with `0x8206DFAC` before the ctor returns (`ppc_recomp.94.cpp:3558-3571`, `ppc_recomp.87.cpp:16270+`) -- and the four scan bands miss the region loader objects are allocated in (`w433` forced one to `CF622D00`). The scan now accepts both vtable families (`src/gpu_device.cpp:7006-7016`); `w434` still reads 0 with zero `W34-GFX-MOVIE`/`W34-LIFE-KEYDEFER` rows, which is the band result. **Read `nGfx=0` as "not counted", never as "does not exist"** (T41.91 / task #58).**
+
 All census hooks are log-only unless noted. Files: `gpu_device.cpp` (device
 boundary + inflation + blits + dict), `patches.cpp` (allocation + misc),
 `task_dispatch_trace.cpp` (poison), `gpu_cp.cpp` (page watches), `boot_host.cpp`
