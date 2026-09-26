@@ -194,7 +194,7 @@ ls -l build/mcla.exe build/CMakeFiles/mcla.dir/src/gpu_device.cpp.obj        # r
 cd build && timeout 120 ./mcla.exe > w<NNN>.log 2> w<NNN>_err.log; echo BOOT_RC=$?   # 124 = survived
 python ../tools/soak_census.py w<NNN>.log w<control>.log                     # one baseline per call
 ```
-Gate: **per-marker**, never line totals (F-072) — boot-to-boot variance is
+**A coverage number needs two soaks.** `UIXSF-GOLDEN-REVERIFY … still_present` varies across boots for the same binary: 57,210,368 produced garage coverage of 121,946 in `w322` and 63,072 in `w323` (F-340 §3). So a claim of the form “coverage rose/fell” is only admissible with a same-binary repeat soak beside it, or with a structural co-signal outside the spread (a `failtotal` or `INFLATE-ENTER` change of multiples, not tens of percent). F-326's “stable across five samples” was five samples inside one boot. Gate: **per-marker**, never line totals (F-072) — boot-to-boot variance is
 57,886 vs 102,134 lines for the same binary (`w274` vs `w276`). Structural
 markers (`LISTLINE 171`, `CP-DRAW 166`, `Fatal error 1`, `C0000005 0`,
 `SEEK-DEAD 0`, error-lines 28) must stay at +0; revert immediately if any moves,
@@ -212,7 +212,7 @@ non-evidence).
 `kUiXsfHunt=true` `:8174` · `kUiXsfGoldenFill=true` `:8376` ·
 `kUiXsfFillListOrder=true` `:8395` ·
 `kUiXsfFrameServe=false` `:8442` · `kUiXsfFillDryRun=true` `:8449` ·
-`kUiXsfReverify=true` `:8599` · `kUiXsfClearResume=false` `:631`.
+`kUiXsfReverify=true` `:8599` · `kUiXsfClearResume=false` `:631` · `kUiXsfLocate=true` `:642` · `kUiXsfAppendWindow=false` `:660` · `kUiXsfPrivateCtx=false` `:703` · `kUiXsfSerializeCtx=false` `:731`.
 
 **Net shipped effect:** Path A hosts 3 containers outright; the feed follows the
 stream and publishes the correct `st+12`; the third container's placement is

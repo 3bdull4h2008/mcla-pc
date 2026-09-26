@@ -701,6 +701,38 @@ static constexpr bool kUiXsfAppendWindow = false;
 // A private context per stream therefore needs a per-stream RECORD, i.e. re-plumbing
 // the streamer's job loop (task #15), not another hook intervention.
 static constexpr bool kUiXsfPrivateCtx = false;
+
+// F-340: SERIALISE the shared codec context instead of trying to own a private one.
+// The reason this is now possible: the "obj" the inflate hook receives as r3 is
+// 0x8283D1B0, and the streamer job loop computes it as `lis r10,-32124; addi
+// r19,r10,-11888` -> 0x8283D190, i.e. obj is **one global field at +0x20 of the
+// streamer object**, not a per-record allocation (ppc_recomp.14.cpp:18844-18874,
+// where the same r19 also holds the descriptor count at +24 and the 28-byte
+// descriptor array base at +52). So there is exactly ONE codec context for the whole
+// streamer, which matches F-336 (two opens per boot) and explains F-339 (per-job
+// records): the guest serialises streams through one context by construction, and we
+// interleave them because our serve makes every stream ready at once.
+//
+// The intervention therefore is not a new context; it is letting ONE container finish
+// before another touches the shared one. Ownership is keyed on the container's package
+// offset (per-container, dynamic-dest-safe per user directive #5), and a non-owner is
+// refused a refill for a bounded number of entries -- it has no input, so its frames
+// cannot advance the shared context's walk state. The cap exists so this can never
+// become the F-315/w275 kind of unbounded livelock: after kUiXsfCtxStallCap stalls for
+// a given package, ownership is released and the legacy path resumes.
+// F-340 MEASURED = false. w323 (this binary, block active: 7 UIXSF-CTX-OWNER lines)
+// left every frontier number at baseline -- garage still_present 63,072, cumprod 917,504,
+// failtotal 5,279 -- so deferring non-owner containers does not un-corrupt the shared
+// context. It also exposed something bigger than the fix: the SAME binary produced
+// still_present=121,946 in w322, i.e. this metric has a cross-boot spread that F-326's
+// five within-boot samples never measured. Any coverage claim now needs a same-binary
+// repeat soak beside it (see F-340 §3), which retroactively qualifies F-333's 43,732 as
+// possibly-noisy (its failtotal=89,483 vs ~5,280 is the part that was never noise).
+static constexpr bool kUiXsfSerializeCtx = false;
+static constexpr uint32_t kUiXsfCtxStallCap = 40u;
+static std::mutex g_uiXsfOwnerMtx;
+static uint32_t g_uiXsfCtxOwner = 0;  // pkg offset holding the context
+static std::unordered_map<uint32_t, uint32_t> g_uiXsfStalls;  // pkg -> stalls
 static std::mutex g_uiXsfPrivMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPrivCtx;  // st -> private ctx
 // F-339: the publish/restore pair. g_uiXsfSharedCtx is the value the slot held
@@ -10352,6 +10384,41 @@ PPC_FUNC(sub_821D5E10) {
                               "{:08X}", n, objAtEntry, cur, priv);
               }
             }
+          }
+        }
+        // F-340: keep the shared codec context with one container at a time.
+        if (kUiXsfSerializeCtx && sPkg != 0u) {
+          bool defer = false;
+          uint32_t owner = 0, seen = 0;
+          {
+            std::lock_guard<std::mutex> olk(g_uiXsfOwnerMtx);
+            owner = g_uiXsfCtxOwner;
+            if (owner == 0u) {
+              g_uiXsfCtxOwner = sPkg;
+              owner = sPkg;
+            }
+            if (owner != sPkg) {
+              seen = ++g_uiXsfStalls[sPkg];
+              if (seen <= kUiXsfCtxStallCap)
+                defer = true;
+              else {
+                g_uiXsfCtxOwner = sPkg;  // hand the context over, stop deferring
+                owner = sPkg;
+              }
+            }
+          }
+          if (defer) {
+            if (seen <= 3u || (seen % 20u) == 0u)
+              MCLA_LOG_WARN("UIXSF-CTX-OWNER #{} pkg={:08X} held by pkg={:08X} "
+                            "-> defer this stream (stall {}/{})",
+                            n, sPkg, owner, seen, kUiXsfCtxStallCap);
+            return;
+          }
+          static uint32_t s_ownLog = 0;
+          if (s_ownLog < 6u) {
+            ++s_ownLog;
+            MCLA_LOG_WARN("UIXSF-CTX-OWNER #{} pkg={:08X} HOLDS the shared ctx "
+                          "(st={:08X})", n, sPkg, st);
           }
         }
         // F-334: ask the guest's own buffer where it is, before deciding what to
