@@ -17601,6 +17601,31 @@ PPC_FUNC(sub_821CFF40) {
                   s_442hits.load(), lr, GetCurrentThreadId());
 }
 
+// F-447 (T41.96): the last unobserved hop on the clause-(b) path. `sub_821CFAA8` (the config
+// tokenizer's read) calls `sub_821BE4F0` exactly when its buffer is exhausted, and that routine is
+// one byte wide: `sub_821BE250(r3=obj, r4=&byte, r5=1)`, return the byte if the read returned 1 else
+// return -1 (generated/ppc_xenon/ppc_recomp.14.cpp:24477-24500). So its result says directly whether
+// the guest's own stream layer has any bytes left for the reader at all -- which is the question
+// F-446 left after it excluded our serve path (widening the path filter engaged the serve 142x and
+// changed nothing downstream). Rule 4 checked first: 0x821BE4F0 had one owner (the function map).
+// Log-only, no state change.
+PPC_FUNC_IMPL(__imp__sub_821BE4F0);
+PPC_FUNC(sub_821BE4F0) {
+  static std::atomic<uint64_t> s_447{0};
+  static std::atomic<uint64_t> s_447eof{0};
+  const uint64_t k = s_447.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  __imp__sub_821BE4F0(ctx, base);
+  const int32_t got = static_cast<int32_t>(ctx.r3.s32);
+  if (got == -1)
+    (void)s_447eof.fetch_add(1);
+  if (k <= 64 || (k % 512) == 0)
+    MCLA_LOG_WARN("F447-REFILL #{} obj={:08X} got={:d} byte={:02X} eof={} lr={:08X} tid={}", k, obj,
+                  got, static_cast<unsigned>(ctx.r3.u32 & 0xFFu), s_447eof.load(), lr,
+                  GetCurrentThreadId());
+}
+
 // F-438: count GFx loader CONSTRUCTIONS, because the presence scan has never been able to do it
 // (F-437: `sub_824C6F08` replaces its own vtable key via `sub_82482008`, and the scan's bands miss
 // the region loader objects land in). This routine is the only one that installs the loader vtable
