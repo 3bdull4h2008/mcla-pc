@@ -1623,12 +1623,27 @@ PPC_FUNC(sub_82135150) {
 // function executes. Cap prints the first 8: a count <=8 is complete.
 PPC_FUNC_IMPL(__imp__sub_82131508);
 static std::atomic<uint32_t> s_hRegCb{0};
+// F-361: the object sub_82305690 copies the descriptor into is [0x8288B9E8] (r30 is
+// loaded from exactly that global: `lis r29,-32119` / `lwz r30,-17944(r29)` at
+// ppc_recomp.0.cpp:3618), and that copier SKIPS the copy when `[obj+4] != 0`
+// (`lbz r10,4(r31); cmplwi r10,0; bne -> 0x82305728`). F361-BOOTOBJ found +88..+104 all
+// zero mid-boot, so the discriminator is obj+4 at the moment of the call. Reads only,
+// before the passthrough (F-091); cap first 8 so a small count is complete (F-317).
 PPC_FUNC(sub_82131508) {
     const uint32_t n = s_hRegCb.fetch_add(1) + 1;
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t obj = 0, of4 = 0, d88 = 0, d92 = 0;
+    (void)memR.ReadU32BE(0x8288B9E8u, &obj);
+    if (obj >= 0x80000000u && obj < 0xE0000000u) {
+        (void)memR.ReadU32BE(obj + 4, &of4);
+        (void)memR.ReadU32BE(obj + 88, &d88);
+        (void)memR.ReadU32BE(obj + 92, &d92);
+    }
     if (n <= 8 || (n % 500) == 0)
-        MCLA_LOG_WARN("F360-REGCB #{} tid={:08X} lr={:08X} r3={:08X} r13={:08X} r1={:08X}",
+        MCLA_LOG_WARN("F360-REGCB #{} tid={:08X} lr={:08X} r3={:08X} r13={:08X} r1={:08X} "
+                      "| obj={:08X} [obj+4]={:08X} [obj+88]={:08X} [obj+92]={:08X}",
                       n, GetCurrentThreadId(), static_cast<uint32_t>(ctx.lr),
-                      ctx.r3.u32, ctx.r13.u32, ctx.r1.u32);
+                      ctx.r3.u32, ctx.r13.u32, ctx.r1.u32, obj, of4, d88, d92);
     __imp__sub_82131508(ctx, base);
     if (n <= 8 || (n % 500) == 0)
         MCLA_LOG_WARN("F360-REGCB-POST #{} tid={:08X} r3={:08X}", n,

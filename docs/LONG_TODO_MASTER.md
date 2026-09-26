@@ -10,6 +10,18 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~14:2x (ledger through F-361; next ID F-362) — supersedes the
+> registration half of the block below.** The UI-load callback's registration **does not
+> complete**: `F361-BOOTOBJ` reads `[0x8288B9E8]=C61C5800` with `+88..+104` all zero at four
+> late samples from an independent site, while `F360-REGCB #1` proves the registering
+> function was entered, and the copier's only skip (byte `obj+4 != 0`) is ruled out (byte is
+> 0). So the (b) failure is now **inside `sub_82131508`, before guest `0x821315F4`** — one
+> function, one instruction. **T41.59 re-scoped**: census the call sequence at
+> `ppc_recomp.0.cpp:3613-3633` and name the last callee entered (one build). Neutrality of
+> all four new censuses proven: `w362` vs `w351` = 20 markers `+0`, `[error]` 28=28,
+> short-circuit 1,334=1,334. **(a) unchanged: 3/4 byte-exact + garage 12.3 %/41.3 %, ceiling
+> closed both hook-reachable sides. (b) `nGfx`=0. Goal NOT complete.**
+
 > **§0 state, 2026-09-26 ~14:0x (ledger through F-360; next ID F-361) — supersedes the
 > "0x40003B03 is a table tag / find the table's consumer" frontier of the two blocks below.**
 > **The UI-load callback is registered by live guest code.** `sub_82131508+0xec` forms

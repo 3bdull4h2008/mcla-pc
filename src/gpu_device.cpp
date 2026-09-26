@@ -13880,6 +13880,30 @@ PPC_FUNC(sub_821E2940) {
       MCLA_LOG_WARN("PATHB2 #{} path='{}' handle={:08X} -> FDD50 ret={:08X} "
                     "out=[{:08X} {:08X}] arg0used={:08X}",
                     n, pathName, handle, f.r3.u32, o0, o1, (uint32_t)f.r4.u32);
+      // F-361: separate "the UI-load callback was never registered" from "registered and
+      // never dispatched". F-360 traced the registration: sub_82131508+0xec builds
+      // {0, fn, ?, 0, 1} via sub_821C2FD8 and sub_82305690 copies those 5 dwords into
+      // [0x8288B9E8]+88, so the callback pointer must sit at obj+92. This site runs after
+      // boot init, so a read here is a late, independent check. Reads only.
+      {
+        uint32_t bootObj = 0;
+        if (mem.ReadU32BE(0x8288B9E8u, &bootObj) && bootObj >= 0x80000000u &&
+            bootObj < 0xE0000000u) {
+          uint32_t d[5] = {0, 0, 0, 0, 0};
+          for (int k = 0; k < 5; ++k)
+            (void)mem.ReadU32BE(bootObj + 88u + 4u * static_cast<uint32_t>(k), &d[k]);
+          static std::atomic<uint32_t> s_f361{0};
+          const uint32_t f1 = s_f361.fetch_add(1) + 1;
+          if (f1 <= 4)  // prints the FIRST 4, so any count <=4 is complete (F-317)
+            MCLA_LOG_WARN("F361-BOOTOBJ #{} obj={:08X} desc[+88..+104]={:08X} {:08X} "
+                          "{:08X} {:08X} {:08X} want+92=82131008 got+92={:08X}",
+                          f1, bootObj, d[0], d[1], d[2], d[3], d[4], d[1]);
+        } else {
+          static std::atomic<uint32_t> s_f361bad{0};
+          if (s_f361bad.fetch_add(1) + 1 <= 4)
+            MCLA_LOG_WARN("F361-BOOTOBJ [0x8288B9E8]={:08X} not a guest pointer", bootObj);
+        }
+      }
       // F-198 read-only diagnostic: dump the streamer RECORD for the enqueued
       // handle to see if record[+4] (remaining length) is 0 AT enqueue (=> Path B
       // built a bad/zero-length record) or non-zero (=> zeroed later by the
