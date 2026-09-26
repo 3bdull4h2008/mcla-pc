@@ -762,6 +762,30 @@ static constexpr bool kUiXsfPerPkgCtx = false;
 static std::mutex g_uiXsfPkgMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPkgCtx;  // pkg -> private ctx
 static std::atomic<uint32_t> g_uiXsfOrigCtx{0};
+
+// F-343: the one combination F-333 never ran. F-333 cleared the frame driver's resume
+// pair once, at refill time, and coverage moved the wrong way -- but F-335 then
+// established that the caller RE-ARMS the inflate record on every call, so a clear that
+// happens once is stale by the second window. This clears the driver's walk state
+// (saved cursor S+12276, byte-offset-into-frame S+12280, and the undrained-staging count
+// S+12272) on EVERY entry whose destination binds to a UI .xsf package, which is what
+// "start this call's window as a fresh frame walk" has to mean given the re-arming.
+// Paired with kUiXsfFrameServe (windows that begin on real frame headers), that is the
+// full contract: src at a frame boundary + the driver told to believe it.
+// Unlike F-337/338/342 this writes no context pointer, only the walk fields the driver
+// itself re-initialises, so it cannot halt the streamer.
+// F-343 MEASURED = false, and it reinstates F-333's conclusion on better evidence. The
+// per-entry clear does exactly what F-333's install-time clear could not (by entry #3 the
+// driver's frame offset is already 0 and stays clean), and the outcome is the same as
+// w307's to the byte: garage coverage 43,732, cumprod DOWN to 196,608 from 917,504,
+// failtotal 70,483 vs ~5,280, INFLATE-ENTER 14,293 vs 4,901. Two independent
+// configurations 17 soaks apart both landing on 43,732 -- with co-signals far outside the
+// F-341 noise band -- means F-333's revert was right after all, and the reason is now
+// clear: [S+12280]/[S+12276] are the continuous bit stream's real position, so erasing
+// them makes the driver re-walk frames it has already consumed and lose sync. The walk
+// state must be RESPECTED, not cleared -- which, with F-342 (it cannot be isolated),
+// leaves only task #15.
+static constexpr bool kUiXsfClearResumeEvery = false;
 static std::mutex g_uiXsfPrivMtx;
 static std::unordered_map<uint32_t, uint32_t> g_uiXsfPrivCtx;  // st -> private ctx
 // F-339: the publish/restore pair. g_uiXsfSharedCtx is the value the slot held
@@ -8757,7 +8781,7 @@ static constexpr bool kUiXsfFillListOrder = true;
 // and saved cursor agree with it. Moving `src` under it is wrong in both
 // directions. The next step is therefore to stop moving `src` at all — see
 // kUiXsfServeInPlace.
-static constexpr bool kUiXsfFrameServe = false;
+static constexpr bool kUiXsfFrameServe = false;  // F-343: re-reverted; F-333+F-343 twice now show frame-aligned serving with a cleared walk state loses sync
 
 // F-326: DRY RUN builds the same plan and records the same claims but writes
 // NOTHING, so `UIXSF-GOLDEN-REVERIFY` then reports how much of the container the
@@ -9230,6 +9254,40 @@ PPC_FUNC(sub_821D5E10) {
   // *obj as the context; r3 is the return value by the time the refill runs, so
   // capture it here.
   const uint32_t objAtEntry = ctx.r3.u32;
+  // F-343: clear the frame driver's walk state on every UI-container entry.
+  if (kUiXsfClearResumeEvery) {
+    auto &wm = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t wst = ctx.r4.u32;
+    uint32_t wdest = 0;
+    (void)wm.ReadU32BE(wst + 20u, &wdest);
+    const uint32_t wpkg = wdest != 0u ? PeekPackageForDest(wdest) : 0u;
+    if (wpkg != 0u && IsUiXsfPkg(wpkg)) {
+      uint32_t wctx = s_xmemCtx.load();
+      if (wctx == 0u) {
+        const uint32_t inf = s_guestInflaterR3.load();
+        if (inf != 0u)
+          (void)wm.ReadU32BE(inf, &wctx);
+      }
+      uint32_t wcodec = 0;
+      if (wctx != 0u && wm.ReadU32BE(wctx + 4u, &wcodec) && wcodec == 1u) {
+        uint32_t pre_off = 0, pre_cur = 0, pre_left = 0;
+        (void)wm.ReadU32BE(wctx + 20u + 12280u, &pre_off);
+        (void)wm.ReadU32BE(wctx + 20u + 12276u, &pre_cur);
+        (void)wm.ReadU32BE(wctx + 20u + 12272u, &pre_left);
+        (void)wm.WriteU32BE(wctx + 20u + 12280u, 0);
+        (void)wm.WriteU32BE(wctx + 20u + 12276u, 0);
+        (void)wm.WriteU32BE(wctx + 20u + 12272u, 0);
+        static uint32_t s_clog = 0;
+        if (s_clog < 10u) {
+          ++s_clog;
+          MCLA_LOG_WARN("UIXSF-RESUME-EVERY #{} pkg={:08X} ctx={:08X} cleared "
+                        "off={} cur={:08X} leftover={}",
+                        s_clog, wpkg, wctx, pre_off, pre_cur, pre_left);
+        }
+      }
+    }
+  }
+
   // F-342: publish the container's own codec context for the duration of this entry.
   if (kUiXsfPerPkgCtx) {
     auto &cmem = mcla::kernel::GuestMemoryHeap::Instance();

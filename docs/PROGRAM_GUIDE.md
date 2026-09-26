@@ -253,6 +253,8 @@ context was placed at an address asserted disjoint from every serve window (F-33
 
 `kUiXsfPerPkgCtx` (**OFF**, `src/gpu_device.cpp:761`) is F-342: one private codec context per UI package, opened with the guest's own `sub_82461378` replay and published into the streamer's context slot for entries whose destination binds to that package, with the captured original restored for everything else. Registered as a **tested and reverted** intervention, and the most informative of the three: the swap succeeds once and the decoder then produces nothing at all (`LZX-FRAME failtotal` 0, `INFLATE-ENTER` 32 vs 4,901), because that slot is the streamer's **live** current-context field, not an inflate argument. Do not re-try any variant that writes it — isolate upstream (arm one container at a time) or give each descriptor its own pointer field.
 
+`kUiXsfClearResumeEvery` (**OFF**) + `kUiXsfFrameServe` (**OFF**) - F-343's completion of F-333: clear the frame driver's `[S+12276]`/`[S+12280]`/`[S+12272]` on every entry whose destination binds to a UI .xsf package (F-333 cleared them once, which the per-call re-arming made stale). Registered as **tested and reverted, and it upgrades F-333's verdict**: same 43,732 coverage, with `cumprod` 196,608 vs ~917,504 and `failtotal` 70,483 vs ~5,280 - uncapped tallies outside the coverage band, so the regression is real. **The driver's walk state is the continuous bit stream's position: respect it, do not erase it.**
+
 `kUiXsfGoldenFill` (F-323, **ON by default**) — **the third and most invasive host
 write: it fills guest slots the guest never filled.** Find the slot mapped to a UI
 `.xsf` package whose head equals golden offset 0 (the anchor), take the container's
