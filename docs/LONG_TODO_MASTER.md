@@ -10,6 +10,26 @@
 > Every claim below cites a commit or log; commit-only claims are marked UNVERIFIED.
 > Older status blocks elsewhere = trail, not truth.
 
+> **§0 state, 2026-09-26 ~14:1x (ledger through F-355; next ID F-356).** UI inflate
+> enqueue: **the binding limit is destination supply, now measured.** The guest issues
+> exactly **two** inflate destinations per UI container (262,144–393,216 B) and a 300-second
+> boot adds no third (`w348`, `w349_long`, `PATHB-HOSTDECODE-CHAIN`). Three of four containers
+> fit inside that budget — which is precisely why Path A finished them; the garage's
+> 1,066,057 B cannot, so F-350's 41.3 % is the ceiling rather than 59 % of a solved problem.
+> **Stricter:** request 2 carries **policecam's** `exp=19337` with `inPtr` on the stack — the
+> shared record `0x6D8F20` was re-used and only our map still calls it garage — so
+> unambiguous placement is **131,072 B = 12.3 %**. Slot model settled by observation: the ten
+> successful frames wrote 327,680 B straight through the `50054000→60000000` block jump,
+> so position = next slot in table order (F-327's list model), which still does not license
+> F-351's cross-table spill. Raising the ceiling needs more inflate requests per container
+> with a per-request record (task #15, now with a measured reason) or GFx loading the movie
+> (`nGfx`=0 = the user's `rule-2`/`F-055`); host-allocated destinations are rejected.
+> Tooling (F-355): `soak_census --json` replaces the awk field-count filters that hid a
+> regression today; `tools/test_ppc_disasm.py` measures our hand decoder at **59.4 %**
+> agreement vs capstone with **579** unnameable VMX/op-29 words and a real **operand
+> reversal on `ori`/`oris`/`xori`/`xoris`**; headless IDA verified live. **Goal (a) 3/4
+> byte-exact + garage 12.3 %/41.3 %, (b) `nGfx`=0 — NOT complete.**
+
 > **§0 state, 2026-09-26 ~11:4x (ledger through F-353; next ID F-354).**
 > **F-353 corrects the gate evidence of everything before it today.** My neutrality
 > filter `awk 'NF==4 && $4!="+0"'` was self-defeating: `soak_census.py` tags only

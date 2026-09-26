@@ -8064,3 +8064,39 @@ The second garage shape is `XMEM-SZPTR #14,#16,#18,#20,#22,#24`: `*srcSz(in)=20`
 **6. The repeat soak ran and resolved §3 before this entry closed.** `build/w347.log` is the SAME binary as `w346`, booted again: `PUT= 6,549 vs 6,307 (+242)` and `rptrWB 6,589 vs 6,345 (+244)` swing on an identical binary, so the −305 in `w346` vs `w340` is inside that band — the CP-pipeline concern is noise and is withdrawn. The other side of the same control is the stronger result: `INFLATE 17,784` is **bit-identical across the two boots**, while the pre-F-350 binaries gave 14,491 and 14,492. So +3,292 inflate entries is a reproducible effect of the placement, not boot variance, and `INFLATE-SKIP` (127), `PRESENT` (51), `LISTLINE` (171), `GFx` (13) and `C0000005` (0) are likewise identical across boots. **A same-binary pair does not just bound the noise — it separates the markers that are deterministic from the ones that are timing, and only the deterministic ones may be quoted as evidence.**
 
 **5. Objective state, unchanged in substance.** (a) 3 containers byte-exact + garage **440,720/1,066,057 = 41.3 %** resident and readback-verified (that number came from guest-memory reads, not from the broken filter, so it stands). (b) `nGfx`=0. Next ID F-354.
+
+### F-354 (2026-09-26 ~13:5x-14:1x, **BUILT + SOAKED `w348` 120 s and `w349_long` 300 s**) — **the binding limit on deliverable (a) is destination supply, measured: the guest issues exactly TWO inflate destinations per UI container, and a 300-second boot adds no third. Supersedes F-350's framing of its own ceiling.**
+
+- Task:        UI inflate enqueue (F-186 objective), deliverable (a).
+- Type:        FACT
+- Class:       G (the guest's own load behaviour)
+- Priority:    P0
+- Evidence:    `build/w348.log` `PATHB-HOSTDECODE-CHAIN pkg=64980000 n=1 this=B7A41000 room=131072` then `n=2 this=B7AC1000 room=262144`, nothing further; identical pair in `build/w349_long.log`. Other containers get exactly two as well: `64CA3000` → `B7A61000`+`B7441000`; `6496F000` → `B7801000`+`B74E1000`. Code: the `PATHB-HOSTDECODE-CHAIN` printer in the `act == kUiDecTry` block of `src/gpu_device.cpp`.
+
+**1. Why three containers finished and one did not.** Two destinations totalling 262,144–393,216 bytes are handed to every UI container. raceeditor (143,069), policecam (19,337) and credits (29,655) fit inside that budget, which is exactly why Path A could complete them in one shot; the garage needs 1,066,057 and is the only container large enough to notice the budget exists. So F-350's 41.3 % is not "59 % of a solvable problem" — it is the two-request ceiling.
+
+**2. Be stricter than my own headline.** The census prints the guest's record with each request. Request 1 is clean (`consumed=32748 exp=1066057 outLeft=131072 produced=327680`). Request 2 reads `inLeft=19325 inPtr=006D8F4C consumed=0 exp=19337 produced=0` — `19,337` is **policecam's** uncompressed size and `0x6D8F4C` is the stack record, i.e. the shared `st=0x6D8F20` was re-used under us and only our dest→package map still calls that destination garage's. Unambiguous, self-consistent placement is therefore the first request alone: **131,072 B = 12.3 %**. Report both figures and lead with the strict one.
+
+**3. The slot model is now settled by observation, not preference.** The ten frames that decoded successfully wrote 327,680 bytes into four successive destinations whose slots are `s1 vbase=50040000 size=10000`, `s2 50050000 size=4000`, `s3 60000000 size=20000`, `s4 60020000` — the output continued straight through the `50054000 → 60000000` virtual discontinuity (65,536+16,384+131,072+114,688 = 327,680). Container position = **next slot in table order**, confirming F-327's `listOrder`. This still does not license F-351's crossing into a *different load's* table, and §2 shows why caution is right: records are already being re-used underneath us.
+
+**4. What could raise the ceiling, ranked by evidence.** (i) Make the guest issue more inflate requests for one container with a **per-request record** rather than the shared stack one — task #15, now with a measured reason attached to it. (ii) Have the consumer allocate by actually loading the movie, i.e. the `nGfx`=0 half, which is `rule-2`/`F-055` (the user's). (iii) Host-allocated destinations — rejected on principle: memory the loader does not own is not "the container decompressed in guest memory" in any sense that could be consumed.
+
+**5. Objective state.** (a) raceeditor/policecam/credits byte-exact; garage 131,072 B unambiguous (12.3 %) / 440,720 B claimed-present by the map (41.3 %), against a measured two-request destination budget of 262,144–393,216 B. (b) `nGfx`=0, unchanged. Goal remains OPEN. Next ID F-355.
+
+### F-355 (2026-09-26 ~13:0x-14:1x, **tooling only, zero emulator behaviour change; commits `b3ceec7`, `2f86377`**) — **two instruments that can actually fail were missing: `soak_census --json`, and a capstone oracle for `ppc_disasm.py`, which measures 59.4 % agreement, 579 words it cannot name, and one real operand-reversal defect class.** Also supersedes four `file:line` citations I wrote today, already drifted.
+
+- Type:        FIX (tooling) + FACT (measured defects)
+- Class:       H
+- Priority:    P1
+- Evidence:    `python tools/soak_census.py build/w346.log build/w340.log --json` → 183 markers, **32 with a delta**: `INFLATE +3,292`, `READWRAP +2,236`, `INFLATE-ENTER +1,115`, `JOIN +118`, `PAGESLOT +42`, `INFLATE-SKIP`/`fatal`/`skip fatal` +21 each, `rptrWB`/`WAIT`/`PUT=`/`WAKE` −305..−307 (noise, per F-353 §6's same-binary pair). `python tools/test_ppc_disasm.py -n 6000` → both decoded 4,774, agreed 2,834 = **59.36 %**, ours-unnamed **579**. Headless IDA: `decompile_function 0x82461378` returns pseudocode; `get_metadata` → `base 0x82000000 size 0xad3000` on `build/cache/mcla_pe.bin`.
+
+**1. `--json` because the human table is unsafe to filter.** Only non-zero delta rows get the trailing `<<`/`>>` (6 fields vs 4 for `+0` rows), and five tracked names contain spaces (`Fatal error`, `skip fatal`, `boot-worker AV`, `fallback advance`, `VEH W0: parking thread`). Any column/field-count filter therefore silently drops exactly the rows that matter — that is the mechanism of F-353's false neutrality. Read `.markers[name].delta`.
+
+**2. `tools/test_ppc_disasm.py`: a 296-line hand-written opcode chain with no test, no assertion, and no VMX at all,** measured against capstone on real guest bytes. 579 words capstone names that our tool emits as `?opNN`/`float/ps` (all VMX/VSX plus op-29 forms) — on a repo with a 251-line VMX plan — and a genuine semantic bug class: **operand reversal in the logical-immediate group** (`ori r11,r21,0x6443` printed where the encoding is `ori r21, r11, …`; likewise `oris`/`xoris`/`xori`). Pseudo-op naming (`lis`/`addis`, `rlwinm`/`clrlwi`, raw `bc` vs `beq`) is formatting and the harness aliases it. Use `--only <VA>…` for any specific claim: a whole-image sample includes data words (`0x61756443` = "audC").
+
+**3. Capstone installed and IDA live, so `ppc_disasm.py` is no longer load-bearing.** §10 carries the start command and the three transport gotchas (raw image not `.xex`; the `Accept` pair; SSE line-reading; the stdio proxy breaks `tools/call`).
+
+**4. Superseded citations of my own, corrected by re-reading.** F-346 §Evidence cited `:479` `MclaUiXsfPkgForPath`, `:517` `MclaUiXsfCompareGuestCopy`, `:3169` the `XMEM-SRCHEAD` printer — true values are **512**, **550**, **3202** (`:455` for the flag was right). Today's own edits shifted everything below the insertion points; the audit measured the same drift at 10 of 11 sampled §7 citations. **Rule: re-grep a `file:line` immediately before citing it; prefer a symbol anchor.**
+
+**5. Objective state unchanged** (F-354 §5). Goal remains OPEN. Next ID F-356.
+

@@ -9923,6 +9923,58 @@ PPC_FUNC(sub_821D5E10) {
     const uint32_t uiPkg = PeekPackageForDest(outPtr);
     if (uiPkg != 0 && IsUiXsfPkg(uiPkg)) {
       const UiDecAct act = UiDecClassify(outPtr, uiPkg);
+      // F-354: print the DESTINATION CHAIN the guest actually requests for each UI
+      // container, because that — not any host choice — is what bounds Path A
+      // placement: F-350 reached 458,752 of 1,066,057 bytes and the ceiling is
+      // exactly the destinations offered (`B7A41000` room 131,072 then
+      // `B7AC1000` room 262,144, `w341`), after which the shared record
+      // `st=0x6D8F20` is taken by another container. Is the chain 2 long, does it
+      // resume later in the boot (a multi-pass load would let F-350 place the rest
+      // with no new mechanism), or does `outPtr` repeat (a ring, which would mean
+      // placement must round-robin)? Nothing printed that before. Log-only, and it
+      // prints the whole chain each time it grows so one line answers the question
+      // regardless of order.
+      {
+        static std::mutex s_chainMtx;
+        static std::unordered_map<uint32_t, std::vector<uint32_t>> s_chain;
+        std::lock_guard<std::mutex> clk(s_chainMtx);
+        std::vector<uint32_t> &ch = s_chain[uiPkg];
+        bool fresh = true;
+        for (uint32_t d : ch)
+          if (d == outPtr) {
+            fresh = false;
+            break;
+          }
+        if (fresh && ch.size() < 24u) {
+          ch.push_back(outPtr);
+          std::string listing;
+          for (uint32_t d : ch) {
+            char hex[9];
+            for (int b = 0; b < 4; ++b) {
+              const unsigned v = (d >> (24 - 8 * b)) & 0xFFu;
+              const char dig[] = "0123456789ABCDEF";
+              hex[2 * b] = dig[v >> 4];
+              hex[2 * b + 1] = dig[v & 0xF];
+            }
+            hex[8] = 0;
+            listing += hex;
+            listing += ' ';
+          }
+          uint32_t r0 = 0, r4 = 0, r8 = 0, r12 = 0, r16 = 0, r24 = 0;
+          (void)mem.ReadU32BE(st + 0, &r0);
+          (void)mem.ReadU32BE(st + 4, &r4);
+          (void)mem.ReadU32BE(st + 8, &r8);
+          (void)mem.ReadU32BE(st + 12, &r12);
+          (void)mem.ReadU32BE(st + 16, &r16);
+          (void)mem.ReadU32BE(st + 24, &r24);
+          MCLA_LOG_WARN("PATHB-HOSTDECODE-CHAIN pkg={:08X} n={} this={:08X} "
+                        "act={} room={} rec=[inLeft={} inPtr={:08X} consumed={} "
+                        "exp={} outLeft={} produced={}] chain={} ",
+                        uiPkg, static_cast<uint32_t>(ch.size()), outPtr,
+                        static_cast<int>(act), outLeft, r0, r4, r8, r12, r16,
+                        r24, listing);
+        }
+      }
       if (act == kUiDecComplete) {
         // already fully decoded into this dest — keep it complete, skip re-inflate.
         (void)mem.WriteU32BE(st + 0, 0);
