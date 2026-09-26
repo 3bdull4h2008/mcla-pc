@@ -7972,40 +7972,197 @@ static bool MclaUiXsfChunkOpen(uint32_t st, uint32_t outPtr) {
 // filled, not just the ones the host wrote. Log-only: no guest state is touched.
 static constexpr bool kUiXsfVerify = true;
 
+// Golden bytes for a UI .xsf package, decoded once and cached. Empty means the
+// decode failed and no verdict from this package is admissible.
+static const std::vector<uint8_t> &MclaUiXsfGolden(uint32_t pkg) {
+  static std::mutex s_gMtx;
+  static std::unordered_map<uint32_t, std::vector<uint8_t>> s_golden;
+  std::lock_guard<std::mutex> glk(s_gMtx);
+  const auto it = s_golden.find(pkg);
+  if (it != s_golden.end())
+    return it->second;
+  std::vector<uint8_t> dec;
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+  std::vector<uint8_t> raw(0x400000);
+  uint64_t got = 0;
+  int hp = 0;
+  if (vfs.OpenFile("xarchive_cache.rpf", fh)) {
+    const bool rd =
+        vfs.ReadFileAt(fh, pkg, raw.data(), 0x400000, got) && got >= 24;
+    vfs.CloseFile(fh);
+    if (rd)
+      hp = mcla_lzx::host_decode_ui_xsf(raw.data(), static_cast<size_t>(got),
+                                        dec, kXcWindowBits);
+  }
+  if (!hp)
+    dec.clear();
+  return s_golden.emplace(pkg, std::move(dec)).first->second;
+}
+
+// F-322: WHERE did the guest put the container bytes past the one window F-321
+// verified? w285 measured pkg 64980000 consuming 294,912 input bytes while only
+// container offset 0..0x8000 matched anywhere the FLUSH census named. Rather
+// than guess more dests, search the golden for the physical slots the host
+// rebase map currently holds and report which container offset each one holds,
+// with a forward byte-compare. One-shot verdict per slot; the hunt runs at
+// several shots per package because the map is reset per job2 (F-252) and grows
+// as jobs are enqueued.
+static constexpr bool kUiXsfHunt = true;
+
+// Slot inventory for the hunt, filled from the SAME guest structure the PSTREAM
+// census reads: the {vbase,pbase,size} triplet array at ctxBase+4+si*12. The
+// first version iterated `g_mclaRebaseMap` instead and w287 printed
+// `nmap=0 anchor_in_map=0` for every package — including raceeditor, whose dest
+// the same boot had just proved byte-exact. A zero that contradicts a known-true
+// fact is an instrument failure, and the anchor field is what caught it.
+// Accumulated across jobs (deduped, capped) because F-322 asks "in ANY slot",
+// not "in this job's slots".
+struct MclaUiXsfSlot {
+  uint32_t pbase;
+  uint32_t size;
+};
+static std::mutex g_uiXsfSlotsMtx;
+static std::vector<MclaUiXsfSlot> g_uiXsfSlots;
+
+static void MclaUiXsfNoteSlot(uint32_t pbase, uint32_t size) {
+  if (pbase < 0xB0000000u || pbase >= 0xC0000000u || size < 64)
+    return;
+  std::lock_guard<std::mutex> lk(g_uiXsfSlotsMtx);
+  if (g_uiXsfSlots.size() >= 128)
+    return;
+  for (const auto &e : g_uiXsfSlots)
+    if (e.pbase == pbase)
+      return;
+  g_uiXsfSlots.push_back({pbase, size});
+}
+
+// `anchor` is the dest the caller just got a byte-exact (or at least named)
+// verdict for. Reporting whether that dest is even IN the map is the hunt's own
+// control: w286's first version printed slots_matched=0 for all four packages,
+// including raceeditor whose dest UIXSF-SLOT-VERIFY had just proved byte-exact —
+// a zero that contradicts a known-true fact is an instrument failure, not a
+// finding, and this field is what tells the two apart.
+static void MclaUiXsfGoldenHunt(uint32_t pkg, uint32_t shot, uint32_t anchor) {
+  const std::vector<uint8_t> &gold = MclaUiXsfGolden(pkg);
+  if (gold.size() < 64)
+    return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  static std::mutex s_huntMtx;
+  static std::unordered_set<uint32_t> s_hunted;  // pkg*8 + shot
+  {
+    std::lock_guard<std::mutex> hlk(s_huntMtx);
+    const uint32_t key = pkg * 8u + shot;
+    if (s_hunted.count(key) || s_hunted.size() >= 64)
+      return;
+    s_hunted.insert(key);
+  }
+  // Snapshot the inventory so the scan never runs under its lock.
+  std::vector<MclaUiXsfSlot> slots;
+  {
+    std::lock_guard<std::mutex> slk(g_uiXsfSlotsMtx);
+    slots = g_uiXsfSlots;
+  }
+  uint32_t hits = 0, covered = 0, scanned = 0, skip_range = 0, skip_poison = 0,
+           skip_read = 0;
+  bool anchor_found = false;
+  const int nmap = static_cast<int>(slots.size());
+  for (int i = 0; i < nmap; ++i) {
+    const uint32_t pb = slots[i].pbase;
+    const uint32_t sz = slots[i].size;
+    if (pb == anchor)
+      anchor_found = true;  // the hunt's own control, checked before any skip
+    if (pb < 0xB0000000u || pb >= 0xC0000000u || sz < 64) {
+      ++skip_range;
+      continue;
+    }
+    ++scanned;
+    uint8_t head[16] = {0};
+    if (!mem.ReadBytes(pb, head, 16)) {
+      ++skip_read;
+      continue;
+    }
+    const uint32_t h0 = MclaBE(head);
+    if (h0 == 0xCDCDCDCDu || h0 == 0u || h0 == 0xFFFFFFFFu) {
+      ++skip_poison;  // untouched slot
+      continue;
+    }
+    uint32_t off = 0;
+    bool found = false;
+    while (off + 16 <= gold.size()) {
+      if (gold[off] == head[0] &&
+          std::memcmp(gold.data() + off, head, 16) == 0) {
+        found = true;
+        break;
+      }
+      ++off;
+    }
+    if (!found)
+      continue;
+    uint32_t cmp = sz;
+    if (cmp > gold.size() - off)
+      cmp = static_cast<uint32_t>(gold.size() - off);
+    if (cmp > 0x80000u)
+      cmp = 0x80000u;
+    uint32_t mismatch = 0;
+    std::vector<uint8_t> buf(0x4000);
+    for (uint32_t done = 0; done < cmp; done += buf.size()) {
+      const uint32_t want =
+          cmp - done < buf.size() ? cmp - done
+                                  : static_cast<uint32_t>(buf.size());
+      if (!mem.ReadBytes(pb + done, buf.data(), want)) {
+        mismatch = cmp - done;
+        break;
+      }
+      for (uint32_t j = 0; j < want; ++j)
+        if (buf[j] != gold[off + done + j])
+          ++mismatch;
+    }
+    ++hits;
+    if (mismatch == 0)
+      covered += cmp;
+    MCLA_LOG_WARN("UIXSF-GOLDEN-HUNT shot={} pkg={:08X} slot[{}]={:08X} "
+                  "slotsize={} goldoff={:08X} compared={} mismatch={} "
+                  "head={:08X}",
+                  shot, pkg, i, pb, sz, off, cmp, mismatch, h0);
+  }
+  MCLA_LOG_WARN("UIXSF-GOLDEN-HUNT-SUMMARY shot={} pkg={:08X} goldsize={} "
+                "nmap={} scanned={} skip_range={} skip_poison={} skip_read={} "
+                "slots_matched={} bytes_exactly_covered={} anchor={:08X} "
+                "anchor_in_map={}",
+                shot, pkg, static_cast<uint32_t>(gold.size()), nmap, scanned,
+                skip_range, skip_poison, skip_read, hits, covered, anchor,
+                anchor_found ? 1 : 0);
+}
+
 static void MclaUiXsfVerifySlot(uint32_t dest, uint32_t slotsize) {
   if (!kUiXsfVerify)
     return;
   const uint32_t pkg = PeekPackageForDest(dest);
   if (!IsUiXsfPkg(pkg) || dest == 0 || dest == 0xCDCDCDCDu)
     return;
+  // Bookkeeping under its own lock, released before any helper is called so the
+  // lock order stays one-way (verify -> hunt -> golden; never the reverse).
   static std::mutex s_vMtx;
-  static std::unordered_map<uint32_t, std::vector<uint8_t>> s_golden;
   static std::unordered_set<uint32_t> s_verdict;
-  std::lock_guard<std::mutex> vlk(s_vMtx);
-  if (s_verdict.size() < 24 && !s_verdict.insert(dest).second)
-    return;  // one verdict per dest
-  auto git = s_golden.find(pkg);
-  if (git == s_golden.end()) {
-    std::vector<uint8_t> empty;
-    auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
-    mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
-    std::vector<uint8_t> raw(0x400000);
-    uint64_t got = 0;
-    int hp = 0;
-    if (vfs.OpenFile("xarchive_cache.rpf", fh)) {
-      const bool rd =
-          vfs.ReadFileAt(fh, pkg, raw.data(), 0x400000, got) && got >= 24;
-      vfs.CloseFile(fh);
-      if (rd)
-        hp = mcla_lzx::host_decode_ui_xsf(raw.data(), static_cast<size_t>(got),
-                                          empty, kXcWindowBits);
-    }
-    if (hp && !empty.empty())
-      git = s_golden.emplace(pkg, std::move(empty)).first;
-    else
-      git = s_golden.emplace(pkg, std::vector<uint8_t>{}).first;
+  static std::unordered_map<uint32_t, uint32_t> s_vfyN;  // pkg -> verifies seen
+  uint32_t vfn = 0;
+  {
+    std::lock_guard<std::mutex> vlk(s_vMtx);
+    if (s_verdict.count(dest) != 0u || s_verdict.size() >= 24u)
+      return;  // one verdict per dest
+    s_verdict.insert(dest);
+    vfn = ++s_vfyN[pkg];
   }
-  const std::vector<uint8_t> &gold = git->second;
+  // Hunt early and late: g_mclaRebaseMap grows as jobs are enqueued, so a single
+  // pass would miss slots allocated afterwards.
+  // One hunt per verify (bounded) rather than per package: w288 proved the
+  // garage's hunt fired while its byte-exact dest was not yet in the inventory
+  // (nmap=9, skip_poison=5, slots_matched=0), so an early single shot cannot
+  // answer "where did the bytes go" for a container that fills later.
+  if (kUiXsfHunt && vfn <= 6u)
+    MclaUiXsfGoldenHunt(pkg, vfn, dest);
+  const std::vector<uint8_t> &gold = MclaUiXsfGolden(pkg);
   if (gold.size() < 64 || slotsize < 64) {
     MCLA_LOG_WARN("UIXSF-SLOT-VERIFY dest={:08X} pkg={:08X} goldsize={} "
                   "slotsize={} → NO GOLDEN",
@@ -10083,6 +10240,7 @@ PPC_FUNC(sub_821BC140) {
         (void)mem.ReadU32BE(sAddr + 0, &vbase);
         (void)mem.ReadU32BE(sAddr + 4, &pbase);
         (void)mem.ReadU32BE(sAddr + 8, &size);
+        MclaUiXsfNoteSlot(pbase, size);  // F-322 inventory for the golden hunt
         MCLA_LOG_WARN("PSTREAM #{} s[{}] @{:08X} vbase={:08X} pbase={:08X} "
                       "size={:08X}",
                       n, si, sAddr, vbase, pbase, size);
