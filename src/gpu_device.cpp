@@ -551,15 +551,42 @@ static constexpr bool kPathBSingleOpen = false;
 // F-315: that "ineffective" verdict was measured on the ls0/j2BadMag leg only. The
 // MclaFindLastServe leg (:8065) had the same never-written-back defect and is the one
 // every INFLATE-REFORCE pos=00000000 line comes from, so it is being tried there.
-// F-315 RESULT: tried ON in w275 and it LIVELCKED — 657,657 lines vs w274's 57,886,
-// of which 119,352 were the SAME INFLATE/XMEM iteration (in=512, identical src/dest),
-// and nGfx prints went 6->4, i.e. shallower in the same wall-clock. No crash
-// (C0000005=0, Fatal=1 = the pre-existing one), but PATHB-HOSTDECODE 5->4. So writing
-// ls.pos back is NOT sufficient: the escape at :8081 needs IsJob2UiDest(outPtr) and
-// otherwise leaves served=false with inLeft unchanged, so the guest re-enters inflate
-// on the same 512 bytes forever. REVERTED to false; the advance code stays, gated off,
-// with the diagnosis above. Do not re-try without also handling the non-Job2 exit.
+// F-315 RESULT: tried ON in w275 and it LIVELCKED — 657,657 lines vs w274's 57,886.
+// REVERTED to false; the advance code stays, gated off.
+// F-318 SUPERSEDES the F-315 diagnosis of WHY (both halves of it were wrong):
+//  (1) The w275 loop was NOT the garage and NOT "the same 512 bytes": its dominant
+//      shape was 119,403x "INFLATE #n st=006D8F20 in=15 out=65536 consumed=196553
+//      magic=03EE0509" on pkg 0xA0000 (meshtextures) — and the printer's own counter
+//      reached #10,956,600, so ~11 MILLION guest inflate calls happened and only the
+//      first 40 + every 200th got printed.
+//  (2) st+8 "consumed" is CUMULATIVE for the stream, not per-call: w276 garage shows
+//      32748 -> 65516 (exactly two 32 KiB chunks) and w275 shows +20 per call. So
+//      "ls.pos += consumed" double-counts and runs the cursor away.
+//  (3) Worse, the advance was never NEEDED. MclaForceServePkgForDest registers
+//      ls.pos=0, ls.size=n (:7740-7741) for ONE window, so "srcOff >= srcSize" is
+//      already the correct "this chunk is exhausted, give me the next one" signal,
+//      and the absolute position is carried by g_destPkgWalk, not ls.pos. Leaving
+//      ls.pos pinned at 0 is what makes ls.pos+consumed an absolute offset.
+// The advance was never the gap; see F-318 and kUiXsfChunkFeed below.
 static constexpr bool kUiServeAdvance = false;
+
+// F-318: garage's UI .xsf is aborted by our OWN empty-stream bail, not by serve
+// framing. w276/w277 evidence, dest B7A41000 -> pkg 64980000 (unc 1066057):
+//   INFLATE-ENTER #32  in=0 consumed=32748 outPtr=B7A41000
+//   INFLATE-HOSTSERVE-PEND #32 got=32768 walk=00000000 pkgSz=00040000 serve=1
+//   XMEM-SZPTR #5      *destSz 131072->0  *srcSz 32768->32768  ret=0
+//   INFLATE-ENTER #34..#42 in=0 consumed=65516 outPtr=B7A41000   (nothing served)
+//   INFLATE-J2-DRAIN-B7 #12 "... — zero outLeft (backup)" -> FLUSH sub_821D5510
+// The refill at :8760ff already walks g_destPkgWalk one 32 KiB window per call and
+// has its own CAP/DONE bounds, but hsThisRetry fires ONLY on retries==3 (once per
+// st) and maxEmptyRetries is 24 when produced>0 — and produced is a LEFTOVER of a
+// previous dest in this shared stack state (the w10 comment says so for the
+// hardcoded needArrData trio). So a UI .xsf dest can never get window #2 and is
+// then killed as "dead". ON = treat a dynamically-keyed UI .xsf dest as a live
+// mid-stream: refill every empty retry while walk < PackageSizeAt, and give it the
+// 400-retry budget. OFF == exact baseline. Census marker: INFLATE-HOSTSERVE-PEND
+// serve=N per dest (no new literal).
+static constexpr bool kUiXsfChunkFeed = true;
 
 // T41.9b / F-195: the legacy host-side J2-DIST XMem replay of pkg 0xA0000. Path B
 // (correct guest enqueue) replaces its purpose; with Path B ON this replay only
@@ -7773,6 +7800,28 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
                 dh[2], dh[3]);
   return true;
 }
+
+// F-318: is this dest a standalone UI .xsf container that still has uncompressed
+// package windows left to serve? Keys on the dynamic dest->pkg map and the stable
+// package offsets, so it survives boot-to-boot dest reassignment. The walk < size
+// bound is what makes this loop-proof: MclaLoadPkgWindow only fails at
+// walk >= pkgSz + 4 MB, which for a default-sized (0x40000) package would mean
+// ~130 re-serves of past-the-end bytes before it stopped on its own.
+static bool MclaUiXsfChunkOpen(uint32_t outPtr) {
+  const uint32_t pkg = PeekPackageForDest(outPtr);
+  if (!IsUiXsfPkg(pkg))
+    return false;
+  uint32_t walk = 0;
+  {
+    std::lock_guard<std::mutex> wl(g_destPkgMtx);
+    const auto it = g_destPkgWalk.find(outPtr);
+    if (it != g_destPkgWalk.end())
+      walk = it->second;
+  }
+  const uint32_t lim = PackageSizeAt(pkg);
+  return walk < lim;
+}
+
 // w10 FIX: job #2 dests are the UI/swfC set only. The whole B7* range also
 // contains job #1 preload dests (B7A01000, B7801000, …) that must keep
 // using package base 0x60000 — routing them to the job #2 walk at 0xA0000
@@ -8584,7 +8633,19 @@ PPC_FUNC(sub_821D5E10) {
     }
     // Backup drain: any B7* dest with no-progress junk continuation
     // (covers job2 PSTREAM pbase not yet listed). Same cap, same key.
-    else if (j2cAnyB7 && outPtr >= 0xB7000000u) {
+    //
+    // F-318: EXEMPT a UI .xsf dest that still has package windows to serve. This
+    // branch is why two earlier attempts at the refill site did nothing at all:
+    // its `return` at the b7spin>0 line below runs BEFORE the inLeft==0 refill
+    // block, so a garage dest that is merely waiting for window #2 is counted as
+    // "no-progress junk", spun 12 times, and then killed by the zero-outLeft bail
+    // — w277: INFLATE-J2-DRAIN-B7 #12 dest=B7A41000 magic=00000000 produced=327680
+    // outLeft=131072 consumed=65516 with 65,516 of 1,066,057 bytes delivered.
+    // Skipping it here lets control fall through to the refill, which is bounded
+    // twice over (retries < 400, and MclaUiXsfChunkOpen goes false at
+    // walk >= PackageSizeAt → the drain resumes).
+    else if (j2cAnyB7 && outPtr >= 0xB7000000u &&
+             !(kUiXsfChunkFeed && MclaUiXsfChunkOpen(outPtr))) {
       static std::mutex s_b7cMtx;
       static std::unordered_map<uint32_t, uint32_t> s_b7cSpin;
       static std::unordered_map<uint32_t, uint32_t> s_b7cProd;
@@ -8676,8 +8737,23 @@ PPC_FUNC(sub_821D5E10) {
     const bool needArrData =
         (outPtr == 0xB7B61000u || outPtr == 0xB7B71000u ||
          outPtr == 0xB79B1000u);
+    // F-318: a standalone UI .xsf stream is mid-stream, not dead. w276/w277 show
+    // garage dest B7A41000 reaching inLeft=0 with consumed=65516 (one 32 KiB
+    // window already served), spinning ~9 times and then being killed by the
+    // backup drain (INFLATE-J2-DRAIN-B7 "zero outLeft") + FLUSH — i.e. the
+    // emulator aborts its own load, exactly the Session 75p mistake, for the one
+    // container whose decoded size (1066057) exceeds the host-decode fit test at
+    // :7884. The per-dest refill below ALREADY walks g_destPkgWalk a window at a
+    // time with its own CAP/DONE bounds, but it only fires on `retries == 3`
+    // (once) and the budget for produced>0 is 24, so it can never deliver more
+    // than one window. Both are keyed on the dynamic dest->pkg map, not an
+    // address, per directive #5; MclaUiXsfChunkOpen returns false once the walk
+    // passes PackageSizeAt, so this cannot spin past the package.
+    const bool uiXsfStream = kUiXsfChunkFeed && MclaUiXsfChunkOpen(outPtr);
     const uint32_t maxEmptyRetries =
-        needArrData ? 400u : ((produced > 0) ? 24u : 200u);
+        (needArrData || uiXsfStream)
+            ? 400u
+            : ((produced > 0) ? 24u : 200u);
     if (inPtr != 0 && outPtr != 0 && outLeft != 0 &&
         retries < maxEmptyRetries) {
       retries++;
@@ -8688,7 +8764,7 @@ PPC_FUNC(sub_821D5E10) {
       // because a single 32KB window is not enough to materialize arr.
       const bool hsThisRetry =
           needArrData ? (retries == 3 || (retries > 3 && (retries % 8) == 0))
-                      : (retries == 3);
+                      : (retries == 3 || uiXsfStream);
       if (hsThisRetry) {
         static std::mutex s_hsMtx;
         static uint32_t s_hsBuf = 0;
