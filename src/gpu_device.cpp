@@ -8529,6 +8529,7 @@ static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
   std::vector<uint8_t> present(static_cast<size_t>(gold.size()), 0);
   std::vector<uint8_t> buf(0x4000);
   uint32_t recsOk = 0, firstBadOff = 0xFFFFFFFFu;
+  uint32_t fbPbase = 0, fbLocal = 0, fbLen = 0;  // F-330: the first mismatch
   for (const auto &r : recs) {
     uint32_t good = 0;
     for (uint32_t done = 0; done < r.len; done += buf.size()) {
@@ -8544,6 +8545,9 @@ static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
           ++good;
         } else if (firstBadOff == 0xFFFFFFFFu) {
           firstBadOff = r.off + done + i;
+          fbPbase = r.pbase;
+          fbLocal = done + i;
+          fbLen = r.len;
         }
       }
     }
@@ -8564,6 +8568,48 @@ static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
                 pkg, shot, static_cast<uint32_t>(recs.size()), recsOk,
                 static_cast<uint32_t>(gold.size()), nClaimed, nPresent,
                 nClaimed ? (nPresent * 100u) / nClaimed : 0u, firstBadOff);
+
+  // F-330: classify the divergence instead of hypothesising about it. Everything
+  // so far (F-326/327/329) left two candidate causes for the garage stopping at
+  // container offset 0x8000 -- a BYTE-SHIFT (our framing/alignment: the guest is
+  // reading the right LZX data from the wrong offset, which a shift exposes) or
+  // UNRELATED bytes (decoder state, e.g. the lazily-initialised singleton at
+  // 0x828D38D8 that `sub_82460420` guards, whose mis-sync no amount of re-slicing
+  // fixes). They need opposite fixes, and only the bytes at the divergence can
+  // tell them apart. So: take 32 bytes of what the guest put there and search the
+  // golden for them within +/-4 KiB; a hit is a shift, a miss is state.
+  if (firstBadOff != 0xFFFFFFFFu && fbPbase != 0 && fbLocal + 32 <= fbLen) {
+    uint8_t gb[32] = {0};
+    if (firstBadOff + 32 <= gold.size() &&
+        mem.ReadBytes(fbPbase + fbLocal, gb, 32)) {
+      int shift = 0;
+      bool shifted = false;
+      const int lo = firstBadOff > 4096 ? -4096 : -(int)firstBadOff;
+      for (int k = lo; k <= 4096 && !shifted; ++k) {
+        if (k == 0)
+          continue;
+        const int pos = (int)firstBadOff + k;
+        if (pos < 0 || pos + 32 > (int)gold.size())
+          continue;
+        if (std::memcmp(gold.data() + pos, gb, 32) == 0) {
+          shift = k;
+          shifted = true;
+        }
+      }
+      MCLA_LOG_WARN("UIXSF-DIVERGE pkg={:08X} at={:08X} slot={:08X}+{:08X} "
+                    "guest=[{:08X} {:08X} {:08X} {:08X}] "
+                    "golden=[{:08X} {:08X} {:08X} {:08X}] {}",
+                    pkg, firstBadOff, fbPbase, fbLocal, MclaBE(gb),
+                    MclaBE(gb + 4), MclaBE(gb + 8), MclaBE(gb + 12),
+                    MclaBE(gold.data() + firstBadOff),
+                    MclaBE(gold.data() + firstBadOff + 4),
+                    MclaBE(gold.data() + firstBadOff + 8),
+                    MclaBE(gold.data() + firstBadOff + 12),
+                    shifted ? "IS A SHIFT" : "NOT-IN-GOLDEN-NEIGHBOURHOOD");
+      if (shifted)
+        MCLA_LOG_WARN("UIXSF-DIVERGE-SHIFT pkg={:08X} shift={}", pkg, shift);
+    }
+  }
 }
 
 static void MclaUiXsfVerifySlot(uint32_t dest, uint32_t slotsize) {
