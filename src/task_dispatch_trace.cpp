@@ -1735,6 +1735,17 @@ F364_PROBE("CONVERGE", sub_822BFCC8)  // both paths continue here
 F364_PROBE("PRECOND", sub_822BFD48)
 F364_PROBE("SIDE-A", sub_821F8038)
 F364_PROBE("SIDE-B", sub_821FAA98)
+// F-366 NOT ADDED, and the reason belongs here: `sub_82182240`, `sub_8218A9E0`,
+// `sub_821CA540` and `sub_821C9A90` are already hooked as T41.3's bisect steps via
+// MCLA_BISECT_HOOK at src/gpu_device.cpp:14189-14191. `tools/addr_owners.py --check`
+// reported each as "1 site(s)" (the generated map only), so a second definition of
+// sub_821CA540/sub_821C9A90 reached the linker before the rule-4 violation was caught --
+// lld-link: duplicate symbol. Tool gap: addr_owners cannot see macro-generated hooks, so
+// its "1 site(s)" is not proof of an unclaimed address; grep the address in src/ as well
+// before defining a hook. Because those steps are already instrumented and MSGBISECT
+// prints nothing in any soak, the four callees are never entered -- so sub_823047D8
+// (proven entered, r3=C61C6180, chain f0=8213154C) exits before its first call at
+// 0x823047F8. That is F-366, recorded without a build.
 // The copier gets its own hand-written probe: `sub_82305690` returns 1 in r3, so the
 // object pointer has to be captured BEFORE the call to read its descriptor afterwards.
 // That is the direct test of "did the copy land?" -- F365's late-sample design failed
