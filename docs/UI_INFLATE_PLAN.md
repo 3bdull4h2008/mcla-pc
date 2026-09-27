@@ -529,3 +529,22 @@ still do not reach the success tail, so §9's chain is correct up to "foreign re
 requested" and **wrong** about "⇒ no completion". The gate therefore moved: `outLeft`/destination chain
 (task #15's original per-request output-descriptor shape), not the record index. `kF483DeferRelease`
 is `false` in the tree; the pins/unpins stay as a reusable instrument.
+
+### 9.2 Path B's reach, after F-487/F-488 — no data seed, and the last possible lever is the walk's inputs
+
+`F-487` shows the six silent jobs re-enter `InflateBegin` with an empty input pair; `F-488` shows that
+pair is `sub_821BC140`'s own stack slots (`r1+96`/`r1+100`, identified arithmetically against
+`st=006D8F20` / `r1in=006D8EC0`), computed from the destination cursor. So:
+
+- **Closed for Path B:** seeding bytes, feeding a read, or writing a record. None of them reaches the
+  pair the walk tests.
+- **Still open, in priority order:** (1) the per-descriptor equality at `ppc_recomp.14.cpp:19100-19105`
+  — reading it requires a hook *inside* `sub_821BC140`, i.e. `.qoder/skills/mcla-recompiler-regen`
+  (toolchain currently broken; that breakage, not the design, is the blocker), or (2) the values the
+  pair is computed from — the slot's read-list entries (`e0=dest/size` at `[slot+8]/[slot+12]`,
+  `RLC` = `[slot+1540]`) — which the title builds in `sub_821BCB10`, so a construction there is the
+  only remaining non-in-loop candidate and it must be evaluated against `F-488`'s arithmetic, not
+  against a hope.
+- **Success criteria unchanged and all still zero:** `XSF-INFLATE` > 0,
+  `RELSEMA … lr=821BC538` above 1, `F438-GFXCTOR` ≥ 1 guest-produced, and a second package at
+  `still_present == claimed == goldsize`. Objective OPEN.
