@@ -4662,6 +4662,16 @@ PPC_FUNC(sub_821C90C0) {
 // pass for a tag that was pushed but has not been dispatched yet, leaving the release
 // to happen after the job's own tail decrements the count. MITIGATION of an ordering
 // our own TASKJOIN-SC zeroing created, and labelled as such.
+// F-498's intervention test (T42.29). The inflater's header parse is gated on
+// [state+8] == 0, and the garage's window never returns there (F-498), so `exp`
+// stays 0 and the input clamp (exp - consumed) is non-positive forever. This
+// writes 0 into [state+8] at InflateBegin entry for a job window whose state is
+// in that dead configuration, which makes the guest's OWN parse reachable again.
+// It is an intervention on guest state, not a fix, and stands or falls on the
+// four numbers in F-498's gate. Runs together with kF483DeferRelease (record
+// ownership), because without it the descriptor being parsed is another
+// container's.
+static constexpr bool kF498ReseedState = false;
 static constexpr bool kF483DeferRelease = false;
 constexpr uint32_t kF483Ring = 32u;
 static std::atomic<uint32_t> g_f483Pushed[kF483Ring]{};
@@ -10437,7 +10447,7 @@ PPC_FUNC(sub_821D5E10) {
         return b;
       };
       if (win != 0 && win < 12u && st >= 96u &&
-          s_f494Dumped[win].load(std::memory_order_relaxed) < 3u) {
+          s_f494Dumped[win].load(std::memory_order_relaxed) < 60u) {
         const uint32_t sp = st - 96u;
         uint32_t d[20] = {0};
         for (uint32_t i = 0; i < 12u; ++i)
@@ -10445,6 +10455,14 @@ PPC_FUNC(sub_821D5E10) {
         for (uint32_t i = 0; i < 8u; ++i)
           (void)mem.ReadU32BE(sp + 128u + i * 4u, &d[12u + i]);
         s_f494Dumped[win].fetch_add(1, std::memory_order_relaxed);
+        // d[] is [sp+80..95] then the state at [sp+96..127]: d[4]=inLeft,
+        // d[5]=inPtr, d[6]=consumed, d[7]=exp, d[8]=outLeft, d[9]=outPtr.
+        if (kF498ReseedState && d[7] == 0u && d[6] != 0u) {
+          (void)mem.WriteU32BE(st + 8u, 0);
+          MCLA_LOG_WARN("F498-RESEED win={} st={:08X} consumed {:08X}->0 "
+                        "in={:08X} outLeft={:08X} outPtr={:08X}",
+                        win, st, d[6], d[4], d[8], d[9]);
+        }
         MCLA_LOG_WARN("F494-WALK win={} sp={:08X} cur=[{:08X} {:08X} {:08X} "
                       "{:08X}] st=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
                       "{:08X} {:08X}] desc=[{:08X} {:08X} {:08X} {:08X} {:08X} "

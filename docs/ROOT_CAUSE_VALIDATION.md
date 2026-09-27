@@ -10789,3 +10789,27 @@ the same commit series as the control. Next ID **F-498**.
 - **The one thing still not named:** who is *supposed* to zero `[state+8]` between blocks. Nothing in the three routines mapped so far (`sub_821BC140`, `sub_821D5E10`, `sub_821CC6F0`) does it, and the value's oscillation between two near-`0x8000` figures suggests the caller re-initialises the state per *read*, not per *block*.
 
 **Testable consequence (T42.29, armed as `kF498ReseedState` with the record pin held):** if the host zeroes `[state+8]` at `InflateBegin` entry when `exp == 0` and `consumed != 0`, the guest's own parse becomes reachable again and should re-seed `exp` from the next descriptor. Gate, in order: `exp != 0` on more than 1 row of the garage's window; its `maxProduced` past `0x50000`; `RELSEMA … lr=821BC538` above 1; `XSF-INFLATE` above 0. **Labelled an intervention on guest state, not a fix** — it stands or falls on those four numbers and is reverted if any fails. Next ID **F-499**.
+
+### F-499 (2026-09-27 08:1x, **2 builds, soaks `w498` armed and `w499` control after the revert**) — **FORCING THE PARSE'S GATE DOES NOT RE-SEED ANYTHING, IT STOPS THE BOOT EARLIER: writing `0` into `[state+8]` when `exp == 0 && consumed != 0` (exactly the dead configuration F-498 names, with the record pin held so the descriptor is the job's own) fired **once**, and the consequences were `PUSH` 7 → 2, `GFx` 13 → 1, `LISTLINE` 171 → 0, `LZX-FRAME` 32 → 10, completion callbacks still 1 and `XSF-INFLATE` still 0. So `consumed != 0` is not an accidental stale flag the guest would thank us for clearing — the parse is skipped because there is no block header to parse at the cursor, and clearing the gate makes the inflater read high-entropy payload as a header and abandon the walk sooner.**
+
+- Task:        T42.29 — the intervention F-498 §"Testable consequence" proposed, run and REVERTED
+- Type:        FIX-attempt measured and reverted
+- Class:       D (our host write) + G
+- Priority:    P0 — it converts "the state flag is the blocker" into "the *descriptor stream* is the blocker"
+- Evidence:    `build/w498.log:1` `F498-RESEED win=… consumed 00007FF4->0 in=00008000 outLeft=00040000 outPtr=…` being the only such row in a 120 s soak, with `PUSH` 2 / `POST-EXEC-START` 1 / `F494-WALK win=2 rows=2 exp!=0=1 maxTotal=00000000`; flags then set `false` and rebuilt — `build/w499.log` reproduces shipped behaviour exactly (`PUSH` 7, `LISTLINE` 171, `BOOTPATH` 10, `GFx` 13, `C0000005` 0, `F498-RESEED` 0, `F483-DEFER` 0), exe 57,455,104 bytes
+- Instrument state kept: `kF498ReseedState = false`, `kF483DeferRelease = false`; both branches compiled out, their markers registered flag-off in `PROGRAM_GUIDE` §7 so a future session reads their 0 as "disarmed", never as "not happening".
+
+**1. What survives as the conclusion for the objective.** Two independent, cleanly-measured facts now
+point at the same thing: the walk's descriptor block at `[sp+128]` holds **one** {magic, size} pair
+inherited from another container (F-495) and re-seeding it in place is not possible from the state side
+(F-499). The missing object is a **per-block input descriptor stream** — task #15's original shape —
+and it lives in the worker's stack frame, produced by code inside `sub_821BC140` that no permitted hook
+reaches. That is where Path B ends for this session: not "unproven", but bounded with evidence.
+
+**2. Objective state after this branch (audited, not asserted).** Clause (a) is delivered only by Path
+A: 3 of 4 UI `.xsf` byte-exact in guest memory and the garage at 917,504/1,066,057 with
+`still_present == claimed` (`pct=100` of what the chain claims) — no guest-side inflate of any UI
+container (`XSF-INFLATE` 0). Clause (b) is not achieved and is not downstream of clause (a) (F-493).
+**Objective OPEN**; the two candidate routes (in-loop hook via the recompiler toolchain, or the user's
+F-055 for the GFx producer question) remain, and both are decisions rather than unknowns. Next ID
+**F-500**.
