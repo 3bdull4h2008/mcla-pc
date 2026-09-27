@@ -2,15 +2,15 @@
 """Marker census for MCLA PC boot soaks -- the machine behind `mcla-log-census`.
 
 Counts every documented log marker and prints new-vs-baseline columns with
-deltas. Counts are matching LINES, case-insensitive -- byte-for-byte what
-`grep -ic MARKER log` returns, so any number here can be re-checked by hand.
-Overlapping markers (`INFLATE` and `INFLATE-SKIP`) both count, exactly as with
-grep; subtract the more specific row when you need the exclusive number.
+deltas. Counts are matching LINES, case-insensitive: what `grep -ic MARKER`
+returns -- except the NTSTATUS codes in EXC_CODES below, which need a
+`code=0x…` context and so read LOWER than a bare grep on the same token. Rows
+are substring matches, so `INFLATE` counts every `INFLATE-SKIP` line too.
 
-The marker list is DERIVED from docs/PROGRAM_GUIDE.md sec 9 (the marker
-inventory) so this tool cannot drift from the documented vocabulary; the
-frontier battery that sec 9 does not cover (exception codes, GFx, fatals,
-DRAW_INDEXED) is appended explicitly below.
+The §9 inventory of docs/PROGRAM_GUIDE.md is re-parsed every run, so that half
+follows the doc rather than a copy; the batteries it does not cover (exception
+codes, GFx, fatals, DRAW_INDEXED) are hand-maintained below and may overlap it.
+§9 is matched by a literal heading -- retitle it and the tracked count drops.
 
 Usage:
     python tools/soak_census.py build/w38a.log
@@ -29,8 +29,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 GUIDE = REPO / "docs" / "PROGRAM_GUIDE.md"
 
-# Markers that gate a claim but are not part of the sec 9 hook vocabulary: host
-# exception codes, the UI/GFx frontier, guest fatal dispatch, and the draw path.
+# Hand-maintained gate markers; the §9 parse currently yields none of these: host
+# exception codes, UI/GFx frontier, fatal dispatch, PRESENT/draw, CP ring fields.
 FRONTIER = [
     "C0000005", "C0000003", "C000001D", "C000008E", "80000003", "406D1388",
     "GFx", "GFX-CTOR", "GFX-CTOR-VT-MISMATCH", "GFX-BLOCK", "GFX-ALLOC",
@@ -40,23 +40,23 @@ FRONTIER = [
     "swfCMD", "PUT=",
 ]
 
-# The crash-path signals: one marker per thing the handler can DO with a fault.
-# Regenerated 2026-09-20 21:45 from the live format strings, because the previous
-# list carried 8 markers that exist nowhere in src/ (T38.3(a) deleted those paths)
-# and omitted the one park that does -- so "all recovery markers are 0" was a
-# tautology, not a verdict (F-057(6)). `dead_tracked()` below now fails loudly
-# instead of letting that happen again.
+# The two handler outcomes tracked here: the honest decline, and the park. The
+# VEH handler has other exits (sampler-thread decline, F390 SEH pass) that are
+# NOT named here. Cut to live src/ strings in the 09-20/21 pass: 8 of the 9
+# markers the old list carried exist nowhere in src/ (T38.3(a) deleted those
+# paths) and the park was missing, so "all recovery markers are 0" was a
+# tautology, not a verdict (F-057(6)) -- dead_tracked() prints that as a question.
 VEH_PATHS = [
     "VEH-NEUTRAL",          # handler declined -> EXCEPTION_CONTINUE_SEARCH (honest)
-    "VEH W0: parking thread",  # src/boot_host.cpp:1064, the generic park
+    "VEH W0: parking thread",  # src/boot_host.cpp:1584, the generic park
 ]
 
 
 def src_blob() -> str:
-    """`src/` plus the recompiler output, lower-cased, for the marker-truth check.
+    """The lower-cased literal universe `dead_tracked` searches.
 
-    A marker can legitimately live outside `src/` (guest-produced text), so this
-    covers every tree that can emit a log line.
+    Roots are `src/**` and `generated/ppc_xenon/**`, `.cpp`/`.h` only; a hit proves
+    a literal is typed there, not that any path prints it (`generated/ppc` unread).
     """
     out = []
     for root in ("src", "generated/ppc_xenon"):
@@ -90,7 +90,7 @@ def marker_tokens(marker: str) -> list[str]:
 
 
 def dead_tracked(markers: list[str]) -> list[str]:
-    """Tracked markers with no literal anywhere in `src/` or `generated/`.
+    """Tracked markers whose literal is in neither root `src_blob()` reads.
 
     Their zero is only *suspicious*, not automatically meaningless: a marker can
     name text the guest itself prints. So report it as a question, never a verdict.
@@ -100,9 +100,9 @@ def dead_tracked(markers: list[str]) -> list[str]:
             if m and not any(t.lower() in blob for t in marker_tokens(m))]
 
 
-# Mirrors the short-circuit labels in PROGRAM_GUIDE sec 7. Curated rather than
-# parsed out of that prose, because prose would also yield junk tokens (`SEH`,
-# `pow2`, `NtReleaseSemaphore`). If sec 7 gains a label, add it here.
+# Hand-picked subset of the §7 / §7-ADDENDUM mitigation labels: `skip fatal`,
+# `FATAL-SOFT`, `-GATE` come from the addendum, `PARK-SAMPLE` from §9, and most
+# registry labels are absent. Parsed prose would also yield junk (`SEH`, `pow2`).
 SHORT_CIRCUITS_TRACKED = [
     "KDELAY", "FENCE", "ClearTaskJoinBusy", "TASKJOIN", "REBASE-POISON",
     "P10-PRE", "INFLATE-SKIP", "INFLATE-EMPTY", "INFLATE-PENDING",
@@ -110,8 +110,8 @@ SHORT_CIRCUITS_TRACKED = [
     "PARK-SAMPLE", "FATAL-SOFT", "-GATE", "fallback advance", "skip fatal",
 ]
 
-# Lines matching this are a host short-circuit intercepting a guest failure.
-# Presence means "mitigation fired", never "fixed" — see PROGRAM_GUIDE §7.
+# A match means a host short-circuit absorbed a guest failure: "mitigation fired",
+# never "fixed" (§7). Five alternatives match no literal in src/ or generated/.
 SHORT_CIRCUIT = re.compile(
     r"skip fatal|delta-0|FATAL-SOFT|fallback advance|-GATE\b|short-circuit"
     r"|advancing RIP|Nuclear advance|patch applied, continuing"
@@ -123,18 +123,18 @@ GUEST_LR = re.compile(r"\blr=([0-9A-Fa-f]{8})\b")
 TS_PREFIX = re.compile(r"^\[[0-9:.]+\]\s*(?:\[\w+\]\s*)?")
 NUM = re.compile(r"0x[0-9A-Fa-f]+|\d+")
 CP_RING = re.compile(r"put=(\d+)\s+rptrWB=([0-9A-Fa-f]+)")
-# The waiter line's put/rptrWB pair is NOT the CP's state: `rptrWB` was read from
-# a hard-coded address for soaks on end (F-057(1), fixed by T40.4). These two are
-# the producer's own words and are the only honest ring signals.
+# The waiter's put/rptrWB pair is NOT the CP's state (imports.cpp:2176; that word
+# was hard-coded 4 bytes off until T40.4's CpPrimaryWritebackVA, F-057(1)).
+# CP_DRAIN/CP_PUB below are gpu_cp.cpp's own drain+publish lines: the honest pair.
 CP_DRAIN = re.compile(r"CP: RING \w DRAIN .*?rptr ([0-9A-Fa-f]{4})->([0-9A-Fa-f]{4})")
 CP_PUB = re.compile(r"CP: GUEST-PUB #\d+ dev=[0-9A-Fa-f]+ pub (\d+)->(\d+) put=(\d+)")
 LEVEL = re.compile(r"\[(error|warning)\]")
-# A line is only evidence of a fault if it reports one. Two exclusions matter:
-# hot polling paths (the 30 ms KWFSO/GPU poller at lr=8242FC1C) also carry `lr=`
-# and would dominate the census, and mitigation lines that merely *mention*
-# fatality (`skip fatal`, `FATAL-SOFT`) are a host short-circuit absorbing a
-# guest failure, not a fault report. The 703 baseline VEH events still match,
-# because those lines carry `VEH`/`AV` in their own right.
+# A line is evidence of a fault only if it reports one. Two exclusions matter: the
+# 30 ms KWFSO/GPU poller (lr=8242FC1C, inside sub_8242FB88) also prints `lr=` and is
+# 3121 of the 5572 `lr=` lines in build/smoke_long2.log -- an all-line lr census is
+# a census of polling, not of progress; and lines that merely *mention* fatality
+# (`skip fatal`, `FATAL-SOFT`) are a host short-circuit absorbing a guest failure,
+# so they match nothing here (0 of 27 in w46.log). The 703 real VEH events do.
 FAULT_LINE = re.compile(
     r"code=0xC0000005|code=0xC0000003|code=0xC000001D|code=0xC000008E"
     r"|code=0x80000003|access violation|\bAV\b"
@@ -186,7 +186,7 @@ def shape(ln: str) -> str:
 
 
 def census(path: Path, markers: list[str]) -> dict:
-    """Per-marker matching-LINE counts (grep -ic semantics) plus the side censuses."""
+    """Per-marker matching-LINE counts (grep -ic, bar the EXC_CODES gate) plus the side censuses."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     lower = [ln.lower() for ln in lines]
@@ -221,13 +221,13 @@ def census(path: Path, markers: list[str]) -> dict:
 
 
 def quality(c: dict) -> list[str]:
-    """Flag a log that is mostly one repeating host message.
+    """Flag a log that is mostly one repeating host message (top 3 shapes, >= 2%).
 
-    A mitigation that launders its own fault produces a log whose counts are all
-    that mitigation: `w38e.log` was 175 MB of one VEH recovery firing 616,824
-    times in 31.7 s, and read naively it looks like a boot that got 616,825
-    exceptions further than its predecessor (F-054). Domination by a benign
-    poller is reported too but is NOT a defect -- marker counts stay exact.
+    A mitigation that launders its own fault yields a log whose counters are all
+    that mitigation: w38e.log is 175 MB where one VEH recovery fired 616,824 times
+    in 31.7 s -- 33% of its 1,860,449 lines, so the counts measure a host loop,
+    not the guest: POISONED, never a baseline or a delta (F-054). A benign poller
+    at the same share is just a "recurring line"; counts stay exact either way.
     """
     out = []
     total = max(c["lines"], 1)

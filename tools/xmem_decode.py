@@ -3,8 +3,8 @@
 
 PROVEN byte-exact against build/xmem_golden/{raceeditor,garage,policecam,credits}.bin.
 
-This SUPERSEDES the earlier "concat per-frame payloads into one stream" guess
-(that produced a non-DIU head on raceeditor and a block-type-0 error on garage).
+This SUPERSEDES the earlier "concat per-frame payloads into one stream" guess;
+the recipe below decodes each container via one of two validated paths.
 
 Validated algorithm (this is the contract the C++ port must reproduce):
   RSC5 header: +0 0x05435352, +12 0x0FF512EF (XComp), +16 uncLen (BE).
@@ -18,10 +18,11 @@ Validated algorithm (this is the contract the C++ port must reproduce):
                  and feed each frame payload to a SINGLE shared LZXDecoder
                  instance (window + R0/R1/R2 + block_remaining carry across
                  frames; the bit buffer re-aligns to a fresh 16-bit word each
-                 frame).  Covers garage (33 frames, uncLen > 128 KiB window).
+                 frame).  Covers garage.
 
-Usage:  python tools/xmem_decode.py [wb] [only_name]
-        python tools/xmem_decode.py gen  # (re)write missing goldens
+Usage:  python tools/xmem_decode.py        # decode all four; write missing goldens,
+                                           # compare against existing ones
+        python tools/xmem_decode.py gen    # force (over)write all four goldens
 """
 from __future__ import annotations
 

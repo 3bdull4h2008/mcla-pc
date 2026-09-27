@@ -2,10 +2,17 @@
 """Guest-address ownership index -- the machine behind rule 4 ("one owner per
 guest address").
 
-Scans src/ and config/mcla_xenonrecomp.toml for every site that claims a guest
-address and reports addresses claimed by conflicting owners. A duplicate claim
-is silent at build time and last-one-wins at runtime, which is how a hook ends
-up dead without anyone noticing.
+Scans every C/C++-suffixed file under src/, plus config/mcla_xenonrecomp.toml,
+for sites that claim a guest address, and reports addresses claimed by
+conflicting owners. Only *literal* macro text is matched, so a hook installed
+through a project macro (MCLA_BISECT_HOOK in src/gpu_device.cpp expands to
+PPC_FUNC_IMPL(...) + PPC_FUNC(...)) is invisible here: the site counts this tool
+prints are a floor, never a ceiling.
+
+A duplicate SetFunction pair is silent at build time and the later registration
+wins at runtime -- App::FunctionDispatcher::SetFunction in src/app.cpp assigns
+m_functions[addr] and re-inserts the same address into the dispatch table --
+which is how a hook ends up dead without anyone noticing.
 
 Recognised sites:
     PPC_FUNC(sub_X) { ... }             override  the host body -- CLAIMS
@@ -15,30 +22,45 @@ Recognised sites:
                                                   override can tail-call it -- no claim
     PPC_FUNC(sub_X);                    fwd       forward declaration -- no claim
     GetFunction(0xX)                    get       reads the current owner -- no claim
-    config/*.toml  address = 0xX        toml      codegen input -- no claim
+    (config/mcla_xenonrecomp.toml)      toml:<sec>  `address = 0xX` or
+                                                    `jump_address = 0xX` -- no claim
+    (generated/ppc_xenon/               map         a row `{ 0xX, body }` -- no
+     ppc_func_mapping.cpp)                          claim, and listed only while
+                                                    src/ and the toml are silent
 
 The `{`-vs-`;` distinction is what separates a real override from a declaration;
-without it every `PPC_FUNC_IMPL(...);` extern looks like a second owner.
+without it every `PPC_FUNC_IMPL(...);` extern looks like a second owner. Both hex
+patterns key on that brace, so `PPC_FUNC_IMPL(sub_X) {` also reads as an
+`override`, and both only match a *hex* name -- symbol-named forms are picked up
+by SYMBOL_PATTERNS below.
 
 Two claims are only a violation when they genuinely conflict. The
 save-original-then-hook idiom --
 
     SetFunction(A, plain);   g_orig = GetFunction(A);   SetFunction(A, hk_plain);
 
--- is deliberate and is reported as a note, not a violation. Claims in
+-- is deliberate and is reported as a note, not a violation. `set` claims in
 *different files* are a violation, because nothing in the tree states which one
 wins; they usually turn out to be guarded by mutually exclusive bisect modes,
 and that guard needs writing down. `--gates <addr>` prints each claim site's
 candidate conditions verbatim so the guard can be read rather than guessed at,
-and the boot log decides which installer actually ran. Resolved cases are
-recorded in `docs/ROOT_CAUSE_VALIDATION.md` (0x827BD6E4 / VdSwap -> F-053).
+and the boot log decides which installer actually ran. classify() itself does no
+reachability analysis, so a pair a human already cleared keeps printing:
+`0x827BD6E4` / VdSwap is exactly that case -- F-053 in
+`docs/ROOT_CAUSE_VALIDATION.md` concluded its registration sites cannot co-fire,
+yet the address still reports a cross-file violation on every run.
 
 Usage:
     python tools/addr_owners.py                      # violations + summary
     python tools/addr_owners.py --check 0x822FBAF8   # who owns this address
+    python tools/addr_owners.py --check VdSwap       # a symbol / host body name
     python tools/addr_owners.py --gates 0x827BD6E4   # each claim's gate text
+    python tools/addr_owners.py --all                # append the full index
     python tools/addr_owners.py --notes              # include advisory notes
     python tools/addr_owners.py --tsv build/addr_owners.tsv
+
+Exit status is 1 when a violation was found (in --check/--gates mode, for any of
+the addresses looked up), 0 otherwise.
 """
 
 from __future__ import annotations
@@ -58,32 +80,44 @@ SRC_SUFFIXES = {".h", ".hpp", ".cpp", ".cc", ".cxx", ".inl"}
 ADDR = r"(?:__imp__)?(?:sub_)?([0-9A-Fa-f]{6,8})"
 NAME = r"([A-Za-z_][\w:]*)"
 
-# (kind when followed by '{', kind when followed by ';', regex)
+# (kind when followed by '{', kind when followed by ';', regex). Both key on
+# ADDR, i.e. a 6-8 digit hex name with an optional `sub_`/`__imp__` prefix -- a
+# host-named `PPC_FUNC_IMPL(hk_foo) {` does not match here.
 BODY_PATTERNS = [
     ("override", "orig",
      re.compile(r"PPC_FUNC_IMPL\(\s*" + ADDR + r"\s*\)\s*(\{|;)")),
     ("override", "fwd",
      re.compile(r"\bPPC_FUNC\(\s*" + ADDR + r"\s*\)\s*(\{|;)")),
 ]
+# Address-shaped sites without a body: the binder macro and the two dispatcher
+# calls. The `0x` prefix is optional on both of the latter. `get` is non-claiming
+# -- reading the current owner is exactly what the save-then-hook idiom does.
 PLAIN_PATTERNS = [
     ("hook", re.compile(r"GUEST_FUNCTION_HOOK\(\s*" + ADDR + r"\s*,\s*" + NAME)),
     ("set", re.compile(r"\bSetFunction\(\s*(?:0x)?" + ADDR + r"\s*,\s*" + NAME)),
     ("get", re.compile(r"\bGetFunction\(\s*(?:0x)?" + ADDR + r"\s*\)")),
 ]
 
+# Line-based toml pass: a section header sets the label the next address line
+# inherits, so the kind that reaches the index is `toml:<section>` (both
+# `[[double]]` and `[single]` brackets are accepted by TOML_SECTION).
 TOML_ADDR = re.compile(r"^\s*(?:jump_)?address\s*=\s*0x([0-9A-Fa-f]{6,8})")
 TOML_SECTION = re.compile(r"^\s*\[\[?(.+?)\]\]?\s*$")
 
 # Named XEX imports (`PPC_FUNC(__imp__VdSwap) { ... }`) are guest functions too,
 # but their address comes from the import table at runtime, so they cannot be
-# indexed by hex. They are indexed by symbol and cross-referenced against hex
-# claims whose bound host function name shares the whole symbol -- that is how
-# the VdSwap triple-owner at 0x827BD6E4 (imports.cpp:3469 + native_renderer.cpp
-# :254 + patches.cpp:678) becomes visible.
+# indexed by hex. They are indexed under `sym:<name>` and cross-referenced
+# against hex claims whose bound host function name shares the whole symbol --
+# that is how the VdSwap case at 0x827BD6E4 becomes visible: the named-import
+# override in src/kernel/imports.cpp plus the two `SetFunction` sites in
+# src/native_renderer.cpp and src/patches.cpp. File:line numbers are deliberately
+# not quoted -- they have drifted once already -- `--check 0x827BD6E4` prints the
+# current ones.
 #
 # `PPC_FUNC_IMPL(hk_foo) { ... }` looks similar but is the *definition of a host
-# function*, not a claim on a guest address; it is indexed as `body:` so a `set`
-# or `hook` binding can be traced to where it is implemented.
+# function*, not a claim on a guest address; it is indexed as `body:<name>` (or,
+# for a body named after an address, under that address -- see scan_source) so a
+# `set` or `hook` binding can be traced to where it is implemented.
 IMPORT_SYM = r"(__imp__[A-Za-z0-9_]+|__xtl_[a-z]+)"
 SYMBOL_PATTERNS = [
     ("sym-override", re.compile(r"\bPPC_FUNC\(\s*" + IMPORT_SYM + r"\s*\)\s*\{")),
@@ -95,15 +129,26 @@ STOP_TOKENS = {"sub", "hook", "hooked", "hk", "impl", "imp", "orig", "census",
                "guest", "host", "the", "fn", "func", "stub", "observer",
                "native", "patch", "ppc", "ctx", "base", "shim"}
 
+# Kinds that assert ownership of the guest function. Everything else (`orig`,
+# `fwd`, `get`, `toml:*`, `map`, `body`) is index context only: it shows up under
+# --check and can never, on its own, make a violation.
 CLAIMING = {"override", "hook", "set", "sym-override", "sym-hook"}
 
 
 def strip_comments(text: str) -> str:
     """Blank out // and /* */ comments, preserving offsets and newlines.
 
-    String literals are left intact so that addresses inside log format strings
-    are still visible; the patterns above all require a macro call shape, so
-    plain prose cannot produce a false owner.
+    The preserving part is load-bearing: scan_source() reads its line numbers out
+    of this same string (count the newlines before the match) and is_hook_idiom()
+    orders sites by byte offset, so each blank has to be exactly as wide, and
+    contain exactly as many newlines, as the text it replaced.
+
+    String literals are copied out verbatim so an address inside a log format
+    string stays visible; the patterns above all require a macro call shape, so
+    plain prose cannot produce a false owner. Two consequences of the
+    left-to-right scan, both accepted rather than handled: the comment test comes
+    before the quote test, so a `//` inside a string (a URL, say) blanks the rest
+    of that line, and `'` counts as a string delimiter too.
     """
     out: list[str] = []
     i, n = 0, len(text)
@@ -157,30 +202,44 @@ class Owner:
 
 
 def norm(addr: str) -> str:
+    """Canonical `0x%08X`. Raises ValueError on a non-hex string, which is how
+    main() tells an address argument from a symbol argument."""
     return f"0x{int(addr, 16):08X}"
 
 
+# The trailing hex inside a host function name: `hk_sub_82554E20` -> 82554E20.
+# The `(?:_|$)` guard is what stops a 6-8 char hex run sitting *inside* a longer
+# word from being read as an address.
 HEX_TAIL = re.compile(r"(?:sub_)?([0-9A-Fa-f]{6,8})(?:_|$)")
 
 
 def tokens(name: str) -> set[str]:
-    """Lowercase identifier words, split only on `_` and `:`.
+    """Lowercase identifier words, split only on `_` and `:`; words of two
+    characters or fewer, and STOP_TOKENS, are dropped.
 
-    Deliberately does NOT split camelCase: sub-word matching made this
-    cross-check useless (159 "overlaps", e.g. ExCreateThread vs
-    SetThreadNameImpl agreeing on the word "thread"). Whole-symbol agreement is
-    the only signal precise enough to be worth printing.
+    Deliberately does NOT split camelCase: sub-word agreement made the symbol
+    cross-check useless (it paired names as different as ExCreateThread and
+    SetThreadNameImpl on the shared word "thread"). Agreement on a whole
+    underscore-separated word is the only signal precise enough to print.
     """
     return {t for t in (p.lower() for p in re.split(r"[_:]+", name))
             if len(t) > 2 and t not in STOP_TOKENS}
 
 
 def import_symbol(name: str) -> str:
-    """`__imp__VdSwap` -> `VdSwap` so it can be compared against host names."""
+    """`__imp__VdSwap` -> `VdSwap` so it can be compared against host names.
+    Leading underscores are stripped with it, so a `__xtl_*` name keeps its
+    suffix and loses only the `__`; the original is returned if that empties."""
     return re.sub(r"^__imp__+", "", name).lstrip("_") or name
 
 
 def scan_source(path: Path) -> list[Owner]:
+    """All the claim shapes above, applied to one file after comment-stripping.
+
+    Line numbers are counted in the stripped text, which is why strip_comments()
+    has to keep newlines. Note that `override`/`orig`/`fwd` sites carry no host
+    name, so they can never take part in the symbol cross-matching that
+    symbol_crosscheck() and the --check "related" list do."""
     try:
         text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
     except OSError:
@@ -213,6 +272,9 @@ def scan_source(path: Path) -> list[Owner]:
                 key = f"sym:{import_symbol(sym)}"
                 label = import_symbol(sym)
                 if name == sym:
+                    # Both capture groups read the same text; restate it as the
+                    # bare symbol so the cross-check compares like with like.
+                    # No site in src/ takes this branch today.
                     name = label
             out.append(Owner(kind, key, name or label, path,
                              text.count("\n", 0, m.start()) + 1, m.start()))
@@ -220,6 +282,9 @@ def scan_source(path: Path) -> list[Owner]:
 
 
 def scan_toml(path: Path) -> list[Owner]:
+    """Line-based codegen pass: the last section header labels the address rows
+    under it (`toml:<section>`), and `off` carries the line number rather than a
+    byte offset. A missing file is not an error -- it returns nothing."""
     if not path.exists():
         return []
     out: list[Owner] = []
@@ -236,18 +301,28 @@ def scan_toml(path: Path) -> list[Owner]:
     return out
 
 
+# One row of the generated table: `{ 0x827BDC64, __imp__XamInputGetState }`.
 MAP_ROW = re.compile(r"\{\s*(0x[0-9A-Fa-f]{6,8})\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}")
 
 
 def scan_mapping(path: Path) -> list[Owner]:
-    """The generated dispatch table is the authoritative address -> body map.
+    """The generated address -> body table, read as fallback context.
 
-    `SKIP_DIRS` excludes `generated/` so this tool cannot mis-parse 176 TUs, but
-    that also hid the one file that decides who owns a guest address:
-    `ppc_func_mapping.cpp` maps e.g. `{ 0x827BDC64, __imp__XamInputGetState }`.
-    Without it, `--check` reported that import slot as "unclaimed" and a new
-    `SetFunction` there would have looked legal while silently shadowing the
-    real implementation (F-092).
+    This is the one ownership record that lives outside src/, and its absence was
+    the blind spot: without it `--check` called an import slot "unclaimed", so a
+    new `SetFunction` there looked legal while shadowing the body the generated
+    table already registers (the `XamInputGetState` case, F-092).
+
+    How the row is used is deliberately second-class, though: collect() keeps it
+    only while no earlier site -- from src/ or the toml -- was indexed under that
+    hex address, and `map` is not in CLAIMING, so a row can never be one half of a
+    violation. Do not read it as "the table says X owns this" -- it says no source
+    file claimed it.
+
+    generated/ needs no exclusion here: collect() only walks src/, so the 176
+    ppc_recomp.*.cpp TUs beside this file are never parsed. The `generated` entry
+    in SKIP_DIRS is checked against the path parts of files found *under src/*,
+    and no such directory exists there today; it is a guard, not the mechanism.
     """
     out: list[Owner] = []
     if not path.exists():
@@ -277,9 +352,12 @@ def collect() -> list[Owner]:
         owners.extend(scan_source(path))
     for t in TOMLS:
         owners.extend(scan_toml(t))
-    # Fallback only: the generated table row is reported when nothing in src/
-    # or config/ claims the address, so an ordinary src hook still reads as
-    # itself rather than as a src claim + a table row pair.
+    # Fallback only: a generated table row survives when no earlier site was
+    # indexed under the same hex key -- an src claim, an `orig`/`fwd` extern, a
+    # toml address or an address-named host body. That keeps an ordinary src hook
+    # reading as itself instead of as a claim + table row pair. Because the filter
+    # is the hex key, a site recorded only as `sym:<name>` does not suppress the
+    # row, and the first row for an address wins over later ones.
     claimed = {o.addr for o in owners}
     for o in scan_mapping(REPO / "generated" / "ppc_xenon"
                           / "ppc_func_mapping.cpp"):
@@ -290,7 +368,13 @@ def collect() -> list[Owner]:
 
 
 def is_hook_idiom(hits: list[Owner]) -> bool:
-    """True when the `set` claims are the save-original-then-hook idiom."""
+    """True when the `set` claims are the save-original-then-hook idiom.
+
+    Three conditions, all read off the byte offsets scan_source recorded: at least
+    two `set` sites, every one of them in the same file, and at least one `get`
+    strictly between the first and the last. A `get` outside that span does not
+    count, so an overwrite that saves the original somewhere else still reports as
+    a violation."""
     sets = [o for o in hits if o.kind == "set"]
     gets = [o for o in hits if o.kind == "get"]
     if len(sets) < 2 or len({o.path for o in sets}) != 1:
@@ -300,6 +384,21 @@ def is_hook_idiom(hits: list[Owner]) -> bool:
 
 
 def classify(hits: list[Owner]) -> tuple[list[str], list[str]]:
+    """The rule-4 verdict for one address: (violations, advisory notes).
+
+    Only kinds in CLAIMING can raise a violation, and the violations it does raise
+    are: more than one `override` body; more than one `set`, either from different
+    files or in one file with no `get` between them; and `hook` beside any other
+    claiming kind. Coexisting toml input and an address named by several toml
+    sections are notes, not violations.
+
+    What it does not report, by construction rather than oversight: two claiming
+    kinds that are simply *different* -- the mixed-mechanism rule fires only when a
+    plain hex `hook` is one of the kinds, so an `override` body plus a `set`, or a
+    `sym-hook` plus a `sym-override`, passes silently -- and any address left with
+    one claiming site or fewer. Nor does it judge reachability: two gated
+    installers that cannot co-fire still read as a violation, which is exactly why
+    --gates exists."""
     claims = sorted((o for o in hits if o.kind in CLAIMING), key=lambda o: o.off)
     tomls = [o for o in hits if o.kind.startswith("toml")]
     violations: list[str] = []
@@ -351,13 +450,23 @@ def candidate_gates(site: Owner) -> tuple[str, list[tuple[int, str]], bool]:
     """Verbatim text of the conditions that gate one claim -- NOT interpreted.
 
     Two claims on one address are only a real conflict if both sites can run in
-    the same process. This walks up to the nearest column-0 line (a crude
-    enclosing-statement anchor) and returns every loop/branch/return line below
-    it, so the reader can see whether a `BisectGroupEnabled` or `renderer_mode`
-    early-return stands between the anchor and the claim. The tool deliberately
-    does not decide reachability: a C++ gate analyzer that quietly concluded
-    "these two cannot co-fire" would hide a rule-4 bug the first time it was
-    wrong. What settles it is the boot log line the installer itself prints.
+    the same process. The mechanics: re-read the *raw* file, walk up from the
+    claim to the first column-0 line that is not noise (that is the crude
+    enclosing-statement anchor), then return every GATEISH line strictly between
+    the anchor and the claim -- so a `BisectGroupEnabled` or `renderer_mode`
+    early-return above the site is visible. Truncation keeps the last
+    MAX_GATE_LINES, i.e. the ones nearest the claim.
+
+    GATEISH is a shape test, not a parser: the branch/loop alternative is anchored
+    to the line start (an optional `}` or `else` in front is allowed) while
+    `return` matches anywhere in the line. And because the raw file is what gets
+    scanned here -- unlike scan_source, which strips comments first -- a `return`
+    inside a comment or a string prints as a gate too.
+
+    The tool deliberately does not decide reachability: a C++ gate analyzer that
+    quietly concluded "these two cannot co-fire" would hide a rule-4 bug the first
+    time it was wrong. What settles it is the boot log line the installer itself
+    prints.
     """
     try:
         lines = site.path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -371,8 +480,10 @@ def candidate_gates(site: Owner) -> tuple[str, list[tuple[int, str]], bool]:
     for i in range(idx - 1, -1, -1):
         raw = lines[i]
         stripped = raw.strip()
-        # Column-0 noise that is not a definition: blank, preprocessor, lone
-        # braces, `else`, access labels, namespace/extern closers.
+        # Keep walking through anything that cannot start a definition: an
+        # indented line (the usual case, since the claim sits inside a body), a
+        # blank, a preprocessor line, a lone brace -- the `}` that closes a
+        # namespace or an extern block -- `else`, access labels and case arms.
         if (raw[:1] in (" ", "\t", "") or stripped in ("}", "{", "};", "")
                 or stripped.startswith(("#", "else", "public:", "private:",
                                         "protected:", "case ", "default:"))):
@@ -389,6 +500,9 @@ def candidate_gates(site: Owner) -> tuple[str, list[tuple[int, str]], bool]:
 
 
 def report_gates(addr: str, hits: list[Owner]) -> None:
+    """One block per CLAIMING site -- non-claiming kinds are never shown -- sorted
+    by file then offset, followed by the standing advice on how to settle the pair.
+    Called for --gates only, and fed the same hits+related list --check printed."""
     claims = sorted((o for o in hits if o.kind in CLAIMING), key=lambda o: (o.path, o.off))
     print(f"\n{addr} -- candidate gates for {len(claims)} claiming site(s) "
           f"(verbatim, NOT interpreted)")
@@ -411,10 +525,13 @@ def report_gates(addr: str, hits: list[Owner]) -> None:
 def symbol_crosscheck(index: dict[str, list[Owner]]) -> list[tuple[str, list[Owner], list[Owner]]]:
     """Pair named-import owners with hex-address owners of the same guest function.
 
-    Matched on whole identifier words only, so `sym:VdSwap` pairs with
-    `Hooked_VdSwap` and `hk_vdswap_observer` but `sym:ExCreateThread` does not
-    pair with `SetThreadNameImpl`. Still a heuristic -- the import table resolves
-    the real address at runtime -- so this is a lead to confirm, not a verdict.
+    Matched on whole `_`/`:`-separated words (tokens()), so `sym:VdSwap` pairs with
+    `Hooked_VdSwap` and `hk_vdswap_observer` but `sym:ExCreateThread` does not pair
+    with `SetThreadNameImpl`. Only the hex side needs a name, and only CLAIMING
+    kinds qualify, so an `override` body of an address is invisible to this. The
+    output is headed "overlaps", not violations: still a heuristic -- the import
+    table resolves the real address at runtime -- so it is a lead to confirm, not a
+    verdict.
     """
     hexed = [(a, hits) for a, hits in index.items()
              if not a.startswith(("sym:", "body:"))]
@@ -450,6 +567,8 @@ def main() -> int:
 
     if args.check or args.gates:
         rc = 0
+        # Only args.check is read here, so with both flags given the loop -- and
+        # the gate report inside it -- runs over the --check list.
         for raw in (a.strip() for a in (args.check or args.gates).split(",")):
             if not raw:
                 continue
@@ -463,7 +582,9 @@ def main() -> int:
             hits = sorted({(o.kind, o.where, o.name): o for o in hits}.values(),
                           key=lambda o: (o.path, o.off))
             # Pull in named-import owners that refer to the same guest function,
-            # so `--check 0x827BD6E4` also shows `PPC_FUNC(__imp__VdSwap)`.
+            # so `--check 0x827BD6E4` also shows `PPC_FUNC(__imp__VdSwap)`. The
+            # join runs one way only: `--check VdSwap` prints the sym site and not
+            # the hex addresses whose bound name shares the token.
             want = {t for o in hits if o.name for t in tokens(o.name)}
             seen = {(o.kind, o.where, o.name) for o in hits}
             related = [o for k, rh in index.items() if k.startswith("sym:")
@@ -480,6 +601,8 @@ def main() -> int:
                 print(f"  VIOLATION: {v}")
             for n in notes:
                 print(f"  note: {n}")
+            # A generated `map` row counts as a hit, so this prints only for an
+            # address absent from src/, the toml and the generated table alike.
             if not hits:
                 print("  (unclaimed in src/ and config/ -- if it shows up in a log "
                       "it is guest code running unhooked)")
@@ -490,6 +613,8 @@ def main() -> int:
 
     bad, noted = [], []
     for addr, hits in sorted(index.items()):
+        # An address is listed once: if classify() returned both a violation and
+        # notes here, only the violation survives into the report.
         violations, notes = classify(hits)
         if violations:
             bad.append((addr, hits, violations))
@@ -521,6 +646,10 @@ def main() -> int:
                 print(f"    {o}")
             print()
     else:
+        # Read this as "no conflict classify() could detect", not "every address is
+        # owned": the bulk of the index keys carry zero claiming sites at all -- a
+        # bare `map` row, or an `orig` extern with nothing over it -- and they too
+        # fall through to this branch.
         print("RULE-4 VIOLATIONS: none -- every guest address has one owner\n")
 
     if args.notes and noted:

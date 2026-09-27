@@ -6,7 +6,7 @@ here, which is why this file exists in two revisions (F-350 audit):
 1. Start it against the RAW GUEST IMAGE, not the .xex.
    `idalib-mcp.exe "build\\game_data\\default.xex"` dies with
    `RuntimeError: failed to analyze input file`. The working database is
-   `build/cache/mcla_pe.bin` (base 0x82000000, size 0xad3000):
+   `build/cache/mcla_pe.bin` (per `get_metadata`: base 0x82000000, size 0xad3000):
 
      "C:/Users/abdul/.local/share/mcp/idamcp-venv/Scripts/idalib-mcp.exe" \
          -v "E:/mcla pc/build/cache/mcla_pe.bin"
@@ -18,8 +18,8 @@ here, which is why this file exists in two revisions (F-350 audit):
 2. The request must advertise BOTH media types. Without
    `Accept: application/json, text/event-stream` the server answers
    `406 Not Acceptable`, including for `tools/call` routed through the stdio
-   proxy — `ida-pro-mcp.exe --transport stdio` forwards without that header, so
-   the proxy is NOT a workaround. Use this module instead.
+   proxy — `ida-pro-mcp.exe --transport stdio` forwards without that header (its
+   `tools/list` succeeds, so it looks alive); NOT a workaround — use this module.
 
 3. The JSON-RPC result does not arrive in the HTTP body's first bytes; it is
    streamed as server-sent events on the same response. A client that calls
@@ -43,7 +43,7 @@ import urllib.request
 
 URL = "http://127.0.0.1:8745/mcp"
 PROTOCOL = "2024-11-05"
-# Both media types are mandatory; see point 2 in the module docstring.
+# Accept must carry both media types; see point 2 in the module docstring.
 BASE_HEADERS = {"Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream"}
 

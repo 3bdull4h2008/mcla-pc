@@ -16,24 +16,24 @@ observability is not mistaken for life-support:
       only logs state. Counted, not reported as violations.
   other: unclassified, counted only.
 
-  sec 7 label with no occurrence in src/      -> STALE (documented, not in tree)
-  MITIGATION-shaped src/ label not in sec 7   -> UNDOCUMENTED (in tree, not registered)
+  sec 7 label absent from src/ code+comments   -> STALE (documented, not in tree)
+  MITIGATION-shaped src/ code label not in sec 7 -> UNDOCUMENTED (in tree, not registered)
 
-Labels are recognised by shape: hyphenated uppercase (`KDELAY-SC`,
-`BLIT-OOB-GUARD`, `REBASE-POISON`) or all-caps of five letters or more
-(`DISCCHK`). That shape rule is what keeps prose words like `SEH`, `pow2` and
-`NtReleaseSemaphore` out of the label set. Suffix classification is a heuristic
-on the name, so each UNDOCUMENTED entry must still be read to confirm it is a
-behaviour change rather than a log line -- but the suffixes are the project's own
-naming convention, and on the 2026-09-20 tree it separated 65 mitigations from
-64 census markers cleanly.
+Labels are recognised by shape: a hyphenated run of capitals and digits
+(`KDELAY-SC`, `BLIT-OOB-GUARD`, `REBASE-POISON`) or all-caps of five letters or
+more (`DISCCHK`). That shape rule is what keeps prose words like `SEH`, `pow2`
+and `NtReleaseSemaphore` out of the label set; it does capture ledger ids such
+as `F-432`, which the suffix tiers then count as unclassified. Suffix
+classification is a heuristic on the name, so each UNDOCUMENTED entry must still
+be read to confirm it is a behaviour change rather than a log line -- the
+suffixes are the project's own naming convention, nothing more.
 
-Exit status is 1 when either side has entries, so this can gate a commit.
+Exit status is 1 when either side has entries; `--label` exits 0, a guide file lacking the sec 7 heading exits 2.
 
 Usage:
-    python tools/mitigation_audit.py                 # stale + undocumented mitigations
-    python tools/mitigation_audit.py --tiers         # also list census/other tokens
-    python tools/mitigation_audit.py --label KDELAY-SC
+    python tools/mitigation_audit.py                 # stale + undocumented mitigations; --limit N = sites per label
+    python tools/mitigation_audit.py --tiers         # also list census/other tokens missing from sec 7; --comments adds comment-only hits
+    python tools/mitigation_audit.py --label KDELAY-SC   # one label on both sides, always exits 0
 """
 
 from __future__ import annotations
@@ -48,15 +48,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from addr_owners import REPO, SKIP_DIRS, SRC, SRC_SUFFIXES, strip_comments  # noqa: E402
 
 GUIDE = REPO / "docs" / "PROGRAM_GUIDE.md"
-SEC7_HEADING = "## 7. Short-circuits in tree"
+SEC7_HEADING = "## 7. Short-circuits in tree"  # matched as a prefix: the guide's real heading carries a parenthetical tail
 
-# Hyphenated uppercase, or a run of five or more capitals. Both must start with a
-# letter so hex literals (`0x82839F70`) and commit hashes never qualify. A `/`
-# is allowed only inside a hyphenated group so that the sec 7 shorthand
-# `INFLATE-SKIP/EMPTY/PENDING` arrives whole and can be expanded into the three
-# labels src/ actually uses.
+# Hyphenated capitals-and-digits, or a run of five or more capitals. Both
+# alternatives must open on a word boundary with an uppercase letter, so
+# `0x82839F70`-style hex literals and sec 7's lowercase commit hashes are safe.
+# A `/` is allowed only inside a hyphenated group so that the sec 7 shorthand
+# `INFLATE-SKIP/EMPTY/PENDING` arrives whole and expands into the three labels.
 LABEL = re.compile(r"\b(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9/]+)+|[A-Z]{5,})\b")
-# Words that are shaped like labels but are ordinary prose or guest API names.
+# Label-shaped prose/API words; entries under 5 letters can never match LABEL.
 NOT_LABELS = {
     "INSERT", "DELETE", "UPDATE", "SELECT", "RETURN", "SHADER", "SHADERS",
     "TEXTURE", "STREAM", "DEVICE", "MEMORY", "ARCHIVE", "PRELOAD", "FATAL",
@@ -105,7 +105,7 @@ def section7(path: Path) -> str:
 
 
 def expand_family(label: str) -> list[str]:
-    """`INFLATE-SKIP/EMPTY/PENDING` -> the three full labels."""
+    """`INFLATE-SKIP/EMPTY/PENDING` -> the three full labels; a head with no hyphen is glued rather than dashed (`ABC/X` -> `ABCX`)."""
     if "/" not in label:
         return [label]
     head, *tails = label.split("/")
@@ -128,7 +128,7 @@ def labels_in(text: str) -> dict[str, int]:
 
 
 def scan_src() -> tuple[dict[str, list[tuple[Path, int]]], dict[str, list[tuple[Path, int]]]]:
-    """Return (code_tokens, comment_only_tokens) -> [(path, line)]."""
+    """Return (code_tokens, comment_only_tokens) -> [(path, first-hit line per file)]; strip_comments blanks // and /* */ only, so a label inside a log literal counts as code."""
     code: dict[str, list[tuple[Path, int]]] = defaultdict(list)
     every_comment: dict[str, list[tuple[Path, int]]] = defaultdict(list)
     for path in sorted(SRC.rglob("*")):

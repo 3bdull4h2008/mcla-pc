@@ -2,16 +2,16 @@
 """Static xrefs into the decompressed guest image (rules 3/14/15).
 
  PPC code materialises a 32-bit address as `lis rA,HI` followed (not necessarily
- immediately) by `addi rT,rA,LO` / `addis rT,rA,LO`, and the second `lis` in a
- pair is a real hazard (do-not #16), so register state is tracked per-register
- across a window instead of pairwise. This tool keeps that state and answers
- "which code points at this address", which is the only xref available here:
- there is no IDA session, and `config`/`generated` give functions, not callers.
+ immediately) by `addi rT,rA,LO` / `ori rT,rA,LO` (zero-extends) / `addis rT,rA,HI`;
+ the second `lis` in a pair is a real hazard (do-not #16), so register state is
+ tracked per-register across the scan instead of pairwise. Blind spot to remember:
+ `hi[]` starts all-None and r2's TOC value is never seeded, so a TOC-relative
+ `addis rT,r2,HI` + low half (F-359 §3) materialises nothing here.
 
   python tools/ppc_xrefs.py find-str <text>            # literal's VA (+ context)
-  python tools/ppc_xrefs.py xref <hexVA>               # code that materialises it
+  python tools/ppc_xrefs.py xref <hexVA> [-n <hits>]   # code that materialises it
   python tools/ppc_xrefs.py fn <hexVA> [<hexVA> ...]   # enclosing sub_XXXXXXXX
-  python tools/ppc_xrefs.py calls <hexVA>              # `bl` edges that target it
+  python tools/ppc_xrefs.py calls <hexVA>              # branch edges (link bit untested)
 """
 import array
 import bisect
@@ -19,7 +19,7 @@ import re
 import sys
 
 IMAGE = "build/cache/mcla_pe.bin"
-BASE = 0x82000000
+BASE = 0x82000000  # rule 3: offset in mcla_pe.bin = VA - BASE (identity, no section table)
 FUNC_RE = re.compile(rb"sub_([0-9A-Fa-f]{8})")
 
 
@@ -36,7 +36,7 @@ def load():
 
 
 def func_starts(words):
-    """Guest function addresses named anywhere in generated/ (the call graph's nodes)."""
+    """`sub_XXXXXXXX` tokens in generated/ppc_xenon/*.cpp (definitions and uses), kept if inside the image."""
     import glob
     names = set()
     for path in glob.glob("generated/ppc_xenon/*.cpp"):
@@ -133,12 +133,12 @@ def cmd_xref(img, words, starts):
                         break
             hi[rt] = None
             continue
-        if op == 24:                     # ori rT,rA,IMM  -- the dominant low-half form
-            # `lis rT,0,HI` + `ori rT,rT,LO` builds an address WITHOUT sign-extending
-            # the low half, so addi alone misses most materialisations: 72,344 of the
-            # 90,192 addis in mcla_pe.bin have rA==0 (`lis`), and the compiler pairs
-            # them with ori far more often than with addi. Added 2026-09-26 (F-359)
-            # after this blind spot made a table look unreferenced.
+        if op == 24:                     # ori rT,rA,IMM (IMM zero-extends)
+            # `lis rT,HI` + `ori rT,rT,LO` builds an address WITHOUT sign-extending
+            # the low half, which `addi` cannot express, so an addi-only scan misses
+            # it. Census of the current mcla_pe.bin: 90,192 op-15 words, 72,344 with
+            # rA==0 (`lis`); a tracked `lis` result feeds 38,980 `addi` but only 2,451
+            # `ori` -- the rarer pairing, not a dominant one (F-359 §3, commit 7307f02).
             if hi[ra] is not None or ra == 0:
                 basev = 0 if ra == 0 else hi[ra]
                 val = (basev & 0xFFFF0000) | imm
@@ -152,17 +152,17 @@ def cmd_xref(img, words, starts):
             hi[rt] = None
             continue
         if op in (32, 33, 34, 35, 36, 37, 40, 41, 42, 43, 44, 45, 46, 47):
-            # loads into GPR/FPR: destination is no longer a known immediate
+            # int load/store group (36/37/44/45 stores, 46/47 lmw-cmpl): rT is not an immediate
             hi[rt] = None
-            if op in (32, 36) and hi[ra] is not None:
+            if op in (32, 36) and hi[ra] is not None:  # 36 = stw: that match is a write
                 if (hi[ra] + sext16(imm)) & 0xFFFFFFFF == target:
                     print(f"  {pc:#010x} lwz r{rt},{sext16(imm)}(r{ra}) reads target directly")
                     found += 1
             continue
         if op == 31 or op in (8, 9, 10, 48, 49, 50, 51, 52, 53, 54, 55):
-            # Fixed-point arithmetic/logic and CR ops: rT is computed, so any
-            # tracked immediate in that GPR is dead from here on.
-            hi[rt] = None
+            # 31 fixed-point arith/logic, 8 subf, 9 mask, 10 cmp: rT is computed, so any
+            # tracked immediate dies. 48-51 are FP stores, 52-55 FP loads (rT is no GPR dest).
+            hi[rt] = None  # opcodes matched by no case above leave hi[] stale
     print(f"  {found} site(s) materialising {target:#x}")
 
 
@@ -172,9 +172,9 @@ def cmd_calls(words, starts):
     target = int(sys.argv[2], 16)
     n = 0
     for i, w in enumerate(words):
-        if _hi(w) in (18, 16) and (w & 0x03FFFFFC):     # bl / bla family
-            off = w & 0x03FFFFFC
-            if off & 0x02000000:
+        if _hi(w) in (18, 16) and (w & 0x03FFFFFC):     # op 18 bl, op 16 b: LK+AA untested
+            off = w & 0x03FFFFFC  # LI = bits 6-29, word-aligned (<<2) by the mask
+            if off & 0x02000000:  # sign-extend the 24-bit field
                 off -= 0x04000000
             if (BASE + i * 4 + off) & 0xFFFFFFFF == target:
                 pc = BASE + i * 4
