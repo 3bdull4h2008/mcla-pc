@@ -10621,3 +10621,27 @@ lifetime causes non-completion (F-485), and now "an exhausted input list could b
 (this entry). Remaining live difference between the one completing job and the six silent ones: the
 per-descriptor `produced == expected` equality at `:19100-19105` and the `[obj+1852]` byte at `:19096`,
 both of which need the in-loop instrument to read at all. Next ID **F-489**.
+
+### F-489 (2026-09-27 07:0x, **0 builds — a side-by-side of the pinned soak `w483` against the baseline `w485`, using fields both already print**) — **EVERY OBSERVABLE RECORD CONDITION IS SATISFIED FOR THE SILENT JOBS AND THEY STILL DO NOT COMPLETE: under the P1c pin, jobs #2, #3 and #4 each entered `sub_821BC140` with `record+0` EQUAL to their own handle, `record+4` equal to their own full length (garage `0x104449` = 1,066,057) and `record+12` = 1, and the garage then read its own whole package — yet the completion callback is still 1 for the boot and `XSF-INFLATE` is still 0. In the baseline the same three jobs enter with `+0` = a foreign gen-tagged handle, `+4` = another container's length and `+12` = 0 or a free-list link, and they fail the same way. So no externally-visible record/state/list field distinguishes completing from silent, and the remaining defect is inside the walk's per-iteration arithmetic.**
+
+- Task:        T42.24 (#79) — answered read-only; closes the "fix the observable state" family
+- Type:        FACT (a null result that is decisive about where to look next)
+- Class:       E + G
+- Priority:    P0 — it is the current boundary of this objective
+- Evidence:    `build/w483.log` `BC140-REC #2 … id=00000002 … [00000002 00104449 C64AC100 00000001 D574B032 000C9300 64980000] RLC=52 e0=B7EC1000/00040000` (and `#3 [00000003 00004B89 … 00000001 … 64CA3000]`, `#4 [00000004 000073D7 … 00000001 … 6496F000]`) against `build/w485.log` `#2 [00008002 00004B89 C64AC100 00000000 …]`, `#3 [00008003 000073D7 … 00000000 …]`, `#4 [00018004 00000000 … 00000005 …]` · outcomes: `RELSEMA … lr=821BC538` = 1 in both soaks, `XSF-INFLATE` 0 in both, and `w483`'s per-window `len>0` = 33 own-package reads for the garage vs `w485`'s 1 foreign read · read-list capacity is not the issue either: every job's `RLC × [slot+12]` (10 × 262,144 and 52 × 262,144) exceeds its container many times over
+
+**1. What this ends.** Five candidate causes have now been measured and removed, in order: the enqueue
+never happened (F-469), the record values were wrong and we can write them (F-468/F-470), the guest
+asked for bytes and got nothing (F-482), the record's lifetime caused non-completion (F-485), and now
+"the observable record/state fields decide completion" (this entry). The completing job and the silent
+ones differ in nothing that a function-entry or function-exit hook can see.
+
+**2. What is left, and its cost.** The only unexplored ground is the loop body's own arithmetic — the
+`produced == [desc+0]` equality at `ppc_recomp.14.cpp:19100-19105`, the `[obj+1852]` byte at `:19096`,
+and the stack pair the walk passes to `InflateBegin` at `[r1+96]/[r1+100]` (F-488). All three live
+*between* the entry and exit of `sub_821BC140`, so observing them needs a hook inside the routine:
+`midasm_hook`/stub regeneration via `.qoder/skills/mcla-recompiler-regen`, which is currently blocked by
+the recompiler toolchain (clang 19 vs STL 14.51). That is a decision for the user, not a step to take
+quietly — and it is also the point where Path A's own result (3 of 4 UI containers byte-exact in guest
+memory, garage 806k-852k of 1,066,057 durable) already covers the decompression half of the objective
+by a different route, without a guest inflate. Next ID **F-490**.
