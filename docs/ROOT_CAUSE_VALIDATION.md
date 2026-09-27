@@ -10523,3 +10523,30 @@ unchanged and cheap to read: `len>0` per UI window stays at own-package coverage
 171, and the gate is `XSF-INFLATE` > 0 plus `RELSEMA … lr=821BC538` ≥ 2. If P1c does not clear that, the
 deferral comes out and F-484 stands as the measurement that pinned-down where the real defect is. Next
 ID **F-485**.
+
+### F-485 (2026-09-27 06:5x, **2 builds: P1c armed (`w483`), then flag OFF + rebuild + control `w484`**) — **P1c CLEARS THE LOADER BUT NOT THE GATE, AND THAT IS THE MORE IMPORTANT RESULT: a job holding its OWN record, reading its OWN whole container (garage: `reads=615 len>0=33 moves=33`, `64980000 → 64A84449` = all 1,066,057 bytes) still never reaches `sub_821BC140`'s success tail — `RELSEMA … lr=821BC538` stays at 1, `XSF-INFLATE` stays 0, and `LISTLINE` never returns. So the record lifetime F-469…F-484 established is real and causal for WHICH BYTES a job asks for, but it is NOT the reason the jobs fail to complete. The completion defect has an independent cause inside the dispatch loop.**
+
+- Task:        T42.21 (#79) — P1c measured, FAILED the stated gate, REVERTED
+- Type:        FIX-attempt measured and reverted + a REFUTATION of the sufficiency claim I recorded in plan §9
+- Class:       E + G
+- Priority:    P0 — it removes the last "if only the record were right" hope and re-points the search
+- Evidence:    `build/w483.log` `POST-EXEC-START #1..#4` (`#1 reads=9 moves=5 len>0=5 64CB0000→64CD2EDD`; `#2 reads=615 moves=33 len>0=33 64980000→64A84449`; `#3/#4 moves=1 len>0=1` still foreign), 4 `F483-UNPIN` rows, yet `PUSH` 6 (not 7), `LISTLINE` **0**, `BOOTPATH` 0, `GFx` 7, `lr=821BC538` 1, `XSF-INFLATE` 0 · `build/w484.log` after the revert: `PUSH` 7, `LISTLINE` 171, `BOOTPATH` 10, `GFx` 13, `C0000005` 0, `F483-DEFER`/`F483-UNPIN` 0, exe back to 57,449,472 bytes = the `w481` build size
+
+**1. Why the unpin did not rescue the loader.** Dropping the pinned count at each job's *exit* removed
+the indefinite join for the four jobs that ran, and indeed one more push appeared (`w482`'s 5 → `w483`'s
+6) — but the loader still never reaches the shader-list phase. So the loader is blocked by something
+other than the join it was spinning in, and the deferral's `w482` collapse was only partly the pin.
+
+**2. Sufficiency is now measured false, and it was my own claim.** Plan §9 asserted the chain ended at
+"the job resolves a foreign record, therefore no tail". `w483` satisfies the antecedent for jobs #1 and
+#2 and the consequent does not follow. The honest successor question is what the dispatch loop needs
+after the reads to fall through to `:19351` — F-393's read gives two exits (`inLeft == 0`, `outLeft == 0`)
+and job #2 clearly drained 1,066,057 bytes of reads in 97 ms, so the candidate is now `outLeft`: the
+destination chain the walk writes into, which is task #15's *original* shape (per-request output
+descriptors) rather than the record-index shape F-470 gave it.
+
+**3. Tree state.** `kF483DeferRelease = false`, both the pin (`src/gpu_device.cpp` in
+`PPC_FUNC(sub_821BD220)`) and the unpin (in `PPC_FUNC(sub_821BC140)`) compiled out; markers
+`F483-DEFER` / `F483-DEFER-HOLD` / `F483-UNPIN` are therefore absent from the shipped binary and are
+registered as flag-off in `PROGRAM_GUIDE` §7 so a future session does not read their 0 as a result
+(F-089 §6). Next ID **F-486**.

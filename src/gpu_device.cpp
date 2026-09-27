@@ -4641,7 +4641,7 @@ PPC_FUNC(sub_821C90C0) {
 // pass for a tag that was pushed but has not been dispatched yet, leaving the release
 // to happen after the job's own tail decrements the count. MITIGATION of an ordering
 // our own TASKJOIN-SC zeroing created, and labelled as such.
-static constexpr bool kF483DeferRelease = true;
+static constexpr bool kF483DeferRelease = false;
 constexpr uint32_t kF483Ring = 32u;
 static std::atomic<uint32_t> g_f483Pushed[kF483Ring]{};
 static std::atomic<uint32_t> g_f483PushN{0};
@@ -12898,11 +12898,9 @@ PPC_FUNC(sub_821BC140) {
       }
     }
   }
-  {
-    uint32_t idt = 0;
-    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(slotAddr, &idt);
-    F483Add(g_f483Dispatched, g_f483DispN, idt);
-  }
+  uint32_t f483Tag = 0;
+  (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(slotAddr, &f483Tag);
+  F483Add(g_f483Dispatched, g_f483DispN, f483Tag);
   g_f481Calls.store(0, std::memory_order_relaxed);
   g_f481Moves.store(0, std::memory_order_relaxed);
   g_f481NonZeroLen.store(0, std::memory_order_relaxed);
@@ -12915,6 +12913,24 @@ PPC_FUNC(sub_821BC140) {
   __imp__sub_821BC140(ctx, base);
   g_f481Window.store(0, std::memory_order_relaxed);   // close it
   const auto tGuestDone = std::chrono::steady_clock::now();
+  // F-484 §3 (P1c): the pin holds a join until this job's record count drops, and
+  // six of seven jobs never reach the tail that would drop it (F-478). Release the
+  // pin HERE, at the job's own exit, with the value the tail would have written --
+  // otherwise the loader blocks forever (measured: w482 LISTLINE 171 -> 0).
+  if (kF483DeferRelease) {
+    uint32_t arb = 0, cap = 0;
+    auto &gm = mcla::kernel::GuestMemoryHeap::Instance();
+    if (gm.ReadU32BE(0x8283D190u + 52u, &arb) &&
+        gm.ReadU32BE(0x8283D190u + 24u, &cap) && arb != 0 && cap != 0 &&
+        f483Tag != 0 && f483Tag != 0xFFFFFFFFu) {
+      const uint32_t rec = arb + (f483Tag & (cap - 1u)) * 28u;
+      uint32_t cnt = 0;
+      (void)gm.ReadU32BE(rec + 12u, &cnt);
+      (void)gm.WriteU32BE(rec + 12u, 0);
+      MCLA_LOG_WARN("F483-UNPIN #{} tag={:08X} rec={:08X} count {}->0 (job exit)",
+                    n, f483Tag, rec, cnt);
+    }
+  }
   // F-474: the routine's own success tail calls the job's completion callback at
   // [slot+1548] (mtctr/bctrl, ppc_recomp.14.cpp:19361-19381) but SKIPS it when
   // [slot+1540] has become 0, and exactly one of the seven jobs in a boot takes it
