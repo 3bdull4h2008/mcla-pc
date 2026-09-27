@@ -86,6 +86,22 @@ static std::unordered_map<std::string, XsfTocInfo> g_xsfToc;
 // was 7 ms too late). ON to test whether raceeditor/others now decompress. OFF == exact baseline.
 static constexpr bool kPathBEnqueueUI = true;
 
+// F-474 (T42.17 / task #77): EXPERIMENT, armed for one soak. `ClearTaskJoinBusy`
+// (src/gpu_device.cpp:4626) is a session-72 short-circuit that zeroes record+12 - the
+// join wait word - from the GPU-fence wait, on the theory that "the CP already did the
+// work". w477 shows it firing for all seven STREAMER jobs, each time on the loader
+// thread and each time BEFORE that job's own `sub_821BC140` dispatch: the tags are the
+// streamer handles 1,2,3,4,0x8004,0x10004,0x18004, the entries base is
+// 0x8283D1C4 = [0x8283D190+52] = the record array, and the guest's own join then reads
+// busy=0 and releases the record (`sub_821BD220` writes +4=0 and record+0 += 0x8000 at
+// ppc_recomp.14.cpp:21632-21637) ~22-28 ms before the job runs - which is exactly the
+// re-stamping F-469 measured. Consequence in the same soak: the routine's own success
+// tail calls the completion callback at [slot+1548] (`ppc_recomp.14.cpp:19361-19381`)
+// and `RELSEMA ... lr=821BC538` fires ONCE per boot, for job #1 only.
+// true  = skip only the join-clear (the FENCE-SC semaphore pre-release stays armed),
+// false = the session-72 behaviour, byte-identical to every recent soak.
+static constexpr bool kF474NoPrematureJoinClear = false;
+
 // F-468 (T42.11 / task #74): mirror a UI container's streamer record onto the queue
 // TAG index its own job object will be read at, because F-467 measured the guest placing
 // these records at `handle & 0x7FFF` (0-based) while sub_821BC140 indexes the array by the
@@ -4704,7 +4720,7 @@ PPC_FUNC(sub_821E5640) {
     ctx.r3.u32 = sr3;
     ctx.r4.u32 = sr4;
     ctx.r5.u32 = sr5;
-    if (releaseFlag != 0)
+    if (releaseFlag != 0 && !kF474NoPrematureJoinClear)
       (void)ClearTaskJoinBusy(tag);
   }
 
@@ -4745,7 +4761,7 @@ PPC_FUNC(sub_821BD220) {
   // Honest short-circuit: if this is the main-thread join on a slot that is
   // still marked busy, force busy=0 so the 10ms spin can exit. GPU work for
   // FENCE-SC tags is already done synchronously.
-  if (busy != 0 && key == tag) {
+  if (!kF474NoPrematureJoinClear && busy != 0 && key == tag) {
     const uint32_t mainId = g_mainGuestThreadId.load();
     if (mainId != 0 && GetCurrentThreadId() == mainId) {
       auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -12826,17 +12842,31 @@ PPC_FUNC(sub_821BC140) {
   const auto tPreGuest = std::chrono::steady_clock::now();
   __imp__sub_821BC140(ctx, base);
   const auto tGuestDone = std::chrono::steady_clock::now();
+  // F-474: the routine's own success tail calls the job's completion callback at
+  // [slot+1548] (mtctr/bctrl, ppc_recomp.14.cpp:19361-19381) but SKIPS it when
+  // [slot+1540] has become 0, and exactly one of the seven jobs in a boot takes it
+  // (w476: RELSEMA lr=821BC538 fires once). Re-read both fields post-call so the
+  // next census decides whether the other six skipped the callback or exited
+  // before the tail. slotAddr is the pre-call snapshot - ctx.r3 is clobbered.
+  uint32_t rlcAfter = 0, cbAfter = 0, r3After = 0;
+  {
+    auto &m2 = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)m2.ReadU32BE(slotAddr + 1540u, &rlcAfter);
+    (void)m2.ReadU32BE(slotAddr + 1548u, &cbAfter);
+    r3After = ctx.r3.u32;
+  }
   // POST-EXEC: mount the inflated buffer as a memory: device so shader
   // lookups (star_glow etc.) can find it. The callback at [ctx+1548] is
   // 0x821BC548 (semaphore release) â€” wrong function. We do the mount here.
   // NOTE: use slotAddr (saved pre-call), never ctx.r3 — r3 is clobbered.
   MCLA_LOG_WARN("POST-EXEC-START #{} slot={:08X} qarg={:08X} r3after={:08X} "
-                "tid={:08X} pre={}ms guest={}ms",
-                n, slotAddr, queueArg, ctx.r3.u32, GetCurrentThreadId(),
+                "tid={:08X} pre={}ms guest={}ms rlcAfter={} cbAfter={:08X}",
+                n, slotAddr, queueArg, r3After, GetCurrentThreadId(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     tPreGuest - tHook0).count(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                    tGuestDone - tPreGuest).count());
+                    tGuestDone - tPreGuest).count(),
+                rlcAfter, cbAfter);
   if (n <= 16 || (n % 500) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t ctxBase = slotAddr;
