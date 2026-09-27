@@ -145,6 +145,10 @@ static std::atomic<uint32_t> g_f481RetZero{0};
 static std::atomic<uint32_t> g_f481RetPos{0};
 static std::atomic<uint32_t> g_f481RetNeg{0};
 static std::atomic<uint32_t> g_f481Infl{0};
+static std::atomic<uint32_t> g_f481Seeded{0};
+static std::atomic<uint32_t> g_f481ExpNZ{0};
+static std::atomic<uint32_t> g_f481OutNZ{0};
+static std::atomic<uint32_t> g_f481MaxProd{0};
 static std::atomic<uint32_t> g_f481Lzx{0};
 
 // F-247 dynamic serve-framing predicate: defined after g_mclaRebaseMap (~:3945).
@@ -10417,8 +10421,16 @@ PPC_FUNC(sub_821D5E10) {
     uint8_t ih[8] = {0};
     if (inPtr)
       (void)mem.ReadBytes(inPtr, ih, 8);
-    if (g_f481Window.load(std::memory_order_relaxed) != 0)
-      g_f481Infl.fetch_add(1, std::memory_order_relaxed);   // F-487: unconditional
+    if (g_f481Window.load(std::memory_order_relaxed) != 0) {
+      // F-490 §3: unconditional seed/exp/outLeft/produced tallies, so "never seeded"
+      // and "seeded then consumed" stop being read off a 1-in-200 sample.
+      g_f481Infl.fetch_add(1, std::memory_order_relaxed);
+      if (inLeft != 0) g_f481Seeded.fetch_add(1, std::memory_order_relaxed);
+      if (expected != 0) g_f481ExpNZ.fetch_add(1, std::memory_order_relaxed);
+      if (outLeft != 0) g_f481OutNZ.fetch_add(1, std::memory_order_relaxed);
+      if (produced > g_f481MaxProd.load(std::memory_order_relaxed))
+        g_f481MaxProd.store(produced, std::memory_order_relaxed);
+    }
     if (n <= 16 || (n % 200) == 0 || j2Ent || stackCont)
       MCLA_LOG_WARN("INFLATE-ENTER #{} st={:08X} in={} inPtr={:08X} "
                     "consumed={} exp={:08X} ihdr=[{:08X} {:08X}] "
@@ -12919,6 +12931,10 @@ PPC_FUNC(sub_821BC140) {
   g_f481RetNeg.store(0, std::memory_order_relaxed);
   g_f481Infl.store(0, std::memory_order_relaxed);
   g_f481Lzx.store(0, std::memory_order_relaxed);
+  g_f481Seeded.store(0, std::memory_order_relaxed);
+  g_f481ExpNZ.store(0, std::memory_order_relaxed);
+  g_f481OutNZ.store(0, std::memory_order_relaxed);
+  g_f481MaxProd.store(0, std::memory_order_relaxed);
   g_f481LastOff.store(0, std::memory_order_relaxed);
   g_f481Window.store(n, std::memory_order_relaxed);   // open the read window
   const auto tPreGuest = std::chrono::steady_clock::now();
@@ -12963,7 +12979,8 @@ PPC_FUNC(sub_821BC140) {
   MCLA_LOG_WARN("POST-EXEC-START #{} slot={:08X} qarg={:08X} r3after={:08X} "
                 "tid={:08X} pre={}ms guest={}ms rlcAfter={} cbAfter={:08X} "
                 "reads={} offFirst={:08X} offLast={:08X} moves={} len>0={} "
-                "ret[0/+/-]={}/{}/{} inflEnters={} lzxFrames={}",
+                "ret[0/+/-]={}/{}/{} inflEnters={} lzxFrames={} "
+                "in!=0={} exp!=0={} outLeft!=0={} maxProduced={}",
                 n, slotAddr, queueArg, r3After, GetCurrentThreadId(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     tPreGuest - tHook0).count(),
@@ -12979,7 +12996,11 @@ PPC_FUNC(sub_821BC140) {
                 g_f481RetPos.load(std::memory_order_relaxed),
                 g_f481RetNeg.load(std::memory_order_relaxed),
                 g_f481Infl.load(std::memory_order_relaxed),
-                g_f481Lzx.load(std::memory_order_relaxed));
+                g_f481Lzx.load(std::memory_order_relaxed),
+                g_f481Seeded.load(std::memory_order_relaxed),
+                g_f481ExpNZ.load(std::memory_order_relaxed),
+                g_f481OutNZ.load(std::memory_order_relaxed),
+                g_f481MaxProd.load(std::memory_order_relaxed));
   if (n <= 16 || (n % 500) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t ctxBase = slotAddr;

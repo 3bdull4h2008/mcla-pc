@@ -10661,3 +10661,30 @@ by a different route, without a guest inflate. Next ID **F-490**.
 `InflateBegin` entry while a window is open, printed on the same `POST-EXEC-START` row. That settles
 "never seeded" vs "seeded and consumed" per job without a filter, which is the last question that
 stands between F-489's null result and the in-loop (`midasm_hook`) route. Next ID **F-491**.
+
+### F-491 (2026-09-27 07:1x, **3 builds: tallies added → `w486` pin OFF, `w487` pin ON, `w488` control after re-disarming**) — **ANSWER TO "NEVER SEEDED OR SEEDED AND CONSUMED": NEVER SEEDED — AND THE PIN SEEDS IT, WHICH IS THE MOST USEFUL THING THIS BRANCH HAS PRODUCED. Unfiltered per-window tallies of the inflate state show the garage's job entering `InflateBegin` 10,106 times with `inLeft != 0` on just 2 of them and `exp != 0` on 4, i.e. the descriptor pair is almost never present; with the release pinned and the same job holding its own record, the same counters read `inLeft != 0` on 78 entries, `exp != 0` on 303, `reads=615 / len>0=33` across its own package — and **`lzxFrames=6` where the baseline has 0: the first host-decoded LZX frames ever attributed to the garage's own dispatch.** The gate still fails (callback 1 of 7, `XSF-INFLATE` 0, `LISTLINE` 171 → 0), so the pin stays disarmed.**
+
+- Task:        T42.25 — seed-vs-consumed settled; T42.23's question closed
+- Type:        FACT + instrument kept + experiment disarmed with a control
+- Class:       E + G
+- Priority:    P0 — it is the current boundary, and it names the one reachable difference
+- Evidence:    `build/w486.log` (pin OFF) `POST-EXEC-START #1..#7 … inflEnters=… lzxFrames=… in!=0=… exp!=0=…`: `#1 28/10/24/28` (the only job with frames and with `inLeft != 0` on 24 of 28 entries — and the only completer), `#2 10,106/0/2/4`, `#3 1,011/0/1/2`, `#4 607/0/1/0`, `#5 3,921/0/16/38`, `#6 222/0/25/221`, `#7 216/0/2/1` · `build/w487.log` (pin ON): `#1 28/10/24/28` unchanged, `#2 660 entries / **6 frames** / 78 seeded / 303 with exp`, `reads=615 len>0=33 moves=33 64980000→64A84449` · `build/w488.log` control after disarming reproduces `w486`'s job #2 row exactly (`10,105 reads / 10,106 entries / 0 frames / 2 / 4`) and restores `PUSH` 7, `LISTLINE` 171, `BOOTPATH` 10, `GFx` 13, `C0000005` 0, `F483-DEFER` 0
+
+**1. Why this is the useful result and not another dead end.** Every prior entry in this branch changed
+what a job *read*; this is the first measurement showing a change in what the job *decodes* — the guest
+calling through `sub_821D5E10` with a real descriptor and producing 6 LZX frames against its own
+container. It also nails the causal ordering: seeding requires the record to be the job's own (F-484),
+and completion requires more than seeding (F-485/F-489). So the chain is now
+`own record → seeded state → frames → [still missing] → tail/callback`, with the last arrow the only
+unmeasured one.
+
+**2. Instrument status.** The unconditional per-window tallies (`in!=0`, `exp!=0`, `outLeft!=0`,
+`maxProduced`, `inflEnters`, `lzxFrames`, read counts and offset moves) stay in the tree on the
+`POST-EXEC-START` row — they are pure host counters, add no guest writes, and printed identically in
+`w486` and `w488` on the same binary, so they are reproducible. `kF483DeferRelease = false`.
+
+**3. Next ID** **F-492**. The one unmeasured arrow needs a hook *inside* `sub_821BC140` (between
+`loc_821BC374`'s `InflateBegin` call and the `cmpw r3,r31` at `ppc_recomp.14.cpp:19100-19105`), which is
+the `midasm_hook`/stub route gated by the broken recompiler toolchain. That is a user decision, and
+`PROGRAM_GUIDE` §7 now carries the flag-off pin so a later session can re-arm it in one edit with the
+seeding result already known.
