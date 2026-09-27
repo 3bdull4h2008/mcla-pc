@@ -4632,6 +4632,37 @@ PPC_FUNC(sub_821C90C0) {
 //   idx     = (count-1) & tag
 //   entry   = entries + idx * 28
 //   entry+0 = key, entry+12 = in-progress flag (join wait word)
+// F-483 (P1 of plan §9): EXPERIMENT, armed for one soak. The chain F-469 -> F-470
+// -> F-474/F-478 -> F-482 says a streamer record is released by the loader's join as
+// soon as its +12 count reads 0, and the NEXT container's Open then claims that very
+// index -- so the first job dispatches against a record that describes another
+// container and issues its only byte-request inside that foreign package. This does
+// NOT write record values (measured dead: F-468/F-470 §1); it refuses to let a join
+// pass for a tag that was pushed but has not been dispatched yet, leaving the release
+// to happen after the job's own tail decrements the count. MITIGATION of an ordering
+// our own TASKJOIN-SC zeroing created, and labelled as such.
+static constexpr bool kF483DeferRelease = true;
+constexpr uint32_t kF483Ring = 32u;
+static std::atomic<uint32_t> g_f483Pushed[kF483Ring]{};
+static std::atomic<uint32_t> g_f483PushN{0};
+static std::atomic<uint32_t> g_f483Dispatched[kF483Ring]{};
+static std::atomic<uint32_t> g_f483DispN{0};
+static void F483Add(std::atomic<uint32_t>* ring,
+                    std::atomic<uint32_t>& ctr, uint32_t tag) {
+  if (tag == 0 || tag == 0xFFFFFFFFu) return;
+  const uint32_t i = ctr.fetch_add(1, std::memory_order_relaxed) % kF483Ring;
+  ring[i].store(tag, std::memory_order_relaxed);
+}
+static bool F483In(const std::atomic<uint32_t>* ring, uint32_t tag) {
+  for (uint32_t i = 0; i < kF483Ring; ++i)
+    if (ring[i].load(std::memory_order_relaxed) == tag) return true;
+  return false;
+}
+// A tag whose job object was pushed but whose sub_821BC140 has not begun.
+static bool F483Pending(uint32_t tag) {
+  return F483In(g_f483Pushed, tag) && !F483In(g_f483Dispatched, tag);
+}
+
 constexpr uint32_t kTaskJoinCountAddr = 0x8283D1A8u;
 constexpr uint32_t kTaskJoinEntriesAddr = 0x8283D1C4u;
 constexpr uint32_t kTaskJoinStride = 28u;
@@ -4761,6 +4792,23 @@ PPC_FUNC(sub_821BD220) {
   // Honest short-circuit: if this is the main-thread join on a slot that is
   // still marked busy, force busy=0 so the 10ms spin can exit. GPU work for
   // FENCE-SC tags is already done synchronously.
+  // F-483: if this tag's job has not been dispatched yet, keep its record pinned
+  // (count 1) so Open cannot claim the index out from under it, and do NOT run the
+  // session-72 clear for this tag.
+  if (kF483DeferRelease && key == tag && F483Pending(tag)) {
+    if (busy == 0) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      (void)mem.WriteU32BE(entry + 12, 1);
+      MCLA_LOG_WARN("F483-DEFER tag={:08X} idx={} entry={:08X} count 0->1 "
+                    "(job not dispatched)",
+                    tag, idx, entry);
+    } else {
+      MCLA_LOG_WARN("F483-DEFER-HOLD tag={:08X} entry={:08X} busy={:08X}", tag,
+                    entry, busy);
+    }
+    __imp__sub_821BD220(ctx, base);
+    return;
+  }
   if (!kF474NoPrematureJoinClear && busy != 0 && key == tag) {
     const uint32_t mainId = g_mainGuestThreadId.load();
     if (mainId != 0 && GetCurrentThreadId() == mainId) {
@@ -12850,6 +12898,11 @@ PPC_FUNC(sub_821BC140) {
       }
     }
   }
+  {
+    uint32_t idt = 0;
+    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(slotAddr, &idt);
+    F483Add(g_f483Dispatched, g_f483DispN, idt);
+  }
   g_f481Calls.store(0, std::memory_order_relaxed);
   g_f481Moves.store(0, std::memory_order_relaxed);
   g_f481NonZeroLen.store(0, std::memory_order_relaxed);
@@ -13944,6 +13997,7 @@ PPC_FUNC(sub_821BC868) {
         }
         MCLA_LOG_WARN("F469-RECSNAP #{} tag={} slot={:08X} base={:08X} records{}",
                       n, slotTag, slot, arb, snap);
+      F483Add(g_f483Pushed, g_f483PushN, slotTag);
       }
     }
     MCLA_LOG_INFO(

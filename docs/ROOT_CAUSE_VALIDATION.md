@@ -10495,3 +10495,31 @@ into their own destination chain, and neither afterwards reached the tail; job #
 that holds up, the defect to fix is the *first* read's address (the record the job resolves), which is
 task #15's index/lifetime route again — and it is now testable against a cheap signal nobody has used:
 `len>0` per window, which should be 0 for a correctly-paired job. Next ID **F-483**.
+
+### F-484 (2026-09-27 06:4x, **1 build: `kF483DeferRelease` armed, soak `w482`; NOT reverted yet — see §3**) — **PINNING THE RECORD MAKES THE GUEST READ ITS OWN CONTAINER, FOR THE FIRST TIME IN THIS PROJECT: with the release deferred for tags whose `sub_821BC140` has not begun, the garage's job window changes from F-482's `moves=1 len>0=1` at a foreign address to `reads=615 offFirst=64980000 offLast=64A84449 moves=33 len>0=33 ret[0/+/-]=582/33/0` — 33 real byte-requests spanning exactly the garage's `+24 .. +24+0x104449` = its whole 1,066,057 bytes — and job #1 likewise reads `64CB0000..64CD2EDD` in 5. The chain F-469→F-470→F-478→F-482 is therefore confirmed as causal, not just correlated.**
+
+- Task:        T42.21 (#79) — P1 of plan §9, run and measured
+- Type:        FIX-attempt, PARTIALLY SUCCESSFUL MECHANICALLY, COSTLY IN ORDERING
+- Class:       E + D (our intervention)
+- Priority:    P0 — it is the first change this session that moved a goal-path signal
+- Evidence:    `build/w482.log` `POST-EXEC-START #1..#4` (quoted above; counters from the F-482 instrument) against `w481`'s `#2 moves=1 len>0=1 offFirst=64CA3000 offLast=64CA7B89`; defer rows `F483-DEFER tag=00000001..00000004,00008004 idx=1..4 entry=C9E2491C.. count 0->1 (job not dispatched)` (5 rows); `F469-RECSNAP #3` STILL shows `[2 00008002/19337/64CA3000]`, so the pin protected jobs #1/#2 but not #3/#4
+
+**1. What moved.** `reads` and `len>0` for job #2: 1 → 33 real requests, and the offset sequence now
+covers the garage's own package. `LZX-FRAME` 32 → 35. So the guest, given a record that still describes
+it, does issue the byte requests for its own container — which is exactly what "Path B = the guest's own
+inflate" was supposed to need, and what no soak showed before this build.
+
+**2. What it cost, in the same soak.** `PUSH` 7 → 5, `LISTLINE` **171 → 0**, `BOOTPATH` 10 → 0,
+`GFx` 13 → 7 — the loader stops after push #5. Mechanism is in the pin itself: the deferred join waits
+on a count that only `sub_821BC140`'s success tail drops, and six of seven tails still never run
+(`RELSEMA … lr=821BC538` = 1, unchanged), so the pin converts a wrong record into a permanent block.
+The deferral fixed the *record* and inherited the *completion* defect.
+
+**3. Status and the next increment (P1c), deliberately not reverted yet.** The result is a real
+mechanical confirmation and it is also unsafe to leave in a tree that loses `LISTLINE`. P1c = keep the
+pin only while the job is undispatched **and** drop the count on the job's exit row (the value its
+unreached tail would have written), so the loader is never blocked indefinitely. Acceptance is
+unchanged and cheap to read: `len>0` per UI window stays at own-package coverage, `LISTLINE` returns to
+171, and the gate is `XSF-INFLATE` > 0 plus `RELSEMA … lr=821BC538` ≥ 2. If P1c does not clear that, the
+deferral comes out and F-484 stands as the measurement that pinned-down where the real defect is. Next
+ID **F-485**.
