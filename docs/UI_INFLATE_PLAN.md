@@ -592,3 +592,14 @@ containers byte-exact and for the fourth at 917,504/1,066,057 durable-100 %, and
 is proven and its blocker localised (§9.3); clause (b) is **not** achieved and, per F-493, is not
 downstream of clause (a). **Objective OPEN.**
 
+### 9.5 Path B is now bounded by evidence, not by ignorance (F-497/F-498/F-499)
+
+The chain closes: `exp` (`[st+12]`, the expected total output) is re-seeded on **28 of 28** iterations
+for the one completing job and on **1 of 60** for the garage even when it owns its record (F-497); the
+parse that sets it is gated on `[st+8] == 0` (F-498) and that field never returns to 0; forcing it to 0
+makes things strictly worse (`w498`: `PUSH` 7→2, `LISTLINE` 171→0) because there is no block header at
+the cursor (F-499). So the missing object is a **per-block input-descriptor stream inside
+`sub_821BC140`**, i.e. task #15's original descriptor shape — unreachable from any permitted hook, and
+reachable only through the recompiler (`midasm_hook`) or by the user's `F-055` decision on the GFx
+side, which F-493 showed is a separate chain anyway.
+
