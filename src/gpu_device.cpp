@@ -16803,7 +16803,9 @@ PPC_FUNC(sub_821CAFB8) {
     // F-152: an object-shaped return for the sub_821BE0C8 re-open was tried here
     // and MEASURED INERT (w162: AFB76-MEM$-OBJ 0 lines, SEEK-DEAD unchanged) -
     // this hook never sees the memory:$ path at all, so the index that faults is
-    // the guest's own sub_821BE0C8 return. Reverted; see F-152.
+    // the guest's own sub_821BE0C8 return. Reverted; see F-152. (F-457 confirms it
+    // again: `w459` prints 0 AFB76-MEM$ rows and 372 BE0C8 rows, so the memory:$
+    // block dump belongs at the BE0C8 site, not here.)
     ctx.r3.u32 = st;
     return;
   }
@@ -17283,6 +17285,34 @@ PPC_FUNC(sub_821BE0C8) {
   // (function-table lookup null / 0x0). Return the buffer handle ourselves.
   uint32_t mb = 0, ms = 0;
   if (ParseMemoryDollar(pth, &mb, &ms) && mb != 0) {
+    // F-457 (T42.3): the tune `.lst` open (`BDF20 #600 path='a:/archive/tune/vehicle/vehicle0008.lst'`)
+    // lands in the SAME millisecond as a place-pass decompress handed only 20 source bytes at an
+    // address inside meshtextures' third 32 KiB bounce window, so the config path is starved of its
+    // own container. Whether Path A (the host XMem/LZX decode that works on the UI .xsf) can be
+    // extended to these blocks turns on one fact no log yet carries: is a `memory:$` block an XMem/RSC
+    // container, and which name did the guest's own composer give it? Dump the head; RSC5 = 52 53 43 05,
+    // XMem = EF 12 F5 0F. Log-only. This site, not AFB76: F-152's "never sees memory:$" reproduced
+    // (0 AFB76-MEM$ rows vs 372 BE0C8 rows in `w459`).
+    {
+      auto &memB = mcla::kernel::GuestMemoryHeap::Instance();
+      unsigned char hb[32] = {0};
+      const uint32_t want = (ms < 32u) ? ms : 32u;
+      const bool got = want != 0 && mb != 0xCDCDCDCDu &&
+                       memB.ReadBytes(mb, hb, want);
+      char hex[65] = {0};
+      char vis[33] = {0};
+      if (got) {
+        for (uint32_t i = 0; i < want; ++i) {
+          std::snprintf(hex + i * 2, 3, "%02X", hb[i]);
+          vis[i] = (hb[i] >= 32 && hb[i] < 127) ? (char)hb[i] : '.';
+        }
+      }
+      if (n <= 80 || (n % 100) == 0)
+        MCLA_LOG_WARN("F457-MEMBLK #{} buf={:08X} size={} read={} pth='{}' "
+                      "head={} vis='{}' lr={:08X}",
+                      n, mb, ms, got ? 1 : 0, pth, hex, vis,
+                      static_cast<uint32_t>(ctx.lr));
+    }
     const uint32_t st = MakeMemoryStream(kMemDeviceObj, mb, ms);
     MCLA_LOG_WARN("BE0C8-RET stream={:08X} buf={:08X} size={}", st, mb, ms);
     // F-155 MEASURED AND REJECTED: returning a guest-native stream OBJECT here
