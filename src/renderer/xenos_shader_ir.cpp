@@ -118,9 +118,9 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
                 entry.info.reserved      = ReadBE16(ciPtr + 10);
                 entry.info.typeInfo      = ReadBE32(ciPtr + 12);
                 entry.info.defaultValue  = ReadBE32(ciPtr + 16);
-                // Bounds-check the constant name before reading it. The
-                // nameOffset is relative to the constant table and may point
-                // outside it (or past ctSize) in some MCLA containers.
+                // Bounds-check the constant name before reading it: nameOffset
+                // is an unvalidated, table-relative guest field, so it can
+                // point at or past the end of the constant table.
                 {
                     const size_t nameOff = size_t(entry.info.nameOffset);
                     if (nameOff < ctSize) {
@@ -146,16 +146,19 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
         }
     }
 
-    // Vertex elements (VS) / interpolators (PS)
+    // Per-stage surfaces: VS decodes vertex elements plus its interpolators,
+    // PS decodes pixel outputs plus its interpolators (both stages append to
+    // out.interpolators).
     out.vertexElements.clear();
     out.interpolators.clear();
     out.pixelOutputs = PixelOutputs{};
     if (out.isVertex) {
-        // VS header: field18 (sp+24) is an entry index into the
-        // vertexElementsAndInterpolators[] array that begins at sp+36.
-        // Vertex element i sits at array index field18 + i; interpolator i at
-        // field18 + vertexElementCount + i. Each entry packs
-        // VertexElement { address:12, usage:4, usageIndex:4 }.
+        // VS header: sp+24 is a start index into the 4-byte-entry array of
+        // vertex elements and interpolators that begins at sp+36; sp+28 is the
+        // vertex element count. Vertex element i sits at array index
+        // sp+24 + i, interpolator i at sp+24 + count + i. Element entries pack
+        // { address:12, usage:4, usageIndex:4 }; interpolator entries are
+        // packed differently (see the interpolator block below).
         uint32_t veStart = ReadBE32(sp + 24);
         uint32_t veCount = ReadBE32(sp + 28);
         // Promote to size_t before multiplying: (veStart+veCount+32)*4 can
@@ -172,7 +175,8 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
                 out.vertexElements.push_back(vi);
             }
             // VS interpolators: emitted outputs, stored right after the vertex
-            // elements in the same array.
+            // elements in the same array, packed
+            // { usageIndex:4, usage:4, reg:4 }.
             const uint32_t interpCount = out.interpolatorCount();
             if (interpCount <= 32 && size_t(so) + 36 +
                                          (size_t(veStart) + veCount + interpCount) * 4 <=
@@ -188,7 +192,8 @@ bool ParseShaderProgram(const uint8_t* data, size_t size, ShaderProgram& out) {
             }
         }
     } else {
-        // PS: field18 (sp+24), outputs (sp+28), interpolators (sp+32...)
+        // PS: pixel outputs at sp+28, interpolator table right after at
+        // sp+32. (sp+24, the VS element start index, is not read here.)
         uint32_t psOutputs = ReadBE32(sp + 28);
         out.pixelOutputs.color0 = (psOutputs & 0x01) != 0;
         out.pixelOutputs.color1 = (psOutputs & 0x02) != 0;
@@ -254,8 +259,11 @@ uint64_t ComputeShaderProgramHash(const ShaderProgram& prog) {
         HashBE32(h, ir.address);
         HashVal(h, ir.isFetch);
         HashVal(h, ir.decoded.kind);
-        // hash the first two dwords of the decoded instruction
-        // (opcode + dest + src fields) as a stable fingerprint
+        // Fingerprint the fetch-side operand fields only. DecodeInstruction
+        // fills dstRegister/srcRegister/constIndex/fetchOpcode for fetch
+        // instructions and leaves them at their defaults for ALU ones, so an
+        // ALU instruction contributes kind/isFetch/address/unknown but not
+        // its vector/scalar opcodes, destinations, masks or sources.
         HashBE32(h, ir.decoded.fetchOpcode);
         HashBE32(h, ir.decoded.dstRegister);
         HashBE32(h, ir.decoded.srcRegister);

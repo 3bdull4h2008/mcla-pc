@@ -57,10 +57,12 @@ ControlFlowInstruction DecodeControlFlow(uint32_t word0, uint16_t word1) {
 
 size_t ComputeControlFlowByteBound(const uint8_t* code, size_t code_size) {
     // Sequential, self-limiting walk that mirrors the XenosRecomp pass-1
-    // clamp (shader_recompiler.cpp 1654-1701): the loop limit is the evolving
-    // bound, so decode stops at the first executable region instead of
-    // scanning the whole payload (where instruction data can decode as a
-    // bogus exec with a tiny address and truncate the program to ~1 block).
+    // clamp (.research/XenosRecomp/XenosRecomp/shader_recompiler.cpp
+    // 1508-1560, where instrSize shrinks to min(instrSize, address * 12)):
+    // the loop limit is the evolving bound, so decode stops at the first
+    // executable region instead of scanning the whole payload (where
+    // instruction data can decode as a bogus exec with a tiny address and
+    // truncate the program to ~1 block).
     size_t bound = code_size;
     // Only walk fully-contained 12-byte blocks. A malformed stream whose
     // shaderSize is not a multiple of 12 would otherwise read up to 11 bytes
@@ -142,10 +144,16 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             // VertexFetchInstruction:
             //   word0: ... constIndexSelect:2 (bits 25-26), prefetchCount:3 (27-29),
             //          srcSwizzle:2 (30-31)
-            //   word1: dstSwizzle:12, formatCompAll:1, numFormatAll:1,
-            //          signedRfModeAll:1, isIndexRounded:1, format:6, reserved2:2,
-            //          expAdjust:6, isMiniFetch:1, isPredicated:1
+            //   word1: dstSwizzle:12, formatCompAll:1(12), numFormatAll:1(13),
+            //          signedRfModeAll:1(14), isIndexRounded:1(15),
+            //          format:6(16-21), reserved2:2(22-23), expAdjust:6(24-29),
+            //          isMiniFetch:1(30), isPredicated:1(31)
             //   word2: stride:8, offset:23, predCondition:1
+            // Below, isIndexRounded and vertexFormat match this layout;
+            // isSigned/isNormalized land on formatCompAll/numFormatAll
+            // (signedRfModeAll at bit 14 is not read), and expAdjust,
+            // isMiniFetch and isPredicated are extracted two bits low
+            // (reserved2 is skipped).
             instr.constIndexSelect = (word0 >> 25) & 0x3;
             instr.prefetchCount = (word0 >> 27) & 0x7;
             instr.srcSwizzle = (word0 >> 30) & 0x3;
@@ -171,7 +179,8 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             //   word1: dstSwizzle:12, mag/min/mip/vol filters, aniso, arbitrary,
             //          useCompLod, useRegLod, unk, isPredicated (bit 31)
             //   word2: useRegGradients:1, sampleLocation:1, lodBias:7, :5,
-            //          dimension:2 (bits 13-14), offsetX/Y/Z:5 each, predCondition:1
+            //          dimension:2 (bits 14-15), offsetX/Y/Z:5 each,
+            //          predCondition:1 -- the read below takes bits 13-14
             instr.srcSwizzle = (word0 >> 26) & 0x3F;
             instr.dstSwizzle = word1 & 0xFFF;
             instr.isPredicated = ((word1 >> 31) & 0x1) != 0;
@@ -179,9 +188,11 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             instr.predicateCondition = ((word2 >> 31) & 0x1) != 0;
         }
         // Known fetch opcodes are the sparse FetchOpcode enum members
-        // {0,1,16,17,18,19,24,25,26}; anything else (the f?2..f?15 / f?20..f?23
-        // placeholder values) has no decoder/lowering table entry and must be
-        // flagged unknown so the Phase 5 gate fails it.
+        // {0,1,16,17,18,19,24,25,26}; the rest are the "f?N" placeholders in
+        // FetchOpcodeName and are flagged unknown here. Lowering keys on the
+        // VertexFetch/TextureFetch kind only, so without this flag an
+        // unfilled opcode would be emitted as a plain fetch instead of
+        // failing the Phase 5 unknown-opcode gate.
         const uint32_t fo = static_cast<uint32_t>(instr.fetchOpcode);
         instr.unknown = !(fo == 0 || fo == 1 || (fo >= 16 && fo <= 19) ||
                           (fo >= 24 && fo <= 26));

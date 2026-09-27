@@ -107,8 +107,8 @@ inline void WriteGuestU64(uint32_t guestAddr, uint64_t val) {
 // Uses high-resolution performance counter scaled to ~800 MHz (Xenon timebase frequency).
 uint64_t QueryGuestTimebase();
 
-// TU83 spawn pointer scanner (Lead 1): searches guest memory for function
-// pointers to sub_8213178C, sub_821BD8C0, sub_824569C8, sub_823F69C8.
+// TU83 spawn pointer scanner: looks for pointers to sub_8213178C, sub_821BD8C0,
+// sub_824569C8 and sub_823F69C8, scanning only 0x82000000-0x83000000 (16 MB).
 namespace kernel {
 void ScanGuestMemoryForTU83SpawnPointers();
 }

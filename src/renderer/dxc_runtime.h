@@ -6,9 +6,13 @@
 // dxil.dll dynamically at runtime (LoadLibrary) so a DXIL blob can be produced
 // at pipeline-key time without a compile-time dependency on the shader
 // compiler. The DLL pair is resolved from, in priority order: an explicit
-// directory, the MCLA_DXC_DIR environment variable, the vendored
-// `third_party/dxc/bin/x64` tree, then the
-// executable's directory.
+// directory, the MCLA_DXC_DIR environment variable, the candidate path
+// `third_party/dxc/bin/x64`, then the executable's directory. A candidate is used
+// only if it actually holds dxcompiler.dll, and `third_party/dxc` ships `inc/`
+// only (no `bin/`), so that path never resolves today; the only DXC DLLs in the
+// tree sit under the read-only `.research/XenosRecomp/thirdparty/dxc-bin/bin/x64`,
+// which is not a candidate. Both in-tree callers pass an empty dllDir, so
+// MCLA_DXC_DIR or a DLL beside the executable is what loads.
 //
 // Threading: DXC COM compiler objects are not thread-safe. Create one
 // DxcRuntime per thread that compiles; the DLLs stay loaded for the process
@@ -38,7 +42,10 @@ public:
 
     // Compiles complete HLSL source into a DXIL blob. `entry` defaults to
     // "main"; `profile` is "vs_6_0" or "ps_6_0". True on success; on failure
-    // `error` holds the first DXC diagnostic and `dxil` stays empty.
+    // `error` receives the ENTIRE DXC_OUT_ERRORS buffer -- every diagnostic line
+    // verbatim, not just the first one -- or the fixed text
+    // "DXC compile failed (no diagnostics)" when that buffer is absent/empty.
+    // `dxil` is cleared on entry, so it stays empty either way.
     // If `keepReflection` is true, the output DXIL will contain reflection data
     // suitable for ID3D12ShaderReflection.
     bool Compile(std::string_view hlsl, std::string_view entry,

@@ -5,8 +5,8 @@
 
 namespace mcla::renderer {
 
-// The mode is intentionally conservative while the native renderer is built.
-// See NATIVE_GPU_REBUILD_PLAN.md for the promotion criteria.
+// The active mode comes from the renderer_mode CVar, whose registered default
+// is "native" (src/renderer_mode.cpp:8); legacy/capture stay selectable as opts.
 enum class RendererMode : uint8_t {
     Legacy,
     Capture,
@@ -16,8 +16,8 @@ enum class RendererMode : uint8_t {
 RendererMode GetRendererMode();
 const char* RendererModeName(RendererMode mode);
 
-// Control how much capture data is written. Mirrors the native_renderer_trace
-// CVar. Tracing only takes effect when the renderer mode is Capture.
+// Control how much capture data is written. Reads the native_renderer_trace
+// CVar, but that CVar is never registered, so GetTraceMode is always Off.
 enum class TraceMode : uint8_t {
     Off,
     Frames,
