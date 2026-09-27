@@ -10572,3 +10572,27 @@ iterations and N>0 failures while job #1 shows 10 and 0, the objective's remaini
 descriptor chain itself (task #15's ORIGINAL shape) and not the record or the feed; if both show 0
 failures, then the tail is being skipped through some branch this read has not enumerated and the search
 restarts at the loop's top. Next ID **F-487**.
+
+### F-487 (2026-09-27 07:0x, **1 build: unconditional per-window `inflEnters`/`lzxFrames` counters, soak `w485`; instrument KEPT, tree otherwise unchanged**) — **EVERY SPINNING READ IS ALSO AN INFLATE ATTEMPT: per job window `inflEnters` equals `reads` to within 0-6 (1219/1216, 10252/10252, 1006/1006, 604/604, 962/874, 222/198, 216/215), so the walk is not waiting between iterations — it calls `zlibInflater::InflateBegin` and then the read wrapper on the same tick, gets `in=0` (input-descriptor count exhausted at `st=006D8F20`, `inPtr=006D8F40`) and a zero-length read, and re-enters. The stall is inside the loop, not outside it.**
+
+- Task:        T42.22 (#80), measured — refines F-486 §2's alternative branch
+- Type:        FACT
+- Class:       E + G
+- Priority:    P0 — it localises the six silent jobs to one exhausted field
+- Evidence:    `build/w485.log` `POST-EXEC-START #1..#7` carrying `reads=… inflEnters=… lzxFrames=…` (counters declared at `src/gpu_device.cpp` top-of-file block, incremented in `PPC_FUNC(sub_821D5E10)` and the `LZX-FRAME` census in `PPC_FUNC(sub_82461B98)`, window opened/closed in `PPC_FUNC(sub_821BC140)`) · the sampled `INFLATE-ENTER` rows in the same soak still read `in=0 inPtr=006D8F40 exp=00000000` · `w485` sanity: `PUSH` 7, `LISTLINE` 171, `BOOTPATH` 10, `GFx` 13, `lr=821BC538` 1, `C0000005` 0 — i.e. flag-off behaviour identical to `w484`/`w480`, the counters are inert · F-181's earlier statement that "`pgStreamer::Open` seeds all seven container lengths correctly" is NOT contradicted: the lengths live in the record, and this exhaustion is of the *state block's* input-descriptor list at `0x006D8F20`+0x20
+
+**1. Reading of the pairing.** `inLeft` is the count of remaining input descriptors at `inPtr`
+(`src/gpu_device.cpp:10328-10333` documents the arithmetic: compare `[inPtr+0]` against the XCompress
+magic, copy `[inPtr+4]` into `st+12`, then `inPtr += 8`, `inLeft -= 8`). With `inLeft == 0` the routine
+has no source buffer to hand the codec, `exp` stays 0, the read it issues has length 0, and the walk's
+produced-vs-expected compare (F-486) can never pass — so the loop's exit is unreachable and the tail is
+never executed. That is the concrete reason six of seven jobs produce no completion callback.
+
+**2. Next question, narrow and answerable (T42.23).** Who is supposed to fill the input-descriptor list
+at `0x006D8F40` for a streamer job, and why is it empty for jobs #2-#7 but (apparently) not empty for
+job #1's earlier iterations? Two candidate sources are already in the tree's notes: the read-list at
+`[slot+8]/[slot+12]` (F-205's 8-byte `{off,size}` entries, iterated by `r25 = task+8`), and the record's
+own `+16` entry pointer. A per-window count of *non-zero* `inLeft` entries (same pattern as above, one
+more atomic) distinguishes "never seeded" from "seeded and consumed", and that distinction decides
+whether Path B has any host-reachable seed point at all. Until then the objective stays OPEN with
+`XSF-INFLATE` 0 and `F438-GFXCTOR` 0. Next ID **F-488**.

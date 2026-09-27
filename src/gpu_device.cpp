@@ -130,6 +130,23 @@ static constexpr bool kF465GarageReindex = false;
 // vehicle/vehicle0008.lst' ret=0` in BOTH soaks, i.e. the tune file gets no stream
 // whether or not we plant the nested archive (F-464). The code stays for reuse.
 static constexpr bool kF463AbstainNestedRpf = false;
+
+// F-481/F-487 per-job-window unconditional counters. Declared at the top of the
+// file because three separate hooks write them: the inflate-entry census
+// (sub_821D5E10), the host LZX frame census (sub_82461B98) and the streamer read
+// wrapper (sub_821CC6F0), all of which sit above their users.
+static std::atomic<uint32_t> g_f481Window{0};
+static std::atomic<uint32_t> g_f481Calls{0};
+static std::atomic<uint32_t> g_f481Moves{0};
+static std::atomic<uint32_t> g_f481FirstOff{0};
+static std::atomic<uint32_t> g_f481LastOff{0};
+static std::atomic<uint32_t> g_f481NonZeroLen{0};
+static std::atomic<uint32_t> g_f481RetZero{0};
+static std::atomic<uint32_t> g_f481RetPos{0};
+static std::atomic<uint32_t> g_f481RetNeg{0};
+static std::atomic<uint32_t> g_f481Infl{0};
+static std::atomic<uint32_t> g_f481Lzx{0};
+
 // F-247 dynamic serve-framing predicate: defined after g_mclaRebaseMap (~:3945).
 static bool MclaIsCurrentJob2Pbase(uint32_t outPtr);
 // w18: job #2 dests are the UI/swfC set only. Shared by package assigner
@@ -10124,6 +10141,8 @@ PPC_FUNC(sub_82461B98) {
     const uint32_t srcp = peekS(11012u);
     const bool inStaging = stagBase != 0u && srcp >= stagBase &&
                            srcp < stagBase + 0x8000u;
+    if (g_f481Window.load(std::memory_order_relaxed) != 0)
+      g_f481Lzx.fetch_add(1, std::memory_order_relaxed);    // F-487: unconditional
     MCLA_LOG_WARN("LZX-FRAME #{} S={:08X} frameIdx={} want={} type={} "
                   "fsize={} state={} ret={} srcp={:08X} bitbuf={:08X} "
                   "cumprod={} failtotal={} stag=[{:08X} pos={} left={}] "
@@ -10398,6 +10417,8 @@ PPC_FUNC(sub_821D5E10) {
     uint8_t ih[8] = {0};
     if (inPtr)
       (void)mem.ReadBytes(inPtr, ih, 8);
+    if (g_f481Window.load(std::memory_order_relaxed) != 0)
+      g_f481Infl.fetch_add(1, std::memory_order_relaxed);   // F-487: unconditional
     if (n <= 16 || (n % 200) == 0 || j2Ent || stackCont)
       MCLA_LOG_WARN("INFLATE-ENTER #{} st={:08X} in={} inPtr={:08X} "
                     "consumed={} exp={:08X} ihdr=[{:08X} {:08X}] "
@@ -12665,17 +12686,6 @@ PPC_FUNC(sub_821BCE68) {
 // INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
 // (the [obj+4]!=0 path). If this fires for op tag=4, the task ran inline and
 // its own completion step is what silently failed.
-// F-481 §3 counters, written by the sub_821CC6F0 census and drained by the
-// sub_821BC140 job window. Zeroed when a window opens.
-static std::atomic<uint32_t> g_f481Window{0};
-static std::atomic<uint32_t> g_f481Calls{0};
-static std::atomic<uint32_t> g_f481Moves{0};
-static std::atomic<uint32_t> g_f481FirstOff{0};
-static std::atomic<uint32_t> g_f481LastOff{0};
-static std::atomic<uint32_t> g_f481NonZeroLen{0};
-static std::atomic<uint32_t> g_f481RetZero{0};
-static std::atomic<uint32_t> g_f481RetPos{0};
-static std::atomic<uint32_t> g_f481RetNeg{0};
 PPC_FUNC_IMPL(__imp__sub_821BC140);
 static std::atomic<uint32_t> s_hBC140{0};
 // Forward declaration for fiDevice::Mount (sub_821CB9D8) used in post-inflate mount fix.
@@ -12907,6 +12917,8 @@ PPC_FUNC(sub_821BC140) {
   g_f481RetZero.store(0, std::memory_order_relaxed);
   g_f481RetPos.store(0, std::memory_order_relaxed);
   g_f481RetNeg.store(0, std::memory_order_relaxed);
+  g_f481Infl.store(0, std::memory_order_relaxed);
+  g_f481Lzx.store(0, std::memory_order_relaxed);
   g_f481LastOff.store(0, std::memory_order_relaxed);
   g_f481Window.store(n, std::memory_order_relaxed);   // open the read window
   const auto tPreGuest = std::chrono::steady_clock::now();
@@ -12951,7 +12963,7 @@ PPC_FUNC(sub_821BC140) {
   MCLA_LOG_WARN("POST-EXEC-START #{} slot={:08X} qarg={:08X} r3after={:08X} "
                 "tid={:08X} pre={}ms guest={}ms rlcAfter={} cbAfter={:08X} "
                 "reads={} offFirst={:08X} offLast={:08X} moves={} len>0={} "
-                "ret[0/+/-]={}/{}/{}",
+                "ret[0/+/-]={}/{}/{} inflEnters={} lzxFrames={}",
                 n, slotAddr, queueArg, r3After, GetCurrentThreadId(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     tPreGuest - tHook0).count(),
@@ -12965,7 +12977,9 @@ PPC_FUNC(sub_821BC140) {
                 g_f481NonZeroLen.load(std::memory_order_relaxed),
                 g_f481RetZero.load(std::memory_order_relaxed),
                 g_f481RetPos.load(std::memory_order_relaxed),
-                g_f481RetNeg.load(std::memory_order_relaxed));
+                g_f481RetNeg.load(std::memory_order_relaxed),
+                g_f481Infl.load(std::memory_order_relaxed),
+                g_f481Lzx.load(std::memory_order_relaxed));
   if (n <= 16 || (n % 500) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t ctxBase = slotAddr;
