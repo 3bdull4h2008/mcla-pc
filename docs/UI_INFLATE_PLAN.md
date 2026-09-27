@@ -450,3 +450,24 @@ next steps are:
    producer side of the count, not on our zeroing of it, and
 3. gate everything on the same two numbers used all session: `RELSEMA … lr=821BC538` count (today 1
    of 7 jobs) and a **second** package reaching `still_present == claimed == goldsize`.
+
+### 8.9 The lifecycle is closed, and it renames the remaining problem (F-478)
+
+`record+12` is an outstanding-job count owned by the enqueuer: `sub_821BCB10` increments
+`[0x8283D190+52] + r27 + 12` on accept (`ppc_recomp.14.cpp:20732-20740`) and decrements it on reject
+(`:20842-20850`); Open claims it at 0 (`:20985`, `:21133`); `sub_821BC140`'s success tail decrements it
+and then fires the completion callback at `[slot+1548]`; `sub_821BD220` releases the record and reuses
+the word as the free-list link. Therefore:
+
+- §8.8's step 1 ("name the writer of the 1") is **answered**, and steps 2/3 collapse into one
+  question: **why do six of seven jobs never reach the tail** — because the only thing that ever
+  releases a streamer record cleanly is that same tail.
+- Path B's remaining meaning is now narrow and honest: there is no record to construct and no index to
+  steal. What Path B would have to supply is a *completed* dispatch, and per F-393 the dispatch's own
+  loop exits only on `inLeft == 0` or `outLeft == 0`. That is the inflate feed — Path A's side — so the
+  two clauses of the objective are one mechanism (`F-478 §2`), and the gate stays
+  `RELSEMA … lr=821BC538` count (today 1 of 7) plus a second package at
+  `still_present == claimed == goldsize`.
+- The `TASKJOIN-SC` mitigation and the record recycling are halves of one defect (F-478 §1), so it must
+  not be disarmed as a "fix" (measured: `w479` costs 2 of 7 jobs) and must not be described as the
+  cause either. Any future change here is a change to job *completion*, not to our zeroing.
