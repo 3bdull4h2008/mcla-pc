@@ -304,8 +304,8 @@ def main() -> int:
         out["not_in_src"] = sorted(set(
             dead_tracked(VEH_PATHS + SHORT_CIRCUITS_TRACKED + FRONTIER
                          + markers_from_guide(GUIDE))))
-        out["lr"] = {"fault_lines": new.get("fault_lr", {}),
-                     "all_lines": new.get("all_lr", {})}
+        out["lr"] = {"fault_lines": dict(new.get("lr_fault", {})),
+                     "all_lines": dict(new.get("lr", {}))}
         print(json.dumps(out, indent=1, sort_keys=True))
         return 0
 
