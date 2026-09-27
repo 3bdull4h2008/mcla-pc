@@ -2188,12 +2188,24 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   }
 
   const uint32_t n = s_watchWrites.fetch_add(1) + 1;
-  if (n <= 16) {
-    uint32_t lr = 0;
-    if (const PPCContext *c = GetPPCContext())
-      lr = static_cast<uint32_t>(c->lr);
-    MCLA_LOG_WARN("PAGEWATCH W #{:02} @ {:08X} = {:08X} lr={:08X}", n,
-                  guestAddr, value, lr);
+  // F-453: the old `n <= 16` was a SHARED lifetime cap, so one burst spent it. Both
+  // w423 and w430 print exactly 16 `PAGEWATCH W` rows at boot +0.66 s (all
+  // 0x828CD0xx, all lr=821327F8) and then cannot print again for the rest of the
+  // soak - later stores are invisible, not absent, which is how F-401 §2 read
+  // "recorded every store ... nothing else". Two-level budget instead: a per-address
+  // stripe (one routine stamping a table of N distinct addresses still gets N rows,
+  // but no single address can monopolise the window) plus a raised shared window
+  // with the file's own periodic tail row. Both bounded - no unbounded logging
+  // (do-not class F-054).
+  static std::atomic<uint32_t> s_watchStripe[1024] = {};
+  if (n <= 64 || (n % 5000) == 0) {
+    if (s_watchStripe[(guestAddr >> 4) & 0x3FFu].fetch_add(1) < 4) {
+      uint32_t lr = 0;
+      if (const PPCContext *c = GetPPCContext())
+        lr = static_cast<uint32_t>(c->lr);
+      MCLA_LOG_WARN("PAGEWATCH W #{:03} @ {:08X} = {:08X} lr={:08X}", n,
+                    guestAddr, value, lr);
+    }
   }
 }
 
