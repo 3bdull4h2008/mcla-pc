@@ -12617,6 +12617,17 @@ PPC_FUNC(sub_821BCE68) {
 // INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
 // (the [obj+4]!=0 path). If this fires for op tag=4, the task ran inline and
 // its own completion step is what silently failed.
+// F-481 §3 counters, written by the sub_821CC6F0 census and drained by the
+// sub_821BC140 job window. Zeroed when a window opens.
+static std::atomic<uint32_t> g_f481Window{0};
+static std::atomic<uint32_t> g_f481Calls{0};
+static std::atomic<uint32_t> g_f481Moves{0};
+static std::atomic<uint32_t> g_f481FirstOff{0};
+static std::atomic<uint32_t> g_f481LastOff{0};
+static std::atomic<uint32_t> g_f481NonZeroLen{0};
+static std::atomic<uint32_t> g_f481RetZero{0};
+static std::atomic<uint32_t> g_f481RetPos{0};
+static std::atomic<uint32_t> g_f481RetNeg{0};
 PPC_FUNC_IMPL(__imp__sub_821BC140);
 static std::atomic<uint32_t> s_hBC140{0};
 // Forward declaration for fiDevice::Mount (sub_821CB9D8) used in post-inflate mount fix.
@@ -12839,8 +12850,17 @@ PPC_FUNC(sub_821BC140) {
       }
     }
   }
+  g_f481Calls.store(0, std::memory_order_relaxed);
+  g_f481Moves.store(0, std::memory_order_relaxed);
+  g_f481NonZeroLen.store(0, std::memory_order_relaxed);
+  g_f481RetZero.store(0, std::memory_order_relaxed);
+  g_f481RetPos.store(0, std::memory_order_relaxed);
+  g_f481RetNeg.store(0, std::memory_order_relaxed);
+  g_f481LastOff.store(0, std::memory_order_relaxed);
+  g_f481Window.store(n, std::memory_order_relaxed);   // open the read window
   const auto tPreGuest = std::chrono::steady_clock::now();
   __imp__sub_821BC140(ctx, base);
+  g_f481Window.store(0, std::memory_order_relaxed);   // close it
   const auto tGuestDone = std::chrono::steady_clock::now();
   // F-474: the routine's own success tail calls the job's completion callback at
   // [slot+1548] (mtctr/bctrl, ppc_recomp.14.cpp:19361-19381) but SKIPS it when
@@ -12860,13 +12880,23 @@ PPC_FUNC(sub_821BC140) {
   // 0x821BC548 (semaphore release) â€” wrong function. We do the mount here.
   // NOTE: use slotAddr (saved pre-call), never ctx.r3 — r3 is clobbered.
   MCLA_LOG_WARN("POST-EXEC-START #{} slot={:08X} qarg={:08X} r3after={:08X} "
-                "tid={:08X} pre={}ms guest={}ms rlcAfter={} cbAfter={:08X}",
+                "tid={:08X} pre={}ms guest={}ms rlcAfter={} cbAfter={:08X} "
+                "reads={} offFirst={:08X} offLast={:08X} moves={} len>0={} "
+                "ret[0/+/-]={}/{}/{}",
                 n, slotAddr, queueArg, r3After, GetCurrentThreadId(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     tPreGuest - tHook0).count(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     tGuestDone - tPreGuest).count(),
-                rlcAfter, cbAfter);
+                rlcAfter, cbAfter,
+                g_f481Calls.load(std::memory_order_relaxed),
+                g_f481FirstOff.load(std::memory_order_relaxed),
+                g_f481LastOff.load(std::memory_order_relaxed),
+                g_f481Moves.load(std::memory_order_relaxed),
+                g_f481NonZeroLen.load(std::memory_order_relaxed),
+                g_f481RetZero.load(std::memory_order_relaxed),
+                g_f481RetPos.load(std::memory_order_relaxed),
+                g_f481RetNeg.load(std::memory_order_relaxed));
   if (n <= 16 || (n % 500) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t ctxBase = slotAddr;
@@ -14934,6 +14964,21 @@ PPC_FUNC(sub_821CC6F0) {
   const uint32_t r5 = ctx.r5.u32;
   const uint32_t r6 = ctx.r6.u32;
   const uint32_t r7 = ctx.r7.u32;
+  // F-481 §3: UNCONDITIONAL per-window read statistics. Every READWRAP row this
+  // hook prints is selected by `ret == 0 || n <= 8 || n % 500 == 0 || insane r1`,
+  // so F-480's "all attempts at one offset" was sampled on the field it
+  // generalised about. These counters have no such condition: they see every call
+  // made while a sub_821BC140 job window is open, and are printed once on that
+  // job's POST-EXEC-START row. Window attribution is per-window, not per-job.
+  if (g_f481Window.load(std::memory_order_relaxed) != 0) {
+    g_f481Calls.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t prev =
+        g_f481LastOff.exchange(r5, std::memory_order_relaxed);
+    const uint32_t seen = g_f481Calls.load(std::memory_order_relaxed);
+    if (seen == 1) g_f481FirstOff.store(r5, std::memory_order_relaxed);
+    else if (prev != r5) g_f481Moves.fetch_add(1, std::memory_order_relaxed);
+    if (r7 != 0) g_f481NonZeroLen.fetch_add(1, std::memory_order_relaxed);
+  }
   const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
 
@@ -15251,6 +15296,13 @@ PPC_FUNC(sub_821CC6F0) {
   }
   __imp__sub_821CC6F0(ctx, base);
   const uint32_t ret = ctx.r3.u32;
+  if (g_f481Window.load(std::memory_order_relaxed) != 0) {
+    if (ret == 0) g_f481RetZero.fetch_add(1, std::memory_order_relaxed);
+    else if (ret >= 0x80000000u)
+      g_f481RetNeg.fetch_add(1, std::memory_order_relaxed);
+    else
+      g_f481RetPos.fetch_add(1, std::memory_order_relaxed);
+  }
   const bool saneIn = r1in < 0x82130000u;
   const bool saneOut = ctx.r1.u32 < 0x82130000u;
   if ((!saneIn || !saneOut) || n <= 8 || (n % 500) == 0 || ret == 0)

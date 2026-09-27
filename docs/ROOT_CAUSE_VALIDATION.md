@@ -10469,3 +10469,29 @@ distinct `r5` values, and the `ret` distribution — three numbers per job, prin
 exit row. That settles whether the garage's read cursor is stuck at `64CA7B89` (loop starvation on
 foreign records) or advances (an ordinary short read), and it is the first measurement in this chain
 whose sample is not conditioned on the value being questioned.
+
+### F-482 (2026-09-27 06:4x, **1 build: unconditional per-window counters, `w481`; instrument KEPT**) — **WITH THE SAMPLING REMOVED THE BOOT ISSUES 14,365 READ CALLS INSIDE THE SEVEN JOB WINDOWS AND EXACTLY TWO OF THEM ASKED FOR ANY BYTES: only jobs #2 and #3 each made one call with `r7 != 0`, each returned non-zero, each advanced the offset once (`moves=1`) by precisely the FOREIGN record's `+4` (garage: `0x64CA3000 → 0x64CA7B89`, delta `0x4B89` = 19,337 = policecam's whole container; #3 likewise by `0x73D7` = 29,655). Every other call — 14,363 of them, in all seven windows including the one job that completes — requests ZERO bytes and returns 0.**
+
+- Task:        T42.19/T42.20 (#78) — measured; interpretation deliberately left open in §3
+- Type:        FACT
+- Class:       E + G
+- Priority:    P0 — it is the first unfiltered statement of what the streamer actually asks the device layer for
+- Evidence:    `build/w481.log` `POST-EXEC-START #k … reads=<total> offFirst=<> offLast=<> moves=<n> len>0=<n> ret[0/+/-]=a/b/c` (counters added at `src/gpu_device.cpp:12622-12631` + the accumulation in `PPC_FUNC(sub_821CC6F0)` before/after `__imp__`, window opened/closed either side of `__imp__sub_821BC140`): `#1 1216/0/1216·0·0` `#2 10252, offFirst=64CA3000 offLast=64CA7B89 moves=1 len>0=1 ret=10251/1/0` `#3 1006, 6496F000→649763D7 moves=1 len>0=1 ret=1005/1/0` `#4 604` `#5 874` `#6 198` `#7 215`, all with `len>0=0 moves=0` · sum of the seven `reads` = 14,365, which matches the `READWRAP` row count every soak has printed (14,363 in `w460`/`w481`), so the windows cover essentially the whole boot · F-481 §2's caution still applies to the older rows: the pre-call printer at `:15244` samples on `n <= 32 || (n % 200) == 0 || r7 == 0`, and its 14,363 sampled rows contain **zero** with `r7 != 0` — the filter is why, and a check that reads that population would wrongly conclude "the boot never asks for bytes" (the two real calls exist; they are simply invisible to that printer)
+
+**1. What the guest asks for.** Two byte-requests in the entire boot, both from jobs whose record had been
+re-stamped, and both for the *other* container's whole length. Nothing whatsoever is requested inside the
+garage's own package span `0x64980000..0x64A84449`. So the garage's 806k-852k durable bytes in guest
+memory are Path A's destination-keyed placement, exactly as F-299/F-350 measured, and no amount of
+feeding the read path can change that — **there is no read to feed.**
+
+**2. Zero-length calls are the norm, not the failure.** Job #1 completes with 1,216 zero-length calls and
+no movement at all; jobs #5-#7 behave the same. So "spinning on `r7 == 0`" cannot by itself explain the
+six missing tails, and F-393's `produced == 0` reading needs this qualifier.
+
+**3. The open question, precisely.** What makes a zero-length call sequence terminate in the tail (job
+#1: 1,216 calls, 93 ms) instead of running 10,251 calls for 569 ms and leaving? The candidate
+discriminator in the data is the single real read: jobs #2/#3 each consumed a foreign container's bytes
+into their own destination chain, and neither afterwards reached the tail; job #1 consumed nothing. If
+that holds up, the defect to fix is the *first* read's address (the record the job resolves), which is
+task #15's index/lifetime route again — and it is now testable against a cheap signal nobody has used:
+`len>0` per window, which should be 0 for a correctly-paired job. Next ID **F-483**.
