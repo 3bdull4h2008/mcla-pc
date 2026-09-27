@@ -669,3 +669,20 @@ measurement). Fabricating a poster is refuted (F-308/W30-ARR-FIX produced our ow
    (F-502 §5, F-509 §1, F-514).
 4. Suspect our own short-circuit first: the whole F-502/F-503/F-507 chain repairs a use-after-free that
    `TASKJOIN-SC` manufactures (F-509 §2).
+
+### 10.4 Status update 08:1x - P1 resolved as a three-way negative, priorities reordered
+
+F-515 and F-516 measured what replaces the garage placement between shot 1 and shot 100. All four
+diverged slots report `UIXSF-REC ... found_at=FFFFFFFF ... foreign_pkg=00000000@FFFFFFFF`, so the bytes
+are neither this container at another offset (reordering, killed by F-515) nor any other of the four
+containers (shared-staging cross-write, killed by F-516). The writer is the title itself: XMEM-SZPTR
+#15..#24 show its own decompress calls (`lr=821D5EBC`) targeting those addresses from the shared stack
+staging `src=006D8F40`, driving each destination size word toward 0, and POST-EXEC #2 records
+maxProduced=491,520 for that job. The counts are stable across shots, so it wrote once and left.
+
+Consequences for the queue: (1) #87 is DEMOTED - re-placing the garage cannot fix content that is
+wrong where it lands, and placement is already perfect at shot 1; its only remaining value is stopping
+host and guest writing the same buffers. (2) #90 is PROMOTED and sharpened: compare the bytes the title
+produces at the moment its decompress call returns against the reference, then census the InflateBegin
+parse exits for the two silent containers. (3) #89 stands unchanged (the verifier still iterates the
+fill log, so policecam and credits have no over-time verdict).

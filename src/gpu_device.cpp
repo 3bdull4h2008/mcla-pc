@@ -10103,6 +10103,14 @@ static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
   uint32_t fbPbase = 0, fbLocal = 0, fbLen = 0;  // F-330: the first mismatch
   for (const auto &r : recs) {
     uint32_t good = 0;
+    // F-515 (T42.43 / P1): the external reference (F-513) showed the garage at pct=65 with
+    // first_bad=0x40000 while the whole stream was walked and 491,520 bytes were decoded by the
+    // guest, so the open question is whether those bytes are GONE or merely sitting at another
+    // offset in the same container (the fill places in read-list order, the guest writes along
+    // its own outPtr chain). Capture the first 16 mismatching memory bytes and search the
+    // reference for them: a hit at an offset other than this record's says reordering.
+    uint8_t probe[16] = {0};
+    uint32_t probeOff = 0xFFFFFFFFu, probeLen = 0;
     for (uint32_t done = 0; done < r.len; done += buf.size()) {
       const uint32_t want =
           r.len - done < buf.size() ? r.len - done
@@ -10120,8 +10128,60 @@ static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
           fbLocal = done + i;
           fbLen = r.len;
         }
+        if (probeOff == 0xFFFFFFFFu && buf[i] != gold[r.off + done + i] &&
+            i + 16u <= want) {
+          std::memcpy(probe, buf.data() + i, 16u);
+          probeOff = done + i;
+          probeLen = r.len;
+        }
       }
     }
+    uint32_t movedTo = 0xFFFFFFFFu;
+    // F-516: the F-515 probe proved the bytes at the four diverged garage slots are not in the
+    // garage at all. The guest is decoding into them (XMEM-SZPTR #15..#24, src=006D8F40 = the
+    // SHARED stack staging buffer, lr=821D5EBC), so the question is whose output they are. Search
+    // the other three containers' reference bytes; a hit names the container whose data the shared
+    // staging is carrying.
+    uint32_t foreignPkg = 0, foreignAt = 0xFFFFFFFFu;
+    if (probeOff != 0xFFFFFFFFu) {
+      const uint32_t others[] = {0x64CB0000u, 0x64980000u, 0x64CA3000u, 0x6496F000u};
+      for (const uint32_t op : others) {
+        if (op == pkg)
+          continue;
+        const std::vector<uint8_t> &og = MclaUiXsfGolden(op);
+        if (og.size() < 16u)
+          continue;
+        for (size_t s = 0; s + 16u <= og.size(); ++s) {
+          if (std::memcmp(&og[s], probe, 16u) == 0) {
+            foreignPkg = op;
+            foreignAt = static_cast<uint32_t>(s);
+            break;
+          }
+        }
+        if (foreignPkg != 0u)
+          break;
+      }
+    }
+    if (probeOff != 0xFFFFFFFFu && probeLen == r.len) {
+      const size_t lim = gold.size() >= 0x400000u ? gold.size() : probeOff + 16u;
+      for (size_t s = 0; s + 16u <= lim; ++s) {
+        if (std::memcmp(&gold[s], probe, 16u) == 0) {
+          movedTo = static_cast<uint32_t>(s);
+          break;
+        }
+      }
+    }
+    if (good != r.len)
+      MCLA_LOG_WARN("UIXSF-REC pkg={:08X} shot={} dest={:08X} goldoff={:08X} "
+                    "len={} good={} firstbad=+{:X} probe={:02X}{:02X}{:02X}{:02X} "
+                    "found_at={:X} {} foreign_pkg={:08X}@{:X}",
+                    pkg, shot, r.pbase, r.off, probeLen ? probeLen : r.len, good,
+                    probeOff == 0xFFFFFFFFu ? 0u : probeOff, probe[0], probe[1],
+                    probe[2], probe[3], movedTo,
+                    movedTo == 0xFFFFFFFFu
+                        ? (foreignPkg == 0u ? "UNKNOWN" : "FOREIGN-CONTAINER")
+                        : "REORDERED",
+                    foreignPkg, foreignAt);
     if (good == r.len)
       ++recsOk;
   }
