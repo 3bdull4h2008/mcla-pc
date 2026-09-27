@@ -1,3 +1,24 @@
+## 2026-09-27 06:4x (F-478/F-479, **0 builds**, supersedes the "Next" line of the 06:2x block above) — T42.18 is CLOSED and the blocker has a new name.
+
+- **Answered:** the writer of the `+12 = 1` is the enqueuer itself. `sub_821BCB10` runs the
+  `lwarx/addi +1/stwcx.` loop on `[0x8283D190+52] + r27 + 12` at `0x821BCD5C` (`ppc_recomp.14.cpp:20732-20740`)
+  and the decrement on its reject path at `0x821BCE28`. Full lifecycle: Open claims with `+12 = 0` →
+  enqueue pins 1 → `sub_821BC140`'s success tail decrements and *then* calls the completion callback at
+  `[slot+1548]` → `sub_821BD220` releases, reusing the word as the free-list link and bumping `+0` by
+  `0x8000`.
+- **Two of my own entries retracted:** F-476's correction of a delegated cell (the cell was right) and
+  F-477's doubt that the 1 was a count (it is). Method saved: grep the atomic inc/dec thunks with their
+  enclosing function, and call a field a **union** when several sites give it different meanings.
+- **Restated blocker (use this wording):** *six of seven streamer jobs never reach
+  `sub_821BC140`'s success tail*, so no record is ever cleanly released and `RELSEMA … lr=821BC538`
+  fires once per boot. F-479 shows where those jobs are instead: 396-20,502 `READWRAP sub_821CC6F0`
+  attempts per span against 0-32 host decodes, i.e. the read path whose served-body branch F-461 proved
+  unreachable. Do **not** re-arm that branch (task #70, `w461`/`w463` measured the regression).
+- **Next (T42.19, #78):** name what a `sub_821CC6F0` read attempt is *waiting for* in those six windows
+  — the honest instrument is per-attempt `inLeft`/`outLeft` on the record the job resolved, not another
+  record census. Gate unchanged: callback count above 1, and a second package at
+  `still_present == claimed == goldsize`. Next ID **F-480**.
+
 ## 2026-09-27 06:2x (F-473/F-474/F-475, **5 builds, soaks `w476`..`w480`; 1 instrument kept, 1 hypothesis of my own refuted, 1 mitigation re-confirmed as load-bearing**) — the record pool is now named end to end, and the enqueue gap's last unknown is a single unexplained store.
 
 - **F-473:** `sub_821BCB10` is the enqueuer and it *does* validate the generation (`record[index].+0 == handle` and `+8 != 0`, `ppc_recomp.14.cpp:20499-20543`) — at push time only. 7 firings/boot, each `a0` equal to the handle F-469 then snapshots.
