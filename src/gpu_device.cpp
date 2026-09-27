@@ -17590,6 +17590,48 @@ PPC_FUNC(sub_821CFF40) {
     if (uc < 32u || uc > 126u)
       ch = '.';
   }
+  // F-455 established two things from existing fields: every section lookup runs on reader
+  // `0x82860C40`, and the tune `.lst` open bound that same object as `{dev=C64AC100, handle=0}`
+  // (`BE610 #600`) while all 21 other bindings in the boot carry handle 1. So the open question is
+  // whether the compressed bytes at the `Vehicle` rows are OUR read-completion answering handle 0
+  // with another stream's window, or the guest re-binding this slot to a different file. Print the
+  // reader's own identity fields -- `[+0]/[+4]` are dev/handle by `sub_821BE610`'s own convention,
+  // and a path/TOC pointer, if it lives in this object at all, has to be one of the remaining words,
+  // so try every word in `+0x30..+0x44` as a string pointer. Log-only; 14 rows per boot, uncapped.
+  {
+    uint32_t sdev = 0, shdl = 0;
+    (void)mem.ReadU32BE(inner + 0, &sdev);
+    (void)mem.ReadU32BE(inner + 4, &shdl);
+    char idsv[8][25] = {{0}};
+    uint32_t idw[8] = {0};
+    for (int i = 0; i < 8; ++i) {
+      (void)mem.ReadU32BE(inner + 0x30u + i * 4u, &idw[i]);
+      const uint32_t p = idw[i];
+      if (p >= 0x1000u && p != 0xCDCDCDCDu && p != 0xFFFFFFFFu) {
+        unsigned char raw[24] = {0};
+        if (mem.ReadBytes(p, raw, 24)) {
+          bool printable = raw[0] >= 0x20 && raw[0] < 0x7F;
+          for (int j = 0; j < 24 && printable; ++j)
+            if (raw[j] == 0)
+              printable = j > 3;
+          if (printable) {
+            for (int j = 0; j < 24; ++j) {
+              if (raw[j] == 0)
+                break;
+              idsv[i][j] = (raw[j] >= 32 && raw[j] < 127) ? (char)raw[j] : '.';
+            }
+          }
+        }
+      }
+    }
+    if (k <= 40)
+      MCLA_LOG_WARN(
+          "F456-STREAMID #{} name='{}' inner={:08X} dev={:08X} handle={:08X} base={:08X} "
+          "pos={} len={} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] "
+          "s0='{}' s1='{}' s2='{}' s3='{}' lr={:08X}",
+          k, nm, inner, sdev, shdl, idat, ipos, ilen, idw[0], idw[1], idw[2], idw[3], idw[4],
+          idw[5], idw[6], idw[7], idsv[0], idsv[1], idsv[2], idsv[3], lr);
+  }
   __imp__sub_821CFF40(ctx, base);
   const uint32_t res = ctx.r3.u32 & 0xFFu;
   if (res != 0u)
