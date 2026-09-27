@@ -12610,6 +12610,11 @@ static bool EmbeddedListInsert(const char *name, uint32_t buf, uint32_t size);
 
 PPC_FUNC(sub_821BC140) {
   const uint32_t n = s_hBC140.fetch_add(1) + 1;
+  // F-471 §3: the entry->post-exec bracket that produced the 35-1,662 ms per-job
+  // spans contains OUR OWN host decompression (the Path A serve block below), so
+  // it cannot say whether the consumer is slow in the title or in us. Two stamps
+  // split it; printed on the existing POST-EXEC-START line, no new marker.
+  const auto tHook0 = std::chrono::steady_clock::now();
   // SAVE the slot descriptor before __imp__: the guest body clobbers r3
   // (return value = completion status). Every post-exec census must use
   // this snapshot — reading ctx.r3 after the call AV'd the consumer
@@ -12818,14 +12823,20 @@ PPC_FUNC(sub_821BC140) {
       }
     }
   }
+  const auto tPreGuest = std::chrono::steady_clock::now();
   __imp__sub_821BC140(ctx, base);
+  const auto tGuestDone = std::chrono::steady_clock::now();
   // POST-EXEC: mount the inflated buffer as a memory: device so shader
   // lookups (star_glow etc.) can find it. The callback at [ctx+1548] is
   // 0x821BC548 (semaphore release) â€” wrong function. We do the mount here.
   // NOTE: use slotAddr (saved pre-call), never ctx.r3 — r3 is clobbered.
   MCLA_LOG_WARN("POST-EXEC-START #{} slot={:08X} qarg={:08X} r3after={:08X} "
-                "tid={:08X}",
-                n, slotAddr, queueArg, ctx.r3.u32, GetCurrentThreadId());
+                "tid={:08X} pre={}ms guest={}ms",
+                n, slotAddr, queueArg, ctx.r3.u32, GetCurrentThreadId(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    tPreGuest - tHook0).count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    tGuestDone - tPreGuest).count());
   if (n <= 16 || (n % 500) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t ctxBase = slotAddr;

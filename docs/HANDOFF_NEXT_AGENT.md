@@ -1,3 +1,28 @@
+## 2026-09-27 05:5x (F-471/F-472, **2 builds, soaks `w475`/`w476`; both instruments KEPT, no new marker**) — the block above's "Next (T42.14)" is already answered, and it says the guest owns the delay.
+
+- **T42.14 cost 0 builds (F-471):** the push→enter→exit table came from joining rows already in
+  `w475` (`F469-RECSNAP` / `BC140-REC` / `POST-EXEC-START`). `sub_821BC140` takes **97/720/35/246/
+  1,662/1,088/325 ms** per job with only 1-32 ms idle between them, so the consumer thread is
+  saturated and the 22-29 ms record window is missed **inside** the job, not in queue latency. That
+  excludes "the worker is parked" for this thread — the clause-(b) park story (F-394/F-395) is a
+  different thread and stays as it was.
+- **T42.15 was the one build it deserved (F-472):** `pre=`/`guest=` stamped either side of
+  `__imp__sub_821BC140` (`src/gpu_device.cpp:12826`) split our host decompression from the title's
+  body. On the four UI jobs **`pre = 0 ms`, guest = 21-590 ms**: our Path A work is not what makes the
+  window unmeetable. The host's 1,447 ms sits entirely on the three later non-UI jobs (#5, #7).
+- **Census `w476` vs `w460`:** `C0000005` 0=0, `GFx` 13=13, `VEH` 43=43, `LISTLINE` 171=171,
+  `LZX-FRAME` 32=32, `XSF-HOSTSERVE` 79=79, `BC140-REC` 7=7, `F442/F456` 14=14, `F457-MEMBLK` 81=81,
+  garage `claimed=851968 still_present=851968 pct=100` at the last shot, `pkg=64CB0000 pct=100`.
+  `Fatal error` 0→2 = the documented 0..2 spread (`FATAL-SOFT-RESOURCE-PARK` ×2, `lr=82184514`); the
+  `WAIT`/`WAKE`/`PUT=`/`rptrWB` −138 group and `PARK-SAMPLE` +3 are timing-coupled.
+- **Next (T42.16), and it is a design question with a one-soak gate:** task #15's surviving form is
+  now *record pool lifetime*, not record contents — job #1 needed its record intact only at entry and
+  still ran 75 ms past its re-stamp, so any construction must keep `record+8`/`record+24` stable for
+  the body's own duration. Gate: **a second package reaches `still_present == claimed == goldsize`.**
+  Do NOT re-run: writing record *values* at our Path B site (F-468, and F-470 §1 explains why the
+  guest cannot even notice), or blaming host overhead for the spin (F-472 measured it at 0 ms).
+  Next ID **F-473**.
+
 ## 2026-09-27 05:4x (F-458…F-470, **6 builds, soaks `w461`…`w475`; 1 probe kept, 3 experiments measured-and-reverted, and the F-186 premise itself closed as false**) — the enqueue gap got re-framed twice and ended as a **pacing** problem, not a construction problem.
 
 - **Clause (b) hit the nested-archive floor (F-458/F-459):** `BDF20`'s printed `ret` is the guest

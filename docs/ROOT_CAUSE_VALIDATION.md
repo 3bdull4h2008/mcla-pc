@@ -10164,3 +10164,91 @@ within 22-29 ms, and at the moment we copied its `[+4]` was still 0 (F-468 §1),
 zero-length record onto live queue state. Option (ii) is not a host short-circuit at all — it is the
 reason `XSF-INFLATE` is 0 for all four containers, so it is the one route that can produce a *guest*
 inflate. Next ID **F-471**.
+
+### F-471 (2026-09-27 05:4x, **0 builds — two marker families already present in `w475`/`w460`**) — **T42.14'S ANSWER IS "INSIDE THE CONSUMER", AND THE CONSUMER IS SATURATED: `sub_821BC140` takes 35-1,662 ms per job (median 246) and idles only 1-32 ms between jobs — 4,173 ms of work for the seven pushes against a record lifetime of 22-29 ms. So the record window is missed by the job's OWN execution, not by queue latency, and even job #1 (the 100 % package) out-runs its own record by 75 ms.**
+
+- Task:        T42.14 (#76) — answered with no instrument and no build
+- Type:        FACT
+- Class:       E (streamer execution) + H-adjacent (the hook's own host work is inside this span; see §3)
+- Priority:    P0 — it picks which of F-470 §3's two levers is even reachable
+- Evidence:    `build/w475.log` pairs `BC140-REC #k` (`:3451,7710,38714,41151,42789,104622,105577`) with `POST-EXEC-START #k` (`:7697,38597,41041,42670,104476,105459,107287`) — the post-exec line is printed immediately after `__imp__sub_821BC140(ctx, base)` at `src/gpu_device.cpp:12821/12826`; consumer `tid=00003CEC` throughout, producer `tid=00005A6C` (F-469 §4), so this is one thread per role · `w460` has the same 7/7 pairs, so the shape is not probe-specific
+
+| job | record pushed | entered | exit | **exec** | idle→next |
+|---|---|---|---|---|---|
+| #1 | 45.092 | 45.092 | 45.189 | **97 ms** | 1 ms |
+| #2 garage | 45.114 | 45.190 | 45.910 | **720 ms** | 13 ms |
+| #3 | 45.142 | 45.923 | 45.958 | 35 ms | 7 ms |
+| #4 | 45.171 | 45.965 | 46.211 | 246 ms | 7 ms |
+| #5 | 45.196 | 46.218 | 47.880 | **1,662 ms** | 32 ms |
+| #6 | 45.221 | 47.912 | 49.000 | **1,088 ms** | 30 ms |
+| #7 | 47.434 | 49.030 | 49.355 | 325 ms | — |
+
+**1. Queue latency is not the problem.** Entry waits (push→enter: 0/76/781/794/1022/2691/1596 ms,
+F-469 §4) are almost entirely *explained* by the previous job still running: the consumer is busy
+from 45.092 to 49.355 with ~90 ms of total idle. So F-470 §3's option (ii) — the pacing — is the
+live lever, and "the worker is parked elsewhere" (the clause-(b) story) is **excluded for this
+thread**.
+
+**2. No job has a stable source for its whole run.** `[record+8]` (device) and `[record+24]`
+(package offset) are re-read inside the routine (F-470 §2's field census), and the shortest job
+(35 ms) is comparable to the 22-29 ms recycle while the median (246 ms) is ~10x it. Job #1 — the one
+whose record still matched at entry — executes for 97 ms, i.e. 75 ms past its record's re-stamp.
+So "which bytes am I inflating" is a moving target for all seven, and the 3/4-containers-complete
+result is Path A's destination-keyed placement, not the guest's own source resolution. That is the
+sharpest statement yet of why `XSF-INFLATE` stays 0.
+
+**3. Half of these spans may be OUR work, and that is now the first thing to measure.** The timing
+bracket is entry→post-exec of the *hook*, and the hook body before `__imp__sub_821BC140` does host
+decompression of its own (`hostInflate` call at `src/gpu_device.cpp:12815`, plus the Path A serve
+machinery). Nothing in this entry separates host time from guest time. T42.15 = one build, one line:
+stamp around `:12821` so `POST-EXEC-START` gains `pre=ms exec=ms`. Acceptance: if `pre` dominates,
+the consumer's slowness is ours and is fixable without touching guest state; if `exec` dominates,
+the pacing lever is inside the title's loop and F-393's spin analysis is the parent question.
+
+**4. Marker-hygiene note so nobody re-reads the wrong number.** `INFLATE-ENTER` is a *sampling*
+printer (`n <= 16 || (n % 200) == 0 || j2Ent || stackCont`, `src/gpu_device.cpp:10337`), so the
+per-span line counts (607/51/205/203/896/197/215) are NOT event counts and were not used above; and
+`soak_census.py`'s `INFLATE` row substring-collides with `INFLATE-ENTER` and the
+`INFLATE-HOSTSERVE-*` family, so its 5,065 is not a count of inflate entries either (F-321 §2's
+prefix landmine, third documented instance). Next ID **F-472**.
+
+### F-472 (2026-09-27 05:4x, **1 build, soak `w476`; instrument KEPT, no new marker**) — **FOR THE FOUR UI CONTAINERS THE CONSUMER'S SLOWNESS IS ENTIRELY THE TITLE'S: `sub_821BC140`'s host-side pre-call work costs 0 ms on jobs #1-#4 while its guest body takes 99 / 590 / 33 / 21 ms, so F-471 §3's open alternative ("half of these spans may be ours") is REFUTED for the UI jobs — our Path A decompression is not what makes the record window unmeetable. The host's 1,447 ms all sits on the three later, non-UI jobs (#5 `pre=1150`, #7 `pre=297`, #6 `pre=0`).**
+
+- Task:        T42.15 (#76) — answered; the pacing lever is inside the guest loop
+- Type:        FACT (and the closure of F-471 §3's caveat)
+- Class:       E (streamer execution) + G
+- Priority:    P0 — it decides whether the pacing lever is ours or the title's
+- Evidence:    `build/w476.log:7702,38583,41025,42618,126746,127691,129521` (`POST-EXEC-START #k … pre=<host ms> guest=<body ms>`, stamped either side of `__imp__sub_821BC140(ctx, base)` at `src/gpu_device.cpp:12826`), paired with the entry rows `:3458,7715,38698,41137,42730,126873,127809` · record shape unchanged from F-469 (same 7 `F469-RECSNAP` rows, same foreign-record pairing, `pkg=64CB0000 … pct=100`, garage `claimed=851968 still_present=851968 pct=100` at the last shot)
+
+| job | slot tag | **pre (our host work)** | **guest (`__imp__` body)** |
+|---|---|---|---|
+| #1 | `00000001` | 0 ms | **99 ms** |
+| #2 garage | `00000002` | 0 ms | **590 ms** |
+| #3 | `00000003` | 0 ms | 33 ms |
+| #4 | `00000004` | 0 ms | 21 ms |
+| #5 | `00008004` | **1,150 ms** | 382 ms |
+| #6 | `00010004` | 0 ms | 329 ms |
+| #7 | `00018004` | 297 ms | 36 ms |
+
+**1. What this closes.** F-471 §3 said the entry→post-exec bracket could not separate host from guest
+time, so "the consumer is saturated" might have been an indictment of our own Path A work inside the
+hook. It is not, for the jobs that matter: on the four UI containers `pre=0 ms` in every row, so the
+22-29 ms record window (F-469 §4) is blown by the title's own 21-590 ms body. The host's time is real
+but lands on jobs #5/#7, whose packages are the 4 KiB-shaped non-UI serves F-392/F-406 already
+distinguishes.
+
+**2. Neutrality of the instrument.** `w476` vs `w460`: `C0000005` 0=0, `GFx` 13=13, `VEH` 43=43,
+`LISTLINE` 171=171, `LZX-FRAME` 32=32, `XSF-HOSTSERVE` 79=79, `BC140-REC` 7=7, `F442-SECTION` 14=14,
+`F456-STREAMID` 14=14, `F457-MEMBLK` 81=81 (the +7 `F469-RECSNAP` row is this probe, which `w460`
+predates). `Fatal error` 0 → 2 with `FATAL-SOFT-RESOURCE-PARK` ×2 at `lr=82184514` is the documented
+0..2 spread of that marker across adjacent binaries (F-457's handoff row reads 2/1/2/0), not a claim;
+`PARK-SAMPLE`/`PARK-STACK` +3 and the `WAIT`/`WAKE`/`PUT=`/`rptrWB` −138 group are timing-coupled.
+
+**3. Where the goal's next step therefore sits.** Making the guest's per-job body faster is not a
+host short-circuit we can reach without either (a) reducing the number of descriptor iterations the
+body performs — F-393's measured spin, whose only exits are `inLeft==0` and `outLeft==0` — or (b)
+giving each job a record that survives its own body, i.e. the pool-index route task #15 now carries
+(F-470 §3). Route (b) is now measurable against a concrete target: job #1 needed its record intact for
+99 ms to reach `pct=100`, so any construction that keeps a record stable for the body's own duration
+is testable by whether a second package reaches `still_present == claimed == goldsize`. Next ID
+**F-473**.

@@ -390,3 +390,26 @@ site* and F-468 then acted on it; both were artifacts of when our code ran. **A 
 hook site says nothing about the value a *later* dispatch will see — pair an enqueue-time snapshot
 with the dispatch-time read of the same field before naming a mechanism.** `F469-RECSNAP` +
 `BC140-REC` in one log is that pair, and it is now the reference instrument for this subsystem.
+
+### 8.6 T42.14 and T42.15 answered (F-471/F-472) — the pacing is the title's, not ours
+
+`BC140-REC ↔ POST-EXEC-START` pairs give per-job execution time without a new instrument, and the one
+build that split host from guest time (`pre=`/`guest=` on the existing `POST-EXEC-START` line,
+`src/gpu_device.cpp:12826`) says: on the four UI containers **our host work is 0 ms and the title's
+body takes 21-590 ms**. So the consumer is saturated inside `sub_821BC140`, idle only 1-32 ms between
+jobs, and the 22-29 ms record window is unmeetable by design of the title's own loop, not by our
+decompression cost.
+
+That leaves exactly two shapes for the remaining work, and they are now separated by a measurable
+target rather than by taste:
+
+- **(B) pool-index route (task #15's surviving form).** Job #1 reached `pct=100` because its record
+  was intact *at entry*; it then ran 99 ms and the fields it re-reads mid-body (`record+8` device,
+  `record+24` package offset — F-470 §2) were the garage's. So the test for any construction is:
+  does a **second** package reach `still_present == claimed == goldsize`? That is a one-soak gate,
+  and it fails closed — it cannot be satisfied by writing values, only by giving a job a record that
+  survives its own body.
+- **(A) iteration-count route.** F-393 measured that the body's only exits are `inLeft==0` and
+  `outLeft==0`; shortening the body means feeding it so those conditions are reached sooner. That is
+  the Path A serve side, which we already own, and it must be measured by the body's own `guest=ms`
+  column rather than by a counter of our calls.
