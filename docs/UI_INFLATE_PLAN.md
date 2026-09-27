@@ -267,3 +267,86 @@ stream and publishes the correct `st+12`; the third container's placement is
 **measuring, and writing** (`kUiXsfGoldenFill=true` + `kUiXsfFillDryRun=false`, the flag's actual value),
 and frame-aligned serving is off (tested and reverted, F-333). No unregistered
 short-circuit: §7 of `PROGRAM_GUIDE` carries each of these.
+
+
+## 6. Frontier as of 2026-09-27 04:3x (ledger through F-462) — what the objective's two clauses now rest on
+
+Everything below is measured (soak line, raw word or `file:line`); the earlier sections are kept as
+the elimination record. Four routes that this document previously listed as open are now closed by
+their own experiments:
+
+| route formerly open | verdict | evidence |
+|---|---|---|
+| guest-visible Open-gate bit30 for the tune archives (F-452 §3) | **refuted** — armed with read-back, nothing downstream moved | `w455.log:116853`/`:117684` vs `w452.log:122150`/`:122870`; F-454 |
+| tag `LISTLINE` with its source path (task #66) | **unnecessary** — `LISTLINE` already self-attributes, and its loader is the *shader* preload loader | 166 × `lr=82187958` + 5 × `lr=82189234`; windows ui 16 / city 64 / cars 62 / characters 22 / effects 17; F-455 |
+| `h=0` on the tokenizer's reader as a failure marker | **refuted** — `dev=C64AC100 handle=0` on all 14 lookups, four of which hold correct config text | `F456-STREAMID` (kept, `PROGRAM_GUIDE` §9); F-456 |
+| extend Path A to the tune container | **closed on the bytes** — no `memory:$` block is an XMem/RSC container | `F457-MEMBLK` 81 heads, 0 with `52534305`/`EF12F50F`; F-457 |
+
+### 6.1 Where clause (b) actually stops now
+
+`sub_821CC6F0` is **not** a per-file read. From the guest's own recompiled body
+(`generated/ppc_xenon/ppc_recomp.17.cpp:3931-3996`) it is
+`(obj, r4, offset, dst, count)` → call `[[obj+32]+132]` → `r5' = [obj+24] + offset` → call
+`[[obj+32]+28](r4, r5', dst, count)`. Census of all 14,363 such calls in a boot: `r3` always
+`C64AC100`, `inner=[r3+32]` always `C6537780`, `r4` always the request block
+`C64B7600[98B0D2B1 F77F0000 0 0]`; the only variable is the offset, and it takes five values
+(`64CA7B89` ×10,251, `0035A000` ×1,287, `64CB0000` ×1,216, `649763D7` ×1,005, `000A0000` ×604) — all
+absolute offsets inside `xarchive_cache.rpf` (F-462). **The nested tuning archive's own offsets
+(`0x48000`, `0x68000`) never appear**: the guest does not read the nested archive through this stream
+at all. F-459's 198 zero-byte rows inside the tune window are therefore meshtextures package refills
+(F-457's stale-record spin), not mount traffic — that attribution is corrected in F-462 §3.
+
+Two host-side layers also matter, both new since §4 was written:
+
+1. **`READWRAP-SERVE` has been unreachable since F-091/F-126.** The call site
+   `src/gpu_device.cpp:14753` passes `tocEntry=0` and `handle=0xFFFFFFFF`, and only the `tocEntry`
+   index can still return true; every other index logs `T413O-SKIP ... would-serve` and falls through
+   to `return false` (`:1713-1780`). `READWRAP-SERVE` = 0 rows in `w452`/`w457`/`w460`/`w462` while
+   `w460` carries 72 `T413O-SKIP` rows naming bodies that existed (F-461).
+2. **Re-arming it by device scan is unsafe and was reverted.** All 7 resolutions named the wrong file
+   (`r5=64CB0000`, raceeditor's package, resolved as `garage.xsf`; `64980000` as `legals.xsf`) and
+   activating the deliberate w21/w22 `r7==0` `READWRAP-R7Z` lever re-armed the inflate loop:
+   `INFLATE-ENTER` 2,378 → 95,913, with the late-boot samples (`W34-NOGFX`, `nGfx=0`, `REVERIFY`)
+   lost. Reverted; exe verified back to 57,442,304 bytes (F-461). `PROGRAM_GUIDE` §7 still lists the
+   marker as rare at a stale `:9818` — it should read unreachable-by-construction plus
+   bypassed-by-lever.
+
+The tune file's own open **does** yield a stream (`BDF20`'s printed field is the stream object
+address, settling F-445): the three `.rpf` preload archives each get `0x82860C40`, while
+`tune/vehicle/vehicle0008.lst` yields `0` — no stream at all (F-458 §1). And the nested archives are
+not present in mountable form: at their TOC offsets the raw bytes are high-entropy with no `RPF3`
+header, and exactly one `RPF3` exists in the first 64 MiB — the outer archive's own (F-458 §2,
+extending F-442). Upstream offers no help here: the local `.research/xenia` checkout has no
+`rpf`/`file_archive` device and no AES key table at all (checked 04:3x in
+`src/xenia/vfs/devices/`), so the transform used on those members is title-side and we do not hold it.
+
+### 6.2 The two routes that remain, with their cost
+
+| route | shape | acceptance | cost / owner |
+|---|---|---|---|
+| **R1 — per-stream record** (task #15) | a `(record, context)` pair per 28-byte descriptor created inside `sub_821BC140`'s walk, `generated/ppc_xenon/ppc_recomp.14.cpp:18805` | at the tune-open millisecond the place pass must inflate against a window whose `pkg` is the tune archive with `*srcSz(in) >= member size` (today: 20 bytes of meshtextures' bounce tail, F-457), holding `LZX-FRAME` 32, `REVERIFY pct>=94`, `LISTLINE` 171, `C0000005` 0, `BC140-REC` 7 and one `F434-SPIN-BREAK` | re-plumbing inside guest-owned structures — a new build class, not a hook; the only route that also serves clause (a)'s last 14 % |
+| **R2 — observe the nested mount itself** (T42.8, task #71) | log-only probe on `obj=0x82860C40` inside `sub_821BE250`/`sub_821BE4F0`: print the resolved target offset, whether inner vtable `+132`/`+28` were entered, and what the device answered | the first row that shows a read *attempted against* `0x48000`/`0x68000` — or proof that no such read is ever issued, which would move clause (b) out of emulator reach entirely and into the missing-key problem | one build, low risk; its negative result is decision-grade |
+
+Ruled in for neither column: any serve/filter/gate variant at `CC6F0` keyed from the device (F-461
+proves the key must be the request's offset, and no tune offset ever arrives there).
+
+### 6.3 Clause (a), restated with the current numbers (unchanged in substance)
+
+Path A decodes 3 of 4 UI `.xsf` byte-exact into guest memory (`raceeditor 143,069 pct=100`,
+`policecam 19,337 ×2`, `credits 29,655`), the garage at `claimed=851,968–917,504` of `1,066,057`
+with `still_present` 94–100 % of the claim (`w455`/`w460`), the residual being destination-supply
+bound (F-354/F-431) and addressable only by R1 or by host-allocated destinations, which the user has
+rejected. `nGfx` remains 0 and is now known to have never been a working GFx counter (F-437); the
+event counter `F438-GFXCTOR` with a fired control shows the guest never calls the GFx loader ctor
+(F-438), the handler registry is never read (F-440), and the boot-worker queue is only memset
+(F-441) — so clause (b) is not downstream of clause (a), and this document's §2/§3 conclusions still
+hold.
+
+### 6.4 What would let the objective be called done
+
+(a) is at its measured ceiling and needs no further claim. (b) needs either R1 to land and the tune
+sections to resolve (`F442-SECTION` with real tuning text in the buffer, `[0x828CD0A8]` raised above
+0 by the guest's own walk) and then `F438-GFXCTOR` to print rows the guest produced, or R2 to show
+that no read of the nested archive is ever issued — in which case the remaining blocker is the
+archive's transform, and that is a content/key question rather than an emulator one. Until one of
+those two is measured, the objective stays open.
