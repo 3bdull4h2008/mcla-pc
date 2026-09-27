@@ -9882,3 +9882,44 @@ So the tuning file's open fails outright, and it fails *after* its parent archiv
 **3. Consequence for the objective's two clauses.** Clause (a) stands as measured (3/4 UI `.xsf` byte-exact, garage 94-100 % durable). Clause (b) does not need an inflate, a record, a gate bit or a decoder at this point (F-446/F-450/F-454/F-456/F-457/F-458 each closed one of those): **it needs the nested archive's read to return bytes and advance**. The next concrete step is therefore narrow and cheap: one build, log-only, at `sub_821CC6F0`'s read handler — print, for requests on wrapper `C64B7600` (and for any read whose `r5` exceeds the served window), the branch that produced `ret=0` and `r1out`, so the zero is attributed to a named site in `src/` rather than inferred. Acceptance: the site is named, and then a single-variable fix attempt can be judged by whether `reqPos` advances and whether `BDF20` for the tune `.lst` stops returning NULL (F-458 §1 is the yardstick: `ret=0x82860C40` instead of `0`).
 
 **4. Also recorded because it will be mistaken for progress:** `INFLATE-ENTER` and `INFLATE-J2-LAST-JUNK` each print 99 times inside this window — that is the place pass spinning on the same stale record (F-434's shape) and it is *not* decompression progress; `produced` stays 0 there (F-457). Next ID **F-460**.
+
+
+### F-461 (2026-09-27 04:1x-04:2x, **2 builds - one attempted fix, measured and reverted; tree restored and verified**) — **THE `sub_821CC6F0` SERVED-BODY BRANCH IS STRUCTURALLY UNREACHABLE, AND THE BLOCKER IS TWO LAYERED: (a) the call site at `src/gpu_device.cpp:14753-14755` passes `handle=0xFFFFFFFF` and `tocEntry=0`, while since F-091/F-126 those are the only indexes that can still return true - every other index just logs `T413O-SKIP ... would-serve` and the function ends in `return false` (:1780); and (b) even when a body IS resolved, these requests arrive with `r7=0` from `lr=0x821BC334`, which takes the deliberate w21/w22 `READWRAP-R7Z` lever that returns 0 on purpose so the guest proceeds into `InflateStep`.**
+
+- Task:        T42.6 (#70) - answered, and the attempted repair was rejected by its own measurement
+- Type:        FACT (dead intended path) + FIX-attempt measured negative + DOC CORRECTION due in PROGRAM_GUIDE 7
+- Class:       H (instrument/code truth) with an E component (the archive read path)
+- Priority:    P1 - anything that tries to feed a body through this site must clear both layers first
+- Evidence:    `src/gpu_device.cpp:14753` (the call site) · `:1713-1780` (`MclaFindServedBody`: tocEntry index, then log-only devh, log-only flagWord family, log-only bare-dev, then `return false`) · `:14756-15015` (the unreachable serve branch and its `READWRAP-SERVE` printer) · `:15000-15003` (the `r7==0 && inflateRefill` lever) · `READWRAP-SERVE` = **0 rows in `w452`, `w457`, `w460`, `w462`** while `T413O-SKIP` = 72 rows in `w460` · attempt: `build/w462.log` `F460-REKEY #1..#7` · revert verified: exe back to 57,442,304 bytes with 0 occurrences of the marker string
+
+**1. Layer (a), proven statically then measured.** F-126's own comment says "only tocEntry is exact", so the repair direction is to supply the real TOC entry. I tried the mechanical version - scan the device's TOC array `[dev+40+h*68]` for `h=0..15` and take the first entry that resolves in the served-body registry. It resolved 7 requests and **every resolution was the wrong file**: `r5=64CB0000` (the *raceeditor* package) came back as `path='resources/ui/garage/garage.xsf' size=1066057`, and `r5=64980000` came back as `path='resources/ui/legals/legals.xsf'`. That is exactly the F-091 contamination (`legals.xsf` offered as some other file's body) re-created from a new direction, because the array scan answers "which registered file lives on this device", not "which file is this request". Reverted. `READWRAP-SERVE` stayed 0 and `READWRAP-R7Z` went 0 to 7 - the second layer, caught in the act.
+
+**2. Layer (b) is intentional, not a bug.** With a body resolved, the `r7 == 0 && (lr==0x821BC334 || lr==0x821BC484)` guard runs first: it clears the abort flag at `0x8286073C`, keeps IO credits positive at `0x827D74E0`, and returns 0 - the documented w21/w22 lever whose purpose is to let the guest reach `InflateStep` instead of taking the short-read exit. So restoring the key alone would deliver no bodies on the inflate refill path either; the two layers have to be reasoned about together, and any future attempt must key on the request rather than on the device.
+
+**3. What this does not explain, stated narrowly.** F-459's 198 identical zero-byte reads come from `lr=0x821CCDBC`, not `0x821BC334`, so they take neither the serve branch nor the R7Z lever: they run the guest's own routine, which returns 0 with `r1in == r1out`. At that site `r4` is a **constant request block** (`C64B7600` in all 14,363 `READWRAP` rows) and `r5` carries a package/size family (`64CA7B89` x 10,251; `0035A000` x 1,287; `64CB0000` x 1,216; `649763D7` x 1,005; `000A0000` x 604) - so the per-file handle is not in any register we print. Establishing which value indexes `[dev+40+h*68]` for that caller is the prerequisite for a safe serve there; until it is established, keying from this site is prohibited by this measurement rather than by taste.
+
+**4. Census of the attempted fix (`w462` vs the control `w460`) - and the change was NOT inert.** I nearly wrote this entry claiming "inert apart from its own log rows"; the counts refute that, so they are recorded as measured:
+
+| marker | `w462` (attempt) | `w460` (control) | delta |
+|---|---|---|---|
+| `LISTLINE` | 171 | 171 | +0 |
+| `C0000005` | 0 | 0 | +0 |
+| `BC140-REC` | 2 | 7 | -5 |
+| `F442-SECTION` | 14 | 14 | +0 |
+| `F432-GROW-SKIP` | 3 | 3 | +0 |
+| `F434-SPIN-BREAK` | 0 | 1 | -1 |
+| `UIXSF-GOLDEN-REVERIFY` | 20 | 21 | -1 |
+| `LZX-FRAME` | 28 | 32 | -4 |
+| `W34-NOGFX` | 0 | 6 | -6 |
+| `nGfx=0` | 0 | 6 | -6 |
+| `INFLATE-ENTER` | 95913 | 2378 | +93535 |
+| `F457-MEMBLK` | 81 | 81 | +0 |
+| `READWRAP-R7Z` | 7 | 0 | +7 |
+| `READWRAP-SERVE` | 0 | 0 | +0 |
+| `T413O-SKIP` | 72 | 72 | +0 |
+| `Fatal error` | 0 | 0 | +0 |
+| `XSF-POSTOPEN-SERVE` | 79 | 79 | +0 |
+
+Read together: resolving a body for the inflate-refill caller activates the w21/w22 `READWRAP-R7Z` lever, which (by design) clears the abort flag at `0x8286073C` and forces IO credits to 1 before returning 0 - and the boot then drives **93,535 more `INFLATE-ENTER` rows (2,378 to 95,913, i.e. 40x)** while `BC140-REC` falls 7 to 2, `LZX-FRAME` 32 to 28, `UIXSF-GOLDEN-REVERIFY` 21 to 20 and both `W34-NOGFX` and `nGfx=0` go 6 to 0. The disappearance of the late-boot census rows is the tell: with the inflate loop re-armed, the boot never reaches the stage where those samples print - the same signature F-344 recorded when a falling failure tally turned out to be a stalled boot rather than a fix. So layer (b) is not merely "a guard that also blocks serving": the lever **interacts with F-434's spin mitigation**, because the flag it clears is one of the conditions that mitigation relies on. That is a do-not-#9 stacked-short-circuit hazard, and it is why the revert is the shipped state (verified: exe back to 57,442,304 bytes, marker string absent, `F460-REKEY` gone from `src/`).
+
+**5. Left open, named precisely.** `PROGRAM_GUIDE` 7 still lists `READWRAP-SERVE` at the stale line ref `:9818` with the count "1 (`w42a` 0)"; it should read *unreachable since F-091/F-126* (layer (a)) *and unused on the refill path by the w21/w22 lever* (layer (b)). And the safe form of any future serve at this site is unchanged: key it on the request's own handle - which requires reading `sub_821CC6F0`'s arithmetic to find where `h` comes from at `lr=0x821CCDBC`, since `r4` is a constant request block there. Next ID **F-462**.
