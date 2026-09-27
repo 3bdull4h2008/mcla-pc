@@ -2373,3 +2373,35 @@ durable record is `C:\mcla-pc\docs` + the mirror in `C:\mcla-emergency-20260921-
 sources, `w41a…h.log`, the HEAD blobs and the two verified patches).
 ### B1 static pass (rule 14) — same session, minutes later
 Static walk ABOVE the pager finished what w50 started: pager-caller sub_821C91C0 registers the window request into the global pending list ([0x828606E8/06EC] lock-protected, counter++), bctls the pager at 821C9260, and returns 0 — **zero post-read work in the caller**. 821C92A0+ = completion-list splice (unlink r11=[r8+0x848], state words 48/47 at +2112 — slot-state flip territory, our SLOT-READY lives at exactly this data). So the member-page consumer is reached by DATA (slot bookkeeping), not by any call edge: static analysis is exhausted, the DR0-3 watchpoint on C6157B80/C6167C00 (stable across w47-w50) is now the only clean discriminator. Implementation next attempt: arm via SuspendThread/SetThreadContext on boot-worker (boot_host.cpp:1320 handle) + each guest thread (kernel/guest_thread.cpp create site), Dr0=base+C6157B80 Dr1=base+C6167C00 Dr7 RW=10 LEN=3(8B), log EXCEPTION_SINGLE_STEP in the existing VEH with thread id + current guest lr (thread_local g_ppcContext), re-arm Dr7 from context on every hit (Windows clears on context switch), cap 32 lines. Frontier must stay w50-identical (watchpoint is read-only; if it adds faults, revert per goal criterion).
+
+
+## 2026-09-27 08:5x - the streamer race, found and fixed (F-500, F-501, F-502)
+
+**Verdict: the first end-to-end GUEST decompress of a UI container in this project.** `sub_821BC140`
+job #1 now walks `64CB0000 -> 64CD2EDD` (raceeditor's package offset plus its exact 143,069-byte
+length) with `lzxFrames=10` and `maxProduced=999,424`, and `Fatal error` went 2 -> 0 with every
+structural marker flat (`LISTLINE` 171, `C0000005` 0, `GFx` 13, `BOOTPATH` 10, `W34-NOGFX` 6,
+`XSF-HOSTSERVE` 79, `TOC76` 2,245). `F438-GFXCTOR` is still 0, so GFx still does not initialise.
+
+**Root cause (F-502, kept ON as `kF502KeepLenOnRelease`).** The title's own join frees a streamer
+record before the worker's enqueue has raised its count, and the join writes `0` into `record+4`
+(`ppc_recomp.14.cpp:21621-21632`) - the exact dword the dispatch then loads as the walk's remaining
+byte count (`:18966`). `w500` logs `TASKJOIN ... entry=C9E2491C` before `ENQ sub_821BCB10 #1`.
+Every dispatched job therefore requested zero bytes: `w501`'s histogram of the walk's own reads is
+**13,756 rows, all `r7=0`**, parked at `pkgoff + length`. Restoring that dword after the release,
+while the handle is pushed-and-not-yet-returned, is what unlocked it. This is NOT the F-483 pin and
+NOT F-468's copy-at-enqueue; both of those are still false/reverted.
+
+**Structure banked (F-500).** The walk feeds itself: `record_array + ([slot+0] & (cap-1)) * 28` ->
+`record+8` -> vtable slot 28, which **is** `sub_821CC6F0`, destination `r1+128` (a 32 KiB stack
+staging buffer), 12-byte block header skipped on the first chunk only. So F-482's "14,365 read calls,
+two bytes requested" was never a mis-placed instrument - and the static guess that it was is withdrawn
+in the entry itself. `F500-DEVREAD`'s `cred=` column is NOT citable yet.
+
+**Next (T42.32).** Jobs #2/#3 still decode nothing because they are dispatched against the record
+index that the *following* push owns (`#2 offFirst=64CA3000`, policecam's range, while its own job is
+the garage's 1,066,057) - task #15's restatement, now the only remaining Path B unknown, and F-502
+means the length field can no longer mask it. `XSF-INFLATE` is a host-VFS DEFLATE probe, not a guest
+counter (F-502 section 5) - stop reading it as the goal's gate. `PRESENT` 61 -> 55 in `w502` is the
+one unexplained delta; re-check it on the next soak.
+

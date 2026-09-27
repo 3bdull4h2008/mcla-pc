@@ -10813,3 +10813,54 @@ container (`XSF-INFLATE` 0). Clause (b) is not achieved and is not downstream of
 **Objective OPEN**; the two candidate routes (in-loop hook via the recompiler toolchain, or the user's
 F-055 for the GFx producer question) remain, and both are decisions rather than unknowns. Next ID
 **F-500**.
+
+
+### F-500 (2026-09-27 08:2x, **1 build, soak `w500`; read-only extension of the existing `sub_821BC140` wrapper**) — **THE WALK'S INPUT IS NOT THE JOB READ-LIST AND NOT `sub_821CC6F0`-BY-ACCIDENT: `sub_821BC140` reads the COMPRESSED stream into a 32 KiB STACK STAGING BUFFER through the record's own device, and the record it indexes is `record_array + ([slot+0] & (cap-1)) * 28`.**
+
+- Task:        T42.29 (#81) - answered with 1 build
+- Type:        FACT (structure) + a self-refutation of the inference that produced it
+- Class:       G (the title's own coded behaviour) + E (device/file structure)
+- Priority:    P0 - it names the single call Path B has to satisfy, and it retires the "we are watching the wrong reader" lead
+- Evidence:    `generated/ppc_xenon/ppc_recomp.14.cpp:18874` (`add r28,r10,r11` after `mulli r10,r10,28` on the masked `[slot+0]`, `lwz r11,52(r19)` with `r19 = 0x8283D190`), `:19025` (`ori r21,r11,32768`), `:19043-19055` (`lwz r11,96(r1)` / `mr r31,r30` = the read is `min(remaining, 0x8000)`), `:19079-19095` (`mr r7,r31` / `addi r6,r1,128` / `ld r5,80(r1)` / `lwz r10,28(r11)` / bctrl), `:19105-19123` (`stw r8,100(r1)` = `r1+128+12`, `stw r7,96(r1)` = `len-12`, `std r6,80(r1)` = cursor advances by the bytes read), `:19130` (`bl sub_821D5E10`) - and `build/w500.log` `F500-DEVREAD #1 tag=00000001 rec=C9E2491C len=0 pkg=64CB0000 dev=C64AC100 vtab=82012BDC s28=821CC6F0 s52=821A5CC0 s124=82656BF8` (7 rows, cap `n <= 20`, no guest write)
+
+**1. The one thing this settles.** `s28=821CC6F0` - the device vtable slot 28 the walk calls **is** `sub_821CC6F0`, the function every serve instrument already hooks. So F-482's "14,365 read calls, exactly two requesting a byte" was never an instrument pointed at the wrong reader. The static reading that predicted a separate, unhooked reader (and the plan it implied) is withdrawn on arrival.
+
+**2. What the frame layout now means.** `[r1+96]`/`[r1+100]` are the inflate state's input length and input pointer, and the pointer is `r1+128+12`: the walk copies a block into its own stack frame and skips a 12-byte header **only on the first chunk** (`li r29,12` at `:19023`, `mr r29,r18` = 0 after the first pass at `:19123`). `[r1+80]` is a 64-bit package cursor that advances by exactly the bytes read. This is the "descriptor stream" F-487/F-495 were looking for: it is not a list, it is one stack buffer refilled per iteration.
+
+**3. Two fields of the record are load-bearing, and `+0` is not one of them.** Inside `sub_821BC140` the record is read at `+8` (device, 9 sites), `+24` (`:18904`, `:18920`), `+16` (`:18931`, `:18957`) and `+4` (`:18966-18967`, into `r30` = the walk's whole remaining byte count), and `+12` is passed by address to the device's slot-52/124 calls (`:19173`, `:19217`, `:19352`). It is never read at `+0` - F-470's "the generation is masked away" holds, and it explains why F-468 could overwrite record *identities* without the guest noticing.
+
+**4. A second sleeper, named but not yet measured.** `:19058-19071`: before every chunk read the walk tests a dword at `0x827374E0` and, while it is <= 0, calls `sub_821C91B8(100)` - a 100 ms sleep - in an unbounded loop. The `F500-DEVREAD` `cred=959169604` column printed the same constant in all 7 rows, which is not a plausible live credit value, so that sample is **not yet citable** (either the address is not guest-backed or `r22`'s base is misread). Any later claim about the 6,626 timeout waits (F-317) should check this site's own return address (`lr=821BC304`) before assuming a different sleeper.
+
+**5. Standing lesson, third time this session.** The inference in item 1 was written into the plan as fact *before* the probe printed. The probe cost one build; the inference would have cost several. Statically deriving a callee from a `bctrl` needs the vtable, and the vtable is only knowable at runtime here.
+
+### F-501 (2026-09-27 08:3x, **1 build, soak `w501`, flag `kF501RestoreLength`**) — **RESTORING `record+4` AT DISPATCH ENTRY IS INERT: the join writes the zero AFTER our wrapper-entry probe, so the walk still loads 0 - which is also the exact reason F-501 must not be dismissed as "the field does not matter".**
+
+- Task:        T42.30 - measured, kept as the negative half of F-502
+- Type:        FIX-attempt, measured INERT (not reverted: it is the capture side of the working fix)
+- Class:       H (instrument timing) + E (record lifetime)
+- Priority:    P1
+- Evidence:    `build/w501.log` `F500-DEVREAD #1 tag=00000001 rec=C9E2491C len=143069 pkg=64CB0000 ... restored=0` (the field was already filled at our probe) and `#4 ... len=0 pkg=000A0000 restored=196553`, `#5 ... restored=10799`, `#6/#7 len=10799 restored=0` (our write survived and the guest read it) - census `w501` vs `w500`: every structural marker `+0` (`C0000005` 0, `Fatal error` 2, `GFx` 13, `W34-NOGFX` 6, `LISTLINE` 171, `BOOTPATH` 10, `TOC76` 2,245, `BC140-REC` 7, `PUSH`/`F469-RECSNAP`/`POST-EXEC-START` 7, `F442-SECTION` 14, `XSF-HOSTSERVE` 79) and the gate unmoved: `XSF-INFLATE` 0, `F438-GFXCTOR` 0. Code: the ring plus `F501Note`/`F501Lookup` at `src/gpu_device.cpp:4709-4733`, capture in the `sub_821BCE68` hook, restore in the `sub_821BC140` wrapper.
+
+**1. The timing proof.** `grep -a "lr=821BC334" build/w501.log | grep -ao "r7=[0-9A-F]*" | sort | uniq -c` = **13,756 rows, all `r7=0`** - the walk's chunk read asked for zero bytes in every single one of ~13.8k attempts across the boot. `r7 = min(r30, 0x8000)`, so `r30` (the record's `+4` loaded at `ppc_recomp.14.cpp:18966`) was 0 at the load even in the rows where our entry probe had just read 143,069.
+
+**2. And the cursors sit one-past-end, which is not a seed error.** The same rows carry five fixed offsets: `r5=64CA7B89` (10,251x), `0035CA2F` (1,284x), `64CB0000` (1,216x), `649763D7` (1,005x). `64CA7B89 = 64CA3000 + 19,337`, `649763D7 = 6496F000 + 29,655`, `0035CA2F = 0035A000 + 10,799` - each is a container's package offset plus its exact record length. So the walk is not failing to reach the stream; it is standing at the stream's end with a zero remaining count.
+
+**3. Why those two facts are one fact, and where the write happens: see F-502.**
+
+### F-502 (2026-09-27 08:4x, **1 build, soak `w502`, flag `kF502KeepLenOnRelease = true`**) — **THE FIRST END-TO-END GUEST DECOMPRESS IN THIS PROJECT: keeping `record+4` alive across a release whose job is still in flight lets `sub_821BC140` walk a UI container from its package offset to exactly `offset + length`, and job #1 leaves with `lzxFrames=10` and `maxProduced=999,424` bytes - with `Fatal error` going 2 -> 0 and no structural regression.**
+
+- Task:        T42.31 - ADVANCE, kept ON in the tree
+- Type:        FIX (and the root cause of the F-186/F-187 gap)
+- Class:       G + D (the title's join racing its own enqueue) - not a recompiler or GPU fault
+- Priority:    P0
+- Evidence:    `ppc_recomp.14.cpp:21621-21632` - `sub_821BD220` spins `while ([record+12] != 0) sub_821C91B8(10)` (`:21600-21618`) and then `li r8,0` / `stw r8,4(r31)` writes 0 into the length, beside `stw r11,12(r31)` (free link) and `stw r7,0(r31)` (generation bump, F-478). `build/w502.log`: `F502-KEEP tag=00000001 rec=C9E2491C +4 0->143069 (job in flight)` for **all seven** jobs (143,069 / 1,066,057 / 19,337 / 29,655 / 240,531 / 196,553 / 10,799) in a 128 ms burst at `08:44:42.117-43.913`; `POST-EXEC-START #1 ... offFirst=64CB0000 offLast=64CD2EDD moves=5 len>0=5 ret[0/+/-]=4/5/0 inflEnters=28 lzxFrames=10 in!=0=24 exp!=0=28 outLeft!=0=28 maxProduced=999424` and `#4 ... offLast=000B8000 len>0=4 lzxFrames=1 maxProduced=24576`, `#6 maxProduced=1744896`, `#7 maxProduced=131072`; read-length histogram now `15,434 r7=0 / 4 r7=32768 / 1 r7=19337 / 1 r7=11997` against `w501`'s `13,756 rows, zero of them nonzero`.
+
+**1. The root cause, stated once.** The thread that pushes a streamer job can run that job's join **before** the worker thread's enqueue has incremented the record's count: `w500` logs `TASKJOIN sub_821BD220 #1 tag=00000001 ... entry=C9E2491C` **before** `ENQ sub_821BCB10 #1`. The join therefore sees count 0, exits its spin immediately, and frees the record - zeroing the length the dispatch loads a microsecond later. `sub_821BC140` is not starved by the device, by our serves, or by the archive: it is handed a record its own title has already released.
+
+**2. What the fix is and what it deliberately is not.** `F502Keep` (`src/gpu_device.cpp:4743-4760`) runs AFTER the guest release completes, so every bookkeeping write the release wants (`+0` generation, `+12` free link, the pool head) still happens. It restores one dword, and only while that handle is in `g_f483Pushed` and not yet in `g_f483Retired` (added when the `sub_821BC140` wrapper returns), so a long-dead record can never be resurrected. This is **not** the F-483 pin (`kF483DeferRelease` stays false) - the pin blocks the loader, this does not; and it is **not** F-468's copy-at-enqueue, which wrote a field that was not filled yet (F-468 section 1).
+
+**3. Clause (a) is now partially achieved by the guest, and the honest bound is visible.** Job #1 (raceeditor) consumed its whole stream and produced 999,424 bytes through 10 guest LZX frames. Jobs #2/#3, which F-500's record arithmetic shows read the *following* container's numbers (`#2 offFirst=64CA3000 ... offLast=64CA7B89` = policecam's range, one read then 10,104 zero-length ones), still do not decode. So the remaining Path B gap is the record *index* a job is dispatched against - task #15's restatement - not the length field, which F-502 now guarantees.
+
+**4. Instrument-neutrality and the one delta this soak does NOT explain.** `C0000005` 0=0, `LISTLINE` 171=171, `GFx` 13=13, `BOOTPATH` 10=10, `W34-NOGFX` 6=6, `XSF-HOSTSERVE` 79=79, `TOC76` 2,245=2,245, `F440-REGREAD` 0, `F441-QUEUE-STORE` 45=45; `INFLATE-ENTER` 2,178 -> 15,407 (real work; a sampling printer, so not a count), `FATAL-SOFT` 4 -> 0 and `Fatal error` 2 -> 0, guest time per job up to 839 ms (expected: they now read). **`PRESENT` 61 -> 55 is unexplained** and is the one number to re-check on the next soak before calling this free of side effects.
+
+**5. Marker semantics correction that has been steering this goal wrong.** `XSF-INFLATE` is NOT "the guest inflated a UI container": its printer is a host-VFS member probe that DEFLATE-inflates candidate bytes looking for an `RSC5`/`XC`/`rgxa` head (`src/gpu_device.cpp:1527-1564`). Its zero has never said anything about the guest inflate path. The counters that do are `lzxFrames`/`maxProduced` on `POST-EXEC-START`, and `F438-GFXCTOR` for the GFx half.

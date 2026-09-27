@@ -4694,6 +4694,67 @@ static bool F483Pending(uint32_t tag) {
   return F483In(g_f483Pushed, tag) && !F483In(g_f483Dispatched, tag);
 }
 
+// F-501 (T42.30): the join/release routine stores ZERO into record+4
+// (`li r8,0` / `stw r8,4(r31)`, generated/ppc_xenon/ppc_recomp.14.cpp:21623-21632) and
+// sub_821BC140 loads record+4 as the total remaining length of the stream it is about
+// to walk (`lwz r30,4(r28)`, ppc_recomp.14.cpp:18967). A record released before its own
+// job dispatches therefore leaves the walker with nothing to request - which is the
+// mechanism behind F-478's "six of seven jobs never reach the decrementing success tail"
+// and F-482's "14,365 read calls, two of them asking for a byte". Measured in w500:
+// record C9E2491C reads +4=0x00022EDD in `BC140-REC #1`, `TASKJOIN #1 idx=1 entry=C9E2491C`
+// runs, and `F500-DEVREAD #1` six lines later reads the same word as 0.
+// So: remember the length pgStreamer::Open wrote (the `stw r3,4(r29)` documented at
+// src/gpu_device.cpp:12710) keyed by record address, and let the dispatch hand it back.
+// Set false for the exact pre-change behaviour.
+static constexpr bool kF501RestoreLength = true;
+static constexpr uint32_t kF501Ring = 32;
+static std::atomic<uint32_t> g_f501Rec[kF501Ring]{};
+static std::atomic<uint32_t> g_f501Len[kF501Ring]{};
+static std::atomic<uint32_t> g_f501N{0};
+static void F501Note(uint32_t rec, uint32_t len) {
+  if (rec == 0 || len == 0) return;
+  const uint32_t i = g_f501N.fetch_add(1, std::memory_order_relaxed) % kF501Ring;
+  g_f501Len[i].store(len, std::memory_order_relaxed);
+  // Length before address: F501Lookup matches on the address, so publishing the value
+  // first means a match can never observe a slot holding a new address and an old length.
+  g_f501Rec[i].store(rec, std::memory_order_relaxed);
+}
+static uint32_t F501Lookup(uint32_t rec) {
+  const uint32_t n = g_f501N.load(std::memory_order_relaxed);
+  const uint32_t lim = n < kF501Ring ? n : kF501Ring;
+  uint32_t best = 0;
+  for (uint32_t i = 0; i < lim; ++i)
+    if (g_f501Rec[i].load(std::memory_order_relaxed) == rec)
+      best = g_f501Len[i].load(std::memory_order_relaxed);
+  return best;
+}
+
+// F-502 (T42.31): WHERE that zero actually lands. w501 measured `F500-DEVREAD #1`
+// reading record C9E2491C's +4 as 143,069 at our dispatch-entry probe, and the walk's
+// own chunk reads - `READWRAP sub_821CC6F0 … r5=64CB0000 r6=006D8F40 r7=0`, 13,756 of
+// them, every one asking for zero bytes - proving r30 was already 0 at
+// `lwz r30,4(r28)` (ppc_recomp.14.cpp:18967). So the join's store lands BETWEEN our
+// wrapper-entry read and the guest's own load, i.e. one instruction later than F-501
+// can reach. The release is therefore the only correct place to keep the field: it
+// still performs every bookkeeping write it wants (+0 generation, +12 free link) and
+// we hand back only the byte count, and only while that record's job is still in
+// flight (pushed and not yet returned from sub_821BC140) so a long-dead record can
+// never be resurrected. Set false for the exact pre-change behaviour.
+static constexpr bool kF502KeepLenOnRelease = true;
+static std::atomic<uint32_t> g_f483Retired[kF483Ring]{};
+static std::atomic<uint32_t> g_f483RetN{0};
+static void F502Keep(uint32_t tag, uint32_t rec) {
+  if (!kF502KeepLenOnRelease || rec == 0) return;
+  if (!F483In(g_f483Pushed, tag) || F483In(g_f483Retired, tag)) return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t now = 0;
+  if (!mem.ReadU32BE(rec + 4u, &now) || now != 0) return;
+  const uint32_t saved = F501Lookup(rec);
+  if (saved != 0 && mem.WriteU32BE(rec + 4u, saved))
+    MCLA_LOG_WARN("F502-KEEP tag={:08X} rec={:08X} +4 0->{} (job in flight)", tag,
+                  rec, saved);
+}
+
 constexpr uint32_t kTaskJoinCountAddr = 0x8283D1A8u;
 constexpr uint32_t kTaskJoinEntriesAddr = 0x8283D1C4u;
 constexpr uint32_t kTaskJoinStride = 28u;
@@ -4838,6 +4899,7 @@ PPC_FUNC(sub_821BD220) {
                     entry, busy);
     }
     __imp__sub_821BD220(ctx, base);
+    F502Keep(tag, entry);
     return;
   }
   if (!kF474NoPrematureJoinClear && busy != 0 && key == tag) {
@@ -4851,6 +4913,7 @@ PPC_FUNC(sub_821BD220) {
     }
   }
   __imp__sub_821BD220(ctx, base);
+  F502Keep(tag, entry);   // F-502: hand back the byte count the release just zeroed
 }
 
 // INFLATE-BEGIN pass-through (session 72): zlibInflater::InflateBegin
@@ -12725,12 +12788,14 @@ PPC_FUNC(sub_821BCE68) {
   // their true sizes)? Read the record this return id selects, right here, so
   // "Open never wrote a length" separates from "a later phase zeroed it".
   uint32_t rbase = 0, rlen = 0, rflag = 0, rid = 0, rpkg = 0, rdev = 0, rent = 0;
+  uint32_t recAddr = 0;
   (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(0x8283D1C4u,
                                                             &rbase);
   rid = ctx.r3.u32;
   if (rbase != 0 && rbase != 0xCDCDCDCDu && rid != 0xFFFFFFFFu) {
     auto &m = mcla::kernel::GuestMemoryHeap::Instance();
     const uint32_t rec = rbase + (rid & 0x7FFFu) * 28u;
+    recAddr = rec;
     (void)m.ReadU32BE(rec + 4u, &rlen);
     (void)m.ReadU32BE(rec + 8u, &rdev);   // F-205: stream/device object (BC140
                                           // derefs record+8 -> vt[124]; if this
@@ -12739,6 +12804,7 @@ PPC_FUNC(sub_821BCE68) {
     (void)m.ReadU32BE(rec + 12u, &rflag);
     (void)m.ReadU32BE(rec + 16u, &rpkg);
     (void)m.ReadU32BE(rec + 20u, &rent);
+    F501Note(rec, rlen);   // F-501: remember what Open wrote into record+4
   }
   if (n <= 24 || (n % 500) == 0)
     MCLA_LOG_INFO("STREAM-OPEN sub_821BCE68 #{} r3={:08X} r4={:08X} r5={:08X} "
@@ -12988,10 +13054,57 @@ PPC_FUNC(sub_821BC140) {
   g_f481OutNZ.store(0, std::memory_order_relaxed);
   g_f481MaxProd.store(0, std::memory_order_relaxed);
   g_f481LastOff.store(0, std::memory_order_relaxed);
+  // F-500 (T42.29, READ-ONLY): statically, sub_821BC140 does NOT feed its inflater from
+  // the job read-list. ppc_recomp.14.cpp:18874 builds r28 = [0x8283D190+52] +
+  // ([slot+0] & ([0x8283D190+24]-1)) * 28 -- the RECORD -- then :19071-19094 calls
+  // [record+8]'s vtable slot 28 as read(dev, r20, [r1+80] package offset64, r1+128 dest,
+  // min(remaining, 0x8000)), i.e. up to 32 KiB of the COMPRESSED stream into a stack
+  // staging buffer, and :19105-19123 points the inflate state at staging+12 with
+  // length-12 before InflateBegin at :19130. Nothing we have ever served sits on that
+  // call: every serve instrument is on sub_821CC6F0/sub_821CCD58, which is the reason
+  // F-482 counted 14,365 read calls but only two requested bytes. Resolve the reader's
+  // guest VA here so the next soak can name the function Path B must actually serve.
+  // Also samples the walk's own outstanding-IO credit at 0x827374E0, the gate that
+  // sleeps 100 ms at ppc_recomp.14.cpp:19064-19070 (`li r3,100; bl sub_821C91B8`).
+  {
+    uint32_t arb = 0, cap = 0, cred = 0;
+    auto &g5 = mcla::kernel::GuestMemoryHeap::Instance();
+    if (g5.ReadU32BE(0x8283D190u + 52u, &arb) &&
+        g5.ReadU32BE(0x8283D190u + 24u, &cap) && arb != 0 && cap != 0 &&
+        f483Tag != 0 && f483Tag != 0xFFFFFFFFu) {
+      const uint32_t rec = arb + (f483Tag & (cap - 1u)) * 28u;
+      uint32_t dev = 0, vtab = 0, fn28 = 0, fn52 = 0, fn124 = 0, rlen = 0, rpkg = 0;
+      (void)g5.ReadU32BE(rec + 4u, &rlen);
+      (void)g5.ReadU32BE(rec + 24u, &rpkg);
+      // F-501: hand back the length the join zeroed, immediately before the guest's
+      // `lwz r30,4(r28)` (ppc_recomp.14.cpp:18967) reads it as the walk's remaining
+      // byte count. Only ever fires on a record whose field is currently 0, and only
+      // with a value this same subsystem saw Open write.
+      uint32_t restored = 0;
+      if (kF501RestoreLength && rlen == 0) {
+        const uint32_t saved = F501Lookup(rec);
+        if (saved != 0 && g5.WriteU32BE(rec + 4u, saved)) restored = saved;
+      }
+      if (g5.ReadU32BE(rec + 8u, &dev) && dev >= 0x80000000u &&
+          g5.ReadU32BE(dev, &vtab) && vtab >= 0x80000000u) {
+        (void)g5.ReadU32BE(vtab + 28u, &fn28);
+        (void)g5.ReadU32BE(vtab + 52u, &fn52);
+        (void)g5.ReadU32BE(vtab + 124u, &fn124);
+      }
+      (void)g5.ReadU32BE(0x827374E0u, &cred);
+      if (n <= 20)
+        MCLA_LOG_WARN("F500-DEVREAD #{} tag={:08X} rec={:08X} len={} pkg={:08X} "
+                      "dev={:08X} vtab={:08X} s28={:08X} s52={:08X} s124={:08X} "
+                      "cred={} restored={}",
+                      n, f483Tag, rec, rlen, rpkg, dev, vtab, fn28, fn52, fn124,
+                      static_cast<int32_t>(cred), restored);
+    }
+  }
   g_f481Window.store(n, std::memory_order_relaxed);   // open the read window
   const auto tPreGuest = std::chrono::steady_clock::now();
   __imp__sub_821BC140(ctx, base);
   g_f481Window.store(0, std::memory_order_relaxed);   // close it
+  F483Add(g_f483Retired, g_f483RetN, f483Tag);        // F-502: no longer in flight
   const auto tGuestDone = std::chrono::steady_clock::now();
   // F-484 §3 (P1c): the pin holds a join until this job's record count drops, and
   // six of seven jobs never reach the tail that would drop it (F-478). Release the
