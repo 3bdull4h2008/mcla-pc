@@ -2463,3 +2463,36 @@ F-498 named: what seeds `exp` (`[state+12]`) for the first block, given the pars
 `[state+8] == 0` and F-499 showed forcing that gate reads payload as a header. T42.34 (#84) states the
 census that answers it: which exit of the parse branch each `InflateBegin` entry takes, keyed by window
 and `[st+8]`. Do not re-arm `kF506ForceLength` outside a soak - it hangs the worker by design.
+
+
+## 2026-09-27 09:4x - F-507: `exp` has one seed in the whole image, and it is `record+4` at the INIT (kept ON, 2/2 reproducible)
+
+**Biggest clause-(a) result in the chain.** `sub_821D5DC0` (`ppc_recomp.18.cpp:10774-10820`) is the inflate-state
+init and the ONLY writer of `state+12` (`stw r30,12(r31)`, `r30 = r5`); its sole caller in the image is
+`ppc_recomp.14.cpp:19004` inside `sub_821BC140`, where `r5 = r30 = lwz r30,4(r28)` = **`record+4`** (`:18966`).
+So F-497's "exp never re-seeded" and F-498's "the parse gate" were both downstream of one read of the field
+F-503 had already explained. Scoping the length override to **generation-0 handles only**
+(`kF507ForceGen0Length`) gives `w508`/`w509` seeds of `0x22EDD` / `0x104449` / `0x4B89` / `0x73D7` - each
+container's own byte count - after which all four walk their full package range and **all seven dispatches
+return** (`w506`'s hang was only ever the gen-1 recycle case, tag `0x8004`).
+
+**Decoded by the guest now:** raceeditor `maxProduced=999,424` / `lzxFrames=10`, garage
+`offFirst=64980000 offLast=64A84449` (its exact 1,066,057 bytes) `/ lzxFrames=6 / maxProduced=491,520`.
+**Not yet:** policecam and meshtextures read their complete streams with the right seed but produce nothing
+(`lzxFrames=0`, `maxProduced=0`, `exp!=0=2` of 645/1011) - that gap is now inside the codec, not in the record.
+
+**Superseding note:** F-506 §3's "never override a non-zero `record+4`" is too broad. The rule is *override
+iff generation == 0*, because for a gen-0 handle the value present was written by the gen-1 open of the NEXT
+container, while for gen>=1 the record is legitimately a newer stream's. `w508`/`w509` = 0 hangs; `w506` =
+1 hang, and it is exactly the gen-1 window.
+
+**Costs, both reproducible:** vs `w507`, `LZX-FRAME` 48 -> 43, `INFLATE-ENTER` 15,405 -> 6,593 (expected - the
+guest consumes whole streams in large steps now), `PRESENT` 60 -> 52 (frame count in a fixed 120 s; the last
+two dispatches got slower). No structural movement: `C0000005` 0, `Fatal error` 0, `LISTLINE` 171, `GFx` 13,
+`BOOTPATH` 10, `F440-REGREAD` 0, `F441-QUEUE-STORE` 45, CP truth identical. **`F438-GFXCTOR` still 0 - the
+goal is NOT met.**
+
+**Next (T42.36, #85):** census the two exits of the header-parse branch inside `sub_821D5E10` keyed by window,
+with the 4 bytes at the input pointer, to separate "no block header at the cursor" from "codec rejects it" for
+the two containers that read everything and decode nothing. `F507-INITEXP` (cap `n <= 12 || n % 400`) is the
+seed instrument; `F505-SLEEP` must stay 0 as the neutrality control.

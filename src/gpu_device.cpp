@@ -161,6 +161,15 @@ static std::atomic<uint32_t> g_f481Lzx{0};
 // itself, keyed by return address, and tally per dispatch window. READ-ONLY.
 static std::atomic<uint32_t> g_f481Sleeps{0};
 static std::atomic<uint32_t> g_f481SleepMs{0};
+// F-507 (T42.35): w506 shows the override is not universally harmful - it is harmful for
+// exactly ONE window. With `kF506ForceLength` on, all four UI dispatches completed and each
+// walked its container precisely (`#2 64980000 -> 64A84449` = the garage's full 1,066,057
+// with lzxFrames=6 and maxProduced=491,520; `#3 64CA3000 -> 64CA7B89` = 19,337; `#4
+// 6496F000 -> 649763D7` = 29,655), and the only window that never returned was #5 = tag
+// 0x8004, a generation-1 handle whose record index 4 is recycled by three later jobs, forced
+// to 240,531 bytes of a stream that ends far sooner. So scope the override to generation-0
+// handles - the set of first-and-only owners.
+static constexpr bool kF507ForceGen0Length = true;
 // F-506: reproduce F-504's full-container walk on demand so the sleep census can say what
 // breaks it. MEASURED (w506): dispatch #5 enters sub_821BC140 at 09:16:43.011 and then
 // emits no log line of any kind for 106 seconds - no READWRAP, no sleep, no visible
@@ -12874,6 +12883,35 @@ PPC_FUNC(sub_821C91B8) {
   __imp__sub_821C91B8(ctx, base);
 }
 
+// F-507: census of the inflate-state INIT, which statically is the only writer of the field
+// every silent window fails on. sub_821D5DC0 (ppc_recomp.18.cpp:10774-10820) does
+// `mr r30,r5 / stw r30,12(r31)` - state+12 (the `exp` of F-497/F-498) <- arg5 - plus
+// `stw 0,8(r31)` (consumed, the parse gate) and zeroes +0/+4/+16/+20/+24. It has EXACTLY ONE
+// caller in the image: ppc_recomp.14.cpp:19004, inside sub_821BC140 at 0x821BC28C, where r5
+// was set from r30 = `lwz r30,4(r28)` = record+4 (:18966). So "what seeds exp" has one
+// answer: the record's length field, read at init time. READ-ONLY.
+PPC_FUNC_IMPL(__imp__sub_821D5DC0);
+static std::atomic<uint32_t> g_f507N{0};
+PPC_FUNC(sub_821D5DC0) {
+  const uint32_t n = g_f507N.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t st = ctx.r4.u32, seed = ctx.r5.u32, arg6 = ctx.r6.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  const uint32_t win = g_f481Window.load(std::memory_order_relaxed);
+  __imp__sub_821D5DC0(ctx, base);
+  uint32_t w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (st >= 96u) {
+    auto &m = mcla::kernel::GuestMemoryHeap::Instance();
+    for (uint32_t i = 0; i < 8u; ++i)
+      (void)m.ReadU32BE(st + i * 4u, &w[i]);
+  }
+  if (n <= 12 || (n % 400) == 0)
+    MCLA_LOG_WARN("F507-INITEXP #{} state={:08X} exp-seed(r5)={:08X} r6={:08X} "
+                  "lr={:08X} window={} after=[{:08X} {:08X} {:08X} {:08X} {:08X} "
+                  "{:08X} {:08X} {:08X}]",
+                  n, st, seed, arg6, lr, win, w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                  w[7]);
+}
+
 PPC_FUNC_IMPL(__imp__sub_821BCE68);
 static std::atomic<uint32_t> s_hBCE68{0};
 PPC_FUNC(sub_821BCE68) {
@@ -13201,7 +13239,8 @@ PPC_FUNC(sub_821BC140) {
           // 6 -> 3, Fatal error 0 -> 1. A non-zero +4 is a newer owner's legitimate value,
           // so overriding it corrupts a live record (the F-468 mistake in new clothes).
           // F-506 = F-504 re-armed, now instrumented: overriding a non-zero +4 too.
-          if (f == 0u && rlen != 0 && !kF506ForceLength) continue;
+          if (f == 0u && rlen != 0 && !kF506ForceLength &&
+              !(kF507ForceGen0Length && f483Tag < 0x8000u)) continue;
           const F501Body *b = F501Find(f483Tag);
           if (b == nullptr) break;
           const uint32_t want =
