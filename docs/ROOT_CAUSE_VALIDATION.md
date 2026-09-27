@@ -10352,4 +10352,39 @@ Open on this path. Before any ordering fix is attempted, one cheap read settles 
 `[0x8283D19C]` (the free head Open maintains through `[str+36]`) and the record's `+12` at push, join
 and dispatch for the same tag, and check whether the 1 is a link or a count. `RELSEMA … lr=821BC538`
 staying at 1 of 7 jobs is the fact worth explaining; the mechanism behind it is now explicitly unknown
-rather than "the refcount the job should have dropped". Next ID **F-478**.
+rather than "the refcount the job should have dropped". Next ID **F-479**.
+
+### F-478 (2026-09-27 06:2x, **0 builds — two 12-line reads of the enqueuer's body**) — **`record+12` IS A JOB COUNT AND THE ENQUEUER OWNS THE INCREMENT: `sub_821BCB10` computes `r3 = [0x8283D190+52] + r27 + 12` and calls the atomic-increment loop at `0x821BCD5C` on its accept path, and the same address through the decrement loop at `0x821BCE28` on its reject path — so the contract is now closed end to end: Open claims with `+12 = 0` (F-477), enqueue pins it to 1, the dispatch routine's success tail drops it back (F-475) immediately before firing the completion callback, and release overwrites the word with the free-list link. F-476's correction and F-477's "maybe it is only a free-list residue" are BOTH withdrawn — the 1 our census reads is a real outstanding-job count.**
+
+- Task:        T42.18 (#77) — CLOSED: incrementer named
+- Type:        FACT + two SELF-CORRECTIONS (F-476 §1, F-477 §1)
+- Class:       G
+- Priority:    P0 — it is the first complete lifecycle statement of the streamer record, and it re-opens the question F-474 thought it closed
+- Evidence:    `generated/ppc_xenon/ppc_recomp.14.cpp:20732-20740` (`lwz r11,52(r31)` / `add r11,r27,r11` / `addi r3,r11,12` / `bl sub_821CE0D8`) and `:20842-20850` (same address arithmetic, `bl sub_821CE100`) · the increment/decrement pair are the `lwarx/addi ±1/stwcx.` loops at `ppc_recomp.17.cpp:8071-8090` and `:8109-8129` · `w477.log:3473` etc. read `busy 00000001->0` for seven jobs on three different indices — a per-job count, not an index-dependent link · `sub_821BC140`'s tail decrement at `ppc_recomp.14.cpp:19351-19360`, which sits 1 instruction-group before the `[slot+1540]`-guarded callback branch at `:19361-19381`
+
+**1. The lifecycle, in order.** (1) `sub_821BCE68`/`pgStreamer::Open` pops a record off the free list and
+stores `+12 = 0` (`:20985`, `:21133`), then fills `+8/+4/+24/+20`. (2) `sub_821BCB10` validates
+`record+0 == handle` (F-473) and, on accepting the job, **atomically increments `+12`**. (3) The
+consumer dispatches `sub_821BC140`; its success tail decrements `+12` and then, if `[slot+1540] != 0`,
+calls the completion callback at `[slot+1548]`. (4) `sub_821BD220` (the join) waits on that count and,
+on release, writes `+4 = 0`, links the record into the free list through `+12`, and bumps `+0` by
+`0x8000` (F-474). Our `TASKJOIN-SC` zeroes step (3)'s counter from step (4), so it *is* what permits a
+record to be recycled while its job is still queued — which rehabilitates the mechanism F-474's
+outcome test seemed to reject.
+
+**2. Both statements are true, and saying so is the point.** Removing the zeroing does not repair
+anything (`w479`: the boot loses 2 of 7 jobs and the callback count stays 1) because the jobs are not
+completing in the first place; and keeping it is what lets the pool hand a live record to the next
+container (F-469's re-stamping). So the mitigation and the recycling are two halves of one defect, and
+the defect is upstream of both: **six of seven jobs never reach `sub_821BC140`'s success tail.** That,
+not "the record is missing" and not "the record is wrong", is the F-186/F-187 gap restated in terms the
+code now supports. Path A's feed decides whether the tail is reached (F-393's `inLeft`/`outLeft`
+exits), which is the first time the two clauses of this objective sit on one measured mechanism
+instead of two argued ones.
+
+**3. Method note, because it cost three entries.** F-476 corrected a delegated cell wrongly, F-477
+then doubted a field's semantics on a sample of 7, and F-478 settled both by reading the twelve
+instructions on each side of the two call sites. The reusable rule: when a value looks ambiguous, read
+the *callers of the atomic helpers* — an increment/decrement pair on the same address expression is
+the definition of a count, and it is found in one grep of `sub_821CE0D8`/`sub_821CE100` with the
+enclosing function named. Next ID **F-479**.
