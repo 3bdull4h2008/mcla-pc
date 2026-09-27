@@ -350,3 +350,43 @@ sections to resolve (`F442-SECTION` with real tuning text in the buffer, `[0x828
 that no read of the nested archive is ever issued — in which case the remaining blocker is the
 archive's transform, and that is a content/key question rather than an emulator one. Until one of
 those two is measured, the objective stays open.
+
+## 8. Frontier as of 2026-09-27 05:4x (ledger through F-470) — the enqueue gap is reframed: pacing, not construction
+
+Everything in §6 through F-462 stands as a record of what was excluded. Three new measurements
+(F-468's failed experiment, F-469's read-only snapshot, F-470's static read) replace the *model*
+that §6.2's R1 was built on, and they change what "Path B" has to mean.
+
+**8.1 The four UI containers are all enqueued, each with a record holding its own full length and
+package offset.** `F469-RECSNAP` (`src/gpu_device.cpp:13853-13878`, `w475.log:3450,4652,5497,6983`)
+prints the record array at every queue push: garage = `[2 00000002/1066057/64980000]`. So the
+F-186/F-187 premise ("opened but never enqueued") is closed as **false**, and no record-construction
+task can be the fix, because there is nothing missing to construct.
+
+**8.2 A streamer handle is `(generation << 15) | record_index`, and the dispatch routine throws the
+generation away before it reads anything.** `ppc_recomp.14.cpp:18850-18874`: `lwz r11,0(r26)` →
+mask with `[0x8283D190+24]-1` → **`stw r9,0(r26)`** → `rec = [0x8283D190+52] + index*28`. It then
+reads only `record+4/+8/+16/+24` and never `record+0`, so there is no validity check to satisfy.
+Two jobs whose handles differ only in generation resolve to the same record (`w475`: `id=4` and
+`id=0x8004` → `rec=C9E24970`).
+
+**8.3 Each push re-stamps the previous container's slot, 22-30 ms later, and every job but the first
+dispatches after that.** Push→dispatch waits vs record windows: `0/22` **MATCH**, `76/28`, `781/29`,
+`794/25`, `1022/25`, `2691/2213`, `1596/-` all foreign. The single job that read its own record is
+the single package at `pct=100` (`pkg=64CB0000`, 143,069 B). One producer thread (`tid=00005A6C`,
+`lr=821BC8F0`, pushes #2-#4 from a loop at `sub_821E606C`/`sub_821FDDDC`) never waits on the
+consumer (`cnt` 1→4).
+
+**8.4 So R1 ("per-stream record inside `sub_821BC140`") is replaced by two questions, and the first
+is cheap and read-only.** T42.14: time `sub_821BC140` entry→exit and record which of its returns the
+job took. That decides whether the 22-29 ms window is missed *inside* the routine (the consumer is
+slow → the inflate/feed is the lever) or *before* it (the worker is parked elsewhere → this is the
+clause-(b) thread, F-394/F-395). Only after that split is a pacing intervention definable, and any
+intervention that writes record *values* is pre-excluded by §8.2: the guest will not notice, and the
+slot belongs to the next container within 25 ms.
+
+**8.5 Standing rule earned.** F-467 inferred an index-space law from a snapshot taken *at our own hook
+site* and F-468 then acted on it; both were artifacts of when our code ran. **A structure read at one
+hook site says nothing about the value a *later* dispatch will see — pair an enqueue-time snapshot
+with the dispatch-time read of the same field before naming a mechanism.** `F469-RECSNAP` +
+`BC140-REC` in one log is that pair, and it is now the reference instrument for this subsystem.

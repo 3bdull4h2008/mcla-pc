@@ -1,3 +1,48 @@
+## 2026-09-27 05:4x (F-458…F-470, **6 builds, soaks `w461`…`w475`; 1 probe kept, 3 experiments measured-and-reverted, and the F-186 premise itself closed as false**) — the enqueue gap got re-framed twice and ended as a **pacing** problem, not a construction problem.
+
+- **Clause (b) hit the nested-archive floor (F-458/F-459):** `BDF20`'s printed `ret` is the guest
+  **stream-object address**, not a status (only `0x82…` values appear), and in the 906-line window
+  between the two nested `.rpf` opens and the tune `.lst` returning NULL our VFS prints **no mount
+  advance at all** — the nested archive is never walked. Offline: that member has no mountable
+  magic (F-403), so the route out is the guest's own inflate, not a serve.
+- **Two more host layers found dead, both by reading (F-461/F-462):** `sub_821CC6F0`'s served-body
+  branch is unreachable by construction (the call site at `src/gpu_device.cpp:14753` passes
+  `handle=0xFFFFFFFF`), and the routine itself is **not** a per-file read — all 14,363 `READWRAP`
+  rows share one stream object with absolute archive offsets. A repair attempt that scanned the
+  device for the exact `tocEntry` resolved the **wrong file in 7/7 cases** (F-091's cross-serve,
+  re-created) and was reverted; tree restored and verified.
+- **Our host plant is exonerated (F-463):** abstaining from serving nested `xarchive_*.rpf` reads
+  (`kF463AbstainNestedRpf`, gate at `src/gpu_device.cpp:11292-11305`) changed the gate value not at
+  all — `BDF20 #600 … ret=0` byte-identical with and without. The mount fails on the title's own path.
+- **Then three self-corrections in one hour, and the fourth reading is the one to keep.** F-464 read
+  the gap as an ordering defect; F-465 concluded "the garage has a record but no job object" (wrong
+  key: `[slot+0]` holds the tag, not a handle); F-467 concluded "two index spaces, off by one"
+  (wrong: the copy experiment that tested it perturbed the state it measured and livelocked inflate
+  5,065 → 306,926, then the control `w473` reproduced `w460` on every marker). **F-469's read-only
+  snapshot settled it**: all four UI containers ARE pushed, each with a record carrying its own full
+  length and package offset — so F-186/F-187's "opened but never enqueued" is **false**, and the
+  handle is `(generation << 15) | record_index`.
+- **F-470 is the static half, and it is why no value-write can work:** `sub_821BC140` masks
+  `[slot+0]` with `capacity-1` and **stores the masked value back over the job's own handle** at
+  `0x821BC17C` (`ppc_recomp.14.cpp:18850-18874`), then reads `record+4/+8/+16/+24` and **never**
+  `record+0`. Pair timing (`w475`): push→dispatch `0/22, 76/28, 781/29, 794/25, 1022/25, 2691/2213,
+  1596/-` ms — only job #1 dispatches inside its record's 22-30 ms window, and `pkg=64CB0000` is the
+  only package at `still_present==claimed==goldsize pct=100`. One producer thread (`tid=00005A6C`,
+  `lr=821BC8F0`) enqueues all seven and never waits (`cnt` 1→4).
+- **Kept instrument:** `F469-RECSNAP` (`src/gpu_device.cpp:13853-13878`, read-only, 7 rows/boot,
+  registered `PROGRAM_GUIDE` §9). Neutral vs `w460`: `C0000005` 0=0, `GFx` 13=13, `VEH` 43=43,
+  `BC140-REC` 7=7, `XSF-HOSTSERVE` 79=79, `F456/F457/F442` identical; garage `claimed` 917,504 →
+  851,968 is inside F-410's one-binary spread. `kF463/kF465/kF468` all `false` in the tree.
+- **Next (T42.14, one cheap read-only build):** time `sub_821BC140` entry→exit and print which return
+  the job took, to split the 22-29 ms miss into *slow-inside-the-consumer* (→ the feed/inflate lever)
+  vs *parked-before-it* (→ the clause-(b) worker thread, F-394/F-395). Acceptance: the six late jobs'
+  execution times sum to explain their dispatch latencies, or they don't and the worker's blocker is
+  somewhere else. Do **not** re-run: any write of record *values* (F-470 §1 says the guest cannot
+  notice, F-468 says it livelocks), the CC6F0 serve branch (F-461), the host-plant abstention
+  (F-463), the off-by-one mirror (F-467/F-468), the gate bit (F-454), the serve filter (F-446).
+  Rule-2/**F-055** (host-forced boot gate) and host-allocated destinations stay the user's / rejected.
+  Next ID **F-471**.
+
 ## 2026-09-27 04:0x (F-457, **3 builds, soaks `w459`/`w460`; probe kept, Path A extension closed**) — the tune stream's inflate is now pinned to the F-186 place pass, and the config text has no container to decode.
 
 - **The join (all in one millisecond, `w457` 18.792):** `BDF20 #600 path='a:/archive/tune/vehicle/vehicle0008.lst'` + `F442-SECTION #5..#13` + `XMEM-SZPTR #18..#24 dest=B7B01000 *srcSz(in)=20 src=D2AD5C6C lr=821D5EBC` on `st=006D8F20`, with `XMEM-CTX ctxprod 16384->16384` (nothing produced). `src=D2AD5C6C` is the **last 20 bytes of meshtextures'** `pkg=000A0000 walk=0x10000` bounce window (`JOB2-PKG-SERVE #1`), and our own `F434-SPIN-BREAK` then closes the loop. So the tune read reaches the place pass and the place pass can only inflate the shared per-job record — F-339's structural cause, now measured on the config path.

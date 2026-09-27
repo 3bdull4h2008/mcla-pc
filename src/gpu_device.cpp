@@ -13850,6 +13850,31 @@ PPC_FUNC(sub_821BC868) {
                                           " f%d=%08X/%08X", f, lrA, lrB));
       sp = back;
     }
+    // F-469 (T42.12 / task #75): snapshot the streamer RECORD ARRAY at every queue push, so the
+    // ordering question F-468 left open is answered by reading rather than writing (F-468's copy
+    // livelocked inflate because our Path B site runs ~22 ms before the guest fills record+4).
+    // Per slot 0..5: +0 (tag/handle), +4 (remaining length), +24 (package offset). Paired with
+    // this row's own tag, it says which container's record is already valid when its job object is
+    // pushed and which is still empty -- the measurement that should have preceded every
+    // record-level intervention attempted since F-186.
+    {
+      uint32_t arb = 0;
+      if (mem.ReadU32BE(0x8283D190u + 52u, &arb) && arb >= 0x80000000u &&
+          arb < 0xE0000000u) {
+        char snap[224] = {0};
+        size_t soff = 0;
+        for (uint32_t r = 0; r < 6u && soff + 24 < sizeof(snap); ++r) {
+          uint32_t w0 = 0, w4 = 0, w24 = 0;
+          (void)mem.ReadU32BE(arb + r * 28u + 0u, &w0);
+          (void)mem.ReadU32BE(arb + r * 28u + 4u, &w4);
+          (void)mem.ReadU32BE(arb + r * 28u + 24u, &w24);
+          soff += static_cast<size_t>(snprintf(snap + soff, sizeof(snap) - soff,
+                                               " [%u %08X/%u/%08X]", r, w0, w4, w24));
+        }
+        MCLA_LOG_WARN("F469-RECSNAP #{} tag={} slot={:08X} base={:08X} records{}",
+                      n, slotTag, slot, arb, snap);
+      }
+    }
     MCLA_LOG_INFO(
         "PUSH sub_821BC868 #{} q={:08X} wIdx={}{} pIdx={}{} cnt={}{} "
         "relH={:08X}{} slot={:08X} tag={:08X} cb={:08X}{} "

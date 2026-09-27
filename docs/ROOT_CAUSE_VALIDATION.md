@@ -10051,3 +10051,116 @@ Only the first container is consistent; every later job reads the next container
 **3. The admissible next measurement (T42.12), stated as the thing I should have done first.** Watch the record array's writers instead of copying its contents: a range watch on `C9E24900..C9E249A4` (records 0..4, 7 dwords each) naming the guest site that stores `+4` (length) and `+24` (package offset) for each container, ordered against `UI-OPEN` / `ENQ-D` / `PUSH` / `BC140-REC`. That answers who is supposed to fill the garage's slot and why the object at tag 2 is pointed at the array index that holds policecam's numbers, without our writing anything. `tools/addr_owners.py --check` still applies before adding a hook, and `F388-PHYSGUARD`'s known read-trip count (3) is the instrument-neutrality baseline for it.
 
 **4. Standing rule, earned twice in one hour and now explicit.** Both of this session's self-corrections were the same error in different clothes: F-465 scanned a field it assumed held the handle (it held the tag), and F-468 copied a field it assumed was filled (it was filled 22 ms later). **Before manipulating a structure to test a theory about it, measure who writes it and when.** A probe that changes the state it is reading cannot support a conclusion about that state, and here it also cost a regression that only the control census caught. Next ID **F-469**.
+
+### F-469 (2026-09-27 05:2x-05:4x, **1 build: `w475`, read-only snapshot, `kF463/kF465/kF468` all `false` and all three of their markers printing 0 rows in that log**) — **THE ENQUEUE GAP IS NOT A MISSING ENQUEUE, AND THE STREAMER HANDLE IS `(generation << 15) | record_index`: ALL FOUR UI CONTAINERS ARE PUSHED WITH A RECORD HOLDING THEIR OWN FULL LENGTH AND PACKAGE OFFSET, EVERY RECORD SLOT IS RE-STAMPED BY THE NEXT CONTAINER 22-30 ms LATER, AND 6 OF 7 DISPATCHED JOBS THEN DEREFERENCE A FOREIGN RECORD — THE ONE JOB THAT DISPATCHED INSIDE ITS OWN WINDOW IS THE ONLY DESTINATION PACKAGE IN THE BOOT AT `pct=100`.**
+
+- Task:        T42.12 (#75) — ANSWERED read-only; the write-watch F-468 §3 proposed was not needed and was not run
+- Type:        FACT (and a partial rehabilitation of F-467's *observation* with its mechanism replaced)
+- Class:       E (streamer record/queue structure) + G (the title's own handle arithmetic)
+- Priority:    P0 — it replaces the framing shared by every record-level intervention since F-186
+- Evidence:    `build/w475.log:3450,4652,5497,6983,7928,9395,95532` (the seven `F469-RECSNAP` rows, quoted in §1) paired with `:3451,7710,38714,41151,42789,104622,105577` (`BC140-REC`) and `:30449/30531` (`UIXSF-GOLDEN-REVERIFY`) · probe `src/gpu_device.cpp:13853-13878` inside `PPC_FUNC(sub_821BC868)` (`:13820`); the dispatch-side mirror of the guest's own index arithmetic is `src/gpu_device.cpp:12611` (`ident = [slot+0]`, `mask = [0x8283D190+24]-1`, `rec = [0x8283D190+52] + (ident & mask)*28`) · neutrality census `w475` vs `w460` in §6. Probe KEPT (log-only, 7 rows/boot).
+
+**1. The seven snapshots (each row is the record array at the instant its job object is pushed).**
+Format `[idx id/+4 length/+24 pkgoff]`, base `C9E24900` in all seven:
+
+| # | t | tag | record stamped for this container | also stamped |
+|---|---|---|---|---|
+| 1 | 45.092 | `00000001` | `[1 00000001/143069/64CB0000]` | `[0 …/143069/64CB0000]` |
+| 2 | 45.114 | `00000002` | `[2 00000002/1066057/64980000]` **garage** | `[1 00008001/1066057/64980000]` |
+| 3 | 45.142 | `00000003` | `[3 00000003/19337/64CA3000]` | `[2 00008002/19337/64CA3000]` |
+| 4 | 45.171 | `00000004` | `[4 00000004/29655/6496F000]` | `[3 00008003/29655/6496F000]` |
+| 5 | 45.196 | `00008004` | `[4 00008004/240531/00060000]` | — |
+| 6 | 45.221 | `00010004` | `[4 00010004/196553/000A0000]` | — |
+| 7 | 47.434 | `00018004` | `[4 00018004/10799/0035A000]` | — |
+
+**2. The handle decodes as `(gen << 15) | record_index`, verified 7/7.** In every row the record at
+index `tag & 0x7FFF` carries `+0 == tag` at the instant of that push — `1→1`, `2→2`, `3→3`, `4→4`,
+`0x8004→0x8004`, `0x10004→0x10004`, `0x18004→0x18004` (indices 4, gen 1/2/3 = three successive
+packages sharing one slot). This *confirms* F-468's withdrawal (the low-15 bits are not a container
+ordinal — they are a slot index with a generation on top) and confirms F-465's `slot+0 = tag`
+correction, and it is why `addr_owners`-clean arithmetic `base + ([slot+0] & 0x7FFF)*28` is exactly
+the guest's own.
+
+**3. Each container occupies TWO records, and the first is the previous container's slot.** Rows
+#2-#4: pushing container *k* writes container *k*'s numbers into index `k` (gen 0) **and** index
+`k-1` (gen bumped). So container 1's record at index 1 lives for 22 ms and then holds the garage's
+numbers with id `0x8001`. This is the mechanism behind F-354's measured "exactly TWO inflate
+destinations per UI container" — the two records are visible, and the garage's are
+`[1 00008001/1066057/64980000]` and `[2 00000002/1066057/64980000]`, i.e. both already carry the
+**full 1,066,057**, so the two-destination split is a *destination-chain* property, not a length
+split in this array.
+
+**4. At dispatch the job's record belongs to the NEXT container, 6 times out of 7 — and the one
+in-time job is the one 100 % destination.** Pairing with `BC140-REC` (which prints the job's own
+`[slot+0]` and the record the guest's arithmetic resolves, `src/gpu_device.cpp:12611`):
+
+| job | pushed | dispatched | wait | its record's window | record seen | own length | verdict |
+|---|---|---|---|---|---|---|---|
+| #1 | 45.092 | 45.092 | **0 ms** | 22 ms | `id=1 len=143069 pkg=64CB0000` | 143,069 | **MATCH** |
+| #2 garage | 45.114 | 45.190 | 76 ms | 28 ms | `id=0x8002 len=19337 pkg=64CA3000` | 1,066,057 | foreign |
+| #3 | 45.142 | 45.923 | 781 ms | 29 ms | `id=0x8003 len=29655 pkg=6496F000` | 19,337 | foreign |
+| #4 | 45.171 | 45.965 | 794 ms | 25 ms | `id=0x18004 len=0 pkg=000A0000` | 29,655 | foreign |
+| #5 | 45.196 | 46.218 | 1,022 ms | 25 ms | `id=0x18004 len=0` | 240,531 | foreign |
+| #6 | 45.221 | 47.912 | 2,691 ms | 2,213 ms | `id=0x20004 len=0` | 196,553 | foreign |
+| #7 | 47.434 | 49.030 | 1,596 ms | — | `id=0x20004 len=0 pkg=0035A000` | 10,799 | pkg right, len 0 |
+
+`INFLATE-ENTER` entries consumed per span: 607, 51, 205, 203, 896, 197, 215 — so the six late jobs
+are not idle, they inflate **against a foreign package offset and, for #4-#7, a zero length**. And
+`UIXSF-GOLDEN-REVERIFY pkg=64CB0000 goldsize=143069 claimed=143069 still_present=143069 pct=100` is
+the only package in the boot at 100 % — job #1, the only job that read its own record. The producer
+is one thread for all seven (`tid=00005A6C`, `lr=821BC8F0`, `cb=821BC548`, `q=82849518`), pushes #2-#4
+from inside a loop (`chain f2=821E606C f3=821FDDDC`) with the queue backlog `cnt` climbing 1→4, so
+**the producer never waits for the consumer, and the consumer takes 0.08-2.7 s per job.**
+
+**5. What the snapshot does NOT cover, stated before anyone reads it as a complete account.** The
+id at index 4 moves independently of and *ahead of* the pushes: `0x10004` at push #6 (45.221),
+`0x18004` already in `BC140-REC #4` at **45.965** (which is 1.4 s *before* the push whose snapshot
+first shows `0x18004`), and `0x20004` in `#6`/`#7`. Also at 45.965 index 4 holds `+4 = 0` with
+container 6's `+24 = 000A0000`, then container 7's values with `+0` unchanged. So `+0`, `+4` and
+`+24` are written by **at least three different events**, and ≥2 of them are not the `sub_821BC868`
+push path this hook sits on. F-468 §3's write-watch is therefore still unpaid work, not closed by
+this entry — what closes is the *ordering* question it was meant to answer.
+
+**6. Instrument neutrality, and why the probe stays.** `w475` vs `w460`: `C0000005` 0=0,
+`GFx` 13=13, `Fatal error` 0=0, `VEH` 43=43, `406D1388` 1=1, `BC140-REC` 7=7, `XSF-HOSTSERVE` 79=79,
+`F456-STREAMID` 14=14, `F457-MEMBLK` 81=81, `F442-SECTION` 14=14, `F440-REGREAD` 0=0,
+`F438-GFXCTOR` 0=0, `swfCMD`/`DRAW_INDEXED`/`XSF-INFLATE` 0=0; only timing-coupled rows moved
+(`INFLATE-ENTER` −4, `F409-FILL-GUARD` −1, `F441-QUEUE-STORE` −1, `PRESENT` −1, `rptrWB` −291) and
+garage `claimed` 917,504 → 851,968, inside F-410's one-binary spread (1,066,057/917,504/851,968).
+7 rows per boot, read-only, `MCLA_LOG_WARN`, no guest write → **kept**, registered in
+`PROGRAM_GUIDE` §9. Next ID **F-470**.
+
+### F-470 (2026-09-27 05:4x, **0 builds — pure static read of the already-generated routine, cross-checked against `w475` rows**) — **THE DISPATCH ROUTINE DELETES THE GENERATION AND NEVER LOOKS AT THE RECORD'S ID: `sub_821BC140` masks `[slot+0]` with `capacity-1` and STORES THE MASKED VALUE BACK OVER THE JOB'S OWN HANDLE at `0x821BC17C`, then reads exactly four record fields (`+4`, `+8` ×5, `+16`, `+24`) and never `+0` — so "which container am I loading" is decided by the array index alone, and F-469's six foreign records are the designed behaviour of a fast path, not a lost validity check.**
+
+- Task:        T42.13 (#75 follow-on) — answered with no instrument
+- Type:        FACT
+- Class:       G (the title's own coded behaviour)
+- Priority:    P0 — it tells task #15 which lever exists: the index, not the values
+- Evidence:    `generated/ppc_xenon/ppc_recomp.14.cpp:18850-18878` (`lwz r11,0(r26)` → `cmpwi cr6,r11,-1` → `lwz r10,24(r19)` / `addi r10,r10,-1` / `and r9,r10,r11` → **`stw r9,0(r26)`** → `lwz r10,0(r26)` / `lwz r11,52(r19)` / `mulli r10,r10,28` / `add r28,r10,r11` → `lwz r9,1540(r26)`, `cmpwi cr6,r9,0`, `beq loc_821BC53C`), with `r19 = 0x8283D190` from `lis -32124` + `addi -11888` at `:18831-18849` · field-use census over `:18805-19600`: `PPC_LOAD_U32(r28.u32 + 8)` ×5, `+ 24` ×2, `+ 16` ×2, `+ 4` ×1, **`+ 0` and `+ 12` never** · `w475.log:3451` is the one row where the mask is a no-op (`id=1`), `:41151,42789` where it costs a generation (`id=00000004/00008004` both resolving to `rec=C9E24970`)
+
+**1. The mask is a destructive store, and that is why the generations in F-469 never line up.** The
+job object's `[+0]` is overwritten with `handle & (cap-1)` *before* anything else happens, so after a
+job has been entered once its handle is a bare index; two jobs whose handles differ only in
+generation resolve to the **same** record address (measured in `w475`: `id=00000004` and
+`id=00008004` → `rec=C9E24970` twice, and `id=00010004`/`id=00018004` → `rec=C9E24970` twice more).
+So `[record+0]`'s generation tag is consumed by some *other* caller (the public handle-validation
+path), and any host-side scheme whose correctness depends on the guest noticing a stale generation
+cannot work — it does not look.
+
+**2. What the routine actually consumes from a record.** Device object `[+8]` (used to call
+`[dev+124]`, and again for the async read at `:18899-18904`), package offset `[+24]`, entry pointer
+`[+16]`, length `[+4]`. The job's own read-list (`[slot+1540]` count, `[slot+8]/[slot+12]` =
+destination/size) is the only per-job state. So a job = *its destinations* + *someone else's source*
+whenever the record was re-stamped — which is 6 of 7 times in `w475` (F-469 §4).
+
+**3. Consequence for the plan, stated as a constraint rather than a fix.** Path B cannot be "build a
+record for the garage": the garage's numbers ALREADY sit in the array at two indices (F-469 §3) and
+the garage's job reads a third. The two admissible levers are (i) the **index** the job resolves to —
+which is `[slot+0] & 0x7FFF` read at entry, i.e. the value `sub_821BC868` wrote when it pushed, and
+(ii) the **pacing**: the record at index k is only guaranteed to still describe container k for the
+22-29 ms until the next push, and the consumer needs 0.08-2.7 s. Option (i) is what F-468 tried and
+its failure is now explained twice over: the slot we copied INTO is one the next push re-stamps
+within 22-29 ms, and at the moment we copied its `[+4]` was still 0 (F-468 §1), so we published a
+zero-length record onto live queue state. Option (ii) is not a host short-circuit at all — it is the
+reason `XSF-INFLATE` is 0 for all four containers, so it is the one route that can produce a *guest*
+inflate. Next ID **F-471**.
