@@ -427,3 +427,26 @@ So §8.6's route (B) is now a contract with two admissible shapes, and both are 
 touching a record's contents: keep `record[index].+0` equal to the handle for the job's whole body, or
 allocate the job a record the enqueuer has never validated. The missing term is the **release** site —
 who clears or bumps a `+0` — and #76's remaining half is exactly that.
+
+### 8.8 The release ordering, and the one term still unnamed (F-474/F-475)
+
+`record+12` is a reference count, not a GPU-completion flag: `sub_821CE100` is an
+`lwarx/addi -1/stwcx.` decrement loop and `sub_821BC140`'s success tail runs it on `record+12` right
+before the callback branch. So the six jobs that never reach that tail never drop the count, and the
+loader's join (`sub_821BD220`) would spin on it — which is exactly what our `TASKJOIN-SC` mitigation
+has been papering over since session 72. F-474 measured the honest alternative and it is **worse**:
+disarming both clear sites costs 2 of 7 jobs and 6 `GFx` lines without changing the record
+re-stamping, so the recycling is not ours and the mitigation stays.
+
+That leaves one term unknown and it is the whole remaining plan: **nobody mapped writes `+12 = 1`.**
+Init and release write it as a free-list link; the dispatch routine only decrements it. Until the
+incrementer is named, "make the guest wait properly for streamer jobs" is not an implementable plan,
+and every earlier route to a *guest* inflate (Path B / task #15) inherits that hole. So the ordered
+next steps are:
+
+1. name the writer of the 1 (static: callers of `sub_821CE0F0`-family increments, and Open/enqueue
+   bodies not yet read in full), then
+2. re-test the disarmed join-clear *with* that knowledge — the fix, if there is one, is on the
+   producer side of the count, not on our zeroing of it, and
+3. gate everything on the same two numbers used all session: `RELSEMA … lr=821BC538` count (today 1
+   of 7 jobs) and a **second** package reaching `still_present == claimed == goldsize`.
