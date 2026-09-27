@@ -10688,3 +10688,17 @@ unmeasured one.
 the `midasm_hook`/stub route gated by the broken recompiler toolchain. That is a user decision, and
 `PROGRAM_GUIDE` §7 now carries the flag-off pin so a later session can re-arm it in one edit with the
 seeding result already known.
+
+### F-492 (2026-09-27 07:3x, **3 builds: pin armed → `w489` at 320 s → pin disarmed + control `w490`**) — **THE PIN BLOCKS, IT DOES NOT MERELY SLOW: a 320-second soak of the pin-armed binary reaches 5 pushes and 4 job completions versus 6 pushes at 120 s (`w487`), with `LISTLINE` still 0 and `BOOTPATH` still 0 — time does not buy the later phases. At the same time the pin's positive effect is now quantified: the garage's OWN dispatch went from `reads=10,105 / inflEnters=10,106 / lzxFrames=0 / maxProduced=0` (baseline `w486`/`w490`) to `reads=615 / len>0=33 / inflEnters=660 / lzxFrames=6 / maxProduced=327,680` (`w487`) — 327,680 bytes of the 1,066,057 decompressed through the guest's own inflate calls, the largest real guest-side decode of the garage recorded in this project.**
+
+- Task:        T42.24 (#79) — answered: read-list/descriptor consistency is not the blocker either; the blocker is the loader's dependency on the completion callback
+- Type:        FACT + experiment REVERTED with a control
+- Class:       E + G
+- Priority:    P0 — it fixes what the next attempt must attack
+- Evidence:    `build/w489.log` (320 s, pin ON): `PUSH` 5, `POST-EXEC-START` 4, `LISTLINE` 0, `BOOTPATH` 0, `lr=821BC538` 1, `XSF-INFLATE` 0, `LZX-FRAME` 35, `C0000005` 0 · `build/w487.log` job #2 row quoted above · `build/w486.log` / `build/w490.log` (pin OFF) job #2 rows identical (`reads=10,252 / inflEnters=10,252 / lzxFrames=0 / in!=0=2 / exp!=0=4 / maxProduced=0`) · control `w490` after disarming: `PUSH` 7, `LISTLINE` 171, `BOOTPATH` 10, `GFx` 13, `F483-DEFER` 0, `C0000005` 0, exe 57,450,496 bytes = the `w486` build
+
+**1. What is now ruled out for the pin.** "Blocked not slow" was tested the way F-395's lesson demands (a 2.7× longer soak of the same binary), so the pin cannot be salvaged by patience, and it must stay disarmed. Its *information* is the valuable part: record ownership is sufficient to make the guest seed and decode its own container (327,680 B, 6 frames) and still not sufficient to finish the job — the last arrow between `maxProduced > 0` and the success tail is the only unmeasured link left (F-491 §3).
+
+**2. Consequences for the objective's two clauses.** Clause (a) — "UI .xsf decompressed" — has Path A's byte-exact placement of 3 of 4 containers plus this new, pin-only guest-side decode of 31 % of the fourth, at the cost of the boot. Clause (b) — "so GFx can initialize" — is unmoved by all of it: `F438-GFXCTOR` 0 and `XSF-INFLATE` 0 in every soak this session. **Objective OPEN.**
+
+**3. The two remaining routes, both named:** (i) the in-loop instrument inside `sub_821BC140` (needs `midasm_hook`/regen; toolchain currently broken — user's call), or (ii) make the loader's wait satisfiable without the tail, which means finding what the loader blocks on after `sub_821BCB10` returns and why `RELSEMA … lr=821BC538` = 1 does not release it (a fresh, host-side-searchable question — the pin's stall is exactly this wait, so solving it may make the pin's decode result reachable in a normal boot). Next ID **F-493**.
