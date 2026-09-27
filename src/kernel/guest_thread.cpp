@@ -23,7 +23,7 @@ GuestThreadContext::GuestThreadContext(uint32_t cpuNumber)
     thread = (uint8_t*)g_userHeap.Alloc(TOTAL_SIZE);
     if (thread == nullptr)
     {
-        // F-370: this used to fall straight into `memset(nullptr, 0, 0x40E70)`, which is the
+        // F-370: this used to fall straight into `memset(nullptr, 0, 0x40E90)`, which is the
         // 2026-09-26 w373 host C0000005 (write to 0x20 inside memset, called from
         // GuestThread::Start -> this ctor) and it killed the new thread silently. Logging the
         // failure makes "the guest asked for N threads and got M<N" answerable from the log;

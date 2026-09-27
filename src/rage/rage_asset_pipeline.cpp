@@ -86,7 +86,7 @@ bool CsrContainer::Parse(const uint8_t* data, size_t size) {
         return true;
     }
     
-    // Parse entries
+    // Parse entries (assumed layout; F-168: the RSC5 header length is the +0x04 word, 9/27/66, not a fixed 24-byte head)
     ptr += sizeof(CsrHeader);
     m_entries.reserve(m_header.num_entries);
     
@@ -108,7 +108,7 @@ bool CsrContainer::Parse(const uint8_t* data, size_t size) {
         ptr += sizeof(CsrEntry);
     }
     
-    // Verify total size
+    // Cross-check the +0x04 word vs the buffer length (F-168: +0x04 is the RSC5 header length; the uncompressed size is +0x10 = unk2, so this warning is not a corruption proof)
     if (m_header.size != size) {
         MCLA_LOG_WARN("CSR: Size mismatch: header=%u, actual=%zu", m_header.size, size);
     }
@@ -139,7 +139,7 @@ const uint8_t* CsrContainer::GetEntryData(const CsrEntry& entry) const {
     return m_data + entry.offset;
 }
 
-// CsrContainer methods for loading from VFS
+// RageAssetManager helpers for loading/parsing CSR containers from the VFS
 bool RageAssetManager::LoadCsrContainer(uint32_t hash, CsrContainer& out_container) {
     if (!m_vfs) return false;
     
@@ -458,7 +458,7 @@ bool RageAssetManager::LoadTextureDictionary(uint32_t hash) {
             if (data) {
                 TxdDictionary dict;
                 if (TxdParser::Parse(container.GetEntryData(entry), entry.size, dict)) {
-                    // Store parsed textures
+                    // Nothing stored: the loop body is empty and m_parsed_textures is never written, so dict dies with this scope
                     for (const auto& tex : dict.textures) {
                         // TODO: Create D3D12 texture resource
                     }

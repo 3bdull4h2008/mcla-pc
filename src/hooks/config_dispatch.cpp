@@ -42,9 +42,9 @@ extern "C" uint32_t KeReleaseSemaphore(void *, uint32_t, uint32_t, uint32_t);
 
 // ---------------------------------------------------------------------------
 // SESSION 50/51/52: Capture-only census on sub_8218CC70 — config dispatch table
-// dump. The dispatch formula (from ppc_recomp.10.cpp:17326):
+// dump. The dispatch formula (generated/ppc_xenon/ppc_recomp.9.cpp:19141-19177):
 //   r3 = handler index
-//   table_base = 0x827D6010 (lis r11,-32131 + addi r9,r11,24512)
+//   table_base = 0x827D6010 here; the guest (lis -32131 + addi 24512) computes 0x827D5FC0
 //   offset = [table_base + r3*4]
 //   if offset == -1: return (no-op)
 //   base_ptr = [0x82839254] (lis r10,-32124 + lwz r3,-28076(r10))
@@ -52,7 +52,7 @@ extern "C" uint32_t KeReleaseSemaphore(void *, uint32_t, uint32_t, uint32_t);
 //   target_fn = [struct + 64]
 //   call target_fn
 //
-// Capture-only: reads memory, logs, calls original. No behavior change.
+// Capture-only only while the hooks.h:34 gate is false; with it on this body IS the dispatcher.
 // Session 51: added OOB logging with full register dump.
 // Session 52: DENSE census — log EVERY call for first 5000, then every 25th,
 //             plus raw file entry for ALL calls with full dispatch details.
@@ -93,8 +93,8 @@ struct DispatchRecord {
   uint32_t structAddr;
   uint32_t targetFn;
   uint8_t
-      validity; // 0=N/A 1=OUT_OF_BOUNDS 2=SENTINEL 3=BASE_NULL 4=NULL
-                // 5=MISALIGNED 6=VALID_CODE 7=VALID_DATA 8=SMALL_INT 9=GARBAGE
+      validity; // 0=N/A 1=OUT_OF_BOUNDS 2=SENTINEL 3=BASE_NULL 4=NULL 6=VALID_CODE 8=SMALL_INT
+                // 9=GARBAGE 10/11/12=BIT0_CODE/DATA/GARBAGE; 5 unused, 7 shadowed by the 6 arm
   uint32_t r3, r4, r5, r6, r7, r8, r9, r10;
 };
 static DispatchRecord s_dispatchRing[4096];
@@ -106,9 +106,9 @@ inline void RecordDispatch(const DispatchRecord &rec) {
 }
 } // namespace
 
-// SESSION 51: Capture-only on sub_82177EB0 — log lr, r3-r10 on every entry.
-// This function does NOT call sub_8218CC70 directly, but its lr value
-// (0x821782AC from a memset call) propagates through tail-call chains.
+// SESSION 51: census trace (gate hooks.h:34) — logs lr on entry, r3-r10 after the original,
+// only when r3 looks like a pointer or a reg sits in 0xC9000000..0xCA000000. Not capture-only —
+// TEXCREATE-SC forces r3<0→0. No direct sub_8218CC70 call; lr 0x821782AC (post-memset) tail-chains.
 PPC_FUNC_IMPL(__imp__sub_82177EB0);
 PPC_FUNC(sub_82177EB0) {
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
@@ -181,9 +181,9 @@ PPC_FUNC(sub_8218CC70) {
   const uint32_t handlerIdx = ctx.r3.u32;
   const uint32_t callerLr = static_cast<uint32_t>(ctx.lr);
 
-  // Capture dispatch mechanics BEFORE the original runs
-  // Correct addresses: lis r11,-32131 → 0x827D0000 + 24512 = 0x827D6010
-  // lis r10,-32124 → 0x82840000 - 28076 = 0x82839254
+  // Capture dispatch mechanics; with the census gate on, __imp__sub_8218CC70 never runs.
+  // Guest base arithmetic (raw 0x8218CC70/78 = 3D60827D/392B5FC0): 0x827D0000 + 24512 =
+  // 0x827D5FC0 — kTableBase below is that +0x50. 0x82840000 - 28076 = 0x82839254 is exact.
   constexpr uint32_t kTableBase = 0x827D6010u;
   constexpr uint32_t kGlobalBase = 0x82839254u;
   constexpr uint32_t kConfigGlobal =
@@ -247,7 +247,7 @@ PPC_FUNC(sub_8218CC70) {
         break;
       MCLA_LOG_WARN("CONFIG-DISPATCH: TABLE[{}] = {:08X}", i, val);
     }
-    // Dump kGlobalBase range (0x82839254..927C) + the crash-critical 0x82839270
+    // Dump kGlobalBase range (0x82839254..9280) + the crash-critical 0x82839270
     for (uint32_t g = 0; g < 12; g++) {
       const uint32_t gaddr = kGlobalBase + g * 4;
       MCLA_LOG_WARN("CONFIG-DISPATCH: GLOBAL @ {:08X} = {:08X}{}", gaddr,
@@ -257,7 +257,7 @@ PPC_FUNC(sub_8218CC70) {
     }
   }
 
-  // OOB: always log with full register dump — flush immediately (crash
+  // OOB: logs the first 32 with full register dump — flush immediately (crash
   // imminent)
   if (!inBounds) {
     const uint32_t oobN = s_configDispatchOOB.fetch_add(1) + 1;
@@ -398,11 +398,11 @@ PPC_FUNC(sub_8218CC70) {
   }
 }
 
-// Session 75l: the committed generated tree references 0x8221D9D0 in the
-// mapping table but no TU defines a body for it (linker: undefined symbol).
-// No recompiled guest code calls it directly (indirect dispatch only).
-// Provide a log-once census body so the table links; a hit means the game
-// dispatches here and the real semantics must be recovered.
+// Session 75l: the generated tree maps 0x8221D9D0 (ppc_func_mapping.cpp:6634) and now also
+// recompiles it (ppc_recomp.25.cpp:20783: weak alias + full body), so the old "no body /
+// undefined symbol" link gap is gone. No recompiled code calls it directly (indirect only).
+// This strong PPC_FUNC still shadows that body with a rate-limited census (first 8, then
+// every 500th) that returns r3=0; a hit means the dispatch needs the real semantics.
 PPC_FUNC(sub_8221D9D0) {
   static std::atomic<uint32_t> s_h8221D9D0{0};
   const uint32_t n = s_h8221D9D0.fetch_add(1) + 1;

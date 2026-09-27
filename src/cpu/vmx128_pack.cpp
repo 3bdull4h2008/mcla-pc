@@ -70,8 +70,8 @@ std::atomic<uint32_t> g_vpkd3d128_type2_hits{0};
 }  // namespace
 
 // vpkd3d128 VD,VB,SH=2,MB=1,ME=0 — 4 sites, all in the vertex-fetch emulator.
-// ME=0 selects dword 0 of VD; the only consumer (stvx128 + lwz 156(r1)) reads
-// host.u32[0] via the VectorMaskL reverse, so writing that lane is sufficient.
+// ME=0 selects dword 0 of VD; the only consumer (stvx128 then lwz base+12, i.e.
+// 156(r1)/108(r1)) reads host.u32[0] via VectorMaskL, so that lane suffices.
 void mcla_Vpkd3d128_type2(PPCVRegister& vD, PPCVRegister& vA) {
     const uint32_t packed = Pack2101010(vA);
     vD.u32[0] = packed;

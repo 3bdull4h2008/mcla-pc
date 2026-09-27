@@ -28,7 +28,7 @@ enum {
     kDxgiR32Uint            = 42,
 };
 
-// Xenos vertex format codes (see _archive/xenia_xenos.h VertexFormat).
+// Xenos vertex format codes (.research/xenia/src/xenia/gpu/xenos.h:602 VertexFormat).
 // 6-bit "vf" field of a VFETCH instruction.
 static VertexFormatDesc MakeDesc(bool valid, VertexType type, uint8_t comps,
                                  uint8_t compBytes, uint16_t totalBytes,
@@ -73,11 +73,11 @@ VertexFormatDesc DecodeVertexFetch(uint32_t vfCode, uint32_t constIndex,
                                    uint32_t constIndexSelect) {
     VertexFormatDesc d = DecodeVertexFormat(vfCode);
     if (d.valid) return d;
-    // vf=0 in MCLA VFETCH means format/stride come from a runtime guest
-    // fetch-constant descriptor; mark it as needing that descriptor so the
-    // capture path resolves the real layout. The concrete descriptor slot is
-    // `const_index * 3 + const_index_select` (Xenos fetch-constant block of
-    // 96 two-dword entries: three 32-byte constants per 5-bit const_index).
+    // vf=0 in MCLA VFETCH carries no format: the runtime guest fetch-constant
+    // descriptor supplies base/size/endian only, so mark it as needing that
+    // descriptor and let the capture path resolve the real layout from the
+    // captured declaration (grc_fvf_decode.h). Slot is `const_index * 3 +
+    // const_index_select` (96 two-dword entries, 3 per 5-bit const_index).
     if (vfCode == 0) {
         d.fromFetchConstant = true;
         d.fetchConstantSelect = constIndexSelect & 0x3;
@@ -127,7 +127,7 @@ VertexFetchConstant DecodeVertexFetchConstant(const uint8_t* p8) {
         fc.isZero = true;
         return fc;
     }
-    // xe_gpu_vertex_fetch_t bit layout (see _archive/xenia_xenos.h:1113):
+    // xe_gpu_vertex_fetch_t bit layout (.research/xenia/src/xenia/gpu/xenos.h:1113):
     //   w0[31:30] type/address_type, w0[29:0]  address (dwords)
     //   w1[31:30] endian,             w1[29:6]  size (words), w1[5:0] pad
     fc.addressType = (w0 >> 30) & 0x3;
@@ -150,7 +150,7 @@ uint64_t HashVertexDeclaration(const uint32_t* vfCodes, const uint8_t* usages,
     for (uint32_t i = 0; i < count; ++i) {
         VertexFormatDesc d = DecodeVertexFormat(vfCodes[i]);
         if (!d.valid) return 0;  // caller must not build a pipeline for unsupported input
-        // Hash vfCode (4 bytes) + usage + usageIndex
+        // Hash vfCode (4 bytes) + usage + usageIndex + resolved comps + totalBytes
         mix(uint8_t(vfCodes[i]));
         mix(uint8_t(vfCodes[i] >> 8));
         mix(uint8_t(vfCodes[i] >> 16));

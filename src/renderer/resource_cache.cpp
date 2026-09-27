@@ -14,7 +14,7 @@ const char* ResourceKindName(ResourceKind kind) {
     }
 }
 
-// FNV-1a 64-bit hash combiner over the key fields.
+// FNV-1a 64-bit over sizeof(ResourceKey) raw bytes: all fields + 3 padding bytes.
 uint64_t HashResourceKey(const ResourceKey& key) {
     uint64_t h = 14695981039346656037ULL;
     const uint64_t prime = 1099511628211ULL;

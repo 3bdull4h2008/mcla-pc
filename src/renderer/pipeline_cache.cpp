@@ -239,8 +239,8 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
             taskQueue_.pop();
         }
 
-        // Compile HLSL -> DXIL and create the PSO on this thread. The key is
-        // left in pendingKeys_ on any failure so it is not retried per draw.
+        // Compile HLSL -> DXIL and create the PSO on this thread. A failed key
+        // is not retried per draw: via pendingKeys_, or a cached null PSO.
         if (!device || task.vsHlsl.empty() || task.psHlsl.empty()) {
             std::fprintf(stderr,
                          "PipelineCache: dropped task (missing device or empty HLSL)\n");

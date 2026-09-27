@@ -14,7 +14,7 @@
 
 
 
-// includes mirror patches.cpp so hook bodies resolve identically.
+// includes mirror patches.cpp (plus kernel/heap_arena.h + <mutex> for the F-412 guard-aware census) so hook bodies resolve identically.
 
 
 
@@ -419,7 +419,7 @@ static void MclaCensusVoidWarn(uint32_t addr) {
 
 
 
-// lr=0x821C2A7C when its heap's free-list walk (sub_821C1BB0, 16 size-class
+// lr=0x821C2A7C when the tiny-class pool alloc sub_821DE9D8 gives back 0 (its refill
 
 
 
@@ -427,7 +427,7 @@ static void MclaCensusVoidWarn(uint32_t addr) {
 
 
 
-// buckets, NO grow path - loc_821C1D28 returns 0 outright) finds nothing.
+// is sub_821C1BB0: 16 size-class buckets, NO grow path - loc_821C1D28 returns 0).
 
 
 
@@ -443,7 +443,7 @@ static void MclaCensusVoidWarn(uint32_t addr) {
 
 
 
-// [r+84]+[r+152]==[r+76]): +76=capacity, +84=free, +152=used counter.
+// [r+84]+[r+152]==[r+76]): +76=capacity, +84=carved-from-arena, +152=free (w430 HEAP76: +76=02E7FFF0 +152=02E5FD90; the fatal passes heap+152 as "available").
 
 
 
@@ -459,7 +459,7 @@ static void MclaCensusVoidWarn(uint32_t addr) {
 
 
 
-// memory allocation wrapper (sole caller 158.cpp:27532) - census proves
+// memory allocation wrapper (96 call sites in generated/ppc_xenon, e.g. ppc_recomp.155.cpp:20602) - census proves
 
 
 
@@ -483,7 +483,7 @@ static void MclaCensusVoidWarn(uint32_t addr) {
 
 
 
-// Golden rules honored: passthrough only (zero behavior change), checked
+// Golden rules honored: checked BE reads via GuestMemoryHeap (hooks.h:38), one
 
 
 
@@ -491,7 +491,7 @@ static void MclaCensusVoidWarn(uint32_t addr) {
 
 
 
-// BE reads via GuestMemoryHeap, one hook owner per address (verified: no
+// hook owner per address (verified 2026-09-27: tools/addr_owners.py --check gives
 
 
 
@@ -499,7 +499,7 @@ static void MclaCensusVoidWarn(uint32_t addr) {
 
 
 
-// prior overrides of either address in src/), no D3D12, no seeding.
+// one override each in src/), no D3D12, no seeding. NOT passthrough: :1070/:1862/:3964 write guest state.
 
 
 
@@ -563,7 +563,7 @@ std::atomic<uint32_t> s_physAllocCensus{0};
 
 
 
-// SESSION 37: entry-time fast-path capture counters (see
+// SESSION 37: entry-time fast-path capture counters - declared only; nothing in
 
 
 
@@ -571,7 +571,7 @@ std::atomic<uint32_t> s_physAllocCensus{0};
 
 
 
-// PPC_FUNC(sub_821C29A0)).
+// this TU reads or bumps either (anonymous namespace: no other TU can) - dead state.
 
 
 
@@ -603,7 +603,7 @@ std::atomic<uint32_t> s_zeroSizeLogged{0};
 
 
 
-// Live free-path writes (lr≈0x821DEB0C) fill freed 16-byte elements with
+// Two guest fills mark "untouched since": the pool-node FREE (sub_821DE908 memset(node,221,elemsize) -> lr=0x821DE934) stamps
 
 
 
@@ -611,7 +611,7 @@ std::atomic<uint32_t> s_zeroSizeLogged{0};
 
 
 
-// 0xCDCDCDCD; older census assumed 0xDDDDDDDD. Accept both.
+// 0xDDDDDDDD, while the allocator's own alloc TAIL (sub_821DE9D8 loc_821DEAFC memset(node,205,elemsize) -> lr=0x821DEB0C) stamps 0xCDCDCDCD. Accept both.
 
 
 
@@ -1443,7 +1443,7 @@ void LogDe9D8Oom(uint32_t classHead, uint32_t heap) {
 
 
 
-// Static decode (ppc_recomp.20.cpp sub_821DE9D8 loc_821DEAFC): the common
+// Static decode (ppc_recomp.19.cpp:14342-14538 sub_821DE9D8 loc_821DEAFC): the common
 
 
 
@@ -1475,7 +1475,7 @@ void LogDe9D8Oom(uint32_t classHead, uint32_t heap) {
 
 
 
-// 0x8283C5E0, ppc_recomp.10.cpp sub_8218C9D4/sub_8218CCB0). Conclusion: a
+// 0x8283C5E0, ppc_recomp.9.cpp sub_8218C9A8:18672 / sub_8218CCA8:19193). Conclusion: a
 
 
 
@@ -3296,9 +3296,9 @@ thread_local uint32_t t_arenaDepth = 0;
 
 
 
-// payload areas when a new slab is allocated. Called from the pool allocator
+// A0018028; the two hooks below are guest-address overrides (PPC_FUNC), not
 
-// census hooks when a new 16-byte pool slab is detected.
+// host helpers - nothing in this file fills slab payload when a new pool slab appears.
 
 
 
@@ -3324,7 +3324,7 @@ thread_local uint32_t t_arenaDepth = 0;
 
 
 
-// arena base is A4001000. Log every buddy alloc/free to catch the block that
+// arena base is A4001000. Logged: the first 60 calls of each, plus every alloc
 
 
 
@@ -3332,7 +3332,7 @@ thread_local uint32_t t_arenaDepth = 0;
 
 
 
-// escaped its arena.
+// with size>=1024 and every free with ptr>=kPhysArenaBeginVa (:3391/:3499) - to catch the escaped block.
 
 
 
@@ -3593,7 +3593,7 @@ PPC_FUNC(sub_82130048) {
 
 
 
-// Session 76j: sub_8218DCE8 = texture pitch computation. The recompiler
+// Session 76j: sub_8218DCE8 = texture pitch computation. At that time the
 
 
 
@@ -3601,7 +3601,7 @@ PPC_FUNC(sub_82130048) {
 
 
 
-// failed on its jump-table switch (all cases emitted as ERROR stubs that just
+// recompiler failed on its jump-table switch (all cases were ERROR stubs that just
 
 
 
@@ -3641,7 +3641,7 @@ PPC_FUNC(sub_82130048) {
 
 
 
-// Reconstructed 1:1 from the raw image: jump table @0x8218DD14, case bodies
+// Reconstructed 1:1 from the raw image (that stub state is fixed - the tool emits
 
 
 
@@ -3649,7 +3649,7 @@ PPC_FUNC(sub_82130048) {
 
 
 
-// @0x8218DD6C-0x8218DE30 (all sth u16 at [obj+12]).
+// the real switch, ppc_recomp.10.cpp:2560): jump table @0x8218DD14, case bodies @0x8218DD6C-0x8218DE30 (all sth u16 at [obj+12]).
 
 
 
@@ -5161,7 +5161,7 @@ PPC_FUNC(sub_821C1BB0) {
 
 
 
-// Static decode (generated/ppc_xenon ppc_recomp.20.cpp:15810-16001):
+// Static decode (generated/ppc_xenon ppc_recomp.19.cpp:14342-14538):
 
 
 
@@ -5249,7 +5249,7 @@ PPC_FUNC(sub_821C1BB0) {
 
 
 
-//   result==0 -> allocator returns 0 (refill failure, already censused
+//   result==0 -> allocator returns 0 (refill failure; the live branch censuses it
 
 
 
@@ -5257,7 +5257,7 @@ PPC_FUNC(sub_821C1BB0) {
 
 
 
-//   by ARENA-CENSUS and observed to never fire).
+//   as ARENA-OOM; ARENA-CENSUS and ARENA-OOM are both 0 rows in w430 - it never fired there).
 
 
 
@@ -5353,7 +5353,7 @@ std::atomic<uint32_t> s_allocCensus{0};
 
 
 
-// Forward declaration — defined after the census wrappers (session 26
+// No forward declaration sits here (the old one is gone); the session-26/39
 
 
 
@@ -5361,7 +5361,7 @@ std::atomic<uint32_t> s_allocCensus{0};
 
 
 
-// write-watch)
+// write-watch thread_locals live at :6522-6554, inside an MCLA_ALLOC_DEBUG block.
 
 
 
@@ -5423,7 +5423,7 @@ std::atomic<uint32_t> s_allocCensus{0};
 
 
 
-//   1. Snapshot every allocation (element addr, first 8 bytes, caller LR)
+//   1. Snapshot every allocation (element addr, first 4 bytes, caller LR)
 
 
 
@@ -5679,7 +5679,7 @@ void DumpPool16Element(uint32_t addr) {
 
 
 
-// 4 bytes against its snapshot. A change in the first 4 bytes of a freed
+// 4 bytes against its snapshot; elements found on the freelist are skipped (they
 
 
 
@@ -5687,7 +5687,7 @@ void DumpPool16Element(uint32_t addr) {
 
 
 
-// element (which should hold a freelist next-pointer) indicates overflow from
+// legitimately hold a next-pointer). A changed first 4 bytes on an ALLOCATED
 
 
 
@@ -5695,7 +5695,7 @@ void DumpPool16Element(uint32_t addr) {
 
 
 
-// the preceding element.
+// element means somebody wrote past the end of the preceding element.
 
 
 
@@ -7857,7 +7857,7 @@ PPC_FUNC(sub_821DE9D8) {
 
 
 
-  //   scan all elements for 0xDD free pattern; if that fails (game overwrites
+  //   scan all elements for the 0xDD-or-0xCD free pattern; if that fails (game overwrites
 
 
 
