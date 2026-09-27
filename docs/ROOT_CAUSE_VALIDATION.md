@@ -10442,4 +10442,30 @@ own dispatch) the only Path-B shape left, and it says what success looks like me
 window would show `r5` inside `0x64980000..0x64A84449` and advance, `RELSEMA … lr=821BC538` would count
 above 1, and a second package would reach `still_present == claimed == goldsize`. Do not re-arm the
 served-body branch to fake an answer at the foreign address (task #70, `w461`/`w463` measured the
-regression), and do not write record values at the enqueue site (F-468/F-470). Next ID **F-481**.
+regression), and do not write record values at the enqueue site (F-468/F-470). Next ID **F-482**.
+
+### F-481 (2026-09-27 06:3x, **0 builds — the read loop's own 40 instructions, plus a re-read of our printer's condition**) — **TWO THINGS: (a) the retry loop `sub_821CCD58` advances its offset ONLY by the bytes a call actually transferred and returns the CALLER'S ORIGINAL COUNT unconditionally, so a caller of it cannot detect a short read at all; (b) F-480's "all attempts at one fixed address" is NARROWED by my own instrument — the post-call `READWRAP` row is printed under `ret == 0 || n <= 8 || (n % 500) == 0 || insane r1`, so a population of rows that all show `ret=0` is partly selected by that filter, and the single-value `r5` histogram was computed over those filtered rows. The failing-reads-at-a-foreign-address claim survives; the "the offset never moves" claim does not.**
+
+- Task:        T42.19 (#78) continued — mechanism named, one inference retracted
+- Type:        FACT + SELF-CORRECTION of F-480 §1's strength
+- Class:       H (printer sampling) + G
+- Priority:    P0 — it fixes what the next instrument must measure
+- Evidence:    `generated/ppc_xenon/ppc_recomp.17.cpp:4977-5032` (`r26 = r28+16` guard enter/leave via `sub_821C8F08`/`sub_821C8F70`; `loc_821CCD8C: r3 = sub_821CCB38(obj, dst=r30, off=r29, len=r31)` → `r11 = extsw(r3)` / `subf. r31,r3,r31` / `add r30,r3,r30` / `add r29,r11,r29` / `bgt loc_821CCD8C`, and `loc_821CCDB4: mr r3,r27` before the return — i.e. the loop's exit test is `remaining <= 0` and the function's result is the *requested* length) · our printer at `src/gpu_device.cpp:15244` (`n <= 32 || (n % 200) == 0 || r7 == 0`) and `:15255` (`(!saneIn || !saneOut) || n <= 8 || (n % 500) == 0 || ret == 0`) · the F-480 counts came from the second form only
+
+**1. The reusable fact from the loop.** `sub_821CCD58` is a "read all N bytes" wrapper: it loops until
+the transferred total reaches N, advancing destination and offset by each partial. Its return value is
+`r27` — the N it was given — on every path, including a path that spun 10,000 times on zero-byte
+transfers. So no caller of this routine can ever see failure, and any plan that reads a CC6F0/CCD58
+return code as a status is reading a constant (the same class of error as F-445's `BDF20 ret`).
+
+**2. Standing rule this earns (third instance in this repo, first where I caught it mid-entry).** A
+marker whose print condition is `ret == 0 || every K-th` cannot support a statement of the form "this
+field never changes" — the field's distribution must come from an *unfiltered* sample. Before writing
+"constant" or "never" about any field, read the printer's `if` and say which values it is able to show.
+
+**3. What the next instrument must be (T42.20, one build, bounded).** For the six non-completing job
+windows only, count every `sub_821CC6F0` call unconditionally into per-window aggregates: total calls,
+distinct `r5` values, and the `ret` distribution — three numbers per job, printed once at the job's
+exit row. That settles whether the garage's read cursor is stuck at `64CA7B89` (loop starvation on
+foreign records) or advances (an ordinary short read), and it is the first measurement in this chain
+whose sample is not conditioned on the value being questioned.
