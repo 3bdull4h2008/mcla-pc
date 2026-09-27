@@ -2574,3 +2574,7 @@ the "golden" is our own host decode, `build/xmem_golden/*.bin` is never read by 
 containers from re-verify, fill and layout audit; (3) `F438-GFXCTOR` remains 0 and F-509 §5 hardens the
 bound on its producer (one caller `sub_82482F78` with zero callers/xrefs, table without a walker), so the
 GFx half needs either the user F-055 decision or a new kind of evidence.
+
+
+### 07:55x addendum - F-513/F-514: the self-referential golden was hiding a 35 percent loss
+`MclaUiXsfGolden` now prefers `build/xmem_golden/*.bin` (flag `kF513ExternalGolden`, shipped ON; `F513-EXTGOLDEN` shows all four loading) and the `gold.size() < 0x10000` floor in `MclaUiXsfReverify` became `0x100`. Boot-neutral (w519 vs w517: every marker +0, POST-EXEC-START 7, Fatal error 0, LISTLINE 171, GFx 13, LZX-FRAME 43) but the verdict changed: raceeditor holds 100 percent at every shot, while the garage drops to `still_present=701454 pct=65 first_bad=00040000` from the first post-placement shot. `ninja -C build check_xmem_lzx` still reports 4/4 EXACT, so the in-boot decoder and the files agree offline and the missing 35 percent is a runtime difference, not a reference difference - that pairing is the open discrepancy in F-514 section 3. Correction to carry forward: F-507/F-508/F-512 said the garage keeps pct=100 at every shot; against an independent reference it does not. Policecam and credits still have zero reverify rows because reverify iterates the FILL log, so their gap is the fill plan (task 87), not the threshold. F438-GFXCTOR remains 0.

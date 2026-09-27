@@ -9265,6 +9265,37 @@ static const std::vector<uint8_t> &MclaUiXsfGolden(uint32_t pkg) {
   const auto it = s_golden.find(pkg);
   if (it != s_golden.end())
     return it->second;
+  // F-513 (T42.40): every `match=true` / `pct=100` in this file currently compares guest
+  // memory against the host decode performed a few lines below - the same code, so it can
+  // prove durability but never correctness (F-509 §1). Prefer the reference bytes written by
+  // the offline recipe (tools/xmem_decode.py, validated by `ninja -C build check_xmem_lzx`
+  // as 4/4 byte-exact) so the in-boot decoder and the container placement are checked
+  // against a separate run. NOTE the honest limit: the two share the MS-LZX algorithm, so
+  // agreement validates the in-boot path, not retail ground truth.
+  static constexpr bool kF513ExternalGolden = true;
+  if (kF513ExternalGolden) {
+    const char *nm = pkg == 0x64CB0000u ? "raceeditor"
+                   : pkg == 0x64980000u ? "garage"
+                   : pkg == 0x64CA3000u ? "policecam"
+                   : pkg == 0x6496F000u ? "credits"
+                                        : nullptr;
+    if (nm != nullptr) {
+      const char *dirs[] = {"xmem_golden/", "build/xmem_golden/"};
+      for (const char *d : dirs) {
+        const std::string path = std::string(d) + nm + ".bin";
+        std::ifstream f(path, std::ios::binary);
+        if (!f)
+          continue;
+        std::vector<uint8_t> v((std::istreambuf_iterator<char>(f)),
+                               std::istreambuf_iterator<char>());
+        if (v.size() >= 16u) {
+          MCLA_LOG_WARN("F513-EXTGOLDEN pkg={:08X} file='{}' size={}", pkg, path,
+                        v.size());
+          return s_golden.emplace(pkg, std::move(v)).first->second;
+        }
+      }
+    }
+  }
   std::vector<uint8_t> dec;
   auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
   mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
@@ -10049,7 +10080,10 @@ static constexpr bool kUiXsfReverify = true;
 
 static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
                               uint32_t shot) {
-  if (!kUiXsfReverify || gold.size() < 0x10000u)
+  // F-513: the 64 KiB floor silently excluded policecam (19,337) and credits (29,655) from
+  // every content verdict. With an external reference file the real floor is just "big
+  // enough to be meaningful".
+  if (!kUiXsfReverify || gold.size() < 0x100u)
     return;
   std::vector<MclaUiXsfFillRec> recs;
   {
