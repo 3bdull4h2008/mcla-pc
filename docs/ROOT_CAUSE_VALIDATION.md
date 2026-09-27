@@ -10252,3 +10252,26 @@ giving each job a record that survives its own body, i.e. the pool-index route t
 99 ms to reach `pct=100`, so any construction that keeps a record stable for the body's own duration
 is testable by whether a second package reaches `still_present == claimed == goldsize`. Next ID
 **F-473**.
+
+### F-473 (2026-09-27 05:5x, **0 builds — one existing marker re-read plus the enqueue routine read through**) — **THE ENQUEUE IS `sub_821BCB10` AND IT *DOES* VALIDATE THE GENERATION — AT PUSH TIME ONLY: its body computes `index = handle & (capacity-1)`, compares `record[index].+0` against the FULL handle, and takes a reject branch when they differ (`ppc_recomp.14.cpp:20499-20543`), and `w476` shows it firing exactly 7/7 times with `a0` = the handle that F-469's snapshot then shows sitting in that record. So the record lifetime contract is real in the title and our gap is that validation happens once, 22-30 ms before the consumer reads the same fields un-checked (F-470).**
+
+- Task:        T42.16 (#76), first half — the enqueuer; the free/release site is still open
+- Type:        FACT
+- Class:       G (the title's own coded behaviour)
+- Priority:    P1 — it is the contract any task-#15 construction must satisfy
+- Evidence:    `build/w476.log:3461,4671,5717,6992,7929,9563,120663` — `ENQ sub_821BCB10 #k a0=<handle> cb=821BC548 -> r3=<job slot>` (7 rows = the true boot total; the printer's cap is `n <= 16 || n % 500 == 0`, `src/gpu_device.cpp:12517-12525`, so 7 < 16 is complete) paired row-for-row with the `F469-RECSNAP` lines at `:3457,4667,5711,6990,7927,9560,120661` · the validation is the `lwz r11,24(r31)` / `mulli r11,r30,28` / `lwzx r9,r11,r26` / `cmplw cr6,r9,r10` sequence at `generated/ppc_xenon/ppc_recomp.14.cpp:20499-20516`, with `r10` = the handle captured *before* the mask at `:20501` · `tools/ppc_xrefs.py calls 0x821BCB10` = two sites: `0x821BD614` (`sub_821BD600`) and `0x821E5EF8` (`sub_821E5E58`) — and F-469's own stack walk of every push showed frames `f0=821E5EB8 / f1=821E5F68 / f2=821E606C / f3=821FDDDC`, i.e. the loader reaches the enqueuer through `sub_821E5E58`
+
+**1. What this adds to the model.** The `+0` handle word is a *claim* checked by the enqueuer: `handle`
+→ `index = handle & (cap-1)` → require `record[index].+0 == handle` and `record[index].+8 != 0`
+(device non-null), else branch to `loc_821BCE30` (the reject/dead-end path an earlier session had
+already characterised at `src/gpu_device.cpp:12510-12514`). That is why F-469 §2 found `+0 == tag`
+self-consistent in 7/7 rows — the check enforces it at push. It also means the generation is the
+title's own staleness mechanism and it is applied **exactly once per job, at enqueue**, ~22-30 ms
+before the consumer's first unchecked read and 76-2,691 ms before the job dispatches.
+
+**2. Consequence for task #15, stated as a contract.** Any construction that hands a job a record must
+either (i) make `record[index].+0` equal the handle the enqueuer was given *and* keep it equal for the
+job's whole body (21-590 ms measured, F-472), or (ii) not rely on the enqueuer's validation at all,
+which is what a new index/record does. Route (i) is what F-468 attempted at the wrong moment; route
+(ii) needs the free/release site, which is the open half of #76 and is what makes `index 4` recycle
+three times while 1-3 are used once. Next ID **F-474**.

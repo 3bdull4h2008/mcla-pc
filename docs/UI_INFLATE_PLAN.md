@@ -413,3 +413,17 @@ target rather than by taste:
   `outLeft==0`; shortening the body means feeding it so those conditions are reached sooner. That is
   the Path A serve side, which we already own, and it must be measured by the body's own `guest=ms`
   column rather than by a counter of our calls.
+
+### 8.7 The pool contract, as far as it is known (F-473)
+
+`sub_821BCB10` is the enqueuer and it is the only place the title checks a record's identity:
+`index = handle & (cap-1)`, require `record[index].+0 == handle` **and** `record[index].+8 != 0`, else
+branch to its reject path (`ppc_recomp.14.cpp:20499-20543`). It fires 7 times per boot and each `a0`
+is exactly the handle F-469's snapshot then finds in that record (`w476`: `ENQ #2 a0=00000002 …` ↔
+`F469-RECSNAP #2 … [2 00000002/1066057/64980000]`). Two call sites only: `0x821BD614` and `0x821E5EF8`
+(inside `sub_821E5E58`, the frame F-469's stack walk shows under every loader push).
+
+So §8.6's route (B) is now a contract with two admissible shapes, and both are testable without
+touching a record's contents: keep `record[index].+0` equal to the handle for the job's whole body, or
+allocate the job a record the enqueuer has never validated. The missing term is the **release** site —
+who clears or bumps a `+0` — and #76's remaining half is exactly that.
