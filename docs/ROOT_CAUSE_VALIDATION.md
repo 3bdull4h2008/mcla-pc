@@ -10756,3 +10756,36 @@ the destination-chain accounting `[sp+28] = 0x69A000` vs `0x124000`. Next ID **F
 - **Caveat, kept in the record so nobody reads those two 255s as data:** `flagCur`/`flagSt` are *not* measurements. The lambda's guard requires `0x80000000 ≤ o < 0xF0000000`, and the two values I passed it (`[sp+128]` and `st` itself) are stack addresses (`0x006D8F40`, `0x006D8F20`), so the read was skipped and the sentinel returned. Only `infR3` (the inflater object) is in range. The two registers the guest actually tests (`r27`, `r29` inside `sub_821BC140`) are not reachable from this hook at all — reaching them is the in-loop (`midasm_hook`) case.
 
 **What remains after this.** One candidate from F-495 §2 is still open: the destination accounting at `[sp+28]` (per-window values `0x124000`, `0x94000`, `0x46000`, `0x1CA000`, `0xA000`) and the produced-vs-`[desc+0]` equality at `:19100-19105`. Neither is decidable from outside the loop. So the honest state of the objective is: Path A covers three of four containers byte-exact and 76-100 % of the fourth by durable presence; Path B's prerequisite (record ownership) is proven and its consequence (the guest decoding `0x104449`-byte descriptors and streaming its own LZX payload) is observed; and the last step — a job reaching its success tail — is not observable or controllable from the hooks that remain permitted. Next ID **F-497**.
+
+### F-497 (2026-09-27 07:0x, **1 build, soak `w496` = the pin armed with the walk-frame dump at 60 rows/window; job #2's numbers reproduce `w487` exactly**) — **THE DISCRIMINATOR BETWEEN THE COMPLETING JOB AND EVERY SILENT ONE IS `exp` (`[st+12]`, the expected total output) BEING RE-SEEDED EVERY ITERATION: across the garage's own 60 walk-frame rows `exp != 0` on exactly **1**, while the completing job #1 has `exp != 0` on **28 of 28**. Per the clamp documented at `src/gpu_device.cpp:10328-10333` (every decompress call's input is limited to `[st+12] - [st+8]`), `exp = 0` with `consumed = 0x7FF4/0xFFF4` makes that limit negative forever, so the codec can consume nothing — and `consumed` does only oscillate between those two values, never returning to 0, which is the condition the header parse needs to re-seed `exp`. The same rows also **void F-354's two-destination ceiling**: the garage's chain walks through **10 distinct `outPtr` windows** and its total output grows to `0x40000`+ (exit row `maxProduced=327,680`), so the destination chain was never the hard bound — reading a foreign record was.**
+
+- Task:        T42.28 (#80) — the last step is now a named field, not a black box
+- Type:        FACT
+- Class:       E + G
+- Priority:    P0 — this is the mechanism behind "no guest inflate of the UI containers"
+- Evidence:    `build/w496.log`, 60 `F494-WALK win=2` rows: `[st+12] exp` non-zero once (`00104449` = the garage's own 1,066,057, set on the row whose `inPtr = 006D8F4C`) and `00000000` on the other 59; `consumed` values `{00007FF4, 0000FFF4, 00000000}`; `outPtr` distinct = 10 (`B7EC1000 B7EC9000 B7ED1000 B7C01000 B7C09000 B7C21000 B7C41000 B7C49000 …`); total up to `00040000` · `win=1` (the completer): `exp != 0` on 28/28, 11 distinct `outPtr`, total `000F4000` · `win=3`/`win=4`: `exp != 0` on 3/60, total `00000000` · exit row `POST-EXEC-START #2 … reads=615 moves=33 len>0=33 inflEnters=660 lzxFrames=6 maxProduced=327680` = identical to `w487`, so the wider dump did not perturb the run · gates under the pin unchanged: `lr=821BC538` 1, `XSF-INFLATE` 0, `LISTLINE` 0 (the pin blocks the loader, F-492)
+
+**1. Why this is the answer to the six-silent-jobs question and not another correlation.** The field is
+the one the loop's own arithmetic uses to decide how much input the codec may eat, its zero value makes
+that quantity non-positive, and it is non-positive *specifically* for the jobs that never reach their
+tail and non-zero on every iteration for the only job that does. The re-seed condition is
+`consumed == 0` (the header parse), and the silent jobs' `consumed` never returns to 0.
+
+**2. What a fix would have to touch, and the honest blocker.** Either `consumed` is reset at each block
+boundary by code we have not identified, or the descriptor block at `[sp+128]` must carry one
+{magic, size} pair per block so the parse runs per block (baseline shows a single, foreign pair). Both
+are inside `sub_821BC140`'s walk, so the next step is reading that loop's block-boundary handling in
+`ppc_recomp.14.cpp` (a static task, no rebuild), not another soak — and any *intervention* still needs
+the `midasm_hook` route. Recorded while the pin is armed; `kF483DeferRelease` goes back to `false` in
+the same commit series as the control. Next ID **F-498**.
+
+### F-498 (2026-09-27 07:0x, **0 builds — the 20 instructions at the head of `sub_821D5E10`**) — **WHY `exp` NEVER RE-SEEDS: the header parse inside `zlibInflater::InflateBegin` is gated on `consumed == 0` (`lwz r11,8(r31); cmplwi cr6,r11,0; bne loc_821d5e7c` — `ppc_recomp.18.cpp:10850-10555` region, i.e. `if ([state+8] != 0) skip parse`), and `w496` shows the garage's `[state+8]` never returning to 0 after its first row (values `0x7FF4`/`0xFFF4` only). So the sequence is closed: the first block sets `exp = 0x104449`, the clamp limits input to `exp - consumed`, the block completes without anything resetting `[state+8]`, and from then on the parse is unreachable — `exp` stays 0, input allowance is non-positive, the walk spins on the same 32 KiB window and never reaches its tail.**
+
+- Task:        T42.28 (#80) — the mechanism, named
+- Type:        FACT
+- Class:       G
+- Priority:    P0
+- Evidence:    `generated/ppc_xenon/ppc_recomp.18.cpp:10832-10862` (`mr r31,r4` = state, `lwz r11,8(r31)` / `cmplwi` / `bne loc_821D5E7C`, then `lwz r11,4(r31)` / compare `[inPtr+0]` against `0x0FF512EF` = `lis 4085` + `ori 4847`) · `build/w496.log` `F494-WALK win=2`: `consumed` ∈ {`00000000` (row 1), `00007FF4`, `0000FFF4`} and `exp != 0` on 1 of 60 rows
+- **The one thing still not named:** who is *supposed* to zero `[state+8]` between blocks. Nothing in the three routines mapped so far (`sub_821BC140`, `sub_821D5E10`, `sub_821CC6F0`) does it, and the value's oscillation between two near-`0x8000` figures suggests the caller re-initialises the state per *read*, not per *block*.
+
+**Testable consequence (T42.29, armed as `kF498ReseedState` with the record pin held):** if the host zeroes `[state+8]` at `InflateBegin` entry when `exp == 0` and `consumed != 0`, the guest's own parse becomes reachable again and should re-seed `exp` from the next descriptor. Gate, in order: `exp != 0` on more than 1 row of the garage's window; its `maxProduced` past `0x50000`; `RELSEMA … lr=821BC538` above 1; `XSF-INFLATE` above 0. **Labelled an intervention on guest state, not a fix** — it stands or falls on those four numbers and is reverted if any fails. Next ID **F-499**.
