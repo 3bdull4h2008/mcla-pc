@@ -85,6 +85,17 @@ static std::unordered_map<std::string, XsfTocInfo> g_xsfToc;
 // s_pendingUiPkg BEFORE the FDD50 call that inflates it (post-call PATHB-PKGFIX
 // was 7 ms too late). ON to test whether raceeditor/others now decompress. OFF == exact baseline.
 static constexpr bool kPathBEnqueueUI = true;
+
+// F-463 (R2 / T42.8): scoped experiment -- never plant host bytes for nested
+// packfiles (`preload/xarchive_*.rpf`), so the title's own read of the member is
+// the only thing that can decrypt it. MEASURED INERT for its own gate and therefore
+// left OFF: `w465` (flag true) and `w460` (control) are structurally identical
+// (`LISTLINE` 171, `C0000005` 0, `BC140-REC` 7, `F442-SECTION` 14, `F432-GROW-SKIP` 3,
+// `F434-SPIN-BREAK` 1, `UIXSF-GOLDEN-REVERIFY` 21, `LZX-FRAME` 32, `INFLATE` 5,065 both)
+// and the gate value itself did not move: `BDF20 #600 path='a:/archive/tune/
+// vehicle/vehicle0008.lst' ret=0` in BOTH soaks, i.e. the tune file gets no stream
+// whether or not we plant the nested archive (F-464). The code stays for reuse.
+static constexpr bool kF463AbstainNestedRpf = false;
 // F-247 dynamic serve-framing predicate: defined after g_mclaRebaseMap (~:3945).
 static bool MclaIsCurrentJob2Pbase(uint32_t outPtr);
 // w18: job #2 dests are the UI/swfC set only. Shared by package assigner
@@ -1614,6 +1625,27 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
     // in RpfVirtualFileSystem::ReadFileAt (registered from the guest's own TOC
     // words at the TOC76-XSF census), so the guest's page-cache copy and this
     // host-served body see the same expanded archive image.
+
+    // F-463 (R2 / T42.8): leave NESTED packfiles (`preload/xarchive_*.rpf`) unserved.
+    // The bytes we would plant are not an RPF3 header (cameratune -> 6655A8B1,
+    // carconfigs -> 63D46C60; F-458 s2: no second RPF3 in the first 64 MiB), and the
+    // title's own TOC decrypts the OUTER archive in guest code -- so if its
+    // fiPackfile read would decrypt a nested member on the fly, our plant pre-empts
+    // exactly that step, and the observed result is F-458 s1: the nested archives open
+    // (stream object 0x82860C40) but `tune/vehicle/*.lst` yields NO stream (0).
+    // Labelled, scoped abstention experiment -- not a fix. Gate criteria: BDF20's
+    // stream-object field for tune/*.lst becomes non-NULL, and F442-SECTION rows show
+    // tuning text instead of another file's compressed window.
+    if (kF463AbstainNestedRpf && path != nullptr &&
+        std::strstr(path, "xarchive_") != nullptr &&
+        std::strstr(path, ".rpf") != nullptr) {
+      MCLA_LOG_WARN(
+          "F463-SERVE-ABSTAIN path='{}' off={:08X} size={} head={:08X} "
+          "-- nested packfile left to the guest",
+          path, serveOff, static_cast<uint32_t>(serveBytes.size()),
+          MclaBE(serveBytes.data()));
+      continue;
+    }
 
     dst = mem.Alloc(static_cast<uint32_t>(serveBytes.size()), 16);
     if (!dst)
