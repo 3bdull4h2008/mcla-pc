@@ -10329,3 +10329,27 @@ routine outside `ppc_recomp.14.cpp` (only three `+12` stores exist in that file:
 `:2664`, `:9674`, `:21133`). Tracing `r25` backwards through Open is the next cheap static step and it
 is the last one this thread needs before the ordering question is either fixable or closed. Next ID
 **F-477**.
+
+### F-477 (2026-09-27 06:2x, **0 builds — six lines of generated code and one grep**) — **I WITHDRAW F-476'S CORRECTION: Open really does install 0 into `record+12` at claim time, so the delegated inventory's cell was right and my "it is `r25`, not 0" objection was wrong — `r25` is set exactly once in the whole routine, by `li r25,0` at `ppc_recomp.14.cpp:20985`, twelve lines before the record base is formed and never reassigned. The consequence is bigger than my error: the value our `TASKJOIN-SC` mitigation zeroes is written with THREE incompatible meanings by three sites, so calling it "the busy flag" (and F-475's reading of the 1 we observe as a reference count) is not established.**
+
+- Task:        T42.18 (#77) — supersedes F-476 §1 and sharpens F-475's open term
+- Type:        SELF-CORRECTION + FACT
+- Class:       H (our naming of a field) + G
+- Priority:    P0 for anyone building on F-475 — including the plan's next step
+- Evidence:    `generated/ppc_xenon/ppc_recomp.14.cpp:20982-20985` (`mulli r10,r10,28` / `add r29,r10,r11` = record base, then `li r25,0`) · `:21130-21133` (`lwz r11,12(r29)` / `stw r25,12(r29)` → stores that 0, exporting the previous value to `[r24-24]` = `0x8283D19C`) · `awk '/r25\.(u64|s64) =/'` over `20893..21135` returns ONE line (`:20985`), which is what falsifies my own correction · the three writers of `+12`: `sub_821BD3C8:21804` (init: `i+1` or `-1`, a free-list link), `sub_821BD220:21634` (release: old free head), Open `:21133` (claim: 0) — plus the only *decrement*, BC140's tail at `:19351-19360` via the `lwarx/addi -1/stwcx.` loop `sub_821CE100`
+
+**1. What is now established about `+12`.** A record that Open has just claimed holds **0**. A record on
+the free list holds an **index or -1**. A record being finished by `sub_821BC140` is **decremented** —
+which, from 0, underflows to `0xFFFFFFFF`. So `+12` cannot be one field; it is a union, and the join
+`sub_821BD220` reads it as a wait condition. The value our census recorded in `w477`/`w478` is
+`00000001` for all seven jobs, across indices 1, 2 and 4 — which matches an initial free-list link
+(`sub_821BD3C8`'s `i+1`) far better than it matches a per-job count, and a count reading would not
+plausibly be 1 for five different jobs sharing index 4.
+
+**2. Effect on the plan.** F-475's "who writes the 1?" question is the wrong shape: the 1 may be
+*nobody writing a count* but the residue of pool initialisation on a record that was never claimed by
+Open on this path. Before any ordering fix is attempted, one cheap read settles it — snapshot
+`[0x8283D19C]` (the free head Open maintains through `[str+36]`) and the record's `+12` at push, join
+and dispatch for the same tag, and check whether the 1 is a link or a count. `RELSEMA … lr=821BC538`
+staying at 1 of 7 jobs is the fact worth explaining; the mechanism behind it is now explicitly unknown
+rather than "the refcount the job should have dropped". Next ID **F-478**.
