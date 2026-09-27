@@ -86,6 +86,16 @@ static std::unordered_map<std::string, XsfTocInfo> g_xsfToc;
 // was 7 ms too late). ON to test whether raceeditor/others now decompress. OFF == exact baseline.
 static constexpr bool kPathBEnqueueUI = true;
 
+// F-465 (T42.9 / task #72): ordering construction for the garage. F-464 measured that the
+// garage's job record IS built (+4 = 1,066,057, +24 = 64980000) at array index 1 -- the same
+// index the streamer walk had already consumed 39 ms earlier as raceeditor's record -- and that
+// the walk only ever advances (`BC140-REC` ids 1, 8002, 8003, 4, 8004, 10004, 18004; `64980000`
+// in ZERO walk rows). So instead of inventing another enqueue (F-204b's closed family), move the
+// garage's identity to a record index nobody has taken: copy the record to index 0x20 and
+// re-point the garage's own streamer task slot (the 0x614-stride ring holding [slot+0] == handle)
+// at that index, preserving the generation bits. Set false for the exact pre-change behaviour.
+static constexpr bool kF465GarageReindex = false;
+
 // F-463 (R2 / T42.8): scoped experiment -- never plant host bytes for nested
 // packfiles (`preload/xarchive_*.rpf`), so the title's own read of the member is
 // the only thing that can decrypt it. MEASURED INERT for its own gate and therefore
@@ -14386,6 +14396,54 @@ PPC_FUNC(sub_821E2940) {
                           "+24={:08X}{}",
                           n, h, rec, w0, w4, w8, w12, w16, w20, w24,
                           (h == (handle & 0x7FFFu)) ? " <==ENQ" : "");
+        }
+      }
+      // F-465 ordering construction (see the flag's comment). Only touches the garage
+      // (record +24 == 64980000), only into an index whose record is empty, and only
+      // after locating the task slot whose [slot+0] equals this handle -- every step is
+      // checked and logged, because an unchecked write here would corrupt the job array.
+      if (kF465GarageReindex && pbPkgOff == 0x64980000u) {
+        uint32_t rb = 0;
+        if (mem.ReadU32BE(0x8283D190u + 52u, &rb) && rb >= 0x80000000u &&
+            rb < 0xE0000000u) {
+          const uint32_t srcIdx = handle & 0x7FFFu;
+          const uint32_t srcRec = rb + srcIdx * 28u;
+          const uint32_t newIdx = 0x20u;  // walk indices seen this boot: 1,2,3,4
+          const uint32_t dstRec = rb + newIdx * 28u;
+          uint32_t rw[7] = {0, 0, 0, 0, 0, 0, 0};
+          bool ok = true;
+          for (uint32_t i = 0; i < 7u; ++i)
+            ok = mem.ReadU32BE(srcRec + i * 4u, &rw[i]) && ok;
+          uint32_t d0 = 0, d4 = 0, d24 = 0;
+          (void)mem.ReadU32BE(dstRec + 0, &d0);
+          (void)mem.ReadU32BE(dstRec + 4, &d4);
+          (void)mem.ReadU32BE(dstRec + 24, &d24);
+          const bool dstFree = (d4 == 0u && d24 == 0u);
+          uint32_t slotAddr = 0;
+          for (uint32_t k = 0; k < 64u && slotAddr == 0u; ++k) {
+            const uint32_t cand = 0x82849B2Cu + k * 0x614u;
+            uint32_t idv = 0;
+            if (mem.ReadU32BE(cand, &idv) && idv == handle)
+              slotAddr = cand;
+          }
+          if (ok && dstFree && slotAddr != 0u) {
+            rw[0] = (handle & 0xFFFF8000u) | newIdx;  // keep generation, new index
+            bool wrote = true;
+            for (uint32_t i = 0; i < 7u; ++i)
+              wrote = mem.WriteU32BE(dstRec + i * 4u, rw[i]) && wrote;
+            wrote = mem.WriteU32BE(slotAddr, rw[0]) && wrote;
+            MCLA_LOG_WARN(
+                "F465-REINDEX handle={:08X} srcRec={:08X} -> dstRec={:08X} "
+                "slot={:08X} newId={:08X} remain={} pkgoff={:08X} wrote={} "
+                "dstWas=[{:08X} {:08X} {:08X}]",
+                handle, srcRec, dstRec, slotAddr, rw[0], rw[1], rw[6], wrote, d0,
+                d4, d24);
+          } else {
+            MCLA_LOG_WARN(
+                "F465-REINDEX-SKIP handle={:08X} srcIdx={} readsOk={} dstFree={} "
+                "dst=[{:08X} {:08X} {:08X}] slotFound={:08X}",
+                handle, srcIdx, ok, dstFree, d0, d4, d24, slotAddr);
+          }
         }
       }
       // F-247 SERVE-FRAMING FIX (authorized route 1; gated by kPathBEnqueueUI so
