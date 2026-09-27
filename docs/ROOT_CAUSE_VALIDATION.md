@@ -10596,3 +10596,28 @@ own `+16` entry pointer. A per-window count of *non-zero* `inLeft` entries (same
 more atomic) distinguishes "never seeded" from "seeded and consumed", and that distinction decides
 whether Path B has any host-reachable seed point at all. Until then the objective stays OPEN with
 `XSF-INFLATE` 0 and `F438-GFXCTOR` 0. Next ID **F-488**.
+
+### F-488 (2026-09-27 07:0x, **0 builds — three numbers already printed by existing markers, plus the 30 instructions that produce them**) — **THE "INPUT DESCRIPTOR LIST" IS THE DISPATCH ROUTINE'S OWN STACK FRAME, SO THERE IS NO HOST-REACHABLE SEED POINT: `INFLATE-ENTER`'s `st=006D8F20` and `inPtr=006D8F40` and `READWRAP`'s `r1in=006D8EC0` differ by exactly 96 and 32, which are the two stack offsets this routine uses — `addi r4,r1,96; bl sub_821D5E10` at `ppc_recomp.14.cpp:19130-19136` and `addi r11,r1,128` at `:19107` — so the exhausted input list is `[r1+96..]` of `sub_821BC140` itself, filled by its own loop from the walk cursor at `[r1+80]`, not by any buffer the host could populate.**
+
+- Task:        T42.23 — the seed-vs-consumed question, answered statically as "neither: it is local state"
+- Type:        FACT
+- Class:       G
+- Priority:    P0 — it closes the last host-side route Path B could have taken without a code change inside the walk
+- Evidence:    `build/w485.log` `INFLATE-ENTER … st=006D8F20 in=0 inPtr=006D8F40 …` and `READWRAP … r1in=006D8EC0 …` (arithmetic: `0x6D8F20 − 0x6D8EC0 = 0x60 = 96`, `0x6D8F40 − 0x6D8F20 = 0x20 = 32`) · `generated/ppc_xenon/ppc_recomp.14.cpp:19104-19136`: `addi r11,r1,128` / `ld r9,80(r1)` / `add r8,r29,r11` / `subf r7,r29,r3` / `stw r8,100(r1)` / `stw r7,96(r1)` / `std r6,80(r1)` / `mr r29,r18` then `loc_821BC374: addi r4,r1,96; mr r3,r24; bl sub_821D5E10` · the two continuation tests immediately above it: `lbz r9,1852(r27); bne loc_821BC3C0` and `cmpw cr6,r3,r31; bne loc_821BC3F4` (produced vs this descriptor's expected count)
+
+**1. Consequence, stated as the plan needs it.** `exp == 0` / `inLeft == 0` is a property of the walk's
+own bookkeeping: the input cursor pair `[r1+96] = consumed`, `[r1+100] = end` is derived from `r29`
+(current destination pointer) and `r18` (its end), so a container whose destination chain does not match
+the bytes actually produced leaves the pair empty and the loop re-enters InflateBegin with nothing to
+consume. Nothing the host writes into a package buffer can change that pair, because it is a stack
+local. Therefore Path B cannot be delivered as a data seed — it would need the descriptor walk's own
+inputs (the destination chain and the record's length) to be consistent, which is task #15's ORIGINAL
+per-request descriptor shape and needs a hook inside the loop, i.e. the `.qoder/skills/mcla-recompiler-regen`
+route (whose toolchain is currently broken) rather than another census.
+
+**2. What is now measured false, in order:** the enqueue is missing (F-469), writing record values fixes
+ordering (F-468/F-470), the guest asks for the UI bytes and gets nothing (F-482: it asks twice), record
+lifetime causes non-completion (F-485), and now "an exhausted input list could be seeded from the host"
+(this entry). Remaining live difference between the one completing job and the six silent ones: the
+per-descriptor `produced == expected` equality at `:19100-19105` and the `[obj+1852]` byte at `:19096`,
+both of which need the in-loop instrument to read at all. Next ID **F-489**.
