@@ -471,3 +471,52 @@ the word as the free-list link. Therefore:
 - The `TASKJOIN-SC` mitigation and the record recycling are halves of one defect (F-478 §1), so it must
   not be disarmed as a "fix" (measured: `w479` costs 2 of 7 jobs) and must not be described as the
   cause either. Any future change here is a change to job *completion*, not to our zeroing.
+
+## 9. Implementation plan for the surviving route (written 2026-09-27 06:5x, ledger through F-482)
+
+**The objective's end state, restated as measurements.** For the UI containers to be decompressed *by
+the guest*, and for GFx to initialise, these counters must move from where they are today:
+
+| signal | today (`w481`/`w480`) | required |
+|---|---|---|
+| `RELSEMA sub_821C9108 … lr=821BC538` (job completion callback) | 1 / boot (job #1 only) | ≥ 4 with the four UI tags |
+| `POST-EXEC-START … len>0` for the garage/job #2-#3 windows | 1 each, and the byte count read is the **foreign** container's `+4` at the **foreign** `+24` | 0 foreign-consumed reads; a real read inside the job's own package span |
+| `XSF-INFLATE` | 0 | > 0 |
+| `F438-GFXCTOR` | 0 | ≥ 1 row produced without the host forcing the call |
+| `UIXSF-GOLDEN-REVERIFY` | one package at `still_present==claimed==goldsize` | a second package there |
+
+**Chain of causes the code now supports (each link has its own F-number).** A streamer job resolves its
+record by `handle & (capacity-1)` with no validation (`F-470`) → the record it finds has been released
+and re-stamped by the next container within 22-30 ms, because the join `sub_821BD220` releases it as
+soon as its `+12` count reads 0 (`F-474`, `F-478`) → so the job's only byte-request is for the foreign
+container (`F-482`) → so its destination chain is never satisfied by a guest read and its success tail
+is never reached (`F-478`) → so no completion callback releases the loader's semaphore and no
+`XMemDecompress` runs (`F-393`, `F-482`) → `nGfx`/GFx stay 0.
+
+**The one intervention point that is not "write record values" (that route is measured dead: F-468 +
+F-470 §1).** `sub_821BC140`'s dispatch consumes `[record+24]`/`[record+4]` *during* its body, so the
+only durable fix is that a record must not be releasable while its job is undispatched. Two candidate
+constructions, in the order they should be tried:
+
+- **(P1) Refuse the premature release, at the join we already own.** `PPC_FUNC(sub_821BD220)`
+  (`src/gpu_device.cpp:4725-4759`) already reads `entry+0` (the handle) and `entry+12` (the count)
+  before the body, and the queue's own pop cursor is available from the `PUSH` census (`q+0x6164`,
+  F-469 §4). If the tag being joined has not yet been dispatched by `sub_821BC140`, leave the count
+  non-zero and let the join keep waiting; when the job's tail decrements it, the join passes and the
+  release happens after dispatch. **Labelled a mitigation** (it writes guest state to restore an
+  ordering our `TASKJOIN-SC` broke) and gated on a new `constexpr bool`. Acceptance, in this order and
+  no cheaper: `moves=0 len>0=0` for windows #2-#4; `RELSEMA … lr=821BC538` ≥ 2; then `XSF-INFLATE` > 0.
+  Risk to measure first: F-474's `w479` showed a naive "stop clearing" costs the boot 2 of 7 jobs, so
+  P1 must keep the *dispatch* path identical and only delay the release.
+- **(P2) Shape the free list so each UI container gets a record nobody reclaims mid-flight** — i.e.
+  give Open a distinct index per container instead of a recycled one. Higher blast radius (it changes
+  allocation order for every consumer) and it needs P1's measurement first to know whether a stable
+  index is even sufficient.
+
+**Explicitly closed by measurement, do not re-open:** constructing or copying record values (F-468,
+F-470), feeding the read path (F-482: there is no byte request to feed), re-arming the `sub_821CC6F0`
+served-body branch (F-461, task #70), disarming `TASKJOIN-SC` alone as a fix (F-474), and any Path A
+extension to config text (F-457). Rule-2/`F-055` (host-forced boot gate) remains the user's call, and
+the GFx dispatch producer remains absent (`F-440`/`F-441`), so **P1 is necessary but may not be
+sufficient for GFx** — the plan's success criterion for this objective is therefore `XSF-INFLATE > 0`
+plus a second package at 100 %, with GFx tracked separately.
