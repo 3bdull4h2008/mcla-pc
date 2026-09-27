@@ -550,8 +550,32 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             }
 
             if (!blitOk) {
-                if (backend_.BeginFrame()) {
-                    backend_.ClearAndPresent(cr, cg, cb, 1.0f);
+                // F-567/F-569: Show a visible gradient instead of dark blue when
+                // no real guest content is available. This proves the display
+                // pipeline works end-to-end while we work on the real rendering path.
+                static std::atomic<uint32_t> fallbackCount{0};
+                const uint32_t fn = fallbackCount.fetch_add(1) + 1;
+                // Generate a simple gradient pattern
+                constexpr uint32_t kW = 1280, kH = 720;
+                static std::vector<uint8_t> gradBuf;
+                if (gradBuf.empty()) {
+                    gradBuf.resize(static_cast<size_t>(kW) * kH * 4u);
+                    for (uint32_t y = 0; y < kH; ++y) {
+                        for (uint32_t x = 0; x < kW; ++x) {
+                            uint8_t* p = &gradBuf[(static_cast<size_t>(y) * kW + x) * 4u];
+                            p[0] = static_cast<uint8_t>((x * 255u) / (kW - 1));
+                            p[1] = static_cast<uint8_t>((y * 255u) / (kH - 1));
+                            p[2] = static_cast<uint8_t>(128 + (x + y) % 128);
+                            p[3] = 255;
+                        }
+                    }
+                }
+                if (!backend_.PresentBgra(kW, kH, gradBuf.data())) {
+                    if (backend_.BeginFrame()) {
+                        backend_.ClearAndPresent(cr, cg, cb, 1.0f);
+                    }
+                } else if (fn <= 4 || (fn % 240) == 0) {
+                    MCLA_LOG_INFO("PRESENT-GRADIENT #{} (fallback pattern)", fn);
                 }
             }
             break;

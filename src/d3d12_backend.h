@@ -46,6 +46,12 @@ public:
     bool BeginFrame();
     bool ClearAndPresent(float r, float g, float b, float a);
 
+    // F-567: present the current swap chain back buffer directly without
+    // uploading guest memory. Used when the D3D12 command processor has
+    // already rendered to the back buffer and we want to show that content
+    // instead of the cleared guest framebuffer.
+    bool PresentDirect();
+
     // W6: full-viewport blit of linear 32bpp host pixels onto the backbuffer.
     // Uploads through a persistent DEFAULT texture + staging, CopyResource to
     // the swapchain image, then Present. Nearest-neighbor scales if (w,h) does

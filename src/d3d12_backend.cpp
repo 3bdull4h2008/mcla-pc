@@ -1932,6 +1932,24 @@ bool D3D12Backend::ClearAndPresent(float r, float g, float b, float a) {
     return SUCCEEDED(hr);
 }
 
+bool D3D12Backend::PresentDirect() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized || !m_swapChain) return false;
+
+    // Just present whatever is already on the current back buffer.
+    // The command processor's draws have already rendered to it.
+    HRESULT hr = m_swapChain->Present(1, 0);
+
+    m_currentFenceValue++;
+    m_commandQueue->Signal(m_fence.Get(), m_currentFenceValue);
+    m_fenceValues[m_frameIndex] = m_currentFenceValue;
+
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    m_inFrame = false;
+
+    return SUCCEEDED(hr);
+}
+
 void D3D12Backend::EndFrame() {
     m_inFrame = false;
 }

@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include <cpu/ppc_context.h>
 #include <cpu/guest_thread.h>
+#include <chrono>
 #include <apu/audio.h>
 #include "function.h"
 #include "heap.h"
@@ -1385,7 +1386,44 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION *cs) {
       return;
     }
 
-    owningThread.wait(previousOwner);
+    // F-564/F-566: log contention + timed force-acquire.
+    // Guest threads can hold CS and get stuck (parked/dead), blocking the
+    // boot worker forever. After 5s of contention, steal the lock.
+    static std::atomic<uint32_t> s_csContention{0};
+    const uint32_t cn = s_csContention.fetch_add(1) + 1;
+    const uint32_t lr = static_cast<uint32_t>(g_ppcContext->lr);
+    if (cn <= 32 || (cn % 500) == 0) {
+      MCLA_LOG_WARN("CS-CONTEND #{} cs={:08X} owner={:08X} waiter={:08X} "
+                    "lr={:08X} rec={}",
+                    cn, reinterpret_cast<uintptr_t>(cs), previousOwner,
+                    thisThread, lr, cs->RecursionCount);
+    }
+
+    // Try normal wait first (with timeout via spin + sleep)
+    const auto start = std::chrono::steady_clock::now();
+    bool acquired = false;
+    while (!acquired) {
+      const auto elapsed = std::chrono::steady_clock::now() - start;
+      if (elapsed > std::chrono::seconds(5)) {
+        // Force-acquire after 5s timeout
+        MCLA_LOG_WARN("CS-TIMEOUT #{} cs={:08X} stolen_from={:08X} by={:08X} "
+                      "lr={:08X} waited_ms={}",
+                      cn, reinterpret_cast<uintptr_t>(cs), previousOwner,
+                      thisThread, lr,
+                      static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+        owningThread.store(thisThread);
+        cs->RecursionCount = 1;
+        return;
+      }
+      previousOwner = 0;
+      if (owningThread.compare_exchange_weak(previousOwner, thisThread) ||
+          previousOwner == thisThread) {
+        cs->RecursionCount++;
+        return;
+      }
+      // Brief sleep to avoid burning CPU
+      Sleep(1);
+    }
   }
 }
 

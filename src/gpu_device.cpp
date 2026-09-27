@@ -370,6 +370,132 @@ static std::unordered_map<uint32_t, uint32_t> g_pkgUsed;     // off -> dest
 // inflates its own RSC5/XMem bytes. Gated by the caller (kPathBEnqueueUI).
 static std::atomic<uint32_t> s_pendingUiPkg{0};
 
+// F-518 (T42.42 step 2): a UI .xsf container is not inflated at the one dest its
+// archive open names. `PATHB-PKGFIX` binds e.g. garage -> B7EC1000, but across
+// 6,594 uncapped `INFLATE-ENTER` rows in w525 NONE has outPtr B7EC1000/B7841000/
+// B78E1000; the guest decodes at the container's *other* read-list slots and at
+// successors inside them (B7C01000 then B7C21000, B7C41000 then B7C59000, ...).
+// Every one of those dests therefore reached the "first unclaimed g_rscTab entry"
+// guess below and was served the wrong package - which is F-517 §4, and the reason
+// F-515/F-516's overwrite looked like content from no container.
+// The fill pass already enumerates the job's real `{pbase, size}` slots, so record
+// them as ranges here and let an unbound dest resolve by containment. Exact
+// bindings still win; this only replaces a guess, never a decision.
+// Own mutex rather than g_destPkgMtx: AssignPackageForDest holds that one when it
+// reads this table, and the writer runs inside the fill pass.
+// F-518 MEASURED AND REVERTED (w527 vs w524, same probe in both): the mechanism fires
+// exactly as designed - 15 `F518-RANGEBIND` rows replace the rscTab guess - and the
+// boot gets worse: `POST-EXEC-START` 7 -> 4, `F507-INITEXP` 7 -> 4, `Fatal error`
+// 0 -> 2, `GFx` 13 -> 7, `JOB2-PKG-SERVE` 3,890 -> 1, and no new container verified
+// (`F517-GUESTOUT` OWN-CONTAINER is still only raceeditor). Cause is blast radius:
+// the garage's own read-list spans dests (`B7D21000..B7E01000`, `B7401000..`) that
+// other streams also use, so claiming them by range steals 3,889 serves that were
+// correctly keyed elsewhere. Same shape as F-511/F-514's binding lesson: the binding
+// is load-bearing for other jobs before it is wrong for ours. Kept `false` = shipped
+// behaviour; a retry must key on the *job* owning the dest, not on address containment.
+static constexpr bool kF518BindSlotRanges = false;
+// F-519 (T42.43 / #91): the SAME lookup, but fed by the title's own truth instead of
+// our plan builder. F-518's failure has a specific explanation available in the logs:
+// the ranges it registered (`own-slot B7D21000..B7D41000`, `B7401000..`) are slots of
+// OUR fill plan, while `REQDUMP #2 a0=8284A140` — the job's own read-list — is
+// `B7EC1000 / B7C01000 / B7C41000 / B7F71000 / B7C81000` and contains NEITHER. So the
+// plan builder is over-inclusive (F-467/F-468's two-index-space confusion) and
+// range-keying it evicted other jobs' bindings. Read the slot triples straight out of
+// the dispatching job's slot — `{vbase, pbase, size}` at slot+4+12i, count at slot+1540
+// — paired with that job's record `+24` package offset, and this table can only ever
+// contain dests the job itself owns.
+// F-519 MEASURED (w529) AND SHIPPED OFF: structurally CLEAN where F-518 was not - all
+// 7 streamer dispatches return, `POST-EXEC-START` 7, `F507-INITEXP` 7, `GFx` 13,
+// `LISTLINE` 171, `C0000005` 0, `UIXSF-GOLDEN-FILL` 9, `Fatal error` 0 (at/below the
+// 0-vs-1 floor of F-518 §4) - so the range mechanism itself is sound and job-keying
+// removes F-518's eviction damage (`JOB2-PKG-SERVE` 3,890 -> 218 instead of -> 1).
+// But it advances nothing: `F517-GUESTOUT` OWN-CONTAINER is STILL only raceeditor, and
+// the sample thins 67 -> 30. So it is kept as the probe, not shipped as a change.
+// What it DID prove is in F-519: `job=8284A140` carries `record+24=64CA3000`
+// (policecam) while `PATHB-PKGFIX #2` binds that same job's dest to `garage`/64980000.
+static constexpr bool kF519BindJobOwned = true;   // F-521 re-arm: snapshot-keyed source
+// F-523: the one inflate the title decompressed byte-exact (F-517 §2, raceeditor) was handed a serve
+// window covering its ENTIRE compressed stream, so its LZX history never had to survive a re-point.
+// The garage needs ~196,553 compressed bytes = 7 windows, and every MclaForceServePkgForDest re-primes
+// st+8=0 at its bounce, which is F-303/F-318's frame-0 cursor reset from the serve side. Give a UI
+// container one window big enough to hold the whole thing. Capped at 256 KiB (the 1 MB experiment at
+// :632 made the caller re-enter forever).
+// F-523 MEASURED AND REVERTED (w535 vs w532/w528): window 32 KiB -> 256 KiB for UI packages did make
+// the guest inflate more (F517-GUESTOUT 30 -> 89 rows, raceeditor's own write 196,608 -> 262,144) but
+// produced NO additional correct container (OWN-CONTAINER still 1, still only raceeditor) and pushed
+// `Fatal error` to 3, above the 0-vs-1 floor. So "the serve window was too small for the container /
+// LZX history had to survive a re-point" is REFUTED as the reason jobs 2-4 fail, and the garage's
+// pct=100 durability came from F-522's binding, not from the window.
+static constexpr bool kF523UiFullWindow = false;
+struct MclaUiSlotRange {
+  uint32_t lo, hi, pkg, job;
+};
+static std::mutex g_uiSlotRangeMtx;
+static std::vector<MclaUiSlotRange> g_uiSlotRanges;
+// F-525 §2: which job is dispatching RIGHT NOW, so range ownership can be made strict. Set at
+// sub_821BC140 entry from slotAddr. F-522 showed the same addresses are claimed by several jobs'
+// slot lists, so a first-match lookup serves one container's bytes into another's destination.
+static std::atomic<uint32_t> g_f525CurJob{0};
+// F-529 §5: w543 hung on exactly the one served UI job whose handle carries generation 1
+// (id=0x8004, slot 8284B37C, credits) - the same index four jobs share, and the one F-507's
+// length override does NOT cover (it is scoped to generation 0). Remember which it was.
+static std::atomic<bool> g_f525CurGen0{false};
+// F-524: which package (if any) owns this dest by the F-522 job-slot table.
+static uint32_t MclaUiPkgOwningDest(uint32_t dest) {
+  std::lock_guard<std::mutex> rlk(g_uiSlotRangeMtx);
+  for (const auto &R : g_uiSlotRanges)
+    if (dest >= R.lo && dest < R.hi)
+      return R.pkg;
+  return 0u;
+}
+// F-524: w532 shows the ~201-per-dest inflate spin is on dests that receive ZERO serves, and every
+// dest that IS served does inflate (0 of 46 served dests went un-inflated). Those inflates read
+// inPtr = 006D8F40, i.e. the stack record still holds a stack address as its input pointer, because
+// nothing overwrote st+4 for them. The existing w28 branch skips them solely on `consumed < 16`
+// (they sit at consumed=32756), so serve them by UI-package ownership instead of by that predicate.
+// static constexpr bool kF524ServeUiStackDests = false;  // F-540: outLeft frozen at 16384 for 92223/92703 entries
+// the serve does reach the spin dests (F524-SERVE-UI-DEST 2 rows) and the guest then decompresses
+// TWO MORE containers byte-exact (F517-GUESTOUT OWN-CONTAINER 1 -> 3: credits@0 at B7C01000 with
+// 262,144 written, garage@4ADA at B7C47000) — the strongest evidence yet that Path B can carry all
+// four. But it costs 6 of the 7 streamer dispatches (`POST-EXEC-START` 7 -> 1, `F507-INITEXP` 7 -> 2,
+// `GFx` 13 -> 1), and the package it serves is wrong for overlapping dests because
+// `MclaUiPkgOwningDest` returns the FIRST range containing the dest, while the F-522 table holds
+// ranges from several jobs over the same addresses (hence garage slot B7C01000 served as `6496F000`
+// = credits). Both are fixable and are the next step; shipping a boot collapse is not.
+// Job-strict variant: resolves ONLY if the owning range belongs to the job now dispatching, so the
+// serve gate can never bind container A's bytes to container B's dest. Used ONLY by that gate.
+static uint32_t MclaUiPkgOwningDestForCurrentJob(uint32_t dest) {
+  const uint32_t job = g_f525CurJob.load(std::memory_order_relaxed);
+  if (job == 0u)
+    return 0u;
+  std::lock_guard<std::mutex> rlk(g_uiSlotRangeMtx);
+  for (const auto &R : g_uiSlotRanges)
+    if (R.job == job && dest >= R.lo && dest < R.hi)
+      return R.pkg;
+  return 0u;
+}
+// F-537: w549 vs w550_1 shows the shipped walk DOES advance its input cursor (`consumed` goes
+// 32756 -> 65524 -> 32756 -> 65524 across sub-dests) while the gate-ON walk pins it at 32748 and
+// only the DESTINATION moves. Cause: MclaForceServePkgForDest primes `st+8 = 0`, so every entry
+// re-zeroes what the codec just consumed and the walk's own progress test can never finish. So the
+// serve must happen ONCE per job and then leave `st` to the title. `produced` reaching 286,720 with
+// a frozen `consumed` (PATHB-HOSTDECODE-CHAIN n=2) is the same fact from the output side.
+static std::mutex g_f537Mtx;
+static std::unordered_set<uint32_t> g_f537ServedJobs;
+static bool MclaUiServeClaim(uint32_t job) {
+  if (job == 0u)
+    return false;
+  std::lock_guard<std::mutex> lk(g_f537Mtx);
+  return g_f537ServedJobs.insert(job).second;
+}
+static constexpr bool kF524ServeUiStackDests = false;  // F-540: outLeft froze at 16384 for 92223/92703 entries
+// w539 reproduced w537 on EVERY marker (OWN-CONTAINER 3, F524-SERVE-UI-DEST 2, JOB2-PKG-SERVE 3,
+// POST-EXEC-START 1, GFx 1) — so making ownership job-strict neither fixed the dispatch collapse nor
+// changed which dests got the right package. The collapse is therefore caused by re-pointing the
+// SHARED stack record st (st+0/st+4 written in place at :11484-11486) for a spin dest, not by package
+// identity. Any retry must give the job its own descriptor instead of mutating st for these dests.
+// The capability finding stands regardless: see F-525 §1 and F-526.
+
 static uint32_t AssignPackageForDest(uint32_t outPtr) {
   BuildRscPackageTable();
   std::lock_guard<std::mutex> lk(g_destPkgMtx);
@@ -406,6 +532,49 @@ static uint32_t AssignPackageForDest(uint32_t outPtr) {
       MCLA_LOG_WARN("DEST-PKG outPtr={:08X} -> off={:08X} (PATHB-PENDING real pkg)",
                     outPtr, pend);
       return pend;
+    }
+  }
+  // F-518: this dest has no exact binding, so before guessing, ask whether it sits
+  // inside a UI container's own read-list slot. Caller already holds g_destPkgMtx.
+  if ((kF518BindSlotRanges || kF519BindJobOwned) && outPtr >= 0xB0000000u &&
+      outPtr < 0xC0000000u) {
+    uint32_t rp = 0, rlo = 0, rhi = 0;
+    {
+      // F-528: ONE authority. w539 showed the gate and this function disagreeing on the same
+      // dest (gate said garage, this said credits), and w541 showed that a job-strict value which
+      // ARRIVES BYPASSING this function also skips its registration and loses the garage's fill.
+      // So resolve job-strictly HERE, and register exactly like the guess path below.
+      const uint32_t curJob = g_f525CurJob.load(std::memory_order_relaxed);
+      std::lock_guard<std::mutex> rlk(g_uiSlotRangeMtx);
+      for (int pass = 0; pass < 2 && rp == 0u; ++pass) {
+        for (const auto &R : g_uiSlotRanges) {
+          if (outPtr < R.lo || outPtr >= R.hi)
+            continue;
+          if (pass == 0 ? R.job != curJob : false)
+            continue;
+          rp = R.pkg;
+          rlo = R.lo;
+          rhi = R.hi;
+          break;
+        }
+      }
+    }
+    if (rp != 0u) {
+      g_destPkgOff[outPtr] = rp;
+      g_destPkgWalk[outPtr] = 0;
+      g_pkgUsed[rp] = outPtr;
+      static std::mutex s_f518Mtx;
+      static std::unordered_map<uint32_t, uint32_t> s_f518Cnt;
+      uint32_t fn = 0;
+      {
+        std::lock_guard<std::mutex> flk(s_f518Mtx);
+        fn = s_f518Cnt[outPtr]++;
+      }
+      if (fn < 4u)
+        MCLA_LOG_WARN("F518-RANGEBIND dest={:08X} -> off={:08X} (inside own-slot "
+                      "{:08X}..{:08X}, replaces the rscTab guess)",
+                      outPtr, rp, rlo, rhi);
+      return rp;
     }
   }
   uint32_t chosen = 0;
@@ -448,6 +617,10 @@ static uint32_t PackageSizeAt(uint32_t off) {
 // never off a literal dest address. These offsets only ever appear as a dest
 // mapping under Path B (s_pendingUiPkg / PATHB-PKGFIX), so a flag-OFF boot never
 // routes through the host decoder at all.
+// F-517: forward declaration so the decompress-call census in the sub_8244FF20 hook can
+// reach the reference bytes without waiting for the definition ~5.7k lines later.
+static const std::vector<uint8_t> &MclaUiXsfGolden(uint32_t pkg);
+
 static bool IsUiXsfPkg(uint32_t off) {
   return off == 0x64CB0000u || off == 0x64980000u || off == 0x64CA3000u ||
          off == 0x6496F000u;
@@ -3577,6 +3750,71 @@ PPC_FUNC(sub_8244FF20) {
                   "lr={:08X}",
                   n, dest, realDestSz, realSrcSz, src, outDestSz, outSrcSz, ret,
                   lr);
+  // F-517 (T42.42 / #90 step 1): ask, AT THE DECOMPRESS CALL, whether the bytes the title just
+  // produced belong to the container it is decoding. F-515/F-516 could only examine the
+  // destinations long after later writes had passed; this reads the destination immediately
+  // after the call returns and searches the reference container for those 16 bytes. found=NONE
+  // with ret=0 means the decoder emitted content that is not in the container at all; a
+  // found_at that decreases or repeats across successive dests says the walk is being fed the
+  // wrong slice. (The fill log is not usable from here - it is declared ~6.4k lines later.)
+  {
+    static std::mutex s_f517Mtx;
+    static std::unordered_map<uint32_t, uint32_t> s_f517Cnt;
+    bool f517Logged = false;
+    {
+      std::lock_guard<std::mutex> clk(s_f517Mtx);
+      f517Logged = dest >= 0xA0000000u && dest < 0xE0000000u &&
+                   s_f517Cnt[dest]++ < 2u;
+    }
+    if (f517Logged) {
+      uint8_t probe[16] = {0};
+      auto &dm = mcla::kernel::GuestMemoryHeap::Instance();
+      const bool have = dm.ReadBytes(dest, probe, 16u);
+      const uint32_t cand[] = {0x64CB0000u, 0x64980000u, 0x64CA3000u, 0x6496F000u};
+      uint32_t foundPkg = 0, foundAt = 0xFFFFFFFFu, refSize = 0;
+      uint32_t sameAsDestPkg = 0;
+      for (const uint32_t rp : cand) {
+        const std::vector<uint8_t> &refb = MclaUiXsfGolden(rp);
+        if (refb.size() < 16u)
+          continue;
+        const uint8_t *base = refb.data();
+        const uint8_t *end = base + refb.size() - 15u;
+        const uint8_t *p = base;
+        while (p < end) {
+          const void *hit = std::memchr(p, probe[0],
+                                        static_cast<size_t>(end - p) + 15u);
+          if (hit == nullptr)
+            break;
+          const uint8_t *hp = static_cast<const uint8_t *>(hit);
+          if (hp >= end)
+            break;
+          if (std::memcmp(hp, probe, 16u) == 0) {
+            foundPkg = rp;
+            foundAt = static_cast<uint32_t>(hp - base);
+            refSize = static_cast<uint32_t>(refb.size());
+            break;
+          }
+          p = hp + 1u;
+        }
+        if (foundPkg != 0u)
+          break;
+      }
+      if (!have) {
+        foundPkg = 0u;
+        foundAt = 0xFFFFFFFFu;
+      }
+      if (destPkg != 0u && foundPkg == destPkg)
+        sameAsDestPkg = 1u;
+      MCLA_LOG_WARN("F517-GUESTOUT dest={:08X} destPkg={:08X} src={:08X} "
+                    "*destSz(in)={} *destSz(out)={} ret={:08X} probe={:02X}{:02X}"
+                    "{:02X}{:02X} found_pkg={:08X}@{:X} (refsize={}) {}",
+                    dest, destPkg, src, realDestSz, outDestSz, ret, probe[0], probe[1],
+                    probe[2], probe[3], foundPkg, foundAt, refSize,
+                    foundPkg == 0u
+                      ? "NONE-OF-FOUR"
+                      : (sameAsDestPkg ? "OWN-CONTAINER" : "WRONG-CONTAINER"));
+    }
+  }
   // F-331: same gate as the line above (per-dest bound, so this cannot repeat
   // w298's 5.5 M-line flooding), one line per call pair showing the frame
   // driver's own progress. `frames`/`ctxprod` are cumulative over the ctx's
@@ -7324,6 +7562,13 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
   static const uint32_t kScanHi[] = {0xA0800000u, 0xC6000000u, 0xC8000000u, 0xCB000000u};
   for (int band = 0; band < 4 && nGfx < 6; ++band) {
     for (uint32_t a = kScanLo[band]; a < kScanHi[band] && nGfx < 6; a += 0x40) {
+      // F-532/F-535/F-537: 0xA0400000 is kPhysHdrVa (heap_arena.h:40) - our own o1heap instance
+      // header, the page boot_host.cpp:348 marks PAGE_NOACCESS. Reading it faults F388-PHYSGUARD
+      // 3x per soak (w549.log:13028, off=0X0, call at gpu_device.cpp returning 0xAAEDC) and it can
+      // never be a GFX object: nGfx has reported 0 in all 225 lever invocations on record, so
+      // skipping the guarded page cannot change any census result - only the fault.
+      if ((a & ~0xFFFu) == 0xA0400000u)
+        continue;
       uint32_t w0 = 0;
       if (!mem.ReadU32BE(a, &w0))
         continue;
@@ -8730,11 +8975,19 @@ static bool MclaHostInflateToDest(uint32_t dest, uint32_t bounce, uint32_t n,
 }
 
 static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
-                                     bool hostInflate) {
+                                     bool hostInflate,
+                                     uint32_t pkgHint = 0u) {
   if (outPtr == 0 || outPtr == 0xCDCDCDCDu)
     return false;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-  const uint32_t baseOff = AssignPackageForDest(outPtr);
+  // F-527: w539 showed the F-524 gate resolve the garage's own package for a dest while this
+  // function, called immediately after, re-resolved the SAME dest to credits' package through the
+  // non-job-scoped map — dispatch #2 then fed a stream that consumed nothing and never returned
+  // (F-506's no-exit retry branch, and the boot's last lines are exactly that cycle). When the
+  // caller already knows the owning package from the dispatching job, that is the authority.
+  const uint32_t baseOff =
+      pkgHint != 0u ? pkgHint : AssignPackageForDest(outPtr);
+  const uint32_t winBytes = kF523UiFullWindow && IsUiXsfPkg(baseOff) ? 0x40000u : 0x8000u;
   const bool job2 = IsJob2UiDest(outPtr);
   uint32_t walkPos = 0;
   if (job2) {
@@ -8745,12 +8998,12 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
     walkPos = g_destPkgWalk[outPtr];
   }
   std::vector<uint8_t> pkgWin;
-  if (!MclaLoadPkgWindow(baseOff, walkPos, 0x8000u, pkgWin) ||
+  if (!MclaLoadPkgWindow(baseOff, walkPos, winBytes, pkgWin) ||
       pkgWin.size() < 16) {
     // Retry from package head if the shared walk ran past the table size.
     if (walkPos != 0) {
       pkgWin.clear();
-      if (!MclaLoadPkgWindow(baseOff, 0, 0x8000u, pkgWin) ||
+      if (!MclaLoadPkgWindow(baseOff, 0, winBytes, pkgWin) ||
           pkgWin.size() < 16)
         return false;
       walkPos = 0;
@@ -8775,7 +9028,7 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
     const uint32_t wh = MclaBE(pkgWin.data());
     if (wh != 0x05435352u && wh != 0x0FF512EFu) {
       pkgWin.clear();
-      if (!MclaLoadPkgWindow(baseOff, 0, 0x8000u, pkgWin) ||
+      if (!MclaLoadPkgWindow(baseOff, 0, winBytes, pkgWin) ||
           pkgWin.size() < 16)
         return false;
       walkPos = 0;
@@ -8795,7 +9048,7 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
     std::lock_guard<std::mutex> bl(s_bounceMtx);
     bounce = s_destBounce[outPtr];
     if (bounce == 0) {
-      bounce = mem.Alloc(0x8000, 16);
+      bounce = mem.Alloc(winBytes, 16);
       s_destBounce[outPtr] = bounce;
     }
   }
@@ -9615,6 +9868,10 @@ static constexpr bool kUiXsfFrameServe = false;  // F-343: re-reverted; F-333+F-
 // then the shared inflate record `st=006D8F20` was taken by another container
 // (`exp=000073D7` = credits' 29,655 in entry #67) and the chain stopped at two
 // dests, leaving 132,578 surviving of what was placed.
+// F-517 CONTROL (w525) RAN AND IS NOW RESTORED: with the fill off, the raceeditor dest
+// still read back byte-exact against the external golden, which is what proved the title's
+// own inflate - not our write - produced it (see F-517). Shipping `true` would drop the
+// garage's only durable coverage (F-514), so the control stays a control.
 static constexpr bool kUiXsfFillDryRun = false;   // F-508 measured with true (w510); see that entry
 
 // F-350: allow the plan to overwrite a slot that belongs to THIS container's own
@@ -9681,7 +9938,7 @@ static constexpr bool kUiXsfLayoutAudit = true;
 static void MclaUiXsfLayoutAudit(uint32_t pkg, const std::vector<uint8_t> &gold,
                                  const std::vector<MclaUiXsfSlot> &slots,
                                  uint32_t anchorPbase) {
-  if (!kUiXsfLayoutAudit || gold.size() < 0x10000u)
+  if (!kUiXsfLayoutAudit || gold.size() < 0x100u)  // F-546: was 0x10000, which excluded policecam (19,337) and credits (29,655) outright; matches F-513's precedent for the re-verify floor
     return;
   static std::mutex s_auditMtx;
   static std::unordered_set<uint32_t> s_audited;
@@ -9922,6 +10179,24 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                     static_cast<uint32_t>(gold.size()), job == anchorJob ? 1 : 0,
                     tail >= static_cast<uint32_t>(gold.size()) ? 1 : 0);
     }
+  }
+  // F-518: publish this container's own read-list slot ranges so that an inflate
+  // dest inside one of them resolves to THIS package instead of the rscTab guess.
+  // This is the only place that has the real `{pbase, size}` list for a named pkg.
+  if (kF518BindSlotRanges && IsUiXsfPkg(pkg)) {
+    std::lock_guard<std::mutex> rlk(g_uiSlotRangeMtx);
+    for (const auto &S : slots) {
+      if (S.pbase < 0xB0000000u || S.pbase >= 0xC0000000u || S.size == 0u)
+        continue;
+      bool dup = false;
+      for (const auto &R : g_uiSlotRanges)
+        if (R.lo == S.pbase && R.pkg == pkg) { dup = true; break; }
+      if (!dup)
+        g_uiSlotRanges.push_back({S.pbase, S.pbase + S.size, pkg, 0u});
+    }
+    if (g_uiSlotRanges.size() <= 40u)
+      MCLA_LOG_WARN("F518-SLOTERANGE pkg={:08X} shot={} slots={} table={}", pkg,
+                    shot, slots.size(), g_uiSlotRanges.size());
   }
   uint32_t covLo = 0xFFFFFFFFu, covHi = 0;
   for (const auto &pr : plan) {
@@ -10468,6 +10743,85 @@ static void MclaUiXsfLateReverify(uint32_t n) {
   static constexpr uint32_t kPkgs[4] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
                                         0x6496F000u};
   const uint32_t sample = n / 1000u;
+  // F-544 (#89): `MclaUiXsfReverify` can only score packages the FILL pass recorded
+  // rows for, so policecam and credits returned 0 rows forever - an absence of
+  // measurement, not a failure. `MclaUiXsfLayoutAudit` derives its golden offset
+  // from each slot's own `vbase` and needs no prior claim, but until now it was
+  // reachable only from inside the hunt (and the hunt also FILLS, which this must
+  // not do). Call the audit directly over the shared slot inventory, log-only.
+  std::vector<MclaUiXsfSlot> slots;
+  {
+    std::lock_guard<std::mutex> slk(g_uiXsfSlotsMtx);
+    slots = g_uiXsfSlots;
+  }
+  for (const uint32_t p : kPkgs) {
+    const std::vector<uint8_t> &g = MclaUiXsfGolden(p);
+    if (g.size() < 0x100u)
+      continue;
+    MclaUiXsfLayoutAudit(p, g, slots, 0u);
+  }
+  // F-547: the layout audit cannot reach policecam/credits (F-545/F-546: its anchor must be in
+  // the fill-sourced inventory, which those packages never populate). But F-522's per-job range
+  // table DOES hold every UI container's own read-list slots, appended in read-list order, so
+  // model A - sequential golden offsets - is computable straight from it. This is the same
+  // comparison the audit makes, sourced from the title's own slots instead of our fill plan, and
+  // it is log-only.
+  static const uint32_t kRangeAuditPkgs[4] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
+                                              0x6496F000u};
+  for (const uint32_t p : kRangeAuditPkgs) {
+    const std::vector<uint8_t> &g = MclaUiXsfGolden(p);
+    if (g.size() < 0x100u)
+      continue;
+    std::vector<MclaUiSlotRange> mine;
+    {
+      std::lock_guard<std::mutex> rlk(g_uiSlotRangeMtx);
+      for (const auto &R : g_uiSlotRanges)
+        if (R.pkg == p)
+          mine.push_back(R);
+    }
+    if (mine.empty())
+      continue;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint8_t head[64] = {0};
+    uint32_t headOk = 0, slotsExact = 0, bytesMatched = 0, bytesCompared = 0;
+    uint32_t off = 0;
+    for (const auto &R : mine) {
+      if (off >= g.size())
+        break;
+      const uint32_t sz = R.hi - R.lo;
+      const uint32_t cmp = sz > g.size() - off ? static_cast<uint32_t>(g.size() - off)
+                                               : sz;
+      if (!mem.ReadBytes(R.lo, head, cmp > 64u ? 64u : cmp)) {
+        off += sz;
+        continue;
+      }
+      ++headOk;
+      uint32_t same = 0;
+      // Chunked, not byte-at-a-time: the garage alone is ~1.06 MB per pass and this
+      // runs for up to eight samples, so a per-byte read would add millions of
+      // calls and shift the very timings the census compares.
+      std::vector<uint8_t> cb(0x4000);
+      for (uint32_t i = 0; i < cmp; i += cb.size()) {
+        const uint32_t want =
+            cmp - i < cb.size() ? cmp - i : static_cast<uint32_t>(cb.size());
+        if (!mem.ReadBytes(R.lo + i, cb.data(), want))
+          break;
+        for (uint32_t k = 0; k < want; ++k)
+          if (cb[k] == g[off + i + k])
+            ++same;
+      }
+      bytesMatched += same;
+      bytesCompared += cmp;
+      if (same == cmp && cmp > 0)
+        ++slotsExact;
+      off += sz;
+    }
+    MCLA_LOG_WARN("F547-RANGEAUDIT pkg={:08X} goldsize={} slots={} readable={} "
+                  "exact={} bytes_matched={}/{} (model A sequential over the "
+                  "job's own read-list)",
+                  p, static_cast<uint32_t>(g.size()), static_cast<uint32_t>(mine.size()),
+                  headOk, slotsExact, bytesMatched, bytesCompared);
+  }
   for (const uint32_t p : kPkgs)
     MclaUiXsfReverify(p, MclaUiXsfGolden(p), 99u + sample);
 }
@@ -10752,9 +11106,10 @@ PPC_FUNC(sub_821D5E10) {
     }
     if (n <= 16 || (n % 200) == 0 || j2Ent || stackCont)
       MCLA_LOG_WARN("INFLATE-ENTER #{} st={:08X} in={} inPtr={:08X} "
-                    "consumed={} exp={:08X} ihdr=[{:08X} {:08X}] "
+                    "consumed={} exp={:08X} outLeft={} ihdr=[{:08X} {:08X}] "
                     "outPtr={:08X} lr={:08X} j2={}",
-                    n, st, inLeft, inPtr, consumed, expected, MclaBE(ih),
+                    n, st, inLeft, inPtr, consumed, expected, outLeft,
+                    MclaBE(ih),
                     MclaBE(ih + 4), outPtr, static_cast<uint32_t>(ctx.lr),
                     j2Ent ? 1 : 0);
   }
@@ -11264,8 +11619,24 @@ PPC_FUNC(sub_821D5E10) {
       // w28: job1-style stack-head without a usable LastServe — host-serve
       // the assigned package (A47FD000 → 0x60000 meshtextures) to heap so
       // XMem reads real compressed bytes, not stack residue.
-      if (!served && stackPkgHead && outPtr != 0 && outPtr != 0xCDCDCDCDu &&
-          !IsJob2UiDest(outPtr)) {
+      const bool f524UiStackDest =
+          kF524ServeUiStackDests && !served &&
+          MclaUiServeClaim(g_f525CurJob.load(std::memory_order_relaxed)) &&
+          outPtr >= 0xA0000000u &&
+          outPtr < 0xE0000000u && inPtr != 0 && inPtr < 0xA0000000u &&
+          IsUiXsfPkg(MclaUiPkgOwningDestForCurrentJob(outPtr));
+      if (f524UiStackDest && !stackPkgHead)
+        MCLA_LOG_WARN("F524-SERVE-UI-DEST dest={:08X} st={:08X} inPtr={:08X} "
+                      "consumed={} inLeft={} pkg={:08X} (UI-owned, stack "
+                      "descriptor)",
+                      outPtr, st, inPtr, consumed, inLeft,
+                      MclaUiPkgOwningDestForCurrentJob(outPtr));
+      if ((!served && stackPkgHead && outPtr != 0 && outPtr != 0xCDCDCDCDu &&
+            !IsJob2UiDest(outPtr)) ||
+          (f524UiStackDest && outPtr != 0 && outPtr != 0xCDCDCDCDu &&
+           !IsJob2UiDest(outPtr))) {
+        // F-528: no hint — AssignPackageForDest is now job-strict itself, so a second resolution
+        // site here would just be a second chance to disagree.
         served = MclaForceServePkgForDest(outPtr, st, /*hostInflate=*/false);
         if (served) {
           (void)mem.ReadU32BE(st + 0, &inLeft);
@@ -13146,6 +13517,52 @@ PPC_FUNC(sub_821BC140) {
                   n, slotAddr, queueArg, ident, mask, base, recAddr, rec[0],
                   rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], cls, rlc, rl0,
                   rl1, rec[6]);
+    // F-519 (#91): register the dispatching job's OWN read-list slots against its
+    // OWN record's package offset. This is the title's data, read the same way
+    // BC140 itself reads it, so a dest can only be bound to a job that lists it —
+    // the property F-518 lacked (it keyed on our plan builder, which claims slots
+    // such as B7D21000 that REQDUMP #2 proves this job never owned).
+    // F-521 RETARGETS THE SOURCE: `rec[6]` here is read at hook ENTRY, ~270 lines
+    // BEFORE `F503-ENTRY` restores the record from the per-handle snapshot, so for
+    // jobs 2-4 it is the NEXT container's package (w529: rec+24=64CA3000 for the
+    // garage, then `F503-ENTRY #2 ... +24 64CA3000->64980000` in the same ms).
+    // w529's ~201 inflates per non-zero slot show those dests are the ones actually
+    // decoded, while slot[0] (the only correctly-bound dest) gets none — so binding
+    // a pre-restore sample guaranteed F-519's null result. Take the package from the
+    // same snapshot the restore will apply, keyed on this handle.
+    uint32_t pkg24 = rec[6];
+    if (const F501Body *fb = F501Find(ident)) {
+      const uint32_t w = fb->w24.load(std::memory_order_relaxed);
+      if (IsUiXsfPkg(w)) pkg24 = w;
+    }
+    g_f525CurJob.store(slotAddr, std::memory_order_relaxed);
+    g_f525CurGen0.store(ident < 0x8000u, std::memory_order_relaxed);
+    if (kF519BindJobOwned && IsUiXsfPkg(pkg24) && rlc > 0u && rlc <= 64u) {
+      uint32_t added = 0;
+      std::lock_guard<std::mutex> rlk(g_uiSlotRangeMtx);
+      for (uint32_t i = 0; i < rlc; ++i) {
+        uint32_t pb = 0, sz = 0;
+        if (!smem.ReadU32BE(slotAddr + 8u + 12u * i, &pb) ||
+            !smem.ReadU32BE(slotAddr + 12u + 12u * i, &sz) || sz == 0u ||
+            pb < 0xB0000000u || pb >= 0xC0000000u)
+          continue;
+        bool dup = false;
+        for (const auto &R : g_uiSlotRanges)
+          if (R.lo == pb && R.pkg == pkg24) {
+            dup = true;
+            break;
+          }
+        if (dup)
+          continue;
+        g_uiSlotRanges.push_back({pb, pb + sz, pkg24, slotAddr});
+        ++added;
+      }
+      MCLA_LOG_WARN("F519-REGISTRATION job={:08X} h={:08X} pkg={:08X} "
+                    "rec+24={:08X} rlc={} added={} table={} (snapshot-keyed, "
+                    "not the entry-time record)",
+                    slotAddr, ident, pkg24, rec[6], rlc, added,
+                    g_uiSlotRanges.size());
+    }
   }
   if (n <= 16 || (n % 2000) == 0)
     MCLA_LOG_INFO("INLINE-EXEC sub_821BC140 #{} a0={:08X} a1={:08X} "
@@ -15047,15 +15464,22 @@ PPC_FUNC(sub_821E2940) {
           // ppc_recomp.43.cpp:23224+). Read it alongside the descriptor slot: this is the
           // discriminator between "the UI-load init lost its allocation" and "the path
           // diverted", since neither the enter/return censuses can tell (JUMPOUT).
-          uint32_t alloc17000 = 0, sing = 0;
+          uint32_t alloc17000 = 0, alloc17000Real = 0, sing = 0;
+          // F-563: the guest publishes to 0x8286D810, NOT the 0x82A6D810 read below. Raw
+          // image words 3D608287/93EBD810 (822C2EEC/EF0) and 3D408287/916AD810 (822C2EF8/2F00)
+          // are both `lis r,0x8287 / stw r31,-10224(r)` = 0x82870000 - 0x27F0 = 0x8286D810, and
+          // no instruction anywhere in the 10,354,688-byte image forms a 0x82A6xxxx base, so
+          // alloc17000 has always read an untouched dword. Kept alongside for A/B.
           (void)mem.ReadU32BE(0x82A6D810u, &alloc17000);
+          (void)mem.ReadU32BE(0x8286D810u, &alloc17000Real);
           (void)mem.ReadU32BE(0x8287E26Cu, &sing);
           if (f1 <= 4)  // prints the FIRST 4, so any count <=4 is complete (F-317)
             MCLA_LOG_WARN("F361-BOOTOBJ #{} obj={:08X} desc[+88..+104]={:08X} {:08X} "
                           "{:08X} {:08X} {:08X} want+92=82131008 got+92={:08X} "
-                          "[82A6D810 alloc17000]={:08X} [8287E26C]={:08X}",
+                          "[82A6D810 alloc17000]={:08X} [8287E26C]={:08X} "
+                          "[8286D810 real]={:08X}",
                           f1, bootObj, d[0], d[1], d[2], d[3], d[4], d[1], alloc17000,
-                          sing);
+                          sing, alloc17000Real);
         } else {
           static std::atomic<uint32_t> s_f361bad{0};
           if (s_f361bad.fetch_add(1) + 1 <= 4)
@@ -17225,6 +17649,107 @@ MCLA_T4A2_CENSUS(sub_8263DCF8, own63DCF8)
 MCLA_T4A2_CENSUS(sub_8263E1E8, own63E1E8)
 
 #undef MCLA_T4A2_CENSUS
+
+// F-554: the boot worker is measured stuck inside sub_822C3A58 (MEMFMT ENTER with r4=FFFFFFFF, no -RET),
+// whose 0x822C3B38 loop calls sub_821CD750 once per 1144-byte stride while decrementing r31 to <0. That
+// loop is the last uninstrumented frame in the chain that gates the UILOAD registration at 0x821315F4, so
+// census its entries with a stride-visible row. Cap is coarse (8 rows, then every 65536th) because a
+// 2^31-scale count would otherwise poison the log the way F-054's 616,824-row mitigation did.
+PPC_FUNC_IMPL(__imp__sub_821CD750);
+PPC_FUNC(sub_821CD750) {
+  static std::atomic<uint64_t> s_554{0};
+  const uint64_t n = s_554.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (n <= 8 || (n % 65536) == 0)
+    MCLA_LOG_WARN("F554-CD750 #{} r3={:08X} r4={:08X} lr={:08X} tid={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, lr, GetCurrentThreadId());
+  __imp__sub_821CD750(ctx, base);
+}
+
+// F-555: F-554 refuted the C3A58 loop, and the boot worker then goes silent for 133 s with only
+// sub_822C2EA8 still on the stack, past its call site at 0x822C3040. Census the next four call targets in
+// program order so the last ENTER without a matching RET names the frame that holds the worker. Rule 4
+// checked: each address had exactly one site (the function map) before these hooks. Log-only.
+#define MCLA_F555_STEP_CENSUS(sym, tag)                                            \
+  PPC_FUNC_IMPL(__imp__##sym);                                                     \
+  static std::atomic<uint32_t> s_##tag{0};                                         \
+  PPC_FUNC(sym) {                                                                  \
+    const uint32_t n = s_##tag.fetch_add(1) + 1;                                   \
+    if (n <= 16 || (n % 200) == 0)                                                 \
+      MCLA_LOG_WARN("F555-{} #{} r3={:08X} r4={:08X} lr={:08X} tid={:08X}", #sym,  \
+                    n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr),      \
+                    GetCurrentThreadId());                                         \
+    __imp__##sym(ctx, base);                                                       \
+    if (n <= 16 || (n % 200) == 0)                                                 \
+      MCLA_LOG_WARN("F555-{}-RET #{} ret={:08X}", #sym, n, ctx.r3.u32);            \
+  }
+
+MCLA_F555_STEP_CENSUS(sub_822D29A0, step2D29A0)
+MCLA_F555_STEP_CENSUS(sub_822C6FC0, step2C6FC0)
+MCLA_F555_STEP_CENSUS(sub_822BFDB0, step2BFDB0)
+MCLA_F555_STEP_CENSUS(sub_822D0048, step2D0048)
+// F-555 step 2: all four of the above returned in w563 and the worker still never came back from
+// sub_822C2EA8, so continue the walk in program order past call site 0x822C3050. Rule 4 re-checked: each
+// address had exactly one site (the function map) before these hooks. sub_82130528 (0x822C3060) is skipped -
+// it is the XTL allocator and already owned elsewhere.
+MCLA_F555_STEP_CENSUS(sub_822C4E28, step2C4E28)
+MCLA_F555_STEP_CENSUS(sub_82243780, step243780)
+MCLA_F555_STEP_CENSUS(sub_822D2310, step2D2310)
+MCLA_F555_STEP_CENSUS(sub_822E50D8, step2E50D8)
+MCLA_F555_STEP_CENSUS(sub_8260C418, step60C418)
+MCLA_F555_STEP_CENSUS(sub_822C5070, step2C5070)
+// F-556: sub_822C54D8 is censused by the dedicated hook below (which also prints its dispatch slots), so no
+// macro instance for it here - a second PPC_FUNC definition of the same symbol would not compile.
+// F-556: sub_822C51B0 only - sub_821BD618 already has a PPC_FUNC elsewhere in this tree, and linking the
+// macro instance produced "lld-link: error: duplicate symbol: sub_821BD618". Note for the rule-4 check: an
+// address whose --check output lists no "map" line is already owned by a hand hook, not by the function map.
+MCLA_F555_STEP_CENSUS(sub_822C51B0, step2C51B0)
+// F-557: F-556 named the dispatch target 0x822C5548, which is its own mapped routine whose body is
+// store-[obj+0] / bl sub_822C5428 / bl sub_821D2028 / conditional free. Census all three so the held frame
+// resolves to one of them. sub_821D2028 sits in the streamer/inflate address band, which is the region this
+// objective is about. Rule 4: each had 1 site, the function map, before these hooks. Log-only.
+MCLA_F555_STEP_CENSUS(sub_822C5548, step2C5548)
+MCLA_F555_STEP_CENSUS(sub_822C5428, step2C5428)
+MCLA_F555_STEP_CENSUS(sub_821D2028, step1D2028)
+
+#undef MCLA_F555_STEP_CENSUS
+
+// F-556: sub_822C54D8 is the frame that holds the boot worker (ENTER 1 / RET 0 in w564) and its body ends
+// in two bctrl dispatches whose target is loaded from [r3]. Print the object and its first dispatch slots so
+// the target is named from the log instead of guessed. Log-only; rule 4 checked (1 site, the map).
+PPC_FUNC_IMPL(__imp__sub_822C54D8);
+static std::atomic<uint32_t> s_556{0};
+PPC_FUNC(sub_822C54D8) {
+  const uint32_t n = s_556.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = ctx.r3.u32;
+  uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+  if (obj >= 0x80000000u && obj < 0xE0000000u) {
+    (void)mem.ReadU32BE(obj + 0, &s0);
+    (void)mem.ReadU32BE(obj + 4, &s1);
+    (void)mem.ReadU32BE(obj + 8, &s2);
+    (void)mem.ReadU32BE(obj + 12, &s3);
+  }
+  MCLA_LOG_WARN("F556-C54D8 #{} obj={:08X} r4={:08X} lr={:08X} tid={:08X} "
+                "[obj+0..+12]={:08X} {:08X} {:08X} {:08X}",
+                n, obj, ctx.r4.u32, static_cast<uint32_t>(ctx.lr), GetCurrentThreadId(), s0, s1, s2, s3);
+  __imp__sub_822C54D8(ctx, base);
+  MCLA_LOG_WARN("F556-C54D8-RET #{} ret={:08X}", n, ctx.r3.u32);
+}
+
+// F-571 (measured, REVERTED — kept as a comment so the next agent does not
+// rediscover it): sub_821C6D90 is an atArray push whose grow path does
+// `capacity += r4` with the caller's r4=4, so capacity grows LINEARLY
+// (measured 4,8,12,...24000) and every 4th push reallocs+copies the whole
+// array -> O(n^2). The boot worker spent >600 s parked here (PARK-STACK
+// lr=821C6DC8, chain 821DD670->821C7000->821C6D90->sub_821C6658). A hook that
+// set r4=capacity (geometric doubling) DID unblock the worker — its park moved
+// off 821C6DC8 to 82137904 — but the [obj+6] capacity field is 16-bit (guest
+// reads lhz, writes `clrlwi r4,r11,16`), so doubling past 32768 wraps to 0,
+// sub_821C6658 then allocs 0 bytes and the boot threw 293,212 C0000005. The
+// fix is correct in shape but must clamp new capacity to stay < 65536 (e.g.
+// r4 = min(capacity, 65535 - 2*capacity) and stop doubling near the ceiling).
+// Guest body: generated/ppc_xenon/ppc_recomp.16.cpp:4591.
 
 // Plain "memory:" @0x820127D8 owners â€” all fiDevice prefix parsers
 // (hash/EMB/GETDEV), NOT a constructor. Census to confirm they are the

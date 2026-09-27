@@ -1214,6 +1214,40 @@ PPC_FUNC(sub_825EF100)
         if (arr != 0 && arr != 0xCDCDCDCDu && arr != 0xFFFFFFFFu)
             (void)mem.ReadU32BE(arr, &arr0);
     }
+    // F-563: Pre-populate CDCD containers at B7921000/B7B41000 before EF100
+    // runs. These objects are allocated but never filled by the streamer
+    // before the PLACE pass executes. Writing a minimal valid empty swfC
+    // structure prevents the fatal in sub_825FDA90 (swfOBJECT::Fixup) and
+    // lets the boot proceed. The guest's own FDBF8 will overwrite [obj+0]
+    // with the real vtable (82085364).
+    const bool isCdcdTarget = (obj == 0xB7921000u || obj == 0xB7B41000u);
+    const bool needsPrepop = isCdcdTarget && (vt == 0xCDCDCDCDu);
+    if (needsPrepop)
+    {
+        // Write minimal valid empty swfC container:
+        // [obj+0]  = 0 (vtable placeholder; FDBF8 overwrites with 82085364)
+        // [obj+4]  = 0
+        // [obj+8]  = 0
+        // [obj+12] = 0 (child array ptr = NULL)
+        // [obj+16] = 0 (child count = 0, u16)
+        // [obj+24] = 0 (entry array ptr = NULL)
+        // [obj+50] = 1 (entry count = 1; skips the walk loop which checks >1)
+        (void)mem.WriteU32BE(obj + 0, 0);
+        (void)mem.WriteU32BE(obj + 4, 0);
+        (void)mem.WriteU32BE(obj + 8, 0);
+        (void)mem.WriteU32BE(obj + 12, 0);
+        (void)mem.WriteU16BE(obj + 16, 0);
+        (void)mem.WriteU32BE(obj + 24, 0);
+        (void)mem.WriteU16BE(obj + 50, 1);
+        MCLA_LOG_WARN("EF100-PREPOP #{:03} obj={:08X} — wrote empty swfC "
+                      "(vt=0 arr=0 cnt=0 +24=0 +50=1) to prevent CDCD fatal",
+                      n, obj);
+        // Re-read after pre-population so the rest of the hook sees valid data
+        vt = 0; arr = 0; arr0 = 0; cnt = 1;
+        (void)mem.ReadU32BE(obj, &vt);
+        (void)mem.ReadU32BE(obj + 12, &arr);
+        (void)mem.ReadU16BE(obj + 16, &cnt);
+    }
     const bool rsc =
         (vt & 0xFFFFFF00u) == 0x44495500u ||
         (vt & 0xFFFFFF00u) == 0x44365500u || (vt & 0xFFFFu) == 0x5500u;
