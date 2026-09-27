@@ -10702,3 +10702,24 @@ seeding result already known.
 **2. Consequences for the objective's two clauses.** Clause (a) — "UI .xsf decompressed" — has Path A's byte-exact placement of 3 of 4 containers plus this new, pin-only guest-side decode of 31 % of the fourth, at the cost of the boot. Clause (b) — "so GFx can initialize" — is unmoved by all of it: `F438-GFXCTOR` 0 and `XSF-INFLATE` 0 in every soak this session. **Objective OPEN.**
 
 **3. The two remaining routes, both named:** (i) the in-loop instrument inside `sub_821BC140` (needs `midasm_hook`/regen; toolchain currently broken — user's call), or (ii) make the loader's wait satisfiable without the tail, which means finding what the loader blocks on after `sub_821BCB10` returns and why `RELSEMA … lr=821BC538` = 1 does not release it (a fresh, host-side-searchable question — the pin's stall is exactly this wait, so solving it may make the pin's decode result reachable in a normal boot). Next ID **F-493**.
+
+### F-493 (2026-09-27 07:3x, **0 builds — one thread-attribution query on `w489` plus two already-shipped markers**) — **THE MISSING COMPLETION CALLBACKS DO NOT GATE THE BOOT, SO THE OBJECTIVE'S TWO CLAUSES ARE NOT ONE CHAIN AFTER ALL: in the shipped (pin-off) soak the loader runs its later phases at full strength — `LISTLINE` 171, `BOOTPATH` 10, `PUSH` 7 — while `RELSEMA … lr=821BC538` is 1 of 7, i.e. six jobs never report completion and nothing downstream notices. And the pin's own stall is self-inflicted, not a discovery: under the pin the loader thread spends the remaining 4.5 minutes in a repeating finite 10 ms wait (`WAIT[KDELAY] … lr=824602C4`, 25,000+ `PARK-CENSUS[KDELAY]` rows for `tid` = the push thread) — which is the join my pin is designed to make it wait in.**
+
+- Task:        T42.24 (#79) — closed, with the premise of route (ii) falsified
+- Type:        FACT + RE-FRAMING of the objective's second clause
+- Class:       G + H (the pin's wait read as an independent discovery)
+- Priority:    P0 — it prevents the next session from spending its budget on the wrong gate
+- Evidence:    `build/w490.log` / `build/w486.log` (`LISTLINE` 171, `BOOTPATH` 10, `PUSH` 7 with `lr=821BC538` = 1) · `build/w489.log`: 142 rows for the loader `tid=00005AB8` captured from its own `PUSH … tid=` field, of which 60 are `WAIT[KDELAY] … to=10ms lr=824602C4` and 25,000+ are the sampled `PARK-CENSUS[KDELAY] #5000..#25000` for the same `tid` and `lr` · F-440/F-441 (registry never read; no poster exists for the GFx dispatch queue)
+
+**1. What this means for the objective.** "Get the UI .xsf containers decompressed" and "so GFx can
+initialize" were treated here as cause and effect; in the current boot they are not — six missing
+streamer completions do not stop any later phase. So the GFx half stays exactly where F-440/F-441 left
+it (no producer posts to the GFx dispatch queue), which is a dispatch-layer gap, not an inflate-layer
+one, and the only host-side lever ever identified for the boot gate as a whole is rule-2/**F-055**,
+which is the user's decision and remains closed by default.
+
+**2. What is still true and worth keeping from this branch:** Path A's 3-of-4 byte-exact placement (the
+real decompression deliverable), the complete record/pool lifecycle (F-469…F-478), and F-492's
+quantified fact that record ownership is enough to make the guest *decode* 327,680 bytes of the fourth
+container on its own. What is no longer supported: that any of these is the gate on GFx. Next ID
+**F-494**.
