@@ -548,3 +548,23 @@ pair is `sub_821BC140`'s own stack slots (`r1+96`/`r1+100`, identified arithmeti
 - **Success criteria unchanged and all still zero:** `XSF-INFLATE` > 0,
   `RELSEMA … lr=821BC538` above 1, `F438-GFXCTOR` ≥ 1 guest-produced, and a second package at
   `still_present == claimed == goldsize`. Objective OPEN.
+
+### 9.3 The loop's own frame is observable after all, and it narrows the last step to two fields (F-495/F-496)
+
+`InflateBegin` receives `r4 = r1+96`, so the walk's frame is readable from a permitted hook:
+`[sp+80]` source cursor, `[sp+96]` inflate state, `[sp+128]` the RSC5/XMem descriptor block. Measured:
+
+- Baseline: the garage's descriptor block carries **policecam's** XCompress header
+  (`0FF512EF 00004B89`) and `exp = 0x4B89`, with the cursor parked at policecam's end; every silent
+  job inherits the previous container's block, and the one completing job has an all-zero block.
+- With record ownership (pin armed): the garage's block becomes its own (`0FF512EF 00104449`,
+  `exp = 1,066,057`) and the following iterations hold high-entropy payload while the cursor steps
+  32 KiB at a time — the guest decoding its own container. The job still never reaches its tail.
+- `[inflater+1852]`, the loop's re-entry byte, is 0 for every job (F-496), so it is not the cause.
+
+Remaining outside-the-loop candidates: the produced-vs-`[desc+0]` equality at
+`ppc_recomp.14.cpp:19100-19105` and the destination accounting at `[sp+28]` (`0x124000` / `0x94000`
+/ `0x46000` / `0x1CA000` / `0xA000` per window). Both need `r27`/`r29` inside `sub_821BC140`, i.e. the
+`midasm_hook` route and a working recompiler — or the user's F-055 gate for the GFx half, which F-493
+showed is a separate chain.
+
