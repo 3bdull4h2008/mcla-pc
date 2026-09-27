@@ -10413,3 +10413,33 @@ entries on one thread, but the rows counted inside a span include work by *other
 same two timestamps, so these are per-window totals, not per-job costs. Reading them as per-job would
 repeat the F-308 class of error. The one claim that survives the limit is the ratio (reads : decodes ≥
 10:1 in six of seven windows), because no other thread issues `READWRAP` rows at that rate.
+
+### F-480 (2026-09-27 06:3x, **0 builds — histogramming the post-call rows of an existing marker per job window**) — **THE SILENT JOBS ARE NOT SPINNING ON DATA, THEY ARE SPINNING ON A FIXED, FOREIGN READ ADDRESS: every `READWRAP sub_821CC6F0` row inside a job's own window carries the SAME `r5` offset, and for the six non-completers that offset is not inside their package at all — the garage's 10,251 attempts all ask for `r5=64CA7B89`, which is `0x64CA3000 + 0x4B89` = POLICECAM'S package base + policecam's full length, i.e. one-past-the-end of a container it was never loading. Job #1, the only completer, spends all 1,216 attempts at `r5=64CB0000`, exactly its own record's `+24`.**
+
+- Task:        T42.19 (#78) — answered read-only
+- Type:        FACT
+- Class:       E + G
+- Priority:    P0 — this is the mechanism F-186/F-187 asked for, and it is the first per-job discriminator found
+- Evidence:    `build/w480.log` windows `BC140-REC #k` → `POST-EXEC-START #k`, rows `READWRAP sub_821CC6F0 #N r3=C64AC100 r4=C64B7600 r5=<off> r6=006D8F40 r7=0 ret=0 r1in=006D8EC0 r1out=006D8EC0 lr=821CCDBC` (printer `src/gpu_device.cpp:14753` region); counts per window: `#1 1,216 rows / 1 distinct r5=64CB0000 / 1 distinct r6 / ret=0 ×1216`, `#2 10,251 / 64CA7B89`, `#3 1,005 / 649763D7`, `#4 604 / 000A0000`. Arithmetic against F-469's snapshots: `0x64CA7B89 − 0x64CA3000 = 0x4B89 = 19,337` = the policecam record's `+4` that the garage's job read at `C9E24938`; `0x649763D7 − 0x6496F000 = 0x73D7 = 29,655` = the same shape for job #3 against container 4's record; the garage's own package spans `0x64980000..0x64A84449` (`+24`/`+4` from `F469-RECSNAP #2`), so `64CA7B89` is **outside it by ~3 MB**
+
+**1. The discriminator, in one sentence per job.** A job reads at one constant address for its whole
+life; if that address is its own record's package base it completes (job #1), and if the record it
+resolved was already re-stamped by the next container (F-469 §4) it reads at *that* container's
+end-of-data, gets `ret=0` every time, and never reaches the tail that would release the record and fire
+the callback (F-478). That connects F-469 (foreign record), F-470 (unchecked index), F-478 (count
+never dropped) and F-186 (no guest inflate) into one chain with a measured link at each step.
+
+**2. What is NOT yet derived, and it matters for the fix.** The offset is `record+24 + record+4` of the
+FOREIGN record for jobs #2/#3 but plain `record+24` for job #1 (whose `+4 = 0x22EDD` is non-zero), so the
+running-offset term is not simply the record's length. Naming that term — the read cursor's source
+inside `sub_821BC140`'s descriptor walk (F-393 read the loop at `ppc_recomp.14.cpp:19042-19170`;
+`sub_821CC6F0` itself is `ppc_recomp.17.cpp:3931-3996` and computes `r5 = [obj+24] + r31`) — is the next
+static step, because a construction that hands a job a record must make BOTH terms consistent with the
+destination chain the job already owns.
+
+**3. Route status.** This makes task #15's restated form (give the job a record index that survives its
+own dispatch) the only Path-B shape left, and it says what success looks like measurably: job #2's
+window would show `r5` inside `0x64980000..0x64A84449` and advance, `RELSEMA … lr=821BC538` would count
+above 1, and a second package would reach `still_present == claimed == goldsize`. Do not re-arm the
+served-body branch to fake an answer at the foreign address (task #70, `w461`/`w463` measured the
+regression), and do not write record values at the enqueue site (F-468/F-470). Next ID **F-481**.
