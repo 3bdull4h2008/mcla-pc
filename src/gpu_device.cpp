@@ -4708,26 +4708,47 @@ static bool F483Pending(uint32_t tag) {
 // Set false for the exact pre-change behaviour.
 static constexpr bool kF501RestoreLength = true;
 static constexpr uint32_t kF501Ring = 32;
-static std::atomic<uint32_t> g_f501Rec[kF501Ring]{};
-static std::atomic<uint32_t> g_f501Len[kF501Ring]{};
+// F-503 (T42.32): the record body, captured per HANDLE, not per address. w502 shows
+// every container is opened TWICE, by two different callers (`lr=821E29C4` then
+// `lr=821E5E10`, ~10-25 ms apart), and the pair of returns steps the handle: raceeditor
+// -> 00000000 then 00000001, garage -> 00008001 then 00000002, policecam -> 00008002 then
+// 00000003, meshtextures -> 00008003 then 00000004. The FIRST open of container N+1
+// therefore writes its {+4,+16,+20,+24} into the record index that container N's
+// dispatched job is about to read - which is what F-467 saw as "garage ran policecam's
+// record", now with the writing site named. F-502 only guards +4, so w502 job #2 still
+// walked policecam's package offset (offFirst=64CA3000) with the garage's byte count.
+// Keying on the handle is what makes this safe to undo: the handle names one open call,
+// the address names whichever container got there last.
+struct F501Body {
+  std::atomic<uint32_t> h{0}, rec{0}, w4{0}, w16{0}, w20{0}, w24{0};
+};
+static F501Body g_f501[kF501Ring]{};
 static std::atomic<uint32_t> g_f501N{0};
-static void F501Note(uint32_t rec, uint32_t len) {
-  if (rec == 0 || len == 0) return;
+static void F501Note(uint32_t h, uint32_t rec, uint32_t w4, uint32_t w16,
+                     uint32_t w20, uint32_t w24) {
+  if (rec == 0 || w4 == 0) return;
   const uint32_t i = g_f501N.fetch_add(1, std::memory_order_relaxed) % kF501Ring;
-  g_f501Len[i].store(len, std::memory_order_relaxed);
-  // Length before address: F501Lookup matches on the address, so publishing the value
-  // first means a match can never observe a slot holding a new address and an old length.
-  g_f501Rec[i].store(rec, std::memory_order_relaxed);
+  g_f501[i].rec.store(rec, std::memory_order_relaxed);
+  g_f501[i].w4.store(w4, std::memory_order_relaxed);
+  g_f501[i].w16.store(w16, std::memory_order_relaxed);
+  g_f501[i].w20.store(w20, std::memory_order_relaxed);
+  g_f501[i].w24.store(w24, std::memory_order_relaxed);
+  // Handle last: it is the key F501Find matches on, so a reader can never pair a new
+  // handle with the previous occupant of the slot.
+  g_f501[i].h.store(h, std::memory_order_relaxed);
 }
-static uint32_t F501Lookup(uint32_t rec) {
+static const F501Body *F501Find(uint32_t h) {
   const uint32_t n = g_f501N.load(std::memory_order_relaxed);
   const uint32_t lim = n < kF501Ring ? n : kF501Ring;
-  uint32_t best = 0;
+  const F501Body *best = nullptr;
   for (uint32_t i = 0; i < lim; ++i)
-    if (g_f501Rec[i].load(std::memory_order_relaxed) == rec)
-      best = g_f501Len[i].load(std::memory_order_relaxed);
+    if (g_f501[i].h.load(std::memory_order_relaxed) == h) best = &g_f501[i];
   return best;
 }
+// F-503 also restores the three address/geometry words the walk reads at
+// ppc_recomp.14.cpp:18904 (record+24), :18931 and :18957 (record+16). Set false to get
+// back F-502's exact single-word behaviour.
+static constexpr bool kF503KeepFieldsOnRelease = true;
 
 // F-502 (T42.31): WHERE that zero actually lands. w501 measured `F500-DEVREAD #1`
 // reading record C9E2491C's +4 as 143,069 at our dispatch-entry probe, and the walk's
@@ -4746,13 +4767,34 @@ static std::atomic<uint32_t> g_f483RetN{0};
 static void F502Keep(uint32_t tag, uint32_t rec) {
   if (!kF502KeepLenOnRelease || rec == 0) return;
   if (!F483In(g_f483Pushed, tag) || F483In(g_f483Retired, tag)) return;
+  const F501Body *b = F501Find(tag);
+  if (b == nullptr) return;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t now = 0;
-  if (!mem.ReadU32BE(rec + 4u, &now) || now != 0) return;
-  const uint32_t saved = F501Lookup(rec);
-  if (saved != 0 && mem.WriteU32BE(rec + 4u, saved))
-    MCLA_LOG_WARN("F502-KEEP tag={:08X} rec={:08X} +4 0->{} (job in flight)", tag,
-                  rec, saved);
+  if (mem.ReadU32BE(rec + 4u, &now) && now == 0) {
+    const uint32_t saved = b->w4.load(std::memory_order_relaxed);
+    if (saved != 0 && mem.WriteU32BE(rec + 4u, saved))
+      MCLA_LOG_WARN("F502-KEEP tag={:08X} rec={:08X} +4 0->{} (job in flight)", tag,
+                    rec, saved);
+  }
+  if (!kF503KeepFieldsOnRelease) return;
+  // F-503: undo the next container's first-open write to the words the walk uses as the
+  // package offset and the block geometry. Only fields whose current value differs from
+  // what THIS handle's open wrote are touched, and +8 (device) / +0 / +12 (pool
+  // bookkeeping) are left exactly as the release put them.
+  static const uint32_t kOff[3] = {16u, 20u, 24u};
+  for (uint32_t f = 0; f < 3u; ++f) {
+    const uint32_t want = f == 0u ? b->w16.load(std::memory_order_relaxed)
+                        : f == 1u ? b->w20.load(std::memory_order_relaxed)
+                                  : b->w24.load(std::memory_order_relaxed);
+    if (want == 0) continue;
+    uint32_t cur = 0;
+    if (!mem.ReadU32BE(rec + kOff[f], &cur) || cur == want) continue;
+    if (mem.WriteU32BE(rec + kOff[f], want))
+      MCLA_LOG_WARN("F503-KEEP tag={:08X} rec={:08X} +{} {:08X}->{:08X} "
+                    "(open-of-next-container)",
+                    tag, rec, kOff[f], cur, want);
+  }
 }
 
 constexpr uint32_t kTaskJoinCountAddr = 0x8283D1A8u;
@@ -12804,7 +12846,11 @@ PPC_FUNC(sub_821BCE68) {
     (void)m.ReadU32BE(rec + 12u, &rflag);
     (void)m.ReadU32BE(rec + 16u, &rpkg);
     (void)m.ReadU32BE(rec + 20u, &rent);
-    F501Note(rec, rlen);   // F-501: remember what Open wrote into record+4
+    uint32_t rp24 = 0;
+    (void)m.ReadU32BE(rec + 24u, &rp24);
+    // F-501/F-503: remember the body THIS handle's open wrote, so the release can hand
+    // the walk-consumed words back before the job reads them.
+    F501Note(rid, rec, rlen, rpkg, rent, rp24);
   }
   if (n <= 24 || (n % 500) == 0)
     MCLA_LOG_INFO("STREAM-OPEN sub_821BCE68 #{} r3={:08X} r4={:08X} r5={:08X} "
@@ -13080,10 +13126,39 @@ PPC_FUNC(sub_821BC140) {
       // `lwz r30,4(r28)` (ppc_recomp.14.cpp:18967) reads it as the walk's remaining
       // byte count. Only ever fires on a record whose field is currently 0, and only
       // with a value this same subsystem saw Open write.
+      // F-501/F-503 at the LAST host-visible point before the guest loads record+4
+      // (:18966), +24 (:18904) and +16 (:18931/:18957). The release-side keeper cannot be
+      // the only one: the next container's first open clobbers +16/+20/+24 ~12 ms AFTER
+      // this handle's release (w502: F502-KEEP tag=2 at 42.138, the policecam open into
+      // index 2 at 42.162, dispatch #2 at 42.179), so the value has to be re-asserted on
+      // the way into the walk as well.
       uint32_t restored = 0;
-      if (kF501RestoreLength && rlen == 0) {
-        const uint32_t saved = F501Lookup(rec);
-        if (saved != 0 && g5.WriteU32BE(rec + 4u, saved)) restored = saved;
+      if (kF501RestoreLength) {
+        static const uint32_t kEOff[4] = {4u, 16u, 20u, 24u};
+        for (uint32_t f = 0; f < 4u; ++f) {
+          // F-504 MEASURED (build of w504): dropping this guard makes every UI job walk
+          // its own FULL range (job #2: 64980000 -> 64A84449 = the garage's exact
+          // 1,066,057 bytes, 33 reads, 6 guest LZX frames) and then the boot goes quiet -
+          // dispatch #5 enters sub_821BC140 and never returns, GFx 13 -> 7, W34-NOGFX
+          // 6 -> 3, Fatal error 0 -> 1. A non-zero +4 is a newer owner's legitimate value,
+          // so overriding it corrupts a live record (the F-468 mistake in new clothes).
+          if (f == 0u && rlen != 0) continue;
+          const F501Body *b = F501Find(f483Tag);
+          if (b == nullptr) break;
+          const uint32_t want =
+              f == 0u ? b->w4.load(std::memory_order_relaxed)
+              : f == 1u ? b->w16.load(std::memory_order_relaxed)
+              : f == 2u ? b->w20.load(std::memory_order_relaxed)
+                        : b->w24.load(std::memory_order_relaxed);
+          if (want == 0) continue;
+          uint32_t cur = 0;
+          if (!g5.ReadU32BE(rec + kEOff[f], &cur) || cur == want) continue;
+          if (g5.WriteU32BE(rec + kEOff[f], want)) {
+            if (f == 0u) restored = want;
+            MCLA_LOG_WARN("F503-ENTRY #{} tag={:08X} rec={:08X} +{} {:08X}->{:08X}", n,
+                          f483Tag, rec, kEOff[f], cur, want);
+          }
+        }
       }
       if (g5.ReadU32BE(rec + 8u, &dev) && dev >= 0x80000000u &&
           g5.ReadU32BE(dev, &vtab) && vtab >= 0x80000000u) {

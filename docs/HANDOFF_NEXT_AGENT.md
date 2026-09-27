@@ -2405,3 +2405,33 @@ means the length field can no longer mask it. `XSF-INFLATE` is a host-VFS DEFLAT
 counter (F-502 section 5) - stop reading it as the goal's gate. `PRESENT` 61 -> 55 in `w502` is the
 one unexplained delta; re-check it on the next soak.
 
+
+
+## 2026-09-27 09:1x - every UI job now reads its own container (F-503, kept) and the measured bound (F-504, reverted)
+
+**Verdict: F-467's misattribution is closed.** Each UI container is opened TWICE by `sub_821BCE68`, from
+two callers (`lr=821E29C4` then `lr=821E5E10`), and the handle pair steps: raceeditor `0 -> 1`, garage
+`0x8001 -> 2`, policecam `0x8002 -> 3`, meshtextures `0x8003 -> 4`. So container N+1's *first* open
+writes container N's record index, between N's push and N's dispatch. `kF503KeepFieldsOnRelease`
+re-asserts `record+16/+20/+24` at dispatch entry from a ring keyed on the HANDLE, and `w503` shows the
+consequence directly: `offFirst` for jobs #2/#3/#4 becomes their own package offset
+(`64980000`/`64CA3000`/`6496F000`) instead of the following container's. `LZX-FRAME` 37 -> 48,
+`PRESENT` 55 -> 60, everything else flat, and `w505` reproduces `w503` marker-for-marker.
+
+**F-504 is the bound, and it is worth reading before anyone "finishes" this.** Removing the one guard
+that keeps `+4` restore conditional gave the guest the garage's COMPLETE walk -
+`offFirst=64980000 offLast=64A84449` = exactly its own 1,066,057 bytes, 33 chunk reads, 6 LZX frames -
+and the boot then stalled: 4 dispatches complete instead of 7, dispatch #5 enters `sub_821BC140` and
+never returns, `GFx` 13 -> 7, `Fatal error` 0 -> 1, 37k log lines instead of 139k. Reverted. A non-zero
+`record+4` is a newer open's live value; overriding it is not a fix. That is the fourth instance of the
+same class of error this session and it is written up as the section rule in F-504 §3.
+
+**Still true after all of this:** `F438-GFXCTOR` 0 - GFx never constructs. Clause (a) is now "every UI
+job reads the right address", not yet "every UI container is decompressed".
+
+**Next (T42.33, stated before touching anything).** The full-garage walk is worth keeping if it can be
+scoped to the four gen-0 UI handles (`tag < 0x8000`); the damaged dispatches in `w504` are the recycling
+trio `0x8004/0x10004/0x18004` on record index 4. That needs the release-side store census F-468 §3 has
+been prescribing since 05:1x: a range watch over `C9E24900..C9E249A4` naming every writer of `+4` per
+index, ordered against `STREAM-OPEN`/`PUSH`/`F502-KEEP`/`F503-ENTRY` - so ownership is answered by the
+guest's writes, not by another guess of ours. `tools/addr_owners.py --check` before any hook.
