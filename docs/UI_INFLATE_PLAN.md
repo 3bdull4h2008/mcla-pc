@@ -1,9 +1,13 @@
 # UI `.xsf` inflate — consolidated plan and Path A / Path B evaluation
 
-Written 2026-09-26, updated the same day through **F-333**. This is the single reference the
+Written 2026-09-26, updated the same day through **F-333**; brought up to date
+2026-09-27 through **F-451** (any pre-F-391 coverage number below is historical),
+and through **F-454** at 03:2x — see §0a, which supersedes the "next host-side lever"
+option that F-452 §3 left open.
+This is the single reference the
 objective asked for ("evaluate Path A and Path B, produce a concrete plan with
 file:line citations"). Evidence lives in `docs/ROOT_CAUSE_VALIDATION.md`
-(F-244…**F-333**); flags/short-circuits in `docs/PROGRAM_GUIDE.md` §7; markers in §9.
+(F-244…**F-454**); flags/short-circuits in `docs/PROGRAM_GUIDE.md` §7; markers in §9.
 Every claim below carries a log line or a `file:line`; nothing here is inferred
 from an earlier summary.
 
@@ -11,11 +15,42 @@ from an earlier summary.
 
 | Requirement | Status | Evidence |
 |---|---|---|
-| (a) UI `.xsf` containers decompressed **in guest memory** | **3 of 4 at 100 %, garage 5.9 % by the guest (63,072, now measured stable across 11 of 12 boots; one 121,946 outlier) / 64.9 % with host placement** | `w285`/`w295`: raceeditor `compared=143069 mismatch=0`, policecam `19337/0` ×2, credits `29655/0`; `w297`: garage `still_present=63072 pct=5`, `w296`: `pct=64` |
-| (b) **…so GFx can initialize** | **NOT achieved**, and NOT downstream of (a) | `MOVIE-CTOR` = 0 and `UILOAD-census` = 0 in every soak `w273`→`w308`, including the one where all four containers were placed (`w295`) |
+| (a) UI `.xsf` containers decompressed **in guest memory** | **3 of 4 at 100 %, garage 851,968–917,504 claimed of 1,066,057 (80–86 %), 872,032 durable = `pct=95`** — up from 5.9 % guest-only / 64.9 % with host placement (both figures predate F-391) | `w441`…`w452`: `UIXSF-GOLDEN-REVERIFY pkg=64980000 goldsize=1066057 claimed=917504 still_present=872032 pct=95 first_bad=00030005` (`w452`), `claimed=851968 pct=97` (`w441`/`w442`); raceeditor `pkg=64CB0000 claimed=143069 pct=100 first_bad=FFFFFFFF`; policecam `19337/0` ×2; credits `29655/0` |
+| (b) **…so GFx can initialize** | **NOT achieved**, and NOT downstream of (a) | `MOVIE-CTOR` = 0 and `UILOAD-census` = 0 in every soak `w273`→`w308`, and the whole T41.10 gate tuple (`W35-BOOT-GATE`, `BOOT-GATE-ENTER/RETURN`, `XSF-INFLATE`) is still 0 in `w442`…`w452`; the blocker is now localized *upstream* of decode — F-443…F-450: the enumerator's reader at `0x82860C68` holds a shaders `.list` and then XMem-compressed bytes, never the tune text |
 | Evaluate Path A (host LZX) | done, §2 | F-295…F-333 |
 | Evaluate Path B (guest descriptor construction) | done, §3 — mechanism identified (F-332 §4); eight variants closed by measurement; cause is structural: `obj` and `st` are per-job (F-339) | F-318…F-335 |
 | Concrete implementation plan with file:line citations | this document | — |
+
+## 0a. Dated update 2026-09-27 03:2x (F-452 → F-454) — the last host-side lever is now measured out
+
+F-452 §3 left one open candidate for clause (b): re-arm the guest-visible Open-gate bit30
+(the `WriteU32BE(entry+8, e8 | 0x40000000)` F-079 retired at `src/gpu_device.cpp:16035`)
+**only** for the two tuning-archive TOC entries, and judge it against four already-instrumented
+criteria. That soak ran (`w455`, after one wasted selector run `w454`) and **refuted the
+hypothesis** — recorded as **F-454**:
+
+- The bit really reached guest memory: `F453-TUNE-GATE … entry=C650CED0 +8 003F0000 ->
+  403F0000 readback=403F0000` (`w455.log:116853`) and the same for `C650CEB0` (`:117684`),
+  against `w452.log:122150`/`:122870` where those identical entries took the
+  "host cache only … guest memory untouched" branch.
+- Zero downstream movement: tune `MEMBER-EXPAND` rows 0 (all 51 rows are `shaders/*/preload.list`
+  ×5 each + `globaltex.list`), `F442-SECTION` 14 rows all `hits=0`, `F432-GROW-SKIP` 3 → 3,
+  `LISTLINE` 171 = 171, `C0000005` 0, `BC140-REC` 7, `nGfx=0` 6, `LZX-FRAME` 32 = 32.
+  The fourth criterion (`[0x828CD0AC] > 0`) was **unevaluable, not zero** — that probe printed
+  0 rows in both soaks.
+- Reverted, and the revert verified in the binary: `src/gpu_device.cpp` has no trace of the
+  experiment, and `build/mcla.exe` (57,435,136 B, 03:15) contains 0 occurrences of the marker
+  string while still containing `XSF-OPEN-GATE-SKIPPED` / `F447-REFILL` / `F432-GROW-SKIP`.
+
+**What this changes in the plan.** Clause (b)'s host-side option set is now empty by measurement:
+serve filter (F-446), host-serve reach (F-450), gate bit (F-454). §1's step "make the guest reach
+its own reset between streams" and task #15's descriptor shape are untouched by this, but neither
+addresses the tune-enumeration gap. The one cheap live probe is **#66**: tag every `LISTLINE` row
+with the path/buffer it came from, which is the only measurement left that can say *why* the loader's
+line loop composes shader lists and never tuning lists (F-451, on ground F-107/F-109 already mapped).
+The other option stays what it has been: §4 / the user's `F-055` host-forced boot-gate decision.
+Clause (a) is unaffected and held through `w455` itself: garage `claimed=851968`, `still_present=851968
+pct=100` early, `pct=94-97 / first_bad=00040005` late.
 | Implement + validate vs `w193` by soak census | done: 17 changes built/soaked/censused, 8 reverted on evidence (latest `w316`→`w317`) | `w274`–`w317`, `tools/soak_census.py` |
 
 **Score: goal NOT achieved.** Two independent blockers remain, and only one of
@@ -32,7 +67,7 @@ why every predicate below keys on the package offset, never on a dest address
 | raceeditor | `0x64CB0000` | 143,069 | 100 % verified in guest memory |
 | policecam | `0x64CA3000` | 19,337 | 100 % (two dests in `w285`) |
 | credits | `0x6496F000` | 29,655 | 100 % |
-| garage | `0x64980000` | 1,066,057 | 5.9 % guest-only; stops at the first `0x8000` block boundary |
+| garage | `0x64980000` | 1,066,057 | 851,968–917,504 claimed / 872,032 durable (`pct=95`) post-F-391; the `0x8000`-block wall is gone — `first_bad` is now `00030005`/`00040005`, never `00008000` (`w441`…`w452`) |
 
 Header layout, read offline from `build/game_data/xarchive_cache.rpf` at
 `+0x64980000`: `+00 05435352` (RSC5) · `+0C 0FF512EF` (XMem) ·
@@ -172,7 +207,7 @@ were aimed at is not in the image. What remains:
    never by assuming a window base. Guard with `IsValid` plus a check that the
    target is not one of the readlist slots. Acceptance: `LZX-FRAME … ret=32768`
    lines after the first ten, and `UIXSF-GOLDEN-REVERIFY … still_present` rising
-   past 63,072 **with `kUiXsfFillDryRun=true`**. If coverage does not rise, this
+   past 63,072 **(`kUiXsfFillDryRun` is `false` in the tree — flip it to `true` deliberately, only for a guest-only reading)**. If coverage does not rise, this
    line closes too, and the remaining candidate is making the guest reach its
    own reset (`sub_82460F88` / `sub_82461840`, which zero exactly this state)
    between streams — a different mechanism, not another framing knob.
@@ -192,7 +227,7 @@ were aimed at is not in the image. What remains:
    decoder's own progress.
 1d. **The failure is now inside the type-2 arithmetic decoder (F-345, static deduction).** The three exits from  to  are enumerated and two are excluded by logged values (type is 2, and  = 32,768 is non-zero), so the failing garage frames die in  after its tables have already been reinstalled from / (:16008-16060). The remaining split is cursor-content vs decoder-internal state, and F-345 §2 names the log-only measurement that decides it (per-frame cursor sequence within one outer call, against the offline walk). Everything in steps 1/1b/1c is upstream of that, which is why none of it moved output.
 1e. **Availability is now closed too (F-348, F-349) — Path B is down to one shape, and it is a different class of build.** w338 makes the failure arithmetically readable (`srcEnd - srcp - 4` = bytes presented; `sub_82461530` arms both fields from its own args at `ppc_recomp.82.cpp:14906`,`:14918-14920`): the ten successes each end with the source consumed to the last 2 bytes, and frame 10 is presented **zero** bytes with its cursor already on the context's staging end (`savedcur` = `stagbase+0x8000`, pinned on every frame). The obvious inference — feed it more — was built and falsified itself: presenting the entire 1,098,825-byte container in one call changed frame 10 **not at all** (same `frameoff=5698`, same cursor, same ten successes) and livelocked the boot (`INFLATE-ENTER` 106,697 vs 4,901, the garage reverify never ran). So the empty source is a symptom of the walk leaving the caller's buffer, and the three content-side causes are now each excluded by measurement: bytes (F-346), recognition (F-347), availability (F-349). **Do not re-run any of them, and do not build the arming-order variant of task #15** — F-344 already held one container at a time and moved every frontier number by exactly 0, so if the state is lost within one stream, order between streams cannot recover it. What remains that is not predicted-null is task #15's larger shape, a (record, context) pair per 28-byte descriptor created inside `sub_821BC140`'s walk (`generated/ppc_xenon/ppc_recomp.14.cpp:18805`), i.e. constructing the stream identity where the guest constructs it rather than steering the shared one from the hook layer — a new build class, and §4 (the user's `rule-2`/`F-055` decision) is now the better-value half of the objective.
- (F-346, F-347) — the only remaining Path B lever is the arming order, not a serve knob.** Two log-only/one-behaviour measurements settled it: every served window is byte-identical to the guest's own copy of the container (`w335:2578` ×6, `match=1`), and when the window is positioned so the guest's own preamble check succeeds — which it now does, `src +8`/`srcSz −8` (`w336:3769`) — coverage is still `63,072 / first_bad=00008000`. So the decoder is not rejecting our bytes or our framing; it loses its own continuation state after ten frames and then emits type-1 attempts with `bitbuf=0` forever (102,275 of them in `w337`, `cumprod` frozen). Do **not** re-run: frame-aligned serving (F-333/F-343, measured worse twice), any context-swap variant (F-337–F-342), or the head-serve (F-347). The one shape left is task #15's smaller one — serialise the streamer's arming so one container's frames run to completion before the next is armed, done at `sub_821BC140`'s 28-byte descriptor walk (`generated/ppc_xenon/ppc_recomp.14.cpp:18805`) where the (record, context) pair is actually born. Acceptance unchanged: `LZX-FRAME … ret=32768` lines past the tenth, `cumprod` climbing, `UIXSF-GOLDEN-REVERIFY pkg=64980000 still_present` past 63,072 **with `kUiXsfFillDryRun=true`**, plus a same-binary repeat soak and a per-marker table vs `w193` and vs the adjacent control boot. If that fails, Path B is finished and §4 (the user's decision) is the deliverable.
+ (F-346, F-347) — the only remaining Path B lever is the arming order, not a serve knob.** Two log-only/one-behaviour measurements settled it: every served window is byte-identical to the guest's own copy of the container (`w335:2578` ×6, `match=1`), and when the window is positioned so the guest's own preamble check succeeds — which it now does, `src +8`/`srcSz −8` (`w336:3769`) — coverage is still `63,072 / first_bad=00008000`. So the decoder is not rejecting our bytes or our framing; it loses its own continuation state after ten frames and then emits type-1 attempts with `bitbuf=0` forever (102,275 of them in `w337`, `cumprod` frozen). Do **not** re-run: frame-aligned serving (F-333/F-343, measured worse twice), any context-swap variant (F-337–F-342), or the head-serve (F-347). The one shape left is task #15's smaller one — serialise the streamer's arming so one container's frames run to completion before the next is armed, done at `sub_821BC140`'s 28-byte descriptor walk (`generated/ppc_xenon/ppc_recomp.14.cpp:18805`) where the (record, context) pair is actually born. Acceptance unchanged: `LZX-FRAME … ret=32768` lines past the tenth, `cumprod` climbing, `UIXSF-GOLDEN-REVERIFY pkg=64980000 still_present` past 63,072 **(`kUiXsfFillDryRun` is `false` in the tree — flip it to `true` deliberately, only for a guest-only reading)**, plus a same-binary repeat soak and a per-marker table vs `w193` and vs the adjacent control boot. If that fails, Path B is finished and §4 (the user's decision) is the deliverable.
 1g. **The ceiling is now measured and it is destination supply, not decoding (F-354).** `PATHB-HOSTDECODE-CHAIN` prints every destination the guest requests per package with its room and the guest's own record: **exactly two**, for each container, unchanged at 300 s (`w348`, `w349_long`). The three finished containers fit inside two requests (143,069 / 19,337 / 29,655) - that is why one-shot Path A completed them - and the garage's 1,066,057 does not, so F-350's 41.3 % *is* the budget, not progress cut short. Stricter: the 2nd request arrives with **policecam's** `exp=19337` and `inPtr` on the stack, i.e. the shared record `0x6D8F20` was re-used and only our map calls that destination garage's, so unambiguous placement is request 1 alone = **131,072 B = 12.3 %**. The slot question is settled by evidence, not choice: the ten successful frames wrote 327,680 B across `s1..s4` straight through the `50054000 -> 60000000` block jump, so position = **next slot in table order** (F-327's list model, confirmed) - which still does not license crossing into another load's table (F-351). Only two levers remain: make the guest issue **more inflate requests per container with a per-request record** (task #15, now carrying a measured reason), or have the consumer allocate by loading the movie (`nGfx`=0 = section 4, the user's decision). Host-allocated destinations are rejected: memory the loader does not own cannot be consumed, so it would not satisfy (a) in any meaningful sense.
 1f. **Path A placement is what moved the garage, and it is now at 41.3 % (F-350, kept; F-351/352, the limits).** The container was never blocked by the decoder: the single-shot host decode refuses unless the whole 1,066,057-byte body fits one 131,072-byte dest, so it fell through to a guest that manages ten frames. Place the body across the destination chain the guest itself requests (write `room` bytes at the requested dest, advance a per-package offset, mark that record complete) and resident coverage goes 5.9 % -> **440,720 bytes**, verified by readback, `still_present` sampling late at `pct=96` of the claim. Two boundaries found on the way, both now enforced: **do not cross readlists** (F-351 spilled into `B7801000`, which the same boot reports as credits' byte-exact destination, on a vbase mapping nothing observes - withdrawn), and **the sequential vs vbase-delta layout question is unanswerable inside a table because the two models coincide there** (F-352's audit reports `winner=TIE`, 458,752/458,752 under both). To go past 458,752 legitimately the guest must keep requesting garage destinations - the shared-record/arming problem (task #15) - or `nGfx` must come up and consume them, which is section 4.
 4. **GFx**: take §4 to the user as a decision with the elimination chain attached;
@@ -224,11 +259,11 @@ non-evidence).
 `kUiXsfBoundUnc=true` `:8104` · `kUiXsfVerify=true` `:8425` ·
 `kUiXsfHunt=true` `:8463` · `kUiXsfGoldenFill=true` `:8665` ·
 `kUiXsfFillListOrder=true` `:8684` ·
-`kUiXsfFrameServe=false` `:8731` · `kUiXsfFillDryRun=true` `:8738` ·
-`kUiXsfReverify=true` `:8888` · `kUiXsfClearResume=false` `:631` · `kUiXsfLocate=true` `:642` · `kUiXsfAppendWindow=false` `:660` · `kUiXsfPrivateCtx=false` `:703` · `kUiXsfSerializeCtx=false` `:731` · `kUiXsfCompareGuestCopy=true` `:455` (log-only) · `kUiXsfStreamHeadServe=false` (F-347 mechanism proven, measured null; briefly re-enabled as F-349's precondition, OFF again) · `kUiXsfWholeStreamWindow=false` (F-349, refuted by its own success, livelocked) · `kUiXsfChunkedHostFill=true` `:506` (F-350, **the placement that works**) · `kUiXsfFillDryRun=false` `:9011` (F-350: Path A now writes the garage, so `still_present` measures host+guest, which is the deliverable's own standard) · `kUiXsfFillOwnSlots=true` `:9022` (F-350: overwrite a slot of this container's own chain when it holds the guest's failed decode, never one another package owns) · `kUiXsfLayoutAudit=true` `:9035` (F-352, log-only).
+`kUiXsfFrameServe=false` `:8731` · `kUiXsfFillDryRun=false` (declared **once**, `static constexpr bool kUiXsfFillDryRun = false;` in `src/gpu_device.cpp` — line ~9269 as of 2026-09-27 02:58; the old `=true` `:8738` entry below was wrong and is the source of the contradiction) ·
+`kUiXsfReverify=true` `:8888` · `kUiXsfClearResume=false` `:631` · `kUiXsfLocate=true` `:642` · `kUiXsfAppendWindow=false` `:660` · `kUiXsfPrivateCtx=false` `:703` · `kUiXsfSerializeCtx=false` `:731` · `kUiXsfCompareGuestCopy=true` `:455` (log-only) · `kUiXsfStreamHeadServe=false` (F-347 mechanism proven, measured null; briefly re-enabled as F-349's precondition, OFF again) · `kUiXsfWholeStreamWindow=false` (F-349, refuted by its own success, livelocked) · `kUiXsfChunkedHostFill=true` `:506` (F-350, **the placement that works**) · `kUiXsfFillDryRun` = the same flag declared above (F-350: Path A now writes the garage, so `still_present` measures host+guest, which is the deliverable's own standard) · `kUiXsfFillOwnSlots=true` `:9022` (F-350: overwrite a slot of this container's own chain when it holds the guest's failed decode, never one another package owns) · `kUiXsfLayoutAudit=true` `:9035` (F-352, log-only).
 
 **Net shipped effect:** Path A hosts 3 containers outright; the feed follows the
 stream and publishes the correct `st+12`; the third container's placement is
-**measuring, not writing** (`kUiXsfGoldenFill=true` + `kUiXsfFillDryRun=true`),
+**measuring, and writing** (`kUiXsfGoldenFill=true` + `kUiXsfFillDryRun=false`, the flag's actual value),
 and frame-aligned serving is off (tested and reverted, F-333). No unregistered
 short-circuit: §7 of `PROGRAM_GUIDE` carries each of these.
