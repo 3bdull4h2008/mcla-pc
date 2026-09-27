@@ -10352,7 +10352,7 @@ Open on this path. Before any ordering fix is attempted, one cheap read settles 
 `[0x8283D19C]` (the free head Open maintains through `[str+36]`) and the record's `+12` at push, join
 and dispatch for the same tag, and check whether the 1 is a link or a count. `RELSEMA … lr=821BC538`
 staying at 1 of 7 jobs is the fact worth explaining; the mechanism behind it is now explicitly unknown
-rather than "the refcount the job should have dropped". Next ID **F-479**.
+rather than "the refcount the job should have dropped". Next ID **F-480**.
 
 ### F-478 (2026-09-27 06:2x, **0 builds — two 12-line reads of the enqueuer's body**) — **`record+12` IS A JOB COUNT AND THE ENQUEUER OWNS THE INCREMENT: `sub_821BCB10` computes `r3 = [0x8283D190+52] + r27 + 12` and calls the atomic-increment loop at `0x821BCD5C` on its accept path, and the same address through the decrement loop at `0x821BCE28` on its reject path — so the contract is now closed end to end: Open claims with `+12 = 0` (F-477), enqueue pins it to 1, the dispatch routine's success tail drops it back (F-475) immediately before firing the completion callback, and release overwrites the word with the free-list link. F-476's correction and F-477's "maybe it is only a free-list residue" are BOTH withdrawn — the 1 our census reads is a real outstanding-job count.**
 
@@ -10387,4 +10387,29 @@ then doubted a field's semantics on a sample of 7, and F-478 settled both by rea
 instructions on each side of the two call sites. The reusable rule: when a value looks ambiguous, read
 the *callers of the atomic helpers* — an increment/decrement pair on the same address expression is
 the definition of a count, and it is found in one grep of `sub_821CE0D8`/`sub_821CE100` with the
-enclosing function named. Next ID **F-479**.
+enclosing function named. Next ID **F-480**.
+
+### F-479 (2026-09-27 06:3x, **0 builds — attributing existing rows to the execution spans already printed**) — **WHERE THE TIME ACTUALLY GOES: inside each job's own `sub_821BC140` span the guest issues 396-20,502 `READWRAP sub_821CC6F0` read attempts (median ~1,500) against 51-896 sampled `INFLATE-ENTER` rows and 0-32 `LZX-FRAME` decodes — i.e. the jobs that never reach their tail spend it in the read path, which F-461 already proved has an unreachable served-body branch and F-462 proved is one stream carrying absolute archive offsets. Job #2 (the garage) is the extreme: 601 ms, 20,502 read attempts, 51 inflate entries.**
+
+- Task:        follow-on to T42.18 — the "what are the six jobs doing instead" half of F-478 §2
+- Type:        FACT (with an explicit instrument limit in §2)
+- Class:       E
+- Priority:    P1 — it points the next instrument at reads rather than at records
+- Evidence:    `build/w480.log`, rows `BC140-REC #k` → `POST-EXEC-START #k` joined by line-range against `READWRAP`/`INFLATE-ENTER`/`LZX-FRAME`/`XSF-HOSTSERVE`/`STREAM-OPEN`/`UIXSF-GOLDEN-REVERIFY`:
+  `#1 98ms: 2,432 reads / 607 infl / 0 frame / 21 serve` · `#2 601ms: 20,502 / 51 / 0 / 29` ·
+  `#3 36ms: 2,010 / 205 / 0 / 0` · `#4 23ms: 1,208 / 203 / 0 / 0` ·
+  `#5 1,497ms: 1,748 / 896 / 25 / 22` · `#6 342ms: 396 / 197 / 0 / 0` ·
+  `#7 341ms: 430 / 215 / 7 / 0` · the read path's own shape is F-461/F-462 (`src/gpu_device.cpp:14753-14755` passes `handle=0xFFFFFFFF`, and all 14,363 rows share one stream object with absolute offsets)
+
+**1. What that says about the six silent jobs.** They are not idle and not inflating: they are issuing
+reads at 30-40 k/s through a branch that cannot be served. `LZX-FRAME` (real host decodes) fires only
+inside jobs #5 and #7 — two of the three non-UI packages — so the containers whose records were still
+theirs at entry (#1) and whose destinations we fill from the host anyway (#5/#7) are different
+populations from the UI containers #2-#4, which decode nothing in-boot and still land byte-exact via
+Path A's destination-keyed placement.
+
+**2. Instrument limit, stated before anyone over-reads the table.** The span boundaries are host hook
+entries on one thread, but the rows counted inside a span include work by *other* threads between the
+same two timestamps, so these are per-window totals, not per-job costs. Reading them as per-job would
+repeat the F-308 class of error. The one claim that survives the limit is the ratio (reads : decodes ≥
+10:1 in six of seven windows), because no other thread issues `READWRAP` rows at that rate.
