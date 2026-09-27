@@ -161,6 +161,29 @@ static std::atomic<uint32_t> g_f481Lzx{0};
 // itself, keyed by return address, and tally per dispatch window. READ-ONLY.
 static std::atomic<uint32_t> g_f481Sleeps{0};
 static std::atomic<uint32_t> g_f481SleepMs{0};
+// F-510 (T42.38): the audit (F-509 §3) found our own host serve writing one container's
+// bytes into another container's destination: `PATHB-PKGFIX #3 path='policecam/policecam'
+// dest=B7841000 -> off=64980000` bound the GARAGE's package to policecam's slot and then
+// wrote 131,072 garage bytes there. Both binding sites (`AssignPackageForDest`
+// src/gpu_device.cpp:348-376 and the PATHB-PKGFIX block at :15075-15086) pick the package
+// from a process-wide `s_pendingUiPkg` or a "first unclaimed rscTab" guess, and write
+// g_destPkgOff/g_pkgUsed last-writer-wins with no ownership test. The authoritative answer
+// already exists since F-507: the dispatching job's own record body, keyed by its handle.
+// So publish the open window's package offset here and let both sites prefer it.
+// F-510/F-511 MEASURED (w512/w513/w514): binding a never-bound destination to the
+// dispatching window's OWN package is arithmetically correct and it gives policecam and
+// credits their first real host decode + verification (`PATHB-HOSTVERIFY dest=B7841000
+// pkg=64CA3000 unc=19337 match=true`, PATHB-HOSTDECODE 6 -> 40, UIXSF-SLOT-VERIFY 4 -> 24,
+// PRESENT 52 -> 72) - but it costs 3 of the 7 streamer dispatches (`POST-EXEC-START` 7 -> 4,
+// `F507-INITEXP` 7 -> 4), brings `Fatal error` 0 -> 2 and drops `GFx` 13 -> 7. The reason is
+// in w511: the garage's host fill spends policecam's 131,072-byte slot as one of its own
+// chunks (`PATHB-HOSTDECODE-CHUNK dest=B7841000 pkg=64980000 wrote=131072`). So the
+// cross-wiring is currently load-bearing, and both routes to the true binding fail the same
+// way - w514 proves it is the binding and not the path preference, which is the opposite of
+// what was assumed when F-511 was first written. Ship both off; the prerequisite is giving
+// the garage its own read-list slots before its package stops landing elsewhere.
+static constexpr bool kF510BindToOpenWindow = false;
+static std::atomic<uint32_t> g_f510WinPkg[12]{};
 // F-507 (T42.35): w506 shows the override is not universally harmful - it is harmful for
 // exactly ONE window. With `kF506ForceLength` on, all four UI dispatches completed and each
 // walked its container precisely (`#2 64980000 -> 64A84449` = the garage's full 1,066,057
@@ -351,6 +374,22 @@ static uint32_t AssignPackageForDest(uint32_t outPtr) {
   auto it = g_destPkgOff.find(outPtr);
   if (it != g_destPkgOff.end())
     return it->second;
+  // F-510: this destination has never been bound, so decide it from the job that is
+  // dispatching RIGHT NOW rather than from a global published by whichever container
+  // last reached the enqueue site. Reaching this branch means the caller is inside a
+  // streamer walk for a container whose record body we resolved from its own handle.
+  if (kF510BindToOpenWindow) {
+    const uint32_t win = g_f481Window.load(std::memory_order_relaxed);
+    const uint32_t wp =
+        win != 0 && win < 12u ? g_f510WinPkg[win].load(std::memory_order_relaxed) : 0u;
+    if (wp != 0u && outPtr >= 0xB0000000u && outPtr < 0xC0000000u) {
+      g_destPkgOff[outPtr] = wp;
+      g_destPkgWalk[outPtr] = 0;
+      MCLA_LOG_WARN("F510-BIND dest={:08X} -> off={:08X} (window {} own record)",
+                    outPtr, wp, win);
+      return wp;
+    }
+  }
   // F-251: consume a Path B-published UI container package BEFORE the guess,
   // so the inflate that runs INSIDE sub_821FDD50 gets the container's real
   // archive offset instead of the "first unclaimed rscTab" meshtexture guess.
@@ -13271,6 +13310,13 @@ PPC_FUNC(sub_821BC140) {
                       "cred={} restored={}",
                       n, f483Tag, rec, rlen, rpkg, dev, vtab, fn28, fn52, fn124,
                       static_cast<int32_t>(cred), restored);
+      // F-510: publish what THIS job's own record says its package is, read AFTER the
+      // F-503 restore, so the host serve cannot bind a container another job owns.
+      if (kF510BindToOpenWindow && n < 12u) {
+        uint32_t authPkg = 0;
+        if (g5.ReadU32BE(rec + 24u, &authPkg) && authPkg != 0)
+          g_f510WinPkg[n].store(authPkg, std::memory_order_relaxed);
+      }
     }
   }
   g_f481Window.store(n, std::memory_order_relaxed);   // open the read window
@@ -13278,6 +13324,8 @@ PPC_FUNC(sub_821BC140) {
   __imp__sub_821BC140(ctx, base);
   g_f481Window.store(0, std::memory_order_relaxed);   // close it
   F483Add(g_f483Retired, g_f483RetN, f483Tag);        // F-502: no longer in flight
+  if (kF510BindToOpenWindow && n < 12u)
+    g_f510WinPkg[n].store(0, std::memory_order_relaxed);   // F-510: window closed
   const auto tGuestDone = std::chrono::steady_clock::now();
   // F-484 §3 (P1c): the pin holds a join until this job's record count drops, and
   // six of seven jobs never reach the tail that would drop it (F-478). Release the
@@ -15073,19 +15121,43 @@ PPC_FUNC(sub_821E2940) {
       // the real RSC5/XCompress head (verified offline at that file offset).
       {
         const uint32_t uiDest = o0;  // FDD50 wrote the load-buffer base = inflate outPtr
+        // F-510: this is the site that actually cross-wired the containers. `pbPkgOff`
+        // comes from the streamer record, and at THIS moment (enqueue, before any
+        // dispatch window is open) that record already belongs to a different container
+        // - w511/w512 both print `PATHB-PKGFIX #3 path='policecam/policecam'
+        // dest=B7841000 -> off=64980000`, binding the garage to policecam's slot and
+        // then writing 131,072 garage bytes there. The path name is available right here
+        // and is unambiguous, so prefer it; the record-derived value stays as the
+        // fallback for containers the path map does not cover.
+        // F-511 MEASURED (w513): preferring the path is CORRECT but the boot is not ready
+        // for it. policecam and credits got their own bytes and their first-ever host
+        // verification (`PATHB-HOSTVERIFY dest=B7841000 pkg=64CA3000 unc=19337 match=true`),
+        // PATHB-HOSTDECODE 6 -> 42 and UIXSF-SLOT-VERIFY 4 -> 24 - but 3 of the 7 streamer
+        // dispatches then stopped running (`POST-EXEC-START` 7 -> 4, `F507-INITEXP` 7 -> 4),
+        // `Fatal error` went 0 -> 2 and `GFx` 13 -> 7, because the garage's host fill had
+        // been spending policecam's 131,072-byte slot as its own second chunk
+        // (`PATHB-HOSTDECODE-CHUNK dest=B7841000 pkg=64980000 wrote=131072` in w511). So the
+        // cross-wiring is load-bearing for the wrong reason, and fixing the binding alone
+        // removes garage coverage. Keep the truth available, ship it off.
+        static constexpr bool kF511PreferPathBinding = false;
+        const uint32_t pathPkg =
+            kF511PreferPathBinding ? MclaUiXsfPkgForPath(pathName) : 0u;
+        const uint32_t bindPkg = pathPkg != 0u ? pathPkg : pbPkgOff;
+        const bool boundByPath = pathPkg != 0u && pathPkg != pbPkgOff;
         if (uiDest >= 0xB0000000u && uiDest < 0xC0000000u &&
-            pbPkgOff >= 0x1000u && pbPkgOff < 0x80000000u) {
+            bindPkg >= 0x1000u && bindPkg < 0x80000000u) {
           std::lock_guard<std::mutex> lk(g_destPkgMtx);
-          g_destPkgOff[uiDest] = pbPkgOff;
+          g_destPkgOff[uiDest] = bindPkg;
           g_destPkgWalk[uiDest] = 0;
-          g_pkgUsed[pbPkgOff] = uiDest;
+          g_pkgUsed[bindPkg] = uiDest;
           MCLA_LOG_WARN("PATHB-PKGFIX #{} path='{}' dest={:08X} -> off={:08X} "
-                        "(pre-empted AssignPackageForDest guess)",
-                        n, pathName, uiDest, pbPkgOff);
+                        "(pre-empted AssignPackageForDest guess){}",
+                        n, pathName, uiDest, bindPkg,
+                        boundByPath ? " [F-510 record disagreed]" : "");
         } else {
           MCLA_LOG_WARN("PATHB-PKGFIX-SKIP #{} path='{}' dest={:08X} off={:08X} "
                         "(implausible)",
-                        n, pathName, uiDest, pbPkgOff);
+                        n, pathName, uiDest, bindPkg);
         }
       }
     } else {

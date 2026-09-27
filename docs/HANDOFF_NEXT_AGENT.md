@@ -2516,3 +2516,31 @@ covers only 2 of the 4 packages, so **policecam and credits have no content-leve
 exactly the pair that reads its whole stream and decodes nothing. F-509 (#86): add `policecam.bin` and
 `credits.bin` to the re-verify set, then the remaining Path B question is purely codec family. GFx
 unchanged: `F438-GFXCTOR` 0.
+
+
+## 2026-09-27 07:3x - F-510/F-511: our own cross-wiring is load-bearing (both arms reverted)
+
+**The finding:** there is a host bug that writes one container's bytes into another container's
+destination (`PATHB-PKGFIX #3 path='policecam/policecam' dest=B7841000 -> off=64980000`, then
+`PATHB-HOSTDECODE-CHUNK dest=B7841000 pkg=64980000 wrote=131072`). Two independent arms now bind the
+truth (F-510 = use the dispatching window's own `record+24`; F-511 = use the path name), and **both cost
+3 of the 7 streamer dispatches and bring `Fatal error` 0 -> 2 back**, because the garage's fill is
+currently spending policecam's slot as its own chunk. `w514` (path arm OFF, F-510 ON) reproduces the
+same damage, which is what attributes it to the binding - and `w513`/`w514` also correct each other: my
+first written diagnosis (blaming F-511) was wrong until the single-arm control existed. That is the
+fourth self-correction of this session and the rule is now explicit: a two-arm change needs its
+single-arm control BEFORE the explanation is written down.
+
+**What the truth would buy:** policecam and credits get their first-ever `PATHB-HOSTVERIFY ... match=true`
+at their own destinations (`dest=B7841000 pkg=64CA3000`, `dest=B78E1000 pkg=6496F000`), and 39 `F510-BIND`
+rows show each window owning its package. Their guest side is still `lzxFrames=0`/`maxProduced=0`, so the
+silent-container question is untouched by this pair.
+
+**Shipped state after the reverts:** `w515` is marker-for-marker the confirmed F-507 baseline
+(`POST-EXEC-START` 7, `F507-INITEXP` 7, `F503-ENTRY` 21, `Fatal error` 0, `C0000005` 0, `LISTLINE` 171,
+`GFx` 13, `BOOTPATH` 10, `LZX-FRAME` 43, `PRESENT` 52, `F505-SLEEP` 0, `F510-BIND` 0). 4th reproduction
+of that state. Flags now all false except F-502/F-503/F-507. `F438-GFXCTOR` still 0: **the goal is open**.
+
+**T42.39 (#87), the prerequisite in one sentence:** make the garage's fill draw only from its own job's
+52-entry read-list and refuse to bind a destination that another live package owns, then re-arm F-510 and
+gate on `POST-EXEC-START` 7 + `Fatal error` 0 + policecam's dest holding `64CA3000`.
