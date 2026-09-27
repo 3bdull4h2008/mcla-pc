@@ -2544,3 +2544,33 @@ of that state. Flags now all false except F-502/F-503/F-507. `F438-GFXCTOR` stil
 **T42.39 (#87), the prerequisite in one sentence:** make the garage's fill draw only from its own job's
 52-entry read-list and refuse to bind a destination that another live package owns, then re-arm F-510 and
 gate on `POST-EXEC-START` 7 + `Fatal error` 0 + policecam's dest holding `64CA3000`.
+
+
+## 2026-09-27 07:4x - F-512: the path-binding arm is clean and ships; F-511's verdict was wrong
+
+**Verdict:** clause (a) is now complete at destination 0 for all four UI containers. With
+`kF511PreferPathBinding = true` and `kF510BindToOpenWindow = false`, `w516`/`w517` (2/2 identical) show
+policecam and credits served their OWN bytes at their OWN destinations and verified there -
+`UIXSF-SLOT-VERIFY dest=B7841000 pkg=64CA3000 ... mismatch=0` +
+`PATHB-HOSTVERIFY dest=B7841000 pkg=64CA3000 unc=19337 ... match=true`, and the same pair for
+`B78E1000`/`6496F000` - while all 7 streamer dispatches return and every frontier marker equals `w515`
+(`POST-EXEC-START` 7, `F507-INITEXP` 7, `F503-ENTRY` 21, `LZX-FRAME` 43, `LISTLINE` 171, `GFx` 13,
+`BOOTPATH` 10, `C0000005` 0, `Fatal error` 0, `F505-SLEEP` 0). Guest decode of raceeditor and the garage
+is unchanged (`999,424`/`10` and `491,520`/`6`).
+
+**What I got wrong and how:** F-511 concluded both true-binding arms were harmful. `w513` had BOTH on,
+`w512`/`w514` had only F-510, and nobody had run (F-510 off, path on). Filling that cell shows the
+3-dispatch loss belongs entirely to F-510 (39 `F510-BIND` rows, 35 of them the garage window). So F-510
+stays OFF, the path arm ships ON, and the recorded cost is `UIXSF-GOLDEN-FILL` 20 -> 9 and `PRESENT`
+52 -> 49: the garage lost the policecam slot it was stealing, which is exactly what task #87 must replace
+from its own 52-entry read-list.
+
+**Ledger rule reinforced, violated, and reinforced again in one hour:** a two-arm change needs its
+single-arm control BEFORE the explanation is written down (F-511 §2 wrote the rule, F-511 §4 broke it).
+
+**Still open, in order:** (1) #87 garage slots, then re-arm F-510; (2) break the verification circularity -
+the "golden" is our own host decode, `build/xmem_golden/*.bin` is never read by `src/`, and the
+`gold.size() < 0x10000` gates at `src/gpu_device.cpp:10011`/`:9693`/`:9612` still exclude the two small
+containers from re-verify, fill and layout audit; (3) `F438-GFXCTOR` remains 0 and F-509 §5 hardens the
+bound on its producer (one caller `sub_82482F78` with zero callers/xrefs, table without a walker), so the
+GFx half needs either the user F-055 decision or a new kind of evidence.

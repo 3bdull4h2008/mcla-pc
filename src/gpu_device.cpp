@@ -180,9 +180,11 @@ static std::atomic<uint32_t> g_f481SleepMs{0};
 // chunks (`PATHB-HOSTDECODE-CHUNK dest=B7841000 pkg=64980000 wrote=131072`). So the
 // cross-wiring is currently load-bearing, and both routes to the true binding fail the same
 // way - w514 proves it is the binding and not the path preference, which is the opposite of
-// what was assumed when F-511 was first written. Ship both off; the prerequisite is giving
-// the garage its own read-list slots before its package stops landing elsewhere.
-static constexpr bool kF510BindToOpenWindow = false;
+// what was assumed when F-511 was first written. F-512 then measured the missing cell
+// (this arm OFF, the path arm ON) and it is CLEAN and 2/2 reproducible, so only THIS arm is
+// harmful - see kF511PreferPathBinding below. The prerequisite for re-arming it is giving the
+// garage its own read-list slots before its package stops landing elsewhere (task #87).
+static constexpr bool kF510BindToOpenWindow = false;   // w512/w514: 39 binds, 3 dispatches lost
 static std::atomic<uint32_t> g_f510WinPkg[12]{};
 // F-507 (T42.35): w506 shows the override is not universally harmful - it is harmful for
 // exactly ONE window. With `kF506ForceLength` on, all four UI dispatches completed and each
@@ -15138,8 +15140,18 @@ PPC_FUNC(sub_821E2940) {
         // been spending policecam's 131,072-byte slot as its own second chunk
         // (`PATHB-HOSTDECODE-CHUNK dest=B7841000 pkg=64980000 wrote=131072` in w511). So the
         // cross-wiring is load-bearing for the wrong reason, and fixing the binding alone
-        // removes garage coverage. Keep the truth available, ship it off.
-        static constexpr bool kF511PreferPathBinding = false;
+        // removes garage coverage.
+        // F-512 CORRECTION (w516 + w517, reproduced 2/2): the missing cell of the 2x2 - this arm ON
+        // with kF510BindToOpenWindow OFF - is CLEAN. All 7 streamer dispatches return, `Fatal error`
+        // stays 0, and every frontier marker equals `w515` (`POST-EXEC-START` 7, `F507-INITEXP` 7,
+        // `F503-ENTRY` 21, `LZX-FRAME` 43, `LISTLINE` 171, `GFx` 13, `BOOTPATH` 10, `C0000005` 0),
+        // while policecam and credits get their first correct-destination verification
+        // (`UIXSF-SLOT-VERIFY dest=B7841000 pkg=64CA3000 ... mismatch=0` + `PATHB-HOSTVERIFY ...
+        // match=true`, and the same pair for B78E1000/6496F000). So "both arms are harmful" was
+        // wrong - only the 39-binding F-510 arm is, and `w513` conflated the two. This arm SHIPS ON.
+        // Its cost: `UIXSF-GOLDEN-FILL` 20 -> 9 and `PRESENT` 52 -> 49, i.e. the garage loses the
+        // policecam slot it was stealing; task #87 replaces it from the garage's own 52-entry list.
+        static constexpr bool kF511PreferPathBinding = true;   // F-512: measured clean, 2/2 reproducible
         const uint32_t pathPkg =
             kF511PreferPathBinding ? MclaUiXsfPkgForPath(pathName) : 0u;
         const uint32_t bindPkg = pathPkg != 0u ? pathPkg : pbPkgOff;
