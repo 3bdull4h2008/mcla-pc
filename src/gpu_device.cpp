@@ -86,6 +86,14 @@ static std::unordered_map<std::string, XsfTocInfo> g_xsfToc;
 // was 7 ms too late). ON to test whether raceeditor/others now decompress. OFF == exact baseline.
 static constexpr bool kPathBEnqueueUI = true;
 
+// F-468 (T42.11 / task #74): mirror a UI container's streamer record onto the queue
+// TAG index its own job object will be read at, because F-467 measured the guest placing
+// these records at `handle & 0x7FFF` (0-based) while sub_821BC140 indexes the array by the
+// 1-based queue tag -- so garage ran policecam's record, policecam ran credits', credits ran
+// meshtextures'. Gate criteria are unchanged since src/gpu_device.cpp:1100: a BC140-REC row
+// carrying pkg 64980000 whose read-list matches the garage, then claimed=1066057 guest-produced.
+static constexpr bool kF468AlignRecordIndex = false;
+
 // F-465 (T42.9 / task #72): ordering construction for the garage. F-464 measured that the
 // garage's job record IS built (+4 = 1,066,057, +24 = 64980000) at array index 1 -- the same
 // index the streamer walk had already consumed 39 ms earlier as raceeditor's record -- and that
@@ -14443,6 +14451,69 @@ PPC_FUNC(sub_821E2940) {
                 "F465-REINDEX-SKIP handle={:08X} srcIdx={} readsOk={} dstFree={} "
                 "dst=[{:08X} {:08X} {:08X}] slotFound={:08X}",
                 handle, srcIdx, ok, dstFree, d0, d4, d24, slotAddr);
+          }
+        }
+      }
+      // F-468 (T42.11 / task #74): F-467 measured that the guest writes a UI container's
+      // streamer record at `handle & 0x7FFF` (raceeditor 0, garage 1, policecam 2, credits 3)
+      // while the job object that executes it lives at queue slot/tag 1,2,3,4 -- and
+      // sub_821BC140 indexes the record array by that tag (`recAddr = recBase + (id&mask)*28`).
+      // So every container after the first runs the NEXT one's record (garage ran policecam's,
+      // policecam ran credits', credits ran meshtextures'), which is why `record[+4]` never
+      // holds the garage's 1,066,057 for a garage job. Mirror the record onto the tag index the
+      // object will read. The tag is taken from the queue itself, not assumed: the header at
+      // q+0x6160 is the write cursor and each slot stores its own tag at +0 (PUSH census).
+      if (kF468AlignRecordIndex && pbPkgOff != 0u) {
+        auto &amem = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t arb = 0;
+        if (amem.ReadU32BE(0x8283D190u + 52u, &arb) && arb >= 0x80000000u &&
+            arb < 0xE0000000u) {
+          const uint32_t hIdx = handle & 0x7FFFu;
+          const uint32_t srcRec = arb + hIdx * 28u;
+          uint32_t tag = 0;
+          for (uint32_t c = 1; c <= 8u && tag == 0u; ++c) {
+            const uint32_t sl = 0x82849518u + c * 1556u;
+            uint32_t st = 0, cb = 0;
+            if (!amem.ReadU32BE(sl + 0, &st) || st != c)
+              continue;                       // slot stores its own tag
+            if (!amem.ReadU32BE(sl + 0x60Cu, &cb) || cb == 0u)
+              continue;                       // no callback installed yet
+            uint32_t sw0 = 0;
+            (void)amem.ReadU32BE(arb + c * 28u, &sw0);
+            if (sw0 == handle) {
+              tag = c;                        // already correctly placed
+              break;
+            }
+            if (sw0 == 0u || tag == 0u) {
+              tag = c;
+              break;
+            }
+          }
+          const uint32_t dstRec = arb + (tag & 0x7FFFu) * 28u;
+          uint32_t s[7] = {0, 0, 0, 0, 0, 0, 0};
+          uint32_t d[7] = {0, 0, 0, 0, 0, 0, 0};
+          bool rok = true, dok = true;
+          for (uint32_t i = 0; i < 7u; ++i) {
+            rok = amem.ReadU32BE(srcRec + i * 4u, &s[i]) && rok;
+            dok = amem.ReadU32BE(dstRec + i * 4u, &d[i]) && dok;
+          }
+          static std::atomic<uint32_t> s_468{0};
+          const uint32_t an = s_468.fetch_add(1) + 1;
+          if (tag != 0u && tag != hIdx && rok && dok && s[6] == pbPkgOff &&
+              (d[6] == 0u || d[6] == pbPkgOff)) {
+            bool wrote = true;
+            for (uint32_t i = 0; i < 7u; ++i)
+              wrote = amem.WriteU32BE(dstRec + i * 4u, s[i]) && wrote;
+            MCLA_LOG_WARN(
+                "F468-ALIGN #{} handle={:08X} hIdx={} tag={} src={:08X} "
+                "dst={:08X} pkgoff={:08X} remain={} wrote={} dstWasPkg={:08X}",
+                an, handle, hIdx, tag, srcRec, dstRec, pbPkgOff, s[1], wrote,
+                d[6]);
+          } else {
+            MCLA_LOG_WARN(
+                "F468-ALIGN-SKIP #{} handle={:08X} hIdx={} tag={} readsOk={}/{} "
+                "srcPkg={:08X} wantPkg={:08X} dstPkg={:08X}",
+                an, handle, hIdx, tag, rok, dok, s[6], pbPkgOff, d[6]);
           }
         }
       }
