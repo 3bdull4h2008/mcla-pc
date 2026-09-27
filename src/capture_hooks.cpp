@@ -372,9 +372,13 @@ bool DrawPacketAccumulator::ValidatePacket(DrawPacket& packet) const {
 } // namespace mcla::native
 
 // ---------------------------------------------------------------------------
-// P4'/P5' device-method capture hook: intercepts a simple FP-table render-state
-// setter (sub_82413950, FP-table slot 14, device+0x78) and enqueues a
-// SetRenderState command to the render thread queue (log-only, no D3D12).
+// Capture hook for the guest render-state setter sub_82413950. PPC_FUNC here is
+// a strong definition overriding the recompiled weak symbol, and it still calls
+// the original afterwards - a pass-through capture, not a short-circuit.
+// The hook logs a rate-limited CAPTURE-SET_RS line (first 20 firings, then every
+// 2000th) and enqueues a SET_RENDER_STATE command on g_commandQueue; the render
+// thread's SET_RENDER_STATE handler currently only logs the command, so this
+// path issues no D3D12 calls.
 // Signature: func(r3=device, r4=renderStateValue)
 // ---------------------------------------------------------------------------
 

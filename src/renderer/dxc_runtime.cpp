@@ -9,7 +9,7 @@
 #include <windows.h>
 #include <unknwn.h>
 #include <dxc/dxcapi.h>
-#include <d3d12shader.h>  // for ID3D12ShaderReflection
+#include <d3d12shader.h>  // for ID3D12ShaderReflection, D3D12_SHADER_DESC, D3D12_SHADER_INPUT_BIND_DESC
 #include <wrl/client.h>
 
 #include <cstdlib>
@@ -77,7 +77,7 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
     }
     if (!impl_) return false;
 
-    // Candidate directories for the DXC DLL pair, in priority order.
+    // Candidate DLL directories, in priority order; the first holding dxcompiler.dll wins.
     std::vector<std::string> dirs;
     if (!dllDir.empty()) dirs.push_back(std::string(dllDir));
     if (const char* env = std::getenv("MCLA_DXC_DIR"); env && *env)
@@ -110,8 +110,8 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
         return false;
     }
 
-    // Pre-load dxil.dll by full path so dxcompiler.dll's dependency resolves
-    // from the same directory regardless of the process search path.
+    // Pre-load dxil.dll by full path: the loader matches imports by module base
+    // name, so dxcompiler.dll binds to this copy instead of one found elsewhere.
     impl_->dxil = LoadLibraryA((dir + "dxil.dll").c_str());
     if (!impl_->dxil) {
         error = "LoadLibrary(dxil.dll) failed: " + WinErrorText(GetLastError());
@@ -174,9 +174,9 @@ bool DxcRuntime::Compile(std::string_view hlsl, std::string_view entry,
     source.Ptr = sourceBlob->GetBufferPointer();
     source.Size = sourceBlob->GetBufferSize();
 
-    // Mirror the reference invocation in
-    // .research/XenosRecomp/XenosRecomp/dxc_compiler.cpp: same profiles,
-    // HLSL 2021, all-resources-bound.
+    // Flags follow the reference invocation in
+    // .research/XenosRecomp/XenosRecomp/dxc_compiler.cpp (HLSL 2021, -all-resources-bound,
+    // -Wno-ignored-attributes); -E is added here, -Qstrip_* only when reflection isn't kept.
     const std::wstring wEntry = ToWide(entry.empty() ? "main" : entry);
     const std::wstring wProfile = ToWide(profile);
     std::vector<const wchar_t*> args;
@@ -240,7 +240,7 @@ bool DxcRuntime::ReflectCbvBindings(const std::vector<uint8_t>& dxil,
         return false;
     }
 
-    // Create a blob from the DXIL bytes
+    // Wrap the DXIL bytes in a pinned blob (no copy; dxil must outlive reflection)
     ComPtr<IDxcBlobEncoding> dxilBlob;
     HRESULT hr = impl_->utils->CreateBlobFromPinned(
         dxil.data(), static_cast<uint32_t>(dxil.size()), DXC_CP_UTF8,
@@ -250,7 +250,7 @@ bool DxcRuntime::ReflectCbvBindings(const std::vector<uint8_t>& dxil,
         return false;
     }
 
-    // Create container reflection
+    // Create container reflection over the DXIL bytes; its parts are walked below
     DxcBuffer buffer{};
     buffer.Ptr = dxilBlob->GetBufferPointer();
     buffer.Size = dxilBlob->GetBufferSize();
