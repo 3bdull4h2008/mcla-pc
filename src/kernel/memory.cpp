@@ -26,8 +26,8 @@ mcla::kernel::Memory::Memory()
     DWORD oldProtect;
     VirtualProtect(base, 4096, PAGE_NOACCESS, &oldProtect);
 #else
-    // On Linux, check if memory is already mapped at the target address
-    // This is a simplified check; in practice, we'd need to parse /proc/self/maps
+    // MAP_FIXED_NOREPLACE below *is* the "already mapped there?" check: no
+    // /proc/self/maps parse needed. The two fallbacks omit it and may relocate.
     base = (uint8_t*)mmap((void*)0x100000000ull, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
 
     if (base == (uint8_t*)MAP_FAILED)
@@ -42,8 +42,8 @@ mcla::kernel::Memory::Memory()
     mprotect(base, 4096, PROT_NONE);
 #endif
 
-    // Record the window size; IsInMemoryRange/Translate bounds checks rely on
-    // it and boot_host reuses this window based on it being fully reserved.
+    // Record the window size: IsInMemoryRange and boot_host's full-4GiB reuse
+    // test (boot_host.cpp:560) read it. Memory::Translate only asserts on it.
     size = PPC_MEMORY_SIZE;
 
     for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
@@ -316,8 +316,8 @@ bool mcla::kernel::GuestMemoryHeap::IsValid(uint32_t guestAddr, size_t size) con
     // The first 4 KB of the heap is a deliberate PAGE_NOACCESS null guard (set at
     // :218/:251), and the rest of the 4 GB is committed read/write. Without this
     // clause a "checked" helper passes IsValid for a near-null guest pointer and
-    // then faults inside memcpy - which is what F-122 measured (50 AVs reading
-    // guest 0x00000C61 from MemoryStreamServeRead's ReadBytes).
+    // then faults inside memcpy - which is what F-122 measured: 50 AVs in
+    // MemoryStreamServeRead's ReadBytes at wrapped src 0x00000C61 (#6: 0x0).
     if (guestAddr < 4096u)
         return false;
 
@@ -455,7 +455,7 @@ bool mcla::kernel::GuestMemoryHeap::AllocVirtualFixed(uint32_t base, uint32_t si
     }
     if (containing)
     {
-        // Non-const upgrade through mutable vector storage.
+        // Re-scan for the same element to get a non-const ref (search used const&).
         for (auto& r : m_virtualRegions)
         {
             if (&r == containing)

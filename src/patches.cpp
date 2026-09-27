@@ -34,7 +34,7 @@
 #include <io.h>
 #include <windows.h>
 
-// Forward declarations for kernel functions via import thunks
+// extern "C" host kernel impls (src/kernel/imports.cpp) - direct host calls, not guest thunks
 extern "C" uint32_t KeReleaseSemaphore(void *, uint32_t, uint32_t, uint32_t);
 
 static mcla::App::FunctionDispatcher *g_dispatcher = nullptr;
@@ -59,7 +59,7 @@ bool StartPulseActive() {
   return held;
 }
 
-// SESSION 44b: minimal census on sub_821C2AB8 to verify call path
+// SESSION 44b: census on sub_821C2AB8 (guest allocator free) - overrides it, never chains, so a firing call drops the free.
 namespace {
 std::atomic<uint32_t> s_routerCalls{0};
 } // namespace
@@ -74,9 +74,9 @@ PPC_FUNC(sub_821C2AB8) {
   }
 }
 
-// SESSION 44c: census on sub_821C09C8 — the dispatch function that routes
-// pool frees. Logs r3 (heap), r4 (node), ctx.lr (stale but diagnostic),
-// and reads the caller's stack to find the real return address.
+// SESSION 44c: the census on sub_821C09C8 (pool-free dispatcher: r3 heap, r4
+// node, ctx.lr, caller's stack for the real return address) is NOT in this file
+// any more - it lives in src/hooks/alloc_census.cpp:12443, gated by hooks.h:34.
 
 static void *g_native_XamInputGetState_func = nullptr;
 
@@ -199,10 +199,10 @@ static void TimerHookDispatch(mcla::native::PPCContext &ctx, uint8_t *base,
   static int timerCount = 0;
   timerCount++;
 
-  // CP progress nudge: advance guest publication periodically to unblock
-  // fence waits when the CP is idle (guest thinks work is done but CP
-  // never processed it). The guest's put/pub counters can get ahead of
-  // actual ring consumption.
+  // CP progress nudge (host mitigation): credit one push-buffer window per timer
+  // hook so a waiting guest fence can clear. CpAdvanceGuestPublication
+  // (src/gpu_cp.cpp:992) writes subctx+0 clamped to put (dev+10908) because
+  // sub_82411E98 waits on *(subctx+0) >= needed: pub LAGS put, it never leads it.
   mcla::gpu::CpAdvanceGuestPublication(1);
 
   if (timerObj) {
@@ -262,15 +262,15 @@ PPC_FUNC_IMPL(__imp__sub_82411840);
 
 static PPCFunc *g_orig_sub_82554E20 = nullptr;
 // SESSION 36: g_orig_sub_821C29A0 / g_orig_sub_82130B50 / g_fast_pool_alloc /
-// g_debug_alloc_caller and the hk_sub_821C29A0 hook were removed. The hook was
-// registered only via FunctionDispatcher::SetFunction, which fills the
-// m_functions map - generated direct calls bind to the weak alias and
-// ppc_func_mapping-table indirect calls resolve through that table, so the map
-// is never consulted for guest calls (proof: soak35.log has ZERO "ALLOC["
-// lines). Its fallback path additionally called the fatal raiser
-// sub_821BD618 directly with wrong args. The real allocation-path census now
-// lives in the PPC_FUNC(sub_821C29A0) weak-alias override below (OOM-CENSUS)
-// and in PPC_FUNC(sub_821C1BB0) (ARENA-CENSUS).
+// g_debug_alloc_caller and the hk_sub_821C29A0 hook were removed. That hook was
+// registered only via SetFunction, which in SESSION 36 filled only m_functions,
+// and generated direct calls bind to the weak alias, so the map was not
+// consulted for guest calls (proof: soak35.log, ZERO "ALLOC[" lines).
+// SUPERSEDED today: SetFunction also writes the real dispatch table
+// (src/app.cpp:337-343, note :315-322; F-092 item 2 relies on it). The removed
+// hook's fallback also called the fatal raiser sub_821BD618 with wrong args.
+// Live allocation-path census is NOT in this file: src/hooks/alloc_census.cpp
+// sub_821C29A0 :1774 (OOM-CENSUS :2703) / sub_821C1BB0 :4356 (ARENA-CENSUS).
 static PPCFunc *g_orig_sub_824569C8 = nullptr;
 static PPCFunc *g_orig_VdSwap_observer = nullptr;
 PPCFunc *g_orig_VdInitializeEngines = nullptr;
@@ -487,10 +487,10 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     // 0x827BDC64 to __imp__XamInputGetState, which via GUEST_FUNCTION_HOOK
     // (kernel/function.h:351) reaches kernel::XamInputGetState
     // (kernel/xam.cpp:261), an SDL keyboard-to-pad mapping. SetFunction
-    // overwrites m_functions[addr] AND calls InsertFunction
-    // (app.cpp:337-341), and mcla_ApplyPatches runs after
-    // InstallFunctionTable (boot_host.cpp:1279) -- so this later
-    // registration always won, leaving the guest reading a pad that
+    // overwrites m_functions[addr] (app.cpp:339) AND calls InsertFunction
+    // (app.cpp:342; body app.cpp:337-343), and mcla_ApplyPatches runs after
+    // InstallFunctionTable (boot_host.cpp:1972, reached from app.cpp:72) -- so
+    // this later registration always won, leaving the guest reading a pad that
     // reports no buttons unless the synthetic StartPulseActive() timer
     // (patches.cpp:51, no host input behind it) happened to be high.
     // Two owners of one guest address is also what rule 4 forbids.
@@ -506,14 +506,14 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     // could never succeed, and success would have been worse than the error it
     // logged. __imp__XamInputGetState is NOT a Windows import thunk --
     // GUEST_FUNCTION_HOOK (src/kernel/function.h:351) expands it to a host
-    // PPC_FUNC at src/kernel/imports.cpp:3540, so its first bytes are our own
+    // PPC_FUNC at src/kernel/imports.cpp:3596, so its first bytes are our own
     // compiled prologue, never the `FF 25` (jmp [rip+disp32]) the test demanded.
     // Had it passed, VirtualProtect + the 12-byte write would have replaced the
     // head of that live host function with `movabs rax,hook; jmp rax`. Everything
     // downstream (E9/hotpatch analysis, the 128-byte dumps, InstallNativeDetour on
     // the "real" func) sat unreachable behind that impossible condition, and its
-    // only consumer was more logging. Guest-side interception here is the
-    // dispatcher->SetFunction call above -- the mechanism this emulator uses.
+    // only consumer was more logging. Intercepting a guest import here takes
+    // dispatcher->SetFunction (writes the real table, app.cpp:342) - none now.
     if (true) { // BisectGroupEnabled("gp") - FORCE ENABLED
       mcla::gpu::CpInstallMmioRouting();
       mcla::gpu::InstallGpuHooks(dispatcher, mcla::gpu::GpuHooks{});
@@ -531,10 +531,10 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     mcla::native::g_renderThread.start();
     MCLA_LOG_ERROR("mcla_ApplyPatches: Render thread started (P4.5')");
 
-    // Device-boundary draw capture (sub_82413660) is owned by the
-    // global-scope PPC_FUNC override in src/gpu_device.cpp (P5'/B8) — the
-    // dispatcher map is not consulted for guest calls, so registering here
-    // would be dead code.
+    // Device-boundary draw capture (sub_82413660) stays owned by the
+    // global-scope PPC_FUNC override in src/gpu_device.cpp:4572 (P5'/B8) - rule
+    // 4, one owner per guest address. Registering it here is pointless, not
+    // "dead code": SetFunction now writes the real table (app.cpp:342).
 
     if (true) { // BisectGroupEnabled("gp") - FORCE ENABLED
       dispatcher->SetFunction(0x82130690, hk_sub_82130690);
@@ -553,9 +553,9 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     }
 
     // SESSION 36: removed the hk_sub_821C29A0 / hk_sub_82130B50 registration
-    // block (dead: dispatcher-map SetFunction is never consulted for guest
-    // calls) and the g_fast_pool_alloc / g_debug_alloc_caller resolution that
-    // only served it. See the note near the removed statics above.
+    // block and the g_fast_pool_alloc / g_debug_alloc_caller resolution that
+    // served it (dead *then*: SetFunction touched only m_functions; it now also
+    // writes the real table, app.cpp:342). See the note near the statics above.
 
     g_orig_sub_82554E20 = dispatcher->GetFunction(0x82554E20);
     if (g_orig_sub_82554E20) {
@@ -591,7 +591,7 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
       MCLA_LOG_ERROR("VdSwap observer: original not found in dispatch table");
     }
 
-    // Detour VdInitializeEngines to call the recompiled implementation
+    // 0x827BD574 is __imp__KeReleaseSemaphore (ppc_func_mapping.cpp:44887); VdInitializeEngines is 0x827BD784 (:44920) - the name here is a misnomer.
     g_orig_VdInitializeEngines = dispatcher->GetFunction(0x827BD574);
     dispatcher->SetFunction(0x827BD574, hk_VdInitializeEngines);
     if (g_orig_VdInitializeEngines) {
@@ -605,7 +605,7 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
   MCLA_LOG_INFO("MCLA patches applied (1 entry + 5 GPU hooks + 5 timer hooks + "
                 "native renderer + screen hooks)");
 
-  // Signal the GPU init semaphore (0x40004D7C) after 3 seconds to unblock loading screen
+  // Nudge: release the guest's 30 ms tick object 0x40004D7C once, 3 s in. F-316 names it the boot-worker tick (kSchedulerTick below), not a "GPU init semaphore", and counts this host release as satisfying 0 of 6,626 waits.
   std::thread([ ] {
     std::this_thread::sleep_for(std::chrono::seconds(3));
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -829,12 +829,12 @@ PPC_FUNC_IMPL(hk_sub_82554E20) {
 // SESSION 36: PPC_FUNC_IMPL(hk_sub_821C29A0) removed - dead code with a
 // latent fatal-raise landmine (called sub_821BD618, the guest OOM fatal
 // dispatcher, directly with (fmt, pool, size) args on its fallback path).
-// The authoritative decode lives in .clinerules/memory/ and
-// docs/BOOT_HANDOFF.md.
+// The authoritative decode is now src/hooks/alloc_census.cpp:1774+ - the
+// .clinerules/memory/ (c83ec91) + docs/BOOT_HANDOFF.md (5fbc08e) paths are gone.
 
-// MASTER SWITCH: disable all census overhead (slab walks, file I/O,
-// snapshot scans, per-alloc logging).  All corruption detections were false
-// positives (Session 56).  Set to true to re-enable diagnostics.
+// MASTER SWITCH kPool16CensusEnabled (src/hooks/hooks.h:34; hooks.h:35 also
+// wants MCLA_ALLOC_DEBUG) is false, so no census overhead (slab walks, file I/O,
+// snapshot scans, per-alloc logging) runs. Session 56: every detection was false.
 
 PPC_FUNC_IMPL(hk_sub_824569C8) {
   if constexpr (!kPool16CensusEnabled) {
@@ -850,13 +850,13 @@ PPC_FUNC_IMPL(hk_sub_824569C8) {
     g_orig_sub_824569C8(ctx, base);
 }
 
-// hk_sub_82413660 removed (P5'/B8): never registered (dispatcher map is not
-// consulted for guest calls), and duplicated the live global-scope override
-// PPC_FUNC(sub_82413660) in src/gpu_device.cpp, which remains diagnostic-only;
-// native geometry submission is owned by sub_82420BA8.
+// hk_sub_82413660 removed (P5'/B8): it was never registered and it duplicated
+// the live global-scope override PPC_FUNC(sub_82413660) in
+// src/gpu_device.cpp:4572, which stays diagnostic-only (chains to __imp__ at
+// :4590); native geometry submission is owned by sub_82420BA8 (:3163).
 
 PPC_FUNC_IMPL(hk_sub_82411840) {
-  // Device-boundary draw consumer hook - native path
+  // DEAD: registered nowhere; the live census of 0x82411840 is src/gpu_device.cpp:4595.
   static std::atomic<uint32_t> s_hookCount{0};
   const uint32_t n = s_hookCount.fetch_add(1) + 1;
   const uint32_t dev = ctx.r3.u32;
@@ -886,12 +886,12 @@ PPC_FUNC_IMPL(hk_sub_82554590) {
 }
 
 // Press Start handler shim, dispatched by the bytecode interpreter's
-// handler-dispatch case (opcode 0x2D at 0x82555C24) in place of the
-// original XAM handler. The screen object is read from the guest global
-// that sub_82554E20 persists (0x828DA3BC, Ghidra-validated); the
-// completion reason is the interpreter's own value 0x828110D4
-// (0x82017D0C is absent from the binary). r31 is a generated-function
-// local under this ABI, so it must not be read here.
+// handler-dispatch case (opcode 0x2D = case 44 of its switch on opcode-1,
+// 0x82555C24) instead of the handler the operand bytes name. Screen object:
+// guest global 0x828DA3BC, stored/cleared by sub_82554800 (recomp.109:1194) -
+// sub_82554E20 never touches it. Reason = the interpreter's own 0x828110D4
+// (recomp.109:4496); 0x82017D0C occurs 0 times in mcla_pe.bin. r31 is a local
+// register in generated code under this ABI, so it must not be read here.
 PPC_FUNC_IMPL(hk_press_start_shim) {
   static int count = 0;
   count++;

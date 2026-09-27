@@ -24,6 +24,14 @@
 // M6: host worker thread periodically invokes the guest XAudio render
 // callback (UnleashedRecomp sdl2_driver pattern) so the guest fills a
 // 6ch BE float32 x 256 frame and calls XAudioSubmitRenderDriverFrame.
+// STATUS (2026-09-29, census of build/*.log): only M5 ever runs. Every soak
+// reaches "AUDIO-OPEN ok" (e.g. build/w580.log), but no soak contains
+// "apu::RegisterClient", "AUDIO-WORKER" or "AUDIO-FRAME". The guest call
+// sites exist (generated/ppc_xenon/ppc_recomp.73.cpp:12392 register, :12717
+// submit) and are simply never reached before the boot stalls, so the worker
+// and the downmix below are currently unreachable and the device plays only
+// the blip. Getting a client registered is the open task
+// docs/LONG_TODO_MASTER.md:1202-1204 (T41.11, Wave E audio).
 
 namespace apu {
 
@@ -39,8 +47,12 @@ constexpr int kGuestSamplesPerFrame = 256;
 constexpr int kHostHz = 48000;
 constexpr int kHostChannels = 2;
 
-// Guest callback period. 256 samples @ 48 kHz = 5.33 ms; use ~8 ms as a
-// safe host-side cadence (queue absorbs jitter).
+// Guest frame period is 256 samples @ 48 kHz = 5.33 ms, but this worker
+// sleeps 8 ms, i.e. deliberately SLOWER than real time: 125 callbacks/s x 256
+// samples = 32 000 samples/s fed against the device's 48 000 samples/s drain,
+// so the queue cannot stay full (it underruns and AudioCallback fills the
+// gaps with the blip). UnleashedRecomp sleeps exactly one frame period and
+// gates on queue depth instead (sdl2_driver.cpp:71-88).
 constexpr auto kCallbackPeriod = std::chrono::milliseconds(8);
 
 // Blip: 440 Hz, ~80 ms, every 2 s, ~-26 dBFS.
@@ -73,7 +85,10 @@ std::atomic<bool> g_shuttingDown{false};
 std::vector<int16_t> g_queue;
 size_t g_queueRead = 0;
 
-// Sample clock for blip phasing (host frames played).
+// Blip phase clock. NOT "host frames played": AudioCallback only advances it
+// inside its !hadGuest branch, so it counts only the frames fed while the guest
+// queue was empty, i.e. the 2 s blip period runs on fed-silence time,
+// not wall clock. Reset to 0 by Init().
 uint64_t g_sampleClock = 0;
 
 // Guest XAudio client registration (set by RegisterClient).
@@ -269,7 +284,9 @@ void UnregisterClient() {
 
 void SubmitFrames(void* samples) {
     const uint32_t n = g_frameCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    // Cap log so a 50 Hz submitter cannot flood the soak log.
+    // Cap log to ~1 line per 50 submits: a real-time render driver submits
+    // ~187 frames/s (48 kHz / 256 samples; the 8 ms worker makes it 125/s),
+    // which would otherwise flood the soak log.
     if (n <= 8 || (n % 50) == 0) {
         MCLA_LOG_INFO("AUDIO-FRAME #{} samples={}", n,
                       samples ? "yes" : "null");

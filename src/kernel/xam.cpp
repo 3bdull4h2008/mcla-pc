@@ -262,8 +262,14 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
 {
     static int callCount = 0;
     callCount++;
+    // A NULL state pointer is upstream's documented probe case: "Games call this
+    // with a NULL state ptr, probably as a query"
+    // (.research/xenia/src/xenia/kernel/xam/xam_input.cc:91). It is answered here
+    // with 0 = ERROR_SUCCESS and nothing written — NOT an error code:
+    // X_ERROR_EMPTY is 0x10D2 and X_ERROR_DEVICE_NOT_CONNECTED is 0x48F
+    // (.research/xenia/src/xenia/xbox.h:86,100,106).
     if (!state)
-        return 0; // ERROR_EMPTY / not connected
+        return 0;
 
     // W3: map host keyboard → XInput pad so menus can be driven.
     //   arrows / WASD = dpad+left stick   Enter|Space=A   Esc|Backspace=B

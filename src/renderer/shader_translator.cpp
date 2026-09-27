@@ -10,16 +10,19 @@
 //     registers with per-opcode operand masks;
 //   - scalar ALU ops -> the float "ps" (previous-scalar) pipeline, with
 //     Setp*/predicate stack and Kills -> clip();
-//   - fetch (vertex/tftex) -> vertex-element inputs (VS) or sampler/texture
+//   - fetch (vertex/tfetch) -> vertex-element inputs (VS) or sampler/texture
 //     binds with swizzled register writes (PS);
 //   - exports -> oC0..oC3 / oDepth (PS) or oPos + interpolators (VS).
 //
 // This is a generator: it must always emit a complete, tokenizable HLSL body
-// so the offline tool can diff and compile it. Every opcode in the ALU/Fetch
-// enums has a branch; anything outside the known table is recorded as
-// unsupported (never silently dropped). The emitted HLSL is diagnostic-grade;
-// precision helper functions (R11G11B10 decode, cube mapping, tfetch helpers)
-// are provided inline so the output stands alone.
+// so the offline tool can diff and compile it. Every ALU vector/scalar opcode
+// has a lowering branch (scalar RetainPrev is deliberately skipped before the
+// clause); vertex and texture fetches get the two fetch branches, and the aux
+// GET/SETTEXTURE fetch opcodes decode as known and share the texture-fetch
+// path. Anything outside the decoder's known table is recorded as unsupported
+// (never silently dropped). The emitted HLSL is diagnostic-grade; the helpers
+// the body references (select() ternary overloads, FLT_MIN/FLT_MAX macros)
+// are emitted inline in AppendHeader so the output stands alone.
 
 #include <algorithm>
 #include <cstdint>
@@ -34,13 +37,14 @@ namespace mcla::renderer {
 
 // ---------------------------------------------------------------- reflection
 //
-// Vertex-input reflection shared by the generator (VS entry signature) and the
-// offline PSO smoke test (input layout). A vertex fetch resolves to a
-// (usage, usageIndex) pair through the program's vertexElements by slot
-// address, falling back to the first element when no element matches — the
-// same rule EmitFetch uses. ReferencedVertexInputs returns the unique pairs in
-// first-fetch order plus the format/stride/offset of the fetch that introduced
-// each pair, so the declared signature and the bound layout always agree.
+// Vertex-input reflection consumed by the render thread's input-layout
+// fallback (src/render_thread.cpp). A vertex fetch resolves to a
+// (usage, usageIndex) pair by matching the program's vertexElements (12-bit
+// stream address) against the fetch's IR instruction address, falling back to
+// the first element when no element matches — the same comparison EmitFetch
+// makes. ReferencedVertexInputs returns the unique pairs in first-fetch order
+// plus the format/stride/offset of the fetch that introduced each pair, so
+// the declared signature and the bound layout always agree.
 
 const char* VertexUsageSemanticName(uint32_t usage) {
     // DeclUsage semantic table (the all-caps counterparts of kUsageVariables).
@@ -106,7 +110,8 @@ constexpr const char* kUsageVariables[] = {
 // (color) and 61 (depth), see ExportRegisterName.
 
 // ---------------------------------------------------------------------------
-// Operand selection (mirrors XenosRecomp ShaderRecompiler::op()).
+// Operand selection (mirrors the `op` operand lambda inside XenosRecomp's
+// ShaderRecompiler::recompile(), shader_recompiler.cpp).
 // ---------------------------------------------------------------------------
 enum class OperandKind : uint8_t {
     Vector0,
@@ -439,8 +444,9 @@ private:
 
         // Constant table. Float4 constants are named where the guest provides
         // a valid identifier; otherwise they fall back to c{N}. The cbuffer is
-        // closed over every register the body references (see Analyze), so no
-        // operand's c{N} reference is ever left undeclared.
+        // closed over every register the body references (referencedConstants_
+        // from Generate pass 1), so no operand's c{N} reference is ever left
+        // undeclared.
         out_ += "cbuffer ShaderConstants : register(b0)\n{\n";
         for (const auto& c : prog_.constants) {
             if (c.info.registerSet != RegisterSet::Float4) continue;
@@ -463,7 +469,8 @@ private:
         }
         out_ += "};\n\n";
 
-        // Sampler/texure binds used by tfetch (named samplers + implicit).
+        // Texture/sampler binds for tfetch: the generic dimension-based
+        // resources (t1D..tCube + s0) that the emitted fetches actually sample.
         std::unordered_set<uint32_t> usedSamplers;
         std::unordered_map<uint32_t, uint32_t> samplerDim;
         for (const auto& ir : prog_.instructions) {
@@ -479,8 +486,11 @@ private:
             out_ += "Texture3D   t3D  : register(t2);\n";
             out_ += "TextureCube tCube : register(t3);\n";
             out_ += "SamplerState s0 : register(s0);\n\n";
-            // Sampler constant names (from the table) get a texture declare so
-            // tfetch can reference a named resource.
+            // A Texture2D tex_<slot> placeholder is declared per sampler slot
+            // tfetch uses, bound at register(t<slot>). The name is derived
+            // from the slot index only (the sampler-table lookup does not
+            // change it) and the emitted body never references these — the
+            // fetches sample the generic resources above.
             for (uint32_t index : usedSamplers) {
                 auto it = samplerConstants_.find(index);
                 const char* dimName =
@@ -527,9 +537,9 @@ private:
     }
 
     // Entry point whose in/out parameter sets match the body's writes exactly
-    // (collected in Analyze): PS consumes iPos + interpolator inputs and writes
-    // the oC*/oDepth exports it uses; VS consumes the resolved vertex inputs
-    // and writes oPos plus the interpolator outputs it exports.
+    // (collected in Generate pass 1): PS consumes iPos + interpolator inputs
+    // and writes the oC*/oDepth exports it uses; VS consumes the resolved
+    // vertex inputs and writes oPos plus the interpolator outputs it exports.
     void AppendSignature(bool ps) {
         out_ += "void main(\n";
         if (ps) {
@@ -588,7 +598,9 @@ private:
 
     void AppendEpilogue(bool ps) {
         if (ps) {
-            // Ensure oDepth isn't left undefined when the shader never wrote it.
+            // Nothing to fill: PS exports are written inline and
+            // AppendSignature only declares an oC*/oDepth target that the
+            // body actually wrote.
             out_ += "    // exports emitted inline\n";
         } else {
             // Half-pixel offset to match D3D9/Xenos rasterization.
@@ -1086,9 +1098,10 @@ private:
             // Vertex fetch: read from the matching vertex element input by
             // usage + usageIndex. The input is derived from the guest stream
             // via the program's vertexElements (usage/index packed).
-            // Emit from the vertex element whose address matches this fetch's
-            // slot address when known, otherwise fall back to the first
-            // element. Diagnostic-grade: the runtime binds real stream data.
+            // Emit from the vertex element whose 12-bit stream address equals
+            // this fetch's IR instruction address when known, otherwise fall
+            // back to the first element. Diagnostic-grade: the runtime binds
+            // real stream data.
             uint32_t usage = 0, ui = 0;
             bool found = false;
             for (const auto& ve : prog_.vertexElements) {

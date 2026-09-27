@@ -1,8 +1,8 @@
-// Guest boot host: allocates the 4 GiB guest window, loads default.xex,
-// installs the 46k-function lookup table, seeds the pre-boot slots and runs
-// the guest entry under SEH. Ported from the proven smoke host
-// (tools/xenon_smoke, commit 8fc8842) with MCLA logging and the App's active
-// GuestMemoryView / PPC base wiring. Phase 5 of BOOT_REBUILD_PLAN.md.
+// Guest boot host: allocates the 4 GiB guest window, loads default.xex, installs the 45k-function
+// lookup table (45,190 PPCFuncMappings entries), seeds the pre-boot slots and runs the guest entry
+// under a process-wide VEH + SetUnhandledExceptionFilter -- no __try around the entry call. Ported
+// from tools/xenon_smoke @8fc8842 (removed by 72cda76) with MCLA logging and the App's active
+// GuestMemoryView / PPC base wiring. Phase 5 of BOOT_REBUILD_PLAN.md (doc no longer in the tree).
 
 #include "ppc_config.h"
 #include "ppc_context.h"
@@ -30,7 +30,7 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 #include <dbghelp.h>
 #include <unordered_map>
 
-// Skip flag for generated code (defined in generated/ppc_xenon/ppc_recomp.49.cpp)
+// s_skipSub822FA958 (generated/ppc_xenon/ppc_recomp.49.cpp:18142) has had no writer in src/ since T38.3.
 
 // UILOAD thread tracking
 std::atomic<DWORD> s_uiLoadThreadId{0};
@@ -53,9 +53,9 @@ extern std::atomic<uint32_t> g_mainGuestThreadId;
 #include <unordered_map>
 #include <vector>
 
-// Global-scope redeclarations of the kernel-stub XTL alloc/free (defined in
-// kernel_stubs.cpp at global namespace; C++ linkage). Referenced via the r13
-// thread-block function block so indirect calls resolve in the guest table.
+// Global-scope redeclarations of the kernel-stub XTL alloc/free (defined at
+// global scope in src/kernel/imports.cpp:53/:61; C++ linkage). Referenced via
+// the r13 thread-block function block so indirect calls resolve in the guest table.
 PPC_EXTERN_FUNC(__xtl_alloc);
 PPC_EXTERN_FUNC(__xtl_free);
 
@@ -253,18 +253,18 @@ namespace
     // CORRECTED (F-412 review): the original first premise -- "PPC_STORE_U32 = `base[va]`, which
     // never touches the checked accessors where RegisterGuestWatchRange lives" -- is WRONG. The
     // verified chain is PPC_STORE_U32 (src/ppc_context.h:93) -> mcla::native::WriteGuestU32
-    // (src/guest_memory.h:98) -> GuestMemoryView::WriteU32BE (src/guest_memory.cpp:315) ->
-    // PageWatchHit/PageWatchOnWrite (src/guest_memory.cpp:330-331): a registered watch range DOES
+    // (src/guest_memory.h:98) -> GuestMemoryView::WriteU32BE (src/guest_memory.cpp:354) ->
+    // PageWatchHit/PageWatchOnWrite (src/guest_memory.cpp:369-372): a registered watch range DOES
     // see every guest dword store. What no watch range can see is the allocator itself, which
     // operates on the arena through a raw HOST pointer obtained from Translate (F-373: a checked
     // read of 0x20000 returns zeros while the allocator's own pointer sees cap=0x7FE7FDC0), and
     // SetThreadContext (CONTEXT_DEBUG_REGISTERS) on a running, un-debugged thread silently does
     // nothing (F-100), so the DR route is dead. Guard page it is, with the same
     // self-test-before-believing rule.
-    // Page granularity is 4 KB and the header occupies the first 40 bytes, so a trip is
-    // classified by offset: `capacity` (off<8) is CONSTANT after Heap::Init, hence a WRITE there
-    // is by definition the corruption; writes to 8..0x27 are the allocator updating its own
-    // counters (expected on every alloc/free), and anything past 0x28 is fragment traffic.
+    // Page granularity is 4 KB and a trip is classified by offset into the instance -- but the
+    // buckets still assume the pre-F-370 model that the first 40 bytes were the header. Per
+    // o1heap.c:133-139 (and `instance+0x208` below) bins[64] run +0x00..+0x200, so off<8 counts
+    // writes to bins[0..1] (routine alloc/free), not `capacity` (+0x208); fragments start +0x240.
     //
     // First attempt (build 17:23, w380) SEGFAULTED the host 34 ms in: the handler re-armed the
     // page before the faulting instruction re-executed, so every allocator write into that page
@@ -273,8 +273,8 @@ namespace
     // HeapGuardDisarm/HeapGuardArm), and the handler never re-arms.
     namespace {
         constexpr uint32_t kHeapHdrVa = mcla::kernel::kUserHeapArenaVa;  // F-384: follows the arena
-        constexpr uintptr_t kHdrCapEnd = 8;   // capacity: never written after Init
-        constexpr uintptr_t kHdrEnd = 0x28;   // whole O1HeapInstance
+        constexpr uintptr_t kHdrCapEnd = 8;   // 'cap' bucket: bins[0..1] (capacity is +0x208)
+        constexpr uintptr_t kHdrEnd = 0x28;   // 'hdr' bucket end (instance is 0x230 bytes)
         uintptr_t g_hgPage = 0;               // page-aligned host address of the header
         std::atomic<bool> g_hgLive{false};
         std::atomic<bool> g_hgSelfTest{false};
@@ -287,7 +287,7 @@ namespace
         std::atomic<uint32_t> g_hgLogged{0};
 
         // F-388: a second guard, over the PHYSICAL heap's instance page (guest
-        // kPhysArenaBeginVa = 0xA0400000 since F-391 = RESERVED_END, `heap.cpp:220`; it was
+        // kPhysArenaBeginVa = 0xA0400000 since F-391 (old `RESERVED_END`, heap.cpp:250); it was
         // 0xA0000000, which is inside the title's own XTL heap). Why this page and not the other
         // one: `w394`..`w399` each AV once inside `o1heapAllocate+0x98`, a WRITE to 0xE49125FC
         // with rcx=0xE49125D4 and
@@ -315,7 +315,7 @@ namespace
         // false trip was charged to us (F-386: "the second guard page caught our own allocator").
         // A depth makes the page return to NOACCESS only when the LAST open window closes, which
         // makes arm/disarm safe regardless of where HeapGuardWindow sits relative to its
-        // std::lock_guard -- the ordering rule heap.cpp:315 was itself an attempt at this, and
+        // std::lock_guard -- the ordering rule heap.cpp:351 was itself an attempt at this, and
         // Heap::Free did not follow it (it opens its window before any lock, because
         // CheckHeapHeader reads the guarded page and must run disarmed).
         // recursive_mutex, not mutex: the deliberate self-test read below faults on THIS thread
@@ -323,10 +323,10 @@ namespace
         std::recursive_mutex g_hgMtx;
         int32_t g_hgDepth = 0;  // guarded by g_hgMtx: open-window count, both guards together
         // F-412: the same open-window count kept PER THREAD. g_hgDepth cannot self-heal: the VEH
-        // parks with `for(;;) Sleep(1000)` inside the handler, so ~HeapGuardWindow (heap.cpp:328)
+        // parks with `for(;;) Sleep(1000)` inside the handler, so ~HeapGuardWindow (heap.cpp:360)
         // never runs on that thread and a thread that is neither the boot worker nor UILOAD would
         // strand g_hgDepth > 0 forever -- both guard pages left PAGE_READWRITE for the rest of the
-        // run plus the parked thread's heap mutex (heap.cpp:334/427) held with it. The park branch
+        // run plus the parked thread's heap mutex (heap.cpp:366/752) held with it. The park branch
         // drains t_hgWin (calls HeapGuardArmImpl while > 0) before it parks.
         thread_local int t_hgWin = 0;
 
@@ -524,8 +524,8 @@ namespace
     }
 
     // Re-write one function-table slot from the canonical mapping. Used when
-    // guest allocs (CDCD-FILL @0x8Cxxxxxx) zero entries inside the table
-    // region that lives at guest VA 0x8B9E0000+.
+    // guest allocs (the CDCD-FILL band) zero entries inside the table region,
+    // which PPC_LOOKUP_FUNC puts at PPC_IMAGE_BASE + PPC_IMAGE_SIZE = 0x829E0000+.
     void RemapFunctionSlot(uint32_t guest)
     {
         if (g_base == nullptr)
@@ -659,7 +659,7 @@ namespace
         // only toggles rounding + flush bits via ctx.fpscr; if the cache starts
         // at zero, the first enableFlushMode() writes MXCSR = 0x8040, clearing
         // the exception-mask bits (0x1F80) and unmasking host FPU exceptions
-        // (0xC000008F STATUS_FLOAT_MULTIPLE_FAULTS) in float-heavy guest code.
+        // (STATUS_FLOAT_MULTIPLE_FAULTS = 0xC00002B4; 0xC000008F is INEXACT_RESULT) in guest FP.
         // The mask bits are ORed in defensively (guest FP never faults on 360).
         ctx.fpscr.csr = ctx.fpscr.getcsr() | 0x1F80;
 
@@ -834,9 +834,9 @@ namespace
         ReplayDeadMemoryDeviceCtor();
 
         // The fatal-error dispatcher (Function_821BD618) reads slot 0x8285FEA0
-        // and calls it when non-zero. Leave it ZERO so the dispatcher
-        // branches straight to its infinite loop (b .) instead of calling
-        // a handler that might return and trigger the debugtrap in the loop.
+        // and calls it when non-zero. Leave it ZERO -- what runs is the host override
+        // sub_821BD618 (kernel/imports.cpp:2982, registered patches.cpp:417), which only
+        // logs the slot and terminates; the guest body would call a handler, then loop (b .).
         constexpr uint32_t SlotAddr = 0x8285FEA0;
         uint32_t slotValue = 0;
         std::memcpy(&slotValue, g_base + SlotAddr, sizeof(slotValue));
@@ -1141,8 +1141,8 @@ static LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info)
 
 // SEH-safe stack-slot read: C-style free function with no C++ objects that
 // require unwinding. clang-cl ICEs compiling __try inside the VEH lambda
-// below (same ICE class as kernel/heap.cpp SehO1Allocate and the note at
-// line 653: SEH + unwinding objects in one function). Callers pass POD only.
+// below (same ICE class as the note at heap.cpp:31-33, and the one above
+// Start()'s CreateThread: SEH + unwinding objects in one function). No caller in this TU today.
 #if defined(_MSC_VER)
 static uint64_t SehReadStackSlot(const uint64_t *p)
 {
@@ -1292,7 +1292,7 @@ void BootWorker(uint32_t entryGuest)
                         {0x50000000, 0x60000000, "inflate-out"},
                         // F-412: the pool follows F-391 to kPhysArenaBeginVa (0xA0400000), and its
                         // upper bound is where the allocator says it ends --
-                        // heap.cpp:221 physArenaSize = 0x100000000 - RESERVED_END. The old
+                        // heap.cpp:251 physArenaSize = 0x100000000 - kPhysArenaBeginVa. The old
                         // 0xA0000000..0xB0000000 band was pre-F-391.
                         {mcla::kernel::kPhysArenaBeginVa, 0x100000000ull, "phys-heap"},
                         {0x82000000, 0x82AD3000, "image+bss"},
@@ -1527,7 +1527,7 @@ void BootWorker(uint32_t entryGuest)
             }
         }
 
-        // Park this thread forever for AVs / illegal insn / fp-div0. Never
+        // Park this thread forever for AV / illegal insn / fp-div0 / 0xC000012A. Never
         // return to the faulting code. Other threads (window, render,
         // workers) keep running so the process and HWND stay alive.
         // F-390: EXCEPT for a fault inside the allocator family, which the structured handler
@@ -1585,9 +1585,9 @@ void BootWorker(uint32_t entryGuest)
                            "— process stays alive",
                            GetCurrentThreadId(), code, guestAv ? 1 : 0, wildParam ? 1 : 0, glr);
             // F-412: drain THIS thread's heap-guard windows before parking. The park never returns,
-            // so ~HeapGuardWindow (heap.cpp:328) never runs and g_hgDepth would stay > 0 for the
+            // so ~HeapGuardWindow (heap.cpp:360) never runs and g_hgDepth would stay > 0 for the
             // rest of the run: both guard pages left PAGE_READWRITE, plus whatever heap mutex this
-            // thread holds (heap.cpp:334/427) held forever, which would then deadlock every later
+            // thread holds (heap.cpp:366/752) held forever, which would then deadlock every later
             // guard trip. Each HeapGuardArmImpl() drops one of our windows (t_hgWin and g_hgDepth
             // move together), and g_hgMtx is a recursive_mutex so re-entering it on this thread
             // while we already hold it (fault inside the drain's self-test read) cannot
@@ -1775,8 +1775,8 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     app->GetGuestMemoryView().SetMemoryBase(g_base, GuestMemorySize);
     app->SetPPCBase(g_base);
     mcla::kernel::GuestMemoryHeap::Instance().Adopt(g_base, GuestMemorySize);
-    // Function table lives at guest VA 0x8B9E0000 (g_base + IMAGE_BASE +
-    // IMAGE_SIZE). Guest o1heap/XTL allocs were landing at 0x8Cxxxxxx and
+    // Function table lives at guest VA 0x829E0000 = PPC_IMAGE_BASE + PPC_IMAGE_SIZE
+    // (src/ppc_context.h:124). Guest o1heap/XTL allocs were landing in that band and
     // zeroing table slots (A5CC0 → null bctrl AV). Reserve that range.
     {
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -1803,8 +1803,8 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     mcla::native::kernel::ScanGuestMemoryForTU83SpawnPointers();
 
     // Session 72/73: physical o1heap lives at guest kPhysArenaBeginVa = 0xA0400000 (F-391; it
-    // was 0xA0000000 when this comment was written). The instance
-    // is 576 bytes (64 bins x8 + mask + diagnostics) then fragments follow.
+    // was 0xA0000000 when this comment was written). The instance is 0x230 bytes
+    // (64 bins x8 + mask + diagnostics, o1heap.c:133-139) padded to 0x240, then fragments follow.
     // Guest stores here are the heap-corruption vector — the session-72
     // 0x200 window saw nothing, but that run never reached the load stage
     // where the corruption fires. Watch the instance + first fragments.
@@ -1863,11 +1863,11 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // names itself here IS the hand-off, and its `caller_rva` resolves with
     // tools/host_rva_resolve.py exactly like F-383's did.
     // F-397/F-398: the count that kills the boot worker is `lhz r4,4(r28)` at
-    // ppc_recomp.61.cpp:18242, with `r28 = lis(-32115) - 12120` (`:18143-18147`) = **0x828CD0C8**,
-    // i.e. the halfword at **0x828CD0CC** -- the sibling of the container 0x828CD064 the callee
-    // receives (`lis(-32115) - 12188`). Both sit in zero-initialised image data (raw
-    // `mcla_pe.bin` at 0x828CD064 is 24 bytes of 0x00), so the count has to be written at runtime
-    // and never is. Watch the whole pair of structs: a `PAGEWATCH W @ 828CD0CC` row names the
+    // ppc_recomp.61.cpp:18242, with `r28 = lis(-32115) - 12120` (`:18143-18147`) = **0x828CD0A8** (F-432 §1),
+    // so the halfword is **0x828CD0AC**; F-398 printed 0CC/0C8. The container 0x828CD064 the callee
+    // receives is the measured `F395-GROW-ENTER obj=`, not F-398's `lis(-32115) - 12188` (= 0x828CD084).
+    // Both sit in zero-initialised image data (raw `mcla_pe.bin` at 0x828CD064 is 24 bytes of 0x00), so
+    // the count must be written at runtime: watch the pair, a `PAGEWATCH W @ 828CD0AC` row names the
     // producer that should have run; its absence is the answer, and it is clause (b)'s real
     // upstream -- F-397 showed `sub_82397060(0x828CD064, count=0)` cannot terminate (the link loop
     // at loc_82397184 guards only `count-1 == 0`, so r11 starts at 0xFFFFFFFF).
@@ -2006,8 +2006,8 @@ void Start(uint32_t entryGuest)
     // Plain CreateThread proc (no std::thread/std::invoke wrapper): clang
     // 19.1.7 ICEs in the X86 assembler for the std::invoke lambda wrapper of a
     // function that contains __try/__except under /EHa. spdlog/fmt calls also
-    // must not appear in the SEH TU at all (same ICE) — logging goes through
-    // BootReportInfo/BootReportError in boot_log.cpp.
+    // must not be made inside a function that holds __try (same ICE) — those paths log
+    // through BootReportInfo/BootReportError in boot_log.cpp (note in boot_host.h).
     // Increase worker thread stack size to 8MB to accommodate recompiled PPC functions
     constexpr size_t WorkerStackSize = 8 * 1024 * 1024; // 8MB
     const HANDLE workerHandle = CreateThread(nullptr, WorkerStackSize, BootThreadProc, (LPVOID)(uintptr_t)entryGuest, 0, nullptr);
@@ -2018,7 +2018,7 @@ void Start(uint32_t entryGuest)
     // Park sampler (diagnostic): periodically suspend the guest worker, log
     // its host RIP + top stack return addresses resolved to guest VAs.
     // Evidence for boot-progression blockers (ring put frozen post-init,
-    // 2026-08-23). Capture-only; stops after ~60s or when boot completes.
+    // 2026-08-23). Capture-only; runs 600 x 500 ms = 5 min or until boot completes.
     if (workerHandle != nullptr)
     {
         std::thread([workerHandle]() {
@@ -2310,7 +2310,7 @@ uint32_t GetBootWorkerReg(unsigned regIndex)
 }
 
 // F-370: counting-semaphore registry (see the declaration in boot_host.h). Deliberately
-// lock-free and fixed-size: this TU cannot instantiate spdlog (the clang ICE note in
+// lock-free and fixed-size: fmt must not be built inside a function holding __try (the clang ICE note in
 // boot_host.h), and a boot creates far fewer than the cap. Creation already logs in
 // imports.cpp (SEMA-CREATE), so this only has to remember which handles had permits.
 namespace {

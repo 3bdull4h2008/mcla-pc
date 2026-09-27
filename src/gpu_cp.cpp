@@ -29,7 +29,8 @@ constexpr uint32_t kMmioSize = 0x00010000u;
 constexpr uint32_t kMmioMask = 0xFFFF0000u;
 
 // CP_RB_WPTR: the ring doorbell. Guest stores the new write-pointer dword
-// index here (verified guest site: ppc_recomp.77.cpp store to base+1812).
+// index here (verified guest site: ppc_recomp.75.cpp:15012-15015, sub_82411928's
+// PPC_MM_STORE_U32(0x7FC80000 + 1812) - the sole doorbell-ringer module-wide).
 constexpr uint32_t kWptrByteOffset = 0x01C5u * 4u; // 0x714
 
 // Xenia treats this value as "no doorbell rung yet".
@@ -47,8 +48,11 @@ std::atomic<uint32_t> g_regShadow[kMmioRegCount]{};
 // parameterised from state. Indices aliasing the MMIO shadow are mirrored so
 // guest read-back still agrees.
 // ---------------------------------------------------------------------------
-// Xenos register indices: type-3 header base_index is 14-bit (`header &
-// 0x3FFF`), PM4_REG_RMW's index field is 13-bit (upstream masks 0x1FFF at
+// Xenos register indices: the base index we poke comes off a TYPE-0 header
+// masked with `header & 0x3FFF` (14 bits) - upstream reads 15 bits there
+// (`packet & 0x7FFF`, command_processor.cc:651) and uses the 0x3FFF mask for
+// the count field (:641), so this is our narrower field, not upstream's.
+// PM4_REG_RMW's index field is 13-bit (upstream masks 0x1FFF at
 // command_processor.cc:1050-1065 — we match it). The file itself is
 // 0x5003 dwords wide upstream (register_file.h:40 `kRegisterCount`), and this
 // constant used to be 0x2000 while CpRegPoke returned BEFORE bumping
@@ -193,8 +197,8 @@ constexpr uint32_t kPm4XeSwap = 0x64; // Xenia-invented swap packet
 // VdInitializeRingBuffer. Never keyed by writeback address or capacity alone.
 //
 // Runtime evidence (build/cache/mcla.log 00:51:22.789 + generated
-// ppc_recomp.77.cpp:23344-23377): the guest's only genuine registration is
-// sub_82412198: init(MmGetPhysicalAddress(ring), log2) followed by
+// ppc_recomp.75.cpp:17946-17994): the guest's only genuine registration is
+// sub_82412A60: init(MmGetPhysicalAddress(ring), log2) followed by
 // enableWB(phys(dev[+10896]ctx + 60), blockLog2). The write-back address is a
 // PHYSICAL address (< 0x20001000); guest waiters poll the same word through
 // its kernel-VA alias PA | 0xC0000000 (= C701C4BC for PA 0701C4BC). We store
@@ -389,10 +393,12 @@ RingState *PrimaryRing() {
   return r.initialized.load(std::memory_order_acquire) ? &r : nullptr;
 }
 
-// All GuestDevices seen driving the ring (create hook + reserver/waiter
-// censuses attach). MCLA binds a SECOND GuestDevice (A0009100) of the same
-// class at create (sub_82413588); waiters poll THEIR OWN dev[+10896] ctx, so
-// mirror maintenance must cover every device, not just the last attacher.
+// All GuestDevices seen driving the ring (the two census hooks attach:
+// sub_82411218 ring-wait at gpu_device.cpp:4692, sub_82411E98 fence-wait at
+// :4760 - there is no create-hook attacher). MCLA binds a SECOND GuestDevice
+// (A0009100) of the same class at create (sub_82413588); waiters poll THEIR
+// OWN dev[+10896] ctx, so mirror maintenance must cover every device, not just
+// the last attacher.
 constexpr size_t kMaxDevices = 4;
 std::atomic<uint32_t> g_devices[kMaxDevices]{};
 static std::atomic<uint32_t> s_attachedCount{0};
@@ -445,12 +451,14 @@ void SyncConsumptionMirrors(uint32_t mark);
 // ---------------------------------------------------------------------------
 // Guest publication contract (IDA-proven 2026-08-26,
 // .research/mcla_rex_contract):
-//   dev[10908] "put"    - window counter, init 3, guest sub_82415500 advances
-//                         +2 per reserved window (only guest writer).
+//   dev[10908] "put"    - window counter, init 3, guest sub_82411CD0 advances
+//                         +2 per reserved window at 0x82411DA8 (only +2 writer).
 //   *(dev[10896]) "pub" - consumed-window counter, init 1 (sub_824162D8 GPU-ctx
 //                         init). On HW the kernel/GPU side publishes completion
-//                         here; the only in-image writers are abort paths
-//                         (sub_82415500 killbit branch, C18 recovery = put-2).
+//                         here; the only in-image writers are the ring-register
+//                         block (pub = put-2 at 0x82412D20, inside sub_82412A60)
+//                         and the abort paths (sub_82411CD0's dev[10941]&2
+//                         killbit branch, C18 = sub_82425C18 recovery = put-2).
 //   sub_82411E98(dev,N) blocks until pub >= N; healthy fences exit via this
 //   check. F98's delta>=5000 -> C18 path is stall recovery only and TRAPS
 //   (twi 31) when dev[13432]==0, so it must stay dormant.
@@ -516,15 +524,16 @@ constexpr uint32_t kPm4MemWrite = 0x3D;       // write N dwords to memory
 constexpr uint32_t kPm4DrawIndx = 0x22;   // fetch index buffer and draw
 constexpr uint32_t kPm4DrawIndx2 = 0x36;  // draw with indices supplied in packet
 
-// VGT_DRAW_INITIATOR field positions (xenia gpu/registers.h:311-326):
+// VGT_DRAW_INITIATOR field positions (xenia gpu/registers.h:311-330, index
+// 0x21FC per register_table.inc:533):
 // prim_type +0 (6), source_select +6 (2: kDMA/kImmediate/kAutoIndex),
 // index_size +11 (1), num_indices +16 (16).
 inline uint32_t DrawInitiatorField(uint32_t v, uint32_t shift, uint32_t bits) {
   return (v >> shift) & ((1u << bits) - 1u);
 }
 
-// GpuSwap mirror (xenia command_processor.cc:1038-1064): endianness encoded
-// in the low bits of PM4 memory addresses.
+// GpuSwap mirror (xenia gpu/xenos.h:1052-1069, the uint32_t overload):
+// endianness encoded in the low bits of PM4 memory addresses.
 inline uint32_t GpuSwap32(uint32_t value, uint32_t endianBits) {
   switch (endianBits & 0x3) {
   case 1: // k8in16: swap bytes in half words
@@ -679,7 +688,9 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
                   CpRegPeek(0x1DDu));
     // T41.4c: the whole batch this draw was preceded by, in write order, so the
     // AUTO-source VB/IB candidates are identifiable instead of guessed at
-    // (F-115a). Non-zero values only; PTR marks a value in a guest heap band.
+    // (F-115a). Non-zero values only; `PTR?` marks a value >= 0x40000000, i.e.
+    // address-shaped in the guest VA space (F-115b read r0081=80010000 PTR?
+    // this way).
     if (n <= 3) {
       const uint32_t total = g_cpTracePos.load(std::memory_order_relaxed);
       const uint32_t first =
@@ -955,7 +966,7 @@ void DrainRing(RingState &ring, uint32_t wptr, const char *source) {
   // Kernel-side role: the real kernel CP consumer bumps the submitting
   // thread's GPU progress counter (*(r13+256)+88) as ring data is consumed;
   // sub_82412F98 busy-returns until it advanced >=5000 past the snapshot
-  // (77.cpp:23832-23953). We run synchronously ON the submitter thread
+  // (75.cpp:18449-18571). We run synchronously ON the submitter thread
   // (doorbell store), so its own PPC context is live here. Increment is
   // exactly the dwords consumed this drain - derived, not invented.
   if (const uint32_t advanced = (rptr - startRptr + cap) % cap; advanced != 0) {
@@ -1398,9 +1409,6 @@ void ConsumePendingAtVblank() {
   }
 }
 
-// Credit pending windows whose bytes an executed INDIRECT_BUFFER range
-// actually covered. Called from DrainIndirectBuffer - i.e. consumption is
-
 // VDRAIN CENSUS (2026-08-31 session 35): the hot WAIT census shows pc=0
 // forever while this function produces no VDRAIN lines at all - meaning it
 // exits early on some branch, but every early-exit here is silent. Count each
@@ -1457,7 +1465,8 @@ void CpVblankDrainToWptr() {
                   s_vdBusy.load(std::memory_order_relaxed),
                   s_vdRejected.load(std::memory_order_relaxed), ringDump);
     // Session 75m: gate-flag probe. dword_828309A0 gates the DLC/streamables
-    // predicate sub_821342F8 (== "flag != 0 && device-poll >= 2"); the whole
+    // predicate at 0x821342F8 - not a function entry in the current decode, it
+    // sits inside sub_821342B8 (== "flag != 0 && device-poll >= 2"); the whole
     // streamables path never activates, so watch it + neighbors.
     if ((vdN % 100) == 1) {
       uint32_t flag = 0, g1 = 0, g2 = 0, g3 = 0, ioCredits = 0;
@@ -1527,7 +1536,7 @@ void CpVblankDrainToWptr() {
   // pointers (ME/PFP init buffers, e.g. C601C4FC/C609C5E8/C601C5BC), NOT
   // ring buffer cursors. Those addresses fall OUTSIDE Ring A's window
   // (C600C500–C6014500), so RingOwningCursorVA always returned nullptr.
-  // The REJECTED HYPOTHESIS comment (gpu_cp.cpp:224) confirmed this.
+  // The REJECTED HYPOTHESIS comment (gpu_cp.cpp:375) confirmed this.
   //
   // On real HW the kernel CP reads the write pointer from the CP_RB_WPTR
   // register (doorbell MMIO 0x7FC80714). Our doorbell handler already
@@ -1736,8 +1745,9 @@ bool CpMmioWrite(uint32_t guestAddr, uint32_t value) {
     g_regShadow[regIndex].store(value, std::memory_order_relaxed);
   }
 
-  // First-touch-per-register logging (low regs tracked by bitmask; high
-  // regs are rare enough to log every store, matching prior behavior).
+  // First-touch-per-register logging (low regs index < 32 are tracked by
+  // bitmask and log once each; higher indices have no bit to set, so they log
+  // the first store and then 1 per 200 - not every store).
   static std::atomic<uint32_t> regSeenMask{0};
   const uint32_t bit = regIndex < 32 ? (1u << regIndex) : 0;
   if (!bit || !(regSeenMask.fetch_or(bit) & bit)) {
@@ -1788,7 +1798,8 @@ bool CpMmioRead(uint32_t guestAddr, uint32_t *outValue) {
   // (graphics_system.cc:184-201) - values verbatim from that switch.
   // Reg 0x1951 bit0 = vblank pending - the game's own vsync ISR gates its
   // flip-request processor on exactly this word
-  // ([0x7FC80000+0x6544]&1, ppc_recomp.77.cpp:19534-19542); answering 0
+  // ([0x7FC80000+0x6544]&1, ppc_recomp.75.cpp:14151-14156 inside sub_82411478,
+  // the VSync callback registered by imports.cpp); answering 0
   // starves the present path.
   switch (regIndex) {
   case 0x0F00: // RB_EDRAM_TIMING (graphics_system.cc:186)
@@ -1827,12 +1838,16 @@ uint64_t CpDrainCount() { return g_drainCount.load(std::memory_order_relaxed); }
 
 // PAGE-WATCH (session 24): attribution probes for the async-task work buffer
 // at guest 0x50000000 - called from GuestMemoryView checked accessors.
-// F-375: the guest's own memcpy (recompiled sub_823DA950) was caught by F-374's guard page writing
-// 16+ consecutive dwords starting at guest 0x20000 -- which is where the HOST keeps its user-heap
-// o1heap instance (src/kernel/heap.cpp:178 binds the arena there). That is the writer behind F-370's
-// dead allocator and uncreated thread #16. What the guard cannot say is the argument set: r3=dst,
-// r4=src, r5=len, i.e. whether 0x20000 arrived as a destination from a caller whose buffer-pointer
-// field actually holds a size. Read-only, own counter, capped at 8 (the burst is 16 dwords).
+// F-375: F-374's guard page caught 16+ consecutive dwords written starting at guest 0x20000 --
+// which is where the HOST keeps its user-heap o1heap instance (src/kernel/heap.cpp:247
+// `Heap::Init` binds the arena at kUserHeapArenaVa).
+// F-375 read the writer as the guest's own memcpy (recompiled sub_823DA950); F-383/F-384 retired
+// that reading as a nearest-preceding-PUBLIC artifact and resolved the burst to the title's own
+// allocator sub_82397060 filling 16-byte free-list entries at our arena base. Either way it is the
+// writer behind F-370's dead allocator and uncreated thread #16. What the guard cannot say is the
+// argument set: r3=dst, r4=src, r5=len, i.e. whether 0x20000 arrived as a destination from a
+// caller whose buffer-pointer field actually holds a size. Read-only, own counter, capped at 8
+// (the burst is 16 dwords).
 void HeapInstanceStoreReport(uint32_t guestAddr, uint32_t value) {
   static std::atomic<uint32_t> s_hi{0};
   const uint32_t n = s_hi.fetch_add(1) + 1;
@@ -2005,8 +2020,8 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   // register 0x81 and the object sub_82184458 fixs up, and 0x00020037 is
   // r01DC, dereferenced as a descriptor by sub_82185190. Name the guest store
   // that materialises them, so the producer is read off the log instead of
-  // deduced. Given its own counter because the generic PAGEWATCH W report is
-  // capped at 16 shared hits.
+  // deduced. Given its own counter because the generic PAGEWATCH W report
+  // shares one budget (F-453: 64 rows overall, 4 per address stripe).
   if (value == 0x80010000u || value == 0x00020037u) {
     static std::atomic<uint32_t> s_refStores{0};
     const uint32_t rn = s_refStores.fetch_add(1) + 1;
@@ -2046,8 +2061,9 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
     //
     // F-412: the gate used to read `>= 0xA0000000u`, which after F-391 is a
     // SUPERSET of our arena (pool now begins at kPhysArenaBeginVa = 0xA0400000, see
-    // src/kernel/heap_arena.h:40). Stores in the registered title-heap watch ranges
-    // (0xA0018028, 0xA008261C, 0xA0106xxx, 0xB7B6xxxx) can never be
+    // src/kernel/heap_arena.h:40). Stores in the title-heap watch ranges armed at the
+    // time (0xA0018028 - which this same F-412 pass moved to 0xA0418028, 0xA008261C,
+    // 0xA0106xxx, 0xB7B6xxxx) can never be
     // MclaPhysRangeEverAllocated -- we never owned them -- so they were counted as our-arena
     // overruns and burned the 64-row cap. Follow the constant, like HEAPHDR-STORE below.
     if (guestAddr >= mcla::kernel::kPhysArenaBeginVa) {

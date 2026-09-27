@@ -49,24 +49,40 @@ enum {
     kDxgiD24UnormS8Uint       = 45,
 };
 
-// Xenos texture format table. Values mirror the compiled legacy
-// FormatInfo table verbatim — generated and cross-checked against the
-// `FormatInfo::Get` export of rexruntime.dll (the FormatInfo oracle; see
-// build/oracle_format_dump.cpp). Per the SDK formula
+// Xenos texture format table. Values mirror the compiled legacy FormatInfo
+// table verbatim: the row order is the xenos::TextureFormat enum, and name /
+// block size / bits-per-texel / type agree row by row (indices 0..63) with
+// Xenia's independent FormatInfo::Get table
+// (.research/xenia/src/xenia/gpu/texture_info_formats.cc:21-88; the type
+// column is xenos FormatType, kResolvable=0/kUncompressed=1/kCompressed=2,
+// texture_info.h:115-121). It was originally generated against the
+// `FormatInfo::Get` export of rexruntime.dll (the FormatInfo oracle, plus the
+// `build/oracle_format_dump.cpp` this comment used to point at): that DLL left
+// the tree with ReXGlue, and no such dump file exists in the tree or in git
+// history, so the only surviving oracle hook is
+// tools/validators/texture_decode_test.cpp, which LoadLibrary's rexruntime.dll
+// and prints "oracle absent (ReXGlue removed) - skipping" instead of
+// comparing when it is missing (texture_decode_test.cpp:68-72).
+// Per the SDK formula
 // `bytes_per_block() = block_width*block_height*bits_per_pixel/8`, the table
 // stores bits per *texel* (e.g. DXT1 is 4, not 64). Host DXGI codes are the
 // canonical D3D mapping for each Xenos format: Xenos stores texel bits in the
 // same order as R5G6B5-style naming, and D3D names those BGR (e.g. 5_6_5 ->
 // DXGI_FORMAT_B5G6R5_UNORM). Compressed/constant formats with a literal DXGI
-// equivalent (DXT3A/DXT5A -> BC4_UNORM, both 1-channel 4bpp 4x4) are mapped;
-// genuinely non-representable ones (YUV REP, MPEG, INTERLACED, CTX1, k_8_A vs
-// k_8_B, 6_5_5, 1-bit) stay dxgi=0 (unsupported) until captured evidence
-// forces them up.
+// equivalent (DXT3A/DXT5A -> BC4_UNORM, both 1-channel 4bpp 4x4) are mapped,
+// and so are 8_A/8_B: both those rows carry dxgi=R8_UNORM (61), so they are
+// aliased onto one host form (which loses the luminance-vs-alpha distinction),
+// not left unsupported. What really is dxgi=0 here is YUV REP, MPEG,
+// INTERLACED, the *_EXPAND and 32_AS_8* packings, CTX1, 6_5_5, 1-bit and
+// 32_32_32_FLOAT — Xenia reaches some of those through a load shader instead
+// of a host format (CTX1 -> R8G8_UNORM, DXT3A -> R8_UNORM,
+// .research/xenia/src/xenia/gpu/d3d12/d3d12_texture_cache.cc:361-374) — and
+// they stay dxgi=0 (unsupported) until captured evidence forces them up.
 static const TextureFormatInfo kFormatTable[] = {
     // (xenos, name, dxgi, blockW, blockH, bitsPerPixel, compressed, resolvable, swapped)
     // type==0 kResolvable -> isResolvable, type==2 kCompressed -> isBlockCompressed.
     {  0, "1_REVERSE",        0,                        1, 1,  1, false, false, false },
-    {  1, "1",                0,                        1, 1,  1, false, false, false }, // host R1_UNORM not native
+    {  1, "1",                0,                        1, 1,  1, false, false, false }, // no 1bpp host form (R1_UNORM=66 does exist in dxgiformat.h, unused here)
     {  2, "8",                kDxgiR8Unorm,             1, 1,  8, false, true,  false },
     {  3, "1_5_5_5",          kDxgiB5G5R5A1Unorm,       1, 1, 16, false, true,  true  },
     {  4, "5_6_5",            kDxgiB5G6R5Unorm,         1, 1, 16, false, true,  true  },
@@ -170,9 +186,15 @@ uint32_t GetTextureBlockSpan(uint32_t xenosFormat, uint32_t width, uint32_t heig
 // ---------------------------------------------------------------------------
 
 int32_t GetTiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bpbLog2) {
-    // XGAddress2DTiledOffset: 32x32-block macro tiles. Pitch is rounded up to
-    // a multiple of 32 blocks, as in Xenia's xe::align (GetTiledOffset2D),
-    // which the SDK oracle also implements.
+    // XGAddress2DTiledOffset: 32x32-block macro tiles (Xenia's equivalent is
+    // texture_address::Tiled2D, kMacroTileWidth/kMacroTileHeight2D = 32; the
+    // rexruntime oracle exported this exact name as
+    // texture_util::graphics::GetTiledOffset2D, see the GetProcAddress in
+    // tools/validators/texture_decode_test.cpp). The pitch is rounded up to a
+    // multiple of 32 blocks *inside* this function, whereas Xenia expects the
+    // caller to have aligned it (texture_address.h:196 asserts pitch_aligned,
+    // the xe::align lives in texture_util.cc:324) — same result, but an
+    // unaligned pitch is a caller bug there and silently fixed here.
     pitch = (pitch + 31u) & ~31u;
     int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (bpbLog2 + 7);
     int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bpbLog2;
@@ -185,7 +207,12 @@ int32_t GetTiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch,
                          uint32_t height, uint32_t bpbLog2) {
     pitch = (pitch + 31u) & ~31u;
     height = (height + 31u) & ~31u;
-    // Triang3l TiledOffset3D: 32x32x4 macro-tile stacks.
+    // Triang3l's RE-derived 3D case (Xenia texture_address::Tiled3D): the
+    // macro tile is 32x16x4 blocks (kMacroTileWidth 32, kMacroTileHeight3D 16,
+    // kMacroTileDepth 4 — texture_address.h:165-171), which is why the macro
+    // term below steps y by >>4 and z by >>2. 32x32x4 is the *storage*
+    // alignment of a 32-block-row x 4-slice portion, larger than the macro
+    // tile (texture_address.h:45-47) — not the macro tile itself.
     int32_t macro_outer =
         ((y >> 4) + (z >> 2) * int32_t(height >> 4)) * int32_t(pitch >> 5);
     int32_t macro = (((x >> 5) + macro_outer) << (bpbLog2 + 6)) & 0xFFFFFFF;
@@ -216,7 +243,9 @@ int32_t GetTiledAddressUpperBound2D(uint32_t right, uint32_t bottom, uint32_t pi
                                     uint32_t bpbLog2) {
     if (!right || !bottom) return 0;
     // Origin of the 32x32 tile containing the last block, then the maximum extent
-    // reachable within that tile (per Xenia GTextureAddressUpperBound).
+    // reachable within that tile (Xenia GetTiledAddressUpperBound2D,
+    // texture_util.cc:451-471; 0xA00/0xC00 are its 1bpb/2bpb extents, whose
+    // portions address independently within 128x128 and 64x64 respectively).
     int32_t origin = GetTiledOffset2D(int32_t((right - 1) & ~31u),
                                       int32_t((bottom - 1) & ~31u), pitch, bpbLog2);
     switch (bpbLog2) {

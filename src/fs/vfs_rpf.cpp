@@ -160,10 +160,18 @@ bool RpfVirtualFileSystem::Initialize(const std::string& extracted_cache_root) {
 
     MCLA_LOG_INFO("VFS: Initializing with extracted cache root: {}", extracted_cache_root);
 
-    // First scan the extracted cache (xarchive packages, etc.)
+    // Scan the extracted cache. In the committed tree that directory is EMPTY
+    // by design (PROGRAM_GUIDE §3: "must exist (empty OK)"), which is why every
+    // soak logs `VFS: Indexed 1 files/directories` and `xarchive* entries=0`.
+    // The packs are not in the index: OpenFile serves them as real files from
+    // game_data via its real-packfile branch.
     BuildIndex(extracted_cache_root);
 
-    // Also scan the game_data root for loose files like .bik movies
+    // Second pass aimed at the game_data root (loose .bik movies) — but the
+    // argument is never read: BuildIndex() clears m_file_index and walks
+    // m_extracted_root, so this re-walks the extracted cache and game_data
+    // stays un-indexed. Do not cite it as "the game_data scan"; honouring the
+    // parameter would be a code change, not a comment fix.
     std::filesystem::path extracted_path(extracted_cache_root);
     std::filesystem::path game_data_root = extracted_path.parent_path();
     if (std::filesystem::exists(game_data_root)) {
@@ -249,8 +257,11 @@ void RpfVirtualFileSystem::BuildIndex(const std::string& root) {
     // error_code overloads everywhere: one unreadable file must not abort the walk
     std::filesystem::recursive_directory_iterator it(
         root_path,
-        // the extracted cache uses NTFS junctions for the xarchive_* packs;
-        // without this flag the iterator silently skips them entirely
+        // Kept for a populated cache: when the extracted cache is laid out per
+        // pack the xarchive_* entries are junctions, and MSVC's recursive
+        // iterator does not descend a reparse point without this flag. The
+        // committed cache is empty (PROGRAM_GUIDE §3) and no soak has ever
+        // logged an xarchive* entry, so today this guards nothing that exists.
         std::filesystem::directory_options::follow_directory_symlink |
             std::filesystem::directory_options::skip_permission_denied,
         iter_ec);
@@ -508,7 +519,8 @@ namespace {
 bool PreadHost(void* handle, uint64_t offset, void* buffer, size_t size) {
     if (size == 0) return true;
     if (!handle) {
-        // open lazily on first use
+        // no lazy open in this helper — a null handle is simply a failed read;
+        // the caller (ReadFile) opens the segment handle before calling.
         return false;
     }
     LARGE_INTEGER li{};
@@ -611,12 +623,20 @@ bool RpfVirtualFileSystem::ReadFile(OpenFileHandle& file, void* buffer, uint64_t
 
 namespace {
 // T41.3p (F-105): raw-DEFLATE member spans the guest must see EXPANDED. The
-// offsets/sizes are not host guesses — they are the size/offset words the
-// guest itself published from its decrypted TOC (TOC76-XSF census). The
-// expansion is decoded once from the stored bytes and cached; a span is only
-// substituted when a single read covers it whole, because DEFLATE cannot be
-// decoded from a fragment and an in-place substitute must not shift the rest
-// of the window.
+// offsets/sizes are not host guesses — they are size/offset words published by
+// the guest's own decrypted TOC, arriving through MarkMemberExpanded from two
+// registrars in src/gpu_device.cpp: the lazy TOC76-XSF census and, since
+// F-149, the tables MclaMarkKnownListMembers marks at the first archive I/O
+// (kListMemberSpans, kTypeMemberSpans). Read the length field accordingly: for
+// the six .list spans stored == expanded (F-105's correction to F-073), but
+// for the ten entity.type spans the registered value is the TOC's LOGICAL
+// (inflated) size — member 0x35CA43 stores 255 deflate bytes and inflates to
+// the declared 0x1E0 — so "storedLen"/the log's `stored=` here means "the
+// length the substitute must produce", and RawInflate stops at the stream's
+// final block before exhausting that bound. The expansion is decoded once from
+// the stored bytes and cached; a span is only substituted when a single read
+// covers it whole, because DEFLATE cannot be decoded from a fragment and an
+// in-place substitute must not shift the rest of the window.
 struct ExpandedSpan {
     uint64_t off = 0;
     uint32_t storedLen = 0;
