@@ -10550,3 +10550,25 @@ descriptors) rather than the record-index shape F-470 gave it.
 `F483-DEFER` / `F483-DEFER-HOLD` / `F483-UNPIN` are therefore absent from the shipped binary and are
 registered as flag-off in `PROGRAM_GUIDE` §7 so a future session does not read their 0 as a result
 (F-089 §6). Next ID **F-486**.
+
+### F-486 (2026-09-27 06:5x, **0 builds — the 70 instructions immediately before the dispatch routine's success tail**) — **WHAT "COMPLETE" MEANS, AND IT IS NOT BYTE COVERAGE: the walk at `loc_821BC440` iterates 12-byte output descriptors (`r31 += 12`, bound `[slot+1540]`), and for each it compares the produced count against `[r31+0]` — unequal sends control back to `loc_821BC3F4`, and a byte flag at `[state+1852]` sends it to `loc_821BC3C0`; only after all descriptors pass does it run `[record+8]`'s `vt[+124]` (and `vt[+52]` when that returns −1) and fall through to the decrement-and-callback tail at `:19351`. Measured against `w483`, that leaves the two first jobs differing ONLY in something the counters do not yet see: job #1 read its whole 143,069-byte container in 5 real requests over 10 descriptors and reached the tail; job #2 read its whole 1,066,057 bytes in 33 real requests over 52 descriptors and did not.**
+
+- Task:        T42.22 (#80) — the completion condition, named statically
+- Type:        FACT + the exclusion of "the reads were incomplete"
+- Class:       G
+- Priority:    P0 — it is the current frontier statement for the objective
+- Evidence:    `generated/ppc_xenon/ppc_recomp.14.cpp:19284-19350` (`lbz r9,1852(r29)` / `bne loc_821BC3C0`; `lwz r4,0(r31)` / `cmpw cr6,r3,r4` / `bne loc_821BC3F4`; `addi r31,r31,12` / `lwz r9,1540(r26)` / `cmpw cr6,r30,r9` / `blt loc_821BC440`; then `loc_821BC4CC` device `vt[+124]`, `cmpwi r3,-1`, `vt[+52]`, `loc_821BC500: addi r3,r28,12` → the F-475 decrement → F-478 callback branch) · per-window counters from `build/w483.log`: `#1 reads=9 len>0=5 moves=5 64CB0000→64CD2EDD rlcAfter=10` vs `#2 reads=615 len>0=33 moves=33 64980000→64A84449 rlcAfter=52`, and `RELSEMA … lr=821BC538` = 1 for the whole soak
+
+**1. The two exclusions this adds.** (a) "The garage's reads were short" is false — its 33 requests span
+its whole package and 582 further calls asked for zero bytes. (b) "Only the first job ever had a valid
+record" is now also false for the completion question, because `w483`'s pin gave job #2 a valid record
+and full reads and it still never reached the tail. So the remaining difference is per-descriptor:
+`produced == [desc+0]` for each of the 52 (or 10) entries, or the `[state+1852]` re-entry flag.
+
+**2. What the next instrument must therefore measure** (T42.22, one build, and it is small): per job
+window, the number of descriptor iterations and the number that fail the `cmpw r3,r4` equality, plus
+`[state+1852]` at entry — three numbers, on the same `POST-EXEC-START` row. If job #2 shows 52
+iterations and N>0 failures while job #1 shows 10 and 0, the objective's remaining blocker is the
+descriptor chain itself (task #15's ORIGINAL shape) and not the record or the feed; if both show 0
+failures, then the tail is being skipped through some branch this read has not enumerated and the search
+restarts at the loop's top. Next ID **F-487**.
