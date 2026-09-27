@@ -2496,3 +2496,23 @@ goal is NOT met.**
 with the 4 bytes at the input pointer, to separate "no block header at the cursor" from "codec rejects it" for
 the two containers that read everything and decode nothing. `F507-INITEXP` (cap `n <= 12 || n % 400`) is the
 seed instrument; `F505-SLEEP` must stay 0 as the neutrality control.
+
+
+### 09:5x addendum - F-508: F-507's gain verified as the GUEST'S OWN (tree back to shipped)
+
+`still_present` was conflated: `kUiXsfFillDryRun=false` means our chunked fill also writes the garage.
+Re-measured with the fill OFF (`w510`): garage guest-only presence **63,072 -> 291,040** with
+`first_bad=00040000` (first 256 KiB byte-exact vs `build/xmem_golden/garage.bin`), `cumprod`
+917,504 -> 950,272, raceeditor 47,484 / `first_bad=00008029` - and **every frontier marker is unchanged
+by switching our placement off** (`PRESENT` 52 -> 51 only). Counter semantics verified: `LZX-FRAME`
+counts the guest's own `sub_82461B98` calls, `maxProduced` is guest `state+24`, `cumprod` is a word in
+the guest's XMem context. Shipped state now reproduces 3/3 (`w508`/`w509`/`w511`, `w511` vs `w509` all
+`+0`), and the garage holds `pct=100 first_bad=FFFFFFFF` at every re-verify shot where pre-F-507 `w507`
+decayed to 97 % / `first_bad=00040005`.
+
+Two corrections: window #4 (29,655 bytes) is **credits**, not "meshtextures" (golden files name them:
+`raceeditor 143,069 / garage 1,066,057 / policecam 19,337 / credits 29,655`); and the golden re-verify
+covers only 2 of the 4 packages, so **policecam and credits have no content-level verdict** - which is
+exactly the pair that reads its whole stream and decodes nothing. F-509 (#86): add `policecam.bin` and
+`credits.bin` to the re-verify set, then the remaining Path B question is purely codec family. GFx
+unchanged: `F438-GFXCTOR` 0.

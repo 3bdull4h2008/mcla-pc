@@ -9543,7 +9543,7 @@ static constexpr bool kUiXsfFrameServe = false;  // F-343: re-reverted; F-333+F-
 // then the shared inflate record `st=006D8F20` was taken by another container
 // (`exp=000073D7` = credits' 29,655 in entry #67) and the chain stopped at two
 // dests, leaving 132,578 surviving of what was placed.
-static constexpr bool kUiXsfFillDryRun = false;
+static constexpr bool kUiXsfFillDryRun = false;   // F-508 measured with true (w510); see that entry
 
 // F-350: allow the plan to overwrite a slot that belongs to THIS container's own
 // chain. `MclaSlotUntouched` was written to stop the host from clobbering another
