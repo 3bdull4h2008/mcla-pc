@@ -10428,6 +10428,14 @@ PPC_FUNC(sub_821D5E10) {
     {
       static std::atomic<uint32_t> s_f494Dumped[12]{};
       const uint32_t win = g_f481Window.load(std::memory_order_relaxed);
+      // The loop's re-entry guard is `lbz r9,1852(r27)` / `(r29)` at
+      // ppc_recomp.14.cpp:19096 / :19284. Three objects are reachable from here:
+      // the inflater (r3), the record-derived pointer and the state block.
+      auto F495Flag = [](mcla::kernel::GuestMemoryHeap& m, uint32_t o) -> uint32_t {
+        uint8_t b = 0xFF;
+        if (o >= 0x80000000u && o < 0xF0000000u) (void)m.ReadU8(o + 1852u, &b);
+        return b;
+      };
       if (win != 0 && win < 12u && st >= 96u &&
           s_f494Dumped[win].load(std::memory_order_relaxed) < 3u) {
         const uint32_t sp = st - 96u;
@@ -10440,10 +10448,11 @@ PPC_FUNC(sub_821D5E10) {
         MCLA_LOG_WARN("F494-WALK win={} sp={:08X} cur=[{:08X} {:08X} {:08X} "
                       "{:08X}] st=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
                       "{:08X} {:08X}] desc=[{:08X} {:08X} {:08X} {:08X} {:08X} "
-                      "{:08X} {:08X} {:08X}]",
+                      "{:08X} {:08X} {:08X}] flagInf={} flagCur={} flagSt={}",
                       win, sp, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
                       d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16],
-                      d[17], d[18], d[19]);
+                      d[17], d[18], d[19], F495Flag(mem, infR3),
+                      F495Flag(mem, d[8]), F495Flag(mem, st));
       }
     }
     if (g_f481Window.load(std::memory_order_relaxed) != 0) {

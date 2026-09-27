@@ -10745,3 +10745,14 @@ gap is narrowed to: after a correct inflate driven by `exp = own length`, why do
 fall through to the tail? Candidates visible from here: the `[obj+1852]` re-entry byte at
 `ppc_recomp.14.cpp:19096`/`:19284` (not yet read — the hook can reach `infR3+1852` in one line), and
 the destination-chain accounting `[sp+28] = 0x69A000` vs `0x124000`. Next ID **F-496**.
+
+### F-496 (2026-09-27 07:5x, **1 build, soak `w495`; probe extended, tree otherwise unchanged**) — **THE LOOP'S RE-ENTRY BYTE IS NOT THE DISCRIMINATOR: the byte at `[inflater+1852]` — the field the walk tests with `lbz r9,1852(r27)` at `ppc_recomp.14.cpp:19096` — reads **0 in all 21 `F494-WALK` rows across all seven job windows**, including job #1, the only job that reaches its tail and completion callback. So the re-entry guard is uniformly clear and cannot explain why six jobs leave by another route.**
+
+- Task:        T42.27 — closes F-495 §2's first candidate
+- Type:        FACT (a negative) + an instrument caveat
+- Class:       E + H
+- Priority:    P1
+- Evidence:    `build/w495.log` 21 × `F494-WALK win=1..7 … flagInf=0 flagCur=255 flagSt=255` (three rows per window) · the probe extension is the `F495Flag` lambda beside the `F494-WALK` print inside `PPC_FUNC(sub_821D5E10)` · neutrality: `PUSH` 7, `LISTLINE` 171, `GFx` 13, `C0000005` 0, `lr=821BC538` 1, `XSF-INFLATE` 0 — identical to `w494`
+- **Caveat, kept in the record so nobody reads those two 255s as data:** `flagCur`/`flagSt` are *not* measurements. The lambda's guard requires `0x80000000 ≤ o < 0xF0000000`, and the two values I passed it (`[sp+128]` and `st` itself) are stack addresses (`0x006D8F40`, `0x006D8F20`), so the read was skipped and the sentinel returned. Only `infR3` (the inflater object) is in range. The two registers the guest actually tests (`r27`, `r29` inside `sub_821BC140`) are not reachable from this hook at all — reaching them is the in-loop (`midasm_hook`) case.
+
+**What remains after this.** One candidate from F-495 §2 is still open: the destination accounting at `[sp+28]` (per-window values `0x124000`, `0x94000`, `0x46000`, `0x1CA000`, `0xA000`) and the produced-vs-`[desc+0]` equality at `:19100-19105`. Neither is decidable from outside the loop. So the honest state of the objective is: Path A covers three of four containers byte-exact and 76-100 % of the fourth by durable presence; Path B's prerequisite (record ownership) is proven and its consequence (the guest decoding `0x104449`-byte descriptors and streaming its own LZX payload) is observed; and the last step — a job reaching its success tail — is not observable or controllable from the hooks that remain permitted. Next ID **F-497**.
