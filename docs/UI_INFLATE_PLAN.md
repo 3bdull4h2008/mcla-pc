@@ -520,3 +520,12 @@ extension to config text (F-457). Rule-2/`F-055` (host-forced boot gate) remains
 the GFx dispatch producer remains absent (`F-440`/`F-441`), so **P1 is necessary but may not be
 sufficient for GFx** — the plan's success criterion for this objective is therefore `XSF-INFLATE > 0`
 plus a second package at 100 %, with GFx tracked separately.
+
+### 9.1 P1 and P1c run and reverted (F-484/F-485) — the record is not what blocks completion
+
+`w482`/`w483` proved the antecedent: with the release deferred, jobs #1 and #2 hold their own records and
+issue real reads across their own whole containers (garage: 33 requests, `64980000 → 64A84449`). They
+still do not reach the success tail, so §9's chain is correct up to "foreign record ⇒ wrong bytes
+requested" and **wrong** about "⇒ no completion". The gate therefore moved: `outLeft`/destination chain
+(task #15's original per-request output-descriptor shape), not the record index. `kF483DeferRelease`
+is `false` in the tree; the pins/unpins stay as a reusable instrument.
