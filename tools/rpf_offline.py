@@ -137,11 +137,13 @@ def names(argv):
         if not nm:
             continue
         off = i * 4  # every word is tested, not only stride-16 record heads
-        rec = struct.unpack_from(">4I", dump, off) if off + 16 <= len(dump) else (w,)
-        kind = "dir " if len(rec) == 4 and rec[2] & 0x80000000 else "file"
-        # Known tail hazard (not fixed here, this pass is comments only): a hit on
-        # the final partial word takes the (w,) branch above, len(rec) != 4 forces
-        # kind to "file", and the rec[1] below then raises IndexError.
+        rec = struct.unpack_from(">4I", dump, off) if off + 16 <= len(dump) else None
+        if rec is None:
+            # Final partial word: the matched hash is real but its 4-word record
+            # runs past EOF, so there is nothing further to decode.
+            print(f"  {off:#08x} tail {nm:34s} (record truncated by EOF)")
+            continue
+        kind = "dir " if rec[2] & 0x80000000 else "file"
         extra = (f"size={rec[1]} off={rec[2]:#x} idx={rec[3] & 0x0FFFFFFF}"
                  if kind == "file" else
                  f"child={rec[2] & 0x7FFFFFF:#x} count={rec[3]}")
@@ -181,8 +183,12 @@ def find(argv):
     for i, w in enumerate(words):
         if w in targets:
             off = i * 4
-            # No bounds guard here, unlike names(): a hit on the last 1-3 words of
-            # a buffer raises struct.error for want of a full 16-byte record.
+            if off + 16 > len(toc):
+                # Hit on the last 1-3 words: no full 16-byte record fits, so report
+                # the offset and the matching word without unpacking.
+                print(f"  {off:#08x} tail {targets[w]:24s} {w:08X} (record truncated by EOF)")
+                hits += 1
+                continue
             rec = struct.unpack_from(">4I", toc, off)
             kind = "dir " if rec[2] & 0x80000000 else "file"
             print(f"  {off:#08x} {kind} {targets[w]:24s} "
