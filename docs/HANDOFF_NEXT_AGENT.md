@@ -2435,3 +2435,31 @@ trio `0x8004/0x10004/0x18004` on record index 4. That needs the release-side sto
 been prescribing since 05:1x: a range watch over `C9E24900..C9E249A4` naming every writer of `+4` per
 index, ordered against `STREAM-OPEN`/`PUSH`/`F502-KEEP`/`F503-ENTRY` - so ownership is answered by the
 guest's writes, not by another guess of ours. `tools/addr_owners.py --check` before any hook.
+
+
+## 2026-09-27 09:3x - the last wall is the codec seed, not the record (F-505, F-506)
+
+**Two negatives that narrow the goal, one control that confirms what ships.**
+
+`w507` (shipped = F-502 + F-503, both flags true, F-506 false) reproduces `w505` **marker-for-marker**,
+including `LZX-FRAME` 48, `PRESENT` 60, `F503-ENTRY` 18 and `INFLATE-ENTER` 15,405. So the two kept
+fixes are stable across builds, and `F438-GFXCTOR` is still 0.
+
+`F-505`: the guest sleep routine `sub_821C91B8` is called **zero times in a whole boot** (hook prints
+its first 24 calls unconditionally; no rows). So neither the walk's outstanding-IO credit gate
+(`ppc_recomp.14.cpp:19065`) nor the release's count spin is on the path - F-317's timeout waits and
+F-500's `cred=` sample are both closed as leads.
+
+`F-506`: re-armed F-504's forced `record+4` with the state words visible, and the hang is explained.
+Window 5's last rows are `st=[00008000 006D8F40 00007FF4 00000000 00080000 B7981000 ...]` +
+`INFLATE-ENTER ... in=32768 consumed=32756 exp=00000000 lr=821BC380`, then 106 s of silence from the
+worker. With the real length supplied, the walk's retry branch (`:19043`, `lwz r11,96(r1); bne
+loc_821bc374`) re-enters the codec without re-reading, and `exp = 0` makes the input allowance
+negative, so nothing is ever consumed. Bounded zero-read spin became an unbounded inflate spin.
+
+**Consequence for the objective:** record ownership is no longer the last blocker - it is fixed. Both
+independent interventions (F-492's pin, F-506's length) now converge on the same single unknown that
+F-498 named: what seeds `exp` (`[state+12]`) for the first block, given the parse is gated on
+`[state+8] == 0` and F-499 showed forcing that gate reads payload as a header. T42.34 (#84) states the
+census that answers it: which exit of the parse branch each `InflateBegin` entry takes, keyed by window
+and `[st+8]`. Do not re-arm `kF506ForceLength` outside a soak - it hangs the worker by design.

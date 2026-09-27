@@ -151,6 +151,24 @@ static std::atomic<uint32_t> g_f481OutNZ{0};
 static std::atomic<uint32_t> g_f481MaxProd{0};
 static std::atomic<uint32_t> g_f481Lzx{0};
 
+// F-505 (T42.33): where a streamer dispatch actually PARKS. w504 (see F-504) showed that
+// forcing record+4 gives the guest the garage's complete walk and then dispatch #5 enters
+// sub_821BC140 and never returns, with the log going QUIET (37,319 lines vs 138,806) -
+// so #5 is not spinning on zero-length reads (that prints 10k lines per 100 ms), it is
+// asleep. Two sleeps exist on this path and neither prints anything today: the walk's
+// outstanding-IO credit gate (`li r3,100; bl sub_821C91B8` at ppc_recomp.14.cpp:19065)
+// and the release's count spin (`li r3,10` at :21606). Census the guest sleep routine
+// itself, keyed by return address, and tally per dispatch window. READ-ONLY.
+static std::atomic<uint32_t> g_f481Sleeps{0};
+static std::atomic<uint32_t> g_f481SleepMs{0};
+// F-506: reproduce F-504's full-container walk on demand so the sleep census can say what
+// breaks it. MEASURED (w506): dispatch #5 enters sub_821BC140 at 09:16:43.011 and then
+// emits no log line of any kind for 106 seconds - no READWRAP, no sleep, no visible
+// inflate row - i.e. it is inside the walk's own retry branch (ppc_recomp.14.cpp:19043
+// `lwz r11,96(r1); cmplwi; bne loc_821bc374`), which has no exit while the codec
+// consumes nothing (F-498's exp=0 clamp). Set false = the shipped F-503 behaviour.
+static constexpr bool kF506ForceLength = false;
+
 // F-247 dynamic serve-framing predicate: defined after g_mclaRebaseMap (~:3945).
 static bool MclaIsCurrentJob2Pbase(uint32_t outPtr);
 // w18: job #2 dests are the UI/swfC set only. Shared by package assigner
@@ -12818,6 +12836,44 @@ PPC_FUNC(sub_821867A0) {
 // what the 'calls' count here settles - the records are 28 bytes and
 // sub_821BCB10 only SEARCHES them by record[0]). Registers-only: see the ENQ
 // note above for the guest-memory-read AV this subsystem has already produced.
+// F-505: read-only census of the title's own sleep routine (sub_821C91B8). It is the
+// only way to see WHERE a streamer dispatch parks, because neither of the two sleeps on
+// that path prints anything today: the walk's outstanding-IO credit gate
+// (ppc_recomp.14.cpp:19065, `li r3,100; bl 0x821c91b8`) and the release's count spin
+// (ppc_recomp.14.cpp:21606, `li r3,10; bl 0x821c91b8`). Address owner check ran clean -
+// sub_821C91B8 had exactly one site (the function mapping) and no existing hook.
+PPC_FUNC_IMPL(__imp__sub_821C91B8);
+static std::atomic<uint32_t> g_f505N{0};
+static std::atomic<uint32_t> g_f505Lrs[8]{};
+static std::atomic<uint32_t> g_f505Cnt[8]{};
+PPC_FUNC(sub_821C91B8) {
+  const uint32_t n = g_f505N.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t ms = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  const uint32_t win = g_f481Window.load(std::memory_order_relaxed);
+  uint32_t ws = 0;
+  if (win != 0) {
+    ws = g_f481Sleeps.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_f481SleepMs.fetch_add(ms, std::memory_order_relaxed);
+  }
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t have = g_f505Lrs[i].load(std::memory_order_relaxed);
+    if (have == lr) {
+      g_f505Cnt[i].fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+    if (have == 0) {
+      g_f505Cnt[i].store(1, std::memory_order_relaxed);
+      g_f505Lrs[i].store(lr, std::memory_order_relaxed);
+      break;
+    }
+  }
+  if (n <= 24 || (win != 0 && (ws <= 3 || (ws % 500) == 0)))
+    MCLA_LOG_WARN("F505-SLEEP #{} ms={} lr={:08X} window={} slept-in-window={}", n,
+                  ms, lr, win, ws);
+  __imp__sub_821C91B8(ctx, base);
+}
+
 PPC_FUNC_IMPL(__imp__sub_821BCE68);
 static std::atomic<uint32_t> s_hBCE68{0};
 PPC_FUNC(sub_821BCE68) {
@@ -13100,6 +13156,8 @@ PPC_FUNC(sub_821BC140) {
   g_f481OutNZ.store(0, std::memory_order_relaxed);
   g_f481MaxProd.store(0, std::memory_order_relaxed);
   g_f481LastOff.store(0, std::memory_order_relaxed);
+  g_f481Sleeps.store(0, std::memory_order_relaxed);
+  g_f481SleepMs.store(0, std::memory_order_relaxed);
   // F-500 (T42.29, READ-ONLY): statically, sub_821BC140 does NOT feed its inflater from
   // the job read-list. ppc_recomp.14.cpp:18874 builds r28 = [0x8283D190+52] +
   // ([slot+0] & ([0x8283D190+24]-1)) * 28 -- the RECORD -- then :19071-19094 calls
@@ -13142,7 +13200,8 @@ PPC_FUNC(sub_821BC140) {
           // dispatch #5 enters sub_821BC140 and never returns, GFx 13 -> 7, W34-NOGFX
           // 6 -> 3, Fatal error 0 -> 1. A non-zero +4 is a newer owner's legitimate value,
           // so overriding it corrupts a live record (the F-468 mistake in new clothes).
-          if (f == 0u && rlen != 0) continue;
+          // F-506 = F-504 re-armed, now instrumented: overriding a non-zero +4 too.
+          if (f == 0u && rlen != 0 && !kF506ForceLength) continue;
           const F501Body *b = F501Find(f483Tag);
           if (b == nullptr) break;
           const uint32_t want =
@@ -13220,7 +13279,8 @@ PPC_FUNC(sub_821BC140) {
                 "tid={:08X} pre={}ms guest={}ms rlcAfter={} cbAfter={:08X} "
                 "reads={} offFirst={:08X} offLast={:08X} moves={} len>0={} "
                 "ret[0/+/-]={}/{}/{} inflEnters={} lzxFrames={} "
-                "in!=0={} exp!=0={} outLeft!=0={} maxProduced={}",
+                "in!=0={} exp!=0={} outLeft!=0={} maxProduced={} "
+                "sleeps={} sleepMs={}",
                 n, slotAddr, queueArg, r3After, GetCurrentThreadId(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     tPreGuest - tHook0).count(),
@@ -13240,7 +13300,9 @@ PPC_FUNC(sub_821BC140) {
                 g_f481Seeded.load(std::memory_order_relaxed),
                 g_f481ExpNZ.load(std::memory_order_relaxed),
                 g_f481OutNZ.load(std::memory_order_relaxed),
-                g_f481MaxProd.load(std::memory_order_relaxed));
+                g_f481MaxProd.load(std::memory_order_relaxed),
+                g_f481Sleeps.load(std::memory_order_relaxed),
+                g_f481SleepMs.load(std::memory_order_relaxed));
   if (n <= 16 || (n % 500) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t ctxBase = slotAddr;
