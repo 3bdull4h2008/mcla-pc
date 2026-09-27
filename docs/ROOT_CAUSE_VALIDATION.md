@@ -10645,3 +10645,19 @@ the recompiler toolchain (clang 19 vs STL 14.51). That is a decision for the use
 quietly — and it is also the point where Path A's own result (3 of 4 UI containers byte-exact in guest
 memory, garage 806k-852k of 1,066,057 durable) already covers the decompression half of the objective
 by a different route, without a guest inflate. Next ID **F-490**.
+
+### F-490 (2026-09-27 07:1x, **0 builds — the state fields `INFLATE-ENTER` already prints, joined per job window across `w483` and `w485`**) — **THE COMPLETING JOB'S INFLATE STATE IS THE ONLY ONE CARRYING A NON-ZERO EXPECTED-OUTPUT, AND THE PINNED GARAGE CARRIES IT ON ONLY PART OF ITS ITERATIONS: in `w483` job #1 shows `exp != 0` on 20/20 printed iterations with `exp = 0x22EDD` = its own 143,069-byte length and `in != 0` on 16 of them, while job #2 (own record, own bytes, pinned count) shows `in = 32768` but `exp = 00000000` on its first seeded row and jobs #3/#4 show `in != 0` on ZERO of 1009/607 printed rows. Also recorded: `w485`'s completing job first shows `in = 4294967284` = `0xFFFFFFD4` = **−44**, so `inLeft` is not a trustworthy quantity in either direction.**
+
+- Task:        T42.23 (#80, seed-vs-consumed) — first pass, filtered
+- Type:        FACT with an explicit instrument bias (see §2)
+- Class:       H + E
+- Priority:    P1
+- Evidence:    `build/w483.log` / `build/w485.log` rows `INFLATE-ENTER #n st=… in=<n> inPtr=… consumed=<n> exp=<hex> ihdr=[…] outPtr=…` bucketed between each job's `BC140-REC` and `POST-EXEC-START` lines; `exp` is `[st+12]` (the expected total output, copied from `[inPtr+4]` per the layout comment at `src/gpu_device.cpp:10328-10333`), `in` is `[st+0]`
+
+**2. Bias, stated before the inference.** `INFLATE-ENTER` prints on `n <= 16 || (n % 200) == 0 || j2Ent || stackCont` (`src/gpu_device.cpp:10337`) — a deterministic 1-in-200 sample plus two special conditions. So *proportions* here (20/20, 301/657, 0/1009) are not iteration rates, only indicators; and the special conditions mean the sample is biased toward the rows this census already treats as interesting. The rates that would carry a claim must come from unconditional counters.
+
+**3. The unconditional version (T42.25, one build):** extend the F-481 per-window block with
+`expZero` / `seeded` (`[st+0] != 0`) / `totalProduced` (`[st+24]`) counters incremented on every
+`InflateBegin` entry while a window is open, printed on the same `POST-EXEC-START` row. That settles
+"never seeded" vs "seeded and consumed" per job without a filter, which is the last question that
+stands between F-489's null result and the in-loop (`midasm_hook`) route. Next ID **F-491**.
