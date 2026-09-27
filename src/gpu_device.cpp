@@ -10421,6 +10421,31 @@ PPC_FUNC(sub_821D5E10) {
     uint8_t ih[8] = {0};
     if (inPtr)
       (void)mem.ReadBytes(inPtr, ih, 8);
+    // F-494: the walk's OWN frame is reachable here, because InflateBegin is called
+    // from inside the loop with r4 = r1+96 (proved: st=0x6D8F20 and r1in=0x6D8EC0
+    // differ by 96). That gives the cursor at [r1+80..95], the state at [r1+96..127]
+    // and the input-descriptor list at [r1+128..159] without any in-loop hook.
+    {
+      static std::atomic<uint32_t> s_f494Dumped[12]{};
+      const uint32_t win = g_f481Window.load(std::memory_order_relaxed);
+      if (win != 0 && win < 12u && st >= 96u &&
+          s_f494Dumped[win].load(std::memory_order_relaxed) < 3u) {
+        const uint32_t sp = st - 96u;
+        uint32_t d[20] = {0};
+        for (uint32_t i = 0; i < 12u; ++i)
+          (void)mem.ReadU32BE(sp + 80u + i * 4u, &d[i]);
+        for (uint32_t i = 0; i < 8u; ++i)
+          (void)mem.ReadU32BE(sp + 128u + i * 4u, &d[12u + i]);
+        s_f494Dumped[win].fetch_add(1, std::memory_order_relaxed);
+        MCLA_LOG_WARN("F494-WALK win={} sp={:08X} cur=[{:08X} {:08X} {:08X} "
+                      "{:08X}] st=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                      "{:08X} {:08X}] desc=[{:08X} {:08X} {:08X} {:08X} {:08X} "
+                      "{:08X} {:08X} {:08X}]",
+                      win, sp, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                      d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16],
+                      d[17], d[18], d[19]);
+      }
+    }
     if (g_f481Window.load(std::memory_order_relaxed) != 0) {
       // F-490 §3: unconditional seed/exp/outLeft/produced tallies, so "never seeded"
       // and "seeded then consumed" stop being read off a 1-in-200 sample.

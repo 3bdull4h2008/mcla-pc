@@ -10723,3 +10723,25 @@ real decompression deliverable), the complete record/pool lifecycle (F-469…F-4
 quantified fact that record ownership is enough to make the guest *decode* 327,680 bytes of the fourth
 container on its own. What is no longer supported: that any of these is the gate on GFx. Next ID
 **F-494**.
+
+### F-495 (2026-09-27 07:4x, **3 builds: `F494-WALK` probe → `w491`/`w492` baseline, pin ON → `w493`, pin OFF + control `w494`**) — **THE WALK'S OWN FRAME IS READABLE FROM THE `InflateBegin` HOOK (its `r4 = r1+96`), and it shows the descriptor the codec is driven by is a *shared stack buffer that the previous container left behind*: baseline job #2 (garage) enters with `desc=[05435352 … 0FF512EF 00004B89 …]` — an RSC5 header whose XCompress block size is `0x4B89` = 19,337 = POLICECAM's length — and `exp = 00004B89`, cursor parked at `64CA7B89` = policecam's end. Under record ownership the same job enters with `desc=[… 0FF512EF 00104449 …]`, `exp = 0x104449` = **its own 1,066,057**, and on the next two iterations the descriptor buffer holds high-entropy LZX data while the cursor steps `64988000 → 64990000 → 64998000`. So Path B's precondition is proven to be record ownership, and the last unmeasured link is after a correctly-driven inflate.**
+
+- Task:        T42.26 (#80 replaced by this) — the loop's inputs observed without an in-loop hook
+- Type:        FACT + instrument KEPT (`F494-WALK`, 3 rows per job window, 21/boot, read-only)
+- Class:       E + G
+- Priority:    P0 — it is the closest observation of the tail condition reachable from outside
+- Evidence:    `build/w494.log`/`build/w492.log` (pin OFF) `F494-WALK win=2 … cur=[0 64CA7B89 …] st=[…] desc=[05435352 0000001B D41D2810 0FF512EF 00004B89 …]`, `win=3 … 000073D7` (= container 4's 29,655), `win=1 … desc=[0×8] exp=0` **and win 1 is the only job that completes**; `st+4` alternates `006D8F40`/`006D8F4C` = `sp+128`/`sp+140`, the descriptor cursor arithmetic from the F-133 layout note · `build/w493.log` (pin ON) `win=2 … cur=[0 64988000 …] st=[00007FF4 … 00104449 00040000 B7EC1000 …] desc=[05435352 0000001B D574B032 0FF512EF 00104449 254E0410 …]` then `desc=[8A0C5E9D F3564445 …]` (compressed payload) · probe `src/gpu_device.cpp` inside `PPC_FUNC(sub_821D5E10)`; frame identity proven by `st=0x6D8F20` vs `r1in=0x6D8EC0` = 96 · neutrality: `w494` = shipped (`PUSH` 7, `LISTLINE` 171, `BOOTPATH` 10, `GFx` 13, `C0000005` 0, `lr=821BC538` 1)
+
+**1. The one frame, all jobs.** `sp = 0x006D8EC0` in every window — the streamer *worker's* loop frame, so
+`[sp+80]` (u64 source cursor), `[sp+96..127]` (the inflate state) and `[sp+128..]` (the RSC5/XMem
+descriptor block) are one shared buffer that each job inherits. That is the mechanism behind F-480's
+foreign read addresses: not only the record but the **descriptor block in the worker's own frame** is
+whatever the previous container left, and job #1 — the completer — is the one whose block is all zeros
+(nothing to satisfy).
+
+**2. Consequence for the plan, stated without optimism.** Path B's prerequisite is now twice-confirmed
+(record ownership ⇒ its own descriptor ⇒ its own bytes streaming through the codec), and its remaining
+gap is narrowed to: after a correct inflate driven by `exp = own length`, why does the walk still not
+fall through to the tail? Candidates visible from here: the `[obj+1852]` re-entry byte at
+`ppc_recomp.14.cpp:19096`/`:19284` (not yet read — the hook can reach `infR3+1852` in one line), and
+the destination-chain accounting `[sp+28] = 0x69A000` vs `0x124000`. Next ID **F-496**.
