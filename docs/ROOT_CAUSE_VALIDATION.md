@@ -10303,3 +10303,29 @@ writes it as the free-list link at init (`:21804`), `sub_821BD220` writes it as 
 release (`:21634`), and `sub_821BC140` only decrements it. So the 1 that `w477` observes is written by
 a site outside those three — naming it is the remaining half of #77, and until it is named the
 "correct" fix for the ordering is a guess rather than a plan.
+
+### F-476 (2026-09-27 06:2x, **0 builds — four greps and one function read**) — **THE "+12 = 1" INCREMENT IS NOT A STREAMER AddRef: the module's only `record+12`-style atomic increment thunk is `sub_82162550` (`addi r3,r3,12; b sub_821CE0D8`, `ppc_recomp.5.cpp:15619-15626`) and it has exactly ONE caller module-wide — `0x82148EE8` inside `sub_82148EA8`, outside the `0x821BCxxx` streamer family. What Open's pop path really writes at `loc_821BCFF0` is `record+12 = r25` (NOT the 0 a delegated inventory claimed — corrected below), while exporting the old free-list link to `[r24-24]` = `0x8283D19C` and bumping an allocation counter at `0x8283D1B8`. So the busy word's initial value is a computed quantity inside `sub_821BCE68`, and the "who pins the record" question narrows to that one value.**
+
+- Task:        T42.18 (#77), second half — hypothesis excluded, term still open
+- Type:        FACT + a CORRECTION to a delegated inventory's cell
+- Class:       G + H (a tool/subagent output that was wrong in a way that would have misled the plan)
+- Priority:    P2 — it closes a route, not the goal
+- Evidence:    `generated/ppc_xenon/ppc_recomp.5.cpp:15619-15626` (the thunk) · `python tools/ppc_xrefs.py calls 0x82162550` → 1 site (`0x82148ee8 bl -> sub_82148EA8 +0x40`) · `grep -rn "sub_821CE0D8(ctx, base)" generated/ppc_xenon/*.cpp` = 67 call sites, of which exactly one is preceded by `addi r3,r3,12` · the pop path `ppc_recomp.14.cpp:21130-21145` (`lwz r11,12(r29)` / `stw r25,12(r29)` / `stw r11,-24(r24)` / `lwz r10,-11880(r9)` + `addi r11,r10,1` + `stw r11,-11880(r9)`), with `r24 = 0x8283D1B4` from `addi r24,r11,-11836`
+
+**1. The correction, because it is the reusable part.** A background inventory of the record-array
+writers transcribed `ppc_recomp.14.cpp:21133` as "`+12 | 0`". The line is
+`PPC_STORE_U32(r29.u32 + 12, r25.u32)` — the stored register is `r25`, and the *old* value is
+deliberately exported two instructions later, which is the signature of a pop-and-repurpose, not an
+init-to-zero. Its other cells (bases, the release at `:21632-21637`, BC140 writing nothing) checked
+out against my own reads and against `src/gpu_device.cpp:4614-4621`, and it is cited here only for
+that one cell. Rule kept: an inventory is a *lead list*, and any value column entering the plan gets
+re-read at the line before it is used.
+
+**2. What this does to F-475's open term.** The candidate "the streamer takes a reference when it
+pins a record" is excluded — no streamer-family code calls the increment thunk, and the field is not
+refcounted through it. Remaining shapes for the 1 that `w477`/`w478` read at join time: (a) the value
+`r25` that Open's pop installs, computed earlier inside `sub_821BCE68`; or (b) a plain `stw` by a
+routine outside `ppc_recomp.14.cpp` (only three `+12` stores exist in that file:
+`:2664`, `:9674`, `:21133`). Tracing `r25` backwards through Open is the next cheap static step and it
+is the last one this thread needs before the ordering question is either fixable or closed. Next ID
+**F-477**.
