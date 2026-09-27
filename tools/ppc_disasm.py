@@ -113,33 +113,38 @@ def decode(i, pc):
             return f"subfe {r(d)},{r(a)},{r(b)}"
         if xo == 104:
             return f"neg {r(d)},{r(a)}"
+        # X-form logical/shift keeps RA (destination) at bits 11-15 (`a`) and RS
+        # (first source) at bits 6-10 (`d`) - the reverse of the XO arithmetic
+        # group above. Ground truth = the recompiler's emitted semantics at a
+        # VA anchored by ctx.lr: 821B4AB0, 821B6D3C, 821B6E28, 821B6CF0,
+        # 821BD1C4, 821B9DC8, 821B6F1C, 82554358.
         if xo == 824:
-            return f"sraw {r(d)},{r(a)},{r(b)}{rc}"
+            return f"srawi {r(a)},{r(d)},{b}{rc}"
         if xo == 792:
-            return f"srawi {r(d)},{r(a)},{b}{rc}"
+            return f"sraw {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 24:
-            return f"slw {r(d)},{r(a)},{r(b)}{rc}"
+            return f"slw {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 536:
-            return f"srw {r(d)},{r(a)},{r(b)}{rc}"
+            return f"srw {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 28:
-            return f"and {r(d)},{r(a)},{r(b)}{rc}"
+            return f"and {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 444:
-            # mr is or with RB == RT; printing a 3-operand or as mr drops RB.
-            return f"mr {r(d)},{r(a)}" if d == b else f"or {r(d)},{r(a)},{r(b)}{rc}"
+            # mr rA,rS == or rA,rS,rS, so it is an mr only when RB == RS.
+            return f"mr {r(a)},{r(d)}" if d == b else f"or {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 478:
-            return f"nand {r(d)},{r(a)},{r(b)}{rc}"
+            return f"nand {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 124:
-            return f"nor {r(d)},{r(a)},{r(b)}{rc}"
+            return f"nor {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 56:
-            return f"eqv {r(d)},{r(a)},{r(b)}{rc}"
+            return f"eqv {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 284:
-            return f"orc {r(d)},{r(a)},{r(b)}{rc}"
+            return f"orc {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 60:
-            return f"andc {r(d)},{r(a)},{r(b)}{rc}"
+            return f"andc {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 412:
-            return f"orc {r(d)},{r(a)},{r(b)}{rc}"
+            return f"orc {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 316:
-            return f"xor {r(d)},{r(a)},{r(b)}{rc}"
+            return f"xor {r(a)},{r(d)},{r(b)}{rc}"
         if xo == 20:
             return f"lwarx {r(d)},{r(a)},{r(b)}"
         if xo == 150:
