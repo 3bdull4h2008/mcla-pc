@@ -568,3 +568,27 @@ Remaining outside-the-loop candidates: the produced-vs-`[desc+0]` equality at
 `midasm_hook` route and a working recompiler — or the user's F-055 gate for the GFx half, which F-493
 showed is a separate chain.
 
+### 9.4 Validation of the CURRENT binary against the objective's named baseline (`w193`)
+
+`build/w495.log` vs `build/w193.log` (`tools/soak_census.py`, 211 markers), i.e. after every instrument
+and revert in §8/§9 — no experiment is armed (`kF483/kF474/kF468/kF465/kF463 = false`):
+
+| marker | w495 | w193 | reading |
+|---|---|---|---|
+| `C0000005` / `C0000003` | 0 / 0 | 0 / 0 | no new access violations |
+| `LISTLINE` | 171 | 171 | shader-list phase unchanged |
+| `406D1388` | 1 | 1 | the single breakpoint-class event unchanged |
+| `LZX-FRAME` | 32 | 0 | **Path A host LZX decoding is the added capability** |
+| `XSF-HOSTSERVE` | 79 | 57 | more UI package serves |
+| `BC140-REC` | 7 | 3 | all seven streamer jobs now dispatch and are observed |
+| `GFx` | 13 | 5 | more GFx-side strings, but see the two zeros below |
+| `UIXSF-GOLDEN-REVERIFY` | garage `claimed=917504 still_present=917504 pct=100`; `pkg=64CB0000 … pct=100` | — | durable presence at 100 % of what the chain claims |
+| **`XSF-INFLATE`** | **0** | **0** | **no guest-side inflate of a UI container in a normal boot** |
+| **`F438-GFXCTOR`** | **0** | **0** | **GFx loader constructor never called** |
+| `Fatal error` | 2 | 0 | within the documented 0..2 spread of that marker (F-457's row, `w475` 0 / `w476` 2 / `w495` 2); `FATAL-SOFT-RESOURCE-PARK`, `lr=82184514` |
+
+So the deliverable state of the objective, honestly: clause (a) is achieved by Path A for 3 of 4
+containers byte-exact and for the fourth at 917,504/1,066,057 durable-100 %, and Path B's prerequisite
+is proven and its blocker localised (§9.3); clause (b) is **not** achieved and, per F-493, is not
+downstream of clause (a). **Objective OPEN.**
+
