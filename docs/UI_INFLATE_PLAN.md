@@ -603,3 +603,69 @@ the cursor (F-499). So the missing object is a **per-block input-descriptor stre
 reachable only through the recompiler (`midasm_hook`) or by the user's `F-055` decision on the GFx
 side, which F-493 showed is a separate chain anyway.
 
+
+
+## 10. Frontier and plan after F-500..F-514 (2026-09-27 07:5x) — replaces §8/§9 as the live plan
+
+### 10.1 What is settled (with the citation that settles it)
+
+| Claim | Evidence |
+|---|---|
+| F-186/F-187's premise ("UI containers opened but never enqueued") is false | `F469-RECSNAP` pushes all four with full-length records (`docs/ROOT_CAUSE_VALIDATION.md` F-469; `build/w502.log`) |
+| The walk's input is `record+8` -> vtable slot 28 = `sub_821CC6F0`, destination `r1+128`, 12-byte header skipped on the first chunk | `generated/ppc_xenon/ppc_recomp.14.cpp:18874`, `:19025`, `:19043-19055`, `:19079-19095`, `:19105-19123`; confirmed live by `F500-DEVREAD` (`s28=821CC6F0`, `r6=006D8F40`) |
+| The read-list entries are decompression DESTINATIONS, not sources | `ppc_recomp.14.cpp:19030-19039` -> `[r1+112]/[r1+116]` = `state+16/+20` (`src/gpu_device.cpp:10547-10548`); flush at `:19298-19302` |
+| Root cause 1: the join frees the record before its own job dispatches and zeroes `record+4` | `ppc_recomp.14.cpp:21621-21632`; `w500` order `TASKJOIN` before `ENQ`; fixed by `kF502KeepLenOnRelease` |
+| Root cause 2: every container is opened twice and the next container's first open writes this job's record index | `STREAM-OPEN` handle pairs (`0 -> 1`, `0x8001 -> 2`, `0x8002 -> 3`, `0x8003 -> 4`); fixed by `kF503KeepFieldsOnRelease` |
+| Root cause 3: `exp` has exactly one seed in the image and it is `record+4` read at the init | `ppc_recomp.18.cpp:10774-10820` (`stw r30,12(r31)`), sole caller `ppc_recomp.14.cpp:19004` with `r5 = lwz r30,4(r28)` (`:18966`); fixed by `kF507ForceGen0Length`, printed by `F507-INITEXP` |
+| Root cause 4 (host side): the destination->package binding served one container's bytes into another's slot | `PATHB-PKGFIX #3 path='policecam' dest=B7841000 -> off=64980000`; fixed by `kF511PreferPathBinding` (F-512), clean 2/2 in `w516`/`w517` |
+| Verification is no longer self-referential | `MclaUiXsfGolden` prefers `build/xmem_golden/*.bin` (`kF513ExternalGolden`, `F513-EXTGOLDEN` 4 rows), `ninja -C build check_xmem_lzx` = 4/4 `EXACT` |
+
+### 10.2 What is NOT done, and the plan for each
+
+**(P1) The garage loses 35 % of its placement after the first shot.** `w519`:
+`UIXSF-GOLDEN-REVERIFY pkg=64980000 shot=1 ... pct=100 first_bad=FFFFFFFF` then `shot=100..105 recs_whole=2
+still_present=701454 pct=65 first_bad=00040000`. Because the decoder and the reference files agree offline,
+this is a runtime overwrite of the region past 262,144.
+*Action:* sample the garage's claimed destinations at shot 1 and shot 100 with the existing `PAGEWATCH`
+range machinery and name the writer `lr`; the candidates are the guest's own inflate into the same
+`pbase` chain (its 6 LZX frames wrote 491,520 bytes) and `MclaUiXsfChunkedHostFill` re-entering. Do not
+re-arm `kF510BindToOpenWindow` (39 bindings, measured harmful in `w512`/`w514`) until this is understood.
+*Cite:* `src/gpu_device.cpp:348-376`, `:15075-15086`, `:9261`, F-514 §3.
+
+**(P2) policecam and credits are externally verified at destination 0 but never re-verified over time.**
+`MclaUiXsfReverify` iterates `g_uiXsfFillLog`, which only holds planned fill claims, so their rows are 0
+even after the size floor dropped to `0x100`.
+*Action:* make the re-verify iterate the job read-list destinations it already knows
+(`PSTREAM`/`REQDUMP` -> `{vbase, pbase, size}` at `slot+4+12i`) instead of the fill log, then check whether
+their content survives as the guest walks them. *Cite:* `src/gpu_device.cpp:10050-10130`, F-514 §4.
+
+**(P3) The guest still decodes only 2 of 4 containers.** policecam/credits walk their complete streams with
+correctly seeded `exp` yet `lzxFrames=0`/`maxProduced=0`, because our Path-A intercept returns from inside
+`PPC_FUNC(sub_821D5E10)` before the guest body runs.
+*Action:* the discriminating measurement is per-entry which exit of the parse branch the guest takes
+(`ppc_recomp.18.cpp:10850` region, `lwz r11,8(r31); cmplwi; bne`) with the 4 bytes at `state+4` - i.e.
+whether a block header exists at the cursor - before any further write is attempted. Do not re-run
+`kF498ReseedState` (F-499: forces the gate, reads payload as a header, stops the boot earlier).
+
+**(P4) GFx still does not initialise: `F438-GFXCTOR` 0 on every boot.**
+Bounded, with fresh independent confirmation (F-509 §5): ctor `sub_824C6F08`
+(`ppc_recomp.94.cpp:3538`, hook `src/gpu_device.cpp:18472-18488`) has exactly one static caller
+`sub_82482F78` (`ppc_recomp.87.cpp:16295`) which has **zero** callers and **zero** xrefs; the
+`{fn, tag}` registry is one address-sorted table with non-unique tags, no `lis` ever names pages
+`0x8211/0x8212`, and no image word points into `0x82114000..0x82118000`. Decompression does not gate it
+(F-493; re-confirmed: `F442-SECTION` 14 rows all `hits=0`, identical in `w507` and `w519`).
+So the remaining options are the user-gated `F-055` host-forced boot path, or new evidence class
+(runtime indirect-target census of `0x82482F00..0x82483000`, which F-509 §5 names as the confirming
+measurement). Fabricating a poster is refuted (F-308/W30-ARR-FIX produced our own bytes and never GFx).
+
+### 10.3 Standing rules earned by this chain
+
+1. A two-arm change needs its single-arm control before the explanation is written (F-511 wrote the rule
+   and broke it in the same hour; F-512 is the correction).
+2. Never override a non-zero field of a shared structure unless ownership is proven; scope by generation
+   instead (F-504 -> F-506 -> F-507).
+3. Do not read a marker as a gate without checking what produces it: `XSF-INFLATE` is a host-VFS DEFLATE
+   probe, `F443`/`F455` are finding IDs not markers, and a `pct` against our own decode is durability
+   (F-502 §5, F-509 §1, F-514).
+4. Suspect our own short-circuit first: the whole F-502/F-503/F-507 chain repairs a use-after-free that
+   `TASKJOIN-SC` manufactures (F-509 §2).
