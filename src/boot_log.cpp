@@ -1,5 +1,5 @@
 // spdlog forwarding for the SEH-bearing boot TU (see boot_host.h). Keeps fmt
-// template instantiation out of the TU that contains __try/__except.
+// codegen out of the function holding __try/__except (boot_host.cpp:2008), not the TU.
 
 #include "logging.h"
 #include "boot_host.h"

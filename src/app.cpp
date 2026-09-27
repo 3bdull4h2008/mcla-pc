@@ -37,9 +37,9 @@ App* GetApp() {
 
 bool App::Initialize() {
     // Initialize logging first so all subsequent log calls have a sink.
-    // InitPaths() must run first to compute m_cacheRoot for the log file path,
-    // but InitPaths/InitSDL log calls before this point are safely dropped by
-    // spdlog's default null-logger.
+    // InitPaths() must run first to compute m_cacheRoot for the log file path.
+    // Lines emitted before this point (InitSDL logs; InitPaths does not) are not
+    // dropped: spdlog's default logger is a stdout sink -> they miss mcla.log.
     if (!InitSDL()) return false;
     if (!InitPaths()) return false;
 
@@ -64,10 +64,10 @@ bool App::Initialize() {
     // — the game must keep booting even with no output device.
     apu::Init();
 
-    // Phase 5 (BOOT_REBUILD_PLAN): load the game image into the 4 GiB guest
-    // window and prepare the boot context. Must run after logging + paths (boot
-    // diagnostics need a sink) and before mcla_ApplyPatches (guest-memory hooks
-    // need a live window).
+    // Phase 5 (BOOT_REBUILD_PLAN.md - retired, cf. src/boot_host.cpp:5): load
+    // the game image into the 4 GiB guest window and prepare the boot context.
+    // Must run after logging + paths (boot diagnostics need a sink) and before
+    // mcla_ApplyPatches (guest-memory hooks need a live window).
     const std::filesystem::path xexPath = m_gameDataRoot / "default.xex";
     if (std::filesystem::exists(xexPath) && boot::LoadAndPrepare(xexPath.string(), m_bootEntry)) {
         MCLA_LOG_INFO("Guest image loaded; entry @0x{:08X}", m_bootEntry);
@@ -82,14 +82,14 @@ bool App::Initialize() {
     m_dispatcher = std::make_unique<FunctionDispatcher>();
     if (m_dispatcher) {
         mcla_ApplyPatches(m_dispatcher.get());
-        // renderer_mode now comes solely from the CVar system (cache/mcla.toml,
-        // default "legacy" — golden rule 10). The previous hard-coded
-        // SetString("renderer_mode","native") forced every boot into native and
-        // made both the cache config and the manifest moot.
+        // renderer_mode comes solely from the CVar system: the previous hard-coded
+        // SetString("renderer_mode","native") is gone - the only writer left is the
+        // LoadConfig() above. Compiled default is "native" (src/renderer_mode.cpp:8);
+        // config/mcla_manifest.toml:16's "legacy" is inert - no src/ reader (F-053).
         mcla::native::InstallNativeRenderer(m_dispatcher.get());
     }
 
-    // Initialize VFS for city art
+    // Initialize the RPF VFS: back-end for guest file IO (Nt*File hooks, RSC tab)
     mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
     std::filesystem::path extractedRoot = m_gameDataRoot / "mcla extracted cache";
     if (std::filesystem::exists(extractedRoot)) {
@@ -104,9 +104,9 @@ m_running = true;
     // Start GPU context poller (Phase 4) - waits for game to allocate GPU context
     StartGpuContextPoller();
 
-    // P4.5': Start the dedicated render thread before boot::Start() which
-    // blocks (watchdog loop) for up to 5 minutes. The thread sits idle in
-    // a blocking pop() until guest code enqueues RenderCommands.
+    // P4.5': Start the dedicated render thread before boot::Start() (which blocks
+    // in its 5-min watchdog loop; W0 below runs it on a detached thread). It
+    // inits D3D12 on entry, then pops - kept awake by its own 33 ms heartbeat.
     mcla::native::g_renderThread.start();
 
     // Start the guest boot worker once the host services it will touch (VFS,
@@ -176,7 +176,7 @@ bool App::InitPaths() {
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
     std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
 
-    // Game data root: check cvar, then fallback to exe_dir/game_data
+    // Game data root: cvar undeclared in src/ (reads "") -> exe_dir/game_data
     std::string gameDataCvar(MCLA_CVAR_GET_STRING(game_data_root));
     if (!gameDataCvar.empty()) {
         m_gameDataRoot = gameDataCvar;
@@ -187,7 +187,7 @@ bool App::InitPaths() {
         }
     }
 
-    // Cache root: check cvar, then fallback to exe_dir/cache
+    // Cache root: cvar undeclared in src/ (reads "") -> exe_dir/cache
     std::string cacheCvar(MCLA_CVAR_GET_STRING(cache_root));
     if (!cacheCvar.empty()) {
         m_cacheRoot = cacheCvar;
@@ -204,7 +204,7 @@ bool App::InitPaths() {
 bool App::CreateSDLWindow() {
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
 
-    // Check for fullscreen cvar
+    // Fullscreen cvar: undeclared in src/, so GetBool() is always false here
     if (MCLA_CVAR_GET_BOOL(fullscreen)) {
         flags |= SDL_WINDOW_FULLSCREEN;
     }
@@ -256,7 +256,7 @@ void App::MainLoop() {
 
         if (!m_running) break;
 
-        // Frame callback (for PPC execution, etc.)
+        // Optional frame callback: never set today (no SetFrameCallback caller)
         if (m_frameCallback) {
             m_frameCallback();
         }
@@ -313,10 +313,10 @@ void App::OnResize(uint32_t width, uint32_t height) {
 // FunctionDispatcher implementation
 //
 // DESIGN NOTE: the recompiled guest dispatch table lives in
-// Memory::InsertFunction / PPC_LOOKUP_FUNC.  For decades the dispatcher
-// map (m_functions) was only consulted by GetFunction/SetFunction and
-// *never* at runtime – SetFunction was effectively dead code.  This fix
-// makes SetFunction also write into the real dispatch table so that
+// Memory::InsertFunction / PPC_LOOKUP_FUNC (src/kernel/memory.h:170-176).
+// The dispatcher map (m_functions) is written by SetFunction and AllocateThunk
+// but read only by GetFunction – never at dispatch time, so SetFunction was
+// dead code on its own.  This fix also writes the real dispatch table so that
 // hooks installed via the dispatcher actually intercept guest calls.
 // GetFunction falls back to the dispatch table so the original can be
 // retrieved before the hook overwrites it.

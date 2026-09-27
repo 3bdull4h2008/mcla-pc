@@ -19,9 +19,10 @@ struct TypeInfo {
 // Corroborated 4-bit type table. Codes 2 (Half3/FloatUnk), 4 (FloatUnk) and
 // 11-15 (Unk1-5) are intentionally absent: no research-backed size/format
 // exists for them, and a declaration using one is refused rather than given
-// an invented layout (Golden Rule 5). DXGI numbers: R32G32B32A32_FLOAT=2,
-// R32G32B32_FLOAT=6, R16G16B16A16_FLOAT=11, R32G32_FLOAT=16,
+// an invented layout (Golden Rule 5). DXGI values (dxgiformat.h, SDK
+// 10.0.26100.0): R32G32B32A32_FLOAT=2, R32G32B32_FLOAT=6, R32G32_FLOAT=16,
 // R10G10B10A2_UNORM=24, R8G8B8A8_UNORM=28, R8G8B8A8_UINT=30, R16G16_FLOAT=34.
+// 11 is R16G16B16A16_UNORM, NOT _FLOAT (that is 10) - case 3 Half4 uses 11.
 bool TypeInfoFor(uint8_t code, TypeInfo& out) {
     switch (code) {
         case 1:  out = {2, 2, 4, 34, true,  false, false}; return true;  // Half2
@@ -39,7 +40,7 @@ bool TypeInfoFor(uint8_t code, TypeInfo& out) {
 // Lane index -> DeclUsage + usage index, matching the DeclUsage semantic
 // numbering VertexUsageSemanticName in shader_translator.cpp uses (POSITION=0,
 // BLENDWEIGHT=1, BLENDINDICES=2, NORMAL=3, TEXCOORD=5, TANGENT=6, BINORMAL=7,
-// COLOR=10) so a decoded channel can be fed straight into the input layout.
+// COLOR=10). Live layout path builds its own table (d3d12_backend.cpp:2205).
 struct LaneSemantic {
     uint8_t usage;
     uint8_t usageIndex;

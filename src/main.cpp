@@ -11,8 +11,8 @@ int main(int argc, char* argv[]) {
     mcla::App app("MCLA Native");
 
     if (!app.Initialize()) {
-        // W0: never drop a live window. If init failed after the HWND exists,
-        // park the process so the user still sees D3D12 output.
+        // W0: park instead of exiting — but Initialize only fails before the HWND
+        // exists (app.cpp:43/54; the D3D12 render thread starts at app.cpp:110).
         MCLA_LOG_ERROR("Initialize failed — keeping process alive if window exists");
         while (true) {
             std::this_thread::sleep_for(std::chrono::hours(24));

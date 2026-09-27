@@ -42,7 +42,7 @@ namespace mcla::native {
 // duties. Golden rule 1 restored.)
 static PPCFunc* orig_Sub8241ABB8     = nullptr;
 
-// Host-side frame trace driver (stubbed - no legacy command processor)
+// Host-side frame trace driver - dead stub: no callers, constants below unused
 static constexpr std::chrono::milliseconds kHostTraceWarmup{3000};
 static constexpr std::chrono::milliseconds kHostTraceWindow{1500};
 
@@ -50,11 +50,11 @@ void StartHostFrameTrace() {
     MCLA_LOG_WARN("StartHostFrameTrace: not available in standalone mode (no legacy command processor)");
 }
 
-// Register file sync - stubbed (no legacy register file in standalone mode)
+// Register file sync - no-ops (the live Xenos register file is gpu_cp.cpp's)
 void WriteGpuContextToRegisterFile(::MclaGpuContext* gpuCtx) {
     (void)gpuCtx;
-    // In standalone mode, we don't have a legacy register file.
-    // Draw state is captured directly from guest context via hooks.
+    // No register file lives here: gpu_cp.cpp owns the live one (g_xenosReg,
+    // F-090). Sole caller patches.cpp:992 logs "seeded" - nothing is seeded.
 }
 
 void RestoreRegisterFileToContext(::MclaGpuContext* gpuCtx) {
@@ -95,14 +95,14 @@ PPC_FUNC_IMPL(Hooked_Sub8241ABB8) {
     }
 }
 
-// Native draw dispatch - now uses D3D12Backend directly
+// Native draw dispatch - dead stub (no callers); draws go via g_commandQueue
 void IssueNativeDraw(::MclaGpuContext* gpuCtx) {
     (void)gpuCtx;
     MCLA_LOG_WARN("IssueNativeDraw: legacy command processor path not available in standalone mode");
 }
 
 // R1 (2026-09-10): native present is owned by PresentKick (sub_824294E0).
-// VdSwap is a kernel import that UR also stubs; MCLA only logs if it fires.
+// VdSwap is a kernel import UR also stubs; here MCLA logs it + feeds W7 only.
 void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
     if (mcla::renderer::GetRendererMode() != mcla::renderer::RendererMode::Native) {
         return;
@@ -115,10 +115,10 @@ void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
     present.swapInfo = fbAddr;
     // W7: resolve surface VA when swapInfo is a swap-table slot.
     present.surfaceVA = mcla::gpu::ResolvedPresentSurfaceVA();
-    // N3a census (F-C in LONG_TODO_MASTER): decode the per-frame swap OBJ
-    // (observed C61D8818/C61D8928/C625894C, ~0x110/0x124 stride) — the last
-    // undecoded present object and the top candidate for holding the real
-    // framebuffer surface pointer. Bounded: first 6 + every 500th.
+    // F-C census (LONG_TODO_MASTER T37.5): dump the present "swap OBJ" plus a
+    // one-hop pointer scan. The spec's observed set C61D8818/C61D8928/C625894C
+    // never printed: obj is PresentKick r3, constant 40002080 (the device) in
+    // all 2223 rows; only fb cycles slots C71D82C0..CC. First 6 + every 500th.
     {
         static std::atomic<uint32_t> s_objCensus{0};
         const uint32_t on = s_objCensus.fetch_add(1) + 1;
@@ -158,7 +158,7 @@ void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
 }
 
 // VdSwap import hook — INERT for frame production (R1).
-// Guest frame-end (sub_82419E90/199B0) may still call VdSwap; log only.
+// Guest frame-end reaches VdSwap only from sub_82419E98 @0x8241A0E4.
 PPC_FUNC_IMPL(Hooked_VdSwap) {
     uint32_t obj       = ctx.r3.u32;
     uint32_t swap_info = ctx.r4.u32;
@@ -178,7 +178,7 @@ PPC_FUNC_IMPL(Hooked_VdSwap) {
     }
     // Do NOT enqueue PRESENT here and do NOT RecordFramePresented —
     // double-present if both VdSwap and PresentKick fire from the same
-    // guest frame-end (verified in ppc_recomp.79.cpp sub_82419E98).
+    // guest frame-end (verified in ppc_recomp.77.cpp sub_82419E98).
 }
 
 void InstallNativeRenderer(mcla::App::FunctionDispatcher* dispatcher) {
