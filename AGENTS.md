@@ -63,9 +63,24 @@ was always right and it is the whole lesson. **But F-647's gloss is INVERTED and
 > makes the boot strictly worse.** Do not. `generated/**` is forbidden anyway (rule 2).
 
 **Field notes, all measured, so you do not rediscover them the hard way:**
-- **`ori`'s destination is `b20:16`; `b25:21` is the other operand.** This is true for `ori`/`or` *and*
-  for `add`/`subf` alike — the claim that `add`/`subf` differ is itself wrong. **Extract nibble by
-  nibble; shift-and-mask arithmetic has produced three wrong answers in this project.**
+- ⚠️ **`ori`'s destination is `b25:21`, NOT `b20:16`. This note previously said the opposite and was
+  wrong.** Authority: LLVM's own `PPCInstrFormats.td`, `class DForm_base` —
+  `let Inst{6...10} = RST; let Inst{11...15} = RA;` ⇒ **destination at word bits 25:21**, source at
+  20:16. Re-encode round-trip: `ori r9,r8,0x6772` → `0x61286772` **matches the guest byte**;
+  `ori r8,r9,0x6772` → `0x61096772` **does not.** Five controls in the same function
+  (`addi r4,r1,80`=`38810050`, `li r5,256`=`38A00100`, `lwz r7,80(r1)`=`80E10050`,
+  `lis r9,0x6178`=`3D206178`) all agree.
+- **The asymmetry is the trap, and it is what produced an hour of wasted work:** `b25:21` is correct
+  for `or`/`and`/`xor`/`mr`/`cmp` (`0x7FC8F378`=`or r8,r30,r30`), and **`b20:16` is correct for
+  `ori`/`addi`/`addis`/`lwz`/`stw`.** Both conventions are right — **for different opcodes.** Never
+  generalise one from the other. **Extract nibble by nibble; shift-and-mask arithmetic has produced
+  four wrong answers in this project.**
+- 🔴 **`generated/ppc_xenon/` mis-emits `ori` immediate-form with SWAPPED operands** — proven at two
+  sites (`0x8218C848`→`ppc_recomp.9.cpp:18434-18435`; `0x8213DC98`→`ppc_recomp.1.cpp:16207-16028`),
+  and **localised, not a convention error**: in the 7-instruction window at `0x8213DC90`, six
+  instructions decode identically under both readings and only the `ori` diverges. There are
+  **3,415** `ori`-imm emissions, so a blanket inversion is implausible. **This is a real defect in
+  generated code — do not "fix" it by hand; route it through `.qoder/skills/mcla-recompiler-regen`.**
 - **`ori rA,r0,imm` round-trips as a no-op store to `r0` in Capstone 5.0.7** — a real defect in its
   or-immediate arm. Do not use it to settle operand order.
 - **An `op18` branch target read as signed lands outside the image; `ppc_disasm.py` reads it unsigned
