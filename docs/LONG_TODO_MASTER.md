@@ -1413,3 +1413,90 @@ scripts behind F-047 are built, validated against hand counts and **uncommitted*
 **T39.7**; `0x822FBAF8` and `0x82839F68` are otherwise unclaimed in `src/`+`config/`, so T38.2b has
 no owner collision to resolve. Note for whoever takes T38.2b: `mcla_pe.bin` is back
 (`10,354,688 B`, 17:14) so rule-3 raw decode works, and the ledger footer is at **F-050+**.*
+
+---
+
+# 2026-10-06 — QUEUE AFTER THE BOOT BLOCKER WAS SOLVED
+
+Superseding block. `HEAD = a9bd027`. Everything below is grounded in a measurement quoted from
+`build/w734.log` or a tool run; nothing here is inferred. Rule 5 satisfied: this file was last
+touched 2026-10-01, so a dated block is the correct form.
+
+## 0. WHAT CHANGED, AND THE ONE NUMBER THAT PROVES IT
+
+```
+                             w733 (had a fatal)    w734 (no fatal)
+Fatal error dispatcher                  1                  0
+FATAL-SOFT                              1                  0
+dstAfter=507B5CED  (DEFLATE head)       1                  0
+dstAfter=61786772  (shader magic)       0                  1
+ARC-WINDOW headIs=1  (byte-exact)       0                  1
+WINWR-CMP beqTaken                      0                  1     r7 = r8 = 0x61786772
+boot duration                  ~14 s to a fatal      149.811 s, no fatal
+DRAW-CP-DRAWN                             -                  4      (was 2)
+```
+
+**The plateau is over.** 27 soaks died at 14.494-16.184 s. This one did not die.
+
+**The cause, in one sentence:** `pos` is dword 1 of the reader object the caller passes as `r4` —
+the guest's own byte cursor — and the file read it *after* `__imp__sub_821CC1E0` had advanced it
+(raw `0x821CC3CC stw r11,4(r31)`), so every read observed the *previous* read's end position.
+The file already snapshotted `r4`/`r5`/`r6` around that call and never extended the snapshot to
+the two dwords it then read out of guest memory.
+
+**The falsifier that refuted the alternative:** 18 rows, 18 different members, six different
+archive offsets, `pos=4096` on every one and **never 8192**. An accumulating cursor cannot read
+4096 on eighteen independent first pages.
+
+## 1. TIER 1 — NOTHING AFTER THE BLOCKER HAS EVER BEEN EXERCISED
+
+Ordered by distance from a menu. **None of these has happened once in the project's history.**
+
+| # | item | current measurement | file |
+|---|---|---|---|
+| 1.1 | **`AUDIO-FRAME` = 0 real rows.** `apu::RegisterClient` = 0 corpus-wide, so the worker never spawns. The import **is** hooked; the guest never calls it. | 0 | `src/apu/audio.cpp` |
+| 1.2 | **No XMA bitstream decoder.** `SetFrameDecoder` has **zero callers**. `xma_decoder.h:16-32`. | 0 callers | `src/apu/xma_decoder.h` |
+| 1.3 | **No `0x7FEA0000` aperture.** | absent | `src/apu/*` |
+| 1.4 | **`XMACreateContext`/`XMAReleaseContext` are silent stubs — `LOG_UTILITY` is `#if _DEBUG` and the build is `NDEBUG`.** **A census blind spot: some code is compiled out entirely in release.** | — | `src/kernel/xam.cpp` |
+| 1.5 | **Input EXISTS and is unreachable.** `XamInputGetState` (`xam.cpp:941-1017`) is hooked, has SDL3 gamepads, keyboard fallback, XInput dead zones; `XamInputPoll()` runs every frame from `app.cpp:325` and publishes a live port map every boot. **0 non-NULL polls, ever.** | 0 | `src/kernel/xam.cpp` |
+| 1.6 | **The menu has never been reached.** 0 evidence in 261 logs. `W34-NOGFX ngfx=0`, `W35-BOOT-GATE=0`. | 0 | — |
+| 1.7 | **Only 2 presents, ever.** Gate is `frameNumber<=8` and the guest counter never leaves single digits, so **2 is the complete count.** | 2 | `src/native_renderer.cpp:335` |
+
+## 2. TIER 2 — REGRESSIONS AND DORMANT DEFECTS FOUND 2026-10-05
+
+| # | item | measurement | owner |
+|---|---|---|---|
+| 2.1 | **TOC WALK HAS NOT RUN IN 10 SOAKS.** `w722` = 1863 slices / 1862 dirs; `w723`-`w734` = **0**, including markers on the unconditional tail, so the function is **never entered**. Its one caller sits behind an early return. **Attribution is N-way and unresolved.** | 0 | `src/gpu_device.cpp:23619` / `:23492` |
+| 2.2 | **`generated/ppc_xenon/` mis-emits `ori` immediate-form with SWAPPED operands.** Proven at two sites (`0x8218C848`→`ppc_recomp.9.cpp:18434-18435`; `0x8213DC98`→`ppc_recomp.1.cpp:16207-16028`) and **localised** — six of seven instructions in a window decode identically, only the `ori` diverges. **3,415 `ori`-imm emissions.** `generated/**` is forbidden (rule 2): **route through `.qoder/skills/mcla-recompiler-regen`.** | 2 sites / 3,415 | regen |
+| 2.3 | **Regen is currently blocked:** `config/mcla_xenonrecomp_baseline.toml` is **32 lines vs the live config's 257**, missing all four `[[midasm_hook]]` blocks. SKILL.md §3 step 3 says STOP. **Refresh the baseline before any Route B.** | — | config |
+| 2.4 | **The CP park never clears.** `PM4_WAIT_REG_MEM` demands `ref=0` while holding `4`; `CP-WAITREG-WRITER-VALUES distinct=2 refAmong=0` — **the demanded zero was never written by anyone.** | 1 park | `src/gpu_cp.cpp` |
+| 2.5 | **`r8` at the fatal compare is still UNDECIDED — three agents decoded it three ways.** With `pos` fixed it no longer blocks the boot, but `generated/**` may still mis-emit the `ori` that feeds it. **Do not trust any of the three readings; measure.** | unresolved | regen |
+| 2.6 | **`READWRAP-SERVE` = 0, `CD3C8-SERVE` = 0, `CC6F0-PKGSUBST` = 0, zero `key=flagWord` rows — that substitution block has NEVER executed.** `READWRAP`'s lookup at `:18887` passes **`tocEntry=0`**, the only argument reaching the table's only exact arm (`:3799-3804`); every other arm is log-only by design. | 0 | `src/gpu_device.cpp` |
+| 2.7 | **The ledger's `file:line` anchors are 66.7% rotted** (18 of 27 adjudicable); named symbols drift a **median of 2,239 lines, max 11,020**; `mitigation_audit` drifted 105->108 shaped. **The reasoning is sound (88/92 mitigations still closed); the pointers are not. Re-point, do not re-derive.** | 66.7% | docs |
+| 2.8 | **`BE710-DEAD` now fires (0 -> 4) with `outcome=REFUSE-NO-BODY`.** The refusal path is live and honest. **Watch it: if it climbs, that is a new wall, not a regression.** | 4 | `src/gpu_device.cpp` |
+| 2.9 | **`BE8D8-PACK`'s `dst=BACA6280` is a write-only dead end** — 23,807 bytes of correct body into guest memory nothing reads. `slotIsBinding=0` on all rows. | 0 readers | `src/gpu_device.cpp` |
+
+## 3. TIER 3 — THE PLATEAU STATISTICS WERE WRONG, AND THE TOOLS THAT FED THEM
+
+| # | item | measurement |
+|---|---|---|
+| 3.1 | **"24 soaks, median 14.903 s, stdev 0.530" was computed over a set that was never verified.** 123 `w*.log` exist, only **43 are real soaks** (80 are 0-byte sidecars). The literal `'Unexpected EOF in fiBaseTokenizer::Pop'` is in **2 of 43**; **`w734.log` has 0** because the fatal changed identity. |
+| 3.2 | **`TIMEOUT_SURVIVED` = 0 across 232 logs.** Not one log ever ended because the guest was still running. `soak_run.py`'s `process survived` line has been reporting success for ~135 s after every guest died. **It is not a pass condition.** |
+| 3.3 | **`MEMBER-SPAN-TAIL-VETO` has 0 real rows and 33 prose mentions.** A naive count gives 33. `MEMBER-SPAN-ALIAS` is **not tracked**. |
+| 3.4 | **Six+ harnesses passed while blind**, including one that reported **90.5% of something because it harvested English prose as data**, one that mis-tokenised `[14:08:06.052]` as a leading token, one whose replay used the *final* span table, and one that reported a confident **0** because `re.match` anchored at line start and every line begins with a tab. |
+| 3.5 | **A harness served a body out of a zero page and reported fabricated bytes** while passing. **If any harness here told a host pointer from a guest VA by a size comparison, its green result is not evidence.** Audit before trusting. |
+| 3.6 | **`git checkout <commit> -- src/gpu_device.cpp` does NOT restore a byte-exact pin** — `core.autocrlf=true`, the file is bare-LF, so a checkout converts line endings. **Verify reverts by content, not by hash.** |
+| 3.7 | `soak_census.py` now has **240 markers**, own-row/line semantics, 63 self-test checks. **9 markers have a correct 0**: `slotcov=`, `nGfx`, `-GATE`, `skip fatal`, `rptrWB`, `PUT=`, `UILOAD`, `PRESENT-FB`, `GEN76-ALLOC/FREE`. `INFLATE-ENTER` is a strict prefix of `INFLATE-ENTER-SUMMARY`. `BE710-MAGIC` is a substring of `BE710-MAGIC-CENSUS`. `CP-T3-CENSUS` reads 2 when 1 real row exists. |
+
+## 4. STANDING RULES LEARNED 2026-10-05 — DO NOT REDISCOVER THESE
+
+- **Extract instruction fields nibble by nibble.** Shift-and-mask arithmetic produced **four** wrong answers in one session.
+- **`ori`/`addi`/`addis`/`lwz`/`stw` destinations are `b25:21`. `or`/`and`/`xor`/`mr`/`cmp` destinations are `b20:16`.** **Both are right, for different opcodes. Never generalise one from the other.** *(This note was wrong twice before it was right; see `AGENTS.md`.)*
+- **Establish the discriminating power of any control you rely on.** A control believed *powerless* was measured to discriminate five wrong-models; a control believed *sufficient* was symmetric and could never have found its bug.
+- **A marker's own prose can contain other markers' literals.** `READAT-BRANCH`'s prose contains `raw_positional=1`. 25 of 39 miscounts were this.
+- **A marker absent from `src/` has a zero that means nothing.** Prove the literal exists first.
+- **`absent from src/` vs `comment-only` vs `dead`** are three different states; `soak_census.py` distinguishes them.
+- **Never put a value in a census field that is a constant.** `WINWR-CMP` printed `kAoCmpR8`, a hardcoded literal, and that "measurement" was believed for an hour. Deleted 2026-10-05.
+- **`CALLERS (none)` is an IDA carving artefact.** `tools/ppc_xrefs.py calls` reported 20 callers of `0x821BE250` where a raw scan finds **0** (vtable dispatch); its `->` column names the *enclosing* function.
+- **`tools/ppc_disasm.py` is a PowerPC disassembler and CANNOT decode Xenos GPU microcode.** It also inverts `mr` and cannot decode `rldicl`. Use `generated/ppc_xenon/*.cpp` as the tiebreaker.
+- **Never accept a fix on a marker count.** 9 fixes moved markers and not the boot. The measures that count: `headIs=1` byte-for-byte against a python-`zlib` oracle, `dstAfter=61786772`, `FATAL-SOFT=0`.
