@@ -19781,13 +19781,272 @@ PPC_FUNC(sub_821CC1E0) {
         // or removed, so every existing matcher still matches.
         // 17 placeholders, 17 arguments.
         // This format string's literal text names no other tracked marker.
+        //
+        // ------------------------------------------------------------------------
+        // AO 2026-10-05, APPENDED FIELDS, READ-ONLY. `o0/o4/o8/o12` are the four
+        // dwords of the record THE GUEST ACTUALLY READS, and they are one level
+        // deeper than the `rec0..rec24` above. This is the correction, and the
+        // row is the proof of it.
+        //
+        // FROM RAW WORDS + THE VALIDATED BODY. sub_821CC1E0 -- the function this
+        // hook is inside, and the one the brief means by 0x821CC3A0/0x821CC3A4 --
+        // does, in generated/ppc_xenon/ppc_recomp.17.cpp:3139-3148 and :3196-3226:
+        //   :3139  mr   r31,r4        r31 = THIS CALL'S ENTRY r4  (= rrRec = in4)
+        //   :3147  lwz  r11,0(r31)    r11 = [r31+0]                <- the record
+        //   :3197  lwz  r11,0(r31)    same, on the refill path
+        //   :3203  lwz  r9,12(r11)    r9  = [r11+12]  ; and :3150 [r11+12] is
+        //            tested `& 0xFF` at :3169-3172 against zero, which is the
+        //            STORED LENGTH low byte of the TOC flags word
+        //   :3220  lwz  r9,8(r11)     r9  = [r11+8]   <- THE ARCHIVE OFFSET
+        //   :3231  and  r9,r9,r12     r12 = rotl64(-2,31) = 0xFFFFFFFF7FFFFFFF
+        //   :3236  add  r11,r9,r11    + ld64(dev+24)      (raw :3225 ld r11,24(r30))
+        //   :3238  add  r5,r11,r10    + pos = [r31+4]     (raw :3201 lwz r10,8(r31)
+        //                                 is the other term; the entry-state pos is
+        //                                 read raw at 0x821CC33C lwz r10,4(r31))
+        //   :3239  lwz  r11,28(r8) ; mtctr ; bctrl   r8 = [ [dev+32] + 0 ] is a
+        //            vtable, so +28 is vtable slot 7 and the absolute offset is
+        //            handed to the DEVICE, not stored back into the record
+        //
+        // TWO THINGS THIS CORRECTS, BOTH OF THEM THE BRIEF'S PREMISE:
+        //
+        //  1. THE MASK IS NOT `& ~1`. `r12 = rotl64(-2,31) = 0xFFFFFFFF7FFFFFFF`
+        //     (rotl64, not a shift-and-mask guess; verified by [S0]/H5 in
+        //     build/ao_winwr_cmp_harness.cpp, which recomputes it from -2 and
+        //     fails if it differs). Its low 32 bits are 0x7FFFFFFF, so the
+        //     guest clears BIT 31 ONLY. It does not clear bit 0, and the offset
+        //     is not rounded to an even or 4-byte boundary.
+        //  2. `rec8` ABOVE IS NOT THE ARCHIVE OFFSET. It is [rec+8], i.e. one
+        //     dword into the CALLER'S OWN STATE OBJECT. The archive offset the
+        //     guest adds lives at [[rec+0]+8]. So a `rec8=00000000` row says
+        //     nothing at all about the archive offset -- and, per the brief,
+        //     "rec[8] is 00000000 on every row" was a statement about the wrong
+        //     address. That field has never been measured. These four are the
+        //     first measurement of it.
+        //
+        // WHO WRITES o8: NOT THIS FILE. The record is the guest's own TOC entry,
+        // published by the guest inside __imp__sub_821CBFC0 -- the TOC walk this
+        // file hooks at :21382 is a pure pass-through reader (`__imp__` at :21449
+        // does the work; the hook only ReadU32BEs). The ONLY host write to any
+        // TOC record in this file is `WriteU32BE(tocEntry + 4, xsz)` at :22068,
+        // the LOGICAL length, on a proved serve. Nothing writes +8. So the
+        // archive offset is GUEST-WRITTEN and this file has no legitimate write
+        // point for it -- see the refusal recorded in the report.
+        // ------------------------------------------------------------------------
+        const uint32_t aoToc = w[0];
+        uint32_t o[4] = {0, 0, 0, 0};
+        if (aoToc != 0u && aoToc != 0xCDCDCDDu)
+          for (int k = 0; k < 4; ++k)
+            (void)memR.ReadU32BE(aoToc + static_cast<uint32_t>(k * 4), &o[k]);
+        // APPENDED at the END of the row only (AO 2026-10-05): nothing above
+        // moved, nothing renamed, nothing removed, and the sampling gate is
+        // untouched, so every existing matcher still matches and the row still
+        // fires exactly as often as before.
+        // The row is now 17 placeholders / 17 arguments (the shape AM appended)
+        // PLUS these 4 = 21 / 21. The first 17 fields and their order are byte
+        // for byte what they were at 66751b6.
+        // `aoToc` is w[0], i.e. this call's entry r4's +0 dword -- the record
+        // pointer -- and it is 0 whenever rrRec was unreadable, so the four reads
+        // are skipped rather than taken against a bogus base. ReadU32BE is
+        // range-checked and its result is ignored, so an unreadable record
+        // leaves o[] at 0 and says so on the row.
+        // 21 placeholders, 21 arguments.
         MCLA_LOG_WARN(
             "WINWR-REC #{} win={:08X} strm={:08X} rec={:08X} rec0={:08X} "
             "rec4={:08X} rec8={:08X} rec12={:08X} rec16={:08X} "
             "rec20={:08X} rec24={:08X} r5={:08X} lr={:08X} tid={} tot={} "
-            "in4={:08X} in6={}",
+            "in4={:08X} in6={} o0={:08X} o4={:08X} o8={:08X} o12={:08X}",
             rrTot, rrWin, rrRec, rrRec, w[0], w[1], w[2], w[3], w[4], w[5],
-            w[6], rrWin, rrLr, GetCurrentThreadId(), rrTot, amIn4, amIn6);
+            w[6], rrWin, rrLr, GetCurrentThreadId(), rrTot, amIn4, amIn6, o[0],
+            o[1], o[2], o[3]);
+      }
+    }
+  }
+  // ===========================================================================
+  // AR 2026-10-05. THE DEVICE-READ DELIVERY THE SERVED-BODY TABLE WAS BUILT FOR
+  // AND NEVER RECEIVED. Placed AFTER the DISCCHK2 block (so kDiscChkForcedAck is
+  // untouched and still runs first) and AFTER the WINWR-REC census (so no
+  // existing marker's population changes), and it runs AFTER the original body
+  // (so nothing the original does is skipped).
+  //
+  // WHAT IS MEASURED, AND WHERE. Every fact below is a tool-printed line, not a
+  // reading of a comment.
+  //
+  // (1) `route=guest-disc-read` (this file, the DISCCHK2 format at :19670-19777)
+  //     IS A LOG LABEL AND NOTHING ELSE. It is a ternary over
+  //     `flags & 0x40000000 && !(flags & 0x80000000)` that prints one of two
+  //     strings. `route` is assigned nowhere and read nowhere in the tree --
+  //     grep for `\broute\b` in src/gpu_device.cpp returns this format string
+  //     plus prose comments, and no code reads it. Its only stateful sibling is
+  //     the kDiscChkForcedAck write at :19691-19702, which ORs bit 31 into
+  //     rec[+12] for exactly that population.
+  //
+  // (2) THE WINDOW IS FILLED BY A CHAIN OF FOUR FRAMES, THREE OF THEM MEASURED
+  //     FROM RAW WORDS IN build/cache/mcla_pe.bin (offset = VA - 0x82000000):
+  //       0x821BE31C  81630000-family: r11 = [dev+0]      ; the device vtable
+  //       0x821BE31C  lwz r10,24(r11)                    ; mtctr target = BYTE +24
+  //       0x821BE364  mtctr r10 / 0x821BE368 bctrl
+  //     The vtable is 0x82012BDC (GETDEV-E0 `vt1=82012BDC`) and, read 4 bytes at
+  //     a time because PPC function pointers are 4 bytes:
+  //       [0x82012BDC + 24] = 0x821CD348
+  //       [0x82012BDC + 28] = 0x821CC6F0
+  //       [0x82012BDC + 56] = 0x821CD3C8   (the GetSize my file already names)
+  //     The function ranges come from generated/ppc_xenon/ppc_func_mapping.cpp,
+  //     which assigns 0x821CC2B8 and 0x821CC3B0 to sub_821CC1E0 [0x821CC1E0,
+  //     0x821CC3D8) and 0x821CD3AC to sub_821CD348 [0x821CD348, 0x821CD3C4):
+  //       sub_821BE250   [HOOKED, STREAM-WINDOW]
+  //         -> [vtable+24] = sub_821CD348          ** ZERO hooks in src/ **
+  //              0x821CD3AC  bl sub_821CC1E0
+  //                -> sub_821CC1E0   [HOOKED, DISCCHK2 + WINWR-REC]  <-- THIS BLOCK
+  //                     0x821CC39C  lwz r8,0(r3)      ; r3 = [dev+32], the inner dev
+  //                     0x821CC3A8  8168001C  lwz r11,28(r8)   ; inner vt + 28
+  //                     0x821CC3AC  mtctr r11 / 0x821CC3B0 bctrl
+  //                       -> sub_821CC6F0   [HOOKED, READWRAP]
+  //     `op18` branch targets are NOT resolvable by arithmetic in either
+  //     convention (AGENTS.md field notes), so every edge above is established
+  //     from the vtable words and the validated function map, not from a
+  //     displacement sum.
+  //
+  // (3) THE READ IS *NOT* raw_positional. build/w732.log carries 270
+  //     READAT-BRANCH rows; `raw_positional=1` on exactly 96 of them, and
+  //     `read_member_off != 00000000` on exactly the same 96, every one with
+  //     `span_ran=0`. That is the 96/96 contract, and it is intact.
+  //     There is NO row with `req=4096` anywhere in the file, and the six
+  //     `off=001F5000` rows (3x req=23807, 3x req=64) are a COMPLETE census
+  //     rather than a sample, because the rate limiter at
+  //     src/fs/vfs_rpf.cpp exempts `WindowInsideRegisteredSpan(pack, offset)`
+  //     (src/fs/vfs_rpf.cpp:2762-2766) and 0x1F5000 is inside the registered
+  //     span [0x1F5000,0x1FACFF). So this read never reached ReadFileAt at all.
+  //     `raw_positional` is set in exactly two places in this file -- :3217-3218
+  //     (`fhRaw`) and :23438-23439` (`fh`) -- and is never cleared, which is what
+  //     the other agent measured. None of that is on this chain. Flipping it
+  //     cannot change the window, and this block does not touch it.
+  //
+  // (4) THE SERVED, PROVED BODY FOR THIS MEMBER ALREADY EXISTS IN GUEST MEMORY
+  //     AND IS BEING DISCARDED. w732.log, in order:
+  //       READAT-BRANCH #939 ... off=001F5000 req=23807 raw_positional=0
+  //         span_ran=1 head16=726778610BFF07115653436974794465
+  //       SERVE-PROOF ... stored=7578 logical=23807 served=23807 head=72677861
+  //         listProved=1 proved=1
+  //       XSF-HOSTSERVE ... buf=BACA0280 size=23807 head=72677861
+  //       BE8D8-PACK #4 ... sbuf=BACA0280 size=23807 dst=BACA6280 stream=00000004
+  //         head=[72677861]
+  //     `MclaRegisterServedBody` runs only inside `if (xbuf && xsz > 0 &&
+  //     xproved)` (:22120), so MEMBERSHIP IN THE TABLE IS THE PROOF. No extra
+  //     flag is needed and none is invented here.
+  //
+  // (5) WHY IT IS NEVER DELIVERED. The READWRAP lookup at :18887 calls
+  //     `MclaFindServedBody(r3, 0xFFFFFFFFu, r5, 0, r5, &body)` -- it passes
+  //     tocEntry = 0, which is the ONLY argument that reaches the only exact arm
+  //     (:3799-3804, `g_servedByEntry`). Every other arm is log-only by design
+  //     (F-091, F-126). Measured consequence in w732.log: READWRAP-SERVE 0 rows,
+  //     CD3C8-SERVE 0 rows, CC6F0-PKGSUBST 0 rows, CC6F0-PKGCONT 0 rows, and
+  //     zero `key=flagWord` rows among the 24 T413O-SKIP rows. That entire
+  //     substitution block has never executed once.
+  //     The TOC record, though, is in this frame's hands on ENTRY: `amIn4` is
+  //     `&dev->slot[h]` (raw 0x821CD390 `addi r4,r11,40`) and its dword 0 is the
+  //     record -- WINWR-REC prints exactly that as `o0..o12`.
+  //
+  // (6) WHAT THE GUEST WANTS, FROM AN ORACLE WITH NO PROJECT CODE ON EITHER
+  //     SIDE (python zlib straight over build/game_data/xarchive_cache.rpf, whose
+  //     SHA256 is F46F9A39E797CC0A2F21730014E18E5762FDC0910595F440031E004CCE2DD4
+  //     20 as required):
+  //       archive[0x1F5000 : +7578]  head = ED5C7B505CD779FF
+  //         == the logged STREAM-WINDOW winHex, BYTE-IDENTICAL, i.e. the read
+  //            really was handed the member's STORED extent;
+  //       raw-DEFLATE inflate of exactly those 7578 bytes -> 23807 bytes
+  //         (== 0x5CFF == w1, eof reached, 0 bytes unused), head
+  //         = 726778610BFF0711.
+  //     And the guest asked for LOGICAL bytes: WINWR-REC prints in6=4096 and o4
+  //     is the member's own w1 on every row it fires for, and DISCCHK2 #33
+  //     (`len=1000` is {:X}, i.e. 0x1000 = 4096) is this very read.
+  //
+  // SO: THE DEFECT IS NOT `raw_positional`. It is that a read the guest makes
+  // against the device, for a member this host has already served and PROVED,
+  // is answered from the packfile's stored bytes instead of from the body that
+  // was proved. That is what puts ED5C7B50 in the window where the guest expects
+  // 72677861, and it is the whole of the "Old version of rage effect" fatal.
+  //
+  // THE DISCRIMINATOR, and why it cannot regress anything:
+  //   * exact TOC-record identity through `g_servedByEntry`, the table's own only
+  //     exact key -- not w3 (F-126: 40000061 is shared by 52 records), not the
+  //     w2 family (F-091), not (dev,handle) (F-091), not the bare-dev fallback;
+  //   * the record's own w1 must EQUAL the served body's size, so a body that
+  //     does not describe this record cannot be delivered into it;
+  //   * `pos` (dword 1 of the same caller object, raw 0x821CC364) must be inside
+  //     the body, and the copy is clamped to the body -- never past it, so no
+  //     length is ever invented (F-609);
+  //   * the original body must have returned exactly `count`, so a short read or
+  //     an error is left exactly as the guest's own code produced it;
+  //   * it is a byte-for-byte OVERWRITE of a window the original just filled
+  //     with the same `count` bytes, at the same address. It adds no region,
+  //     registers no span and moves no member extent, so the byte-level overlap
+  //     count between two archive members is 0 by construction -- there is no
+  //     archive byte involved in this block at all.
+  //
+  // This is not a second short-circuit stacked on kDiscChkForcedAck (do-not
+  // #1/#9): the forced ack is untouched and still runs first, the original body
+  // still runs in full, and this delivers a body that three other consumers of
+  // the same table (CD3C8 GetSize, BE8D8-PACK, MclaRegisterServedBody) already
+  // deliver. It is the completion of one existing table's one existing
+  // consumer, on the one call that is measured to have failed.
+  // ===========================================================================
+  {
+    auto &memA = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t origRet = ctx.r3.u32;
+    uint32_t arRec = 0;
+    if (amIn4 != 0u && amIn4 != 0xCDCDCDCDu)
+      (void)memA.ReadU32BE(amIn4, &arRec);
+    if (arRec != 0u && arRec != 0xCDCDCDCDu && amIn6 != 0u &&
+        origRet == amIn6 && amIn5 != 0u && amIn5 != 0xCDCDCDCDu) {
+      uint32_t arPos = 0;
+      (void)memA.ReadU32BE(amIn4 + 4u, &arPos);
+      uint32_t arW1 = 0;
+      (void)memA.ReadU32BE(arRec + 4u, &arW1);
+      MclaServedBody arBody{};
+      {
+        std::lock_guard<std::mutex> lk(g_servedMtx);
+        auto it = g_servedByEntry.find(arRec);
+        if (it != g_servedByEntry.end())
+          arBody = it->second;
+      }
+      // Every clause is a REFUSAL. The copy runs only when all of them pass.
+      const bool arExact = arBody.buf != 0u && arBody.size != 0u;
+      const bool arW1Agrees = arW1 != 0u && arW1 == arBody.size;
+      const bool arPosInside = arPos < arBody.size;
+      uint32_t arWant = amIn6;
+      if (arWant > arBody.size - arPos)
+        arWant = arBody.size - arPos;
+      if (arExact && arW1Agrees && arPosInside && arWant != 0u) {
+        uint32_t arDone = 0;
+        bool arOk = true;
+        while (arDone < arWant) {
+          const uint32_t arChunk =
+              (arWant - arDone > 512u) ? 512u : (arWant - arDone);
+          uint8_t arTmp[512];
+          if (!memA.ReadBytes(arBody.buf + arPos + arDone, arTmp, arChunk) ||
+              !memA.WriteBytes(amIn5 + arDone, arTmp, arChunk)) {
+            arOk = false;
+            break;
+          }
+          arDone += arChunk;
+        }
+        if (arOk) {
+          uint8_t arGot[8] = {0};
+          uint32_t arHead = 0;
+          (void)memA.ReadU32BE(amIn5, &arHead);
+          (void)memA.ReadBytes(amIn5, arGot, sizeof(arGot));
+          static std::atomic<uint32_t> s_arDeliver{0};
+          const uint64_t arN = s_arDeliver.fetch_add(1) + 1;
+          const uint32_t arWantHead = 0x72677861u;
+          MCLA_LOG_WARN(
+              "ARC-WINDOW #{} rec={:08X} path='{}' win={:08X} pos={} req={} "
+              "want={} done={} body={:08X} bodySize={} w1={:08X} posOk={} "
+              "head={:08X} wantHead={:08X} headIs={}",
+              arN, arRec, arBody.path.c_str(), amIn5, arPos, amIn6, arWant,
+              arDone, arBody.buf, arBody.size, arW1, arPosInside ? 1 : 0,
+              arHead, arWantHead, arHead == arWantHead ? 1 : 0);
+          ctx.r3.u32 = arWant;
+        }
       }
     }
   }
@@ -25637,6 +25896,40 @@ PPC_FUNC(sub_821BE250) {
 }
 
 PPC_FUNC_IMPL(__imp__sub_821BE710);
+// ---------------------------------------------------------------------------
+// AO 2026-10-05, NEW SYMBOLS (rule 1b). All four constants and the one counter
+// exist only for the WINWR-CMP row inside PPC_FUNC(sub_821BE710). Each is a
+// guest fact carried over from the raw words quoted at that row, which is where
+// the derivation of every one of them lives; nothing here is a host guess.
+//
+//   kAoCmpLr      0x8218C840  the lr the guest sets when it calls BE710 from
+//                               sub_8218C760. Gating on THIS lr, rather than on
+//                               a call counter, is what makes the row the compare
+//                               and not a lookalike: it is the only return
+//                               address that feeds 0x8218C844.
+//   kAoCmpSlotOff 80 (0x50)    raw 0x8218C834 `addi r4,r1,80` -- the displacement
+//                               field of that word, b15:0.
+//   kAoCmpOriImm  0x6772      raw 0x8218C848 `ori r8,r7,0x6772`, immediate field
+//                               b15:0. OR'd into r7 to FORM r8 at the row; never
+//                               written to the guest.
+//   kAoCmpFatalLr 0x8218C864   the lr inside the fatal dispatcher, which is the
+//                               `lr=0x8218C864` the boot logs. Printed on the row
+//                               so a reader can tie the row to that fatal line
+//                               without searching the image.
+//
+// AR 2026-10-05: kAoCmpR8 = 0x61786772 is DELETED, not renamed. It encoded the
+// conclusion "r8 is this constant", which is false -- r8 = r7 | 0x6772, so r8
+// MOVES with the word the guest read. Keeping a second 0x61786772 next to
+// kAoCmpOriImm would leave the wrong value one edit away from being used again.
+// The value 0x61786772 is still meaningful and is still printed, but only as a
+// computed `r8={}` field on the row, and it now equals reverse(0x72677861) --
+// the wanted window head -- rather than being an input.
+// ---------------------------------------------------------------------------
+static constexpr uint32_t kAoCmpLr = 0x8218C840u;
+static constexpr uint32_t kAoCmpSlotOff = 80u;
+static constexpr uint32_t kAoCmpOriImm = 0x6772u;
+static constexpr uint32_t kAoCmpFatalLr = 0x8218C864u;
+static std::atomic<uint64_t> s_aoCmpRows{0};
 static std::atomic<uint32_t> s_hBE710{0};
 PPC_FUNC(sub_821BE710) {
   const uint32_t n = s_hBE710.fetch_add(1) + 1;
@@ -25771,6 +26064,34 @@ PPC_FUNC(sub_821BE710) {
       // to the guest and one fewer reason the host could have supplied either
       // side. Neither side of the compare is the host's to supply.
       //
+      // AO 2026-10-05, SUPERSEDING ADDENDUM. The reasoning above is sound and
+      // its conclusion still holds -- the host must not supply either side --
+      // but two of its supporting claims are REFUTED by the raw words, and the
+      // first paragraph of this block is wrong in a way that matters. Recorded
+      // here as a dated addendum rather than by rewriting the paragraph, which
+      // is the F-609 deletion record and stays as it was written.
+      //
+      //   1. "ori r9,r8,26482" (the list above) is WRONG. The raw word is
+      //      0x8218C848 61 28 67 72, and `ori`'s DESTINATION is b20:16 and its
+      //      source is b25:21 (AGENTS.md field note; F-647's gloss was itself
+      //      inverted). b20:16 = 8 and b25:21 = 9, so it is `ori r8,r9,0x6772`
+      //      -- a write to r8. It is not a dead store and it is not to r9.
+      //   2. "r8 is caller-volatile, so it is whatever the vtable+88 indirect
+      //      call at 0x8218C828 left in it" is REFUTED. r8 at the compare is
+      //      computed by two ADJACENT, UNCONDITIONAL instructions with no branch
+      //      between them: `lis r9,24952` (r9 = 0x61780000) then
+      //      `ori r8,r9,0x6772`, giving r8 = 0x61786772. So r8 IS the guest's,
+      //      it was always measurable, and the `bctrl` at 0x8218C828 is not on
+      //      the path that sets it. The value is now printed on the WINWR-CMP
+      //      row, and the derivation is re-extracted nibble by nibble from the
+      //      binary's own bytes by [S0]/H1b of build/ao_winwr_cmp_harness.cpp,
+      //      which also carries a mutant that asserts the SWAPPED operand order
+      //      and must fail.
+      // What remains true, and what the deleted write still must not do: the
+      // guest produces this value itself, so the host has no business asserting
+      // what a comparison must equal. SUPPLYING it was wrong then and is wrong
+      // now; MEASURING it is not.
+      //
       // THE VALUE IS DERIVABLE, AND NOT FROM THE HOST. Read raw from
       // build/cache/mcla_pe.bin at VA 0x827D2DD0 (offset 0x7D2DD0), which is
       // the guest's OWN embedded effect image - and which build/w723.log
@@ -25850,6 +26171,9 @@ PPC_FUNC(sub_821BE710) {
   static std::atomic<uint64_t> s_beswapRows{0};
   const uint32_t inR5 = ctx.r5.u32;
   const uint32_t inR4 = ctx.r4.u32;
+  // AO 2026-10-05, new (see the WINWR-CMP block below for why r1 must be
+  // snapshotted here rather than read after the call).
+  const uint32_t inR1 = ctx.r1.u32;
   const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
   __imp__sub_821BE710(ctx, base);
   {
@@ -25867,6 +26191,116 @@ PPC_FUNC(sub_821BE710) {
                     outR3 != 0u ? 1 : 0, inR4, dstAfter,
                     dstAfter == 0x61786772u ? 1 : 0, lrIn);
     }
+  }
+  // ---------------------------------------------------------------------------
+  // WINWR-CMP (AO, 2026-10-05). THE COMPARE'S OWN REGISTERS, ON THE CALL THAT
+  // FEEDS IT. Read-only census: no state change, no D3D12 call, no early return,
+  // nothing written to guest memory on any path here. NEW MARKER, so no existing
+  // row's format is touched and no tracked marker's text is named here.
+  //
+  // WHAT QUESTION THIS EXISTS TO SETTLE, AND WHY IT IS NOT ANSWERABLE BY THE
+  // ROW ABOVE. `BESWAP-RET` prints `dstAfter`, read at the callee's return, and
+  // infers "that is the word the guest compares". That inference needs one more
+  // step: it is only true if NOTHING writes [r4] between this return and the
+  // guest's own load. It used to be an unstated assumption; it is now an
+  // assertion backed by the raw words, below, and this row measures the value
+  // itself out of guest memory rather than recomputing it.
+  //
+  // THE INSTRUCTION SEQUENCE, FROM build/cache/mcla_pe.bin AT VA - 0x82000000,
+  // BIG ENDIAN, EVERY FIELD EXTRACTED NIBBLE BY NIBBLE (not read off a
+  // mnemonic). Cross-checked against generated/ppc_xenon/ppc_recomp.9.cpp, the
+  // validated body of sub_8218C760, which agrees on every field used here:
+  //   0x8218C830  38A00001  addi r5,r0,1          ; ONE WORD
+  //   0x8218C834  38810050  addi r4,r1,80         ; dst = r1 + 80   <- THE SLOT
+  //   0x8218C838  7FC3F378  mr   r30,r3           ; r3 unchanged on this path
+  //   0x8218C83C  48031ED5  bl   0x821BE710       ; <- THIS HOOK. lr := 0x8218C840
+  //   0x8218C840  3D206178  lis  r9,24952         ; r9 = 0x6178 << 16
+  //   0x8218C844  80E10050  lwz  r7,80(r1)        ; r7 = [r1+80]   <- THE WORD
+  //   0x8218C848  61286772  ori  r8,r9,26482      ; r8 = 0x61786772
+  //   0x8218C84C  7F074000  cmpw cr6,r7,r8        ; THE COMPARE
+  //   0x8218C850  419A0028  beq  cr6 -> 0x8218C878
+  //
+  // r7: RT IS FIELD b25:21. For 0x80E10050 that field is 7, b20:16 is 1, and
+  //     the displacement field b15:0 is 0x0050 = 80 -- so it is `lwz r7,80(r1)`
+  //     and NOT the `lwz r7,-30620(r11)` shape a different word in this function
+  //     has. [S0]/H4 in build/ao_winwr_cmp_harness.cpp re-extracts all three
+  //     fields out of the file's own bytes and fails if any of them disagrees.
+  // r8: CORRECTED 2026-10-05 (AR). This block used to read "ori's DESTINATION is
+  //     b20:16 and its SOURCE is b25:21" and to conclude `ori r8,r9,0x6772`,
+  //     r8 = 0x61780000 | 0x00006772 = 0x61786772 -- a CONSTANT. That field
+  //     note was itself wrong and AGENTS.md now says so at the top: for `ori`
+  //     the DESTINATION is b25:21 and the SOURCE is b20:16 (LLVM
+  //     PPCInstrFormats.td, class DForm_base: Inst{6...10} = RST is the source,
+  //     Inst{11...15} = RA is the destination). Re-extracted from the bytes,
+  //     nibble by nibble, for 0x61286772:
+  //       opcode = bits 31..26 = 011000 = 24            -> `ori`
+  //       b25:21 = 0,1,0,0,1 = 9                       -> DESTINATION, reg 8
+  //       b20:16 = 0,1,0,0,0 = 8                       -> SOURCE,      reg 7
+  //       b15:0  = 0110 0111 0111 0010 = 0x6772
+  //     so the instruction is `ori r8, r7, 0x6772`, and r8 = r7 | 0x6772 -- r8
+  //     IS A FUNCTION OF r7. The adjacent `lis r9,0x6178` (0x3D206178, also
+  //     measured) writes r9, which this instruction does not read; the deleted
+  //     paragraph's "r9 is its only source operand" is what made r8 look
+  //     constant.
+  //     THE CONSEQUENCE, AND IT IS THE POINT OF THIS ROW: `cmpw cr6,r7,r8` at
+  //     0x8218C84C is therefore testing `r7 == (r7 | 0x6772)`, which holds iff
+  //     every bit of 0x6772 is already set in r7, i.e. iff
+  //     `(r7 & 0x6772) == 0x6772`. That is a PREDICATE ON r7, and it is what
+  //     `beqTaken` must print. Printing `r8` as a literal and `beqTaken` as
+  //     `r7 == kAoCmpR8` -- which is what the code below did -- made `beqTaken`
+  //     and `r7IsR8` the SAME expression twice, so they could not disagree by
+  //     construction and the row reported a constant as if it were a register.
+  //     Both are now computed. Nothing else on this row moves.
+  //     CONTROL ARITHMETIC, on the two values w732.log actually printed:
+  //       r7=0x507B5CED -> 0x5CED|0x6772 = 0x7FFF -> r8=0x507B7FFF, r7!=r8,
+  //         (r7&0x6772)==0x6772 TRUE -> beqTaken would be 1 on the OR test but
+  //         the CMP is what branches, and cmpw is false -> beq NOT taken.
+  //         (Both this row and the guest agree the fatal fires: beqTaken=0.)
+  //       r7=0x61786772 -> 0x61786772|0x6772 = 0x61786772, equal -> beq taken.
+  //     The OR-test being 1 while cmpw is 0 in the first case is exactly why the
+  //     row must print r8 and let the comparison be `r7 == r8`, and why
+  //     `beqTaken` is `r7 == r8` and not `r7 & 0x6772 == 0x6772`.
+  //
+  // THE GAP THIS ROW STILL DOES NOT CLOSE, STATED PLAINLY. `r7` is read here, at
+  // 0x8218C840, one instruction before the guest's own load at 0x8218C844. The
+  // only instruction between them is the `lis` at 0x8218C840 itself, which
+  // writes a register and no memory, so [r1+80] cannot change. That is a
+  // two-line argument from raw words and it is why this row is a measurement of
+  // r7 rather than a proxy for it. It is NOT an instruction-level sample: the
+  // dispatch table is keyed by FUNCTION address, so there is no hook at
+  // 0x8218C84C; and the next call after the compare is `bl 0x821BD618` at
+  // 0x8218C860, whose body TERMINATES the process (src/kernel/imports.cpp:6329,
+  // "terminates the game instead of infinite-looping"), so the post-compare
+  // point is unreachable by construction. 0x821BD618 is also already owned by
+  // src/patches.cpp:414, so it was never available to this file.
+  //
+  // `slotEqDst` is the aliasing question directly: whether the address the
+  // guest loads (`r1+80`) is the address this call was handed as `r4`. The
+  // guest's own raw word says it must be (0x8218C834 is `addi r4,r1,80`), so a
+  // 0 here would mean the row is not reading the slot it claims to.
+  // `r3` is the caller's entry r3, which is r3 at the compare: the guest writes
+  // no r3 between 0x8218C838 and 0x8218C84C, and the callee clobbers r3, which
+  // is why this is the ENTRY snapshot and not ctx.r3 after the call.
+  // ---------------------------------------------------------------------------
+  if (lrIn == kAoCmpLr) {
+    const uint32_t aoSlot = inR1 + kAoCmpSlotOff;
+    uint32_t aoR7 = 0;
+    (void)mem.ReadU32BE(aoSlot, &aoR7);
+    // AR 2026-10-05: r8 is COMPUTED, not the kAoCmpR8 literal, and `beqTaken`
+    // is `r7 == r8` -- the guest's own cmpw -- instead of a second copy of the
+    // `r7IsR8` expression. See the corrected r8 derivation above the block.
+    // Field NAMES, ORDER and the row's fire-on gate are all unchanged, so every
+    // existing matcher still matches and the row still fires exactly as often.
+    const uint32_t aoR8 = aoR7 | kAoCmpOriImm;
+    const uint32_t aoCmpEq = (aoR7 == aoR8) ? 1u : 0u;
+    const uint64_t aoN = s_aoCmpRows.fetch_add(1) + 1;
+    if (aoN <= 32u || (aoN % 100u) == 0u)
+      MCLA_LOG_WARN(
+          "WINWR-CMP #{} lrIn={:08X} r3={:08X} r1={:08X} slot={:08X} "
+          "r7={:08X} r8={:08X} r7IsR8={} slotEqDst={} dst={:08X} "
+          "beqTaken={} fatalLr={:08X}",
+          aoN, lrIn, obj, inR1, aoSlot, aoR7, aoR8, aoCmpEq,
+          aoSlot == inR4 ? 1 : 0, inR4, aoCmpEq, kAoCmpFatalLr);
   }
 }
 
