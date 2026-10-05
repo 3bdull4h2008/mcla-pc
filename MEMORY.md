@@ -1,6 +1,40 @@
-# MEMORY.md — session memory (written 2026-10-05, ~03:40)
+# MEMORY.md — session memory (written 2026-10-05, revised 17:10)
 
-## 🔴🔴🔴🔴 F-647 IS INVERTED. THE PROJECT'S MOST-CITED RULE WAS WRONG ALL ALONG.
+## ✅✅ RESOLVED AND CORRECTED: `AGENTS.md:45` NOW CARRIES THE F-647 FIX
+
+**The correction is committed.** Three independent implementations against the Xenia oracle: ISA **28/31**, `ComputeMask` **28/31** — identical 28, identical 3 (all `MB>ME` wrap cases). Both disputed words agree: `MB=1,ME=1 → 0x40000000`, `MB=24,ME=31 → 0x000000FF`. The correct record is **F-765**.
+⚠️ **"Fixing" `generated/**` to `0xFF000000` would have inverted 16,709 sites across 176 TUs.** One agent's refusal is the only reason that did not happen. **`AGENTS.md` also now carries the field notes: `ori`'s destination is `b20:16` (for `ori`/`or` *and* `add`/`subf` alike); Capstone's or-immediate arm is broken; `op18` targets are unresolvable both ways; `ppc_xrefs.py calls` misleads; `ppc_disasm.py` inverts `mr` and cannot decode `rldicl`.**
+
+## 🔴🔴 THE ANSWER: a single pair of ZERO fields
+
+```
+SERVE-PROOF     off=001F5000 stored=7578 logical=23807 served=23807 head=72677861 proved=1
+STREAM-WINDOW #42  buf=82862DF8  winHex=ED5C7B505CD779FF  winAbs=0000000000000000
+WINWR-REC #6       rec0=B737B580  rec4=0000AB38  rec8=00000000  rec12..rec24=0
+```
+The guest computes `r5 = (rec[8] & ~1) + ld64(dev+24) + pos` (`0x821CC3A0/3A4`).
+**`rec[8]` (the member's archive offset) is 0 on every row. `winAbs` (`+16/+20`) is 0 on every row.**
+**Both anchors that should locate the member inside the `0x1F0000` page return nothing.**
+Archive ✓ TOC ✓ inflate ✓ serve ✓ byte-exact (`firstDiff=-1`) → **handoff ✗**.
+
+**Two fixers refused from opposite files and BOTH were right.** `gpu_device.cpp`: the bytes exist one layer up, writing them in means **routing a refusal the span owner issued**. `vfs_rpf.cpp`: a refill **does** write offset 0 and **does** write a full 4096 granule — **"stale window" was never a thing.**
+
+## 🔴 AND THE COMPARE IS UNSATISFIABLE — from raw words
+```
+0x8218C7BC  54 68 06 3E  rlwinm MB=24 ME=31 mask=0x000000FF  -> r8 is A BYTE
+0x8218C7C0  2B 08 00 00  cmpwi r8,0                        -> range check on that byte
+0x8218C848  61 28 67 72  ori RT(b25:21)=9 RA(b20:16)=8      -> DEAD STORE for r8
+0x8218C84C  7F 07 40 00  cmpw r7, r8
+```
+**A byte never equals a 32-bit word.** The constant is built in `r9`, never `r8`. **`r7IsCmp=` is structurally always 0** — which is why it read 0 on all 21 rows, and why I misread that as "the operand was fine." **Two independent causes are stacked; fixing either alone does not fix the boot.**
+
+## 🔴 THE MENU HAS NEVER BEEN REACHED
+**0 evidence across the corpus.** The one `menu` and all 47 `press start` are one host-setup line; all 76 `attract` and 92 `logo` are inside compile lines. `W34-NOGFX ngfx=0`, `W35-BOOT-GATE=0`.
+**Input EXISTS and is unreachable** — `XamInputGetState` `xam.cpp:941-1017`, hooked, SDL3 + keyboard + XInput dead zones, polled every frame from `app.cpp:325`, **0 non-NULL polls ever.**
+**Audio blocked at the first link** — `apu::RegisterClient`=0 corpus-wide; behind it no XMA decoder, no `0x7FEA0000` aperture, and `LOG_UTILITY` is `#if _DEBUG` in an `NDEBUG` build, so some stubs are **compiled out entirely**.
+**Graphics EXONERATED** — the 25% is the geometry's true size; `vs-input-stream #2` is a full-screen primitive and covered **100%**. **Presents = 2, not 1.**
+
+## 🔴🔴 27 SOAKS: A FLAT PLATEAU. ZERO FIXES MOVED THE BOOT.
 
 **F-647 says: "all three decompilers render PPC rotate-immediate masks backwards — raw `55 6A 00 42` is MB=1, ME=1 = bit 1."**
 **That is FALSE. MB=1, ME=1 ⇒ bit 30 ⇒ `0x40000000`, which is what the ISA gives, what `ComputeMask` gives, and what IDA and `ppc_recomp.17.cpp` print. THE EMITTERS WERE RIGHT. THE RECORD'S GLOSS "= bit 1" IS THE ERROR.**
