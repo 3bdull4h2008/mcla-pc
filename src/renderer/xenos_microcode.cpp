@@ -151,9 +151,8 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             //   word2: stride:8, offset:23, predCondition:1
             // Below, isIndexRounded and vertexFormat match this layout;
             // isSigned/isNormalized land on formatCompAll/numFormatAll
-            // (signedRfModeAll at bit 14 is not read), and expAdjust,
-            // isMiniFetch and isPredicated are extracted two bits low
-            // (reserved2 is skipped).
+            // (signedRfModeAll at bit 14 is not read), and expAdjust is
+            // still extracted two bits low (reserved2 is skipped).
             instr.constIndexSelect = (word0 >> 25) & 0x3;
             instr.prefetchCount = (word0 >> 27) & 0x7;
             instr.srcSwizzle = (word0 >> 30) & 0x3;
@@ -165,8 +164,8 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             instr.vertexFormat = (word1 >> 16) & 0x3F;
             instr.expAdjust = static_cast<int32_t>((word1 >> 22) & 0x3F);
             if (instr.expAdjust >= 32) instr.expAdjust -= 64;
-            instr.isMiniFetch = ((word1 >> 28) & 0x1) != 0;
-            instr.isPredicated = ((word1 >> 29) & 0x1) != 0;
+            instr.isMiniFetch = ((word1 >> 30) & 0x1) != 0;
+            instr.isPredicated = ((word1 >> 31) & 0x1) != 0;
 
             instr.stride = word2 & 0xFF;
             instr.offset = static_cast<int32_t>((word2 >> 8) & 0x7FFFFF);

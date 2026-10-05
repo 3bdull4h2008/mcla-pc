@@ -21,6 +21,7 @@
 #include <lzx.h>
 #include <mspack.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include <dbghelp.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <iterator>
 #include <string>
 #include <thread>
@@ -44,6 +46,167 @@ extern std::atomic<bool> s_inUILoad;
 // 0x827D838C device has a live vtable when callers dispatch +88.
 static void EnsureMemoryDeviceVtable();
 static constexpr uint32_t kMemDeviceObj = 0x827D838Cu;
+
+// ---------------------------------------------------------------------------
+// The guest's OWN stream-wrapper array. Every constant and every field offset
+// below is read from raw words (tools/ppc_disasm.py 0x821BDDE8 100, offset =
+// VA - 0x82000000) and not from a decompiler and not from a rotate-immediate
+// mask (F-647). sub_821BDDE8 is what sub_821BDF20 tail-calls at 821BE004
+// (raw `4BFFFDE5 bl 821BDDE8`) with r3=path, r4=handle, r5=dev, and its
+// return is the stream object the caller reads through:
+//   821BDE5C  3D608286  lis   r11,8286
+//   821BDE60  394B0C18  addi  r10,r11,3096     ; r10 = 0x82860C18  ARRAY BASE
+//   821BDE64  80CB0000  lwz   r6,0(r11)        ; free marker: [entry] == 0
+//   821BDE68  2B060000  cmpli r6,0
+//   821BDE6C  419A0034  beq   -> 821BDEA0      ; take this slot
+//   821BDE70  396B0028  addi  r11,r11,40       ; STRIDE 40
+//   821BDED4  55256026  rlwinm r5,r9,12,0,19   ; i * 4096
+//   821BDEBC  38860DF8  addi  r4,r6,3576       ; 0x82860DF8  WINDOW BASE
+//   821BDECC  7FAB512E  stwx  r29,r11,r10     ; [entry+ 0] = dev     (GUEST)
+//   821BDEC4  7FCB192E  stwx  r30,r11,r3      ; [entry+ 4] = handle  (GUEST)
+//   821BDF00  7CAB192E  stwx  r5,r11,r3       ; [entry+ 8] = window  = base+i*4096
+//   821BDEEC  7CEBD92E  stwx  r7,r11,r27      ; [entry+24] = 0
+//   821BDEF8  7CEBE92E  stwx  r7,r11,r29      ; [entry+28] = 0
+//   821BDEF4  7FCBE12E  stwx  r30,r11,r28     ; [entry+32] = 4096
+//   821BDF14  7FE3FB78  mr    r3,r31          ; return base + i*40
+//
+// THE CONTRACT, and it is the guest's: it picks the slot itself, per open, by
+// scanning for a zero, and it writes {dev,handle} into that slot itself. The
+// host is therefore not asked to bind a stream wrapper at all; the host's only
+// obligation is to answer the device read for the (dev,handle) pair the guest
+// wrote. Any host-side write of {dev,handle} into a wrapper is redundant with
+// the guest's own stwx pair and, if it names a different index, is a binding
+// the guest never asked for (F-609).
+static constexpr uint32_t kBdf20WrapArray = 0x82860C18u;
+static constexpr uint32_t kBdf20WrapStride = 40u;
+static constexpr uint32_t kBdf20WindowBase = 0x82860DF8u;
+static constexpr uint32_t kBdf20WindowStride = 4096u;
+
+// ============================================================================
+// AK census 2026-10-05: WINWR-WATCH / WINWR-REC. Census ONLY -- no state
+// change, no D3D12 call, no early return on any existing path, and NOTHING
+// written to guest memory on any path here. Charter F-609: the host answers
+// the device read the guest asked for; it does not decide what the body says.
+//
+// THE QUESTION. The boot dies at 'Old version of rage effect found', and the
+// one word that fatal compares is delivered by this chain (every address below
+// is a raw word read out of build/cache/mcla_pe.bin at VA - 0x82000000, big
+// endian, with tools/ppc_disasm.py -- NOT a decompiler's comment, and NOT a
+// rotate-immediate mask):
+//   0x821BE360  80BF0008  lwz   r5,8(r31)     +8 = the window buffer
+//   0x821BE364  7D4903A6  mtctr r10           r10 = [[+0]] vtable slot +24
+//   0x821BE368  4E800421  bctrl               dev->Read(dev, +4, window)
+//   0x821CCB38                              segmented dispatch (+296/+316/...)
+//   0x821CCB84  7FA6EB78  mr    r6,r29
+//   0x821CCB88  7F85E378  mr    r5,r28        r5 = the OFFSET into the member
+//   0x821CCB8C  7F24CB78  mr    r4,r25        r4 = the DESTINATION (the window)
+//   0x821CCB90  7EE3BB78  mr    r3,r23        r3 = r31+296, the SLOT
+//   0x821CCB94  4BFFF285  bl    0x821CBE18
+// and inside sub_821CBE18, which is the function that copies:
+//   0x821CBE24  7C7F1B78  mr    r31,r3        r31 = entry r3  = the slot
+//   0x821CBE28  7C9E2378  mr    r30,r4        r30 = entry r4  = DEST
+//   0x821CBE2C  7CBD2B78  mr    r29,r5        r29 = entry r5  = OFFSET
+//   0x821CBE30  7CDC3378  mr    r28,r6        r28 = entry r6  = COUNT
+//   0x821CBE80  817F0008  lwz   r11,8(r31)    r11 = [slot+8]  = SOURCE BASE
+//   0x821CBE84  7F85E378  mr    r5,r28        r5 = COUNT
+//   0x821CBE88  7FC3F378  mr    r3,r30        r3 = DEST
+//   0x821CBE8C  7C8BEA14  add    r4,r11,r29    r4 = [slot+8] + OFFSET = SOURCE
+//   0x821CBE90  4820EAC1  bl    0x823DA950    memcpy(DEST, SOURCE, COUNT)
+//
+// AND THE CALL SITE IS CONDITIONAL -- MEASURED, and this is the handle the
+// falsifier needs. From the same raw source:
+//   0x821CCB44  7CDD3378  mr    r29,r6
+//   0x821CCB48  54BC047E  rlwinm r28,r5,mb=17,me=31,mask=0x00007FFF  r28 = r5 & 0x7FFF
+//   0x821CCB54  616B8000  ori    r11,r11,8000                        r11 = 0x00008000
+//   0x821CCB58  7C7F1B78  mr    r31,r3        r31 = the reader
+//   0x821CCB5C  7C992378  mr    r25,r4        r25 = the window, -> r4 = DEST
+//   0x821CCB70  815F0128  lwz   r10,296(r31)  r10 = [reader+296]
+//   0x821CCB78  557E003E  rlwinm r30,r11,sh=0,mb=0,me=31            r30 = 0x8000
+//   0x821CCB7C  7F1E5000  cmpw  cr6,r30,r10
+//   0x821CCB80  409A0048  bne   cr6 -> 0x821CCBC8   <-- SKIPS the call
+//   0x821CCB94  4BFFF285  bl    0x821CBE18
+// So sub_821CBE18 is reached ONLY when [reader+296] == 0x8000. It is not an
+// unconditional writer. If a soak shows [reader+296] != 0x8000 at the fatal's
+// read, this function is NOT the writer on that path, the branch goes to
+// 0x821CCBC8, and the WINWR-WATCH row firing zero times is evidence about the
+// CALL SITE rather than about the bytes. WINWR-WATCH cannot see that word from
+// inside the callee -- [reader+296] belongs to the caller's frame -- so it is
+// recorded here rather than guessed at from the row.
+//
+// So the entry registers of sub_821CBE18 are r3=slot, r4=destination,
+// r5=offset-into-the-member, r6=count, and the SOURCE of the copy is
+// [slot+8] + r5 -- read BEFORE the copy. That single fact is what the
+// WINWR-WATCH row measures, because `src8` settles the open question directly:
+//   src8 == 507B5CED (the byte-swapped DEFLATE stream header) -> the host's own
+//       source buffer was already wrong, i.e. a HOST BUFFER bug;
+//   src8 == 61786772 ('rgxa', the inflated body the guest compares against) ->
+//       the SOURCE was right and the bytes arrived wrong, i.e. the OFFSET
+//       ARITHMETIC is wrong.
+// Neither outcome is decided here. The row only reports which one the boot
+// produced, and `copied=` says on the same row whether the copy was faithful
+// (post8 == src8), so "the memcpy is faithful" stops being an assertion.
+//
+// THE GATE is a 3-compare range test ON THE DESTINATION and nothing else. No
+// watch range is registered globally: RegisterGuestWatchRange and
+// RegisterGuestWatchValue are NOT called anywhere in this block, the generic
+// page-watch logger is not touched, and no other armed range is disturbed.
+// Every bound is a constant or a guest word, never an invented number:
+//   compare 1  dest >= kBdf20WindowBase             from raw 0x821BDEBC
+//   compare 2  dest <  base + slots*4096             from raw 0x821BDE4C + 0x821BDEE4
+//   compare 3  (dest - base) % 4096 == 0            from raw 0x821BDEE4
+// `slots` is the GUEST'S OWN runtime count, read from kBdf20SlotCountAddr on
+// every call, so the arena's upper bound is the number of windows the guest
+// actually allocated rather than a bound this file guessed. If that word is 0
+// or implausible the predicate answers false and says so (`slots=` on the row),
+// which is a recorded "did not fire" rather than a silent widening.
+static constexpr uint32_t kBdf20SlotCountAddr = 0x827D8864u;
+
+// AK census 2026-10-05, new symbol. Returns true only for a guest address that
+// is the BASE of one of the guest's own BDF20 stream windows. Read-only: it
+// reads one guest dword and touches nothing else.
+static bool MclaWinwrIsWindowBase(uint32_t dest) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t slots = 0;
+  (void)mem.ReadU32BE(kBdf20SlotCountAddr, &slots);
+  if (slots == 0u || slots > 0x1000u)
+    return false;  // unreadable or implausible: refuse rather than widen
+  if (dest < kBdf20WindowBase)
+    return false;  // compare 1
+  const uint32_t off = dest - kBdf20WindowBase;
+  if (off >= slots * kBdf20WindowStride)
+    return false;  // compare 2
+  return (off % kBdf20WindowStride) == 0u;  // compare 3
+}
+
+// Which index of kBdf20WrapArray is `obj`? An identification, not a claim:
+// w724.log's reader is 0x82860C68 = base + 2*40 AND its +8 field is 0x82862DF8
+// = base + 2*4096 (the STREAM-WINDOW `buf=` field). Two independent fields of
+// the same object agreeing is what makes this an identity rather than a
+// coincidence; a single field would not be enough. Returns -1 for anything
+// that is not a slot of that array. Read-only, no writes, no allocation.
+static int64_t MclaBdf20WrapIndex(uint32_t obj) {
+  if (obj < kBdf20WrapArray)
+    return -1;
+  const uint32_t d = obj - kBdf20WrapArray;
+  if (d % kBdf20WrapStride != 0u)
+    return -1;
+  return static_cast<int64_t>(d / kBdf20WrapStride);
+}
+
+// Is the 16-entry table at kGuestSlotTable this stream's binding? MEASURED: not
+// unless the stream's device IS the memory device. The memory table is the
+// memory-device handle space; a packfile handle indexes dev+40+h*68 (see the
+// GetSize decode at BE8D8, 0x821CD3C8) and names a TOC RECORD, not a slot.
+// w724.log proves the two spaces are unrelated by carrying the same h over 42
+// DIFFERENT files: STREAM-WINDOW rows carry dev=B7321700 h=1 on every one,
+// while the record the device actually read changes every row (DISCCHK2 #2
+// rec=B737B5A0 ... #33 rec=B737C320). So a packfile stream must not have the
+// memory table read with its handle as the index; when it does, the row prints
+// a plausible body that was never bound to that stream. That reading is a
+// census artefact and its value is not evidence about the stream.
+static bool MclaSlotTableBindingApplies(uint32_t dev) {
+  return dev == kMemDeviceObj;
+}
 
 // Used by several later censuses (CBSETUP/GETDEV/MOUNT/TOC76); defined here
 // so it is visible at every use site.
@@ -129,7 +292,22 @@ static constexpr bool kF465GarageReindex = false;
 // and the gate value itself did not move: `BDF20 #600 path='a:/archive/tune/
 // vehicle/vehicle0008.lst' ret=0` in BOTH soaks, i.e. the tune file gets no stream
 // whether or not we plant the nested archive (F-464). The code stays for reuse.
-static constexpr bool kF463AbstainNestedRpf = false;
+//
+// F-632 (2026-09-28): the flag AND its abstain block (the one below, at what was
+// src/gpu_device.cpp:1935-1944) are DELETED, and this comment is what remains of
+// them. The flag could not move anything because it was asked the wrong question:
+// "is it inert?" is unanswerable while the serve that the block skips was
+// reading at the wrong offset. `XsfOffsetCandidates` took the record's w1 -- the
+// LOGICAL SIZE -- as the file offset, so the nested members were read at
+// 0x68000 instead of 0x3F0000 and the bytes handed to the guest were a raw
+// DEFLATE stream (XSF-HOSTSERVE off=00068000 head=6655A8B1), not the nested RPF3
+// image the guest's own header parse requires. A wrong-offset serve and an
+// abstention are indistinguishable from the guest's side, so w465 == w460 proved
+// nothing about abstention. F-458 and F-463 are refuted as stated: the host was
+// never pre-empting the guest's inner-TOC decrypt, it was serving garbage and
+// the guest was correctly rejecting it. Keeping an abstention whose stated reason
+// has been measured false is the exact pattern F-632's method note warns about,
+// so the mechanism goes and the finding stays on the record here.
 
 // F-481/F-487 per-job-window unconditional counters. Declared at the top of the
 // file because three separate hooks write them: the inflate-entry census
@@ -256,36 +434,83 @@ static bool IsJob2UiDest(uint32_t outPtr) {
 // w18: archive-content paths (not just UI .xsf). TOC76 finds preload.list /
 // globaltex.list / .xtd the same way; their bodies never land because the
 // cache/serve path excluded them.
+//
+// F-632 (2026-09-28): `.lst` and `tune/` are now IN, and they are in LAST, on
+// purpose. F-446 measured the widening and recorded a null:
+//
+//   F-446 MEASURED AND REVERTED: adding ".lst"/"tune/" here did engage our serve
+//   machinery for the tuning files (mentions of `tune/vehicle` in the log went
+//   1 -> 142 in `w448`) and changed nothing else: still 14 F442-SECTION rows all
+//   ret=0 with hits=0 ... So the config tokenizer is NOT fed by this host-serve
+//   path -- do not re-try widening this predicate as a route to clause (b).
+//
+// That conclusion was drawn from a serve reading the WRONG OFFSET. The nested
+// packfile's record is `w=[E2D132A2 00068000 003F0000 400503CF]`; the serve took
+// w1 = 0x00068000 as the offset and served `head=6655A8B1` -- a DEFLATE stream
+// header -- where the guest required an RPF3 image. A predicate that admits
+// 142 tune paths into a serve that cannot produce a valid archive is a null
+// RESULT, not a null mechanism, so F-446's evidence does not apply to the fixed
+// serve and the "do not re-try" is retired with it. The ordering is the lesson:
+// items 1-6 (the three-field discipline, the host serve, the abstain removal,
+// the registrations, the nested registration) are all landed; only now is the
+// predicate widened, so the next soak's result is about the fix and not about
+// the ordering. `tune/` and `.lst` are last in the chain so the older, better
+// understood families are unaffected by their cost.
 static bool PathLooksLikeArchiveContent(const char *path) {
   if (!path || !path[0])
     return false;
   return std::strstr(path, ".xsf") != nullptr ||
          std::strstr(path, ".xtd") != nullptr ||
          std::strstr(path, ".list") != nullptr ||
-         // F-446 MEASURED AND REVERTED: adding ".lst"/"tune/" here did engage our serve machinery for
-         // the tuning files (mentions of `tune/vehicle` in the log went 1 -> 142 in `w448`) and
-         // changed nothing else: still 14 F442-SECTION rows all ret=0 with hits=0, the Vehicle rows
-         // still holding the previous stream's compressed bytes, F432-GROW-SKIP 3, LISTLINE 171,
-         // C0000005 0, BC140-REC 7. So the config tokenizer is NOT fed by this host-serve path --
-         // do not re-try widening this predicate as a route to clause (b).
          std::strstr(path, "globaltex") != nullptr ||
          std::strstr(path, "preload") != nullptr ||
          std::strstr(path, "shaders/") != nullptr ||
          std::strstr(path, "textures/") != nullptr ||
-         std::strstr(path, "resources/") != nullptr;
+         std::strstr(path, "resources/") != nullptr ||
+         // F-632: the tuning files. `tune/vehicle/vehicle0008.lst` is the path
+         // F-464/F-443/F-444 have been chasing (BDF20 #600 ret=0, F442-SECTION
+         // 14 rows all hits=0) and it is the member shape the fixed serve can
+         // now actually deliver.
+         std::strstr(path, ".lst") != nullptr ||
+         std::strstr(path, "tune/") != nullptr;
 }
 
 static bool PathLooksLikeUiBody(const char *path) {
   return PathLooksLikeArchiveContent(path);
 }
 
+// F-632 (2026-09-28): the cached words are the GUEST'S record, so the FIRST
+// TOC76-XSF row for a path wins and later rows do not overwrite them. Measured
+// in w653: `preload/xarchive_bootscripts.rpf` is published as
+// `[8F113871 000B0000 00368000 40082186]` and then, 13 ms later, as
+// `[8F113871 00368000 00368000 40082186]` -- and the second w1 (3,571,712) is
+// exactly the size XSF-POSTOPEN-SERVE reports for that first open, i.e. it is the
+// CD3C8 size publication `WriteU32BE(tocEntry + 4, xsz)` writing our own served
+// body length into the guest's record. Overwriting the cache with it made every
+// LATER open ask for a 3,571,712-byte window for a 720,896-byte member, which is
+// how one wrong field becomes a wrong length as well. `entry` is still
+// refreshed (the guest may hand back a different record address).
+//
+// W68 (2026-09-30): the sentence this block used to end with -- "the open-gate
+// pre-scan in sub_821CCEA0 still ORs bit 30 into the cached w2, which the offset
+// mask ignores" -- was FALSE, and it was the licence for the fault. There is no
+// offset mask that ignores bit 30: kTocMemberOffMask is 0x7FFFFFFFu (below,
+// 31 bits, bit 30 INCLUDED, F-657's measured guest-emitted width), it is applied
+// in XsfOffsetCandidates and at the RegisterNestedRpf call in sub_821CCEA0, and
+// RpfVirtualFileSystem::ReadFileAt takes the result unmasked. The pre-scan no
+// longer ORs the bit (see the W68 block in sub_821CCEA0), so the cached w2 is now
+// always byte-identical to the guest's own [entry+8] as published by the first
+// TOC76 row -- the copy this function performs at the end of its body.
 static void XsfTocCache(const char *path, uint32_t entry,
                         const uint32_t w[4]) {
   if (!PathLooksLikeUiBody(path))
     return;
   std::lock_guard<std::mutex> lk(g_xsfMtx);
   auto &e = g_xsfToc[path];
+  const bool firstRow = (e.entry == 0);
   e.entry = entry;
+  if (!firstRow)
+    return;
   for (int i = 0; i < 4; ++i)
     e.w[i] = w[i];
 }
@@ -973,6 +1198,40 @@ static constexpr bool kHostLzxDecode = false;
 // XCompress codec=1 window size in bits (17 = 128KB, standard for Xbox 360).
 static constexpr int kXcWindowBits = 17;
 
+// W66 (2026-09-30): the RSC5/XCompress host decode, as its OWN lever.
+// kHostLzxDecode above is a DIFFERENT format: it is libmspack's CAB-LZX, which
+// F-191 measured to be unable to decode these members at all (rc=11 after
+// 4x32KiB under every strategy). mcla_lzx::host_decode_ui_xsf
+// (src/xmem_lzx.h:501, F-295) is a different decoder for a different framing and
+// is byte-exact on all four UI containers, re-proven offline 09-30 against
+// build/xmem_golden/*.bin (143069/1066057/19337/29655, all EXACT).
+// The two are never mixed: this constant gates ONLY the RSC5 container branch of
+// the content serve, and kHostLzxDecode still gates the two CAB sites
+// (:6356 per-frame, :6515 whole-payload) which stay exactly as they were.
+// That is the whole point of not flipping kHostLzxDecode (do-not #9: stacking a
+// mitigation on a lever another stream disabled for evidence).
+//
+// IS THE w204 STALL REACHABLE FROM HERE? Measured answer, checked BEFORE the
+// enablement stood:
+//   * WHAT IT WAS. `RD-SUBMIT` is the census on sub_8244F4C0 (gpu_device.cpp:
+//     16871), and gpu_device.cpp:16883 records that this is the FIRST archive
+//     I/O the guest issues. `RD-SUBMIT=4` therefore means the guest issued
+//     exactly four archive reads and issued no more: the table-of-contents walk
+//     stopped, upstream of any file body existing. F-123 leaves its cause open
+//     ("environmental").
+//   * IT IS NOT REACHABLE HERE. This decode runs inside the XSF-OPEN handler,
+//     i.e. AFTER the guest's open returned a slot, which is after the TOC
+//     lookup that produced the record. It rewrites `serveBytes` after the
+//     archive read has already completed; it gates, delays, reorders and
+//     counts nothing on the sub_8244F4C0 path.
+//   * THE CONTROL ALREADY RAN. F-190's w204 control had kHostLzxDecode=false
+//     -- this branch compiled out entirely -- and still stalled at
+//     RD-SUBMIT=4, so the stall is not a decode symptom at all.
+//   * IT IS NOT PRESENT NOW. RD-SUBMIT prints its first 24 rows then every
+//     200th (gpu_device.cpp:16873), and w662/w663/w664 all reach 24-25, i.e.
+//     the cap. The TOC walk is not stalling in the current tree.
+static constexpr bool kRsc5XmemDecode = true;
+
 // F-295: Path A host XMem/raw-LZX decoder (src/xmem_lzx.h), proven byte-exact
 // offline against build/xmem_golden/*.bin for all 4 UI .xsf (no guest VM
 // re-entry, so free of the F-288/290 corrupt-serve context conflict). ON by
@@ -1501,24 +1760,348 @@ static void MclaRecordLastServe(const MclaLastServe &ls) {
     g_lastServeByDest[ls.dest] = ls;
 }
 
+// F-633 (2026-10-01). THE PREDICATE THIS FUNCTION NEVER HAD.
+//
+// MEASURED DEFECT, one line. The pre-edit body was:
+//
+//     if (st) { auto it = g_lastServeBySt.find(st);
+//               if (it != ... && it->second.sbuf) { *out = it->second; return true; } }
+//     if (dest) { ... }                       // <-- UNREACHABLE whenever st matched
+//
+// So when `st` was non-zero and its key was present, `dest` was never consulted at
+// all: the record was returned regardless of which dest it actually described.
+// `MclaLastServe` carries `dest` and `srcPkg` precisely so this can be checked, and
+// before this edit NO CALLER CHECKED EITHER. `MclaRecordLastServe` writes both maps
+// from one struct (`g_lastServeByDest[ls.dest] = ls`), so a dest-keyed lookup is
+// self-authenticating BY CONSTRUCTION -- the key IS the record's dest, and only
+// records with a non-zero dest are stored there at all. The st-keyed map has no such
+// guarantee, which is why only the st branch needed a predicate.
+//
+// THE MEASURED DAMAGE (build/w685.log, 12,433,581 B, sha256 ebe396d0...0d652f52):
+//   08:45:17.092 JOB2-PKG-SERVE #1 dest=B6582280 st=006D8F20 pkg=64CB0000 ...
+//   08:45:17.092 INFLATE-RSC5 #1   ... inPtr=BA24D280 out=262144 outPtr=B6582280
+//   08:45:17.362 INFLATE-RSC5 #114 ... inPtr=BA24D280 out=262144 outPtr=B6282280
+//   08:45:17.375 F517-GUESTOUT dest=B6282280 destPkg=00000000 src=BA24D294
+//                 *destSz(out)=196608 probe=44495500 found_pkg=64CB0000@0 WRONG-CONTAINER
+// One JOB2-PKG-SERVE registered raceeditor's bounce under the inflate-state address
+// st=006D8F20 with ls.dest=B6582280. 270 ms later an inflate asked for the garage's
+// B6282280 while carrying that same st, and the st branch handed it raceeditor's
+// window -- which the guest then inflated into the garage's container. The host's own
+// fill had already verified byte-perfect (08:45:17.359 REVERIFY pct=100
+// first_bad=FFFFFFFF) 1.257 s earlier, so this is a settled overwrite, not a race.
+//
+// WHY THE MINIMAL PREDICATE AND NOT THE PACKAGE ONE.
+//   minimal  (enforced): reject when `dest != 0 && ls.dest != 0 && ls.dest != dest`.
+//   stronger (NOT enforced): also reject when `ls.srcPkg` disagrees with
+//            `PeekPackageForDest(dest)`.
+// The stronger form is measured and then declined, for two reasons that are properties
+// of this data, not preferences:
+//   (1) `ls.srcPkg == 0` for every body serve that did not come from the plaintext
+//       RSC5 table -- the sibling branch at :17746 tests exactly that -- so for those
+//       records there is no package to compare and the test degenerates to "reject
+//       everything", i.e. it would delete the st path wholesale rather than fix a
+//       cross-dest mix-up.
+//   (2) `PeekPackageForDest` reads `g_destPkgOff`, which F-528 records as
+//       last-writer-wins and able to disagree with the gate. `AssignPackageForDest`
+//       REBINDS a dest when PATHB-PENDING is published (:591), when the F-518 read-list
+//       range matches (:626), and on every rscTab guess (:659). So `ls.srcPkg` is the
+//       value at SERVE time and `PeekPackageForDest(dest)` is the value at FIND time;
+//       a legitimate rebound dest would be refused, turning working deliveries into
+//       misses -- precisely the P5 risk. The fix must not be able to invent a refusal
+//       where none is warranted.
+// The package relationship is therefore MEASURED, not asserted: `destPkg=` on the new
+// marker reports it on every rejection, so if the minimal gate proves insufficient the
+// log already answers whether the package agreed. Note also `PeekPackageForDest`
+// returns 0 (not 0xFFFFFFFF) for an unbound dest -- :696-700 is the whole function;
+// it is `MclaUiXsfSlotCov` (:10455-10456) that returns 0xFFFFFFFF. So 0xFFFFFFFF is
+// free to be this file's "no binding" sentinel here, which is also what resolves the
+// ambiguous `destPkg=00000000` on the F517-GUESTOUT row (same peek, printed raw).
+//
+// FALL-THROUGH, NOT REFUSE. On rejection this falls through to the dest-keyed lookup
+// that already exists below. That is safe BY CONSTRUCTION rather than by argument: the
+// dest map is written as `g_lastServeByDest[ls.dest] = ls` and only under `if (ls.dest)`,
+// so any record it yields has `ls.dest == dest` -- the fall-through can never
+// reintroduce a foreign record. Refusing instead would also throw away a legitimate
+// delivery at the second `!served` call site, where the dest map has NOT yet been
+// consulted for this dest, and would push a working dest into MclaForceServePkgForDest
+// (which allocates a new bounce). If neither map has the dest, both options return
+// false and the caller's own pre-existing failure path runs unchanged -- this function
+// writes nothing, and no buffer is allocated, no package re-served, no retry added.
+//
+// ONE RESIDUAL, stated rather than hidden: a record with `ls.dest == 0` cannot
+// contradict the request, so the minimal predicate accepts it and it stays
+// unverified. `ls.dest` is set from `outPtr` at all three JOB2 sites and from the
+// guest register `r6` at :17734, so destless st-keyed records are possible but rare.
+// That is the falsifier for P2: if the predicate fixes nothing, the mixing record is
+// destless, not mismatched, and the SUMMARY's `total=` reading 0 says so (see below).
+//
+// ===========================================================================
+// F-634 (2026-10-01) -- CADENCE FOR THE REJECTION MARKER, AND THE EXACT
+// ACCOUNTING THAT REPLACES ROW-COUNTING AS THE FALSIFIER.
+//
+// THE POISON, MEASURED, NOT ASSERTED. F-633 shipped the marker unconditional
+// and w687.log answered with 1,730,967,144 bytes / 8,924,802 lines, of which
+// 8,649,924 rows (96.9106%) are `XSF-LASTSERVE-MISMATCH` -- 145x the 9,933,256 B
+// of w686.log. That is ledger entry F-054's failure class recurring verbatim: a
+// log dominated by one repeating marker cannot be read, so the measurement it was
+// added to make is destroyed by the marker itself. F-054: 616,824 laundered
+// firings = 66% of w38e.log. Different marker, same arithmetic, same cost.
+//
+// WHY THIS IS NOT "JUST ADD A RATE LIMIT". The reason the marker was
+// unconditional in the first place is a real one: a rate limit is precisely what
+// turned XSF-BIND's "2 rows" into a log filter rather than a count, and a
+// rate-limited row count is not a measurement. That reasoning was CORRECT about
+// the falsifier and it was WRONG about the volume. Both errors are avoided here
+// by separating the two jobs that one unconditioned row was doing at once:
+//
+//   JOB 1 -- verbatim shape. Only needs enough rows to see the field values. This
+//            is what the sample is for, and a sample is honest as long as the log
+//            says out loud that it is one.
+//   JOB 2 -- the exact count, and the exact distinct-value sets. This is what the
+//            falsifier needs, and it CANNOT be sampled. A sampled set is a lie:
+//            "I saw 40 distinct dest values" is not a claim about how many there
+//            are.
+//
+// So JOB 1 becomes a bounded sample on a fixed cadence, and JOB 2 moves to
+// `XSF-LASTSERVE-MISMATCH-SUMMARY`, which reports exact totals and exact set
+// cardinalities. The row keeps its format byte-for-byte; only its cadence is new.
+//
+// THE CADENCE, AND ITS ARITHMETIC AGAINST w687's MEASURED 8,649,924 REJECTIONS:
+//   rows 1..32            -> 32 rows, unfiltered. The first mismatches are always
+//                            visible verbatim, which is the whole point of having a
+//                            head: the first rejection of a boot is the diagnostic
+//                            one, and a 1-in-65536 sample would have hidden it.
+//   then every 65536th    -> floor(8649924 / 65536) = 131 rows
+//   total                 -> 32 + 131 = 163 rows, vs 8,649,924 before: 0.00188%.
+//
+// The stride is 65536, NOT the 4096 first specified for this change, and the
+// deviation is deliberate and checkable. 4096 was a SUBSAMPLE of the same
+// arithmetic: floor(8649924 / 4096) = 2111, so 2111 + 32 = 2143 rows, which is
+// 10.7x the "under ~200 rows per soak" target this same brief sets and which its
+// P1 asserts. The choice is not close and it costs nothing, because the stride
+// does NOT carry the measurement -- the summary does. At 65536 the sample is
+// still 163 verbatim rows of a homogeneous population (w687: 1 distinct ls_size,
+// 1 distinct ls_st, 3 distinct ls_dest), and the exact total and the exact
+// distinct sets are reported independently and exactly. To restore a 4096 stride
+// it is a one-token change to kLsmRowStride and nothing else.
+//
+// `#{}` REMAINS THE EXACT REJECTION ORDINAL, not the row index. Row #65536 is
+// the 65536th rejection, so the gaps between printed ordinals are themselves the
+// evidence that a sample was taken, and a reader can never mistake the last
+// printed `#` for the population size. That is the whole reason the field is
+// named `#` and is left alone.
+//
+// WHY THE SUMMARY CADES ON POWERS OF TWO. The brief requires the summary to
+// appear at least once even if fewer than M rows fire, and to appear on a cadence
+// so a long soak gets several. Powers of two satisfy both with one predicate and
+// give a property nothing else here can: after a TRUNCATED soak, the last
+// summary row's `total=N` is a power of two, so the true final total is provably
+// in [N, 2N) -- a multiplicative bound, not a guess. Against w687 that is 24 rows
+// (2^0..2^23) and the last one bounds the truth to [8388608, 16777216). A reader
+// of a poisoned-or-killed log gets a real interval from one field, which is the
+// requirement that actually matters here since w687 is itself proof the boot can
+// die mid-stream.
+//
+// NO atexit, AND NOT BY OMISSION. Measured, four independent reasons:
+//   (1) `src/app.cpp:30-33` -- `~App()` calls `Shutdown()`, and
+//       `src/app.cpp:173` is `mcla::log::Shutdown()`, which is
+//       `src/common/logging.h:56-58` -> `spdlog::shutdown()`. Static destructors
+//       and atexit handlers run AFTER main's locals are destroyed, so by the time
+//       any exit handler of ours could run, spdlog's sinks are already gone and
+//       the MCLA_LOG_WARN would be silently dropped. An atexit print here is not
+//       merely unreliable, it is ORDERED TO PRODUCE NOTHING.
+//   (2) There is no exit-time logging idiom in this file to reuse: measured 0
+//       hits for `atexit` and 0 for `Shutdown()` in gpu_device.cpp. Introducing
+//       one would be inventing an idiom on the file that the boot is least able
+//       to run.
+//   (3) The boot does not reach that path anyway. In w687.log the literal
+//       `Shutdown complete` occurs 0 times and the file's last line is
+//       `XSF-LASTSERVE-MISMATCH #8649924` at 10:00:45.974 -- the log ends
+//       mid-stream. There is no exit to print from.
+//   (4) An exit-only print would also be the single worst design available: it is
+//       the one row guaranteed to be MISSING from every truncated soak, which is
+//       the only kind of soak an agent most needs to read.
+// The power-of-two summary is the replacement, and it is strictly better than an
+// exit print for the failure this project actually has.
+//
+// THE SETS ARE EXACT, NOT SAMPLED, AND BOUNDED. Four `unordered_set<uint32_t>`
+// under one mutex. Cardinalities (`ndest=`, `nls_dest=`, ...) are the exact
+// population sizes and are NEVER capped -- those are the measurement. The value
+// LISTS are capped at kLsmSetCap entries and always print `*_shown=` beside the
+// exact count, so a capped list can never be read as the whole set. w687 measured
+// 93 distinct dest, under the 256 cap, so at the measured scale the list IS the
+// complete set. The cap exists only to bound the worst case: a pathological boot
+// with 100k distinct dests would otherwise print 900 KB per summary row and
+// re-poison the log this change exists to fix. 256 * 9 B * 64 max summary rows =
+// 147 KB worst case, which cannot become the next 1.73 GB.
+//
+// CONTAINER CHOICE, AND RULE 1b. ONE struct, holding the counter and all four
+// sets, with its own mutex -- not a bare global counter plus a bare global set,
+// because those two would need two locks or a lock-order argument to stay
+// consistent with each other, and the snapshot the summary prints has to be a
+// single consistent view of total + all four sets. It replaces the function-local
+// `s_lsm` atomic outright rather than sitting beside it: the struct's mutex
+// already serialises the counter, so the atomic was redundant, and this change
+// therefore REMOVES one function-local static rather than adding a third. The
+// instance is function-local, exactly as `s_lsm` was. `s_fillPass` is untouched.
+struct MclaLastServeTally {
+  std::mutex mtx;
+  uint64_t total = 0;  // EXACT rejection count, never sampled, never capped
+  uint64_t rows = 0;   // EXACT count of MISMATCH rows actually printed
+  std::unordered_set<uint32_t> dest, lsDest, lsSrcPkg, destPkg, lsSt;
+};
+static constexpr uint32_t kLsmHead = 32;      // first N rejections, unfiltered
+static constexpr uint64_t kLsmRowStride = 65536; // then every Mth
+static constexpr size_t kLsmSetCap = 256;      // value-list cap; counts uncapped
+
+// Render a set as a sorted, capped, comma-separated hex list. Sorted so two runs
+// are diffable; capped so a pathological population cannot re-poison the log.
+// The exact size is reported separately by the caller and is never capped.
+static std::string MclaLsmJoin(const std::unordered_set<uint32_t> &s, size_t *shown) {
+  std::vector<uint32_t> v(s.begin(), s.end());
+  std::sort(v.begin(), v.end());
+  if (v.size() > kLsmSetCap)
+    v.resize(kLsmSetCap);
+  std::string out;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i)
+      out += ',';
+    out += fmt::format("{:08X}", v[i]);
+  }
+  *shown = v.size();
+  return out;
+}
+
 static bool MclaFindLastServe(uint32_t st, uint32_t dest,
                               MclaLastServe *out) {
   if (!out)
     return false;
-  std::lock_guard<std::mutex> lk(g_lastServeMtx);
-  if (st) {
-    auto it = g_lastServeBySt.find(st);
-    if (it != g_lastServeBySt.end() && it->second.sbuf) {
-      *out = it->second;
+  MclaLastServe lsSt, lsDest;
+  bool haveSt = false, haveDest = false;
+  {
+    // Both map reads under the map lock, then RELEASE it: PeekPackageForDest takes
+    // g_destPkgMtx and must not be nested inside g_lastServeMtx.
+    std::lock_guard<std::mutex> lk(g_lastServeMtx);
+    if (st) {
+      auto it = g_lastServeBySt.find(st);
+      if (it != g_lastServeBySt.end() && it->second.sbuf) {
+        lsSt = it->second;
+        haveSt = true;
+      }
+    }
+    if (dest) {
+      auto it = g_lastServeByDest.find(dest);
+      if (it != g_lastServeByDest.end() && it->second.sbuf) {
+        lsDest = it->second;
+        haveDest = true;
+      }
+    }
+  }
+  if (haveSt) {
+    if (dest != 0u && lsSt.dest != 0u && lsSt.dest != dest) {
+      // F-634 (2026-10-01): F-633 shipped this row UNCONDITIONAL, one per
+      // rejection, and it poisoned w687.log (8,649,924 rows = 96.9106% of all
+      // lines). Now rate-limited. The reasoning and the arithmetic are in the
+      // block above; the short form is that the row is a SAMPLE of the field shape
+      // and the SUMMARY below is the exact count, so the falsifier no longer
+      // depends on row-counting. The row's FORMAT is unchanged -- only its cadence
+      // is new, because 244 markers are tracked by tools/soak_census.py.
+      //
+      // `destPkg` is the declined stronger predicate, reported: 0 from
+      // PeekPackageForDest means the dest has no binding at all and prints as
+      // FFFFFFFF so it cannot be confused with a real package.
+      //
+      // `action=blocked`, never WOULD-BLOCK: the gate ships enabled and this tree has
+      // no flag-OFF build of it, so the row reports what the fix DID, not a
+      // counterfactual. WOULD-BLOCK is the label a flag-OFF build would print.
+      const uint32_t destPkg = PeekPackageForDest(dest);
+      const uint32_t destPkgRep = destPkg != 0u ? destPkg : 0xFFFFFFFFu;
+      // Function-local, as `s_lsm` was: one struct, its own mutex, holding the
+      // exact total plus all four exact sets. The atomic `s_lsm` this replaces is
+      // gone -- the mutex already serialises the counter.
+      static MclaLastServeTally s_tally;
+      uint64_t n = 0;
+      bool printRow = false, printSummary = false;
+      {
+        // Snapshot under the lock so `total` and all four set sizes in the summary
+        // are ONE consistent view. Emitting outside it: the log call is the slow
+        // part and must not be serialised across 8.6M rejections.
+        std::lock_guard<std::mutex> lk(s_tally.mtx);
+        n = ++s_tally.total;
+        s_tally.dest.insert(dest);
+        s_tally.lsDest.insert(lsSt.dest);
+        s_tally.lsSrcPkg.insert(lsSt.srcPkg);
+        s_tally.destPkg.insert(destPkgRep);
+        s_tally.lsSt.insert(st);
+        // Head unfiltered, then every kLsmRowStride'th. `n` is the EXACT ordinal,
+        // so the printed `#` is the true rejection index, not a row counter.
+        printRow = (n <= kLsmHead) || ((n % kLsmRowStride) == 0);
+        if (printRow)
+          ++s_tally.rows;
+        // Powers of two: guarantees a summary even if only one rejection ever
+        // fires, and bounds a truncated soak's true total to [N, 2N).
+        printSummary = ((n & (n - 1)) == 0);
+      }
+      if (printRow) {
+        MCLA_LOG_WARN(
+            "XSF-LASTSERVE-MISMATCH #{} dest={:08X} ls_dest={:08X} ls_st={:08X} "
+            "ls_sbuf={:08X} ls_srcPkg={:08X} ls_pos={} ls_size={} destPkg={:08X} "
+            "action=blocked",
+            n, dest, lsSt.dest, st, lsSt.sbuf, lsSt.srcPkg, lsSt.pos, lsSt.size,
+            destPkgRep);
+      }
+      if (printSummary) {
+        // Re-read under the lock: between the increment above and here other
+        // threads may have advanced the tally, and the point of this row is to be
+        // the exact number, not the number as of a few instructions ago.
+        uint64_t total = 0, rows = 0;
+        size_t nDest = 0, nLsDest = 0, nLsSrcPkg = 0, nDestPkg = 0, nLsSt = 0;
+        size_t shownDest = 0, shownLsDest = 0, shownLsSrcPkg = 0, shownDestPkg = 0,
+               shownLsSt = 0;
+        std::string sDest, sLsDest, sLsSrcPkg, sDestPkg, sLsSt;
+        {
+          std::lock_guard<std::mutex> lk(s_tally.mtx);
+          total = s_tally.total;
+          rows = s_tally.rows;
+          // Sizes read INSIDE the lock alongside the lists, so `n_*` and the
+          // printed `[...]` are the same snapshot. Reading them out here would be
+          // a data race on the buckets.
+          nDest = s_tally.dest.size();
+          nLsDest = s_tally.lsDest.size();
+          nLsSrcPkg = s_tally.lsSrcPkg.size();
+          nDestPkg = s_tally.destPkg.size();
+          nLsSt = s_tally.lsSt.size();
+          sDest = MclaLsmJoin(s_tally.dest, &shownDest);
+          sLsDest = MclaLsmJoin(s_tally.lsDest, &shownLsDest);
+          sLsSrcPkg = MclaLsmJoin(s_tally.lsSrcPkg, &shownLsSrcPkg);
+          sDestPkg = MclaLsmJoin(s_tally.destPkg, &shownDestPkg);
+          sLsSt = MclaLsmJoin(s_tally.lsSt, &shownLsSt);
+        }
+        // `total` is the EXACT rejection count and is what the falsifier reads.
+        // The `n_*` counts are the EXACT distinct cardinalities, uncapped; the
+        // `*_shown` fields say how many values the (capped) list actually printed,
+        // so a capped list is never mistakable for the whole set. `stride=`, `head=`
+        // and `cadence=pow2` are stated in the row so a reader never has to infer
+        // the sampling from the source.
+        MCLA_LOG_WARN(
+            "XSF-LASTSERVE-MISMATCH-SUMMARY total={} rows={} head={} stride={} "
+            "cadence=pow2 note=exact-totals-uncapped-lists-capped-at-{} "
+            "ndest={} dest_shown={} dest=[{}] nls_dest={} ls_dest_shown={} "
+            "ls_dest=[{}] nls_srcPkg={} ls_srcPkg_shown={} ls_srcPkg=[{}] "
+            "ndestPkg={} destPkg_shown={} destPkg=[{}] nls_st={} ls_st_shown={} "
+            "ls_st=[{}]",
+            total, rows, kLsmHead, kLsmRowStride, kLsmSetCap, nDest, shownDest,
+            sDest, nLsDest, shownLsDest, sLsDest, nLsSrcPkg, shownLsSrcPkg, sLsSrcPkg,
+            nDestPkg, shownDestPkg, sDestPkg, nLsSt, shownLsSt, sLsSt);
+      }
+    } else {
+      *out = lsSt;
       return true;
     }
   }
-  if (dest) {
-    auto it = g_lastServeByDest.find(dest);
-    if (it != g_lastServeByDest.end() && it->second.sbuf) {
-      *out = it->second;
-      return true;
-    }
+  if (haveDest) {
+    *out = lsDest;
+    return true;
   }
   return false;
 }
@@ -1548,70 +2131,417 @@ static void MclaStampPageCache(uint32_t inner, uint32_t filePos, uint32_t want,
   (void)pathHash;
 }
 
-// Candidate file offsets from a decrypted TOC entry. w18: guest TOC words are
-// NOT always {off,size,uncomp}. Raceeditor/garage entries have a plausible
-// w1 size/hash and a huge w2 (flag bits). Treat w1 as size-or-offset when
-// in-range; also accept low-24-bit packed sizes. Never walk RPF junk —
-// only serve a window whose head is non-poison.
+// ===========================================================================
+// F-657 (2026-09-30) -- THE MEMBER MASKS WIDENED TO THE GUEST'S, AND THE GATE
+// BIT CORRECTED. Every number below is a re-measurement, not a citation of a
+// comment; the instructions were re-read as RAW WORDS (F-023), because this
+// block used to rest on a claim about the toolchain that has since been
+// measured and found INVERTED. See (0) below, which supersedes it.
+//
+// (0) THE TOOLCHAIN IS NOT BROKEN. THE RECORD THAT SAID IT WAS, WAS WRONG.
+// Re-derived independently on 2026-10-05 from raw words only
+// (build/cache/mcla_pe.bin, offset = VA - 0x82000000, big-endian), three
+// independent oracles, in sub_821CCEA0 / sub_821CC1E0:
+//
+//   VA          bytes       MB  ME   ISA    ComputeMask  emitted
+//   0x821CCF7C  55 6A 00 42   1   1   0x40000000  0x40000000  0x40000000
+//   0x821CCF88  55 6B 00 00   0   0   0x80000000  0x80000000  0x80000000
+//   0x821CC26C  55 28 00 BE   2  31   0x3FFFFFFF  0x3FFFFFFF  0x3FFFFFFF
+//   0x821CC1BC  55 6A 0F FE  31  31   0x00000001  0x00000001  0x00000001
+//
+// ISA: MB and ME are bit indices counted from the MSB, so value bit j is
+// retained iff MB <= 31-j <= ME (with the MB>ME wrap). ComputeMask is
+// .research/XenonRecomp/XenonRecomp/recompiler.cpp:5-11 called as :1546 does,
+// ComputeMask(MB+32, ME+32). Emitted literals are the ones in
+// generated/ppc_xenon/ppc_recomp.*.cpp. ALL THREE AGREE ON ALL 1024 (MB,ME)
+// PAIRS, and on all 16 expected values in Xenia's own hand-written
+// .research/xenia/src/xenia/cpu/ppc/testing/instr_rlwinm.s.
+//
+// SO: `& 0x40000000` in the recompiled source really is bit 30. `& 0x7FFFFFFF`
+// really is 31 bits. `& 0x3FFFFFFF` really is 30 bits. `& 0xFF` really is the
+// low byte (`clrlwi` is CLEAR LEFT, keeping the low 32-n bits; n=24 -> 0xFF).
+// The emitters were RIGHT and F-647 named them as the defect. Its own cited
+// word 0x821CCF7C has MB=1, ME=1 -> bit 30 -> 0x40000000; the record's gloss
+// "MB=1, ME=1 = bit 1" (which implies 0x00000002) is the error. That gloss was
+// the load-bearing input to Defects 1 and 3 below.
+//
+// THE TRANSFERABLE LESSON IS NOT ABOUT MASKS. It is that a recorded gloss
+// outranked the bytes and then licensed code: a sentence in a ledger was cited
+// as authority, three readings agreed with each other and disagreed with the
+// image, and the disagreement was resolved in favour of the sentence because
+// it was written down. Three readers agreeing is not evidence against a fourth
+// measurement. When a rule has been used to justify a change, re-derive the
+// rule before reusing it -- and prefer an oracle you did not build from the
+// same assumption.
+//
+// THE DISCRIMINATOR F-647 LACKED. Its control was MB=0 (it read "MB=0, ME=19
+// -> 0xFFFFF000 is correct *necessarily*"). A control is only worth citing if
+// it has POWER TO DISCRIMINATE, and the cheap one to reach for is:
+//
+//   rlwinm r3, r4, 0, 16, 31   on 0x12345678  ->  0x0000FFFF  ->  0x00005678
+//
+// MB=16, ME=31 retains the LOW half; numbering MB from the LSB instead of the
+// MSB would give 0xFFFF0000 and 0x12340000. One register, one mask, no
+// ambiguity -- and Xenia ships that exact case as its own expected value.
+// ⚠️ CORRECTION TO THE STORY THAT CIRCULATED ABOUT F-647's control: an MB=0
+// control is NOT automatically powerless. Measured 2026-10-05 over all 32
+// MB=0 controls against five candidate wrong-models, MB=0, ME=19 distinguishes
+// every one of them (generator 0xFFFFF000; LSB-numbered 0x000FFFFF; swapped
+// operands 0x80001FFF; un-offset 0x00000000; complemented 0x00000FFF). Only
+// the two degenerate endpoints are blind: ME=0 (0x80000000) against the
+// swapped-operand model, and ME=31 (0xFFFFFFFF) against the LSB reading.
+// "Symmetric, therefore powerless" was asserted, never measured. Do not repeat
+// it; measure the control.
+//
+// (1) THE SERVE GATE, Defect 1 -- THIS DEFECT WAS A REAL ONE AGAINST A FAKE
+// CAUSE, AND THE CORRECTION BELOW UNDOES THE CORRECTION. Measured 2026-10-05
+// from raw words, 0x821CC204-0x821CC230, one instruction per row:
+//   0x821CC204  81 4B 00 0C  lwz    r10,12(r11)          r10 = w3
+//   0x821CC208  55 49 00 42  rlwinm r10,r9,0,MB=1,ME=1  & 0x40000000
+//   0x821CC20C  2B 09 00 00  cmpli  cr6,r9,0
+//   0x821CC210  41 9A 00 14  beq    cr6 -> 0x821CC224
+//   0x821CC214  55 4A 00 00  rlwinm r10,r10,0,MB=0,ME=0 & 0x80000000
+//   0x821CC218  2B 0A 00 00  cmpli  cr6,r10,0
+//   0x821CC21C  39 40 00 01  addi   r10,0,1
+//   0x821CC220  41 9A 00 08  beq    cr6 -> 0x821CC228
+//   0x821CC228  55 4A 06 3E  rlwinm r10,r10,0,MB=24,ME=31 & 0x000000FF
+//   0x821CC22C  2B 0A 00 00  cmpli  cr6,r10,0
+//   0x821CC230  41 9A 01 2C  beq    cr6 -> 0x821CC35C   (the BULK w1 path)
+//   0x821CC234  90 BF 00 18  stw    r5,24(r31)          fall through ->
+//     the 4096-byte-chunked w3 path, which fatals with 'Fatal disc error'
+//     (lis aFatalDiscError at 0x821CC244).
+// So the FATAL condition is BIT 30 SET AND BIT 31 CLEAR -- the two masks are
+// 0x40000000 and 0x80000000 -- and the low bits are not in it at all.
+// ⚠️ THIS IS THE PREDICTION THAT WAS WRONG, NOT THE PREDICTION THAT WAS RIGHT.
+// The text this replaces read `t1 = w3 & 0x00000002`, `t2 = w3 & 0x00000001`,
+// `r10 &= 0xFF000000`, "so the FATAL condition is w3 & 0x3 == 2", and called the
+// host's pre-existing bit30-set/bit31-clear test "the two-bits-higher version of
+// the same misread". Every one of those three mask VALUES came from numbering MB
+// from the LSB (see (0)). Under the ISA they are 0x40000000, 0x80000000 and
+// 0x000000FF. The host's original test was RIGHT, it was called a defect, and
+// the "corrected" predicate replaced it with two low bits the guest never tests.
+// Acting on that is what retired the mitigation for ~93% of records and fired
+// the guest's own fatal (measured, w676, in the record's own Defect 1 history).
+// The conclusion "the old test is the misread" is WITHDRAWN; the observation
+// that the old test is load-bearing is not.
+//
+// (2) THE MEMBER OFFSET, Defect 2. 0x821CC04C `55 5F 00 7E` MB=1 ME=31 and
+// 0x821CC050 `55 6A 00 BE` MB=2 ME=31 are the guest's (lo, cnt) pair. The
+// 31-bit read of w2 is what a MEMBER's offset gets. The host read 22 bits
+// (0x3FFFFF). Measured over the 8,192 TOCWALK-LEAF rows of w675.log:
+//   w2 & 0x3FFFFF != w2            on 7,822 / 8,192   (95.5%)
+//   distinct offsets, 22-bit mask      5,766 / 8,192  (2,426 members ALIAS
+//                                       onto another member's byte range --
+//                                       impossible for distinct members)
+//   distinct offsets, 31-bit mask      8,192 / 8,192  (0 collisions)
+//   22-bit offsets landing in a constant-byte hole   301 ; 31-bit  0
+// The single member the old mask mangled is present in that run:
+//   w2=0x00448000 -> 22-bit 0x00048000 (294,912) / 31-bit 0x00448000
+//   (4,489,216), w3=0x400289B3, w1=294,912. So the truncation moved that
+// member by 4,194,304 bytes, and the number 294,912 that came out the other
+// end is w1, not the offset -- the collision that made it look like an
+// index.
+//
+// (3) THE MEMBER STORED LENGTH, Defect 3. 0x821CC26C reads w3 with MB=2,
+// ME=31, i.e. 30 bits. The host read 24 (0x00FFFFFF). The 30-bit read is
+// adopted here because it is what BOTH the running guest code and the raw
+// encoding agree on in WIDTH, and because 24 vs 30 is provably harmless on
+// this population: bits 24..29 of w3 are ZERO on all 8,192 rows
+// (`w3&0x00FFFFFF != w3` and `w3&0x3FFFFFFF != w3` are the same 6,573 rows --
+// the only difference the 24-bit mask loses is bits 24-29). NOT WIDENED
+// FURTHER: the sentence this replaces read "the raw MB/ME would give
+// 0xFFFFFFFC (bits 2..31, top bit kept), and that reading is REJECTED". Both
+// halves are withdrawn. 0xFFFFFFFC is the LSB-numbered reading; the ISA gives
+// 0x3FFFFFFF for MB=2, ME=31 (measured, (0) table), which is the value
+// already adopted here. So there was never a wider candidate to reject, and
+// the offline check that "rejected" it was checking an artefact of the same
+// misreading. The 30-bit width is now established by the raw word rather than
+// defended against a straw man. See `kTocMaskWidthUnresolved` below, whose
+// premise this same correction removes; do not "finish" it without a fresh
+// measurement.
+//
+// (4) THE TWO BASES ARE NOT APPLIED, and that is now MEASURED rather than
+// assumed. The guest's read offset is not w2: at 0x821CC38C it is
+// `ld r9, 24(r30)` -- a 64-bit load of the pair at dev+0x18/dev+0x1C -- added
+// to ([dev+8] & ~1), plus the stream's running position from [stream+4]
+// (0x821CC380/0x821CC3A0/0x821CC3A4; the 4096-chunked path at 0x821CC288 /
+// 0x821CC294 / 0x821CC2AC is the same sum). Those two words are written by
+// the guest itself at 0x821CC234/0x821CC23C (`stw r5,24(r31)` /
+// `stw r27,28(r31)`, i.e. this call's arg2 and arg3). The host adds NEITHER:
+// MclaTocServeMember below uses rec.off as an ABSOLUTE file offset. That is
+// not changed here -- the six-step corroboration reads a member's own bytes
+// at exactly that offset and the measured members decode (see the Shadows
+// triple restated below), so for the file-offset interpretation the bases are
+// not required. What is NOT established is what the two words CONTAIN, and
+// that is now published per object by TOCWALK-SUMMARY as `base24=`/`base28=`
+// so the next run measures it instead of inheriting an assumption. Do not
+// fold them into an offset until a run has printed a non-zero pair.
+// ===========================================================================
+
+// w2, the member's archive offset: the guest's 31-bit read.
+static constexpr uint32_t kTocMemberOffMask = 0x7FFFFFFFu;
+// w3, the member's stored length: the guest's 30-bit read.
+static constexpr uint32_t kTocMemberStoredMask = 0x3FFFFFFFu;
+// ⚠️ REPORTED, NOT SILENTLY CHANGED (2026-10-05) -- THESE TWO CONSTANTS CARRY THE
+// INVERTED GLOSS AND ARE EXECUTABLE CODE. The comment this replaces read:
+// "The serve predicate's first bit, from 0x821CCF7C / 0x821CC208 (MB=1, ME=1)"
+// / "NOT bit 31: the raw word is `55 6B 00 00`, ME=0", and concluded the guest
+// "reaches its fatal/chunked block iff (w3 & (bit1|bit0)) == bit1" while calling
+// the host's bit30-set/bit31-clear test "this predicate read two bits too high".
+// MEASURED 2026-10-05 FROM RAW WORDS, THE OPPOSITE IS TRUE:
+//   0x821CCF7C / 0x821CC208  MB=1, ME=1  ->  mask 0x40000000  (BIT 30)
+//   0x821CCF88 / 0x821CC214  MB=0, ME=0  ->  mask 0x80000000  (BIT 31)
+// so the guest's fatal/chunked condition IS bit30-set-and-bit31-clear -- the
+// host's ORIGINAL test, the one this comment demoted. 0x2/0x1 are the
+// LSB-numbered reading; "NOT bit 31" is exactly backwards, since MB=0, ME=0 is
+// the single top bit, 0x80000000. See the (0) and (1) blocks above.
+// NOT CHANGED HERE ON PURPOSE. This is a value change to executable code, not a
+// comment fix, so it is the owning session's decision and it needs a soak, not
+// a diff review. What IS already true and matters: the ONLY live use of these
+// two constants is report-only -- MclaTocServeGateFatal below is called at the
+// two print sites (the `gate=` column and `serveGateFatal=`) and gates nothing.
+// The load-bearing gate is the bit30/bit31 test in sub_821CC1E0, which is still
+// the byte-exact reverted predicate. So the inverted reading is currently
+// REACHABLE-ONLY-THROUGH-A-LOG-COLUMN, and correcting these two literals cannot
+// move a marker count or a serve decision on its own.
+static constexpr uint32_t kTocServeGateBit1 = 0x00000002u;
+static constexpr uint32_t kTocServeGateBit0 = 0x00000001u;
+// The guest reaches its fatal/chunked block iff (w3 & (bit1|bit0)) == bit1.
+// The host's old test (bit30 set, bit31 clear) is this predicate read two bits
+// too high; it is kept as a NAMED, REPORTED measurement and is no longer the
+// gate. See the `openGateBit30=` column on TOC76-XSF, which still prints it.
+// ⚠️ THE SENTENCE ABOVE IS WITHDRAWN; the block above it says why, with the
+// measurement. Keep the function and the two literals; do not re-derive their
+// meaning from this paragraph.
+static inline bool MclaTocServeGateFatal(uint32_t w3) {
+  return (w3 & (kTocServeGateBit1 | kTocServeGateBit0)) == kTocServeGateBit1;
+}
+
+// ===========================================================================
+// F-680 (2026-10-01) -- THE TOC ARRAY BASE IS RESOLVED AT RUNTIME, AND A
+// CAPTURE THAT IS ALL ZEROS IS NO LONGER "okread=1".
+// INSTRUMENTATION ONLY. Nothing below is on a serve path: it reads guest
+// memory, writes files, and logs. No `proved`/`listProved`, no span
+// registration, no gate, and not one byte the guest reads or writes is
+// affected.
+// ===========================================================================
+//
+// WHY. Three captures were anchored on the LITERAL 0xC60B7780. That address
+// was correct only in the 09-24 soaks, and it is the ROOT TOC ARRAY BASE,
+// which MOVES. Measured from the `inner=` field of `TOC76 #1` over every
+// build/w*.log in the tree (re-measured 10-01, not taken from any doc):
+//
+//   inner=        soaks
+//   C60B7780      209 logs  (w99..w405)  <-- the hard-coded literal
+//   C60B7700      127 logs  (w271..w405)
+//   C64B7780       18 logs  (w442..w622)
+//   C64B7700      179 logs  (w406..w654)
+//   C64B7E00        6 logs  (w658..w664)
+//   B9038E00        7 logs  (w666..w672)
+//   B733D280        1 log   (w673)
+//   B733C280        2 logs  (w674..w675)
+//   B733B280        5 logs  (w676..w680)  <-- current
+//
+// NINE distinct bases, and the literal is the OLDEST one. So the three dumps
+// were reading whatever now lives at 0xC60B7780 and writing it out as "the
+// parsed TOC". Measured consequence, build/toc_parsed.bin: 382,976 bytes,
+// nonzero = 0. (build/toc_decrypted.bin is 382,976 B at 381,426 nonzero, but
+// it is a HASH CORPUS, not a name table -- `corpus=38170 name hashes` -- and it
+// is stale anyway, mtime 09-26, not 09-30.)
+//
+// WHY IT FAILED SILENTLY. The old success flag proved only that `ReadBytes`
+// returned true -- i.e. that the address was READABLE. A readable address full
+// of zeros is still readable, so the row read
+// `TOC-DUMP2 parsed wrote=1 okread=1` while 382,976 bytes of unrelated guest
+// memory went to disk. `okread` was never evidence of a TOC. Hence the
+// `nonzero=` column below, which is the thing that can falsify it.
+//
+// THE SOURCE OF TRUTH, and why it is `obj+8` and not "dev+8". The guest reads
+// its root array base at generated/ppc_xenon/ppc_recomp.17.cpp:2823
+// (`node = [dev+8]`), where that function's `dev` is the PACKFILE OBJECT
+// (sub_821CBFC0's r3). sub_821CBFC0 already reads it -- that is the `inner=`
+// on every TOC76 row -- and `MclaTocWalkArray` describes the same array as
+// "one flat 16-byte-stride array, hash-sorted on word0". So the base is
+// published by the one function that has it, and every dump reads it from
+// there.
+//
+// CAUTION, because `[dev+8]` is an OVERLOADED spelling in this file: the
+// `ReadU32BE(dev + 8, &need)` at the F-603 fence census is a DIFFERENT
+// structure's frame need (frame+8), not the TOC base. Only
+// sub_821CBFC0's `obj+8` is the array base. Do not "simplify" one into the
+// other.
+
+// The guest's root TOC array base, 0 until a reader has published one. NEVER a
+// default and never a fallback literal: 0 means "not known yet", and a dump
+// gated on 0 is a no-op that says so, which is strictly better than dumping
+// the wrong address.
+static std::atomic<uint32_t> g_tocArrayBase{0};
+
+// F-680: one writer (sub_821CBFC0, from [obj+8]). 0 is never stored, so
+// "published" and "not yet" cannot be confused.
+static inline void MclaTocPublishArrayBase(uint32_t base) {
+  if (base == 0) return;
+  g_tocArrayBase.store(base, std::memory_order_release);
+}
+
+// Where a capture is written. Anchored to the EXECUTABLE's directory, and the
+// choice is deliberate (the bug being fixed): the three writers used to
+// `fopen_s(&fp, "toc_parsed.bin", "wb")` with a BARE RELATIVE name, so the
+// file landed in the process CWD. Every capture in the tree today is in
+// build/ (measured: all four of toc_parsed.bin, toc_decrypted.bin,
+// early_decrypted.bin, d0_parsed.bin are under build/, none in the repo root)
+// and the exe is build/mcla.exe -- so CWD == exe dir today and this is
+// behaviour-preserving. It becomes correct for the case the bare name got
+// wrong: PROGRAM_GUIDE.md:50 launches `./build/mcla.exe` from the REPO ROOT,
+// and a run launched that way put an untracked, NOT-gitignored capture in the
+// root (.gitignore:2 ignores /build/ only), which is exactly the root junk
+// AGENTS.md polices. If the exe path cannot be resolved we fall back to the
+// bare leaf, so this can never regress against today's behaviour.
+static std::string MclaTocCapturePath(const char* leaf) {
+  char exe[MAX_PATH] = {0};
+  const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return std::string(leaf);
+  std::string s(exe, n);
+  const size_t cut = s.find_last_of("\\/");
+  if (cut == std::string::npos) return std::string(leaf);
+  s.resize(cut + 1);
+  s += leaf;
+  return s;
+}
+
+struct MclaTocDumpResult {
+  bool wrote = false;    // every byte reached the file
+  bool okRead = false;   // ReadBytes succeeded -- proves READABLE, nothing more
+  uint32_t nonzero = 0;  // the assertion: 0 means the region was not a table
+  uint32_t len = 0;
+  std::string path;      // resolved, so the log says where it really went
+};
+
+// Read `len` bytes of guest memory at `region` and write them to `leaf` beside
+// the executable, COUNTING THE NONZERO BYTES on the way. `okRead` is retained
+// verbatim as a measurement other text cites, but it is no longer load-bearing
+// for success: `wrote` is now `fwrite(...) == len` rather than "we called
+// fwrite", and `nonzero` is what says whether the region held a table.
+static MclaTocDumpResult MclaTocWriteCapture(const char* leaf, uint32_t region,
+                                             uint32_t len) {
+  MclaTocDumpResult r;
+  r.len = len;
+  r.path = MclaTocCapturePath(leaf);
+  if (region == 0 || len == 0) return r;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  std::vector<uint8_t> tmp(len);
+  bool okAll = true;
+  for (uint32_t o = 0; o < len; o += 4096u) {
+    const uint32_t piece = (len - o < 4096u) ? (len - o) : 4096u;
+    if (!mem.ReadBytes(region + o, reinterpret_cast<char*>(&tmp[o]), piece)) {
+      okAll = false;
+      MCLA_LOG_WARN("TOC-CAPTURE {} short read at +{} region={:08X}", leaf, o,
+                    region);
+      break;
+    }
+  }
+  r.okRead = okAll;
+  if (!okAll) return r;
+  for (uint32_t i = 0; i < len; ++i)
+    if (tmp[i]) ++r.nonzero;
+  FILE* fp = nullptr;
+  if (fopen_s(&fp, r.path.c_str(), "wb") == 0 && fp != nullptr) {
+    r.wrote = fwrite(tmp.data(), 1, len, fp) == len;
+    fclose(fp);
+  }
+  return r;
+}
+
+// The new evidence, on its OWN marker so no existing reader of TOC-DUMP /
+// TOC-DUMP2 / TOC-DUMP3 loses a field it already parses. `allZero=1` is the
+// old silent failure, now named: okRead=1, wrote=1, and a file of nothing.
+static void MclaTocLogCapture(const char* marker, const char* leaf,
+                              const MclaTocDumpResult &r, uint32_t region) {
+  const uint32_t pct = r.len ? (r.nonzero * 100u / r.len) : 0u;
+  MCLA_LOG_WARN("{} file='{}' region={:08X} len={} wrote={} okread={} "
+                "nonzero={} ({:3}%) allZero={}",
+                marker, leaf, region, r.len, r.wrote ? 1 : 0, r.okRead ? 1 : 0,
+                r.nonzero, pct, (r.okRead && r.nonzero == 0u) ? 1 : 0);
+}
+// UNRESOLVED, deliberately left as a fact and not a constant. ⚠️ 2026-10-05: the
+// REASON this flag exists is the one claim the (0) block above retracts. It
+// read: "the raw mb/me at 0x821CC04C/0x821CC050/0x821CC26C are 1/31, 2/31 and
+// 2/31, which is 0xFFFFFFFE and 0xFFFFFFFC -- 31 and 30 bits counted from the
+// LOW end", and it left the width unre-established because the guest's own
+// emitted constants appeared to DISAGREE with the raw encoding. Measured from
+// the raw words (0) table: MB=1,ME=31 is 0x7FFFFFFF and MB=2,ME=31 is
+// 0x3FFFFFFF -- which are exactly kTocMemberOffMask and kTocMemberStoredMask.
+// There is no disagreement and no competing width; 0xFFFFFFFE/0xFFFFFFFC were
+// never encodings of these instructions. The flag is left as-is because it is
+// executable code and this change is comments only, but its premise is dead:
+// the widths ARE re-established, by the raw words. Refuse to narrow either
+// mask on the old reasoning; on the ISA reading there is nothing to narrow.
+static constexpr bool kTocMaskWidthUnresolved = true;
+
+// F-632: the ONE member window a decrypted TOC record describes, and the
+// function that used to guess it is gone.
+//
+// THE THREE FIELDS, MEASURED (docs/ROOT_CAUSE_VALIDATION.md F-632), from the
+// guest's OWN decrypted TOC over all 377 distinct members w653 published
+// (`TOC76-XSF`), and re-verified offline against build/game_data/xarchive_cache.rpf
+// with a raw-inflate probe:
+//   w1           logical size  -- the length the guest must SEE
+//   w2 & 0x7FFFFF file offset  -- where the member's stored bytes live (F-657)
+//   w3 & 0x3FFFFF stored size  -- how many compressed bytes that is (F-657)
+// 364 of 377 satisfy inflate(bytes at w2) == w1 exactly; 6 have stored == w1
+// (stored UNCOMPRESSED, serve verbatim); 7 are the UI .xsf/.xtd XCompress/LZX
+// containers, a different codec this transform does not own. The three nested
+// packfiles are the sharpest confirmation: w3&0x3FFFFF is 0x503CF / 0x82186 /
+// 0x289B3 and the DEFLATE stream at w2 (0x3F0000 / 0x368000 / 0x448000) is
+// measured at 328,655 / 532,870 / 166,323 bytes, inflating to w1 = 425,984 /
+// 720,896 / 294,912 bytes each beginning `52 50 46 33`. 370 of 377 are decided
+// with no name table at all.
+//
+// THE BUG THIS REPLACES. The w18 candidate enumeration below treated w1 as a
+// candidate OFFSET ("treat w1 as size-or-offset when in-range") and emitted up
+// to five windows, the first of which was w1. w1 is the SIZE. So every serve
+// read compressed bytes from the wrong place and handed the guest a body that
+// began with raw DEFLATE magic (XSF-HOSTSERVE off=00068000 head=6655A8B1) where
+// a nested RPF3 image belonged. The consequences ran in order: the guest's inner
+// RPF3 header parse failed -> its inner TOC decrypt never ran ->
+// `sub_821CFF40(&it,"Vehicle",0)` found nothing -> [0x828CD0AC] stayed 0 ->
+// `sub_82397060` ran its zero-count store storm (what kF432SkipZeroCountGrow
+// exists to skip) -> F442-SECTION printed 14 rows, all hits=0.
+//
+// There is deliberately no second candidate and no fallback: "try both" is what
+// made this undebuggable, because a serve at a wrong offset is indistinguishable
+// from a serve at the right one unless the head is checked, and a fallback
+// restores exactly that ambiguity. One record, one window.
+//
+// Range check: the offset is bounded by the packfile, not by a guess. The three
+// nested members sit at 0x3F0000/0x368000/0x448000, but the cache packfile is
+// 0x7F008000 bytes and w653 also publishes members above 0x0F000000, so the old
+// 0x0F000000 "plausible RPF cursor" ceiling would reject legitimate windows. The
+// only bound that means something is "the window lies inside the file", and the
+// serve checks that against the VFS's own size where the handle is open.
+struct MclaXsfWindow {
+  uint32_t off = 0;      // w2 & kTocMemberOffMask (31 bits, F-657)
+  uint32_t stored = 0;   // w3 & kTocMemberStoredMask  (on-disk length, 30 bits)
+  uint32_t logical = 0;  // w1            (length the guest must see)
+};
+
 static int XsfOffsetCandidates(uint32_t w0, uint32_t w1, uint32_t w2,
-                               uint32_t w3, uint32_t *offs, uint32_t *szs,
-                               int maxOut) {
-  int n = 0;
-  (void)w0;
-  (void)w3;
-  const uint32_t sizeA = w2 & 0x7FFFFFFFu;
-  const uint32_t sizeLow = w2 & 0x00FFFFFFu;
-  const uint32_t sizeB = w3 & 0x7FFFFFFFu;
-  const uint32_t w1m = w1 & 0x0FFFFFFFu; // strip flag bits
-  // Primary: w1 as data_offset when it looks like an RPF data cursor.
-  if (w1m > 0x1000u && w1m < 0x0F000000u) {
-    uint32_t sz = sizeLow;
-    if (sz < 0x40u || sz > 0x400000u)
-      sz = (w1 > 0x40u && w1 < 0x400000u) ? w1 : 0x8000u;
-    offs[n] = w1m;
-    szs[n] = sz;
-    ++n;
-  }
-  // w18 list-form: w1 is SIZE (small), w2/w3 carry flag|offset. Use
-  // low-24 of w2/w3 as file offset when it is a plausible RPF cursor.
-  if (n < maxOut && w1 > 0x20u && w1 < 0x100000u) {
-    const uint32_t off2 = sizeLow; // w2 & 0xFFFFFF
-    if (off2 > 0x1000u && off2 < 0x0F000000u) {
-      offs[n] = off2;
-      szs[n] = w1;
-      ++n;
-    }
-    if (n < maxOut) {
-      const uint32_t off3 = w3 & 0x0FFFFFFFu;
-      if (off3 > 0x1000u && off3 < 0x0F000000u && off3 != off2) {
-        offs[n] = off3;
-        szs[n] = w1;
-        ++n;
-      }
-    }
-  }
-  // Secondary: classic {offset=w1, size=w2} when both plausible.
-  if (n < maxOut && w1 > 0x1000u && w1 < 0x80000000u && sizeA > 0x40u &&
-      sizeA < 0x4000000u && w1 != w1m) {
-    offs[n] = w1;
-    szs[n] = sizeA;
-    ++n;
-  }
-  if (n < maxOut && w2 > 0x800u && w2 < 0x80000000u && sizeB > 0x40u &&
-      sizeB < 0x4000000u) {
-    offs[n] = w2;
-    szs[n] = sizeB;
-    ++n;
-  }
-  if (n < maxOut && sizeA > 0x800u && sizeA < 0x2000000u) {
-    const uint32_t packed = ((w2 & 0x7FFFFF00u) >> 11) & 0x1FFFFFu;
-    if (packed > 0x10u) {
-      offs[n] = packed << 11;
-      szs[n] = sizeB ? sizeB : sizeA;
-      ++n;
-    }
-  }
-  return n;
+                               uint32_t w3, MclaXsfWindow *out, int maxOut) {
+  (void)w0;  // the record's leaf/parent hash; it names nothing about geometry
+  if (out == nullptr || maxOut <= 0)
+    return 0;
+  MclaXsfWindow win;
+  win.logical = w1;
+  win.off = w2 & kTocMemberOffMask;
+  win.stored = w3 & kTocMemberStoredMask;
+  // A record the guest never filled (the census prints zeros=1 for those) has no
+  // window. A stored length of zero is the same statement from w3.
+  if (win.off == 0 || win.logical == 0 || win.stored == 0)
+    return 0;
+  if (win.stored > 0x1000000u || win.logical > 0x1000000u)
+    return 0;
+  out[0] = win;
+  return 1;
 }
 
 // Host-serve a UI body from xarchive_cache.rpf using cached TOC words.
@@ -1629,7 +2559,12 @@ static int XsfOffsetCandidates(uint32_t w0, uint32_t w1, uint32_t w2,
 // expansion is applied where the archive bytes enter guest memory —
 // RpfVirtualFileSystem::ReadFileAt. Without it the loader's line reader
 // (sub_82188E50) is handed binary and yields no name (F-104).
-static bool MclaListMemberPath(const char *path) {
+// T41.3p (F-105): the six *.list name-list members -- the shape a
+// raw-DEFLATE member takes. The predicate is no longer a gate on serving, only
+// a gate on the TOC census in sub_821CBFC0, so every `.list` member registers
+// its own (offset, stored, logical) triple instead of the six the span table
+// hardlists.
+[[maybe_unused]] static bool MclaListMemberPath(const char *path) {
   if (path == nullptr)
     return false;
   const size_t n = std::strlen(path);
@@ -1643,26 +2578,44 @@ static bool MclaListMemberPath(const char *path) {
 // start ~59 s before the first list query (`w95`: first pump read 03:53:54.409,
 // first mark 03:54:53.082), so the spans must be known at the first I/O submit.
 //
-// These twelve numbers are not host guesses: each is a `[entry+4]/[entry+8]`
-// pair the guest published from its OWN decrypted TOC (`w74`/`w95`
+// These numbers are not host guesses: each `off` is the record's own `[entry+8]`
+// (F-632: w2, now read 31 bits) and each `logical` is its `[entry+4]` (F-632: w1),
+// published by the GUEST from its OWN decrypted TOC (`w74`/`w95`
 // TOC76-XSF/LAYOUT lines: e.g. `[0DB1C876 00000104 001DD11C 4000007E]`), and
 // every one was re-derived independently by the raw-DEFLATE decode of F-105
 // (all six expand to name lists of exactly this length). The general key is the
 // leaf hash — all five `preload.list` records share `0DB1C876`, and
 // `globaltex.list` is `3D9B8154` — so a TOC scan could replace this table once
-// the decrypted table is reachable before the first read.
+// the decrypted table is reachable before the first read. F-632's census
+// registration in sub_821CBFC0 now does exactly that, per member, at run time.
+//
+// F-632 (2026-09-28): `stored` is the THIRD field of the record and this table
+// did not have it. w3 of each record is 0x4000007E / 0x400001C4 / 0x400001CC /
+// 0x40000084 / 0x400000BC / 0x400000EC, and bit 30 is the open-gate flag, so
+// w3 & 0x3FFFFF is the on-disk length: 126 / 452 / 460 / 132 / 188 / 236. The
+// registration used to hand the LOGICAL length (260 / 1246 / 1108 / 496 / 368 /
+// 575) to MarkMemberExpanded as if it were the stored length. That survived only
+// because of F-105's "in == out": these six are stored raw and the substitute it
+// produced was the right length, while every member whose stored and logical
+// lengths DIFFER was refused outright (RpfVirtualFileSystem::ResolveSpan logs
+// MEMBER-EXPAND-SIZE for those, not MEMBER-EXPAND). The stored values below are
+// re-measured offline against build/game_data/xarchive_cache.rpf with a raw-inflate
+// probe: the 126 bytes at 0x001DD11C yield exactly 260, the 452 at 0x001F41FB
+// exactly 1246, the 460 at 0x0027F1AF exactly 1108, the 132 at 0x002DB9A1
+// exactly 496, the 188 at 0x00304E12 exactly 368, the 236 at 0x000D0000 exactly 575.
 struct MclaListMemberSpan {
   const char *path;
-  uint32_t off;
-  uint32_t size;
+  uint32_t off;      // w2 & kTocMemberOffMask (31 bits, F-657)
+  uint32_t stored;   // w3 & kTocMemberStoredMask (30 bits, F-657)
+  uint32_t logical;  // w1
 };
 constexpr MclaListMemberSpan kListMemberSpans[] = {
-    {"shaders/ui/preload.list", 0x001DD11Cu, 260u},
-    {"shaders/city/preload.list", 0x001F41FBu, 1246u},
-    {"shaders/cars/preload.list", 0x0027F1AFu, 1108u},
-    {"shaders/characters/preload.list", 0x002DB9A1u, 496u},
-    {"shaders/effects/preload.list", 0x00304E12u, 368u},
-    {"textures/global/cars/globaltex.list", 0x000D0000u, 575u},
+    {"shaders/ui/preload.list", 0x001DD11Cu, 126u, 260u},
+    {"shaders/city/preload.list", 0x001F41FBu, 452u, 1246u},
+    {"shaders/cars/preload.list", 0x0027F1AFu, 460u, 1108u},
+    {"shaders/characters/preload.list", 0x002DB9A1u, 132u, 496u},
+    {"shaders/effects/preload.list", 0x00304E12u, 188u, 368u},
+    {"textures/global/cars/globaltex.list", 0x000D0000u, 236u, 575u},
 };
 
 // ON IS THE COMMITTED DEFAULT since F-111: it is what clears B2's gate
@@ -1688,49 +2641,353 @@ constexpr bool kExpandListInArchive = true;
 // stores 255 deflate bytes and inflates to exactly the 0x1E0 the TOC declares,
 // beginning "Version: 103\r\nshadinggroup {". `Version:` is the token
 // sub_82611018 tests first and 103 is the constant it compares, so the format is
-// settled, not guessed. Unlike the .list spans (in == out, F-105) the stored and
-// logical lengths differ here, which is why the span is registered with the TOC
-// size - the length ApplyExpandedSpans must produce - exactly as the lazy TOC76
-// site already does. Excluded: the two records whose offset word carries bit31
-// (0x7F000EBA, 0x7EA85817); at offset & 0x3FFFFFFF they do not inflate, so their
+// settled, not guessed. F-632 (2026-09-28) corrects the sentence this comment
+// used to end on: it said the .list spans were "in == out" so only the
+// entity.type members had stored != logical. That was the source of the mistake
+// -- ALL of them differ, and the table below had only ONE length per member, so
+// it could not have registered a stored length at all. See the note on the
+// table. Excluded: the two records whose offset word carries bit31
+// (0x7F000EBA, 0x7EA85817); at offset & 0x7FFFFFFF they do not inflate, so their
 // offset encoding is still unknown.
 constexpr bool kExpandTypeMembersInArchive = true;
 struct MclaTypeMemberSpan {
-  uint32_t off;
-  uint32_t logical;
+  uint32_t off;      // w2 & kTocMemberOffMask (31 bits, F-657)
+  uint32_t stored;   // w3 & kTocMemberStoredMask (30 bits, F-657)
+  uint32_t logical;  // w1
 };
+// F-632 (2026-09-28): `stored` added, and it is NOT 255 for all ten. Only
+// 0x0035CA43 is 255 -- that is F-149's own measurement in the comment above. The
+// other nine were measured in the same offline probe that re-measured the .list
+// spans: each `off` inflates, from that exact `off`, to exactly the declared
+// `logical` length.
+//   0x0032C000 256->485  0x0032C729 236->482  0x0032E767 246->481
+//   0x0035CA43 255->480  0x0127E226 248->489  0x0127EBB1 259->492
+//   0x0127FCB8 312->648  0x03F0C65A 293->555  0x055233B5 286->542
+//   0x055301D0 313->549
+// Ten of ten begin "Version: 103", so the family is uniform; the STORED LENGTHS
+// are not, and a single shared 255 would have been a guess dressed as a
+// measurement.
 constexpr MclaTypeMemberSpan kTypeMemberSpans[] = {
-    {0x0032C000u, 0x1E5u}, {0x0032C729u, 0x1E2u}, {0x0032E767u, 0x1E1u},
-    {0x0035CA43u, 0x1E0u}, {0x0127E226u, 0x1E9u}, {0x0127EBB1u, 0x1ECu},
-    {0x0127FCB8u, 0x288u}, {0x03F0C65Au, 0x22Bu}, {0x055233B5u, 0x21Eu},
-    {0x055301D0u, 0x225u},
+    {0x0032C000u, 256u, 0x1E5u}, {0x0032C729u, 236u, 0x1E2u},
+    {0x0032E767u, 246u, 0x1E1u}, {0x0035CA43u, 255u, 0x1E0u},
+    {0x0127E226u, 248u, 0x1E9u}, {0x0127EBB1u, 259u, 0x1ECu},
+    {0x0127FCB8u, 312u, 0x288u}, {0x03F0C65Au, 293u, 0x22Bu},
+    {0x055233B5u, 286u, 0x21Eu}, {0x055301D0u, 313u, 0x225u},
 };
+
+// W64 (2026-09-30): forward declaration -- the definition, with the evidence
+// behind it, sits next to HostServeUiBody below.
+static void MclaNoteRegisteredSpan(const char *path, uint32_t off,
+                                   uint32_t stored, uint32_t logical);
 
 void MclaMarkKnownListMembers() {
   if (!kExpandListInArchive)
     return;
+  // F-632: the packfile argument is `xarchive_cache.rpf` because that is the
+  // archive these spans live in -- the same spelling HostServeUiBody opens, and
+  // the same spelling RpfVirtualFileSystem::PackKeyOf derives from the physical
+  // path, so a span matches a read instead of matching "any packfile". The old
+  // two-argument MarkMemberExpanded passes an EMPTY packfile, which also matched
+  // every read; naming it costs nothing and is one fewer coincidence.
   for (const auto &m : kListMemberSpans) {
-    mcla::vfs::MarkMemberExpanded(m.off, m.size);
-    MCLA_LOG_WARN("MEMBER-EXPAND-MARK-EARLY path='{}' off={:08X} stored={}",
-                  m.path, m.off, m.size);
+    mcla::vfs::MarkMemberExpandedIn("xarchive_cache.rpf", m.off, m.stored,
+                                    m.logical);
+    MclaNoteRegisteredSpan(m.path, m.off, m.stored, m.logical);
+    MCLA_LOG_WARN("MEMBER-EXPAND-MARK-EARLY path='{}' off={:08X} stored={} "
+                  "logical={}",
+                  m.path, m.off, m.stored, m.logical);
   }
   if (kExpandTypeMembersInArchive) {
     for (const auto &m : kTypeMemberSpans) {
-      mcla::vfs::MarkMemberExpanded(m.off, m.logical);
-      MCLA_LOG_WARN("MEMBER-EXPAND-MARK-TYPE off={:08X} logical={}", m.off,
-                    m.logical);
+      mcla::vfs::MarkMemberExpandedIn("xarchive_cache.rpf", m.off, m.stored,
+                                      m.logical);
+      MCLA_LOG_WARN("MEMBER-EXPAND-MARK-TYPE off={:08X} stored={} logical={}",
+                    m.off, m.stored, m.logical);
     }
   }
 }
 
-static uint32_t HostServeUiBody(const char *path, uint32_t &outSize);
+namespace {
+// ---------------------------------------------------------------------------
+// HOSTSERVE-WINDOW-READ: which read IN THIS FILE asks the archive for a member,
+// at what window, and what the buffer held when it came back.  Log-only, no
+// state change, no D3D12 call.
+//
+// WHY IT IS NEEDED WHEN THE OTHER CENSUS EXISTS.  The boot log's per-read
+// census belongs to another translation unit and is rate-limited per virtual
+// path: the first 16 calls on a path, then every 4096th, plus two exemptions.
+// The member this row exists for is read at 0x7EF65487 with a 2839-byte window,
+// and MEASURED over build/w719.log that read is not among the rows a boot
+// prints: 0 of the 289 rows name that offset, and the largest `call=` value any
+// row carries is 985, so the every-4096th rule cannot be what hid it.  Whether
+// the table-scan exemption could have covered it instead is NOT MEASURED and is
+// not claimed here.  Either way the question cannot be answered from a soak as
+// it stands.
+//
+// THE BOUND IS ON DISTINCT OFFSETS, NOT ON CALLS, and the totals row is
+// deliberately OUTSIDE that bound.  Every call is counted unconditionally; a
+// per-offset row prints only the first time a given member offset is read
+// through this function, and only for the first 256 distinct offsets.  Size,
+// measured rather than guessed: build/w719.log carries 576 open rows naming 241
+// distinct paths and 184 distinct member offsets, so the rule yields at most
+// 184 rows there -- the same order as the per-member censuses already in this
+// file.  Every 64th call prints a separate row carrying the UNSAMPLED call
+// count and both site counts, so a soak can check the bound against the total
+// instead of trusting it.
+//
+// `site` names which of this function's two archive reads fired: `window` is
+// the one that asks for the member's LOGICAL length (the window is sized by
+// what the guest must end up with), and `raw-stored` is the one that asks for
+// its STORED length with the span table bypassed.  `head` is the buffer's own
+// bytes as the archive layer returned them, because that is what the decode
+// decision immediately below is taken on.
+// ---------------------------------------------------------------------------
+std::mutex g_hostServeReadMtx;
+std::set<uint32_t> g_hostServeReadSeen;
+std::atomic<uint64_t> g_hostServeReadCalls{0};
+std::atomic<uint64_t> g_hostServeReadRows{0};
+std::atomic<uint64_t> g_hostServeReadWindow{0};
+std::atomic<uint64_t> g_hostServeReadRawStored{0};
+constexpr uint64_t kHostServeReadEveryN = 64;
+constexpr size_t kHostServeReadMaxRows = 256;
+
+std::string HostServeHeadHex(const std::vector<uint8_t> &b, size_t n = 16) {
+  static const char *kHex = "0123456789ABCDEF";
+  std::string out;
+  const size_t take = std::min(n, b.size());
+  out.reserve(take * 2);
+  for (size_t i = 0; i < take; ++i) {
+    out.push_back(kHex[b[i] >> 4]);
+    out.push_back(kHex[b[i] & 0x0F]);
+  }
+  return out;
+}
+
+void MclaNoteHostServeRead(const char *path, const char *site, uint32_t off,
+                           uint32_t req, uint64_t got, uint32_t storedLen,
+                           uint32_t logicalLen, bool rawPositional,
+                           const std::vector<uint8_t> &buf) {
+  const uint64_t call = g_hostServeReadCalls.fetch_add(1) + 1;
+  if (std::strcmp(site, "window") == 0)
+    g_hostServeReadWindow.fetch_add(1, std::memory_order_relaxed);
+  else
+    g_hostServeReadRawStored.fetch_add(1, std::memory_order_relaxed);
+
+  if ((call % kHostServeReadEveryN) == 0) {
+    MCLA_LOG_WARN("HOSTSERVE-READ-TOTAL call={} window={} raw-stored={} rows={} "
+                  "(every {}th call, UNSAMPLED: the per-offset rows are "
+                  "rate-limited and a sample must not be read as the whole)",
+                  call, g_hostServeReadWindow.load(std::memory_order_relaxed),
+                  g_hostServeReadRawStored.load(std::memory_order_relaxed),
+                  g_hostServeReadRows.load(std::memory_order_relaxed),
+                  kHostServeReadEveryN);
+  }
+
+  bool firstTime = false;
+  {
+    std::lock_guard<std::mutex> lk(g_hostServeReadMtx);
+    if (g_hostServeReadSeen.size() < kHostServeReadMaxRows &&
+        g_hostServeReadSeen.insert(off).second)
+      firstTime = true;
+  }
+  if (!firstTime)
+    return;
+  const uint64_t row = g_hostServeReadRows.fetch_add(1) + 1;
+  MCLA_LOG_WARN("HOSTSERVE-WINDOW-READ #{} call={} site={} path='{}' "
+                "off={:08X} stored={} logical={} req={} got={} "
+                "raw_positional={} head={} (one row per distinct member "
+                "offset; head is the buffer's own bytes as the archive layer "
+                "returned them, which is what the decode decision below is "
+                "taken on. the totals row carries the unsampled call count)",
+                row, call, site, path ? path : "", off, storedLen, logicalLen,
+                req, got, rawPositional ? 1 : 0, HostServeHeadHex(buf));
+}
+}  // namespace
+
+static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
+                                bool *outProved);
 
 // F-188 Path A: host-buffer XC decode (defined after MclaHostLzxDecode).
-static uint32_t MclaHostXcDecodePackage(const uint8_t *pkg, uint32_t pkgSz,
-                                        std::vector<uint8_t> &out);
+// W66: no longer called. The content serve now uses the F-295 decoder
+// (mcla_lzx::host_decode_ui_xsf) behind kRsc5XmemDecode, because this walker
+// concatenates frame payloads and is not the decoder that was proven byte-exact
+// against build/xmem_golden. Kept, not deleted: it is a working second opinion
+// and the brief forbade removing a symbol another stream may be about to use.
+[[maybe_unused]] static uint32_t MclaHostXcDecodePackage(const uint8_t *pkg,
+                                                        uint32_t pkgSz,
+                                                        std::vector<uint8_t> &out);
 
-static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
+// ---------------------------------------------------------------------------
+// W64 PRELOAD-SERVE CONTENT VERIFY (2026-09-30) -- the check that would have
+// caught the cars-list fatal, measured from w663.log.
+//
+// THE FAILURE w663 SHOWED. Three of the six name-list members were served the
+// RIGHT LENGTH and the WRONG CONTENT, and nothing said so:
+//
+//   member                       logical  served head  real head
+//   shaders/cars/preload.list       1108   6000134C     57686565 "Whee"
+//   shaders/ui/preload.list          260   AAAAAAAA     416C7068 "Alph"
+//   shaders/effects/preload.list     368   50726F6A     2F2F2053 "// S"
+//   shaders/city/preload.list       1246   2F2F2053     2F2F2053  ok
+//   shaders/characters/preload.list  496   43686172     43686172  ok
+//   textures/global/cars/globaltex.list 575 5F5F6E6F    5F5F6E6F  ok
+//
+// A LENGTH CHECK CANNOT SEE THIS: the guest's GetSize is w1, the body is w1
+// bytes, and the tokens the guest's own parser pulls out of the wrong bytes
+// still look like names. Only a CONTENT check can.
+//
+// WHERE THE WRONG BYTES COME FROM (measured offline, reproduced byte for byte
+// against the w663.log ascii= fields; see the report, not this comment):
+// RpfVirtualFileSystem's expanded-span splice uses the member's LOGICAL length
+// as the span END (src/fs/vfs_rpf.cpp:971), so every compressed member's
+// substitute range overshoots its real on-disk extent by `logical - stored`
+// bytes and is memcpy'd over whatever members follow it. The five name lists
+// are registered FIRST (MclaMarkKnownListMembers, gpu_device.cpp:1810), so any
+// member registered LATER wins. Reproduced, head for head:
+//   cars     <- shaders/city/fxl_final/CityWindowDirt.fxc off=0027D000
+//               stored 8623 -> logical 24034 overshoots 15411 bytes, which is
+//               0x38 past the cars member, and copies that .fxc's expanded
+//               bytes[8623..] over the whole 1108-byte window.
+//   ui       <- textures/global/cars/globaltex/bumper_subframe_n.dds
+//               off=001DA000 stored 12572 -> logical 43832.
+//   effects  <- shaders/characters/fxl_final/Character_plastic_normalmap.fxc
+//               off=00303000 stored 7698 -> logical 24366.
+// The span table itself is src/fs/**, so nothing here changes it; this only
+// makes the contamination LOUD and names the offender.
+//
+// THE CHECK. At the point a name-list body is served, re-read the member's
+// stored bytes from the packfile directly (bypassing the span table, which is
+// the thing under suspicion), raw-inflate them, and compare the result with
+// the bytes about to be handed to the guest. A prefix/length comparison of the
+// INFLATED image is enough: the member's own expansion is unique, and it is
+// the only thing the guest must see.
+//
+// COST. One fread of `stored` bytes plus one RawInflate of the same, per
+// name-list serve. The six members are 126-460 stored bytes, and w663 served
+// them ~20 times in 180 s, so this is microseconds against a 180 s soak. It
+// is NOT on the shader/texture hot path -- it is gated on the same
+// `.list`/globaltex/preload test the serve already uses at gpu_device.cpp:1979.
+static bool MclaVerifyServedListBody(const char *path,
+                                     const std::string &physicalPath,
+                                     uint32_t off, uint32_t storedLen,
+                                     uint32_t logicalLen,
+                                     const std::vector<uint8_t> &served) {
+  if (physicalPath.empty() || off == 0 || storedLen == 0 || logicalLen == 0)
+    return false;
+  std::vector<uint8_t> raw;
+  {
+    std::ifstream f(physicalPath, std::ios::binary);
+    if (!f)
+      return false;
+    f.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+    raw.resize(storedLen);
+    f.read(reinterpret_cast<char *>(raw.data()),
+           static_cast<std::streamsize>(storedLen));
+    if (static_cast<size_t>(f.gcount()) != storedLen)
+      return false;
+  }
+  std::vector<uint8_t> real;
+  if (!mcla::RawInflate(raw.data(), raw.size(), real,
+                        static_cast<size_t>(logicalLen) + 0x10000u))
+    return false;
+  const size_t n = served.size() < real.size() ? served.size() : real.size();
+  const bool same = n != 0 && std::memcmp(served.data(), real.data(), n) == 0 &&
+                    served.size() == real.size();
+  MCLA_LOG_WARN("LIST-SERVE-VERIFY path='{}' off={:08X} stored={} logical={} "
+                "ok={} served={} real={} servedHead={:08X} realHead={:08X} "
+                "firstDiff={}",
+                path, off, storedLen, logicalLen, same ? 1 : 0, served.size(),
+                real.size(), served.empty() ? 0u : MclaBE(served.data()),
+                real.empty() ? 0u : MclaBE(real.data()),
+                same ? static_cast<int32_t>(-1)
+                     : static_cast<int32_t>([&] {
+                         for (size_t i = 0; i < n; ++i)
+                           if (served[i] != real[i])
+                             return static_cast<int32_t>(i);
+                         return static_cast<int32_t>(n);
+                       }()));
+  if (!same)
+    MCLA_LOG_WARN("LIST-CONTENT-MISMATCH path='{}' off={:08X} -- the served "
+                  "body is NOT this member's inflated bytes (see "
+                  "MEMBER-SPAN-OVERLAP for the span that overwrote it)",
+                  path, off);
+  return same;
+}
+
+// W64 registration-side half of the same finding. RpfVirtualFileSystem keeps
+// the span table privately, so this is a local mirror of what THIS file has
+// registered. A member's real on-disk extent is [off, off+stored); if a LATER
+// registration's LOGICAL range [off, off+logical) covers any earlier span's
+// on-disk extent, then that earlier member's expanded bytes will be memcpy'd
+// over by the later one on the next read (vfs_rpf.cpp ApplyExpandedSpans
+// iterates the table in registration order). Log-only; it changes nothing.
+struct MclaRegisteredSpan {
+  uint32_t off;
+  uint32_t stored;
+  uint32_t logical;
+  std::string path;
+};
+static std::mutex g_regSpanMtx;
+static std::vector<MclaRegisteredSpan> g_regSpans;
+
+static void MclaNoteRegisteredSpan(const char *path, uint32_t off,
+                                   uint32_t stored, uint32_t logical) {
+  if (off == 0 || stored == 0 || logical == 0)
+    return;
+  std::lock_guard<std::mutex> lk(g_regSpanMtx);
+  for (const auto &s : g_regSpans) {
+    // Earlier member's ON-DISK extent, this member's LOGICAL extent.
+    if (off >= s.off && off < s.off + s.stored && off + logical > s.off) {
+      MCLA_LOG_WARN(
+          "MEMBER-SPAN-OVERLAP new='{}' newOff={:08X} newStored={} "
+          "newLogical={} over='{}' overOff={:08X} overStored={} overLogical={} "
+          "overshoot={} (a span end taken from newLogical covers overStored's "
+          "on-disk bytes; src/fs/vfs_rpf.cpp ApplyExpandedSpans)",
+          path ? path : "", off, stored, logical, s.path.c_str(), s.off,
+          s.stored, s.logical,
+          logical > s.stored ? logical - s.stored : 0u);
+    }
+    if (s.off >= off && s.off < off + stored && s.off + logical > off) {
+      MCLA_LOG_WARN(
+          "MEMBER-SPAN-OVERLAP new='{}' newOff={:08X} newStored={} "
+          "newLogical={} over='{}' overOff={:08X} overStored={} overLogical={} "
+          "overshoot={} (earlier span's logical end reaches this member's "
+          "on-disk bytes; src/fs/vfs_rpf.cpp ApplyExpandedSpans)",
+          path ? path : "", off, stored, logical, s.path.c_str(), s.off,
+          s.stored, s.logical,
+          s.logical > s.stored ? s.logical - s.stored : 0u);
+    }
+  }
+  for (const auto &s : g_regSpans)
+    if (s.off == off)
+      return;  // same offset re-registered: the table already has it
+  g_regSpans.push_back({off, stored, logical, path ? path : ""});
+}
+
+// W65 (2026-09-30) -- `outProved` (ADDITIVE, defaulted, so the second call site
+// at the MclaRegisterServedBody/BE8D8 path below is byte-for-byte unchanged):
+// the caller is told whether the body it is about to publish is PROVEN to be
+// this member's logical content, or merely a window that decodes to something.
+// The measure that defines it is in w664.log and is arithmetic, not a guess:
+//
+//   XSF-HOSTSERVE path='resources/ui/raceeditor/raceeditor.xsf' off=64CB0000
+//       size=143069 stored=3420181 logical=143089 head=05435352
+//   MEMBER-EXPAND-SIZE off=000B001B stored=3420181 expanded=64830 logical=143089
+//       (guest w1 not reproduced; served as stored)
+//
+// i.e. the window served to the guest is 143,069 bytes and the TOC record the
+// GUEST itself published says the file is 143,089 bytes (w1). The container does
+// not merely fail to expand -- it DECLARES its own uncompressed length at
+// RSC5+0x10 (MclaRsc5DeclaredSize, gpu_device.cpp:1490) and that number is
+// 143,069, twenty short of w1. Publishing GetSize/handle for a body whose
+// length contradicts the guest's own TOC is the host contract violation; see
+// the CCEA0 hook below for the refusal.
+static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
+                                bool *outProved = nullptr) {
   outSize = 0;
+  bool proved = false;
+  if (outProved)
+    *outProved = false;
   // T41.3g (F-077) refusal RETIRED by T41.3p/F-105: list paths were blocked
   // from host-serve so the guest's own open/read could be observed. F-103 showed
   // the guest's own path never reaches the loader (BE8D8-PACK-MISS: no body),
@@ -1753,17 +3010,34 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
     for (int i = 0; i < 4; ++i)
       w[i] = it->second.w[i];
   }
-  uint32_t offs[4] = {0}, szs[4] = {0};
+  MclaXsfWindow win[1];
   const int ncand =
-      XsfOffsetCandidates(w[0], w[1], w[2], w[3], offs, szs, 4);
+      XsfOffsetCandidates(w[0], w[1], w[2], w[3], win, 1);
   if (ncand == 0)
     return 0;
+  // F-632: ONE record, ONE window -- offset = w2 & 0x7FFFFF, stored =
+  // w3 & 0x3FFFFF, logical = w1 (the three-field discipline is stated in full at
+  // MclaXsfWindow). The old code enumerated up to five windows from the same
+  // four words and led with w1, which is the SIZE, so every serve read the
+  // compressed stream from an address that happens to be a length. There is no
+  // fallback here on purpose: a second window cannot be told apart from the
+  // right one without checking the head, and the head is what the pass-0/pass-1
+  // rule below already checks.
+  const uint32_t off = win[0].off;
+  const uint32_t storedLen = win[0].stored;
+  const uint32_t logicalLen = win[0].logical;
   auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
   mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
   if (!vfs.OpenFile("xarchive_cache.rpf", fh))
     return 0;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t dst = 0;
+  // F-632: a nested packfile is a REAL RPF3 image once its member is expanded,
+  // and `RPF3` is a container head exactly like RSC5/XCompress/rgxa. Without it
+  // in this set the fixed serve would be rejected by the very rule that exists
+  // to reject junk, and the guest would keep getting nothing. The gate for the
+  // fix is that XSF-HOSTSERVE heads now read `52 50 46 33` for these three.
+  constexpr uint32_t kHeadRpf3 = 0x52504633u;  // 'RPF3'
   // F-129/T41.11: pass 0 accepts ONLY a candidate whose first word is a real
   // container magic; pass 1 repeats with today's "first non-sentinel" rule so a
   // plaintext .list body still lands (it has no magic). Measured why this is
@@ -1775,13 +3049,39 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
   constexpr uint32_t kHeadRgxa = 0x72677861u;  // 'rgxa' as BE of bytes r,g,x,a
   constexpr uint32_t kHeadRsc5 = 0x05435352u;  // 'RSC5'
   constexpr uint32_t kHeadXcmp = 0x0FF512EFu;  // XCompress
+  const uint64_t packSz = vfs.GetFileSize("xarchive_cache.rpf");
+  // F-632: read the window the GUEST expects to see, which is the member's
+  // LOGICAL length, not its stored length. When RpfVirtualFileSystem holds this
+  // member as an expanded span the archive range [off, off+logical) already
+  // carries the expanded image; when it does not, the same range carries the
+  // compressed stream followed by its neighbours and the inflate step below
+  // reduces it to the member. Reading `stored` bytes instead would have
+  // truncated the cameratune image to 328,655 of its 425,984 bytes, which is the
+  // RPF3 header and TOC but not the members the guest is about to ask for.
+  const uint32_t readLen = logicalLen;
+  if (off == 0 || readLen < 0x40 || readLen > 0x400000 ||
+      storedLen == 0 || storedLen > 0x1000000 ||
+      (packSz != 0 && static_cast<uint64_t>(off) + readLen > packSz))
+    return 0;
+  // W66: what the container itself said, and what the decode actually produced,
+  // for the member that WON this loop. Both are the container's own statements;
+  // neither is w1, and the gate below is built out of them instead. Set only
+  // inside the RSC5/XCompress branch, so a non-container member leaves both 0
+  // and the gate cannot mistake "not this class" for "proved".
+  uint32_t rsc5Declared = 0;  // RSC5+0x10, MclaRsc5DeclaredSize
+  uint32_t rsc5Decoded = 0;   // bytes the host decode actually reproduced
   for (int pass = 0; pass < 2 && dst == 0; ++pass) {
   for (int c = 0; c < ncand && dst == 0; ++c) {
-    if (offs[c] == 0 || szs[c] < 0x40 || szs[c] > 0x400000)
-      continue;
-    std::vector<uint8_t> tmp(szs[c]);
+    std::vector<uint8_t> tmp(readLen);
     uint64_t got = 0;
-    if (!vfs.ReadFileAt(fh, offs[c], tmp.data(), szs[c], got) || got < 0x40)
+    // The read is hoisted out of the `if` so the marker below sees the bytes
+    // the archive layer actually returned, including on the paths that go on
+    // to refuse.  The short-circuit ORDER is unchanged -- the read still runs
+    // first and `got < 0x40` is still only tested when the read reported true.
+    const bool windowOk = vfs.ReadFileAt(fh, off, tmp.data(), readLen, got);
+    MclaNoteHostServeRead(path, "window", off, readLen, got, storedLen,
+                          logicalLen, fh.raw_positional, tmp);
+    if (!windowOk || got < 0x40)
       continue;
     uint32_t be = (uint32_t(tmp[0]) << 24) | (uint32_t(tmp[1]) << 16) |
                   (uint32_t(tmp[2]) << 8) | uint32_t(tmp[3]);
@@ -1789,46 +3089,200 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
     // and dict bodies ARE those families; the old reject starved preload.
     if (be == 0xCDCDCDCDu || be == 0 || be == 0xFFFFFFFFu)
       continue;
-    // F-130: the span hook in vfs_rpf.cpp only expands a member that fits
-    // WHOLE inside one read window, so a member straddling a page boundary -
-    // exactly the TOC's own 0x1DD1E8 + 3170 for AlphaModulate.fxc - reaches us
-    // still DEFLATE-compressed (that is why only 6 spans ever printed
-    // MEMBER-EXPAND and why no candidate carried a magic in w134). Inflate the
-    // candidate here, with the same helper.
-    if (be != kHeadRgxa && be != kHeadRsc5 && be != kHeadXcmp) {
+    // F-130 + F-632: the window may be the member still DEFLATE-compressed --
+    // either because the archive layer has no expanded span for it, or because a
+    // member straddling a read-window boundary (exactly the TOC's own
+    // 0x1DD1E8 + 3170 for AlphaModulate.fxc) is only substituted in the
+    // covered sub-range. `stored` says how many bytes the stream is;
+    // `logical` says how many the guest must end up with, so the substitute is
+    // accepted only when it reproduces w1 exactly. F-105's "in == out" members
+    // (stored == logical, 6 of the 377) skip this entirely and are served
+    // verbatim, which is the F-632 rule for that case.
+    if (storedLen != logicalLen && be != kHeadRgxa && be != kHeadRsc5 &&
+        be != kHeadXcmp && be != kHeadRpf3 && storedLen <= got) {
       std::vector<uint8_t> inf;
-      if (mcla::RawInflate(tmp.data(), tmp.size(), inf) && inf.size() >= 0x40) {
+      bool inflated = mcla::RawInflate(tmp.data(), storedLen, inf) &&
+                      inf.size() == logicalLen;
+      // F-658 (2026-09-30). The decode above reads the member's STORED extent
+      // out of the window this pass just read -- and that window is NOT always
+      // the file. `readLen = logicalLen` (the comment at the read says so
+      // deliberately), and RpfVirtualFileSystem substitutes an expanded span
+      // for [off, off+logical) when it holds one. So when the span is INCOMPLETE
+      // the first `storedLen` bytes of the window are already part of the
+      // expanded body, the DEFLATE stream is not there, RawInflate refuses, and
+      // the code fell through to "not raw DEFLATE; served stored" -- serving a
+      // window of which only the span's own bytes are real.
+      //
+      // MEASURED, w677.log, on the member the guest's vehicle-list walk reads:
+      //   MEMBER-EXPAND-OVERRUN off=7EF65487 stored=494 expanded=2839
+      //     overrun=2345 logical=2839
+      //   XSF-INFLATE-SIZE path='tune/vehicle/vehicle0002.lst' off=7EF65487
+      //     stored=494 logical=2839 head=56656869 (not raw DEFLATE; served stored)
+      //   SERVE-PROOF ... off=7EF65487 stored=494 logical=2839 served=2839
+      //     cls=other decoded=0
+      // i.e. 494 real bytes in a 2839-byte window and 2345 bytes of whatever the
+      // arena held. Re-measured OFFLINE against build/game_data/
+      // xarchive_cache.rpf, no run: `zlib.decompressobj(-15)` over the 494 bytes
+      // at 0x7EF65487 yields exactly 2839 bytes, head `56 65 68 69` = the same
+      // head the log printed, and 123 newlines = the same `nl=123` the log
+      // printed. CORRECTED 2026-10-01: this block used to end "and no
+      // occurrence of `chevy`". That was FALSE and it cost an investigation.
+      // MEASURED, same offline inflate, case-insensitive: the 2839-byte body
+      // holds `chevy` TWICE, at offsets 149 and 691, spelled `Chevy` both times
+      // (`   Manufacturer    Chevy\r\n        Group           D0`). The 22391-byte
+      // body at 0x471000 (stored 2355) holds it 8 more times, at offsets 206,
+      // 3584, 4862, 7456, 9154, 9587, 17960, 21899, also all `Chevy`.
+      // WHERE THE FALSE ZERO CAME FROM: the "exactly ONE occurrence ... at
+      // 0x18B3E650 ... (`chEvYL`) -- a coincidental match" sentence is a TRUE
+      // measurement of the WRONG BUFFER. A raw byte scan of the whole 2,130,739,200
+      // B packfile does return exactly 1 hit, at 0x18B3E650, in a compressed
+      // stream. But xarchive_cache.rpf members are raw DEFLATE, so plaintext
+      // inside a member is INVISIBLE to a raw scan -- 10 occurrences exist across
+      // the two inflated bodies and 9 of them can never be seen that way. Scanned
+      // the INFLATED bodies instead and the count is not 0.
+      //
+      // WHY THIS IS THE FAULT AND NOT A COSMETIC ONE. w677 is the first run in
+      // which the guest's vehicle-list walk got a CORRECT head out of this
+      // member: F442-SECTION #7 reads `head='Vehicle..{..        Name        '`
+      // hits=1 ret=1, where w675's same row reads garbage with hits=0. Having
+      // got a correct head, the guest walked the whole 2839-byte window, read a
+      // manufacturer token, and refused it:
+      //   [error] Fatal error dispatcher invoked - terminating game
+      //   [error]   fatal message: 'Unknown manufacturer %s in vehicle list file'
+      //   [error]   fatal %%s arg: 'chevy'
+      //   [error]   fatal-dispatch regs: lr=0x823966E8
+      // CORRECTED 2026-10-01: this block used to read "read a manufacturer token
+      // out of the 2345-byte OVERRUN TAIL ... The token cannot have come from the
+      // file -- it is not in the decoded body -- so it came from the window's
+      // unowned tail." BOTH HALVES ARE FALSE, and the token is NOT from the tail:
+      //   * the body's FIRST `Chevy` is at offset 149, and the window's real head
+      //     is 494 B (MEMBER-EXPAND-OVERRUN overrun=2345 logical=2839), so 149
+      //     < 494 -- it is inside the member's OWN byte-correct bytes;
+      //   * the window the guest walked really is the inflated body: rendering
+      //     body[8:40] with non-printables as '.' gives `.{..        Name
+      //     vp_s` + 0x20 padding, byte-identical to the logged F442-SECTION #7
+      //     `at='.{..        Name            vp_s'`;
+      //   * 'chevy' is LOWERCASE because the guest lowercases it. sub_82183870
+      //     is the lowercaser, from RAW WORDS (tools/ppc_disasm.py, no mnemonics
+      //     trusted): 2B0B0041 cmpli 0x41 / 2B0B005A cmpli 0x5A / 396B0020
+      //     addi r11,r11,32 / 2B0B005C cmpli 0x5C -> 3960002F li 47. A-Z minus
+      //     32, and 0x5C '\' -> 0x2F '/'. `Chevy` -> `chevy` is that
+      //     transform, not evidence of a foreign source.
+      // The delivered bytes are CORRECT: w683.log LIST-SERVE-VERIFY is 20/20
+      // rows ok=1 firstDiff=-1 and LIST-CONTENT-MISMATCH is 0. So the tail is
+      // not the source of this fatal and the "foreign token" reading is dead.
+      // WHAT IS STILL OPEN (deliberately not resolved here): the guest read a
+      // manufacturer that IT rejected, so the fault is in which list the guest
+      // walked or in the manufacturer table it validated against -- NOT in the
+      // member's delivery. Measure that before naming a cause.
+      //
+      // THE FIX IS THE MISSING DECODE, NOT ANOTHER SHORT-CIRCUIT: when the
+      // span-substituted window will not decode, re-read the member's STORED
+      // extent with the span table bypassed -- the same `raw_positional` read
+      // MclaTocServeMember's STEP2 uses (F-645, :20967) -- and decode THAT. The
+      // decode is still accepted only when it reproduces `logical` exactly, and
+      // the existing "not raw DEFLATE" row is kept verbatim for the case where
+      // the raw read does not decode either, so the 7 UI .xsf/.xtd containers
+      // keep behaving exactly as they did. No new predicate, no guard layered on
+      // the forced-ack mitigation, and the `XSF-*`/`SERVE-PROOF` markers are all
+      // unchanged so a soak can compare them against w675/w677 row for row.
+      if (!inflated) {
+        mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fhRaw;
+        std::vector<uint8_t> rawStored;
+        uint64_t rawGot = 0;
+        if (vfs.OpenFile("xarchive_cache.rpf", fhRaw)) {
+          fhRaw.raw_positional = true;   // do not run the span table: this read
+          fhRaw.read_member_off = off;   // is the FILE, as STEP2's own name says
+          rawStored.resize(storedLen);
+          // Same hoist as the window read above, and for the same reason: the
+          // marker has to see the STORED extent as the file returned it, which
+          // is the whole question this row exists to answer.  Short-circuit
+          // order is unchanged.
+          const bool rawReadOk = vfs.ReadFileAt(fhRaw, off, rawStored.data(),
+                                                storedLen, rawGot);
+          MclaNoteHostServeRead(path, "raw-stored", off, storedLen, rawGot,
+                                storedLen, logicalLen, fhRaw.raw_positional,
+                                rawStored);
+          const bool rawOk = rawReadOk && rawGot >= storedLen;
+          vfs.CloseFile(fhRaw);
+          if (rawOk) {
+            std::vector<uint8_t> infRaw;
+            if (mcla::RawInflate(rawStored.data(), storedLen, infRaw) &&
+                infRaw.size() == logicalLen) {
+              inf.swap(infRaw);
+              inflated = true;
+              MCLA_LOG_WARN("XSF-INFLATE-STORED path='{}' off={:08X} stored={} "
+                            "logical={} spanHead={:08X} (the expanded span is "
+                            "incomplete: decoded the FILE's stored extent with "
+                            "the span table bypassed)",
+                            path, off, storedLen, logicalLen, be);
+            }
+          }
+        }
+      }
+      if (inflated) {
         const uint32_t ibe = (uint32_t(inf[0]) << 24) |
                              (uint32_t(inf[1]) << 16) |
                              (uint32_t(inf[2]) << 8) | uint32_t(inf[3]);
-        if (ibe == kHeadRgxa || ibe == kHeadRsc5 || ibe == kHeadXcmp) {
-          MCLA_LOG_WARN("XSF-INFLATE path='{}' off={:08X} stored={} "
-                        "expanded={} head={:08X}->{:08X}",
-                        path, offs[c], szs[c], inf.size(), be, ibe);
-          tmp.swap(inf);
-          be = ibe;
-        }
+        MCLA_LOG_WARN("XSF-INFLATE path='{}' off={:08X} stored={} "
+                      "expanded={} head={:08X}->{:08X}",
+                      path, off, storedLen, inf.size(), be, ibe);
+        tmp.swap(inf);
+        be = ibe;
+      } else {
+        // Not raw DEFLATE, from the span window OR from the file's own stored
+        // extent. That is expected for the 7 UI .xsf/.xtd XCompress/LZX
+        // containers, whose stored bytes ARE the container, so the window is
+        // served as it stands. Say which, because a null here is exactly what a
+        // wrong offset looks like.
+        MCLA_LOG_WARN("XSF-INFLATE-SIZE path='{}' off={:08X} stored={} "
+                      "logical={} head={:08X} (not raw DEFLATE, span or file; "
+                      "served stored)",
+                      path, off, storedLen, logicalLen, be);
       }
     }
-    if (pass == 0 && be != kHeadRgxa && be != kHeadRsc5 && be != kHeadXcmp)
+    if (pass == 0 && be != kHeadRgxa && be != kHeadRsc5 && be != kHeadXcmp &&
+        be != kHeadRpf3)
       continue;
 
     // w20: TOC-derived bodies for .xtd/.xsf are often AES ciphertext.
     // Prefer the plaintext RSC5+XCompress package from the host table
     // (0x60000 meshtextures, 0xA0000 UI) when the candidate head is not
     // parseable. Lists keep their own plaintext name bodies.
-    uint32_t serveOff = offs[c];
+    uint32_t serveOff = off;
     std::vector<uint8_t> serveBytes = tmp;
     uint32_t pkgSubst = 0;
     {
       const uint32_t pathPkg = MclaPreferredPkgOffForPath(path);
       const uint32_t tocPkg = MclaPkgOffFromTocW2(w[2]);
+      // F-632: a nested packfile is NEVER a package substitute. Its head is
+      // `RPF3` and it is a real archive, so the F-171 probe (RSC5 magic AND
+      // [pkg+8] == w3) already refuses it -- but the refusal is stated here
+      // rather than left to a probe that only fails by accident, because
+      // MclaPkgOffFromTocW2(w2) is non-zero for a member offset (0x3F0000 ->
+      // 0x3F0000) and a member address is not a package address.
       const bool wantsPkg =
           (pathPkg != 0 || tocPkg != 0) &&
-          !MclaHeadIsRscOrXc(tmp.data(), static_cast<uint32_t>(got));
+          !MclaHeadIsRscOrXc(tmp.data(), static_cast<uint32_t>(got)) &&
+          !(got >= 4 && MclaBE(tmp.data()) == kHeadRpf3);
       // Lists never take a package substitute (their name bodies work).
+      // ".lst" is NOT a substring of ".list" -- the two are disjoint, so the
+      // tune family fell through this guard. MEASURED in build/w679.log: all 8
+      // ".lst" XSF-HOSTSERVE rows (tune/rmptfx/tireptx.lst, tune/vehicle/
+      // vehicle.lst, vehicle0001.lst, vehicle0002.lst) have isList == false
+      // and wantsPkg == true, because MclaPreferredPkgOffForPath returns 0 for
+      // them and MclaPkgOffFromTocW2(w[2]) is non-zero for every one
+      // (0032F000 / 00471000 / 00479000 / 7EF65000) while their measured heads
+      // (77686565 6668955C 4D616E75 F8EC1A56 56656869 2B8BD220) are none of
+      // RSC5 05435352 / XC 0FF512EF / RPF3 52504633. The block then entered
+      // and produced nothing only because the downstream F-171 probe refused
+      // the member offset (PKG-SUBST is 0 in w677/w678/w679 and pkgSubst is
+      // 00000000 on all 94 rows) -- an inert guard masked by a probe failure,
+      // whose failure mode is substituting a UI package over a correct
+      // 22,391-byte vehicle list. Same class as the .lst gate at :2619.
       const bool isList =
           std::strstr(path, ".list") != nullptr ||
+          std::strstr(path, ".lst") != nullptr ||
           std::strstr(path, "globaltex") != nullptr ||
           std::strstr(path, "preload") != nullptr;
       if (wantsPkg && !isList) {
@@ -1899,16 +3353,60 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
             pkgSubst = useOff;
             MCLA_LOG_WARN("PKG-SUBST path='{}' tocOff={:08X} tocHead={:08X} "
                           "-> pkg={:08X} head={:08X} n={}",
-                          path, offs[c], be, pkgOff, pbe, serveBytes.size());
+                          path, off, be, pkgOff, pbe, serveBytes.size());
             // F-188 Path A: UI .xsf never reach guest inflate (F-186 enqueue
             // gap). Decode the RSC5+XCompress LZX payload here so the guest
             // gets real resource bytes. Lists keep DEFLATE/`RawInflate` above.
-            if constexpr (kHostLzxDecode) {
+            //
+            // W66: this used to sit behind kHostLzxDecode, which is the libmspack
+            // CAB-LZX lever F-191 measured to be the WRONG FORMAT for these
+            // bytes, and behind MclaHostXcDecodePackage, which is neither the
+            // proven decoder nor restricted to a container class. It is now
+            // behind kRsc5XmemDecode, in a branch that has ALREADY proved the
+            // bytes are an RSC5/XCompress container by their own magic (pbe
+            // above), and it calls the F-295 decoder that is byte-exact on all
+            // four UI containers. The CAB sites are untouched.
+            //
+            // host_decode_ui_xsf re-checks RSC5 at +0 and 0x0FF512EF at +0x0C
+            // itself and returns 0 for anything else, so the class test does not
+            // rest on this branch's `pbe`. It also REQUIRES the decode to
+            // reproduce the container's own declared length
+            // (src/xmem_lzx.h:513 is_diu) -- that is what makes the result
+            // admissible as proof below rather than merely plausible.
+            //
+            // The buffer decoded here is `declared` bytes, read from the
+            // container head (MclaRsc5DeclaredSize already replaced pkgSz with
+            // it at F-168), so it is the 20 bytes of trailing payload the member
+            // carries beyond its own declared length that are NOT in it. That is
+            // not a truncation: the LZX stream ends at 22,608 / 165,972 /
+            // 1,614 / 4,132 bytes on these four members, all far inside the
+            // declared length, so nothing the decoder needs is missing. It is
+            // also NOT compensated with a w1 - 20 anywhere.
+            if constexpr (kRsc5XmemDecode) {
+              rsc5Declared = MclaRsc5DeclaredSize(
+                  serveBytes.data(), static_cast<uint32_t>(serveBytes.size()));
               std::vector<uint8_t> decoded;
-              if (MclaHostXcDecodePackage(serveBytes.data(),
-                                          static_cast<uint32_t>(serveBytes.size()),
-                                          decoded) > 0) {
+              const int lzxPath = mcla_lzx::host_decode_ui_xsf(
+                  serveBytes.data(), static_cast<size_t>(serveBytes.size()),
+                  decoded, kXcWindowBits);
+              if (lzxPath != 0 && rsc5Declared != 0 &&
+                  decoded.size() == static_cast<size_t>(rsc5Declared)) {
+                rsc5Decoded = static_cast<uint32_t>(decoded.size());
                 serveBytes.swap(decoded);
+                MCLA_LOG_WARN(
+                    "RSC5-XMEM-DECODE path='{}' off={:08X} lzxPath={} "
+                    "declared={} decoded={} w1={} w1delta={} -- container and "
+                    "decode AGREE, w1 does not (see SERVE-PROOF)",
+                    path, serveOff, lzxPath, rsc5Declared, rsc5Decoded,
+                    logicalLen,
+                    static_cast<int32_t>(logicalLen) -
+                        static_cast<int32_t>(rsc5Declared));
+              } else {
+                MCLA_LOG_WARN(
+                    "RSC5-XMEM-DECODE-FAIL path='{}' off={:08X} lzxPath={} "
+                    "declared={} decoded={} -- served as the container stands",
+                    path, serveOff, lzxPath, rsc5Declared,
+                    static_cast<uint32_t>(decoded.size()));
               }
             }
           }
@@ -1922,26 +3420,248 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
     // words at the TOC76-XSF census), so the guest's page-cache copy and this
     // host-served body see the same expanded archive image.
 
-    // F-463 (R2 / T42.8): leave NESTED packfiles (`preload/xarchive_*.rpf`) unserved.
-    // The bytes we would plant are not an RPF3 header (cameratune -> 6655A8B1,
-    // carconfigs -> 63D46C60; F-458 s2: no second RPF3 in the first 64 MiB), and the
-    // title's own TOC decrypts the OUTER archive in guest code -- so if its
-    // fiPackfile read would decrypt a nested member on the fly, our plant pre-empts
-    // exactly that step, and the observed result is F-458 s1: the nested archives open
-    // (stream object 0x82860C40) but `tune/vehicle/*.lst` yields NO stream (0).
-    // Labelled, scoped abstention experiment -- not a fix. Gate criteria: BDF20's
-    // stream-object field for tune/*.lst becomes non-NULL, and F442-SECTION rows show
-    // tuning text instead of another file's compressed window.
-    if (kF463AbstainNestedRpf && path != nullptr &&
-        std::strstr(path, "xarchive_") != nullptr &&
-        std::strstr(path, ".rpf") != nullptr) {
-      MCLA_LOG_WARN(
-          "F463-SERVE-ABSTAIN path='{}' off={:08X} size={} head={:08X} "
-          "-- nested packfile left to the guest",
-          path, serveOff, static_cast<uint32_t>(serveBytes.size()),
-          MclaBE(serveBytes.data()));
-      continue;
+    // F-463 (R2 / T42.8) -- DELETED 2026-09-28 by F-632, and the abstention is
+    // what this window used to hold:
+    //
+    //   if (kF463AbstainNestedRpf && path != nullptr &&
+    //       std::strstr(path, "xarchive_") != nullptr &&
+    //       std::strstr(path, ".rpf") != nullptr) {
+    //     MCLA_LOG_WARN("F463-SERVE-ABSTAIN path='{}' off={:08X} size={} "
+    //                   "head={:08X} -- nested packfile left to the guest", ...);
+    //     continue;
+    //   }
+    //
+    // Its reason was F-458: "the bytes we would plant are not an RPF3 header
+    // (cameratune -> 6655A8B1)". F-632 measured why that was true and it was
+    // not a property of the archive: `6655A8B1` is a raw DEFLATE stream header,
+    // and the bytes at 6655A8B1 ARE a DEFLATE stream -- the nested packfile's own
+    // stored member, read at the wrong address. The serve took the record's w1
+    // (0x68000 = 425,984, the LOGICAL length) as the offset instead of w2
+    // (0x3F0000), so it planted compressed bytes and then correctly concluded the
+    // archive was not there. The guest's own RPF3 parse failing on those bytes
+    // was the system working. The `continue` also sat AFTER the read and BEFORE
+    // the alloc, so the flag suppressed the only code that could hand the guest
+    // a window at all. Removed with the flag (see the F-632 note where
+    // kF463AbstainNestedRpf used to be declared); the finding above is what
+    // remains of the experiment.
+
+    // W64 (2026-09-30): CONTENT check, on the name-list family only, at the
+    // point the body is chosen. w663 served three of the six lists with the
+    // right length and the wrong content and no marker said so; this re-reads
+    // the member's own stored bytes from the packfile (bypassing the span
+    // table, which is what got contaminated) and compares the inflated image
+    // with what is about to go to the guest. Log-only -- it names the fault,
+    // it does not paper over it, and the span table is src/fs/**.
+    //
+    // W65 (2026-09-30): the result is no longer discarded. It is one of the
+    // three ways a body becomes `proved` below, which is what lets a list be
+    // published at all. The LIST-SERVE-VERIFY / LIST-CONTENT-MISMATCH rows are
+    // UNCHANGED; only this local gained a consumer.
+    // W65: per-candidate verdict, reset each candidate so a refused candidate
+    // cannot leak a `true` into the next pass.
+    bool listProved = false;
+    // W67 (2026-09-30): the gate read ".list", which does NOT match ".lst" --
+    // ".list" and ".lst" are disjoint substrings, so MclaVerifyServedListBody
+    // was never called for a .lst member. MEASURED in build/w678.log: 6/6
+    // ".list" members proved and 0/8 ".lst" proved (SERVE-PROOF rows parsed
+    // with a byte-exact counter: .list proved=1 six times -- globaltex.list and
+    // five preload.list -- and .lst proved=1 zero times).
+    //
+    // The verifier itself is extension-agnostic (gpu_device.cpp:2048-2068: open
+    // physicalPath, seek off, read storedLen, RawInflate, memcmp against
+    // `served`), so routing .lst to it can only turn 0 -> 1. A false result
+    // leaves today's behaviour unchanged -- this is a monotone gate, not a
+    // bypass, and it does not author a single byte of guest content.
+    //
+    // WHY THIS IS THE BOOT BLOCKER (all from w678.log, 09-30 12:45):
+    //   :33501  XSF-INFLATE-STORED tune/vehicle/vehicle.lst off=00471000
+    //           stored=2355 logical=22391, then :33502 expands to exactly
+    //           22391 head=4D616E75 ("Manu") -- the CONTENT IS CORRECT.
+    //   :33509  SERVE-PROOF ... served=22391 logical=22391 listProved=0
+    //           proved=0 cls=other -- because listProved could not be set.
+    //   :33512  OPEN-REFUSED-STATUS reason=UNPROVED-BODY, then :33513
+    //           NULL-HANDLE-CHECK ret=0.
+    //   sub_823971D0 gates its whole parse on `result != nullptr`, so with ret=0
+    //   it builds nothing. The manufacturer array lives at 0x828CD078 as
+    //   {u32 base, u16 count@0x828CD07C, u16 cap@0x828CD07E}; the raw image has
+    //   0000000000000000 at 0x828CD078 (mcla_pe.bin off 0x8CD078) and nothing
+    //   repopulates it. sub_823964C0 then reads v9 = count = 0, never enters
+    //   the search loop, and evaluates `if (v8 == v9)` as 0 == 0 ->
+    //   "Unknown manufacturer %s in vehicle list file" (lr=823966E8) for the
+    //   FIRST manufacturer it sees, whatever the string is. The reported 'chevy'
+    //   is the symptom; an empty table is the cause.
+    //
+    // W69 (2026-10-01): DROP THE FILENAME TEST. The gate above was scoped to
+    // two extensions because that is what W67 measured; the verifier itself has
+    // never been scoped that way. Re-measured on build/w683.log (9,613,727 B,
+    // byte-exact line counts) and offline against
+    // build/game_data/xarchive_cache.rpf:
+    //
+    //   XSF-INFLATE-STORED   168 rows, 42 distinct PATH STRINGS, 41 distinct
+    //                         MEMBERS. (42 vs 41 is not a discrepancy:
+    //                         textures/Random3D.dds and textures/random3d.dds
+    //                         are ONE member -- off=0031C000 stored=1930
+    //                         logical=2176 -- under two spellings. Count
+    //                         members by (off,stored,logical), not by name.)
+    //   served == logical    168/168. XSF-INFLATE-STORED is emitted in the
+    //                         SUCCESS branch below, so it fires BECAUSE the
+    //                         F-658 fallback repair worked; it is not a fault
+    //                         marker. XSF-INFLATE-SIZE (8 rows) is the real
+    //                         short-result marker and fires only for
+    //                         resources/city/SC/trash.xrn.
+    //   OPEN-ACCEPTED        10 paths / 38,387 B  ( 7.10%)
+    //   OPEN-REFUSED-STATUS  31 paths / 502,229 B (92.90%), every one
+    //                         reason=UNPROVED-BODY, every one proved=0.
+    //   The 10 are exactly the members the `.list`/`.lst` strstr pair reaches;
+    //   the other 31 have no content verification of any kind.
+    //   OFFLINE, over those 31: raw-inflate of outer[off : off+stored] with
+    //   zlib wbits=-15 reproduces EXACTLY `logical` for 31/31, no exceptions.
+    //   (Over all 45 distinct members in the log the only failure is
+    //   resources/city/SC/trash.xrn, which is XSF-INFLATE-SIZE's member and
+    //   which the verifier therefore keeps refusing -- unchanged.)
+    //
+    // THE PREDICATE, and why these two terms and not others:
+    //
+    //  (a) `storedLen != logicalLen` -- KEEP, it is already here. This is the
+    //      data property that makes the question well posed: it says the member
+    //      is DEFLATE-compressed on read and therefore HAS a stored extent whose
+    //      expansion is the body to verify. An "in == out" member (F-105,
+    //      stored == logical) has no DEFLATE stream at `off`; RawInflate refuses
+    //      and the verifier returns false. That class is already admitted by
+    //      branch (2) of `proved` below with no content check at all, so
+    //      excluding it here costs nothing and saves a pointless file read.
+    //  (b) `pkgSubst == 0` -- ADD. `serveBytes` must actually BE the bytes at
+    //      `off` for the comparison to be about this member. When a package was
+    //      substituted, `serveBytes` came from a DIFFERENT offset (`useOff`,
+    //      :2627-2635) and the question "does outer[off:off+stored] inflate to
+    //      what we are serving?" is not one the verifier can answer. Measured in
+    //      w683: PKG-SUBST 0 rows, and pkgSubst=00000000 on all 94
+    //      XSF-HOSTSERVE rows, so this term removes nothing today. It is also
+    //      monotone: `isList` (:2565) already forbids a package substitute for
+    //      every path the old `.list`/`.lst` gate could reach, so no member
+    //      verified today can have pkgSubst != 0.
+    //  NOT ADDED -- `logicalLen != 0 && storedLen != 0`: already guaranteed on
+    //  arrival (:2391-2394 returns 0 when storedLen == 0, and readLen ==
+    //  logicalLen >= 0x40), and re-checked inside the verifier at :2204.
+    //  Restating them here would be noise that reads like a new guarantee.
+    //  NOT ADDED -- a nested-packfile (`.rpf`) exclusion, because it would be
+    //  WRONG. `fh` is opened by name at :2360 as "xarchive_cache.rpf", which
+    //  OpenFile resolves to the REAL outer archive (vfs_rpf.cpp:578-591 takes
+    //  parent_path(m_extracted_root)/norm; measured present, 2,130,739,200 B),
+    //  and `off` is w2 -- an offset in that same outer archive. A nested packfile
+    //  is a MEMBER of the outer archive, so outer[off : off+stored] is precisely
+    //  where its own stored extent lives; re-measured, all three inflate to
+    //  exactly `logical` and begin 52 50 46 33 ('RPF3'):
+    //    preload/xarchive_bootscripts.rpf off=00368000 stored=532870 -> 720896
+    //    preload/xarchive_cameratune.rpf  off=003F0000 stored=328655 -> 425984
+    //    preload/xarchive_carconfigs.rpf  off=00448000 stored=166323 -> 294912
+    //  That is the same (off,stored,logical) triple RegisterNestedRpf is handed
+    //  at :20038, so verifying a nested `.rpf` against the OUTER archive is not a
+    //  category error -- the outer archive is the only place it can be verified.
+    //
+    // MONOTONICITY. `listProved` is initialised false per candidate (:2744) and
+    // is only ever ASSIGNED the verifier's return, which is false unless the
+    // member's own stored extent inflates to exactly `served` at exactly
+    // `storedLen` bytes with a full-length memcmp. So term (1) of `proved` below
+    // is satisfiable-by-addition only, term (2) does not read `listProved` at
+    // all, and term (3) reads only `rsc5Declared`/`rsc5Decoded`, which this
+    // change does not touch. Nothing here can turn a proved body unproved.
+    //
+    // WHAT THIS IS NOT. Not a bypass: the verifier re-opens the file with
+    // ifstream, seeks to `off`, reads `storedLen` raw bytes, RawInflates them
+    // and byte-compares against the body already chosen for publication. It
+    // admits bytes that already exist on disk and that it has just verified
+    // independently. It fabricates no length, no completion status, and no
+    // `proved` value the file does not support.
+    //
+    // NEW MARKER: W69 changes WHICH members get verified, and the existing rows
+    // are the project's investigation record (240 tracked markers;
+    // tools/soak_census.py counts their fields). SERVE-PROOF-SCOPE records
+    // whether the verifier RAN for this candidate and, if not, why -- so a soak
+    // can tell "never verified" from "verified and refused".
+    const bool verifyEligible = (storedLen != logicalLen) && (pkgSubst == 0);
+    const bool wouldPassListNameGate =
+        std::strstr(path, ".list") != nullptr ||
+        std::strstr(path, ".lst") != nullptr;
+    if (verifyEligible) {
+      listProved = MclaVerifyServedListBody(path, fh.physical_path, off,
+                                            storedLen, logicalLen, serveBytes);
     }
+    MCLA_LOG_WARN("SERVE-PROOF-SCOPE path='{}' off={:08X} stored={} logical={} "
+                  "served={} ran={} ok={} listName={} pkgSubst={:08X}",
+                  path, off, storedLen, logicalLen, serveBytes.size(),
+                  verifyEligible ? 1 : 0, listProved ? 1 : 0,
+                  wouldPassListNameGate ? 1 : 0, pkgSubst);
+
+    // W65 (2026-09-30): PROVE-OR-REFUSE. Three ways to earn the right to
+    // publish a body for this handle, and no fourth:
+    //
+    //  (1) the member's own stored bytes raw-inflate to EXACTLY w1, and
+    //      MclaVerifyServedListBody agreed byte-for-byte (F-105 "in == out"
+    //      members take this too: stored == logical and the window is verbatim);
+    //  (2) the window IS the member (stored == logical) at exactly w1 bytes;
+    //  (3) W66, REPLACING the condition that was here. The old (3) was "the
+    //      container's own declared length EQUALS w1". That can never fire,
+    //      and it cannot fire for a reason that is now measured: for this class
+    //      w1 is the member's ON-DISK length and the container is a 20-byte
+    //      five-word RSC5 header plus a payload region the packer reserves at
+    //      the declared uncompressed size, so w1 == declared + 20 by
+    //      construction, for every member measured. The condition was
+    //      unsatisfiable, i.e. an always-refuse wearing caution's clothes.
+    //      The replacement asks a question that CAN be answered and that does
+    //      not mention w1: did a decode actually reproduce the length the
+    //      container declares for itself? Container and decoder agreeing is a
+    //      fact about two independent sources; w1 is the odd one out and is
+    //      REPORTED as such below instead of being trusted or subtracted.
+    //
+    // THE 20 BYTES, measured 09-30 offline from build/game_data/xarchive_cache.rpf
+    // (scratch script, byte-exact against build/xmem_golden/*.bin; no build):
+    //   member      container   RSC5+0x10   w1     w1-declared  LZX stream
+    //   raceeditor  0x64CB0000     143,069  143,089      +20       22,608 B
+    //   garage      0x64980000   1,066,057 1,066,077      +20      165,972 B
+    //   policecam   0x64CA3000      19,337   19,357      +20        1,614 B
+    //   credits     0x6496F000      29,655   29,675      +20        4,132 B
+    // 20 = sizeof the fixed RSC5 header (magic, hdrLen, packageID, XCompress,
+    // uncLen -- five BE words, gpu_device.cpp:1486-1487 / xmem_lzx.h:10), and
+    // the LZX stream begins immediately after it, at container+0x14. hdrLen is
+    // 0x1B (27) for all four and is NOT where the payload starts, so the 20 is
+    // not hdrLen. Independent witness that w1 is the on-disk extent: the
+    // archive's zero padding starts at container+w1 for all four (zero runs of
+    // 20,751 / 15,267 / 1,123 / 3,093 bytes, each exactly the distance from
+    // container+w1 to the NEXT RSC5 head in the file).
+    // AND: `stored` is not a length for this class at all. w3 equals the
+    // container's own packageID at RSC5+0x08 for all four (D4343015 /
+    // D574B032 / D41D2810 / D4082813, each matching toc=[... ... ... w3]), so
+    // `stored` = w3 & 0x3FFFFF is a fragment of an ID: 3,420,181 / 7,647,282 /
+    // 1,910,800 / 534,547. It stays in the row because XSF-HOSTSERVE's format
+    // is the project's record, but no ratio built on it means anything.
+    proved = (logicalLen != 0) &&
+             ((listProved && serveBytes.size() == logicalLen) ||
+              (storedLen == logicalLen && serveBytes.size() == logicalLen) ||
+              // (3) decode reproduced the container's own declared length
+              (rsc5Declared != 0 && rsc5Decoded == rsc5Declared &&
+               serveBytes.size() == rsc5Decoded));
+    // W65: a new row, NOT a field on XSF-HOSTSERVE -- that marker's format is
+    // the project's investigation record and other streams count its fields.
+    // W66 additions, all additive: `cls` says which class the member is (so a
+    // soak can tell "this class was refused" from "this class was decoded and
+    // w1 disagreed"), and `w1delta` is w1 minus the container's own declared
+    // length, signed, per member. `head` is the SERVED body's head, which after
+    // a successful decode is `44 49 55 00` ("DIU\0") and not the RSC5 magic --
+    // `declared` and `decoded` are the fields that carry the container's side.
+    const bool isRsc5Class = (rsc5Declared != 0);
+    const int32_t w1delta =
+        isRsc5Class ? static_cast<int32_t>(logicalLen) -
+                          static_cast<int32_t>(rsc5Declared)
+                    : 0;
+    MCLA_LOG_WARN("SERVE-PROOF path='{}' off={:08X} serveOff={:08X} stored={} "
+                  "logical={} served={} head={:08X} declared={} listProved={} "
+                  "proved={} cls={} decoded={} w1delta={} w1disagrees={}",
+                  path, off, serveOff, storedLen, logicalLen, serveBytes.size(),
+                  MclaBE(serveBytes.data()), rsc5Declared, listProved ? 1 : 0,
+                  proved ? 1 : 0, isRsc5Class ? "rsc5" : "other", rsc5Decoded,
+                  w1delta,
+                  (isRsc5Class && w1delta != 0) ? 1 : 0);
 
     dst = mem.Alloc(static_cast<uint32_t>(serveBytes.size()), 16);
     if (!dst)
@@ -1952,11 +3672,20 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize) {
       continue;
     }
     outSize = static_cast<uint32_t>(serveBytes.size());
-    MCLA_LOG_WARN("XSF-HOSTSERVE path='{}' off={:08X} size={} buf={:08X} "
-                  "head={:08X} pkgSubst={:08X} pass={} toc=[{:08X} {:08X} "
-                  "{:08X} {:08X}]",
-                  path, serveOff, outSize, dst, MclaBE(serveBytes.data()),
-                  pkgSubst, pass, w[0], w[1], w[2], w[3]);
+    if (outProved)
+      *outProved = proved;
+    // F-632: the three fields are printed next to the window they produced, so a
+    // row is self-checking: off must be w2&0x7FFFFF, stored must be
+    // w3&0x3FFFFF and the served size must be the LOGICAL length (w1) unless a
+    // package was substituted. w653's rows cannot be checked this way -- they
+    // read `off=00068000` against `toc=[E2D132A2 00068000 003F0000 400503CF]`,
+    // i.e. the serve used the size as the offset, which is the whole finding.
+    MCLA_LOG_WARN("XSF-HOSTSERVE path='{}' off={:08X} size={} stored={} "
+                  "logical={} buf={:08X} head={:08X} pkgSubst={:08X} pass={} "
+                  "toc=[{:08X} {:08X} {:08X} {:08X}]",
+                  path, serveOff, outSize, storedLen, logicalLen, dst,
+                  MclaBE(serveBytes.data()), pkgSubst, pass, w[0], w[1], w[2],
+                  w[3]);
   }
   }
   vfs.CloseFile(fh);
@@ -2112,6 +3841,127 @@ static bool MclaFindServedBody(uint32_t dev, uint32_t handle, uint32_t flagWord,
 // the w19 served-list bootstrap can call it before that hook appears.
 PPC_FUNC_IMPL(__imp__sub_821854C8);
 
+// ---------------------------------------------------------------------------
+// THE canonical host->guest synthetic context: r13 + a REAL private stack.
+// One helper, two callers (:3201 MclaInsertNamesFromBytes, :4366
+// MclaBootstrapGlobaltexNames). Both values below are measured, not inferred.
+//
+// WHY THE `*_AS_LOCAL` CONFIG DOES NOT MAKE r1/r13 OPTIONAL
+//   With PPC_CONFIG_NON_ARGUMENT_AS_LOCAL (src/ppc_config.h:9) and
+//   PPC_CONFIG_NON_VOLATILE_AS_LOCAL (:10) defined, src/ppc_context.h:323
+//   omits r0/r2/r11/r12 and r14-r31 from the struct ENTIRELY -- generated code
+//   declares those as `PPCRegister rNN{}` function locals instead. So the
+//   host does NOT populate them. What remains a struct member, and therefore
+//   the host's responsibility, is r1 (@0x08), r13 (@0x48), the argument
+//   registers r3-r10, and lr. The two sites this replaces set r3/r4 only.
+//   r13 is a PURE INPUT: generated/ppc contains ZERO writes of `ctx.r13 =`
+//   across all recompiled TUs, exactly as generated/ has none for the boot
+//   thread -- the host must supply it or the guest reads address 0.
+//
+// WHY r13 IS READ FOUR TIMES PER CALL (this is P3's "x4", measured)
+//   __imp__sub_821B5A60 (generated/ppc/ppc_recomp.15.cpp:2849): r13+0 :2869,
+//                                                          r13+60 :2875
+//   __imp__sub_821D2970 (generated/ppc/ppc_recomp.19.cpp:2308): r13+0 :2345,
+//                                                          r13+60 :2351
+//   With ctx.r13 == 0 those reads are at guest 0 and guest 60. Both are
+//   refused by GuestMemoryHeap::IsValid (src/kernel/memory.cpp:502-523,
+//   clause `guestAddr < 4096`), so ReadU32BE returns false with *outVal
+//   UNWRITTEN (memory.cpp:204-210) and ReadGuestU32 (src/guest_memory.h:82-86)
+//   DROPS that bool, so the recompiled code executes on a FABRICATED 0.
+//   (guest_memory.h:82 is the dropped-bool site; not my file, not touched.)
+//   The zeros are not benign: __imp__sub_821B5A60's `cmplwi cr6,r30,0 / beq`
+//   then falls to loc_821B5AC4 and STORES 0 into *(r3), and __imp__sub_821D2970's
+//   identical compare skips its whole insert body.
+//
+// WHY r1 IS REQUIRED -- a zero r1 is NOT a no-op, it corrupts registers
+//   These are pushing frames that RELOAD what they stored:
+//     __imp__sub_821854C8 (ppc_recomp.9.cpp:24170): stw r12,-8(r1) :24179,
+//        std r31,-16(r1) :24181, stwu r1,-96(r1) :24183, then lwz r12,-8(r1)
+//        :24228 and ld r31,-16(r1) :24232.
+//     __imp__sub_821D2970 (ppc_recomp.19.cpp:2308): stores at :2320-2324,
+//        reloads all three at :2375-2381.
+//     __imp__sub_821B5A60 (ppc_recomp.15.cpp:2849): same shape.
+//   With ctx.r1 == 0 every store lands at 0xFFFFFF.., which IsValid refuses
+//   (0xFFFFFFF8 >= m_size, and m_size is the 4 GiB adopted at
+//   src/boot_host.cpp:2935 from GuestMemorySize :78), so the matching reloads
+//   fabricate 0: r30 and r31 come back ZERO and ctx.lr is zeroed. Fixing r13
+//   while leaving r1 == 0 would trade a null r13 for a silently
+//   register-corrupting frame, so both are set here or neither is.
+//
+// VALUE OF r13 = 0x8F200000  (measured, not chosen)
+//   SetupInitialContext (src/boot_host.cpp:1078) sets ctx.r13 = 0x8F200000 and
+//   memsets + populates that block at :1076-1087 -- *(r13) = TableBase
+//   0x8F201000, TEB at +0x100, cpu at +0x10C, want-errors at +0x150,
+//   TableBase+28 = Descriptor 0x8F202000 whose [0] = FuncBlock 0x8F203000.
+//   That is exactly the *(r13) / *(r13+28) chain these callees dereference.
+//   boot_host.cpp:1092-1110 (F-609) forbids moving it, and 13 other synthetic
+//   sites in THIS file already pass exactly 0x8F200000 (:6651, and the note
+//   at :7781). It is inside the arena, so IsValid(0x8F200000,4) passes and
+//   the read is real rather than refused.
+//
+// VALUE OF r1 = top of a private 64 KiB region, allocated ONCE (not a constant)
+//   Deliberately not a literal:
+//     - a fabricated stack address is prohibited (F-609 NATIVE-ONLY);
+//     - the boot thread's own 0x8F000000 (boot_host.cpp:1034) must NOT be
+//       reused, because BOTH call sites run ON the guest thread --
+//       MclaBootstrapGlobaltexNames is called from PPC_FUNC(sub_82180A30)
+//       (:4386), i.e. from inside a live guest frame, so a fixed 0x8F000000
+//       would alias that thread's own frames;
+//     - the file-wide literal 0x006D8EC0 (:6650 and 19 more sites) is
+//       documented at :7785 as coming "from a 15-day-old run". It does land in
+//       committed R/W memory, so it is a HYGIENE defect, not a live bug: those
+//       13 sites are NOT defective and are deliberately left untouched.
+//   Size: the measured worst-case cumulative push depth over the tree
+//   reachable from 0x821854C8 is 432 B (96 + 112 + 112 + 112). Repairing r13
+//   RE-OPENS the branch to sub_82187A38 / sub_8217D890 that the broken r13
+//   used to skip, so the budget must cover the REPAIRED path, not the broken
+//   one; 64 KiB is ~150x the measured floor and costs one allocation in a
+//   4 GiB arena. 16-byte aligned (PPC ABI stack alignment) and zeroed once,
+//   matching boot_host.cpp:1036 and the MclaXcFreshCtx idiom at :6670-6673.
+//
+// lr IS DELIBERATELY LEFT UNTOUCHED. Every indirect branch in this tree writes
+//   its own return address and then branches to ctr, never to lr (e.g.
+//   ppc_recomp.19.cpp `mtctr r8` / `ctx.lr = 0x821D275C` /
+//   PPC_CALL_INDIRECT_FUNC(ctr.u32)), and each frame saves and restores ctx.lr
+//   across its own body. So lr is never a branch target here and needs no
+//   value; supplying one would be a fabrication. msr/fpscr keep the
+//   PPCContext defaults (msr = 0x200A000, src/ppc_context.h:379, which is the
+//   value boot_host.cpp:1039 sets by hand) -- nothing else about what the
+//   guest observes changes.
+// ---------------------------------------------------------------------------
+
+// Exactly-once private stack for host-built guest contexts. Returns the stack
+// TOP (the PPC stack grows down) or 0 if the allocation failed, in which case
+// the caller MUST skip the guest call rather than fall back to r1 == 0.
+static uint32_t MclaSyntheticGuestStackTop(auto &mem) {
+  static std::mutex s_synStackMtx;
+  static uint32_t s_synStackTop = 0;
+  std::lock_guard<std::mutex> lk(s_synStackMtx);
+  if (s_synStackTop == 0) {
+    constexpr uint32_t kBytes = 0x10000u; // 64 KiB, justified in the note above
+    const uint32_t stackBase = mem.Alloc(kBytes, 16);
+    if (stackBase == 0)
+      return 0;
+    const std::vector<uint8_t> zero(kBytes, 0);
+    (void)mem.WriteBytes(stackBase, zero.data(), kBytes);
+    s_synStackTop = stackBase + kBytes;
+    // New marker name on purpose: this is a one-shot host-allocation notice, not
+    // a census row, so it cannot perturb any existing marker count or gate.
+    MCLA_LOG_WARN("SYNCTX-STACK base={:08X} top={:08X} bytes={:08X} r13={:08X}",
+                  stackBase, s_synStackTop, kBytes, 0x8F200000u);
+  }
+  return s_synStackTop;
+}
+
+// The single synthetic-context constructor. r1 == 0 means "no stack available":
+// callers must not enter the guest with it (see MclaSyntheticGuestStackTop).
+static PPCContext MclaSyntheticGuestCtx(auto &mem) {
+  PPCContext c{};
+  c.r13.u64 = 0x8F200000u; // measured; boot_host.cpp:1078
+  c.r1.u64 = MclaSyntheticGuestStackTop(mem);
+  return c;
+}
+
 // Parse first tokens (and embedded printable runs) from a served body and
 // INSERT each name via the guest's own 821854C8(noneObj, name).
 static int MclaInsertNamesFromBytes(uint8_t *base, uint32_t noneObj,
@@ -2154,10 +4004,13 @@ static int MclaInsertNamesFromBytes(uint8_t *base, uint32_t noneObj,
       if (nameAddr != 0) {
         (void)mem.WriteBytes(nameAddr, cur.c_str(),
                              static_cast<uint32_t>(cur.size()) + 1);
-        PPCContext tmp{};
+        PPCContext tmp = MclaSyntheticGuestCtx(mem);
         tmp.r3.u32 = noneObj;
         tmp.r4.u32 = nameAddr;
-        __imp__sub_821854C8(tmp, base);
+        // r1 == 0 => the private stack could not be allocated. Skip the guest
+        // rather than re-introduce the dropped-store frame (see the helper).
+        if (tmp.r1.u32 != 0)
+          __imp__sub_821854C8(tmp, base);
         ++inserted;
       }
     }
@@ -2461,7 +4314,12 @@ static std::atomic<uint32_t> s_821873E8_live{0};  // F-358 alive-path census
 // dispatching the UILOAD callback is not what initialises GFx. Back to false, and it must stay
 // false: while it is true, `W35-BOOT-GATE` is our own line and proves nothing about the guest
 // reaching 0x821315F4. Re-arm only to re-test that negative.
-constexpr bool kF368HostDispatchGate = false;  // F-436/F-438: measured ON twice (w433/w436), reverted; the user still owns this lever
+// F-609 NATIVE CHARTER: the host dispatch gate is RETIRED, not flaggable.
+// kF368HostDispatchGate (was here, always false since F-436/F-438 measured
+// the forced dispatch null twice, w433/w436) and the whole
+// dispatchBootGateOnce body (own thread + stack + GFX-ALLOC/CTOR + BOOT-GATE)
+// are deleted. F-055 stays the user's in principle; no mechanism for it
+// remains in the tree, which is the point: the boot must be earned.
 PPC_FUNC(sub_821873E8) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t n = s_821873E8_hits.fetch_add(1) + 1;
@@ -2474,185 +4332,8 @@ PPC_FUNC(sub_821873E8) {
   if (tlsOk)
     (void)mem.ReadU32BE(tlsTable + 12, &slot12);
 
-  // F-368 (user-approved 2026-09-26): what used to be an `if` inside the TLSDEAD branch only.
-  // Making it callable lets the ALIVE path reach it too, which is the point of the experiment:
-  // F-367 showed nothing in the image can reach the guest's own registration of sub_82131008,
-  // so the only way to test whether that callback leads to GFx is to dispatch it ourselves.
-  // It stays seed-free (T38.3f) -- flags are read, never written -- and runs at most once.
-  auto dispatchBootGateOnce = [&] {
-    static std::atomic<uint32_t> s_uiLoadCalled{0};
-    if (s_uiLoadCalled.fetch_add(1) != 0) return;
-    // T41.3 / w38o: this stand-in used to run INLINE, i.e. the host forced
-    // sub_82131008 re-entrantly from inside the guest's own allocator hook, on the
-    // thread that was mid-way through sub_823047D8 (w38o.log:3866 -> :3868 -> :3869
-    // -> :4088 in w38n). The AV the gate provoked therefore killed that caller too,
-    // and the tail of sub_823047D8 never ran — including 0x82304910, whose callee
-    // sub_822F38C0 is the ONLY writer of the [0x8287E26C] singleton that the gate
-    // then faulted on (F-060). Same stand-in, off the caller's stack, and given the
-    // guest a window to publish that singleton itself first. Nothing is fabricated:
-    // if [0x8287E26C] never appears, GATE-WAIT says so and the gate runs anyway.
-    MCLA_LOG_WARN("FIX-821873E8 dispatching BOOT-GATE (sub_82131008) on its own thread");
-    std::thread([caller = ctx]() mutable {
-      PPCContext &ctx = caller;
-      SetPPCContext(ctx);  // a fresh host thread has no TLS context (guest_thread.cpp:34)
-      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-      // This thread now runs concurrently with the guest thread the hook was called
-      // from, so the gate cannot share that thread's stack: everything below r1 is
-      // exactly where a live thread pushes its next frames. Give it its own — from
-      // the HOST user heap, the same source GuestThreadContext uses for real guest
-      // thread stacks (src/kernel/guest_thread.cpp:20). Taking it from
-      // GuestMemoryHeap::Alloc (the guest PHYSICAL o1heap) is wrong: w38p.log:3890
-      // allocated r1=CA75D740 there and 1 ms later three
-      // `AllocPhysical: o1heapAllocate returned null size=0xca71d400` appeared that
-      // are absent from the baseline w38m.log.
-      void *stackHost = g_userHeap.Alloc(0x40000);
-      const uint32_t callerR1 = ctx.r1.u32;
-      if (stackHost != nullptr) {
-        ctx.r1.u64 = mcla::kernel::MapVirtual(
-                         static_cast<uint8_t *>(stackHost) + 0x40000u - 64u) &
-                     ~15u;
-        MCLA_LOG_WARN("GATE-STACK own guest stack r1={:08X} (caller's was {:08X})",
-                      ctx.r1.u32, callerR1);
-      } else {
-        MCLA_LOG_WARN("GATE-STACK 256K userHeap alloc FAILED, gate reuses caller r1={:08X}",
-                      ctx.r1.u32);
-      }
-      uint32_t sing = 0;
-      int waits = 0;
-      for (; waits < 50; ++waits) {
-        sing = 0;
-        (void)mem.ReadU32BE(0x8287E26Cu, &sing);
-        if (sing != 0 && sing != 0xCDCDCDCDu) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-      MCLA_LOG_WARN("GATE-WAIT [8287E26C]={:08X} after {} ms", sing, waits * 10);
-      auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
-    // T38.3f (2026-09-20): the four seed writes that used to be here are DELETED. The driver
-    // used to publish [0x8288E6F0]=1, [0x82830ACC]=0, [0x82830AB8]=0 and [0x82830B14]=0 and then
-    // call, by hand, exactly the functions those flags tell the gate to skip (raw decode:
-    // 0x82131020 `lwz r11,4(r29)` / 0x82131028 `bc -> 0x8213103C` skips 0x82131030/1038). Now
-    // the flags are only READ, so the log shows what the guest really has and the guest's own
-    // branches decide what runs. (F-055: the stage deletions got UILOAD to fire; this removes
-    // the last of the fabricated state that made that entry meaningless.)
-    for (const uint32_t flag : {0x8288E6F0u, 0x82830ACCu, 0x82830AB8u, 0x82830B14u, 0x8288B9ACu,
-                                0x82830998u}) {
-      uint32_t v = 0;
-      (void)mem2.ReadU32BE(flag, &v);
-      MCLA_LOG_WARN("GATE-FLAG-READ [{:08X}] = {:08X} (read-only, T38.3f)", flag, v);
-    }
-
-    // ponytail: pump scheduler tick semaphore (0x40004D7C) now so UILOAD's KeWait
-    // doesn't park forever on an unsignaled semaphore.
-    ::SignalSchedulerTickPublic();
-
-    constexpr uint32_t kBootGateAddr = 0x82131008;
-    if (auto *gateFn = mcla::kernel::g_memory.FindFunction(kBootGateAddr)) {
-      // T38.3f: this is now the ONE guest entry the host forces here — sub_82131008 itself,
-      // with no seeded flags and no hand-staged callees (see the block below).
-      // ponytail: fresh ctx per house style (W32/W34 levers); gate takes no args, propagate stack only
-      PPCContext g{};
-      g.r1.u64 = ctx.r1.u64;
-      g.r13.u64 = ctx.r13.u64;
-      g.fpscr = ctx.fpscr;
-      g.fpscr.disableFlushModeUnconditional();
-
-      // Every guest call below runs on `g`, not on the caller's ctx: publish it so a
-      // fault inside the gate reports THIS frame (F-046 — the old dumps printed the
-      // boot thread's root context and every session read them as the faulting one).
-      mcla::boot::FaultContextScope gateCtx(&g, "forced-boot-gate");
-
-      // ponytail: create GFx loader object BEFORE gate stages so it exists even if gate hangs
-      // The ctor 824C6F08 writes vtable 0x820736DC at offset 0 and 0x820736B0 at offset 672.
-      MCLA_LOG_ERROR("GFX-BLOCK: entered pre-gate");
-      // 1024B: ctor 824C6F08 writes obj+740+68/+72 (=+808/+812) and 6F70 reads
-      // [obj+816]; Alloc(800) truncated both and corrupted the heap.
-      uint32_t gfxLoader = mem.Alloc(1024, 16);
-      MCLA_LOG_ERROR("GFX-ALLOC loader={:08X} null={}", gfxLoader, gfxLoader == 0);
-      if (gfxLoader) {
-        for (uint32_t off = 0; off < 1024; off += 4)
-          (void)mem.WriteU32BE(gfxLoader + off, 0);
-        if (auto *ctorFn = mcla::kernel::g_memory.FindFunction(0x824C6F08u)) {
-          MCLA_LOG_ERROR("GFX-CTOR-FN found at 824C6F08");
-          PPCContext gfxP{};
-          gfxP.r1.u64 = ctx.r1.u64;
-          gfxP.r13.u64 = ctx.r13.u64;
-          gfxP.fpscr = ctx.fpscr;
-          gfxP.r3.u64 = gfxLoader; // ctor expects object pointer in r3
-          mcla::boot::FaultContextScope gfxCtx(&gfxP, "gfx-loader-ctor");
-          MCLA_LOG_ERROR("GFX-CTOR entering loader={:08X}", gfxLoader);
-          ctorFn(gfxP, mcla::kernel::g_memory.base);
-          uint32_t vt = 0, vt2 = 0;
-          (void)mem.ReadU32BE(gfxLoader, &vt);
-          (void)mem.ReadU32BE(gfxLoader + 672, &vt2);
-          MCLA_LOG_ERROR("GFX-CTOR done loader={:08X} vt0={:08X} vt672={:08X}", gfxLoader, vt, vt2);
-          // Faithful: ctor 824C6F08 writes vt0=0x820736DC, vt672=0x820736B0
-          // (generated ppc_recomp.94.cpp:3559-3587, single-arg r3 only).
-          // Prior D8/B8 overwrite was off-by-4 (off_820736DC confusion) — verify only.
-          if (vt != 0x820736DCu || vt2 != 0x820736B0u) {
-            MCLA_LOG_ERROR("GFX-CTOR-VT-MISMATCH loader={:08X} got {:08X}/{:08X} want 820736DC/820736B0",
-                           gfxLoader, vt, vt2);
-          }
-        } else {
-          MCLA_LOG_ERROR("GFX-CTOR-FN NOT FOUND at 824C6F08");
-        }
-      } else {
-        MCLA_LOG_ERROR("GFX-ALLOC FAILED");
-      }
-
-      MCLA_LOG_WARN("BOOT-GATE started on boot worker thread");
-      s_inUILoad.store(true);
-      struct UiLoadGuard {
-        ~UiLoadGuard() { s_inUILoad.store(false); }
-      } uiGuard;
-
-      // Reserve 4 KB guest stack window for the gate and everything it calls; never
-      // reuse the caller's live frame (prior r1+80/84 overwrote the LR-save area).
-      // T38.3f: 256 B was enough for the hand-staged leaf calls, but the gate now runs
-      // its own tree (0x82131010 `stwu r1,-128(r1)` plus nested frames), so the reserve
-      // has to cover nested guest frames instead of one leaf.
-      uint32_t stageStack = 0;
-      {
-        auto &mm = mcla::kernel::GuestMemoryHeap::Instance();
-        const uint32_t rs = (g.r1.u32 - 4096u) & ~15u;
-        uint32_t probe = 0;
-        uint32_t probeLo = 0;
-        if (rs && mm.ReadU32BE(rs, &probe) && mm.ReadU32BE(rs + 4080u, &probeLo)) {
-          stageStack = rs;
-          g.r1.u32 = rs;
-        } else {
-          MCLA_LOG_WARN("GATE-STAGE no 4K stack reserve, keeping r1={:08X}", g.r1.u32);
-        }
-      }
-      // T38.3f (2026-09-20): the hand-staged calls (sub_821C0750 x2 + UILOAD sub_822C0980)
-      // are DELETED. They existed only to isolate a hang point after the gate's own
-      // prologue crashed, and they contradicted the flag seeds that are now gone: the guest
-      // reaches them itself at 0x82131054 / 0x821310B0 with r1-relative out-params and
-      // r3=[0x82830998], and it compares their results against [0x827D7500+44] before
-      // deciding (raw decode of 0x82131008-0x821310D0). Running the real function is the
-      // only measurement that says whether the boot path can advance without a host
-      // stand-in (F-055 named the last fabrication; this deletes it).
-      // lr is the caller's own return address, so `mflr r12` at 0x82131008 sees a frame
-      // this host actually called from.
-      g.lr = ctx.lr;
-      MCLA_LOG_WARN("BOOT-GATE-ENTER 82131008 r1={:08X} r13={:08X} lr={:08X} reserve={:08X} (no seeds, T38.3f)",
-                    g.r1.u32, g.r13.u32, (uint32_t)g.lr, stageStack);
-      gateFn(g, mcla::kernel::g_memory.base);
-      MCLA_LOG_WARN("BOOT-GATE-RETURN 82131008 r3={:08X} r1={:08X}", g.r3.u32, g.r1.u32);
-      MCLA_LOG_WARN("BOOT-GATE stages done on boot worker thread r1={:08X}", g.r1.u32);
-
-      // Factory 82488C98 DISABLED: generated ppc_recomp.88.cpp:14741 shows
-      // (parent:r3 needs >=11576B for +11572 store, r4 index/flags, r5 ignored,
-      // r6 required config deref [r6+20]/[r6+24] via 82257678; zero calls to
-      // 824C6F08; movie lands at [parent+11572], never dest+4). Calling with
-      // r4=r5=r6=0 + Alloc(800) guarantees early-out/AV + heap overflow, and
-      // reading dest+4 always yields 0. Next: trace a real r6 config from a
-      // 82257678 caller, alloc >=11576, or drive 824C6F70(obj) lifecycle
-      // (824880F8 creates [obj+4] movie) then reuse W34-LOOKUP/PARSE-FLAG.
-      MCLA_LOG_ERROR("GFX-FACTORY-SKIP 82488C98 needs real r6 config + 11576B parent (see ppc_recomp.88)");
-      (void)mem;
-    }
-    }).detach();
-  };
+  // F-368 (user-approved 2026-09-26, retired F-609): the dispatch experiment
+  // lived here and is deleted; the experiment's negative stands in F-436.
 
   const bool slotLive = slot12 != 0 && slot12 != 0xCDCDCDCDu;
   if (tlsOk && slotLive) {
@@ -2667,8 +4348,7 @@ PPC_FUNC(sub_821873E8) {
                     "slot12={:08X} lr={:08X}",
                     nl, n, ctx.r13.u32, tlsTable, slot12,
                     static_cast<uint32_t>(ctx.lr));
-    // F-368: with the flag on, dispatch the gate from here too (user-approved test).
-    if (kF368HostDispatchGate) dispatchBootGateOnce();
+    // (dispatch call deleted F-609; passthrough is the whole behavior here.)
     __imp__sub_821873E8(ctx, base);
     return;
   }
@@ -2703,12 +4383,9 @@ PPC_FUNC(sub_821873E8) {
     }
   }
 
-  // After chain init, dispatch the REAL boot-gate (sub_82131008) on this thread.
-  // It performs init + event-gate checks and calls UILOAD itself at guest
-  // 0x821310B0 with the correct r3=[0x82830998]. Calling UILOAD directly
-  // (prior rev) bypassed the gates. Per W36 note, preset [0x8212E6F0]=1 to
-  // skip the 823043F8/4348 crash path.
-  dispatchBootGateOnce();  // TLSDEAD path: same behaviour as before F-368
+  // (F-609: the TLSDEAD dispatch call that was here is deleted with the gate.
+  // Dead tables are healed by the chain init above; then the alloc72 handoff
+  // below, which is load-bearing (prevents the lwz r9,0(0) AV).)
 
   uint32_t obj = mem.Alloc(72, 16);
   if (obj == 0) {
@@ -2815,6 +4492,64 @@ PPC_FUNC(sub_82411618) {
   if (n <= 12 || (n % 2000) == 0)
     MCLA_LOG_INFO("HELPER-thunk sub_82411618 hit #{} r3={:08X}", n, ctx.r3.u32);
   __imp__sub_82411618(ctx, base);
+}
+
+// F-595: census the CP publish-pointer producer side. put (dev+10908) is
+// advanced +2 ONLY by guest sub_82411CD0 (:0x82411DAC, unconditional) from
+// init 3; the host only ever reads it (gpu_cp.cpp, gpu_device.cpp:4662,
+// :4765). w622 froze at put=7 (957/1609 waits), i.e. exactly two windows
+// reserved, then nothing. These two hooks say whether the writer stops
+// being called, or its callers stop reaching it. Log-only, bounded,
+// registers-first; no state change.
+PPC_FUNC_IMPL(__imp__sub_82411CD0);
+static std::atomic<uint32_t> s_h11CD0{0};
+PPC_FUNC(sub_82411CD0) {
+  const uint32_t n = s_h11CD0.fetch_add(1) + 1;
+  const uint32_t dev = ctx.r3.u32;
+  const uint32_t lr = ctx.lr;
+  uint32_t putBefore = 0;
+  {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(dev + 10908u, &putBefore);
+  }
+  if (n <= 16 || (n % 2000) == 0)
+    MCLA_LOG_WARN("F595-PUTADV #{} dev={:08X} putBefore={} lr={:08X}", n, dev,
+                  putBefore, lr);
+  __imp__sub_82411CD0(ctx, base);
+  if (n <= 16) {
+    uint32_t putAfter = 0;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(dev + 10908u, &putAfter);
+    MCLA_LOG_WARN("F595-PUTADV-RET #{} dev={:08X} putBefore={} putAfter={}", n,
+                  dev, putBefore, putAfter);
+  }
+}
+
+// F-608: SkipIntro pre-census. LARecomp skips 0x822C2F08->0x822C2F7C (intro
+// movie block inside sub_822C2EA8). A guest-RAM branch patch would do NOTHING
+// here (recompiled code is baked from mcla_pe.bin at build time), so the only
+// transferable shape is callee-level. NO new hook: sub_821F8038 (intro movie
+// creator) is already probed as F364_PROBE("SIDE-A") in task_dispatch_trace
+// (lr-windowed ENTER/RETURN) - read those rows instead (rule 4's tool missed
+// the macro-generated owner; grep src/ too, F-366). Zero SIDE-A rows = the
+// skip is moot for the stall; ENTER-no-RETURN = the skip has a target.
+PPC_FUNC_IMPL(__imp__sub_82412588);
+static std::atomic<uint32_t> s_h12588{0};
+// F-596: which caller feeds the put-advance path (see ledger).
+PPC_FUNC(sub_82412588) {
+  const uint32_t n = s_h12588.fetch_add(1) + 1;
+  if (n <= 16 || (n % 2000) == 0)
+    MCLA_LOG_WARN("F596-12588 #{} r3={:08X} lr={:08X}", n, ctx.r3.u32, ctx.lr);
+  __imp__sub_82412588(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8242FEF8);
+static std::atomic<uint32_t> s_h2FEF8{0};
+PPC_FUNC(sub_8242FEF8) {
+  const uint32_t n = s_h2FEF8.fetch_add(1) + 1;
+  if (n <= 16 || (n % 2000) == 0)
+    MCLA_LOG_WARN("F595-2FEF8 #{} r3={:08X} lr={:08X}", n, ctx.r3.u32, ctx.lr);
+  __imp__sub_8242FEF8(ctx, base);
 }
 
 // PRIMARY CHOKE POINT (reverser-pinned 2026-08-23): sub_82411640 is a
@@ -3161,7 +4896,7 @@ const CapturedDrawV1 *mcla_gpu_GetLastCapturedDraw(uint32_t *outTotal) {
 PPC_FUNC_IMPL(__imp__sub_82420BA8);
 static std::atomic<uint32_t> s_h20BA8{0};
 PPC_FUNC(sub_82420BA8) {
-  // Single owner of the draw-builder seam (S1â€“S3 consolidation). The removed
+  // Single owner of the draw-builder seam (S1-S3 consolidation). The removed
   // native_renderer dual-owner hook folded its duties in here.
   mcla::renderer::RecordDrawBuild();
   const uint32_t n = s_h20BA8.fetch_add(1) + 1;
@@ -3301,7 +5036,7 @@ PPC_FUNC(sub_82420BA8) {
   // Trace feed (folded from the removed native_renderer dual-owner hook).
   // The accumulator no-ops unless capture mode enabled it via
   // SetCaptureEnabled; the MclaGpuContext overlay is the pre-existing
-  // capture-path pattern (S4 inventory â€” refactor with checked reads when
+  // capture-path pattern (S4 inventory -- refactor with checked reads when
   // capture_hooks grows a checked-read API).
   if (dev != 0) {
     mcla::native::GetDrawAccumulator()->OnDrawBuild(
@@ -3424,7 +5159,7 @@ static void MclaBootstrapGlobaltexNames(uint8_t *base) {
       continue;
     std::string line;
     while (std::getline(in, line)) {
-      // format: "<name> <file>" â€” first token is the registry name
+      // format: "<name> <file>" -- first token is the registry name
       const auto sp = line.find_first_of(" \t\r");
       std::string name = (sp == std::string::npos) ? line : line.substr(0, sp);
       while (!name.empty() && (name.back() == '\r' || name.back() == '\n'))
@@ -3437,10 +5172,13 @@ static void MclaBootstrapGlobaltexNames(uint8_t *base) {
         continue;
       (void)mem.WriteBytes(nameAddr, name.c_str(),
                            static_cast<uint32_t>(name.size()) + 1);
-      PPCContext tmp{};
+      PPCContext tmp = MclaSyntheticGuestCtx(mem);
       tmp.r3.u32 = noneObj;
       tmp.r4.u32 = nameAddr;
-      __imp__sub_821854C8(tmp, base);
+      // r1 == 0 => the private stack could not be allocated. Skip the guest
+      // rather than re-introduce the dropped-store frame (see the helper).
+      if (tmp.r1.u32 != 0)
+        __imp__sub_821854C8(tmp, base);
       ++inserted;
     }
   }
@@ -3480,61 +5218,53 @@ PPC_FUNC(sub_82177948) {
 }
 
 // ===========================================================================
-// Stage C: Shader dictionary hash-table hydration
+// REMOVED (2026-09-30) -- Stage C `HydrateShaderHashTable`, an F-609 NATIVE-ONLY
+// violation: the host was authoring 10 entries into the guest's own dictionary
+// hash table at 0x82839F70 + slot*4 (slots 0-9). A host serves bytes; it does
+// not write guest state.
 //
-// MEASURED (F-085/F-086, 2026-09-21). The table address 0x82839F70 is
-// raw-verified: sub_82188E50 holds `lis r11,0x8284` at 0x82188E5C and
-// `addi r28,r11,-0x6090` at 0x82188E60. The old account here ("empty table ->
-// sub_82189138 returns -1 -> star_glow fatal") is REFUTED: w38s.log:3975 shows
-// DICTLOOKUP-OK slot=10 followed by a different fatal, and w41i.log calls
-// sub_82189138 zero times while the same fatal occurs, so the lookup is not on
-// the fatal path. sub_821CB488 is a 7-byte "memory:" comparator, not a resource
-// handler lookup. The ten entries written below all carry a zero word at +4 and
-// an empty name, so a match by name hash is not possible.
-// Kept in tree pending a measured behaviour-neutral removal (soak x2).
+// Removal trigger, MEASURED (not assumed):
+//   * marker literals proven to exist in src/ before the counts were read, so a
+//     zero would have meant something (RULE 0 / F-057(6)):
+//     build/w679.log and build/w678.log, byte-exact, case-insensitive, both:
+//       'DICT-HYDRATE done:'  1
+//       'DICT-HYDRATE slot=' 10   (slots 0,1,2,...,9)
+//       'DICTLOOKUP-OK'      22   (COMPLETE, not sampled: the print is bounded
+//                                  at n<=32 and the max observed n is 22)
+//       'DICTLOOKUP-MISS'     0
+//   * the 22 observed lookup slots are
+//       62,67,68,68,69,70,71,72,73,53,74,74,51,44,47,75,76,77,61,78,79,80
+//     -- DISJOINT from the injected 0-9. No lookup ever resolved into the
+//     injected range, so the removal deletes 10 entries nothing has read.
+//
+// The "it is load-bearing" claim is REFUTED, not assumed:
+//   * 0x82839F70 has exactly ONE write site in the tree. Census of src/ +
+//     generated/ finds 8 hits in 4 distinct lines, all in this file, and only
+//     line 4153 was a write (`constexpr uint32_t TABLE = 0x82839F70`); the other
+//     three were comments. generated/ has ZERO hits. That one write was the
+//     function removed here.
+//   * MclaBootstrapGlobaltexNames (:4053) does not read this table. It calls the
+//     guest's own __imp__sub_821854C8, and `ppc_xrefs.py xref 0x82839F70`
+//     materialises the address at 11 guest sites -- sub_82188E50 (:0x82188E64,
+//     the INSERT), sub_82189138 (:0x82189174, this lookup), sub_82189438, and
+//     eight more. sub_821854C8 is NOT among them. Its own insert target is a
+//     DIFFERENT table, 0x82839E2C (8 materialising sites, likewise excluding
+//     sub_821854C8).
+//   * the comment that asserted the dependency ("insert names ... via the guest's
+//     own insert linker") described the LOOKUP NAME path, which is intact: the
+//     named-texture bootstrap still runs and still inserts through the guest's
+//     own linker. Only the hash-table write is gone.
+//
+// WHAT TO WATCH IN THE NEXT SOAK (the falsifying log lines):
+//   * `DICT-HYDRATE done:` and `DICT-HYDRATE slot=` must both go 1/10 -> 0. Any
+//     residue means this removal is not the only writer.
+//   * `DICTLOOKUP-OK` must stay 22 with the same slot set, and `DICTLOOKUP-MISS`
+//     must stay 0. A MISS above 0, or an OK slot moving, is the falsifier: it
+//     would mean the guest's own INSERT path (sub_82188E50 / sub_82189438) does
+//     need the host to pre-fill the table, and this must be reinstated.
+//   * `TEXDICT-CALLER` must stay at its baseline (the census hook survives; only
+//     the Stage C collection block and the `n == 10` trigger are gone).
 // ===========================================================================
-
-// Hash table hydration: populate 0x82839F70 from factory-created entries.
-static uint32_t s_factoryEntryPtrs[256] = {};
-static std::atomic<uint32_t> s_factoryEntryCount{0};
-
-static void HydrateShaderHashTable() {
-  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-  constexpr uint32_t TABLE = 0x82839F70;
-  constexpr uint32_t SLOT_COUNT = 256;
-
-  uint32_t count = s_factoryEntryCount.load();
-  uint32_t inserted = 0;
-
-  for (uint32_t i = 0; i < count && inserted < SLOT_COUNT; ++i) {
-    uint32_t entry = s_factoryEntryPtrs[i];
-    if (entry == 0 || !mem.IsValid(entry, 112))
-      continue;
-
-    uint32_t slot = 0;
-    for (; slot < SLOT_COUNT; ++slot) {
-      uint32_t val = 0;
-      mem.ReadU32BE(TABLE + slot * 4, &val);
-      if (val == 0)
-        break;
-    }
-    if (slot >= SLOT_COUNT)
-      break;
-
-    mem.WriteU32BE(TABLE + slot * 4, entry);
-    ++inserted;
-
-    uint32_t w[4] = {};
-    for (int j = 0; j < 4; ++j)
-      (void)mem.ReadU32BE(entry + j * 4, &w[j]);
-    MCLA_LOG_INFO("DICT-HYDRATE slot={} entry={:08X} [{:08X} {:08X} {:08X} "
-                  "{:08X}]",
-                  slot, entry, w[0], w[1], w[2], w[3]);
-  }
-
-  MCLA_LOG_INFO("DICT-HYDRATE done: {}/{} entries -> hash table @0x{:08X}",
-                inserted, count, TABLE);
-}
 
 // Census on sub_82189138 (lookup-or-insert).
 // ASSUMED, not verified (F-085/F-086): "scans 256 slots at 0x82839F70 comparing
@@ -3574,18 +5304,16 @@ PPC_FUNC(sub_82189138) {
 
 // Session 75e (IDA): pgDictionary load/register caller.
 // sub_82197598 links the dict into active list 0x82839ED0 (not a
-// recompiled entry â€” no __imp__). Census its mapped caller instead.
-// Stage C: collect entry pointers for hash table hydration.
+// recompiled entry -- no __imp__). Census its mapped caller instead.
+// The Stage C "collect entry pointer for hash table hydration" block that used
+// to sit here, and the `n == 10` hydration trigger at the tail, are removed
+// (2026-09-30) -- see the REMOVED block above. This census hook itself is
+// unchanged and must keep firing.
 PPC_FUNC_IMPL(__imp__sub_8218B000);
 static std::atomic<uint32_t> s_h18B000{0};
 PPC_FUNC(sub_8218B000) {
   const uint32_t n = s_h18B000.fetch_add(1) + 1;
   const uint32_t obj = ctx.r3.u32;
-
-  // Collect entry pointer for hash table hydration (Stage C)
-  if (obj != 0 && s_factoryEntryCount.load() < 256) {
-    s_factoryEntryPtrs[s_factoryEntryCount.fetch_add(1)] = obj;
-  }
 
   if (n <= 16 || (n % 50) == 0) {
     MCLA_LOG_INFO("TEXDICT-CALLER sub_8218B000 #{} r3={:08X} r4={:08X} lr={:08X}",
@@ -3602,12 +5330,6 @@ PPC_FUNC(sub_8218B000) {
     MCLA_LOG_INFO("TEXDICT-OBJ #{} @{:08X} [{:08X} {:08X} {:08X} {:08X} "
                   "{:08X} {:08X} {:08X} {:08X}]",
                   n, obj, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-  }
-
-  // Stage C: after factory completes all 10 entries, hydrate the hash table
-  if (n == 10) {
-    MCLA_LOG_INFO("TEXDICT-CALLER #10 reached â€” triggering hash table hydration");
-    HydrateShaderHashTable();
   }
 }
 
@@ -3642,8 +5364,168 @@ PPC_FUNC(sub_82185648) {
   __imp__sub_82185648(ctx, base);
 }
 
-// Session 75h: XMemDecompress (RPF3 LZX) â€” the real unsquish for archive
-// entries. Doc: docs/MCLA_RPF3_Technical_Reference.txt Â§8.
+// ===========================================================================
+// (2026-10-02) -- F-720/F-634 CADENCE SHAPE APPLIED TO THE FOUR TAIL-SATURATING
+// MARKERS: `XMEM`, `INFLATE-ENTER`, `INFLATE`, `XMEM-OPEN-CENSUS`. ONE CHANGE,
+// 91.96% OF EVERY LOG FILE. INSTRUMENTATION ONLY.
+//
+// F-ID DELIBERATELY NOT CLAIMED. Measured at edit time,
+// docs/ROOT_CAUSE_VALIDATION.md carries 584 `### F-NNN` headings, max `F-728`,
+// and F-721/F-722 are already allocated; a change confined to one `src/` file
+// must not allocate an ID in an append-only ledger another session is writing.
+// Cite the measurements below, never this block's date, as its authority.
+//
+// THE POISON, MEASURED ON build/w693.log (111,153,290 B / 715,856 lines), NOT
+// ASSERTED. The last `CP-`/`DRAW-`/`PC-` row is `DRAW-SEAM sub_82413660 #10`,
+// which starts at byte 4,900,565 and whose newline is at 4,900,702, so the
+// first TAIL byte is 4,900,703 and the post-`CP-` tail is 106,252,587 B =
+// 95.5910% of the file. The head is 4,900,703 B = 4.4090%. Ranked by rows over
+// the tail's 686,187 lines:
+//     1  XMEM               319,571        4  XMEM-OPEN-CENSUS   15,979
+//     2  INFLATE-ENTER      159,785        5  WAIT               10,019
+//     3  INFLATE            159,785        6  WAKE               10,018
+//                                              7  CAS-SITE          10,018
+// Ranks 1-4 are 655,120 rows = 95.47% of tail rows; ranks 5-25 are 31,063 rows
+// = 4.53%; ranks 8-25 are 871 rows between them, which is why the tail reads as
+// four shapes and nothing else. In BYTES over the whole file the same four are
+// 40,490,831 + 29,843,516 + 29,269,303 + 2,616,181 = 102,219,831 B = 91.963%.
+//
+// WHY THE ROWS ARE 106 MB OF NOTHING. Field tuples, with the ordinal and the
+// timestamp masked, counted distinct: `XMEM` 322,238 rows -> 16 distinct tuples,
+// of which ONE (`ctx=4000FD80 dest=B5FA6280 destLen=114688 src=BB00CC33
+// srcLen=0 ret=00000000 lr=821D5EBC`) accounts for 322,222 rows = 99.995%, the
+// other 15 being the head window n=1..16. `INFLATE` 161,126 rows -> 16 distinct
+// tuples, 161,111 identical = 99.992%. `INFLATE-ENTER` 161,638 rows -> 100
+// distinct, 161,111 identical = 99.685%; the residue is the 507 bypass rows plus
+// the head. `XMEM-OPEN-CENSUS` is the one CORRECTION to the claim as usually
+// stated: it is NOT constant. All 16,119 of its rows are distinct, because the
+// bracketed triad restates the running counters and `control=N` restates the
+// ordinal. Masking ordinal AND triad, it is 9 distinct tuples and ONE control
+// payload `r3=4000FD80 r4=B5FA6280 r5=006D8EA4 r6=BB00CC33 r7=006D8EA0` carries
+// 16,111 rows = 99.95%. So the accurate statement is "the only per-row value
+// that moves is one that restates the ordinal", not "zero new field values".
+//
+// WHY A MODULUS IS NOT A CADENCE -- the filter was never the problem, the
+// POPULATION is. All four rows already had a gate and every gate's arithmetic
+// reproduces EXACTLY on w693:
+//   `XMEM`              `n <= 16 || n % 100  == 0`, serial reaches 32,222,200
+//                       -> 16 + 322,222        = 322,238 rows  (measured 322,238)
+//   `INFLATE-ENTER`     `n <= 16 || n % 200  == 0 || j2Ent || stackCont`,
+//                       serial reaches 32,223,000
+//                       -> 16 + 161,115 = 161,131, plus 507 bypass
+//                         (6 `j2=1`, 501 `stackCont=1`) = 161,638 (measured)
+//   `INFLATE`           same `s_h5E10` counter, same `%200` -> 161,126 rows
+//   `XMEM-OPEN-CENSUS`  `n <= 4 || n % 2000 == 0`, control reaches 32,222,000
+//                       -> 4 + 16,111 = 16,115 (measured 16,115 control rows)
+// Three INDEPENDENT counters each reach ~32.22 M, over a measured 167.40 s of
+// `INFLATE-ENTER` traffic = 192,490 entries/s, and the rate is FLAT. A modulus
+// linear in an unbounded serial cannot bound volume: `%100` on 32 M is still
+// 322k rows. The counter has to be STRIDED, and the exact count has to come
+// from a SUMMARY rather than from row-counting -- F-634's shape, F-720's.
+//
+// THE STRIDE, AND ITS ARITHMETIC AGAINST THE MEASURED POPULATIONS. F-720 chose
+// 1024 against a measured population of 154,469 (w689.log). The population here
+// is 32,223,000 = 208.6x larger, so the same ratio asks for 1024 x 208 = 213k,
+// and the nearest power of two is 2^18 = 262,144:
+//   2^17 = 131,072 -> floor(32223000/131072) = 245 stride rows, over target
+//   2^18 = 262,144 -> floor(32223000/262144) = 122 stride rows
+// Power of two is load-bearing twice over, not taste: it makes the summary mask
+// `((n & (n - 1)) == 0)` a single AND, and it leaves each stride independently
+// changeable by one token, which the companion SUMMARY names in its own row.
+// Restoring any other stride is a one-token change to the constant named there.
+//
+// WHY POWERS OF TWO FOR THE SUMMARY, AND WHAT IT BUYS. The summary appears at
+// least once however few calls fire, and after a TRUNCATED soak the last
+// summary's `total=N` is a power of two, so the true final total is provably in
+// [N, 2N). w693.log is itself proof the boot can die mid-stream. This is load-
+// bearing here rather than decorative: measured, the last `total=` in w693's
+// `INFLATE-R3-CENSUS-SUMMARY` is 131,072, which bounds that marker only to
+// [26.2 M, 52.4 M) and CANNOT say 32,223,000. `INFLATE-ENTER-SUMMARY` is
+// therefore the row that has to carry the exact count, and it does -- its
+// `total=` is `s_h5E10` read AT the summary, not an estimate and not a row
+// count. Do not weaken the pow2 mask to a linear modulus to raise the summary
+// frequency; that is precisely the property that survives a truncated soak.
+//
+// NO ORDINAL IS ADDED TO ANY ROW AND NO ROW FORMAT CHANGES. The same F-720
+// discipline: 244 markers are tracked by tools/soak_census.py and reformatting
+// one is out of scope. All four row formats stay byte-for-byte as they were, so
+// a historical grep over them keeps working; the cadence is stated in the
+// companion SUMMARY (`head=`, `stride=`, `rows=`, `cadence=pow2`) so a reader
+// never has to infer the sampling from the source.
+//
+// PROJECTED ROW COUNT PER MARKER, SIMULATED over the measured populations, as
+// head + stride + power-of-two summaries. The summaries are ADDITIONAL rows, not
+// a subset of the head -- that is the point of a separate SUMMARY line:
+//     head    n = 1..32                          -> 32 rows
+//     stride  n = 262144, 524288, ... <= P       -> floor(32222200/262144) = 122
+//     summary n = 2^0..2^24 (2^25 = 33,554,432 > P) -> 25 rows
+//     --------------------------------------------------
+//     TOTAL                                         = 179 rows, vs 322,238 today
+// Same 179 for `INFLATE-ENTER` and `INFLATE` (their P = 32,223,000 also admits
+// 2^0..2^24 and excludes 2^25): a 1802x / 903x / 901x reduction.
+// `XMEM-OPEN-CENSUS` is 179 for `control` PLUS 4 for `wrapper` and 4 for
+// `caller` -- each of those two sites reaches only n=2, which is inside the head
+// and is also a power of two, so each emits 2 detail + 2 summary rows = 187 in
+// total, against 16,119 today, an 86x reduction.
+// `INFLATE-ENTER` ALSO still emits its 507 bypass rows (`j2Ent` / `stackCont`),
+// so ~686 rows rather than 179. That is intended and is NOT a stride failure:
+// the bypass is the load-bearing half of that gate and was kept on purpose. The
+// stride-controlled portion of it is the 154 head+stride rows.
+//
+// PROJECTED FILE SIZE, same simulation: 111,153,290 B -> ~9,144,352 B = 9.14 MB,
+// reclaiming ~102,008,937 B = 91.77%; tail 106,252,587 B -> ~4,243,649 B, tail
+// fraction 95.59% -> ~46.4%. PROJECTED, NOT MEASURED -- no soak was run and a
+// soak is the next session's to run, not this change's. The falsifiers are row
+// count and summary total: a head+stride portion much above ~300 rows means the
+// stride is too small, and a summary `total=` above 10^6 means the gate is not
+// bounding at all.
+//
+// WHAT THIS DOES NOT FIX, STATED RATHER THAN HIDDEN.
+//  - `XMEM` IS NOT DELETED. It is fully redundant with `T413N2-XMEM` (this file,
+//    64-key dedup cap) for every field it prints -- deleting would reclaim all
+//    40,490,831 B rather than striding it -- but it carries the
+//    `lr=821D5EBC` cross-reference and `T413N2-XMEM`'s dedup cannot guarantee
+//    that row appears at all. Deletion is a separate decision with its own
+//    falsifier; this change only strides the row.
+//  - THE SPIN IS THE FINDING; THE VOLUME IS ONLY ITS SHADOW. The five
+//    conditions that saturate `INFLATE-ENTER` are ALREADY tallied
+//    unconditionally under `g_f481Window` -- `g_f481Infl` / `g_f481Seeded` /
+//    `g_f481ExpNZ` / `g_f481OutNZ` / `g_f481MaxProd`, in the block immediately
+//    above that row's gate -- so those measurements survive this change byte for
+//    byte. What this change HIDES is the headline: how many of the 32.2 M
+//    entries hit each condition stops being legible in a row, and only the
+//    exact `total=` in the SUMMARY survives. That is the cost, stated.
+//  - RANKS 5-25 ARE NOT TOUCHED. `WAIT` + `WAKE` + `CAS-SITE` (10,019 / 10,018 /
+//    10,018) are the poller-rate measurement and `CP: VDRAIN-CENSUS` is the
+//    honest drain-truth signal; together 4.53% of tail rows. Striding them
+//    would risk a real measurement to fix a rounding error.
+//  - `XMEM-OPEN-CENSUS`'s HEAD IS 32, NOT LOWER, because its two live sites
+//    fired at n=1 and n=2 and their first rows ARE the F-309 liveness
+//    measurement: across all 16,115 control rows the triad reads
+//    `[wrapper=2 caller=2 control=N]`, i.e. the wrapper and the caller each ran
+//    exactly twice for the whole boot and never again. Four rows carry that;
+//    the other 16,111 restate it. A head below 2 would lose it outright.
+//
+// CONTAINER CHOICE, AND RULE 1b. The four constants below are the ONLY new
+// namespace-scope names in this change and none of them is storage. Each row's
+// `rows=` is a FUNCTION-LOCAL `static std::atomic<uint64_t>` beside its own
+// gate, and `total=` is the hook's EXISTING exact serial `n` (already a
+// `fetch_add`), so no mutex and no tally struct is added to a 32 M-call path:
+// one relaxed fetch_add fires on ~173 of 32,222,200 calls. The four row-counter
+// statics are listed with them below. No behaviour change beyond logging: every
+// `g_f481*` bump, every write to `s_xmemCtx` / `s_guestInflaterR3` /
+// `s_joinSlotAddr` / `s_openWrap` / `s_openCaller` / `s_openCtrl`, the 1-in-200
+// upstream `MclaCensusInflaterFamily` sample, the `s_seen` dedup and the
+// `s_f494Dumped` window budget all still happen on exactly the calls they did
+// before. Only four MCLA_LOG calls are gated.
+// ===========================================================================
+static constexpr uint32_t kCadHead = 32;          // first N calls, unfiltered
+static constexpr uint64_t kXmemStride = 1ull << 18;         // 262,144
+static constexpr uint64_t kInflateStride = 1ull << 18;      // 262,144, SHARED
+static constexpr uint64_t kOpenCensusStride = 1ull << 18;   // 262,144
+
+// Session 75h: XMemDecompress (RPF3 LZX) -- the real unsquish for archive
+// entries. Doc: docs/MCLA_RPF3_Technical_Reference.txt sec.8.
 // 8244FF20 = XMemDecompress dispatcher (codec must be 1/LZX).
 // 82460420 = maps inner result to HRESULT.
 PPC_FUNC_IMPL(__imp__sub_8244FF20);
@@ -3907,12 +5789,33 @@ PPC_FUNC(sub_8244FF20) {
                     "destSzPtr={:08X} destLen={} ret={:08X} lr={:08X}",
                     n, src, srcSz, realSrcSz, dest, destSz, realDestSz, ret, lr);
   }
-  if (n <= 16 || (n % 100) == 0) {
+  // (2026-10-02) `n <= 16 || n%100==0` admitted 16 + 322,222 = 322,238 rows on
+  // a serial that reaches 32,222,200, which is the whole argument for the
+  // constants block above: a modulus linear in an unbounded serial cannot bound
+  // volume. Now head + 1-in-262144, plus a power-of-two SUMMARY that carries the
+  // exact count. The row's own format is UNCHANGED (244 markers are tracked by
+  // tools/soak_census.py); this row is strided, not deleted -- it carries the
+  // `lr=821D5EBC` cross-reference that `T413N2-XMEM`'s 64-key dedup cannot
+  // guarantee. Measured on w693.log: 322,238 rows -> 16 distinct field tuples,
+  // one of which is 322,222 rows = 99.995%.
+  static std::atomic<uint64_t> s_xmemRows{0};
+  const bool xmemRow = (n <= kCadHead) || ((n % kXmemStride) == 0);
+  const bool xmemSummary = ((n & (n - 1)) == 0);
+  if (xmemRow) {
+    s_xmemRows.fetch_add(1, std::memory_order_relaxed);
     MCLA_LOG_INFO("XMEM #{} ctx={:08X} dest={:08X} destLen={} src={:08X} "
                   "srcLen={} ret={:08X} lr={:08X}",
                   n, ctxp, dest, realDestSz, src, realSrcSz, ret,
                   static_cast<uint32_t>(ctx.lr));
   }
+  if (xmemSummary)
+    // `total=` is `n`, this hook's EXACT serial, not a row count -- so it bounds
+    // a truncated soak's true total to [total, 2*total). `cadence=pow2` states
+    // why. `rows=` is the exact number of XMEM rows printed so far.
+    MCLA_LOG_INFO("XMEM-SUMMARY total={} rows={} head={} stride={} cadence=pow2 "
+                  "note=exact-total-unaltered-row-format",
+                  n, s_xmemRows.load(std::memory_order_relaxed), kCadHead,
+                  kXmemStride);
   if (n <= 6 && ret == 0 && dest != 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t head = 0;
@@ -3972,7 +5875,7 @@ PPC_FUNC(sub_822012E8) {
 }
 
 // Session 75j: the empty-dict factory itself (mapped). Requesters 8218D120/
-// 8218CB10 never run â€” this is reached via indirect/vtable from unmapped code.
+// 8218CB10 never run -- this is reached via indirect/vtable from unmapped code.
 PPC_FUNC_IMPL(__imp__sub_8218BF20);
 static std::atomic<uint32_t> s_h18BF20{0};
 PPC_FUNC(sub_8218BF20) {
@@ -4058,7 +5961,7 @@ PPC_FUNC(sub_821854C8) {
   __imp__sub_821854C8(ctx, base);
 }
 
-// Session 75j: requesters into the empty-dict factory (8218BEB0â†’8218BF20).
+// Session 75j: requesters into the empty-dict factory (8218BEB0->8218BF20).
 PPC_FUNC_IMPL(__imp__sub_8218D120);
 static std::atomic<uint32_t> s_h18D120{0};
 PPC_FUNC(sub_8218D120) {
@@ -4182,18 +6085,97 @@ void AddSurfaceCandidate(uint32_t va, uint32_t w, uint32_t h, const char* src) {
 }
 
 // Re-score all candidates and publish the best.
+//
+// F-633 (MMIO audit, two defects in the five lines this used to be):
+//
+// 1. `(was ...)` was read AFTER the store, so it could only ever print the NEW
+//    value. w653 shows it three times and all three rows are the bug in
+//    decimal: `va=004E0D30 (was 5115184)` and 5115184 == 0x4E0D30;
+//    `va=CB1B8480 (was 3407578240)` and 3407578240 == 0xCB1B8480. The previous
+//    value is now taken with an EXCHANGE before the store, which both reads it
+//    correctly and makes the publish a single atomic operation.
+// 2. The re-score is 8 candidates x 256 guest 4-byte reads = 2,048 reads, every
+//    call, all of them under g_candMutex, and the only caller is the present
+//    kick -- so the mutex is held across 2,048 guest-memory round trips per
+//    frame. The SCORE is now gated (full re-score on the first 8 calls, then
+//    every 30th) while the SELECTION over the cached scores still runs on every
+//    call, so a winner that changes is still published the moment the gated
+//    re-score notices it. The row is also no longer change-only: the audit
+//    needed to see every refresh to count them, and the call rate is the
+//    present kick (24 in w653), not per-guest-read.
+//
+// F-634 (log quality, the F-054 defect in a new dress). "Log every refresh"
+// is F-054's shape: the two fixes above are correct and were kept, but
+// RefreshResolvedSurface is called from mcla_gpu_AddSurfaceCandidate on EVERY
+// candidate add, and the picker adds one per present, so the call rate is
+// ~2,000/s, not the 24 w653 showed. Measured on w658.log (1,001,196 lines,
+// 120 s): 236,309 of them (23.6%) were this one row, the second-largest shape
+// in the log and 42% of the lines outside the two mitigation floods. A log that
+// is 24% one row reads as a rich log and is not one (F-054: 66% of w38e).
+//
+// BOUND, not deleted, and the three things the rewrite was FOR all survive:
+//   * `prev` still comes from an exchange() BEFORE the store (F-633 #1);
+//   * the winning candidate's `src` is still named (F-633 intent);
+//   * every row now carries suppressed=/changed=/srcChg= CUMULATIVE counters,
+//     so "we did not print this" is distinguishable from "it did not happen".
+// A change of winner is the rare event and speaks for its first
+// kSurfChangeHead firings, then only counts -- a 200-wide window may hide a
+// change, but a hidden change is a NUMBER, not a vanished row.
+// House pattern: n <= K || (n % 200) == 0.
+constexpr uint32_t kSurfHead = 12;       // every refresh of the first boot window
+constexpr uint32_t kSurfChangeHead = 20; // change-events that each get a row
 void RefreshResolvedSurface() {
+  static std::atomic<uint32_t> s_refreshCalls{0};
+  static std::atomic<uint32_t> s_suppressed{0};
+  static std::atomic<uint32_t> s_changed{0};
+  static std::atomic<uint32_t> s_srcChg{0};
+  const uint32_t k = s_refreshCalls.fetch_add(1) + 1;
+  const bool rescore = (k <= 8u) || ((k % 30u) == 0u);
   std::lock_guard<std::mutex> lock(g_candMutex);
   uint32_t bestVA = 0, bestScore = 0;
+  const char *bestSrc = "";
+  uint32_t live = 0;
   for (auto& c : g_candidates) {
     if (c.va == 0) continue;
-    c.score = ScoreSurfacePixels(c.va, c.w ? c.w : 1280, c.h ? c.h : 720);
-    if (c.score > bestScore) { bestScore = c.score; bestVA = c.va; }
+    ++live;
+    if (rescore)
+      c.score = ScoreSurfacePixels(c.va, c.w ? c.w : 1280, c.h ? c.h : 720);
+    if (c.score > bestScore) {
+      bestScore = c.score;
+      bestVA = c.va;
+      bestSrc = c.src;
+    }
   }
-  if (bestVA != 0 && bestVA != g_resolvedSurfaceVA.load()) {
-    g_resolvedSurfaceVA.store(bestVA);
-    MCLA_LOG_WARN("PRESENT-SURF resolved va={:08X} score={} (was {})",
-                  bestVA, bestScore, g_resolvedSurfaceVA.load());
+  // Exchange, then log: `prev` is the value the previous refresh published, and
+  // the store lands whether or not the winner moved. F-633 #1: the exchange is
+  // BEFORE the store and is NOT reverted by the F-634 bound above.
+  const uint32_t prev = bestVA != 0
+                            ? g_resolvedSurfaceVA.exchange(bestVA)
+                            : g_resolvedSurfaceVA.load();
+  const uint32_t chgTotal = (prev != bestVA) ? s_changed.fetch_add(1) + 1
+                                            : s_changed.load();
+  // `src` is a literal handed to AddSurfaceCandidate, so compare by value, not
+  // pointer, and carry the last one in a buffer (a candidate slot is reused).
+  static char s_lastSrc[32] = {0};
+  char curSrc[32] = {0};
+  std::snprintf(curSrc, sizeof(curSrc), "%s",
+                bestSrc != nullptr ? bestSrc : "-");
+  const bool srcMoved = std::strcmp(curSrc, s_lastSrc) != 0;
+  const uint32_t srcTotal =
+      srcMoved ? s_srcChg.fetch_add(1) + 1 : s_srcChg.load();
+  if (srcMoved)
+    std::snprintf(s_lastSrc, sizeof(s_lastSrc), "%s", curSrc);
+
+  // F-634 bound: a change speaks loudly for the first kSurfChangeHead of them.
+  const bool speak = (k <= kSurfHead) || ((k % 200u) == 0u) ||
+                     (chgTotal != 0 && chgTotal <= kSurfChangeHead);
+  const uint32_t supp = speak ? 0u : (s_suppressed.fetch_add(1) + 1);
+  if (speak) {
+    MCLA_LOG_WARN("PRESENT-SURF #{} va={:08X} score={} (was {:08X}) src='{}' "
+                  "cands={} rescore={} changed={} suppressed={} changedTotal={} "
+                  "srcChg={}",
+                  k, bestVA, bestScore, prev, curSrc, live, rescore ? 1 : 0,
+                  prev != bestVA ? 1 : 0, supp, chgTotal, srcTotal);
   }
 }
 } // anonymous namespace
@@ -4285,7 +6267,7 @@ PPC_FUNC(sub_824294E0) {
       const uint32_t ts = static_cast<uint32_t>(
           mcla::native::QueryGuestTimebase() & 0xFFFFFFFFu) | 1u;
       // The table is 4-BYTE slots (idx 16..23). Write exactly one slot per
-      // entry â€” an 8-byte write here spilled into subctx+96 whenever
+      // entry -- an 8-byte write here spilled into subctx+96 whenever
       // (queued&7)+16 == 23. lwbrx interprets the bytes little-endian.
       for (uint32_t k = 0; k < 2; ++k) {
         const uint32_t off = (((queued + k) & 7u) + 16u) * 4u;
@@ -4304,7 +6286,7 @@ PPC_FUNC(sub_824294E0) {
 
 // R1 census: high-level frame-end entry. sub_82419E90(r3=dev) forwards to
 // sub_824199B0 which runs the flip picker + PresentKick + VdSwap sequence.
-// Fires only when the guest actually presents â€” first hit is the present
+// Fires only when the guest actually presents -- first hit is the present
 // milestone (currently absent through pool-OOM-era boots).
 PPC_FUNC_IMPL(__imp__sub_82419E90);
 static std::atomic<uint32_t> s_h19E90{0};
@@ -4318,7 +6300,7 @@ PPC_FUNC(sub_82419E90) {
 
 // ---------------------------------------------------------------------------
 // SESSION 74 census: tiled 2D surface blit (d3d9-style copy-rect, generated
-// impl ppc_recomp.80.cpp:37005). PROVEN corruptor path â€” its two memcpy call
+// impl ppc_recomp.80.cpp:37005). PROVEN corruptor path -- its two memcpy call
 // sites (guest lr 0x82431C5C / 0x82431D18) write 0xCDCDCDCD into the physical
 // arena at the allocation frontier (PHYS-OVERRUN @ CAEC5004..CAF04004), which
 // clobbers o1heap free-fragment headers: header.size / next_free read back as
@@ -4399,7 +6381,7 @@ PPC_FUNC(sub_82431A40) {
   // SESSION 74 GUARD: refuse a provably out-of-bounds blit. Blit #8 is handed
   // a 512x640 RECT against a 0xA000 destination and writes 0x46000 bytes of
   // copied 0xCD straight over o1heap free-fragment headers at the arena
-  // frontier â€” that is the AV storm, the E_OUTOFMEMORY cascade and the fatal
+  // frontier -- that is the AV storm, the E_OUTOFMEMORY cascade and the fatal
   // null-deref. On hardware the surface dims and the buffer always agree; here
   // the source descriptor is uninitialized (fmtEnum=0, flag=1 direct-copy
   // path), so the two disagree. Skipping only when the allocation match is
@@ -4421,7 +6403,7 @@ PPC_FUNC(sub_82431A40) {
 }
 
 // ---------------------------------------------------------------------------
-// SESSION 74 census: sub_824321E0 â€” the copy-rect wrapper, sole caller of the
+// SESSION 74 census: sub_824321E0 -- the copy-rect wrapper, sole caller of the
 // blit sub_82431A40 (call site guest 0x82432428). Capturing ITS parameters is
 // what separates "destination under-allocated" from "RECT is garbage":
 //   r3=dstW r4=dstH (the true surface dims) r5=log2 tile shift
@@ -4474,7 +6456,7 @@ PPC_FUNC(sub_824321E0) {
 // ---------------------------------------------------------------------------
 // SESSION 73 census: swap-completion processor. Advances dev[+21624] when
 // the swap table (dev[10896]) holds non-zero entries at the completed index.
-// Reads are lwbrx (little-endian) â€” the entries are HW-side bytes. Dump the
+// Reads are lwbrx (little-endian) -- the entries are HW-side bytes. Dump the
 // table window around the completed index to see why the advance stalls.
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_824286A0);
@@ -4511,7 +6493,7 @@ PPC_FUNC(sub_824286A0) {
 // SESSION 73: swap-completion status. The guest stops kicking presents once
 // dev[+21628] (queued) - dev[+21624] (completed) >= 6 (gate decoded at
 // ppc_recomp.79.cpp loc_82419FD8). Completions advance only when the
-// per-frame check sub_82428FD8 sees bit26 of sub_82458030() set â€” that fn
+// per-frame check sub_82428FD8 sees bit26 of sub_82458030() set -- that fn
 // reads [0x820007E8]=0x10059 then *(u32*)0x10059, a low-memory block the
 // 360 kernel populates and our emu never writes (always 0 -> return 0 ->
 // completions never advance -> presents stop after 6 kicks).
@@ -4527,7 +6509,7 @@ PPC_FUNC(sub_82458030) {
   const uint32_t n = s_h58030.fetch_add(1) + 1;
   __imp__sub_82458030(ctx, base);
   if (ctx.r3.u32 != 0)
-    return; // guest resolved its own status object â€” trust it
+    return; // guest resolved its own status object -- trust it
 
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t dev = 0;
@@ -4540,7 +6522,7 @@ PPC_FUNC(sub_82458030) {
   const uint32_t gap = queued - completed;
   if (gap != 0) {
     // rlwinm r11,r3,0,26,26 == r3 & 0x20: PPC bit 26 is value bit 5.
-    ctx.r3.u32 = 0x20u; // swap pending â€” run the completion processor
+    ctx.r3.u32 = 0x20u; // swap pending -- run the completion processor
     if (n <= 16 || (n % 1000) == 0)
       MCLA_LOG_WARN("SWAP-STATUS #{} dev={:08X} queued={} completed={} gap={} "
                     "-> bit26 (emu status; guest chain [0x820007E8]->0x10059 "
@@ -4604,7 +6586,7 @@ PPC_FUNC_IMPL(__imp__sub_8241BD08);
 static std::atomic<uint32_t> s_h1BD08{0};
 PPC_FUNC(sub_8241BD08) {
   const uint32_t n = s_h1BD08.fetch_add(1) + 1;
-  // Single owner of the submit seam (S1â€“S3 consolidation): frame counters +
+  // Single owner of the submit seam (S1-S3 consolidation): frame counters +
   // submit observers folded in from the removed native_renderer hook.
   mcla::renderer::RecordSubmit();
   mcla::renderer::hooks::DispatchBeforeSubmit(ctx, base);
@@ -4677,7 +6659,7 @@ PPC_FUNC(sub_82429570) {
 // ---------------------------------------------------------------------------
 // RING-WAIT census (2026-08-23): sub_82411928 is the SOLE doorbell-ringer
 // module-wide (PPC_MM_STORE_U32(0x7FC80000+1812), 77.cpp:20398). Earlier run:
-// 5 reserve passes then silence ï¿½ thread parked between 11218-return and the
+// 5 reserve passes then silence -- thread parked between 11218-return and the
 // doorbell store. Log predicate inputs + whether the tail is ever reached.
 // Units: dword indices, mask=dev[+14900]; published rptr = subctx[+60].
 // ---------------------------------------------------------------------------
@@ -4810,7 +6792,7 @@ PPC_FUNC(sub_82411E98) {
       if (pcBlk != 0) {
         (void)mem.WriteU32BE(pcBlk + 88, pcVal + 6000);
       }
-      ctx.r3.u32 = 0;  // STATUS_SUCCESS â€” wait completed
+      ctx.r3.u32 = 0;  // STATUS_SUCCESS -- wait completed
       return;
     }
   }
@@ -4854,7 +6836,7 @@ PPC_FUNC(sub_82419718) {
 // SLEEP-HELPER census (2026-09-10 KDELAY stall): sub_82460270(ms=r3,
 // alertable=r4) is the ONLY body that contains the lr=0x824602C4 site.
 // sub_8244FEC0(ms) is a tail-call with r4=0 (single Sleep). Main thread
-// parks forever at 10ms â€” outer poll loop re-enters this helper. Log
+// parks forever at 10ms -- outer poll loop re-enters this helper. Log
 // (ms, alertable, caller LR) so the outer loop is named.
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_82460270);
@@ -4907,8 +6889,11 @@ PPC_FUNC(sub_82135DC0) {
   // Finite timeouts are the poll patterns (frame pacing etc.) - always
   // surface those up to a cap; infinite worker parks stay throttled.
   const bool finite = timeoutArg != 0xFFFFFFFFu;
+  // F-578: this census was MCLA_LOG_INFO, so it produced 0 rows in every WARN
+  // soak (F-057(6) blind zero) and the handle the main thread parks on could
+  // not be named. Promoted to WARN with the existing bound unchanged.
   if ((finite && n <= 400) || n <= 12 || (n % 1000) == 0)
-    MCLA_LOG_INFO("WAITHELP sub_82135DC0 #{} h={:08X} t={} al={} lr={:08X}", n,
+    MCLA_LOG_WARN("WAITHELP sub_82135DC0 #{} h={:08X} t={} al={} lr={:08X}", n,
                   handle, timeoutArg, alertable, ctx.lr);
   const uint32_t lrIn370 = static_cast<uint32_t>(ctx.lr);
   F370SemaRow("WAIT", handle, timeoutArg, lrIn370);
@@ -4916,7 +6901,7 @@ PPC_FUNC(sub_82135DC0) {
   F370SemaRow("RETURNED", handle, ctx.r3.u32, lrIn370);
   const uint32_t d = s_h135DC0done.fetch_add(1) + 1;
   if (d <= 12 || (d % 1000) == 0)
-    MCLA_LOG_INFO("WAITHELP RETURNED #{} r3={:08X} (257=timeout)", d,
+    MCLA_LOG_WARN("WAITHELP RETURNED #{} r3={:08X} (257=timeout)", d,
                   ctx.r3.u32);
 }
 
@@ -4929,7 +6914,7 @@ PPC_FUNC(sub_82135DB8) {
   const uint32_t n = s_h135DB8.fetch_add(1) + 1;
   const uint32_t lrIn370 = static_cast<uint32_t>(ctx.lr);
   if (n <= 24 || (n % 1000) == 0)
-    MCLA_LOG_INFO("WAITB8 sub_82135DB8 #{} h={:08X} t={} lr={:08X}", n,
+    MCLA_LOG_WARN("WAITB8 sub_82135DB8 #{} h={:08X} t={} lr={:08X}", n,
                   ctx.r3.u32, ctx.r4.u32, ctx.lr);
   const uint32_t h370 = ctx.r3.u32;
   F370SemaRow("WAIT-B8", h370, ctx.r4.u32, lrIn370);
@@ -4947,13 +6932,13 @@ PPC_FUNC(sub_821C90C0) {
   const uint32_t handle = ctx.r3.u32;
   const uint32_t caller = ctx.lr;
   if (n <= 24 || (n % 1000) == 0)
-    MCLA_LOG_INFO("WAITSYNC sub_821C90C0 #{} h={:08X} caller={:08X}", n, handle,
+    MCLA_LOG_WARN("WAITSYNC sub_821C90C0 #{} h={:08X} caller={:08X}", n, handle,
                   caller);
   __imp__sub_821C90C0(ctx, base);
 }
 
 // Task-join table (generated ppc_recomp.15.cpp sub_821BD220):
-//   r30 = 0x8283D1AC  (lis -32124 â†’ 0x82840000, addi -11860)
+//   r30 = 0x8283D1AC  (lis -32124 -> 0x82840000, addi -11860)
 //   count   = *(u32*)(r30-4)  = 0x8283D1A8   // slot count; mask = count-1
 //   entries = *(u32*)(r30+24) = 0x8283D1C4
 //   idx     = (count-1) & tag
@@ -5171,7 +7156,7 @@ PPC_FUNC(sub_821E5640) {
   // (close handle, zero fields, optional release-flag work) runs normally.
   //
   // v1 failed because GetKernelObject(handle) returned raw guest memory
-  // instead of the canonical WrapperIdentityMap wrapper â€” Wait() saw count=0
+  // instead of the canonical WrapperIdentityMap wrapper -- Wait() saw count=0
   // on the wrong object.  With GetKernelObject fixed (session 70c) to route
   // through QueryKernelObject, both Release and Wait now operate on the same
   // host wrapper.
@@ -5267,9 +7252,9 @@ PPC_FUNC(sub_821BD220) {
 // INFLATE-BEGIN pass-through (session 72): zlibInflater::InflateBegin
 // (sub_821D5E10) fatals unless the stream starts with XCompress magic
 // 0x0FF512EF. Our VFS serves already-extracted raw files (vfs_rpf.h),
-// so the magic check fires on every named resource (meshtextures, â€¦).
+// so the magic check fires on every named resource (meshtextures, ...).
 // Honest short-circuit: if the stream does not carry the magic, copy the
-// remaining input to the output as uncompressed and advance the state â€”
+// remaining input to the output as uncompressed and advance the state --
 // same shape as the post-decompress pointer update in generated.
 //
 // state (r4) layout from ppc_recomp.19.cpp sub_821D5E10:
@@ -5296,6 +7281,28 @@ static bool BufLooksLikeRgxa(uint32_t buf) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t w = 0;
   return mem.ReadU32BE(buf, &w) && w == kRgxaMagic;
+}
+
+// D2308-REG: label a buffer's first BE word using the SAME vocabulary the
+// DEST-DUMP census already uses, so a refusal can name what it was actually
+// handed instead of only saying what it was not. Measured over the six
+// star_glow preload-pack destinations (w666.log BUF-HEAD D2308-buf): four read
+// 0x44495500 ("DIU\0") and two read 0x8200C454 / 0x82085364 with CDCDCDCD
+// fill behind them -- i.e. RSC resource packs and a stale/poisoned region,
+// never a shader container. BufLooksLikeRgxa is CORRECT on those six; it is
+// only too strict as a gate on a general registration (see D2308-REG).
+static const char *MclaClassifyHead(uint32_t w) {
+  if (w == kRgxaMagic)
+    return "RGXA";
+  if (w == 0xCDCDCDCDu)
+    return "POISON";
+  if ((w & 0xFFFF0000u) == 0x82080000u)
+    return "swfC-obj";
+  if ((w & 0xFFFFFF00u) == 0x44495500u || (w & 0xFFFFFF00u) == 0x44365500u)
+    return "RSC-res";
+  if (w == 0)
+    return "zero";
+  return "unknown";
 }
 static void DumpBufHead(const char *tag, uint32_t buf) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -5748,8 +7755,9 @@ static uint32_t MclaHostLzxDecode(const uint8_t *src, uint32_t srcLen,
 // 32 KiB chunks (guest keeps ctx+20 across frames), so payload bytes are
 // concatenated and decoded in one lzxd call. Returns decompressed bytes; 0 =
 // fail. Partial output is a fail — never serve a truncated resource.
-static uint32_t MclaHostXcDecodePackage(const uint8_t *pkg, uint32_t pkgSz,
-                                        std::vector<uint8_t> &out) {
+[[maybe_unused]] static uint32_t MclaHostXcDecodePackage(const uint8_t *pkg,
+                                                        uint32_t pkgSz,
+                                                        std::vector<uint8_t> &out) {
   out.clear();
   if (!pkg || pkgSz < 24)
     return 0;
@@ -6446,8 +8454,160 @@ static uint32_t MclaXcDecodeGuestInflate(auto &mem, uint32_t pkgBounce,
   return live ? produced : 0;
 }
 
+// ===========================================================================
+// F-720 (2026-10-01) -- CADENCE FOR `INFLATE-R3-CENSUS`, AND THE EXACT
+// ACCOUNTING THAT REPLACES ROW-COUNTING AS THE FALSIFIER.
+//
+// THE POISON, MEASURED ON w689.log, NOT ASSERTED. 141,675,295 B / 842,455
+// lines, of which `INFLATE-R3-CENSUS` is 154,469 rows = 34,909,994 B =
+// 24.64% of the file. On the first-three-raw-tokens shape census that is
+// 18.336% of all lines; the next shape is `TOCWALK-SLICE` at 1,863 rows
+// (0.221%), so this one row out-weighs its nearest rival 83:1. tools/soak_-
+// census.py's own collapse ranks it #4 of 8 (153,719 + 744 rows across two
+// `words[2]` collapse variants = 154,463 = 18.247%). This is F-054's failure
+// class: a log dominated by one repeating marker cannot be read, so the
+// measurements taken from it are destroyed by the marker itself.
+//
+// WHAT IT MEASURES, stated so the falsifier is about the right thing. It is
+// NOT per-decompress-chunk and NOT per-word. `MclaCensusInflaterFamily` is
+// called from exactly two places: this file's `PPC_FUNC(sub_821D5E10)` hook
+// (the guest's zlibInflater::InflateBegin -- the guest-fact is the comment at
+// the `INFLATE` row below, and the caller passes `ctx.r3.u32` as the inflater
+// object) and the J2-DIST replay, which is itself capped at 24 runs. So ONE
+// row = ONE guest entry into `sub_821D5E10`, and the body reads the guest's
+// inflater object (8 big-endian words at `infR3`) plus the joinTable family at
+// 0x8283D1A8/0x8283D1C4 -- it is a per-inflate-call census of which inflater
+// and which join slot is live.
+//
+// WHY ~154k ROWS, WITH THE POPULATION MEASURED RATHER THAN GUESSED. The call
+// site is already gated `n <= 4 || (n % 200) == 1` where `n` is
+// `s_h5E10.fetch_add(1) + 1`, the exact count of entries into `sub_821D5E10`.
+// The population is read off a row that prints that counter directly: the
+// `INFLATE #{}` row in the same hook, also 1-in-200, whose last ordinal in
+// w689.log is `INFLATE #30893000`. Solving rows(N) = 4 + floor((N-1)/200) =
+// 154,469 gives N in [30,893,001, 30,893,200], and that row's last ordinal
+// being 30,893,000 closes it to N in [30,893,001, 30,893,199]. So the boot
+// makes ~30.9 MILLION inflate-hook entries and a 1-in-200 sample of them is
+// already 154,469 rows. A rate limit UPSTREAM cannot help: the 1-in-200 is
+// what makes the census affordable, and the population is 30.9 M. The cadence
+// has to live INSIDE, on the sampled stream, exactly as F-634 did.
+//
+// THE CADENCE, AND ITS ARITHMETIC AGAINST w689's MEASURED 154,469 CALLS:
+//   rows 1..32            -> 32 rows, unfiltered. The first inflate census of
+//                            a boot is the diagnostic one -- the first
+//                            inflater the guest ever binds and the first join
+//                            slot it publishes -- and a 1-in-1024 sample would
+//                            have hidden both.
+//   then every 1024th     -> floor(154469 / 1024) = 150 rows
+//   total                 -> 32 + 150 = 182 rows, vs 154,469 before: 0.1178%.
+// The stride is 1024, and the deviation from F-634's 65536 is arithmetic, not
+// taste: that stride was chosen against a population of 8,649,924 rejections,
+// 56x larger than this one, and 65536 / 56 = 1170 sits either side of 1024.
+// 2048 would give 107 rows and 512 would give 333, over the ~200-row target;
+// 1024 lands at 182 and keeps the same power-of-two neighbourhood. As in
+// F-634 the stride does NOT carry the measurement -- the summary does -- so
+// restoring any other stride is a one-token change to kR3RowStride.
+//
+// NO ORDINAL IS ADDED TO THE ROW, DELIBERATELY. The precedent's rejection row
+// already had a `#{}` ordinal in its format, so its sampled gaps were legible
+// in the row itself; this format is FROZEN -- 244 markers are tracked by
+// tools/soak_census.py and reformatting one is out of scope -- so the
+// exemplar's ordinal cannot be added here without breaking that contract. The
+// row is therefore byte-for-byte what it always was, and the cadence is stated
+// in the companion SUMMARY row instead (`head=`, `stride=`, `rows=`, `n=`), so
+// a reader never has to infer the sampling from the source. The exact call
+// ordinal of any printed row is recoverable as its rank among printed rows
+// scaled by the stated stride, and `total=` is exact regardless.
+//
+// WHY POWERS OF TWO FOR THE SUMMARY. Same argument as F-634: the summary
+// appears at least once however few calls fire, and after a TRUNCATED soak the
+// last summary's `total=N` is a power of two, so the true final total is
+// provably in [N, 2N). Against 154,469 that is 18 rows (2^0..2^17, since
+// 2^17 = 131,072 <= 154,469 < 2^18) and the last one bounds the truth to
+// [131072, 262144). w689.log is itself proof the boot can die mid-stream, so
+// this is the property that actually matters. No atexit, for the four
+// measured reasons already written at the F-634 block above -- they apply
+// unchanged to this row.
+//
+// THE COUNTS ARE EXACT, THE LISTS ARE CAPPED, AND ONLY THREE FIELDS GET A
+// LIST. The 14 `n_*` cardinalities are the EXACT distinct populations and are
+// never capped -- those are the measurement, and a sampled set would be a lie.
+// The three value LISTS (infR3, joinSlot, jentries) are capped at kR3SetCap
+// and always print a `*_shown=` beside the exact count, so a capped list can
+// never be read as the whole set. Three lists, not fourteen: w689 shows the
+// fields are near-constant (1 distinct infR3, 1 distinct xmemCtx, 1 distinct
+// joinSlot), so a list per field would spend bytes restating zeros. 16 * 9 B
+// * 3 lists * 18 summary rows = 7,776 B worst case, which cannot become the
+// next 141 MB.
+//
+// WHAT THIS DOES NOT FIX, STATED RATHER THAN HIDDEN, BECAUSE THE BRIEF'S
+// TWO-ORDERS-OF-MAGNITUDE TARGET IS NOT REACHABLE FROM THIS MARKER ALONE.
+// Measured on w689.log, three sibling rows on the SAME `s_h5E10` population
+// own the rest of the flood: `XMEM` 308,939 rows / 39,124,096 B (36.671% of
+// lines), `INFLATE-ENTER` 154,988 / 28,768,254 B, `INFLATE` 154,476 /
+// 28,213,479 B. Those four families together are 772,872 rows = 91.74% of
+// lines and 131,016,023 B = 92.5% of bytes. This marker is 34,909,994 B of
+// that, so rate-limiting it moves the post-last-`CP-` tail from 136,980,595 B
+// to 102,314,063 B -- a 1.34x improvement, NOT 100x. Reaching ~1 MB needs
+// those three siblings rate-limited on the same shape, and they are not this
+// change's to touch. Nor does this change the tool's POISON verdict either
+// way: measured, `is_mitigation("INFLATE-R3-CENSUS")` is False, so all four
+// big shapes are `recurring line`, and tools/soak_census.py:884 grades a shape
+// POISONED only when its kind is MITIGATION/VEH LINE and its share clears
+// POISON_SHARE (0.25, tools/soak_census.py:805). w689.log is already
+// `poisoned: False` today and stays False after this change. F-054's w38e
+// was a laundering case; this is a rate, and the tool grades it as one. The
+// argument for the change is readability of the tail, which the tool does not
+// measure and which is why this was worth doing anyway.
+//
+// CONTAINER CHOICE, AND RULE 1b. One struct holding the counter, both
+// sub-ordinals and the eleven sets, with its own mutex -- not a bare counter
+// beside bare sets, because the snapshot the summary prints has to be ONE
+// consistent view of total + all eleven cardinalities. The instance is
+// FUNCTION-LOCAL inside `MclaCensusInflaterFamily`, exactly as F-634's
+// `s_tally` is inside `MclaFindLastServe`, so no new mutable symbol is added
+// at namespace scope. The struct type, the three constants and the join
+// helper are the only new namespace-scope names and none of them is storage.
+// No behaviour change: the census body below still runs, and still writes
+// `s_xmemCtx` / `s_joinSlotAddr` / `s_guestInflaterR3`, on exactly the same
+// calls as before. Only the MCLA_LOG_WARN is gated.
+// ===========================================================================
+struct MclaInflateR3Tally {
+  std::mutex mtx;
+  uint64_t total = 0; // EXACT census-call count, never sampled, never capped
+  uint64_t rows = 0;  // EXACT count of INFLATE-R3-CENSUS rows actually printed
+  uint64_t n = 0;     // last exact s_h5E10 ordinal seen: the upstream population
+  std::unordered_set<uint32_t> infR3, w0, w1, w2, w3, w4, w5, w6, w7;
+  std::unordered_set<uint32_t> xmemCtx, joinSlot, slot0, slot1, slot2, jentries;
+};
+static constexpr uint32_t kR3Head = 32;      // first N calls, unfiltered
+static constexpr uint64_t kR3RowStride = 1024; // then every Mth
+static constexpr size_t kR3SetCap = 16;      // value-list cap; counts uncapped
+
+// Render a set as a sorted, capped, comma-separated hex list. Sorted so two runs
+// are diffable; capped so a pathological population cannot re-poison the log.
+// The exact size is reported separately by the caller and is never capped.
+static std::string MclaR3Join(const std::unordered_set<uint32_t> &s,
+                              size_t *shown) {
+  std::vector<uint32_t> v(s.begin(), s.end());
+  std::sort(v.begin(), v.end());
+  if (v.size() > kR3SetCap)
+    v.resize(kR3SetCap);
+  std::string out;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i)
+      out += ',';
+    out += fmt::format("{:08X}", v[i]);
+  }
+  *shown = v.size();
+  return out;
+}
+
 // Census joinTable+32+(a1*4) family + inflater object words.
-static void MclaCensusInflaterFamily(auto &mem, uint32_t infR3) {
+// `ord` is the caller's exact inflate-hook ordinal (`s_h5E10`), or 0 from the
+// J2-DIST site which has no such ordinal; it is reported, never used to gate.
+static void MclaCensusInflaterFamily(auto &mem, uint32_t infR3,
+                                     uint32_t ord = 0) {
   uint32_t iw[8] = {0};
   if (infR3 && infR3 >= 0x80000000u && infR3 != 0xCDCDCDCDu) {
     for (int i = 0; i < 8; ++i)
@@ -6497,13 +8657,132 @@ static void MclaCensusInflaterFamily(auto &mem, uint32_t infR3) {
       }
     }
   }
-  MCLA_LOG_WARN("INFLATE-R3-CENSUS infR3={:08X} words=[{:08X} {:08X} "
-                "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] "
-                "xmemCtx={:08X} joinSlot={:08X} slot=[{:08X} {:08X} {:08X}] "
-                "jentries={:08X}",
-                infR3, iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[6],
-                iw[7], s_xmemCtx.load(), slotCand, slotWords[0], slotWords[1],
-                slotWords[2], jentries);
+  // F-720 (2026-10-01): rate-limited. The reasoning and the arithmetic are in
+  // the block above; the short form is that the row is a SAMPLE of the field
+  // shape and `INFLATE-R3-CENSUS-SUMMARY` below is the exact count, so the
+  // falsifier no longer depends on row-counting. The row's FORMAT is unchanged
+  // -- only its cadence is new, because 244 markers are tracked by
+  // tools/soak_census.py. The census body above is untouched and still runs on
+  // every call the call sites made before: the `s_xmemCtx` / `s_joinSlotAddr` /
+  // `s_guestInflaterR3` stores happen identically whether or not this row
+  // prints, so the gate cannot move what the draw or serve path sees.
+  //
+  // `n` is the EXACT census-call ordinal, so the printed `#` is the true call
+  // index, not a row counter. Function-local, as F-634's `s_tally` is: one
+  // struct, its own mutex, holding the exact total plus all eleven exact sets.
+  static MclaInflateR3Tally s_tally;
+  uint64_t n = 0;
+  bool printRow = false, printSummary = false;
+  {
+    // Snapshot under the lock so `total` and all eleven cardinalities in the
+    // summary are ONE consistent view. Emitting outside it: the log call is the
+    // slow part and must not be serialised across the hot inflate path.
+    std::lock_guard<std::mutex> lk(s_tally.mtx);
+    n = ++s_tally.total;
+    s_tally.infR3.insert(infR3);
+    for (int i = 0; i < 8; ++i) {
+      // w0..w7 are the 8 guest inflater-object words, tracked separately
+      // because each is a distinct field of the census, not one population.
+      switch (i) {
+      case 0: s_tally.w0.insert(iw[0]); break;
+      case 1: s_tally.w1.insert(iw[1]); break;
+      case 2: s_tally.w2.insert(iw[2]); break;
+      case 3: s_tally.w3.insert(iw[3]); break;
+      case 4: s_tally.w4.insert(iw[4]); break;
+      case 5: s_tally.w5.insert(iw[5]); break;
+      case 6: s_tally.w6.insert(iw[6]); break;
+      default: s_tally.w7.insert(iw[7]); break;
+      }
+    }
+    s_tally.xmemCtx.insert(s_xmemCtx.load());
+    s_tally.joinSlot.insert(slotCand);
+    s_tally.slot0.insert(slotWords[0]);
+    s_tally.slot1.insert(slotWords[1]);
+    s_tally.slot2.insert(slotWords[2]);
+    s_tally.jentries.insert(jentries);
+    // `ord` is 0 at the J2-DIST site (no s_h5E10 ordinal there) and is otherwise
+    // the caller's exact inflate count. Monotone from the hot site, so a plain
+    // store keeps `n=` the last ordinal observed and never regresses it.
+    if (ord != 0u)
+      s_tally.n = ord;
+    // Head unfiltered, then every kR3RowStride'th. `n` is the EXACT census-call
+    // ordinal, not a row counter: it gates the cadence and it is the value the
+    // power-of-two test below runs on, so the SUMMARY's `total=` is exact and
+    // the printed rows are a subset of calls 1..total by construction.
+    printRow = (n <= kR3Head) || ((n % kR3RowStride) == 0);
+    if (printRow)
+      ++s_tally.rows;
+    // Powers of two: guarantees a summary even if only one call ever fires, and
+    // bounds a truncated soak's true total to [N, 2N).
+    printSummary = ((n & (n - 1)) == 0);
+  }
+  if (printRow) {
+    MCLA_LOG_WARN("INFLATE-R3-CENSUS infR3={:08X} words=[{:08X} {:08X} "
+                  "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] "
+                  "xmemCtx={:08X} joinSlot={:08X} slot=[{:08X} {:08X} {:08X}] "
+                  "jentries={:08X}",
+                  infR3, iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[6],
+                  iw[7], s_xmemCtx.load(), slotCand, slotWords[0], slotWords[1],
+                  slotWords[2], jentries);
+  }
+  if (printSummary) {
+    // Re-read under the lock: between the increment above and here other threads
+    // may have advanced the tally, and the point of this row is to be the exact
+    // number, not the number as of a few instructions ago.
+    uint64_t total = 0, rows = 0, nord = 0;
+    size_t shownInfR3 = 0, shownJoinSlot = 0, shownJentries = 0;
+    std::string sInfR3, sJoinSlot, sJentries;
+    size_t nInfR3, nW0, nW1, nW2, nW3, nW4, nW5, nW6, nW7, nXmemCtx, nJoinSlot;
+    size_t nSlot0, nSlot1, nSlot2, nJentries;
+    {
+      std::lock_guard<std::mutex> lk(s_tally.mtx);
+      total = s_tally.total;
+      rows = s_tally.rows;
+      nord = s_tally.n;
+      // Sizes read INSIDE the lock alongside the lists, so `n_*` and the printed
+      // `[...]` are the same snapshot. Reading them out here would be a data race
+      // on the buckets.
+      nInfR3 = s_tally.infR3.size();
+      nW0 = s_tally.w0.size();
+      nW1 = s_tally.w1.size();
+      nW2 = s_tally.w2.size();
+      nW3 = s_tally.w3.size();
+      nW4 = s_tally.w4.size();
+      nW5 = s_tally.w5.size();
+      nW6 = s_tally.w6.size();
+      nW7 = s_tally.w7.size();
+      nXmemCtx = s_tally.xmemCtx.size();
+      nJoinSlot = s_tally.joinSlot.size();
+      nSlot0 = s_tally.slot0.size();
+      nSlot1 = s_tally.slot1.size();
+      nSlot2 = s_tally.slot2.size();
+      nJentries = s_tally.jentries.size();
+      sInfR3 = MclaR3Join(s_tally.infR3, &shownInfR3);
+      sJoinSlot = MclaR3Join(s_tally.joinSlot, &shownJoinSlot);
+      sJentries = MclaR3Join(s_tally.jentries, &shownJentries);
+    }
+    // `total` is the EXACT census-call count and is what the falsifier reads;
+    // the detail rows above are drawn from calls 1..total, so their implied
+    // count is `total` by construction and the two cannot disagree (P3). `n=` is
+    // the caller's exact inflate-hook ordinal, i.e. the UPSTREAM population this
+    // census is a 1-in-200 sample of -- reporting it is what lets a reader see
+    // the upstream gate is still in force. The `n_*` counts are EXACT distinct
+    // cardinalities, uncapped; the `*_shown` fields say how many values the
+    // (capped) list actually printed, so a capped list is never mistakable for
+    // the whole set. `head=`, `stride=` and `cadence=pow2` are stated in the row
+    // so a reader never has to infer the sampling from the source.
+    MCLA_LOG_WARN(
+        "INFLATE-R3-CENSUS-SUMMARY total={} rows={} head={} stride={} "
+        "cadence=pow2 n={} note=exact-totals-uncapped-lists-capped-at-{} "
+        "ninfR3={} infR3_shown={} infR3=[{}] nw0={} nw1={} nw2={} nw3={} nw4={} "
+        "nw5={} nw6={} nw7={} nxmemCtx={} njoinSlot={} joinSlot_shown={} "
+        "joinSlot=[{}] nslot0={} nslot1={} nslot2={} njentries={} "
+        "jentries_shown={} jentries=[{}]",
+        total, rows, kR3Head, kR3RowStride, nord, kR3SetCap, nInfR3, shownInfR3,
+        sInfR3, nW0, nW1, nW2, nW3, nW4, nW5, nW6, nW7, nXmemCtx, nJoinSlot,
+        shownJoinSlot, sJoinSlot, nSlot0, nSlot1, nSlot2, nJentries,
+        shownJentries, sJentries);
+  }
 }
 
 // w26: census swfC +24 list nodes for real 8208xxxx pointers. Lead:
@@ -8974,6 +11253,13 @@ static bool MclaHostInflateToDest(uint32_t dest, uint32_t bounce, uint32_t n,
   return dh[0] != 0xCDCDCDCDu && dh[0] != 0 && dh[0] != 0xFFFFFFFFu;
 }
 
+// F-645 (2026-09-30): forward declaration -- MclaForceServePkgForDest now reads
+// the container's own declared uncompressed length to publish `exp` (st+12),
+// and the definition (with the .xsf-container citation) sits below
+// HostInflateDest. Without this the prime below would publish 0, which is the
+// defect F-646 names.
+static uint32_t MclaUiXsfUnc(uint32_t pkg);
+
 static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
                                      bool hostInflate,
                                      uint32_t pkgHint = 0u) {
@@ -9015,31 +11301,70 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
       return false;
     }
   }
-  // w25: continuation window whose head is not RSC5/XC cannot be inflated
-  // independently — reset job2 shared walk to the package head so guest
-  // InflateStep sees a decodable stream (w24 proven path).
-  // F-248 probe (gated by kPathBEnqueueUI): this reset is what thrashes the
-  // SHARED g_job2SharedWalk back to 0 on every legitimate LZX continuation frame
-  // (compressed bytes, no RSC5 head by design), so each job2 dest re-serves the
-  // package head forever (w247 B7841000 produced=16384 loop, JOB2-PKG-RESET ×14).
-  // A mid-stream continuation does NOT need an RSC5 head, so SKIP the reset when the
-  // serve-framing stack is on and let the walk advance. Flag OFF == exact baseline.
-  if (!kPathBEnqueueUI && job2 && walkPos > 0 && pkgWin.size() >= 4) {
-    const uint32_t wh = MclaBE(pkgWin.data());
-    if (wh != 0x05435352u && wh != 0x0FF512EFu) {
-      pkgWin.clear();
-      if (!MclaLoadPkgWindow(baseOff, 0, winBytes, pkgWin) ||
-          pkgWin.size() < 16)
-        return false;
-      walkPos = 0;
-      {
-        std::lock_guard<std::mutex> wl(g_job2SharedMtx);
-        g_job2SharedWalk = 0;
-      }
-      MCLA_LOG_WARN("JOB2-PKG-RESET dest={:08X} — continuation head not "
-                    "RSC5/XC, re-serve package head",
-                    outPtr);
+  // F-646 (2026-09-30): TWO THINGS THAT WERE WRONG IN THE SAME FUNCTION, both
+  // measured on w674.log.
+  //
+  // (1) THE REFUSAL THAT REPLACED THE RESET. The reset below answered "a
+  // continuation window's head is not RSC5/XC" by re-serving the PACKAGE HEAD
+  // for this dest and zeroing the shared walk. F-248 already named why that is
+  // the wrong answer -- "this reset is what thrashes the SHARED g_job2SharedWalk
+  // back to 0 on every legitimate LZX continuation frame (compressed bytes, no
+  // RSC5 head by design), so each job2 dest re-serves the package head forever"
+  // (w247 B7841000 produced=16384 loop, JOB2-PKG-RESET -> 14) -- and w674.log is
+  // that loop at full length: JOB2-PKG-SERVE reaches 210 rows for ONE
+  // destination and every one of them carries walk=00000000, i.e. 210 identical
+  // re-primes. One refusal with a name and a per-destination count is worth more
+  // than 210 silent rows: a soak can now tell "thirty distinct packages were
+  // refused" from "one dest was served the same package thirty times".
+  // NOTHING is planted into the dest, no LastServe is recorded, the shared walk
+  // is left where it is, and the inflate state is not primed.
+  //
+  // (2) THE THIRD PRIME FIELD. `exp` (st+12) is the DECLARED UNCOMPRESSED SIZE
+  // (RSC5 +0x10) and the guest clamps every XMemDecompress call's input to
+  // ([st+12] - [st+8]) -- the guest's own block header, cited at the INFLATE-*
+  // rows below. This function primes st+8 = 0 and did NOT write st+12, so the
+  // guest computed 0 - 0 = 0, and an UNWRITTEN field is worse than a wrong one:
+  // the clamp is non-positive and the stream can accept no buffered input at all
+  // (F-498 measured exactly this shape: exp staying 0 forever). The host DOES
+  // write this field correctly elsewhere -- HostInflateDest primes
+  // `mem.WriteU32BE(s_st + 12, expected)` and the enqueue leg primes
+  // `mem.WriteU32BE(st + 12, unc)` -- so this prime was the outlier and the
+  // disagreement is what this closes. When the container declares nothing usable
+  // there is no honest value to publish, so the serve is refused BY NAME rather
+  // than primed with the negative bound this field exists to prevent.
+  const uint32_t declaredUnc = MclaUiXsfUnc(baseOff);
+  const uint32_t contHead = MclaBE(pkgWin.data());
+  const char *refuseWhy = nullptr;
+  if (!kPathBEnqueueUI && job2 && walkPos > 0 && pkgWin.size() >= 4 &&
+      contHead != 0x05435352u && contHead != 0x0FF512EFu) {
+    refuseWhy = "CONTINUATION-HEAD-NOT-RSC5-OR-XCOMPRESS";
+  } else if (declaredUnc == 0u) {
+    refuseWhy = "NO-DECLARED-UNC-ST+12-UNPUBLISHABLE";
+  }
+  if (refuseWhy != nullptr) {
+    static std::mutex s_refMtx;
+    static std::unordered_map<uint32_t, uint32_t> s_refused;
+    uint32_t refusedN = 0;
+    {
+      std::lock_guard<std::mutex> rl(s_refMtx);
+      refusedN = ++s_refused[outPtr];
     }
+    MCLA_LOG_WARN("JOB2-PKG-REFUSE #{} dest={:08X} pkg={:08X} st={:08X} "
+                  "walk={:08X} n={} head={:08X} declaredUnc={} reason={} (no "
+                  "plant into the dest, no LastServe, the shared walk is left "
+                  "where it is, the inflate state is not primed; {} -- a zero "
+                  "declaredUnc means st+12 has no honest value, and priming "
+                  "st+8=0 against an unwritten st+12 is the negative input bound "
+                  "the guest would then compute as [st+12]-[st+8])",
+                  refusedN, outPtr, baseOff, st, walkPos,
+                  static_cast<uint32_t>(pkgWin.size()), contHead, declaredUnc,
+                  refuseWhy,
+                  (declaredUnc == 0u)
+                      ? "RSC5 +0x10 absent or outside 0x100..0x800000 at the "
+                        "package head"
+                      : "a continuation window's head is compressed frame data by "
+                        "design, so there is no decodable stream to prime here");
+    return false;
   }
   static std::mutex s_bounceMtx;
   static std::unordered_map<uint32_t, uint32_t> s_destBounce;
@@ -9066,6 +11391,19 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
     (void)mem.WriteU32BE(st + 0, n);
     (void)mem.WriteU32BE(st + 4, bounce);
     (void)mem.WriteU32BE(st + 8, 0);
+    // F-646: the THIRD field. `exp` = the container's own declared
+    // uncompressed size (RSC5 +0x10), which the guest subtracts st+8 from to
+    // bound every XMemDecompress call's input. It is NOT `n`: n is how many
+    // bytes this serve happened to hand over, which is 32 KiB of a stream that
+    // expands to up to 4 MiB, so publishing n would cap the guest's input at one
+    // window. It is NOT destCap either: that is the OUTPUT budget, not this
+    // member's size, and the two are different quantities (garage is 1,066,057
+    // declared over a 0x40000 window). And it is never 0: declaredUnc == 0 was
+    // already refused above with reason=NO-DECLARED-UNC-ST+12-UNPUBLISHABLE, so
+    // the one value that would make [st+12]-[st+8] non-positive cannot reach
+    // here. Same field, same units, same sense as HostInflateDest's prime and the
+    // enqueue leg's prime -- which is what "the host writes it elsewhere" meant.
+    (void)mem.WriteU32BE(st + 12, declaredUnc);
     if (job2 && destCap) {
       uint32_t stOut = 0;
       (void)mem.ReadU32BE(st + 20, &stOut);
@@ -9130,11 +11468,11 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
   }
   MCLA_LOG_WARN("JOB2-PKG-SERVE #{} dest={:08X} st={:08X} pkg={:08X} "
                 "walk={:08X} bounce={:08X} n={} head={:08X} destCap={} "
-                "hostInflate={} inflated={} destHead=[{:08X} {:08X} {:08X} "
-                "{:08X}]",
+                "exp={:08X} hostInflate={} inflated={} destHead=[{:08X} {:08X} "
+                "{:08X} {:08X}]",
                 servedN, outPtr, st, baseOff, walkPos, bounce, n, head,
-                destCap, hostInflate ? 1 : 0, inflated ? 1 : 0, dh[0], dh[1],
-                dh[2], dh[3]);
+                destCap, declaredUnc, hostInflate ? 1 : 0, inflated ? 1 : 0,
+                dh[0], dh[1], dh[2], dh[3]);
   return true;
 }
 
@@ -10067,6 +12405,17 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
   // on the first four slots; they differ exactly in the region that is missing.
   const bool listOrder = kUiXsfFillListOrder;
   std::vector<std::pair<size_t, uint32_t>> plan;  // (slot index, golden offset)
+  // F-633: the fill's only SILENT plan shrinker, counted. The `continue` in the
+  // list-order plan builder below keys on `g_uiDecExpect` -- another container's
+  // completed dest -- and emitted NOTHING, so `UIXSF-GOLDEN-FILL-SUMMARY`'s
+  // `slots_written`/`skipped` cannot distinguish "the plan never contained this slot"
+  // from "the plan contained it and the write loop refused it": a dropped slot is
+  // invisible in both counters, and the run cursor skips its capacity too. Declared
+  // at function scope because the list-order branch is conditional. Published on
+  // UIXSF-FILL-DRAIN as `dropped_foreign_claim`. FALSIFIER: 0 on every pass means plan
+  // shrink is not a factor and the coverage ceiling is set entirely by the
+  // anchor/job/seq selection above.
+  uint32_t droppedForeignClaim = 0;
   if (listOrder) {
     // F-352 WALKS ONLY WITHIN THE ANCHOR'S OWN READLIST. F-351 crossed into later
     // tables because the guest's own inflate requests did (it asked for B7A41000,
@@ -10113,8 +12462,10 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
         std::lock_guard<std::mutex> elk(g_uiDecMtx);
         const auto it = g_uiDecExpect.find(slots[idx].pbase);
         if (it != g_uiDecExpect.end() && it->second.pkg != pkg &&
-            IsUiXsfPkg(it->second.pkg))
+            IsUiXsfPkg(it->second.pkg)) {
+          ++droppedForeignClaim;
           continue;  // another container owns this slot — do not spill into it
+        }
       }
       plan.push_back({idx, run});
       uint32_t take = slots[idx].size;
@@ -10342,6 +12693,55 @@ static void MclaUiXsfGoldenFill(uint32_t pkg, const std::vector<uint8_t> &gold,
                 slots[ai].pbase, slotsWritten, bytesWritten, skipped,
                 kUiXsfFillDryRun ? 1u : 0u,
                 covLo == 0xFFFFFFFFu ? 0u : covLo, covHi);
+  // F-633 (2026-10-01): UIXSF-FILL-DRAIN -- THE COMPLETION SIGNAL THE FILL NEVER
+  // HAD, and the row that makes the plan shrinker countable.
+  //
+  // WHY IT EXISTS. `UIXSF-GOLDEN-FILL-SUMMARY` is emitted by the same function and
+  // reports only what the WRITE loop did. It cannot say whether the plan itself was
+  // short, because a slot dropped in the plan builder never reaches the write loop and
+  // so is counted by neither `slots_written` nor `skipped`. Comparing the two counters
+  // against the inventory is the only way to see the shrink, and nothing did that.
+  //
+  // FIELD DEFINITIONS (so the row is not read by inference):
+  //   pass        = monotonic count of fill passes run in this process, NOT per-pkg;
+  //                 `(pkg, shot)` identifies the pass uniquely because `s_filled`
+  //                 dedups on `pkg*8 + shot` and caps the table at 32 entries.
+  //   slots_in_inventory = slots.size() -- the whole read-list inventory handed in,
+  //                 including slots of OTHER jobs, so `slots_planned` is readable as a
+  //                 selection rather than as a shrink.
+  //   firstSeq/lastSeq = min/max `seq` OVER THE PLAN (not over the inventory). Both
+  //                 print as FFFFFFFF/00000000 for an empty plan, so "planned nothing"
+  //                 is distinguishable from "planned from the anchor's seq".
+  //   dropped_foreign_claim = the g_uiDecExpect `continue` count -- slots removed from
+  //                 the plan because another UI .xsf container owns them.
+  //                 FALSIFIER: 0 on every pass => plan shrink is not a factor here.
+  //   skipped     = the write loop's own refusals (MclaSlotUntouched / F-409), a
+  //                 DIFFERENT population from dropped_foreign_claim.
+  // Exactly one row per fill pass that reaches the plan, emitted after the plan is built
+  // AND after every write has completed, as the function's last statement. Passes that
+  // return earlier (gold.size() < 0x10000, the s_filled dedup/cap, NO ANCHOR SLOT, BAD
+  // ANCHOR VBASE) build no plan and so emit no DRAIN row -- that is why the row is a
+  // completion marker: its presence means the pass ran to the end. Deliberately NOT
+  // rate-limited and not merged into SUMMARY, whose format is frozen (244 tracked
+  // markers, tools/soak_census.py counts its fields).
+  uint32_t planFirstSeq = 0xFFFFFFFFu, planLastSeq = 0;
+  for (const auto &pr : plan) {
+    const uint32_t sq = slots[pr.first].seq;
+    if (sq < planFirstSeq)
+      planFirstSeq = sq;
+    if (sq > planLastSeq)
+      planLastSeq = sq;
+  }
+  static std::atomic<uint32_t> s_fillPass{0};
+  const uint32_t passN = s_fillPass.fetch_add(1) + 1u;
+  MCLA_LOG_WARN("UIXSF-FILL-DRAIN pkg={:08X} shot={} pass={} slots_planned={} "
+                "slots_written={} bytes_written={} skipped={} slots_in_inventory={} "
+                "anchorJob={:08X} anchorSeq={} firstSeq={:08X} lastSeq={:08X} "
+                "dropped_foreign_claim={}",
+                pkg, shot, passN, static_cast<uint32_t>(plan.size()), slotsWritten,
+                bytesWritten, skipped, static_cast<uint32_t>(slots.size()),
+                slots[ai].job, slots[ai].seq, planFirstSeq, planLastSeq,
+                droppedForeignClaim);
 }
 
 // F-324: how many claimed container bytes are STILL in guest memory right now.
@@ -10632,10 +13032,49 @@ static void MclaOpenCensus(const char *site, uint32_t n, uint32_t r3,
                            uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7,
                            uint32_t ctrlNow,
                            uint32_t wrapNow, uint32_t callerNow) {
-  if (n <= 4u || (n % 2000u) == 0u)
+  // (2026-10-02) `n <= 4 || n%2000==0` admitted 4 + 16,111 = 16,115 control
+  // rows on a serial that reaches 32,222,000. Strided by kOpenCensusStride.
+  //
+  // HEAD MUST STAY ABOVE 2, and this is measured rather than assumed: across ALL
+  // 16,115 control rows of w693.log the bracketed triad reads
+  // `[wrapper=2 caller=2 control=N]` -- the wrapper and the caller each ran
+  // EXACTLY TWICE for the whole 167.40 s boot and never again. Those four rows
+  // (`wrapper` #1,#2 and `caller` #1,#2) ARE the F-309 liveness measurement;
+  // the other 16,111 restate it. So kCadHead=32 keeps them, and any head below
+  // 2 would lose the measurement outright. A bare zero from a new hook is
+  // uninterpretable; these four rows are what make the two small counters
+  // readable as "ran, then never again" rather than as "never ran".
+  //
+  // This is the one marker of the four whose rows are NOT all identical: all
+  // 16,119 are distinct, because the triad restates the running counters and
+  // `control=N` restates the ordinal. Masking both, it is 9 distinct payloads
+  // and one control payload (`r3=4000FD80 r4=B5FA6280 r5=006D8EA4 r6=BB00CC33
+  // r7=006D8EA0`) carries 16,111 rows = 99.95%. What strides it is the
+  // ordinal and the triad, not a varying measurement.
+  //
+  // The row's own format is UNCHANGED; `rows=` is per site, so each of the three
+  // counters is summarised against its OWN serial and a reader can never add the
+  // three together as if they were one population.
+  static std::atomic<uint64_t> s_openRowsCensus[3]{};
+  const size_t oi = (std::strcmp(site, "wrapper") == 0)   ? 0u
+                    : (std::strcmp(site, "caller") == 0)  ? 1u
+                                                           : 2u;
+  const bool openRow = (n <= kCadHead) || ((n % kOpenCensusStride) == 0);
+  const bool openSummary = ((n & (n - 1)) == 0);
+  if (openRow) {
+    s_openRowsCensus[oi].fetch_add(1, std::memory_order_relaxed);
     MCLA_LOG_WARN("XMEM-OPEN-CENSUS site={} #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} "
                   "[wrapper={} caller={} control={}]",
                   site, n, r3, r4, r5, r6, r7, wrapNow, callerNow, ctrlNow);
+  }
+  if (openSummary)
+    // `total=` is this site's OWN exact serial, so the pow2 bound applies per
+    // site: the wrapper and the caller are bounded to [2, 4) and [2, 4) by their
+    // own last summaries, which is the F-309 statement in one number.
+    MCLA_LOG_WARN("XMEM-OPEN-CENSUS-SUMMARY site={} total={} rows={} head={} "
+                  "stride={} cadence=pow2 note=per-site-serial-head-covers-n1-n2",
+                  site, n, s_openRowsCensus[oi].load(std::memory_order_relaxed),
+                  kCadHead, kOpenCensusStride);
 }
 PPC_FUNC(sub_82461378) {
   const uint32_t n = s_openWrap.fetch_add(1) + 1;
@@ -11026,7 +13465,13 @@ PPC_FUNC(sub_821D5E10) {
       s_xmemCtx.store(x0);
   }
   if (n <= 4 || (n % 200) == 1)
-    MclaCensusInflaterFamily(mem, infR3);
+    // F-720 (2026-10-01): the 1-in-200 UPSTREAM gate is unchanged and must stay
+    // -- it is what keeps the joinTable walk affordable at 30.9 M inflate-hook
+    // entries (measured, w689.log). The row's cadence is the census function's
+    // own business now; `n` is passed only so the SUMMARY can report the exact
+    // upstream population this 1-in-200 sample is drawn from. The other call
+    // site has no such ordinal and takes the default 0.
+    MclaCensusInflaterFamily(mem, infR3, n);
   uint32_t inLeft = 0, inPtr = 0, consumed = 0, expected = 0;
   uint32_t outLeft = 0, outPtr = 0, produced = 0;
   (void)mem.ReadU32BE(st + 0, &inLeft);
@@ -11104,7 +13549,31 @@ PPC_FUNC(sub_821D5E10) {
       if (produced > g_f481MaxProd.load(std::memory_order_relaxed))
         g_f481MaxProd.store(produced, std::memory_order_relaxed);
     }
-    if (n <= 16 || (n % 200) == 0 || j2Ent || stackCont)
+    // (2026-10-02) `n <= 16 || n%200==0 || j2Ent || stackCont` admitted
+    // 16 + 161,115 = 161,131 rows plus 507 bypass rows (6 `j2=1`, 501
+    // `stackCont=1`) = 161,638, on a serial that reaches 32,223,000 at a
+    // measured 192,490 entries/s over 167.40 s. A modulus cannot bound that, so
+    // the serial is now STRIDED (kInflateStride) instead of moduloed.
+    // `|| j2Ent || stackCont` IS KEPT, DELIBERATELY: those 507 rows are 0.31%
+    // of the old row count and they are the load-bearing ones -- they are the
+    // only rows that ever showed `outPtr` in the Job2-UI range or a resumed
+    // `consumed > 0`. Removing them to save 507 rows would be a rounding error
+    // traded for a measurement.
+    //
+    // The five conditions that saturate this row are ALREADY tallied
+    // unconditionally under `g_f481Window` in the block ABOVE this gate
+    // (`g_f481Infl` / `g_f481Seeded` / `g_f481ExpNZ` / `g_f481OutNZ` /
+    // `g_f481MaxProd`), so the spin itself -- which is the finding, not the
+    // volume -- is measured independently of this log line and survives this
+    // change byte for byte. What the cadence HIDES is the headline: how many of
+    // the 32.2 M entries hit each condition is no longer legible in a row. That
+    // is why the SUMMARY below is not optional and carries the EXACT total.
+    static std::atomic<uint64_t> s_inflateEnterRows{0};
+    const bool inflEntRow = (n <= kCadHead) || ((n % kInflateStride) == 0) ||
+                            j2Ent || stackCont;
+    const bool inflEntSummary = ((n & (n - 1)) == 0);
+    if (inflEntRow) {
+      s_inflateEnterRows.fetch_add(1, std::memory_order_relaxed);
       MCLA_LOG_WARN("INFLATE-ENTER #{} st={:08X} in={} inPtr={:08X} "
                     "consumed={} exp={:08X} outLeft={} ihdr=[{:08X} {:08X}] "
                     "outPtr={:08X} lr={:08X} j2={}",
@@ -11112,6 +13581,20 @@ PPC_FUNC(sub_821D5E10) {
                     MclaBE(ih),
                     MclaBE(ih + 4), outPtr, static_cast<uint32_t>(ctx.lr),
                     j2Ent ? 1 : 0);
+    }
+    if (inflEntSummary)
+      // THIS IS THE ROW THAT MUST CARRY THE EXACT COUNT. Measured on w693.log,
+      // the last `total=` in `INFLATE-R3-CENSUS-SUMMARY` is 131,072, which
+      // bounds that marker only to [26.2 M, 52.4 M) and cannot say 32,223,000.
+      // Here `total=` is `s_h5E10` read AT the summary -- the hook's exact
+      // serial, shared with `INFLATE`, not an estimate and not a row count --
+      // and `cadence=pow2` is what bounds a truncated soak to [total, 2*total).
+      // Do not weaken the pow2 mask to raise this row's frequency.
+      MCLA_LOG_WARN("INFLATE-ENTER-SUMMARY total={} rows={} head={} stride={} "
+                    "cadence=pow2 bypass=j2Ent,stackCont "
+                    "note=exact-s_h5E10-serial-bypasses-still-printed",
+                    n, s_inflateEnterRows.load(std::memory_order_relaxed),
+                    kCadHead, kInflateStride);
   }
 
   MclaUiXsfLateReverify(n);  // F-325 persistence sampler (read-only)
@@ -12199,7 +14682,7 @@ PPC_FUNC(sub_821D5E10) {
     }
   }
 
-  // Session 72: empty input â€” nothing to inflate. The guest re-enters with
+  // Session 72: empty input -- nothing to inflate. The guest re-enters with
   // in=0 consumed=0xFFFFFFF4 forever (INFLATE #286600+). Mark the stream
   // fully consumed so the caller's progress check exits; do not call the
   // original (it would spin or AV on a corrupt state).
@@ -12211,7 +14694,7 @@ PPC_FUNC(sub_821D5E10) {
   //                 if (state.outLeft /*[r1+112]=state+16*/ != 0) goto 2D4;
   //               exit per stream when outLeft == 0
   // The caller refills input BEFORE re-entering InflateStep, so InflateStep
-  // never sees inLeft==0 on a live stream â€” reaching here means the stream
+  // never sees inLeft==0 on a live stream -- reaching here means the stream
   // is dead/empty. Zeroing outLeft is the caller's own "stream complete"
   // key (same path a descriptor with expected==0 takes); without it the
   // guest spins on the loop forever (INFLATE-EMPTY x1663).
@@ -12244,7 +14727,7 @@ PPC_FUNC(sub_821D5E10) {
     // Session 75p CORRECTION: the boot init enqueues batches of streams and
     // calls InflateStep BEFORE the async input refill delivers. Killing
     // those (produced=0, sequential outPtrs, all in one burst) aborted the
-    // boot's next load batch â€” the emu has been stalling itself. Distinguish:
+    // boot's next load batch -- the emu has been stalling itself. Distinguish:
     //  - fresh/pending stream (no real progress yet): return WITHOUT touching
     //    state; the caller's own refill pacing re-polls until data arrives.
     //  - genuinely dead (no input after ~20s of paced retries, or the -12
@@ -12726,7 +15209,7 @@ PPC_FUNC(sub_821D5E10) {
                           (void *)frames[fi2], name);
           }
         }
-        // lr=1 is bogus â€” walk the stack instead (recompiler frames:
+        // lr=1 is bogus -- walk the stack instead (recompiler frames:
         // [sp]=back, [back-8]=saved lr).
         uint32_t inPtr = 0;
         mem.ReadU32BE(st + 4, &inPtr);
@@ -12749,13 +15232,13 @@ PPC_FUNC(sub_821D5E10) {
             static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId(),
             chain);
         // Session 75v: dump the inner stream's 3 page-cache slots
-        // (inner+296/336/356) â€” the fill reads land in page buffers but the
+        // (inner+296/336/356) -- the fill reads land in page buffers but the
         // buffered reader never matches, so watch the slot state.
         {
           uint32_t inner = 0;
           // 75v fix: the inner object lives at wrapper+32; the wrapper is
           // join_entry+8 (A007D810 in every soak). Do not deref the object
-          // to get its vtable â€” we want the OBJECT itself.
+          // to get its vtable -- we want the OBJECT itself.
           uint32_t wrapper = 0;
           mem.ReadU32BE(0xA0121560u + 8, &wrapper);
           if (wrapper != 0 && wrapper != 0xCDCDCDCDu)
@@ -12779,7 +15262,7 @@ PPC_FUNC(sub_821D5E10) {
                           i48, i296);
           }
         }
-        // Session 75q: dump the join table â€” entry+8 = the source stream
+        // Session 75q: dump the join table -- entry+8 = the source stream
         // object whose vtable+28 read returns 0 for this batch.
         uint32_t jcount = 0, jentries = 0;
         mem.ReadU32BE(0x8283D1A8u, &jcount);
@@ -12867,7 +15350,7 @@ PPC_FUNC(sub_821D5E10) {
       }
       MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} produced={} "
                     "outPtr={:08X} head=[{:08X} {:08X} {:08X} {:08X}] "
-                    "(bail, clear outLeft â€” caller loop key)",
+                    "(bail, clear outLeft -- caller loop key)",
                     e, st, consumed, produced2, outPtr2, h0, h1, h2, h3);
     } else if ((e % 1000) == 0) {
       MCLA_LOG_WARN("INFLATE-EMPTY #{} st={:08X} consumed={} (bail)", e, st,
@@ -12882,9 +15365,19 @@ PPC_FUNC(sub_821D5E10) {
     return;
   }
 
-  if (n <= 16 || (n % 200) == 0) {
+  // (2026-10-02) `n <= 16 || n%200==0` admitted 16 + 161,115 = 161,131 rows on
+  // the same `s_h5E10` serial that reaches 32,223,000, and measured on w693.log
+  // 161,126 of its rows are 16 distinct field tuples with 161,111 identical =
+  // 99.992%. Strided by kInflateStride -- SHARED with `INFLATE-ENTER` above, so
+  // one token moves both rows. The guest stack walk stays INSIDE the gate: it is
+  // 6 ReadU32BE calls and only its `chain[]` result is worth logging.
+  static std::atomic<uint64_t> s_inflateRows{0};
+  const bool inflRow = (n <= kCadHead) || ((n % kInflateStride) == 0);
+  const bool inflSummary = ((n & (n - 1)) == 0);
+  if (inflRow) {
+    s_inflateRows.fetch_add(1, std::memory_order_relaxed);
     // Session 75n: guest stack walk. Recompiler frame convention:
-    // mflr r12; stw r12,-8(r1); stwu r1,-X(r1)  â‡’  saved LR of the function
+    // mflr r12; stw r12,-8(r1); stwu r1,-X(r1)  =>  saved LR of the function
     // owning this frame sits at [back_chain - 8]. Walk back chains upward.
     char chain[160] = {0};
     size_t off = 0;
@@ -12903,6 +15396,16 @@ PPC_FUNC(sub_821D5E10) {
                   static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
                   GetCurrentThreadId(), chain);
   }
+  if (inflSummary)
+    // `total=` is this hook's exact `s_h5E10` ordinal, so a truncated soak's
+    // true total is bounded to [total, 2*total) by `cadence=pow2`. Note this
+    // row can be REACHED FEWER TIMES than the counter advances: the
+    // `INFLATE-EMPTY` bail returns at :14747 before the gate, which is exactly
+    // why measured rows are 161,126 against the gate's arithmetic 161,131.
+    MCLA_LOG_INFO("INFLATE-SUMMARY total={} rows={} head={} stride={} "
+                  "cadence=pow2 note=exact-s_h5E10-serial-early-return-skips",
+                  n, s_inflateRows.load(std::memory_order_relaxed), kCadHead,
+                  kInflateStride);
   // Track the largest inflate-output capacity we have seen for this process.
   // PRELOAD-CTX inflSize is a 12-byte sentinel; the real package size is the
   // out buffer size from the stream (up to 512 KiB in boot soaks).
@@ -13180,7 +15683,7 @@ PPC_FUNC(sub_821D5E10) {
       inPtr != 0 && outPtr != 0) {
     // Session 72: do NOT copy unknown-magic bytes into the output. A
     // 525DE064 stream was pass-through'd raw and the guest parser produced
-    // wild pointer 0x7E780000 â†’ AV in sub_821DEE40. Skip the XCompress
+    // wild pointer 0x7E780000 -> AV in sub_821DEE40. Skip the XCompress
     // fatal, consume the stream, emit nothing. Guest sees empty output.
     uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
     (void)mem.ReadU32BE(inPtr + 0, &b0);
@@ -13196,7 +15699,7 @@ PPC_FUNC(sub_821D5E10) {
     if (pt <= 16 || (pt % 50) == 0)
       MCLA_LOG_WARN("INFLATE-SKIP #{} magic={:08X} in={} out={} inPtr={:08X} "
                     "head=[{:08X} {:08X} {:08X} {:08X}] (no XCompress "
-                    "header â€” skip fatal, emit 0)",
+                    "header -- skip fatal, emit 0)",
                     pt, magic, inLeft, outLeft, inPtr, b0, b1, b2, b3);
     return;
   }
@@ -13258,6 +15761,33 @@ PPC_FUNC(sub_821CE100) {
   __imp__sub_821CE100(ctx, base);
 }
 
+// WORK-FLAG producer census (F-585/586): records in the 1556-byte ring become
+// runnable only when sub_82622AC0 reaches its *(r31+1548) = r29 store, guarded
+// by r5 != 0, via the sibling entry sub_8268B6D0. sub_8268B960 (the
+// find-or-create-by-name sibling) is never called - measured, not assumed.
+// Both probes are registers-only, bounded, and log before any guest read.
+PPC_FUNC_IMPL(__imp__sub_82622AC0);
+static std::atomic<uint32_t> s_h22AC0{0};
+PPC_FUNC(sub_82622AC0) {
+  const uint32_t n = s_h22AC0.fetch_add(1) + 1;
+  if (n <= 24 || (n % 500) == 0)
+    MCLA_LOG_WARN("WF-PRODUCER sub_82622AC0 #{} r5={:08X} r3={:08X} lr={:08X}",
+                  n, ctx.r5.u32, ctx.r3.u32,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  __imp__sub_82622AC0(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_8268B6D0);
+static std::atomic<uint32_t> s_h8B6D0{0};
+PPC_FUNC(sub_8268B6D0) {
+  const uint32_t n = s_h8B6D0.fetch_add(1) + 1;
+  if (n <= 24 || (n % 500) == 0)
+    MCLA_LOG_WARN("WF-SETUP sub_8268B6D0 #{} r3={:08X} r4={:08X} lr={:08X}", n,
+                  ctx.r3.u32, ctx.r4.u32,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  __imp__sub_8268B6D0(ctx, base);
+}
+
 // CALLBACK SETUP census: sub_8268B960 (find-or-create by name).
 // Returns the callback pointer stored at [ctx+1548] and the archive device
 // stored at [ctx+1552]. Logs which string lookup produced which function.
@@ -13265,6 +15795,15 @@ PPC_FUNC_IMPL(__imp__sub_8268B960);
 static std::atomic<uint32_t> s_h68B960{0};
 PPC_FUNC(sub_8268B960) {
   const uint32_t n = s_h68B960.fetch_add(1) + 1;
+  // F-585: registers-only entry probe, logged BEFORE the guest read below.
+  // The CBSETUP line is unreachable if that ReadBytes faults, and this file
+  // already records a prior consumer dying on a guest read in this subsystem,
+  // so a 0-row census here cannot distinguish "not reached" from "faulted".
+  if (n <= 16 || (n % 200) == 0)
+    MCLA_LOG_WARN("CBSETUP-ENTER sub_8268B960 #{} pool={:08X} idx={:08X} "
+                  "flags={:08X} lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r6.u32,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
   if (n <= 16 || (n % 200) == 0) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     char name[68] = {0};
@@ -13290,7 +15829,7 @@ static std::atomic<uint32_t> s_h4EE00{0};
 PPC_FUNC(sub_8244EE00) {
   const uint32_t n = s_h4EE00.fetch_add(1) + 1;
   if (n <= 24 || (n % 2000) == 0)
-    MCLA_LOG_INFO("TASK-DONE sub_8244EE00 #{} arg={:08X}", n, ctx.r3.u32);
+    MCLA_LOG_WARN("TASK-DONE sub_8244EE00 #{} arg={:08X}", n, ctx.r3.u32);
   __imp__sub_8244EE00(ctx, base);
 }
 
@@ -13307,7 +15846,7 @@ PPC_FUNC(sub_821BCB10) {
   const uint32_t a6 = ctx.r7.u32;
   __imp__sub_821BCB10(ctx, base);
   if (n <= 16 || (n % 500) == 0)
-    MCLA_LOG_INFO("ENQ sub_821BCB10 #{} a0={:08X} cb={:08X} -> r3={:08X}", n,
+    MCLA_LOG_WARN("ENQ sub_821BCB10 #{} a0={:08X} cb={:08X} -> r3={:08X}", n,
                   a0, a6, ctx.r3.u32);
 }
 
@@ -13468,6 +16007,179 @@ static std::atomic<uint32_t> s_hBC140{0};
 extern "C" void __imp__sub_821CB9D8(PPCContext &ctx, uint8_t *base);
 // Defined at EOF: push {name,buf,size} onto the embedded:/ D22E8 list.
 static bool EmbeddedListInsert(const char *name, uint32_t buf, uint32_t size);
+static bool EmbeddedListLookup(const char *relName, uint32_t *outBuf,
+                               uint32_t *outSize);
+
+// ===========================================================================
+// D2308-REG -- the GUEST's own registration routine, hooked generally.
+//
+// sub_821D22E8 is six instructions (ppc_disasm.py 0x821D22E8):
+//   stw r4,0(r3)  stw r5,4(r3)  stw r6,8(r3)             node = {name,buf,size}
+//   lwz r11,2804(r10)  stw r11,12(r3)  stw r3,2804(r10)  link into the list
+// so a registration carries THREE GUEST VAS plus a size: r3 = a STATIC node
+// already present in the image, r4 = the name string, r5 = the buffer, r6 = the
+// byte count. All 15 callers decoded from mcla_pe.bin (F-023, offset VA-0x82000000):
+//   node 0x828395B8..0x829054C0  (image .data, one static per caller)
+//   name 0x820093D4..0x82089394  (single-site .rdata strings, ppc_xrefs find-str)
+//   buf  0x827D2DD0..0x8281BB00  (image .data; image is 0x9E0000 B)
+// Every buf is therefore a GUEST VA INSIDE THE IMAGE today, and is read with the
+// checked helper (ReadBytes: IsValid() then an SEH-guarded memcpy,
+// src/kernel/memory.cpp:118) -- never reinterpret_cast, never assert. A buffer
+// that is NOT readable returns false and is refused with a named reason; that
+// refusal is the whole safety story, because a guest-registered buffer is not
+// guaranteed to stay in-image.
+//
+// WHY THIS IS NOT BufLooksLikeRgxa. BufLooksLikeRgxa requires the first BE word
+// to be 0x61786772 ("rgxa"). Measured over the 15 real registrations, 13
+// buffers are byte-exact "rgxa" -- and TWO ARE NOT:
+//   dcl/rmptfx_default.dcl  buf=0x827F8168 size=138  head=0x32303039 ("2009")
+//   dcl/rmptfx_litsprite.dcl buf=0x827F81F8 size=138 head=0x32303039 ("2009")
+// A .dcl is a dated text file. So "is it an rgxa" is not a property of a
+// REGISTRATION; it is a property of the .fxc/.dcl split. Gating a general
+// insert on it would silently drop 2 of the 15 real ones. The general gate is
+// therefore READABILITY, and the container magic is demoted to a logged LABEL
+// (MclaClassifyHead). BufLooksLikeRgxa itself is left exactly where it was, on
+// the two star_glow preload-pack sites, because there the measurement says it
+// is right: those six buffers are 256 KB RSC pack destinations, not shaders.
+//
+// The head-slot note: the guest links through 0x82860000+2804 = 0x82860AF4,
+// while kEmbeddedNameListHead (and boot_host's seed) use 0x82860AF8. The host
+// therefore mirrors each registration into the host list rather than relinking
+// the guest's static node -- reusing that node would require overwriting its
+// +12 next field and would break the guest's own chain at 0xAF4. Boot host is
+// another stream's file, so the 4-byte head difference is REPORTED, not changed.
+// ===========================================================================
+PPC_FUNC_IMPL(__imp__sub_821D22E8);
+// Entries into the guest's registration routine: 0 before the .CRT$XCU fix
+// (the 15 static initialisers never run), 15 after. This is the counter the
+// parallel stream needs to prove its half landed, independent of what we then
+// do with the entry.
+static std::atomic<uint32_t> s_regD22E8{0};
+// Refusals kept per reason, so a soak can tell "could not read the name" from
+// "buffer not readable" instead of one undifferentiated skip count.
+enum MclaRegRefuse {
+  kRegOk = 0,
+  kRegNameUnreadable,
+  kRegNameShape,
+  kRegBufNull,
+  kRegSizeZero,
+  kRegSizeAbsurd,
+  kRegBufUnreadable,
+  kRegDupName,
+  kRegAllocFail,
+  kRegRefuseCount
+};
+static const char *kRegRefuseName[kRegRefuseCount] = {
+    "OK",         "NAME-UNREADABLE", "NAME-SHAPE",  "BUF-NULL",
+    "SIZE-ZERO",  "SIZE-ABSURD",     "BUF-UNREADABLE", "DUP-NAME",
+    "ALLOC-FAIL"};
+static std::atomic<uint32_t> s_regRefuse[kRegRefuseCount]{};
+// A guest buffer may legitimately live anywhere, so no in-image assumption is
+// made -- but we only ever PROBE it (4 bytes), never bulk-copy it. The cap is
+// on the size we are willing to record, not on a read.
+static constexpr uint32_t kRegMaxSize = 64u * 1024u * 1024u;
+
+PPC_FUNC(sub_821D22E8) {
+  const uint32_t n = s_regD22E8.fetch_add(1) + 1;
+  // Read the arguments into locals BEFORE the body runs: the existing
+  // sub_821BC140 hook notes the guest body clobbers r3 (see the save above it).
+  const uint32_t node = ctx.r3.u32, nameVa = ctx.r4.u32;
+  const uint32_t buf = ctx.r5.u32, size = ctx.r6.u32;
+  // Guest first: it stores {name,buf,size,next} into the static node and links
+  // it into ITS list. We mirror into the host list afterwards, so the two never
+  // write the same words in the same breath.
+  __imp__sub_821D22E8(ctx, base);
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  // Fixed bound, and the NUL must fall inside it. MclaSanitizePath() would
+  // instead truncate a long name and hand back a plausible-looking prefix, so
+  // the shape is checked explicitly here and over-long is a refusal.
+  char raw[80] = {0};
+  char name[64] = {0};
+  uint32_t head = 0;
+  int reason = kRegOk;
+  if (nameVa == 0 || !mem.ReadBytes(nameVa, raw, sizeof(raw) - 1)) {
+    reason = kRegNameUnreadable;
+  } else {
+    size_t len = 0;
+    while (len < sizeof(raw) - 1 && raw[len] != '\0')
+      ++len;
+    if (len == 0 || len >= sizeof(raw) - 1) {
+      reason = kRegNameShape; // empty, or no NUL in 79 bytes
+    } else {
+      for (size_t i = 0; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(raw[i]);
+        if (c < 0x20 || c > 0x7E) { // not printable ASCII
+          reason = kRegNameShape;
+          break;
+        }
+      }
+      if (reason == kRegOk) {
+        if (len >= sizeof(name)) {
+          reason = kRegNameShape; // would be truncated into a wrong name
+        } else {
+          std::memcpy(name, raw, len);
+          name[len] = '\0';
+        }
+      }
+    }
+  }
+  if (reason == kRegOk && buf == 0)
+    reason = kRegBufNull;
+  if (reason == kRegOk && size == 0)
+    reason = kRegSizeZero;
+  if (reason == kRegOk && size > kRegMaxSize)
+    reason = kRegSizeAbsurd;
+  if (reason == kRegOk && !mem.ReadU32BE(buf, &head))
+    reason = kRegBufUnreadable;
+
+  // Classify for the log only -- a label, never a gate.
+  const char *cls = reason == kRegOk ? MclaClassifyHead(head) : "unreadable";
+  if (reason != kRegOk) {
+    const uint32_t r = s_regRefuse[reason].fetch_add(1) + 1;
+    const uint32_t m = s_regRefuse[kRegNameUnreadable].load() +
+                       s_regRefuse[kRegNameShape].load() +
+                       s_regRefuse[kRegBufNull].load() +
+                       s_regRefuse[kRegSizeZero].load() +
+                       s_regRefuse[kRegSizeAbsurd].load() +
+                       s_regRefuse[kRegBufUnreadable].load() +
+                       s_regRefuse[kRegDupName].load() +
+                       s_regRefuse[kRegAllocFail].load();
+    if (n <= 16 || (n % 200) == 0)
+      MCLA_LOG_WARN("D2308-REG-SKIP #{} reason={} ({}) seen={} node={:08X} "
+                    "nameVa={:08X} buf={:08X} size={} lr={:08X}",
+                    n, kRegRefuseName[reason], r, m, node, nameVa, buf, size,
+                    static_cast<uint32_t>(ctx.lr));
+    return;
+  }
+
+  // A duplicate is NOT a failure: boot_host's seed already holds these 15
+  // names, so the honest steady state after the parallel fix is DUP, and
+  // D2308-INS (a physical push) will stay 0 for names the seed owns. Reporting
+  // that as OK-with-state is the difference between a countable insert and a
+  // counter that can only read zero.
+  uint32_t prevB = 0, prevS = 0;
+  if (EmbeddedListLookup(name, &prevB, &prevS)) {
+    const uint32_t r = s_regRefuse[kRegDupName].fetch_add(1) + 1;
+    if (n <= 16 || (n % 200) == 0)
+      MCLA_LOG_WARN("D2308-REG-OK #{} state=DUP name='{}' buf={:08X} size={} "
+                    "cls={} prevBuf={:08X} prevSize={} dups={} (seed already "
+                    "owns it; D2308-INS cannot fire)",
+                    n, name, buf, size, cls, prevB, prevS, r);
+    return;
+  }
+  if (!EmbeddedListInsert(name, buf, size)) {
+    const uint32_t r = s_regRefuse[kRegAllocFail].fetch_add(1) + 1;
+    MCLA_LOG_WARN("D2308-REG-SKIP #{} reason=ALLOC-FAIL ({}) name='{}' "
+                  "buf={:08X} size={} cls={}",
+                  n, r, name, buf, size, cls);
+    return;
+  }
+  if (n <= 16 || (n % 200) == 0)
+    MCLA_LOG_WARN("D2308-REG-OK #{} state=NEW name='{}' buf={:08X} size={} "
+                  "cls={} node={:08X}",
+                  n, name, buf, size, cls, node);
+}
 
 PPC_FUNC(sub_821BC140) {
   const uint32_t n = s_hBC140.fetch_add(1) + 1;
@@ -13594,7 +16306,7 @@ PPC_FUNC(sub_821BC140) {
         name[j] = (c >= 32 && c < 127) ? static_cast<char>(c) : '?';
       }
       name[j] = 0;
-      if (j < 4) name[0] = 0; // too short to be a path â€” keep scanning
+      if (j < 4) name[0] = 0; // too short to be a path -- keep scanning
     }
     MCLA_LOG_INFO("REQDUMP #{} a0={:08X} name='{}' d=[{:08X} {:08X} {:08X} "
                   "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
@@ -13873,7 +16585,7 @@ PPC_FUNC(sub_821BC140) {
   }
   // POST-EXEC: mount the inflated buffer as a memory: device so shader
   // lookups (star_glow etc.) can find it. The callback at [ctx+1548] is
-  // 0x821BC548 (semaphore release) â€” wrong function. We do the mount here.
+  // 0x821BC548 (semaphore release) -- wrong function. We do the mount here.
   // NOTE: use slotAddr (saved pre-call), never ctx.r3 — r3 is clobbered.
   MCLA_LOG_WARN("POST-EXEC-START #{} slot={:08X} qarg={:08X} r3after={:08X} "
                 "tid={:08X} pre={}ms guest={}ms rlcAfter={} cbAfter={:08X} "
@@ -13915,7 +16627,7 @@ PPC_FUNC(sub_821BC140) {
       // Register the inflated buffer under embedded:/ relative names.
       // inflSize in the preload ctx is a 12-byte sentinel; use the largest
       // INFLATE out capacity seen this process as the package size.
-      // NOTE: do NOT Mount a fake device at 0xA001xxxx â€” that is o1heap and
+      // NOTE: do NOT Mount a fake device at 0xA001xxxx -- that is o1heap and
       // previously caused sysMemMultiAllocator::Free ownership fatals.
       uint32_t regSize = inflSize;
       if (regSize < 16)
@@ -13944,9 +16656,17 @@ PPC_FUNC(sub_821BC140) {
           MCLA_LOG_WARN("D2308-INS-DONE #{} buf={:08X} size={} (infl={} maxOut={})",
                         n, bufPtr, regSize, inflSize, s_maxInflateOut.load());
         } else {
-          MCLA_LOG_WARN("D2308-INS-SKIP #{} buf={:08X} size={} — not rgxa "
-                        "(preload pack); AFB76-FALLBACK will serve rage_im",
-                        n, bufPtr, regSize);
+          // D2308-REG found the general reason this gate is right here: this is
+          // a 256 KB multi-chunk PRELOAD PACK, not a shader container. Name the
+          // head it actually had so the skip stops being a refusal with no
+          // explanation attached.
+          uint32_t packHead = 0;
+          (void)mem.ReadU32BE(bufPtr, &packHead);
+          MCLA_LOG_WARN("D2308-INS-SKIP #{} buf={:08X} size={} - not rgxa "
+                        "(preload pack) reason=PACK-NOT-A-CONTAINER "
+                        "head={:08X} cls={}; AFB76-FALLBACK will serve rage_im",
+                        n, bufPtr, regSize, packHead,
+                        MclaClassifyHead(packHead));
         }
       } else {
         MCLA_LOG_WARN("D2308-INS-SKIP #{} buf={:08X} inflSize={} maxOut={}",
@@ -14806,9 +17526,12 @@ PPC_FUNC(sub_821BC140) {
       sz = 0x20000;
     DumpBufHead("STAR-GLOW-SEED", bufPtr);
     if (!BufLooksLikeRgxa(bufPtr)) {
-      MCLA_LOG_WARN("STAR-GLOW-SEED #{} buf={:08X} size={} — not rgxa, "
-                    "skip insert (fallback serves rage_im)",
-                    n, bufPtr, sz);
+      uint32_t seedHead = 0;
+      (void)mem.ReadU32BE(bufPtr, &seedHead);
+      MCLA_LOG_WARN("STAR-GLOW-SEED #{} buf={:08X} size={} - not rgxa, "
+                    "skip insert reason=PACK-NOT-A-CONTAINER head={:08X} "
+                    "cls={} (fallback serves rage_im)",
+                    n, bufPtr, sz, seedHead, MclaClassifyHead(seedHead));
     } else {
       static const char *kShaderNames[] = {
           "fxl_final/star_glow.fxc",
@@ -14864,6 +17587,20 @@ PPC_FUNC(sub_821BC910) {
     MCLA_LOG_INFO("RINGB-CONSUMER PRE #{} q={:08X} popIdx={} cnt={} "
                   "waitH={:08X} tid={:08X}",
                   n, qBase, popIdx, cnt, waitH, GetCurrentThreadId());
+    // F-590: the record the drain is ABOUT to test, and the +1548 work flag it
+    // gates on (sub_821BC910: r30 = r31 + popIdx*1556; if (*(r30+1548)) exec).
+    // qBase/popIdx are logged first, so a fault in the guest read below can
+    // never hide the entry (the F-585 rule). Bounded 1-in-8 by popIdx.
+    if ((popIdx & 7u) == 0u) {
+      const uint32_t rec = qBase + popIdx * 1556u;
+      uint32_t flag1548 = 0xDEADBEEFu, tagAt0 = 0xDEADBEEFu;
+      const bool okFlag = mem.ReadU32BE(rec + 1548u, &flag1548);
+      (void)mem.ReadU32BE(rec, &tagAt0);
+      MCLA_LOG_WARN("RINGB-SLOT #{} q={:08X} popIdx={} cnt={} rec={:08X} "
+                    "tag0={:08X} flag1548={:08X} ok={} tid={:08X}",
+                    n, qBase, popIdx, cnt, rec, tagAt0, flag1548, okFlag ? 1 : 0,
+                    GetCurrentThreadId());
+    }
   }
   __imp__sub_821BC910(ctx, base);
   const uint32_t d = s_hBC910out.fetch_add(1) + 1;
@@ -14914,7 +17651,7 @@ PPC_FUNC(sub_821BC868) {
     (void)mem.ReadU32BE(slot + 0, &slotTag);
     // Session 75o: walk the guest stack to name the boot requester above
     // the push wrapper. Recompiler convention saves LR at [back-8]; plain
-    // ABI frames save it at [back+4] â€” try both, log both.
+    // ABI frames save it at [back+4] -- try both, log both.
     char chain[160] = {0};
     size_t off = 0;
     uint32_t sp = ctx.r1.u32;
@@ -14965,7 +17702,7 @@ PPC_FUNC(sub_821BC868) {
 
 // Session 75o: completion dispatcher census. The transfer executor
 // (sub_821BC140) tail calls sub_821C31B8(slot+1544, slot+8, slot+1552,
-// slot+1548) when slot+1540 != 0 â€” the per-transfer completion, which then
+// slot+1548) when slot+1540 != 0 -- the per-transfer completion, which then
 // issues a virtual call (vtable+88). If this never runs after the 3 boot
 // transfers, the init sequence never advances.
 PPC_FUNC_IMPL(__imp__sub_821C31B8);
@@ -14980,7 +17717,7 @@ PPC_FUNC(sub_821C31B8) {
   __imp__sub_821C31B8(ctx, base);
 }
 
-// RELEASE-HANDLE census (session 72): sub_821C9108(h) â†’ sub_8244ED10(h,1,0).
+// RELEASE-HANDLE census (session 72): sub_821C9108(h) -> sub_8244ED10(h,1,0).
 // Ring-B PUSH should release queue+0x616C to wake the consumer parked on
 // C5000300. That SIGNAL never appeared. Dump every release handle.
 PPC_FUNC_IMPL(__imp__sub_821C9108);
@@ -15040,12 +17777,35 @@ PPC_FUNC(sub_824569C8) {
 // GPU fence wait short-circuit: sub_82412F98 busy-loops reading
 // *(TLS_block+332) but the CP drain only writes to *(TLS_block+88).
 // The fence never signals, parking the main thread forever in boot.
-// Override returns r3=0 (success) to unblock boot â†’ start menu.
+// Override returns r3=0 (success) to unblock boot -> start menu.
 // Reference: PARK-SAMPLE shows thread stuck at lr=82412FA0 (mid-function
 // label inside sub_82412F98), polling dev+10896 sub-context via TLS.
+//
+// F-634 (log quality). This override is a BUSY-LOOP poll, so the row was one
+// line per poll iteration: measured on w658.log (1,001,196 lines, 120 s) it
+// printed 295,458 rows = 29.5% of the log, the single largest family in it,
+// over only 7 distinct frame values (5 of them ~59,080 rows each, dev/lr/
+// need/sub/pub byte-identical). That is F-054's shape: a count that measures
+// the host loop instead of the guest, in a log that still looks rich.
+// BOUND, not deleted, house pattern n <= K || (n % 200) == 0.
+//
+// What the bound costs, stated rather than assumed: a 200-wide window can HIDE
+// a rare event. The rare event here is the fence equation moving (need != pub),
+// i.e. the one observation this override exists to make -- so it is counted on
+// every call, printed cumulatively in every row, and its RISING EDGE gets its
+// own low-volume row (capped, then counted only). A 3-poll mismatch blip is
+// therefore countable, not merely suppressed. A dev/lr/sub that changes inside
+// a window is NOT separately announced: it is a per-call-site address, not an
+// event, and `n` in the surviving rows still delimits where to look.
 // ---------------------------------------------------------------------------
+constexpr uint32_t kF98Head = 12;      // every poll of the first boot window
+constexpr uint32_t kF98EdgeHead = 32;  // fence-equation rising edges that get a row
 PPC_FUNC_IMPL(__imp__sub_82412F98);
 static std::atomic<uint32_t> s_h12F98{0};
+static std::atomic<uint32_t> s_f98Supp{0};
+static std::atomic<uint32_t> s_f98Mism{0};
+static std::atomic<uint32_t> s_f98Edge{0};
+static std::atomic<uint32_t> s_f98WasMism{0};
 PPC_FUNC(sub_82412F98) {
   const uint32_t n = s_h12F98.fetch_add(1) + 1;
   // r3 = frame pointer, *(r3+0) = device context
@@ -15055,8 +17815,38 @@ PPC_FUNC(sub_82412F98) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     (void)mem.ReadU32BE(dev, &actualDev);
   }
-  MCLA_LOG_WARN("F98-SKIP #{} frame={:08X} dev={:08X} lr={:08X}", n, dev, actualDev, ctx.lr);
-  
+  // F-603: print the fence equation per hit (needed vs published) so the soak
+  // says WHAT the fence waits on. Guest reads (disasm 0x82412FE4-82412FF8):
+  // need=[frame+8], subctx=[devctx+10896], pub=[subctx+0]. Read-only.
+  uint32_t need = 0, subctx = 0, pub = 0;
+  {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(dev + 8, &need);
+    if (actualDev != 0 && mem.ReadU32BE(actualDev + 10896, &subctx) &&
+        subctx != 0)
+      (void)mem.ReadU32BE(subctx, &pub);
+  }
+  // F-634 bound. need != pub is the observation this override exists to make,
+  // so it is counted on EVERY call (cheap: two values already in hand) and the
+  // rising edge speaks. Everything else is per-poll noise.
+  const bool mism = (need != pub);
+  const uint32_t mismTotal = mism ? s_f98Mism.fetch_add(1) + 1 : s_f98Mism.load();
+  const bool wasMism = s_f98WasMism.exchange(mism ? 1u : 0u) != 0u;
+  const bool speak = (n <= kF98Head) || ((n % 200u) == 0u);
+  const uint32_t supp = speak ? 0u : (s_f98Supp.fetch_add(1) + 1);
+  if (speak) {
+    MCLA_LOG_WARN("F98-SKIP #{} frame={:08X} dev={:08X} lr={:08X} need={} sub={:08X} pub={} "
+                  "suppressed={} mismatch={}", n, dev, actualDev, ctx.lr,
+                  need, subctx, pub, supp, mismTotal);
+  }
+  if (mism && !wasMism) {
+    const uint32_t e = s_f98Edge.fetch_add(1) + 1;
+    if (e <= kF98EdgeHead)
+      MCLA_LOG_WARN("F98-MISMATCH rising #{:03} total={} frame={:08X} need={} pub={} "
+                    "sub={:08X} lr={:08X}", e, mismTotal, dev, need, pub, subctx,
+                    ctx.lr);
+  }
+
   // Also log the TLS block fence addresses being polled
   if (n <= 10) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -15959,7 +18749,7 @@ static void LogFabricatedShader(const char *tag, uint32_t obj) {
 }
 
 // Session 75p: IO-credit census. The streamer refill waits while
-// [0x82757500] <= 0 (Sleep 100ms) before issuing its virtual read â€” an
+// [0x82757500] <= 0 (Sleep 100ms) before issuing its virtual read -- an
 // async-IO credit/deepth limit. These two TU45 functions are the credit
 // consumers/producers; log them to see whether credits ever flow.
 PPC_FUNC_IMPL(__imp__sub_822CBE30);
@@ -16400,7 +19190,7 @@ static std::atomic<uint32_t> s_hF4C0{0};
 // Session 76a: completed-read tracking. Our NtReadFile finishes reads
 // synchronously; record the destination buffers so SLOT-READY only marks
 // slots whose buffer really received a completed read (a flip without a
-// read serves garbage â€” the 0x7E780000 guest AV).
+// read serves garbage -- the 0x7E780000 guest AV).
 constexpr size_t kDoneBufCap = 64;
 static std::atomic<uint32_t> g_doneBufs[kDoneBufCap];
 static std::atomic<uint32_t> g_doneBufIdx{0};
@@ -16474,31 +19264,37 @@ PPC_FUNC(sub_8244F4C0) {
       {
         static bool s_tocDumped = false;
         static bool s_earlyDumped = false;
+        // F-680: `wantBuf` is no longer compared against a stale literal for
+        // the TOC. The buffer the guest reads the ROOT ARRAY into IS the array
+        // base -- that is how the 09-24 soaks caught this at all -- but the
+        // base is now passed in from the published value, and a 0 (not yet
+        // known) makes the call a no-op that keeps the one-shot armed instead
+        // of matching a stale address and writing a wrong file.
         auto dumpOnce = [&](uint32_t wantBuf, uint32_t wantCnt, bool& flag,
                             const char* path) {
-          if (flag || buf != wantBuf || cnt < wantCnt) return;
+          if (flag || wantBuf == 0 || buf != wantBuf || cnt < wantCnt) return;
           flag = true;
-          std::vector<uint8_t> tmp(wantCnt);
-          bool okAll = true;
-          for (uint32_t o = 0; o < wantCnt; o += 4096u) {
-            const uint32_t piece = (wantCnt - o < 4096u) ? (wantCnt - o) : 4096u;
-            if (!memR.ReadBytes(buf + o, reinterpret_cast<char*>(&tmp[o]), piece)) {
-              okAll = false;
-              MCLA_LOG_WARN("TOC-DUMP {} failed at +{} buf={:08X}", path, o, buf);
-              break;
-            }
+          const MclaTocDumpResult r =
+              MclaTocWriteCapture(path, buf, wantCnt);
+          if (!r.wrote) {
+            MCLA_LOG_WARN("TOC-DUMP {} not written (okread={} nonzero={})", path,
+                          r.okRead ? 1 : 0, r.nonzero);
           }
-          if (!okAll) return;
-          FILE* fp = nullptr;
-          if (fopen_s(&fp, path, "wb") == 0 && fp != nullptr) {
-            fwrite(tmp.data(), 1, wantCnt, fp);
-            fclose(fp);
-            MCLA_LOG_WARN("TOC-DUMP wrote {} bytes={} buf={:08X}", path, wantCnt, buf);
-          } else {
-            MCLA_LOG_WARN("TOC-DUMP {} open failed", path);
-          }
+          // Original row, fields unchanged.
+          MCLA_LOG_WARN("TOC-DUMP wrote {} bytes={} buf={:08X}", path, wantCnt, buf);
+          MclaTocLogCapture("TOC-DUMP-NZ", path, r, buf);
         };
-        dumpOnce(0xC60B7780u, 382976u, s_tocDumped, "toc_decrypted.bin");
+        // The TOC array base, as published by sub_821CBFC0's [obj+8] read.
+        dumpOnce(g_tocArrayBase.load(std::memory_order_acquire), 382976u,
+                 s_tocDumped, "toc_decrypted.bin");
+        // NOT RE-ANCHORED, and deliberately so. early_decrypted.bin is a
+        // SEPARATE pre-parse table at 0xC60ACE00, not a prefix of the array
+        // above, so gating it on g_tocArrayBase would silently redefine it as
+        // a truncation of the TOC dump. No runtime source for that address has
+        // been established, so the literal stays and this row is the honest
+        // report that it is unverified: compare `region=` on TOC-DUMP-NZ with
+        // the TOC row's. It does get the nonzero assertion and the
+        // exe-anchored path, because those are address-independent.
         dumpOnce(0xC60ACE00u, 18432u, s_earlyDumped, "early_decrypted.bin");
       }
       // F-100 / rule 19: our own census reads are done, so arm the guard page on
@@ -16609,10 +19405,24 @@ PPC_FUNC(sub_821CDB88) {
 // Session 75w: slot-ready fix. sub_821CBE18(slot) waits on the slot's
 // event while [slot+12]==1 (read in flight). Our NtReadFile completes all
 // reads synchronously with no event signal, so pending slots would block
-// forever on data that is already in their buffers. Flip state 1â†’2 before
+// forever on data that is already in their buffers. Flip state 1->2 before
 // the wait: the IO has in fact completed.
 PPC_FUNC_IMPL(__imp__sub_821CBE18);
 static std::atomic<uint32_t> s_hCBE18{0};
+// AK census 2026-10-05, new symbols (rule 1b). Two running counts for
+// WINWR-WATCH: s_winwrTot counts EVERY entry to sub_821CBE18 and s_winwrHit
+// counts only the entries whose destination passed the 3-compare window-base
+// test. Keeping both is what makes the falsifier decidable: if s_winwrHit stays
+// 0 the bytes reached the window with no host code in it, which is a different
+// answer from "the gate never matched". Both are std::atomic so the census is
+// thread-safe; neither is read by any other code path and neither changes any
+// existing behaviour.
+static std::atomic<uint64_t> s_winwrTot{0};
+static std::atomic<uint64_t> s_winwrHit{0};
+// AK census 2026-10-05, new symbol (rule 1b). WINWR-REC's running count of
+// ARMED entries, i.e. of the entries whose ctx.r5 passed the 3-compare
+// window-base test. std::atomic, read by no other code path.
+static std::atomic<uint64_t> s_winwrRec{0};
 PPC_FUNC(sub_821CBE18) {
   const uint32_t n = s_hCBE18.fetch_add(1) + 1;
   const uint32_t slot = ctx.r3.u32;
@@ -16630,7 +19440,109 @@ PPC_FUNC(sub_821CBE18) {
                       n, slot, buf);
     }
   }
-  __imp__sub_821CBE18(ctx, base);
+  // ---------------------------------------------------------------------------
+  // WINWR-WATCH (AK census 2026-10-05). READ-ONLY. No state change, no D3D12
+  // call, no early return on any existing path, nothing written to guest memory,
+  // and the slot-ready logic above is untouched and still runs first. The ABI
+  // used here (r3=slot, r4=destination, r5=offset, r6=count, and
+  // source = [slot+8] + r5) comes from raw words quoted in the block comment
+  // above kBdf20SlotCountAddr, not from a decompiler.
+  //
+  // WHY src8 IS READ HERE AND NOT AFTER. The copy is the guest's own memcpy at
+  // raw 0x821CBE90, i.e. it happens INSIDE __imp__sub_821CBE18. Reading the
+  // "source" after that call would measure the destination and label it the
+  // source, which is the exact confusion this row exists to remove. pre8 is the
+  // eight bytes ENDING at the destination and src8 is the eight bytes AT the
+  // source, both read on this side of the copy; post8 is the eight bytes AT the
+  // destination read on the far side. copied= is the byte-for-byte comparison of
+  // src8 against post8, so "the memcpy is faithful" is a measured field on the
+  // row instead of an assertion in a comment.
+  //
+  // The gate is MclaWinwrIsWindowBase(dest): a 3-compare range test on the
+  // DESTINATION and nothing else. No watch range is registered anywhere in this
+  // block, RegisterGuestWatchRange/RegisterGuestWatchValue are not called, the
+  // generic page-watch logger is not touched, and no other armed range is
+  // disturbed. hit= and slots= are on the row so a soak can tell "the gate never
+  // matched" apart from "the function was never entered".
+  {
+    const uint32_t wwDest = ctx.r4.u32;
+    const uint32_t wwOff = ctx.r5.u32;
+    const uint32_t wwCnt = ctx.r6.u32;
+    const uint32_t wwLr = static_cast<uint32_t>(ctx.lr);
+    uint32_t wwSrcBase = 0;
+    if (slot != 0 && slot != 0xCDCDCDCDu)
+      (void)memS.ReadU32BE(slot + 8, &wwSrcBase);
+    const bool wwBaseOk = (wwSrcBase != 0u && wwSrcBase != 0xCDCDCDCDu);
+    const uint32_t wwSrc = wwBaseOk ? (wwSrcBase + wwOff) : 0u;
+    const bool wwHit = MclaWinwrIsWindowBase(wwDest);
+    uint32_t wwSlots = 0;
+    (void)memS.ReadU32BE(kBdf20SlotCountAddr, &wwSlots);
+    const uint64_t wwTot = s_winwrTot.fetch_add(1) + 1;
+    const uint64_t wwHitTot = wwHit ? (s_winwrHit.fetch_add(1) + 1) : 0u;
+    // Sparse on BOTH counters: the first 6 of each and every 50th of each, so
+    // the last row printed before the fatal carries the running count with it.
+    const bool wwPrint = (wwTot <= 6u) || ((wwTot % 50u) == 0u) ||
+                         (wwHitTot <= 6u) || ((wwHitTot % 50u) == 0u);
+    uint8_t wwPreB[8] = {0};
+    uint8_t wwSrcB[8] = {0};
+    const bool wwPreOk =
+        (wwDest >= 8u) && memS.ReadBytes(wwDest - 8u, wwPreB, sizeof(wwPreB));
+    const bool wwSrcOk = wwBaseOk && memS.ReadBytes(wwSrc, wwSrcB, sizeof(wwSrcB));
+    // std::string, not char[17]: the first version of this returned a
+    // `char*` from the lambda, i.e. a pointer to a local that died at the
+    // return, and read it back through snprintf -- clang flagged it as
+    // -Wreturn-stack-address and it was undefined behaviour, not a style note.
+    std::string wwPreHex = "-";
+    std::string wwSrcHex = "-";
+    std::string wwPostHex = "-";
+    // [S0]: this census reads the PROCESS-GLOBAL active guest view -- the view
+    // the recompiled guest's own load/store macros route through -- and NOT a
+    // private local view. VerifyGuestMemoryViewForTests() is deliberately not
+    // used anywhere in this file: it installs a view of its own and would
+    // measure nothing. s0ok=1 means the active view's eight bytes at the source
+    // agree, byte for byte, with the heap read the row reports as src8.
+    uint8_t wwS0B[8] = {0};
+    auto &wwS0View = mcla::native::GetActiveGuestMemoryView();
+    const bool wwS0Ok = wwBaseOk && wwS0View.ReadBytes(wwSrc, wwS0B, 8);
+    const bool wwS0Same =
+        wwSrcOk && wwS0Ok && (std::memcmp(wwSrcB, wwS0B, 8) == 0);
+    auto wwHex = [](const uint8_t *b) {
+      std::string s;
+      char t[3] = {0};
+      for (int k = 0; k < 8; ++k) {
+        std::snprintf(t, sizeof(t), "%02X", b[k]);
+        s += t;
+      }
+      return s;
+    };
+    if (wwPreOk)
+      wwPreHex = wwHex(wwPreB);
+    if (wwSrcOk)
+      wwSrcHex = wwHex(wwSrcB);
+    __imp__sub_821CBE18(ctx, base);
+    if (wwPrint) {
+      uint8_t wwPostB[8] = {0};
+      const bool wwPostOk = memS.ReadBytes(wwDest, wwPostB, sizeof(wwPostB));
+      if (wwPostOk)
+        wwPostHex = wwHex(wwPostB);
+      uint32_t wwDstAfter = 0;
+      (void)memS.ReadU32BE(wwDest, &wwDstAfter);
+      const bool wwCopied =
+          wwSrcOk && wwPostOk && (std::memcmp(wwSrcB, wwPostB, 8) == 0);
+      // 20 placeholders, 20 arguments (counted by tools/ak_fmt_arity.py, not by
+      // eye). This format string's literal text names no other tracked marker,
+      // so printing it cannot move another marker's line count.
+      MCLA_LOG_WARN(
+          "WINWR-WATCH #{} dest={:08X} slot={:08X} off={} cnt={} "
+          "srcBase={:08X} src={:08X} lr={:08X} tid={} hit={} slots={} "
+          "pre8={} src8={} post8={} copied={} dstAfter={:08X} "
+          "preOk={} srcOk={} s0ok={} tot={}",
+          wwHitTot, wwDest, slot, wwOff, wwCnt, wwSrcBase, wwSrc, wwLr,
+          GetCurrentThreadId(), wwHit ? 1 : 0, wwSlots, wwPreHex, wwSrcHex,
+          wwPostHex, wwCopied ? 1 : 0, wwDstAfter, wwPreOk ? 1 : 0,
+          wwSrcOk ? 1 : 0, wwS0Same ? 1 : 0, wwTot);
+    }
+  }
 }
 
 // T41.3w (B3): the "[dev+12] error/media flags" word is the RPF3 TOC record's
@@ -16642,18 +19554,44 @@ PPC_FUNC(sub_821CBE18) {
 // inverted, see F-112): generated/ppc_xenon/ppc_recomp.17.cpp:3114 ff --
 //   r31 = r4 (the read-request object), r30 = r3, r27 = r6 (length)
 //   r11 = [r31+0] = the TOC record;  r10 = [r11+12]
-//   if (r10 & 0x40000000) { if (!(r10 & 0x80000000)) -> 0x821CC234 block }
-//   else -> 0x821CC224 with r10 = r25 = 0 -> normal
-// so the block at 0x821CC234 runs iff bit30 set AND bit31 clear, and inside it
-// the guest submits the real read through the device vtable (bctrl at
+// so the block at 0x821CC234 runs iff `w3 & 0x3 == 2` -- bits 1 and 0 -- and
+// inside it the guest submits the real read through the device vtable (bctrl at
 // 0x821CC2B8), waits on the IO block (bl 0x821DEE40 at 0x821CC2EC), and fatals
 // with 'Fatal disc error' when THAT returns 1 (r29 = r3, cmpi r29,1 at
-// 0x821CC2F8). i.e. bit30 = "bytes not resident yet, do a disc read",
-// bit31 = "read completed". The missing step is the completion, not an ack.
+// 0x821CC2F8). i.e. the pair is "do a disc read" vs "read completed", and the
+// test is on the two LOW bits.
+// ⚠️ THE THREE LINES ABOVE ARE WITHDRAWN (2026-10-05, measured from raw words).
+// "w3 & 0x3 == 2 -- bits 1 and 0 ... the test is on the two LOW bits" is the
+// LSB-numbered reading. 0x821CC208 is MB=1, ME=1 -> mask 0x40000000 and
+// 0x821CC214 is MB=0, ME=0 -> mask 0x80000000, so the block at 0x821CC234 runs
+// iff bit30 is SET and bit31 is CLEAR. That is the host's ORIGINAL test. The
+// measurement and the raw bytes are in the F-657 (0)/(1) blocks above.
+// F-657 CORRECTION (2026-09-30) -- WITHDRAWN IN ITS CONCLUSION, ITS HISTORY IS
+// KEPT. The two lines above this one, as they read on disk before that pass,
+// were:
+//     if (r10 & 0x40000000) { if (!(r10 & 0x80000000)) -> 0x821CC234 block }
+// and the host implemented exactly that. That pass called it "wrong, twice
+// over" and blamed the decompilers, reading 0x821CCF7C `55 6A 00 42` (MB=1,
+// ME=1) and 0x821CCF88 `55 6B 00 00` (MB=0, ME=0) as "bit 1 and bit 0; bit 31
+// is not in it". The masks those two words encode are 0x40000000 and
+// 0x80000000. The decompilers were right, the byte-level test was right, and
+// the "correction" was the error -- it was made on a gloss, not on the words.
+// Nothing here is changed in consequence: the byte-exact reverted predicate is
+// what runs, which is the original reading, so this comment now matches the
+// code below it for the first time.
 // MITIGATION (labelled, NOT the mechanism): forcing bit31 claims the data is
 // already resident and skips the guest's own read submission. Without it the
 // boot dies 13k lines earlier (w100 vs w99: TOC76 232 vs 2079, GETDEV 100 vs
 // 694), so the forced bit is load-bearing while the completion path is unfixed.
+// F-657: the corrected predicate fires on FAR fewer records than the old one
+// (measured on the w675 TOCWALK-LEAF population: 877 of 8,192 have
+// `w3 & 0x3 == 2`, against 577 for the old bit30/!bit31 test), so retiring the
+// old predicate retires the mitigation for ~93% of records at once and hands
+// them to the guest's own read submission, which this file has never made
+// deliver. THAT IS A REGRESSION RISK, NOT A RESULT: it is not predicted here
+// and it is not measured. The gate a soak must meet is stated in the
+// F-657 handoff, not run. Do-not #1/#9 applies -- do not add a second
+// short-circuit on top of this one to cover the new path.
 // The honest measurement of the missing step is DISCCHK2-RES below.
 PPC_FUNC_IMPL(__imp__sub_821CC1E0);
 static std::atomic<uint32_t> s_hCC1E0{0};
@@ -16669,22 +19607,38 @@ PPC_FUNC(sub_821CC1E0) {
       if (n <= 40 || (n % 200) == 0) {
         (void)memD.ReadU32BE(rec + 4, &size);
         (void)memD.ReadU32BE(rec + 8, &offs);
+        // `route=` is the OLD, WRONG predicate (bit30 set, bit31 clear) kept
+        // verbatim so w101/w99 remain comparable; `gate=` is the corrected one
+        // from 0x821CCF7C/0x821CCF88. They are different populations.
         MCLA_LOG_WARN(
             "DISCCHK2 #{} strm={:08X} fobj={:08X} len={:X} rec={:08X} "
-            "size={:X} offs={:X} flags={:08X} route={}",
+            "size={:X} offs={:X} flags={:08X} route={} gate={}",
             n, strm, ctx.r3.u32, ctx.r6.u32, rec, size, offs, flags,
             ((flags & 0x40000000u) && !(flags & 0x80000000u))
                 ? "guest-disc-read"
-                : "already-resident");
+                : "already-resident",
+            MclaTocServeGateFatal(flags) ? "fatal-chunked" : "bulk-w1");
       }
+      // REVERTED (2026-09-30, after w676): the F-657 corrected gate (w3&0x3)==2
+      // is a POPULATION change, not a result, exactly as its own block above
+      // warned. w676 measured the consequence: DISCCHK 779 -> 3, AFB76-TOC-HIT
+      // 18 -> 0, SERVE-PROOF 262 -> 3, TOCSERVE 18 -> 0, and the guest's own
+      // 'Fatal error dispatcher invoked - terminating game' fired for the first
+      // time in this project's history at 11:25:13.958. Only WHICH records the
+      // forcing is asked about is reverted, to the bit30-set/bit31-clear test the
+      // host had before F-657; the forcing mechanism and label are unchanged and
+      // kDiscChkForcedAck is still load-bearing. `gate=` on DISCCHK2 still PRINTS
+      // the corrected predicate so the two populations stay separable. Pending a
+      // make-the-read-submission-deliver fix. Do-not #1/#9: no second
+      // short-circuit on top of this one to cover the other population.
       if ((flags & 0x40000000u) != 0 && (flags & 0x80000000u) == 0) {
         // MITIGATION, load-bearing: w101 (false) dies at 4,528 lines with
         // 'Fatal disc error' because the guest's own completion returns -3
         // (DISCCHK2-RES), and r3<0 is exactly its fatal condition; w99 (true)
         // reaches 17,868 lines. Cost: forcing bit31 tells the guest the bytes
         // are already resident, so its read submission (the bctrl at
-        // 0x821CC2B8) never runs for ANY record -- every cache-packfile record
-        // has bit30. Retiring this means making that path deliver.
+        // 0x821CC2B8) never runs for ANY record. Retiring this means making
+        // that path deliver.
         constexpr bool kDiscChkForcedAck = true;
         if (kDiscChkForcedAck)
           (void)memD.WriteU32BE(rec + 12, flags | 0x80000000u);
@@ -16692,10 +19646,64 @@ PPC_FUNC(sub_821CC1E0) {
     }
   }
   __imp__sub_821CC1E0(ctx, base);
+  // ---------------------------------------------------------------------------
+  // WINWR-REC (AK census 2026-10-05). READ-ONLY, and placed AFTER the call so
+  // the record's fields are read in the same state the guest resumes in. No
+  // state change, no D3D12 call, no early return, nothing written to guest
+  // memory. The existing DISCCHK2 block above is untouched and still owns the
+  // kDiscChkForcedAck write; this block only reads.
+  //
+  // ARMED ON ctx.r5, which is the window. MEASURED, from raw words in
+  // build/cache/mcla_pe.bin at VA - 0x82000000 (big endian, tools/ppc_disasm.py):
+  //   0x821CD35C  7CBD2B78  mr  r29,r5      r29 = this frame's entry r5
+  //   0x821CD3A4  7FA5EB78  mr  r5,r29      r5 = r29, handed to the callee
+  //   0x821CD3A8  7FE3FB78  mr  r3,r31
+  //   0x821CD3AC  4BFFEE35  bl  0x821CC1E0  <- THIS function
+  // so ctx.r5 on entry is the same window address that later arrives as r4 (the
+  // destination) at 0x821CCB8C and is copied into by raw 0x821CBE90. The gate
+  // is therefore the same 3-compare window-base test WINWR-WATCH uses on its
+  // destination, applied here to r5.
+  //
+  // WHY rec[+0..+24]. rec[4] and rec[8] are the two numbers the offset-basis
+  // question turns on -- the record's LOGICAL size and the member's ARCHIVE
+  // offset -- and neither is printed densely enough by the existing row to be on
+  // the record for the fatal's own member. The whole 7-dword span is dumped so
+  // the two are comparable against any later reading of the same record rather
+  // than quoted from memory. `rec` is resolved the same way the block above
+  // resolves it (the guest's own r31 == this function's entry r4, then [r31+0]),
+  // so these values line up with that row's size= / offs= fields.
+  {
+    const uint32_t rrWin = ctx.r5.u32;
+    if (MclaWinwrIsWindowBase(rrWin)) {
+      const uint64_t rrTot = s_winwrRec.fetch_add(1) + 1;
+      if (rrTot <= 6u || (rrTot % 50u) == 0u) {
+        // The DISCCHK2 block's own `memD` is scoped inside its braces, so this
+        // block takes its own handle on the same singleton. Read-only.
+        auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+        const uint32_t rrStrm = ctx.r4.u32;
+        uint32_t rrRec = 0;
+        if (rrStrm != 0u && rrStrm != 0xCDCDCDCDu)
+          (void)memR.ReadU32BE(rrStrm + 0, &rrRec);
+        uint32_t w[7] = {0, 0, 0, 0, 0, 0, 0};
+        if (rrRec != 0u && rrRec != 0xCDCDCDCDu)
+          for (int k = 0; k < 7; ++k)
+            (void)memR.ReadU32BE(rrRec + static_cast<uint32_t>(k * 4), &w[k]);
+        const uint32_t rrLr = static_cast<uint32_t>(ctx.lr);
+        // 15 placeholders, 15 arguments (counted by tools/ak_fmt_arity.py).
+        // This format string's literal text names no other tracked marker.
+        MCLA_LOG_WARN(
+            "WINWR-REC #{} win={:08X} strm={:08X} rec={:08X} rec0={:08X} "
+            "rec4={:08X} rec8={:08X} rec12={:08X} rec16={:08X} "
+            "rec20={:08X} rec24={:08X} r5={:08X} lr={:08X} tid={} tot={}",
+            rrTot, rrWin, rrStrm, rrRec, w[0], w[1], w[2], w[3], w[4], w[5],
+            w[6], rrWin, rrLr, GetCurrentThreadId(), rrTot);
+      }
+    }
+  }
 }
 
 // Session 76e: boot-init path census. sub_82187820(descriptor) runs in the
-// boot task and reaches fiDevice::GetDevice(path) â€” the crash showed the
+// boot task and reaches fiDevice::GetDevice(path) -- the crash showed the
 // path pointer itself = garbage (0xFF00FF00). Log the descriptor + the
 // path string at entry to find which field is unwritten.
 PPC_FUNC_IMPL(__imp__sub_82187820);
@@ -16885,15 +19893,39 @@ PPC_FUNC(sub_82188E50) {
         text[i] = (c >= 32 && c < 127) ? static_cast<char>(c) : '.';
       }
     }
+    // F-654: `src=` names WHERE the line came from, because the buffer address
+    // alone is ambiguous and the last six rows of this marker are NOT list
+    // content. Measured on w666.log (63 rows, 940,429 lines):
+    //   lr=82187958 -> 57 rows, r3 = 0x8EFFFxxx (guest stack) -- the five
+    //     preload.list groups (ui/city/cars/characters/effects, BOOTPATH #1..#5).
+    //   lr=82189234 -> 5 rows, r3 = 0x8EFFF1xx/0x8EFFF280 (guest stack, sp was
+    //     0x8EFFF230 at the fatal) -- 'embedded:/rage_postfx' ... 'embedded:/Shadows'
+    //   lr=82189248 -> 1 row,  r3 = 0x820436E0 = IMAGE .rdata, the literal
+    //     "Shadows" (verified against build/cache/mcla_pe.bin at VA-0x82000000,
+    //     sitting between "cityLOD" and "$/shaders/misc").
+    // So the last six are the FALLBACK probe chain inside sub_82189138 (the
+    // dictionary's lookup-or-insert), which composes "embedded:/<name>" onto its
+    // OWN stack and finally retries the bare .rdata name -- not a file, and not
+    // text the line reader pulled from one. `src` classifies the address band so
+    // this is re-measurable rather than re-derived.
+    const char *src = "unknown";
+    if (buf >= 0x82000000u && buf < 0x82AD3000u)
+      src = "IMAGE-rdata";   // guest static literal baked into the executable
+    else if (buf >= 0x8E000000u && buf < 0x90000000u)
+      src = "GUEST-STACK";   // guest composed this buffer itself
+    else if (buf >= 0xA0000000u && buf < 0xC0000000u)
+      src = "HOST-HOLE";     // host-allocated guest view
+    else
+      src = "OTHER";
     MCLA_LOG_WARN("LISTLINE sub_82188E50 #{} r3={:08X} r4={:08X} lr={:08X} "
-                  "read={} text='{}'",
+                  "read={} src={} text='{}'",
                   n, buf, ctx.r4.u32, static_cast<uint32_t>(ctx.lr), got ? 1 : 0,
-                  text);
+                  src, text);
   }
   __imp__sub_82188E50(ctx, base);
 }
 
-// Session 76g: census of the 13 preload-list global users â€” which runs?
+// Session 76g: census of the 13 preload-list global users -- which runs?
 // (the global 0x827D7770 is never populated before the boot init reads it)
 PPC_FUNC_IMPL(__imp__sub_8268A828);
 static std::atomic<uint32_t> s_h8268A828{0};
@@ -17079,8 +20111,40 @@ PPC_FUNC(sub_821CB488) {
       if (hold) {
         memR.ReadU32BE(hold, &d0);
         memR.ReadU32BE(hold + 4u, &d1);
-        memR.ReadU32BE(d0, &vt0);
-        memR.ReadU32BE(d1, &vt1);
+        // LOG-ONLY null guards, in the style of the two d*pfx reads below.
+        // vt0/vt1 are census locals: declared on this loop's line, written only
+        // here, and read only by the MCLA_LOG_WARN format below. They feed no
+        // register, no guest memory, no draw. ReadU32BE REFUSES va=0 and
+        // returns false WITHOUT writing *outVal (src/kernel/memory.h marks it
+        // [[nodiscard]]; src/kernel/memory.cpp:204-210 returns before the
+        // store), so a guard cannot change what the row prints -- it only
+        // removes one spurious GUEST-LOAD-REFUSED row per null pointer.
+        //
+        // MEASURED, w682.log, byte-exact: 16 GUEST-LOAD-REFUSED rows, every one
+        // va=00000000 size=4 fn=ReadU32BE why=range, and they close exactly on
+        // this block. Forward attribution (the GETDEV-E* row prints AFTER its
+        // reads, so a refusal belongs to the row that FOLLOWS it): 7 GETDEV-E1
+        // rows carry d0=00000000 d1=00000000 -> 2 refusals each = 14, and 2
+        // GETDEV-E0 rows carry d0=B7321288 d1=00000000 -> 1 each = 2. 14 + 2 =
+        // 16, none left over, none double-counted. `ReadU32BE(d0` and
+        // `ReadU32BE(d1` occur only HERE in this file (2 each; the other two are
+        // the already-guarded d*pfx lines).
+        //
+        // THIS IS NOT A CRASH FIX. The boot's real crash is ctr == 0 at
+        // PPC_CALL_INDIRECT_FUNC, a different file, instrumented separately.
+        if (d0) (void)memR.ReadU32BE(d0, &vt0);
+        if (d1) (void)memR.ReadU32BE(d1, &vt1);
+      }
+      // LOG-ONLY: which vtable read did NOT happen. d0 and d1 both print as
+      // 00000000 when the device pointer is null AND when the holder itself is
+      // null, so before this field those states were indistinguishable on the
+      // row -- a future null would have looked like an absence. Bit 0 = the vt0
+      // read was skipped because d0 was null; bit 1 = likewise for vt1; bit 2 =
+      // the whole holder block was skipped because `hold` was null.
+      uint32_t vtNullMask = hold ? 0u : 4u;
+      if (hold) {
+        if (d0 == 0) vtNullMask |= 1u;
+        if (d1 == 0) vtNullMask |= 2u;
       }
       uint32_t d0pfx = 0, d1pfx = 0;
       if (d0) (void)memR.ReadU32BE(d0 + 36u, &d0pfx);
@@ -17088,8 +20152,9 @@ PPC_FUNC(sub_821CB488) {
       MCLA_LOG_WARN(
           "GETDEV-E{} [name='{}' flag={:x} len={} hold={:08X} dcnt={:04X} "
           "dcap={:04X} d0={:08X} vt0={:08X} pfx0={:08X} d1={:08X} vt1={:08X} "
-          "pfx1={:08X}]",
-          e, name, flag, len, hold, dcnt, dcap, d0, vt0, d0pfx, d1, vt1, d1pfx);
+          "pfx1={:08X} vtNullMask={}]",
+          e, name, flag, len, hold, dcnt, dcap, d0, vt0, d0pfx, d1, vt1, d1pfx,
+          vtNullMask);
     }
   }
   const uint32_t pathG = ctx.r3.u32; // path arg, clobbered by the call
@@ -17111,7 +20176,7 @@ PPC_FUNC(sub_821CB488) {
   }
 }
 
-// Session 76j: fiDevice::Mount census â€” every device registration with its
+// Session 76j: fiDevice::Mount census -- every device registration with its
 // device pointer and vtable sanity (crash = garbage Device* in the holder).
 PPC_FUNC_IMPL(__imp__sub_821CB9D8);
 static std::atomic<uint32_t> s_hMnt{0};
@@ -17132,7 +20197,7 @@ PPC_FUNC(sub_821CB9D8) {
   __imp__sub_821CB9D8(ctx, base);
 }
 
-// Session 76j: the "embedded:" device method (sub_821CB070) â€” crash RIP was
+// Session 76j: the "embedded:" device method (sub_821CB070) -- crash RIP was
 // inside its inlined strrchr/strlen (AV at first uncommitted page below the
 // scan). Log its args to separate garbage-device vs non-terminated string.
 PPC_FUNC_IMPL(__imp__sub_821CB070);
@@ -17155,12 +20220,1072 @@ PPC_FUNC(sub_821CB070) {
   __imp__sub_821CB070(ctx, base);
 }
 
+// F-632 (2026-09-28): the set of nested packfiles the guest has opened, so the
+// TOC census can attribute a record to the right one. The guest reaches a nested
+// member under two spellings -- `preload/xarchive_cameratune.rpf/tune/vehicle/
+// vehicle0008.lst` (the outer device, which SplitNestedPath parses) and
+// `tune/vehicle/vehicle0008.lst` (the nested device's own TOC lookup, which
+// repeats no archive component). The second spelling has to be resolved against
+// the archives that are actually MOUNTED, not against a guess, so each candidate
+// is asked of RpfVirtualFileSystem::FindNestedRpf using the VFS's own key
+// normalisation: it can only answer yes for an archive this file registered and
+// the VFS mounted. Append-only for the life of a boot.
+static std::mutex g_nestedNameMtx;
+static std::vector<std::string> g_nestedNames;
+
+static void MclaRememberNestedArchive(const std::string &name) {
+  std::lock_guard<std::mutex> lk(g_nestedNameMtx);
+  for (const auto &nm : g_nestedNames) {
+    if (nm == name)
+      return;
+  }
+  g_nestedNames.push_back(name);
+}
+
+static std::vector<std::string> MclaNestedArchiveNames() {
+  std::lock_guard<std::mutex> lk(g_nestedNameMtx);
+  return g_nestedNames;
+}
+
+// ===========================================================================
+// F-655 (2026-09-30) -- THE GUEST'S OWN TOC, ENUMERATED INSTEAD OF OBSERVED.
+//
+// THE QUESTION F-654 COULD NOT ANSWER. w667.log's refusal is right that the
+// host cannot search the on-disk TOC (F-099: it is AES on disk) and right that
+// the content is present, but it stopped one step short of the fact that
+// matters: the GUEST holds an unencrypted copy of that same table, in guest
+// memory, and the host can walk it. F-654 could only READ a record when the
+// guest happened to look one up, and a guest that wants 'Shadows' through
+// `embedded:/` never looks one up -- so nothing was ever published for it.
+// (Measured: none of w667.log's 479 TOC76-XSF rows is a `shaders/city/...Shadows`
+// member, which is the whole gap.)
+//
+// THE STRUCTURE, from the guest's own lookup code and nothing else.
+// sub_821CBFC0(dev, path) -- generated/ppc_xenon/ppc_recomp.17.cpp:2795:
+//   :2823  node = [dev+8]                       the ROOT ARRAY BASE (TOC76's
+//                                               `inner=`); 0 -> return 0
+//   :2835  skip one leading '/' or '\'
+//   :2878  loc_821CC03C -- ONE TURN PER PATH COMPONENT
+//   :2880  w2 & 0x7FFFFFFF         binary-search COUNT of the slice below
+//   :2884  w3 & 0x3FFFFFFF         binary-search BASE INDEX of the slice
+//          F-657: these two were named backwards here for the life of the
+//          walk. The masked word8 value is the COUNT and the masked word12
+//          value is the BASE INDEX -- not the reverse. It never showed up as a
+//          failure because the walk only ever uses the pair to enumerate the
+//          SET {base .. base+cnt-1}, and a set does not care which end is
+//          called what; that is why 256/256 observations passed over it.
+//   :2891  the component is copied to sp+80, stopping at 0x00, 0x2F or 0x5C
+//          F-657: these three are the whole test. Re-read as raw words at
+//          0x821CC064 `3F 0A 00 00` (cmpi r10,0), 0x821CC06C `3F 0A 00 2F`
+//          (cmpi r10,47) and 0x821CC074 `3F 0A 00 5C` (cmpi r10,92), each
+//          branching to 0x821CC098 -- NUL, '/' and '\\', and nothing else.
+//          This comment used to say "NUL, \"" -- there is no 0x22 compare
+//          anywhere in the component loop. The quote handling that does exist
+//          is in the HASH (MclaTocHash, sub_821C9790, which stops at '"' and
+//          folds '\\' to '/'), not in the walker.
+//   :2933  hash = sub_821C9790(component, 0)    the per-component NAME HASH
+//   :2936  if (lo > lo+cnt-1) return 0          the array's OWN bounds test
+//   :2944  loc_821CC0B8 -- binary search: mid=(lo+hi)>>1, stride 16 BYTES
+//   :2953  key = *(u32*)(node + mid*16)         == the slot's word 0
+//   :3023  hash vs key; equal -> found (:3031/:3048 narrow lo or hi)
+//   :3083  the found slot IS `node + mid*16`; a further component DESCENDS
+//          with that slot as the next node (its +8/+12 are then lo/cnt)
+//   :3104  otherwise the slot is RETURNED as the TOC record
+// So the guest's TOC is ONE FLAT 16-byte-stride array, hash-sorted on word0,
+// holding every level in order; a slot with bit31 of word8 set is a DIRECTORY
+// whose word8/word12 are (lo,cnt) slices of that same array (see DIRECTORY-vs-
+// LEAF below), and a slot with that bit clear is a MEMBER:
+//   word0  = sub_821C9790(componentName, 0)   -- MEASURED, not inferred:
+//             h("Shadows.fxc") = 0x496B51F8 = w0 of w667.log's row for
+//                                        shaders/city/fxl_final/Shadows.fxc
+//             h("Shadows.dcl") = 0xC51C449D = that row for .../dcl/Shadows.dcl
+//             h("AmbientOcclusionShadows.dcl") = 0xFD32FB30 = w667.log's row
+//                                        for shaders/cars/dcl/AmbientOcclusionShadows.dcl
+//   word4  = LOGICAL length, word8 = archive offset | flags,
+//   word12 = STORED length | flags            (the three-field discipline)
+//
+// DIRECTORY-vs-LEAF, AND WHERE THE CHILD LIVES. MEASURED, w668.log.
+//
+// (1) THE FLAG IS BIT 31 OF word8, and it is a bit, not a threshold. The
+// instruction is 0x821CC1BC `556A0FFE` -- the disassembly in the previous
+// revision of this comment (MB=11,ME=21, mask 0x003FF800) was a mis-split of
+// those 32 bits; re-derived from the raw word (offset = VA - 0x82000000,
+// big-endian) it is `rlwinm r10,r11,1,31,31`, i.e. SH=1, MB=31, ME=31.
+// ⚠️ 2026-10-05, MEASURED: the mask for MB=31, ME=31 is 0x00000001, NOT
+// 0x80000000, so this sentence's "i.e. bit 30 of word8, and the mask is
+// 0x80000000" was the LSB-numbered reading and is WITHDRAWN. Rotate left by 1
+// and keep the single retained bit: the retained bit of the ROTATED value is
+// bit 0, which came from bit 31 of word8. So the raw encoding says BIT 31.
+// The code that ACTUALLY RUNS is the recompiled form
+// (generated/ppc_xenon/ppc_recomp.17.cpp:3093)
+//     __builtin_rotateleft64((r11.u64 << 32) | r11.u64, 1) & 0x1
+// whose low bit is bit 31 of word8 (the <<32 puts word8 in the HIGH half, so
+// the 64-bit rotate brings bit 31 down to bit 0). CONSEQUENCE: the disagreement
+// this paragraph used to assert does not exist. The measurements pick bit 31,
+// the raw encoding picks bit 31, and the emitted mask is 0x1 -- three oracles,
+// one answer. The "they differ by one bit" reading was an artefact of the
+// withdrawn 0x80000000, and the separate bit30 census below should be read as
+// history rather than as a competing hypothesis. The two halves of the archive
+// separate cleanly on bit 31:
+//   * all 14 slots of the root array have word8 = 0x8000_00xx -> bit31 SET,
+//     bit30 CLEAR. Their word0 hashes match real top-level component names
+//     (re-running MclaTocHash offline: 0x4049095C="preload", 0x938B83B2=
+//     "shaders", 0xA39DCA00="resources", 0xB80C6AE8="audio"), so they ARE
+//     directories; the guest demonstrably descends through them
+//     (resources/ui/raceeditor/raceeditor.xsf resolves, TOC76 #1/RET #1).
+//   * of the 160 distinct slot addresses the guest published in w668.log, the
+//     number with bit31 SET in word8 is ZERO, and the number with bit30 SET is
+//     5. Bit 30 is therefore not the discriminator either (its own
+//     `openGateBit30` column, 157/160 on word12, is a different bit entirely).
+//
+// (2) A CHILD DIRECTORY'S RANGE IS AN INDEX RANGE INTO THE SAME ARRAY, NOT A
+// NEW BASE. This is the defect w668.log measured: 0x821CC0B0 is
+// `80BB0008  lwz r5,8(r27)` -- the search base is re-read from [dev+8] on
+// EVERY turn of the component loop, and r27 (the device) is never reassigned in
+// sub_821CBFC0 (ppc_recomp.17.cpp:2818 is its only definition, :2810-3111 read
+// in full). Only the (count, base index) PAIR moves: 0x821CC1B0 `7F8B2A15 add
+// r28,r11,r5` makes the matched slot the next node, and 0x821CC03C/:2880-2884
+// then read the pair off it while r5 is still the root. F-657: word8's masked
+// value is the COUNT and word12's is the BASE INDEX -- the raw mb/me are
+// 0x821CC04C `55 5F 00 7E` (MB=1,ME=31) and 0x821CC050 `55 6A 00 BE`
+// (MB=2,ME=31) -- and this comment had them the other way round until now. So
+// one FLAT 16-byte-stride array holds the whole tree, sorted by word0, and a
+// directory's word8/word12 are that directory's slice of it.
+// Measured support, from w668.log's 160 distinct `entry=` values and the root
+// B9038E00 that TOC76 publishes as `inner=`: every one of the 160 is 16-byte
+// aligned on B9038E00 (0 exceptions) and every consecutive pair differs by a
+// multiple of 16 (47 gaps of 16, 38 of 32, 20 of 64, ...), with indices
+// 31..17044 -- the walk had only reached 1..14. Re-anchoring the child on the
+// slot address, as w668's walk did, is wrong by mid*16 at every level.
+//
+// (3) A MEMBER'S word8 IS ITS ARCHIVE OFFSET, and the separation is measured
+// from the log rather than assumed: the LOWEST published member in w668.log is
+// `resources/ui/meshtextures.xtd` at entry=B9038FF0 with word8=0x00060009 =
+// 393,225 -- the 0x60009 floor this file has quoted all along, now observed in
+// the same run as the directories. The walk prints both margins
+// (TOCWALK-SUMMARY `maxDirLo`/`minMemberLo`) so the separation stays a
+// measurement of the run and not an assumption.
+//
+// F-656b CORRECTION (2026-09-30). The 0x60009 floor is real -- it IS
+// meshtextures.xtd's published offset -- but it was applied as a MINIMUM over
+// all 22,068 members, which makes it a one-slot veto and hides the population
+// it is actually measuring. w670 logged 8,192 of the 22,068 leaves and 691 of
+// those (8.4%) fall below it, not one.
+// F-657: the reason WAS the mask, and it is now WIDENED, so the rest of this
+// paragraph is history. `off` used to be read with 22 bits (0x3FFFFF) while the
+// archive holds offsets that do not fit in 22: this file's own F-632 table
+// records the guest publishing w2=0x00448000 = 4,489,216 for
+// preload/xarchive_carconfigs.rpf, which the old mask truncated to 0x00048000.
+// w675 measures the cost at 7,822 of 8,192 rows truncated and 2,426 members
+// ALIASED onto another member's byte range. `off` is now the guest's 31-bit
+// read. So a low `off` is evidence about the
+// MASK, not about the member column holding indices. The gate is therefore the
+// COUNTED FRACTION (`memBelowFloor`/`memAboveFloor`), and minMemberLo is
+// reported and no longer a veto. F-657: the mask is NOW widened, to the guest's
+// own 31-bit read (kTocMemberOffMask), and the thing entitled to decide it WAS
+// the six-step corroboration reading a member's own bytes -- done offline
+// against build/game_data/xarchive_cache.rpf over the w675 population: 0 aliasing
+// collisions in 8,192 rows at 31 bits against 2,426 at 22 bits, and 0 rows
+// landing in a constant-byte hole at 31 bits against 301 at 22 bits. See also
+// the `memMaskBitsSet` count and `off31=`/`off24=` on every TOCWALK-LEAF row.
+//
+// WHY THIS IS NOT THE NAME->OFFSET TABLE F-654 REFUSED. The index is keyed by
+// the hash THE GUEST COMPUTES, from the name AT REQUEST TIME. Rename a shader
+// and the key changes with it; nothing in this file names an offset, and no
+// name appears in any table here. That is the entire difference.
+// ===========================================================================
+
+static inline uint32_t MclaRotl32(uint32_t v, unsigned n) {
+  n &= 31u;
+  return n ? ((v << n) | (v >> (32u - n))) : v;
+}
+static inline int32_t MclaS8(uint32_t v) {
+  return static_cast<int32_t>(static_cast<int8_t>(static_cast<uint8_t>(v)));
+}
+
+// sub_821C9790, instruction for instruction, from
+// generated/ppc_xenon/ppc_recomp.16.cpp:11864-11968. Folds A-Z to lower case,
+// '\' to '/', stops at NUL and at '"' (and, only when the string opened with
+// '"', at the '"' that opened it), and mixes with two rotate-xor rounds. The
+// r7 flag is 0 for every real path component, so the '"' cases never fire here;
+// they are kept so the function is the guest's, not a simplification of it.
+static uint32_t MclaTocHash(const char *s, uint32_t seed) {
+  if (!s || !s[0])
+    return seed;
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(s);
+  uint32_t h = seed;
+  // :11875-11888 -- "skip the first character" flag
+  const uint32_t t = static_cast<uint32_t>(MclaS8(p[0]) - 34);
+  const uint32_t clz = (t == 0) ? 32u : static_cast<uint32_t>(__builtin_clz(t));
+  const uint32_t r7 = MclaRotl32(clz, 27) & 1u;   // rlwinm r11,r9,27,31,31
+  if (r7 != 0)
+    ++p;
+  for (;;) {
+    uint32_t raw = *p;
+    int32_t cur = MclaS8(raw);
+    if (cur == 0)
+      break;
+    for (;;) {
+      if (r7 == 0 || cur != 34) {          // :11899-11906
+        const int32_t folded = MclaS8(raw);
+        ++p;
+        uint32_t f;
+        if (folded >= 65 && folded <= 90)
+          f = static_cast<uint32_t>(folded + 32);   // :11920-11921
+        else if (folded == 92)
+          f = 47u;                                  // :11931-11932
+        else
+          f = static_cast<uint32_t>(folded);
+        const uint32_t nxt = *p;
+        h = f + h;                                 // :11938-11939
+        h = (MclaRotl32(h, 10) & 0xFFFFFC00u) + h; // :11942-11947
+        h = (MclaRotl32(h, 26) & 0x3FFFFFFu) ^ h;  // :11948-11951
+        if (MclaS8(nxt) == 0)
+          break;
+        raw = nxt;
+        cur = MclaS8(nxt);
+      } else {
+        break;
+      }
+    }
+    break;
+  }
+  h = (MclaRotl32(h, 3) & 0xFFFFFFF8u) + h;        // :11955-11958
+  h = h ^ (MclaRotl32(h, 21) & 0x1FFFFFu);         // :11959-11962
+  h = h + (MclaRotl32(h, 15) & 0xFFFF8000u);       // :11963-11966
+  return h;
+}
+
+// ONE 16-byte slot of the guest's TOC, in the guest's own four words.
+struct MclaTocRec {
+  uint32_t obj;      // the packfile object this TOC belongs to
+  uint32_t slot;     // the slot's guest VA == the `entry=` TOC76-XSF prints
+  uint32_t hash;     // word0  = sub_821C9790(componentName, 0)
+  uint32_t logical;  // word4
+  uint32_t w8;       // word8 raw
+  uint32_t w12;      // word12 raw
+  uint32_t off;      // word8  & kTocMemberOffMask (31 bits)
+  uint32_t stored;   // word12 & kTocMemberStoredMask (30 bits)
+  uint32_t depth;    // path depth of the leaf (root array = 0)
+  uint32_t chain[3]; // the nearest three ancestor hashes, root-first
+};
+
+static std::mutex g_tocIdxMtx;
+static std::unordered_map<uint32_t, std::vector<MclaTocRec>> g_tocByHash;
+
+// F-655: the packfile objects the guest has actually looked a name up in. The
+// walk tries each of them, so the archive that answers is identified by what
+// its own table CONTAINS rather than by a hard-coded object pointer.
+struct MclaTocObjRow {
+  uint32_t obj;
+  uint32_t hits;
+  char first[72];
+};
+static std::mutex g_tocObjMtx;
+static std::vector<MclaTocObjRow> g_tocObjs;
+static void MclaNoteTocObj(uint32_t obj, const char *path) {
+  if (!obj)
+    return;
+  std::lock_guard<std::mutex> lk(g_tocObjMtx);
+  for (auto &r : g_tocObjs) {
+    if (r.obj == obj) {
+      ++r.hits;
+      return;
+    }
+  }
+  if (g_tocObjs.size() >= 32u)
+    return;
+  MclaTocObjRow row{};
+  row.obj = obj;
+  row.hits = 1;
+  if (path) {
+    std::strncpy(row.first, path, sizeof(row.first) - 1);
+    MclaSanitizePath(row.first, sizeof(row.first));
+  }
+  g_tocObjs.push_back(row);
+}
+
+// F-655: the guest's OWN published records, kept so the walk can be CHECKED
+// against them instead of merely believed. Append-only, capped; TOCWALK-PROOF
+// reports how many of them the enumeration reproduced.
+struct MclaTocObs {
+  uint32_t entry;
+  uint32_t w[4];
+  char path[72];
+};
+static std::mutex g_tocObsMtx;
+static std::vector<MclaTocObs> g_tocObs;
+static void MclaNoteTocObs(uint32_t entry, const uint32_t w[4],
+                           const char *path) {
+  if (!entry)
+    return;
+  std::lock_guard<std::mutex> lk(g_tocObsMtx);
+  if (g_tocObs.size() >= 256u)
+    return;
+  MclaTocObs o{};
+  o.entry = entry;
+  for (int i = 0; i < 4; ++i)
+    o.w[i] = w[i];
+  if (path) {
+    std::strncpy(o.path, path, sizeof(o.path) - 1);
+    MclaSanitizePath(o.path, sizeof(o.path));
+  }
+  g_tocObs.push_back(o);
+}
+
+struct MclaTocWalk {
+  uint32_t obj = 0;
+  uint32_t arrays = 0, slots = 0, leaves = 0, dirs = 0, refused = 0;
+  uint32_t depthMax = 0;
+  uint32_t maxDirLo = 0;                  // the discriminator's margin
+  uint32_t minMemberLo = 0xFFFFFFFFu;     // ...measured, both halves
+  uint32_t dirSlots = 0, memSlots = 0;    // the two columns of bit 31
+  // F-656b: HOW MANY members sit below kTocMemberLoFloor, and how many carry
+  // bits 22-23 that the 22-bit mask throws away. A COUNT, not a minimum,
+  // because a minimum over 22,068 members is a one-slot veto by construction
+  // (see the verdict). w670 measured 691 of its 8192 logged leaves below the
+  // floor -- not the single degenerate slot a minimum reports.
+  uint32_t memBelowFloor = 0;
+  uint32_t memAboveFloor = 0;
+  uint32_t memMaskBitsSet = 0;            // (w8 >> 22) & 3, i.e. bits 22-23
+  uint32_t rangeDups = 0;                 // (node,lo,cnt) already walked
+  uint32_t maxIdx = 0;                    // highest index the walk actually read
+  uint64_t packSz = 0;
+  bool truncated = false;
+};
+
+static constexpr uint32_t kTocWalkMaxArrays = 4096u;
+static constexpr uint32_t kTocWalkMaxSlots = 400000u;
+static constexpr uint32_t kTocWalkMaxDepth = 12u;
+// F-658: kTocWalkLogLeafCap was 8192u and it gated PRINTING ONLY -- ++w.leaves
+// and g_tocByHash[r[0]].push_back(rec) are unconditional above it, which is why
+// TOCWALK-SUMMARY could read leaves=22068 while the log held 8,192 rows. Every
+// census built from those rows saw 37% of the archive, and a BIASED 37%:
+// measured on w680's 8,192 rows the idx-decile histogram is
+// [1859, 158, 310, 172, 7, 1733, 1939, 143, 0, 1870] -- deciles 4 and 8 took 7
+// and 0 leaves -- offsets < 4 MB: 370 (4.5%), offsets >= 1 GB: 7,556 (92.2%).
+// That sample cannot bound a low-offset question, and it already produced one
+// wrong extrapolation ("~26 members in the carconfigs window", unverifiable).
+// The census now goes to a FILE (kTocWalkLeafDumpName) written from the index
+// the walk ALREADY built, so it costs the walk nothing; the console keeps only
+// kTocWalkConsoleLeafRows rows as a human sample. Measured per-row cost of the
+// old arrangement: 1,844,615 bytes / 8,192 rows = 225 B/row on a WARN sink that
+// flushes on every line (common/logging.h:44), so 22,068 rows would have added
+// ~4.97 MB to an 11.34 MB soak AND 22,068 flushes on the boot path.
+static constexpr uint32_t kTocWalkConsoleLeafRows = 256u;
+// CWD-RELATIVE, like the other dumps in this file ("toc_decrypted.bin" :17586,
+// "d0_parsed.bin" :19293, "toc_parsed.bin" :19485): the file lands in whatever
+// the process CWD is, NOT in build/. TOCWALK-LEAF-DUMP prints the resolved
+// absolute path so a census knows where to read it from.
+static constexpr const char *kTocWalkLeafDumpName = "toc_leaves.csv";
+// THE GUEST'S OWN DIRECTORY TEST, as the recompiled code computes it: bit 31 of
+// the slot's word8. See the DIRECTORY-vs-LEAF block above: the raw encoding at
+// 0x821CC1BC is one bit lower, and the 160 records w668.log published separate
+// on this one and not on that one (0 have bit31 set, 5 have bit30 set).
+static constexpr uint32_t kTocDirBit = 0x80000000u;
+
+// F-656b: BIT 30 IS NOT THE DIRECTORY BIT, and that is now measured rather than
+// argued. The w670 TOCWALK-LEAF population has bit 30 of word8 SET on 7,556 of
+// 8,192 logged leaves (92.2%), in every dominant shape the run contains
+// (w8 hi bytes 0x7E x2141, 0x65 x1273, 0x7D x659, 0x64 x646, 0x63 x686, ...).
+// Testing bit 30 instead would reclassify ~92% of real members as directories,
+// each with lo = w8 & 0x7FFFFFFF ~ 2.13e9, which the `lo > 400000u` guard at
+// :18309 refuses outright -- so the walk would collapse to almost nothing and
+// the refusal would be self-inflicted. The one record that made this look
+// attractive is idx=23231 (slot B90939F0, w8=0x7E800000): bit 30 is set there
+// too, exactly as it is on the 2,140 other 0x7E-shaped members around it.
+
+// F-656: the container header that stands between a member's DECOMPRESSED
+// length and its ON-DISK EXTENT. 20 bytes, five words: magic, header length,
+// package id, XCompress magic, uncompressed length. Measured from the archive's
+// own bytes on the four members that have a decoded golden --
+// build/xmem_golden/{raceeditor,garage,policecam,credits}.bin are
+// 143,069 / 1,066,057 / 19,337 / 29,655 and the console w1 that
+// TOC76-LAYOUT published for the same four entries is
+// 143,089 / 1,066,077 / 19,357 / 29,675. +20 on all four, from the archive's
+// bytes and not from the TOC. This is the ONLY tolerance the TOC control is
+// given (see the field set at the comparison below).
+static constexpr int32_t kTocW1ContainerHeader = 20;
+
+// A (node,lo,cnt) slice already enumerated. The array is FLAT, so two
+// directories can name the same slice, and the ROOT's own header is itself a
+// directory record (w668: word8=0x80000001, word12=0x0000000E at the inner=
+// B9038E00 that TOC76 publishes). A dedup set is what stops the walk
+// re-walking a slice or chasing a cycle.
+static std::mutex g_tocRangeMtx;
+static std::set<uint64_t> g_tocRanges;
+
+// The member column's floor, and the two numbers the DIVERGE row needs to be
+// self-locating: the base the walk searched and the highest index it reached.
+// w668 measured both, and they are the whole of the "which array" question.
+static constexpr uint32_t kTocMemberLoFloor = 0x60009u;   // 393,225
+static std::atomic<uint32_t> g_tocWalkBase{0};
+static std::atomic<uint32_t> g_tocWalkMaxIdx{0};
+static std::atomic<uint32_t> g_tocWalkUsable{0};
+static std::atomic<const char *> g_tocWalkVerdict{nullptr};
+
+// MclaTocWalkArray walks ONE SLICE of ONE FLAT ARRAY.
+//   base  the array's base address == [dev+8]. It NEVER changes: 0x821CC0B0
+//         re-reads it from the device on EVERY turn of the component loop.
+//         w668's walk passed the child SLOT here instead, which re-anchors by
+//         mid*16 at every level -- the defect obsProved=0 measured.
+//   node  the slot whose +8/+12 give this slice's (lo,cnt). For the root walk
+//         that is the header itself; for a descent it is the parent slot.
+//   lo,cnt  the slice, as an index range INTO `base` (not a byte offset).
+static void MclaTocWalkArray(uint32_t obj, uint32_t base, uint32_t node,
+                              uint32_t lo, uint32_t cnt, uint32_t depth,
+                              uint32_t chain[3], MclaTocWalk &w) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (depth > kTocWalkMaxDepth || w.arrays >= kTocWalkMaxArrays ||
+      w.slots >= kTocWalkMaxSlots) {
+    w.truncated = true;
+    return;
+  }
+  if (cnt == 0u || cnt > 200000u || lo > 400000u) {
+    ++w.refused;
+    return;
+  }
+  // A slice already walked. The array is FLAT, so two directories can name the
+  // same slice, and the ROOT's own header is itself a directory record (w668:
+  // word8=0x80000001, word12=0x0000000E at the inner=B9038E00 that TOC76
+  // publishes). Without this set the walk re-walks a slice or chases a cycle.
+  const uint64_t rkey = (static_cast<uint64_t>(node) << 32) |
+                        (static_cast<uint64_t>(lo) << 16) |
+                        static_cast<uint64_t>(cnt & 0xFFFFu);
+  {
+    std::lock_guard<std::mutex> lk(g_tocRangeMtx);
+    if (!g_tocRanges.insert(rkey).second) {
+      ++w.rangeDups;
+      return;
+    }
+  }
+  const uint32_t last = lo + cnt - 1u;      // :2897-2898
+  ++w.arrays;
+  if (depth > w.depthMax)
+    w.depthMax = depth;
+  MCLA_LOG_WARN("TOCWALK-SLICE obj={:08X} base={:08X} node={:08X} lo={} "
+                "cnt={} depth={} lastIdx={} chain=[{:08X} {:08X} {:08X}]",
+                obj, base, node, lo, cnt, depth, last, chain[0], chain[1],
+                chain[2]);
+  for (uint32_t i = lo; i <= last && i - lo < cnt; ++i) {
+    const uint32_t slot = base + i * 16u;   // :2944-2953, stride 16, base=root
+    uint32_t r[4] = {0, 0, 0, 0};
+    bool ok = true;
+    for (int k = 0; k < 4; ++k) {
+      if (!mem.ReadU32BE(slot + static_cast<uint32_t>(k * 4), &r[k])) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) {
+      ++w.refused;
+      continue;
+    }
+    ++w.slots;
+    if (i > w.maxIdx)
+      w.maxIdx = i;
+    // THE DISCRIMINATOR: bit 31 of word8. Set => the slot is a DIRECTORY and
+    // word8/word12 are (lo,cnt) of a slice of THIS SAME array. Clear => a
+    // MEMBER and word8 is its archive offset. Both halves are printed per slot,
+    // so the verdict is a measurement of the run and not of this file.
+    if (r[2] & kTocDirBit) {
+      const uint32_t dlo = r[2] & 0x7FFFFFFFu;
+      const uint32_t dcnt = r[3] & 0x3FFFFFFu;
+      ++w.dirs;
+      ++w.dirSlots;
+      if (dlo > w.maxDirLo)
+        w.maxDirLo = dlo;
+      MCLA_LOG_WARN("TOCWALK-DIR obj={:08X} depth={} h={:08X} idx={} "
+                    "slot={:08X} w8={:08X} w12={:08X} -> slice lo={} cnt={} "
+                    "of base={:08X} (bit30={})",
+                    obj, depth, r[0], i, slot, r[2], r[3], dlo, dcnt, base,
+                    (r[2] & 0x40000000u) ? 1 : 0);
+      uint32_t sub[3] = {chain[0], chain[1], chain[2]};
+      if (depth < 3)
+        sub[depth] = r[0];
+      MclaTocWalkArray(obj, base, slot, dlo, dcnt, depth + 1, sub, w);
+      continue;
+    }
+    const uint32_t slo = r[2] & kTocMemberOffMask;  // the member's archive offset
+    if (slo < w.minMemberLo)
+      w.minMemberLo = slo;
+    if (slo < kTocMemberLoFloor)
+      ++w.memBelowFloor;
+    else
+      ++w.memAboveFloor;
+    // MEASUREMENT ONLY, never the serve path: bits 22-23 are OUTSIDE the
+    // 22-bit mask above, so a member whose offset really occupies them reads
+    // as a small (or zero) offset here. w670 counted 5,897 of its 8,192 logged
+    // leaves (72.0%) carrying at least one of them, and this file's own F-632 table
+    // (:19152-19154) publishes w2=0x00448000 -- 4,489,216 -- which the 22-bit
+    // mask truncates to 0x00048000. The mask is therefore too narrow for the
+    // archive; WHICH width is correct is for the six-step corroboration to
+    // decide from a member's own bytes, not for a census of the word to guess.
+    if ((r[2] & 0x00C00000u) != 0)
+      ++w.memMaskBitsSet;
+    ++w.leaves;
+    ++w.memSlots;
+    MclaTocRec rec{};
+    rec.obj = obj;
+    rec.slot = slot;
+    rec.hash = r[0];
+    rec.logical = r[1];
+    rec.w8 = r[2];
+    rec.w12 = r[3];
+    rec.off = r[2] & kTocMemberOffMask;
+    rec.stored = r[3] & kTocMemberStoredMask;
+    rec.depth = depth;
+    rec.chain[0] = chain[0];
+    rec.chain[1] = chain[1];
+    rec.chain[2] = chain[2];
+    {
+      std::lock_guard<std::mutex> lk(g_tocIdxMtx);
+      g_tocByHash[r[0]].push_back(rec);
+    }
+    if (w.leaves <= kTocWalkConsoleLeafRows) {
+      // F-657: `off24=` is the OLD 22-bit read kept as a measurement of how
+      // much the too-narrow mask cost (w675: 7,822 of 8,192 rows differ, and
+      // 2,426 of them aliased onto another member). `off31=` is the corrected
+      // 31-bit read and is what `off=` now equals. Both are printed so the two
+      // populations stay separable in one run.
+      MCLA_LOG_WARN("TOCWALK-LEAF obj={:08X} depth={} h={:08X} off={:08X} "
+                    "off31={:08X} off24={:08X} stored={} logical={} w8={:08X} "
+                    "w12={:08X} slot={:08X} "
+                    "idx={} chain=[{:08X} {:08X} {:08X}]",
+                    obj, depth, r[0], rec.off, r[2] & kTocMemberOffMask,
+                    r[2] & 0x3FFFFFu, rec.stored, rec.logical, r[2],
+                    r[3], slot, i, chain[0], chain[1], chain[2]);
+    }
+    if (w.leaves == kTocWalkConsoleLeafRows)
+      MCLA_LOG_WARN("TOCWALK-LEAF-SAMPLE-END n={} (CONSOLE sample ends here; "
+                    "the census is no longer capped -- all leaves go to the "
+                    "TOCWALK-LEAF-DUMP file, and the SUMMARY's leaves= is the "
+                    "true count)", kTocWalkConsoleLeafRows);
+  }
+}
+
+// F-658: THE FULL LEAF CENSUS -- every leaf the walk found, to a FILE, with no
+// cap. Written from g_tocByHash, the index the walk fills UNCONDITIONALLY (the
+// old cap gated only the console print), so this adds nothing to the walk and
+// the row count cannot disagree with the SUMMARY's leaves=: both read the same
+// vectors. `idx=` is RECOVERED, not measured -- the walk computes
+// slot = base + idx*16 but MclaTocRec carries no idx field, so a slot off that
+// lattice prints idx=FFFFFFFF and a census can tell a derived index from a
+// measured one. `off=` is w2 & 0x7FFFFFFF (31 bits) and `off24=` is
+// w2 & 0x3FFFFF (22 bits, DESPITE THE NAME) -- the two widths side by side so
+// the F-657 ambiguity is visible in the data instead of inferred from a doc.
+// The text is built under g_tocIdxMtx but WRITTEN after the lock is dropped:
+// that mutex is on the serve path and must never be held across file I/O.
+static void MclaTocDumpLeaves(uint32_t base, uint32_t expectLeaves) {
+  std::string text;
+  uint32_t rows = 0, idxOk = 0, idxBad = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_tocIdxMtx);
+    text.reserve(6u << 20);
+    fmt::format_to(std::back_inserter(text),
+                   "# MclaTocDumpLeaves: every leaf the TOC walk enumerated, "
+                   "uncapped. base=0x{:08X}; slot = base + idx*16\n"
+                   "# off = w2 & 0x7FFFFFFF (31 bits); off24 = w2 & 0x3FFFFF "
+                   "(22 bits, despite the name)\n"
+                   "# idx=FFFFFFFF means the slot was NOT on the base+idx*16 "
+                   "lattice, so the index is not recoverable\n"
+                   "obj,idx,slot,depth,hash,off,off24,stored,logical,w8,w12,"
+                   "chain0,chain1,chain2\n",
+                   base);
+    for (const auto &kv : g_tocByHash) {
+      for (const auto &rec : kv.second) {
+        uint32_t idx = 0xFFFFFFFFu;
+        if (rec.slot >= base && ((rec.slot - base) % 16u) == 0u) {
+          idx = (rec.slot - base) / 16u;
+          ++idxOk;
+        } else {
+          ++idxBad;
+        }
+        fmt::format_to(std::back_inserter(text),
+                       "{:08X},{},{:08X},{},{:08X},{:08X},{:08X},{},{},{:08X},"
+                       "{:08X},{:08X},{:08X},{:08X}\n",
+                       rec.obj, idx, rec.slot, rec.depth, rec.hash, rec.off,
+                       rec.w8 & 0x3FFFFFu, rec.stored, rec.logical, rec.w8,
+                       rec.w12, rec.chain[0], rec.chain[1], rec.chain[2]);
+        ++rows;
+      }
+    }
+  }
+  FILE *fp = nullptr;
+  if (fopen_s(&fp, kTocWalkLeafDumpName, "wb") != 0 || fp == nullptr) {
+    MCLA_LOG_WARN("TOCWALK-LEAF-DUMP open FAILED name='{}' -- CWD-relative, and "
+                  "the {} rows built above were NOT written",
+                  kTocWalkLeafDumpName, rows);
+    MCLA_LOG_WARN("TOCWALK-LEAF-CAP n={} (NOT a cap any more: this is the census "
+                  "size; w680 measured n=8192 of 22068 here, but the WRITE "
+                  "FAILED, so no census exists)",
+                  rows);
+    return;
+  }
+  const size_t wrote = fwrite(text.data(), 1, text.size(), fp);
+  fclose(fp);
+  char cwd[MAX_PATH] = {0};
+  const DWORD n = GetCurrentDirectoryA(MAX_PATH, cwd);
+  MCLA_LOG_WARN("TOCWALK-LEAF-DUMP name='{}' path='{}\\{}' rows={} idxOk={} "
+                "idxOffLattice={} bytes={} wrote={} base=0x{:08X}",
+                kTocWalkLeafDumpName, (n ? cwd : "?"), kTocWalkLeafDumpName,
+                rows, idxOk, idxBad, text.size(), wrote, base);
+  // THE MARKER THE OLD CAP PRINTED. n= used to BE the 8,192-row console cap and
+  // is now the census size, so the single transition
+  // "TOCWALK-LEAF-CAP n=8192" -> "TOCWALK-LEAF-CAP n=22068" is what shows the
+  // truncation is gone. It is printed from the row count, not from a constant.
+  MCLA_LOG_WARN("TOCWALK-LEAF-CAP n={} (NOT a cap any more: this is the census "
+                "size, and all of it is in the dump above; w680 measured "
+                "n=8192 of 22068 at this marker)", rows);
+  // F-658: `rows` is a sum over the index vectors; `expectLeaves` is the walk's
+  // own ++w.leaves total (recomputed by the caller from the same vectors, so
+  // this is a check on the WRITE, not an independent witness -- if it ever
+  // fires, the two readings of the census disagree and neither can be trusted).
+  if (rows != expectLeaves)
+    MCLA_LOG_WARN("TOCWALK-LEAF-DUMP MISMATCH rows={} expectLeaves={} -- the "
+                  "dump and the walk's own counter disagree", rows,
+                  expectLeaves);
+}
+
+static std::atomic<uint32_t> s_tocWalkRan{0};
+// F-655: the walk is one-shot, and the guest's shader load is not the only
+// thread that can ask. A mutex (not just the atomic) so a second caller BLOCKS
+// until the table is fully read instead of seeing a half-built index and
+// refusing a member that is in it.
+static std::mutex g_tocWalkMtx;
+
+// F-655: build the index once, from the guest's own table, and CHECK it against
+// the records the guest itself published. Returns true if the index is usable.
+static bool MclaTocIndexEnsure(uint32_t *outHashes = nullptr,
+                               uint32_t *outLeaves = nullptr) {
+  if (s_tocWalkRan.load(std::memory_order_acquire) == 0) {
+    std::lock_guard<std::mutex> walkLk(g_tocWalkMtx);
+    if (s_tocWalkRan.fetch_add(1) == 0) {
+    std::vector<MclaTocObjRow> objs;
+    {
+      std::lock_guard<std::mutex> lk(g_tocObjMtx);
+      objs = g_tocObjs;
+    }
+    auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+    const uint64_t packSz = vfs.GetFileSize("xarchive_cache.rpf");
+    uint32_t totalLeaves = 0, totalArrays = 0, totalDirs = 0, totalRefused = 0;
+    uint32_t maxDirLo = 0, minMemberLo = 0xFFFFFFFFu, depthMax = 0;
+    uint32_t totalDirSlots = 0, totalMemSlots = 0, totalDups = 0;
+    uint32_t totalBelowFloor = 0, totalAboveFloor = 0, totalMaskBits = 0;
+    // F-657: the two words the guest ADDS to a member's offset before it reads
+    // (0x821CC38C `ld r9, 24(r30)` -- a 64-bit load of dev+0x18/dev+0x1C, added
+    // to ([dev+8] & ~1)). The host adds neither, so their contents are a fact
+    // nobody has measured. Published here per object, LOG ONLY, so the next run
+    // reads them instead of inheriting the assumption. A non-zero pair means the
+    // host's absolute file offsets are shifted by a constant and MclaTocServeMember
+    // must add it -- but nothing is added on the strength of this line alone.
+    uint32_t base24Seen = 0, base28Seen = 0, baseNonZeroObjs = 0;
+    uint32_t base24First = 0, base28First = 0;
+    bool anyTrunc = false;
+    for (const auto &o : objs) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      uint32_t root = 0;
+      if (!mem.ReadU32BE(o.obj + 8u, &root) || root == 0) {
+        MCLA_LOG_WARN("TOCWALK-OBJ obj={:08X} root=0 refused=NO-ROOT "
+                      "hits={} first='{}'",
+                      o.obj, o.hits, o.first);
+        continue;
+      }
+      // THE ROOT SLICE. word0 is not a name hash (it is the header's own
+      // directory record), word4 is not a length; the geometry is the guest's
+      // :2880-2884 pair: count=[root+8]&0x7FFFFFFF,
+      // baseIndex=[root+12]&0x3FFFFFFF (F-657: named lo/cnt backwards until
+      // this pass; the walk only ever uses the pair as a set), searched in
+      // the array BASED AT `root` itself. w668's inner=B9038E00
+      // measured that pair as lo=1, cnt=14.
+      uint32_t hw8 = 0, hw12 = 0;
+      if (!mem.ReadU32BE(root + 8u, &hw8) || !mem.ReadU32BE(root + 12u, &hw12)) {
+        MCLA_LOG_WARN("TOCWALK-OBJ obj={:08X} root={:08X} refused=NO-HEADER "
+                      "hits={} first='{}'",
+                      o.obj, root, o.hits, o.first);
+        continue;
+      }
+      // F-657: measure the two offset bases on the same object whose array we
+      // are about to walk. Read-only, LOG ONLY.
+      {
+        uint32_t b24 = 0, b28 = 0;
+        if (mem.ReadU32BE(o.obj + 24u, &b24) && mem.ReadU32BE(o.obj + 28u, &b28)) {
+          base24Seen++;
+          base28Seen++;
+          if (b24 != 0 || b28 != 0) {
+            ++baseNonZeroObjs;
+            if (base24First == 0 && base28First == 0) {
+              base24First = b24;
+              base28First = b28;
+            }
+          }
+          MCLA_LOG_WARN("TOCWALK-BASES obj={:08X} base24={:08X} base28={:08X} "
+                        "sum={} applied=NO (F-657: the host uses w2 as an "
+                        "absolute file offset; this row is the measurement that "
+                        "would overturn that)",
+                        o.obj, b24, b28,
+                        static_cast<uint64_t>(b24) + static_cast<uint64_t>(b28));
+        }
+      }
+      MclaTocWalk w;
+      w.obj = o.obj;
+      w.packSz = packSz;
+      uint32_t chain[3] = {0, 0, 0};
+      MclaTocWalkArray(o.obj, root, root, hw8 & 0x7FFFFFFFu,
+                       hw12 & 0x3FFFFFFu, 0, chain, w);
+      totalLeaves += w.leaves;
+      totalArrays += w.arrays;
+      totalDirs += w.dirs;
+      totalRefused += w.refused;
+      totalDirSlots += w.dirSlots;
+      totalMemSlots += w.memSlots;
+      totalDups += w.rangeDups;
+      totalBelowFloor += w.memBelowFloor;
+      totalAboveFloor += w.memAboveFloor;
+      totalMaskBits += w.memMaskBitsSet;
+      g_tocWalkBase.store(root, std::memory_order_relaxed);
+      if (w.maxIdx > g_tocWalkMaxIdx.load(std::memory_order_relaxed))
+        g_tocWalkMaxIdx.store(w.maxIdx, std::memory_order_relaxed);
+      if (w.maxDirLo > maxDirLo)
+        maxDirLo = w.maxDirLo;
+      if (w.minMemberLo < minMemberLo)
+        minMemberLo = w.minMemberLo;
+      if (w.depthMax > depthMax)
+        depthMax = w.depthMax;
+      anyTrunc = anyTrunc || w.truncated;
+      MCLA_LOG_WARN("TOCWALK-OBJ obj={:08X} root={:08X} rootW8={:08X} "
+                    "rootW12={:08X} hits={} first='{}' "
+                    "arrays={} slots={} leaves={} dirs={} dirSlots={} "
+                    "memSlots={} rangeDups={} refused={} "
+                    "depthMax={} maxDirLo={} minMemberLo=0x{:08X} "
+                    "truncated={}",
+                    o.obj, root, hw8, hw12, o.hits, o.first, w.arrays, w.slots,
+                    w.leaves, w.dirs, w.dirSlots, w.memSlots, w.rangeDups,
+                    w.refused, w.depthMax, w.maxDirLo, w.minMemberLo,
+                    w.truncated ? 1 : 0);
+    }
+    uint32_t hashes = 0, leaves = 0;
+    {
+      std::lock_guard<std::mutex> lk(g_tocIdxMtx);
+      hashes = static_cast<uint32_t>(g_tocByHash.size());
+      for (const auto &kv : g_tocByHash)
+        leaves += static_cast<uint32_t>(kv.second.size());
+    }
+    // THE CONTROL. Every record the guest published is looked for in the
+    // enumeration, by slot address, and its four words are compared. A walk
+    // that is not checked against the guest is a walk that is merely plausible.
+    // The FIRST divergence is reported with the observation's path, the guest's
+    // slot address, the slot the walk would have had to hold, and the first
+    // differing word -- a bare counter says "wrong", this says where.
+    uint32_t proved = 0, disproved = 0, checked = 0;
+    uint32_t w1Bimodal = 0, forcedAck = 0;
+    {
+      std::unordered_map<uint32_t, MclaTocRec> bySlot;
+      std::lock_guard<std::mutex> lk(g_tocIdxMtx);
+      for (const auto &kv : g_tocByHash)
+        for (const auto &rec : kv.second)
+          bySlot.emplace(rec.slot, rec);
+      for (const auto &o : g_tocObs) {
+        ++checked;
+        auto it = bySlot.find(o.entry);
+        if (it == bySlot.end()) {
+          ++disproved;
+          if (disproved == 1u) {
+            // The guest's own flat index for this record, from the root base the
+            // TOC76 rows publish as `inner=`. Printed so the next run can read
+            // the offset between the two addresses instead of inferring it.
+            MCLA_LOG_WARN("TOCWALK-DIVERGE #1 reason=SLOT-NOT-VISITED "
+                          "path='{}' guestEntry={:08X} walkBase={:08X} "
+                          "guestFlatIdx={} walkMaxIdx={} "
+                          "obsWords=[{:08X} {:08X} {:08X} {:08X}]",
+                          o.path, o.entry, g_tocWalkBase.load(),
+                          (o.entry - g_tocWalkBase.load()) / 16u,
+                          g_tocWalkMaxIdx.load(), o.w[0], o.w[1], o.w[2],
+                          o.w[3]);
+          }
+          continue;
+        }
+        const MclaTocRec &rec = it->second;
+        // -------------------------------------------------------------------
+        // F-656: THE FIELD SET. Re-measured on w669.log over all 256 published
+        // records, by joining every TOC76-XSF `ret=` against the TOCWALK-LEAF
+        // `slot=` the walk read for the same address:
+        //
+        //   w0  hash                256/256 exact
+        //   w2  offset RAW          256/256 exact
+        //   w2  bit 31 (dir bit)    256/256 agrees
+        //   w3  & 0x3FFFFFFF        256/256 exact   <- the STORED length (F-657)
+        //   w3  bit 31              121/256 raw; 135 rows differ by EXACTLY
+        //                           0x80000000, always in the same direction
+        //   w1                       251 equal / 5 rows +20 / 0 rows otherwise
+        //
+        // So the run holds TWO disagreement classes, not one, and BOTH of them
+        // are the HOST writing into the guest's TOC -- two writes, at two
+        // addresses, both already in this file and neither in the walk:
+        //
+        //   w1  gpu_device.cpp:19190  memR.WriteU32BE(tocEntry + 4, xsz)
+        //        The CD3C8 GetSize publication in the XSF-OPEN serve path puts
+        //        the host's SERVED body length where the console's on-disk
+        //        extent was. w669 proves it inside one millisecond, on one
+        //        address: TOC76-XSF #1 (05:54:19.037) publishes w1=00022EF1
+        //        (143,089) and TOC76-LAYOUT #2 (05:54:19.061) re-reads the
+        //        SAME entry B9040770+4 as 00022EDD (143,069), in the same
+        //        millisecond as XSF-HOSTSERVE size=143069. The TOC76-LAYOUT
+        //        emitter does NO arithmetic (gpu_device.cpp:18902 reads
+        //        entry+4+i*4 and prints it), so the diagnostic is honest and
+        //        the value really did change underneath it.
+        //
+        //   w3  gpu_device.cpp:17484  memD.WriteU32BE(rec + 12, flags |
+        //        0x80000000u) -- the already-labelled kDiscChkForcedAck
+        //        MITIGATION in sub_821CC1E0, which ORs "read completed" into
+        //        every cache-packfile record. It sets bit 31 and nothing else,
+        //        so the stored length below it survives untouched.
+        //
+        // Comparing w1 and w3 RAW therefore made the control fail on the
+        // host's own bookkeeping, and refused an index that is in fact
+        // field-for-field identical to the guest's on every field that decides
+        // where a member's bytes are.
+        //
+        // MUST AGREE -- a difference here means the walk read a DIFFERENT record
+        // than the guest published, and the index is not safe to serve:
+        //   * w0, the hash. It is the key the whole index is built on.
+        //   * w2, the offset, raw. It is where the member's bytes are.
+        //   * bit 31 of w2, the directory bit. w2 is compared raw so this is
+        //     already implied; it is tested separately so that a
+        //     member/directory confusion -- the discriminator that splits
+        //     22,068 members from 1,862 directories in w669's TOCWALK-OBJ --
+        //     can never be reported as an offset difference.
+        //   * w3 & 0x3FFFFFFF, the stored length. The only host write to w3
+        //     touches bit 31, so everything below it is the archive's own and
+        //     must be bit-identical.
+        //
+        // TWO-VALUED, NOT COMPARED AWAY -- w1. For a container member the
+        // console's TOC holds the member's ON-DISK EXTENT and the host's
+        // publish holds the DECOMPRESSED length; they differ by the 20-byte
+        // RSC5/XCompress header (kTocW1ContainerHeader). w1 is therefore
+        // accepted at delta 0 or +20 and REFUSED at anything else. This is a
+        // comparison, not a deletion: the shape the FIRST-ROW-WINS guard
+        // exists for -- a 3,571,712 body published into a 720,896-byte
+        // member (gpu_device.cpp:18760) -- is neither, and still fails here.
+        // WHICH of the two the serve must then honour is decided from the
+        // member's own bytes in MclaTocServeMember (STEP3B), not from either
+        // value of w1 and not from the TOC.
+        // -------------------------------------------------------------------
+        const bool hashOk = (rec.hash == o.w[0]);
+        const bool offOk = (rec.w8 == o.w[2]);
+        const bool dirOk = ((rec.w8 & kTocDirBit) != 0) ==
+                           ((o.w[2] & kTocDirBit) != 0);
+        const bool storedOk =
+            ((rec.w12 & kTocMemberStoredMask) == (o.w[3] & kTocMemberStoredMask));
+        if ((rec.w12 & 0x80000000u) != 0 && (o.w[3] & 0x80000000u) == 0)
+          ++forcedAck;   // the host set it AFTER the guest published the record
+        const int32_t w1Delta = static_cast<int32_t>(o.w[1]) -
+                                static_cast<int32_t>(rec.logical);
+        const bool w1Ok = (w1Delta == 0 || w1Delta == kTocW1ContainerHeader);
+        if (w1Delta == kTocW1ContainerHeader)
+          ++w1Bimodal;
+        if (hashOk && offOk && dirOk && storedOk && w1Ok) {
+          ++proved;
+          continue;
+        }
+        ++disproved;
+        if (disproved == 1u) {
+          // firstDiff now names a FIELD, not a word number, and it is chosen
+          // over the must-agree set only: reporting "w1" as the divergence
+          // when the hash was also wrong would send the next reader after the
+          // wrong field entirely.
+          static const char *kW[4] = {"word0-hash", "word2-dirbit+off",
+                                      "word12-stored-masked", "word1-w1"};
+          int firstDiff = -1;
+          const uint32_t mine[4] = {rec.hash, rec.w8,
+                                    rec.w12 & kTocMemberStoredMask, rec.logical};
+          const uint32_t theirs[4] = {o.w[0], o.w[2],
+                                      o.w[3] & kTocMemberStoredMask, o.w[1]};
+          for (int k = 0; k < 4; ++k)
+            if (mine[k] != theirs[k]) {
+              firstDiff = k;
+              break;
+            }
+          MCLA_LOG_WARN("TOCWALK-DIVERGE #1 reason=WORDS-DIFFER path='{}' "
+                        "slot={:08X} firstDiff={} mine={:08X} guest={:08X} "
+                        "w1delta={} (words [mine guest] = [{:08X} {:08X}] "
+                        "[{:08X} {:08X}] [{:08X} {:08X}] [{:08X} {:08X}])",
+                        o.path, o.entry,
+                        firstDiff >= 0 ? kW[firstDiff] : "none",
+                        firstDiff >= 0 ? mine[firstDiff] : 0u,
+                        firstDiff >= 0 ? theirs[firstDiff] : 0u,
+                        static_cast<int32_t>(w1Delta),
+                        mine[0], o.w[0], mine[1], o.w[1], rec.w12, o.w[3],
+                        rec.logical, o.w[1]);
+        }
+      }
+    }
+    // THE VERDICT, and the only thing that decides whether the index may be
+    // served. A walk that found one array and descended zero levels, or that
+    // put an index into the member-offset column, or that the guest's own 256
+    // records contradict, does NOT get to answer an AFB76 request -- it gets to
+    // refuse, and to say so in a form that cannot be read as "nothing observed".
+    const bool provedSome = proved > 0;
+    const bool noneDisproved = (disproved == 0);
+    const bool descended = (totalDirs > 0 && depthMax > 0);
+    // F-656b: THE FLOOR, COUNTED. The floor's job (:18093) is to tell OFFSETS
+    // from INDICES, and those two are separated by an arithmetic gap, not by a
+    // threshold:
+    //   * an index is bounded by the array the walk just read -- memSlots +
+    //     dirSlots -- which w670 measured as 22,068 + 1,862 = 23,930, and
+    //     maxDirLo=23,929 is one less than that, which is what proves the
+    //     directory column really does hold INDICES;
+    //   * an offset is bounded by packSz=2,130,739,200, and the smallest one
+    //     the guest publishes is 0x60009 = 393,225.
+    // A member column holding indices therefore puts essentially EVERY member
+    // below the floor, while a member column holding offsets in a field wider
+    // than the mask puts only the members whose LOW bits happen to be small
+    // below it. So the discriminating statistic is the FRACTION, and the only
+    // constant not chosen to pass is the majority: at 50/50 the two hypotheses
+    // are equidistant. w670 measured 691 of its 8,192 logged leaves below the
+    // floor (8.4%), i.e. 91.6% above -- nowhere near the boundary.
+    //
+    // The old test was `minMemberLo >= kTocMemberLoFloor`, a MINIMUM over
+    // 22,068 members. A minimum is a one-slot veto by construction: it cannot
+    // distinguish "one degenerate entry" from "the mask is too narrow", and it
+    // reported the second while looking like the first. minMemberLo is still
+    // measured and still printed; it is simply not a veto.
+    const uint32_t memTotal = totalBelowFloor + totalAboveFloor;
+    const bool membersClean =
+        (memTotal != 0u) && (static_cast<uint64_t>(totalAboveFloor) * 2u >
+                             static_cast<uint64_t>(memTotal));
+    const char *verdict = "OK";
+    if (checked == 0)
+      verdict = "REFUSE-NO-OBSERVATIONS-TO-CHECK";
+    else if (!provedSome)
+      verdict = "REFUSE-UNPROVEN-obsProved=0";
+    else if (!noneDisproved)
+      verdict = "REFUSE-DISPROVED";
+    else if (!descended)
+      verdict = "REFUSE-NO-DESCENT";
+    else if (!membersClean)
+      verdict = "REFUSE-MEMBER-COLUMN-HOLDS-INDICES";
+    else if (anyTrunc)
+      verdict = "REFUSE-TRUNCATED";
+    const bool usable = provedSome && noneDisproved && descended &&
+                        membersClean && !anyTrunc && leaves != 0;
+    g_tocWalkVerdict.store(verdict, std::memory_order_release);
+    g_tocWalkUsable.store(usable ? 1u : 0u, std::memory_order_release);
+    MCLA_LOG_WARN("TOCWALK-SUMMARY objects={} arrays={} slices={} dirs={} "
+                  "leaves={} hashes={} dirSlots={} memSlots={} rangeDups={} "
+                  "refused={} depthMax={} maxDirLo={} "
+                  "minMemberLo=0x{:08X} memberFloor=0x{:08X} margin={} "
+                  "memBelowFloor={} memAboveFloor={} memBelowPct={} "
+                  "memMaskBitsSet={} slotSpan={} "
+                  "base24Objs={} base28Objs={} baseNonZeroObjs={} "
+                  "base24First=0x{:08X} base28First=0x{:08X} basesApplied=NO "
+                  "truncated={} packSz={} obsChecked={} obsProved={} "
+                  "obsDisproved={} obsW1Bimodal={} obsForcedAck={} "
+                  "verdict={} usable={} -- w1 is two-valued by the 20-byte "
+                  "RSC5/XCompress header and w3 bit31 is the host's forced-ack "
+                  "MITIGATION (:17484), so neither is compared raw; w0, w2, the "
+                  "dir bit and w3&0x3FFFFFFF are. F-657: w2 is read 31 bits and "
+                  "w3 30, the guest's own widths; the two offset bases at "
+                  "obj+24/obj+28 that the guest adds at 0x821CC38C are "
+                  "MEASURED here and still NOT applied. enumeration is keyed "
+                  "by the GUEST'S OWN HASH, so no name->offset table exists "
+                  "here; obsProved=0 with obsChecked>0 means the walk read a "
+                  "DIFFERENT array from the guest's, not that nothing was "
+                  "observed. F-656b: the floor is COUNTED, not minimized -- "
+                  "refuse when memAboveFloor is not a strict majority of "
+                  "memBelowFloor+memAboveFloor, because an INDEX-valued member "
+                  "column puts ~100% below a floor that OFFSETS clear by the "
+                  "index bound slotSpan (22068+1862=23930 w670) while a "
+                  "too-narrow offset mask puts only the low-bit members "
+                  "below; minMemberLo is reported, not vetoed",
+                  objs.size(), totalArrays, totalArrays, totalDirs,
+                  totalLeaves, hashes, totalDirSlots, totalMemSlots, totalDups,
+                  totalRefused, depthMax, maxDirLo, minMemberLo,
+                  kTocMemberLoFloor,
+                  (minMemberLo == 0xFFFFFFFFu || minMemberLo <= maxDirLo)
+                      ? 0
+                      : minMemberLo - maxDirLo,
+                  totalBelowFloor, totalAboveFloor,
+                  memTotal ? (totalBelowFloor * 100u / memTotal) : 0u,
+                  totalMaskBits, totalDirSlots + totalMemSlots,
+                  base24Seen, base28Seen, baseNonZeroObjs, base24First,
+                  base28First,
+                  anyTrunc ? 1 : 0, packSz, checked, proved, disproved, w1Bimodal,
+                  forcedAck, verdict, usable ? 1 : 0);
+    // F-658: the census the 8,192-row console cap used to truncate, written
+    // HERE -- inside the s_tocWalkRan one-shot block, not after it -- so it runs
+    // exactly once per walk. Placed after the one-shot guard it would have
+    // rewritten the file on every MclaTocIndexEnsure call (the shader load calls
+    // it per load), which is both wasteful and would make TOCWALK-LEAF-CAP a
+    // repeated line rather than a census. base is the array base the walk
+    // recorded (g_tocWalkBase); idx=(slot-base)/16 is recovered from it.
+    // expectLeaves is totalLeaves -- the sum of the walk's own ++w.leaves
+    // counters -- while `rows` is a sum over g_tocByHash's vector sizes. Those
+    // are TWO derivations of the same number from DIFFERENT bookkeeping (the
+    // counter vs the pushes), so MISMATCH is a real cross-check, not a tautology.
+    MclaTocDumpLeaves(g_tocWalkBase.load(std::memory_order_relaxed),
+                      totalLeaves);
+    }
+  }
+  uint32_t hashes = 0, leaves = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_tocIdxMtx);
+    hashes = static_cast<uint32_t>(g_tocByHash.size());
+    for (const auto &kv : g_tocByHash)
+      leaves += static_cast<uint32_t>(kv.second.size());
+  }
+  if (outHashes)
+    *outHashes = hashes;
+  if (outLeaves)
+    *outLeaves = leaves;
+  // A WALK THAT FINDS NOTHING MUST REFUSE, NOT SERVE. The one-shot block above
+  // has already printed the verdict; a later caller that arrives after the walk
+  // (or after a walk that was truncated by its caps) still gets the answer only
+  // if the control passed.
+  const char *verdict = g_tocWalkVerdict.load(std::memory_order_acquire);
+  if (verdict == nullptr) {
+    g_tocWalkVerdict.store("REFUSE-NO-VERDICT", std::memory_order_release);
+    g_tocWalkUsable.store(0u, std::memory_order_release);
+  }
+  return g_tocWalkUsable.load(std::memory_order_acquire) != 0u;
+}
+
+// F-655: the records the guest's table holds for one component hash, optionally
+// narrowed by the ancestor hashes the CALLER can compute (the archive group from
+// the preload list, the variant directory from the request).
+static std::vector<MclaTocRec> MclaTocFind(uint32_t leafHash,
+                                            const uint32_t *wantChain,
+                                            int wantChainLen) {
+  std::vector<MclaTocRec> out;
+  std::lock_guard<std::mutex> lk(g_tocIdxMtx);
+  auto it = g_tocByHash.find(leafHash);
+  if (it == g_tocByHash.end())
+    return out;
+  for (const auto &rec : it->second) {
+    if (wantChain && wantChainLen > 0) {
+      if (rec.depth < static_cast<uint32_t>(wantChainLen))
+        continue;   // chain truncated by depth -- do not filter on it
+      bool ok = true;
+      for (int k = 0; k < wantChainLen; ++k) {
+        if (rec.chain[k] != wantChain[k]) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok)
+        continue;
+    }
+    out.push_back(rec);
+  }
+  return out;
+}
+
 // Session 76j: packfile TOC lookup (vtable+144, sub_821CBFC0). Returns 0
-// immediately when [obj+8]==0 â€” a phantom not-found here sends GetDevice to
+// immediately when [obj+8]==0 -- a phantom not-found here sends GetDevice to
 // the NEXT device in the holder (the audlo packfile) whose state may be
-// uninitialized â†’ the 0x7E780000 AV.
+// uninitialized -> the 0x7E780000 AV.
 // PHASE1 T3: hang census. p0d1 ends with TOC76 #22 (lr=821CC44C) entered and
-// no RET â€” dump TOC bounds + elapsed so a spin/corrupt-search is visible.
+// no RET -- dump TOC bounds + elapsed so a spin/corrupt-search is visible.
 PPC_FUNC_IMPL(__imp__sub_821CBFC0);
 static std::atomic<uint32_t> s_hTOC{0};
 PPC_FUNC(sub_821CBFC0) {
@@ -17183,6 +21308,15 @@ PPC_FUNC(sub_821CBFC0) {
   uint32_t inner = 0, tStart = 0, tCount = 0, e0 = 0, e4 = 0, e8 = 0, e12 = 0;
   if (hot) {
     (void)memR.ReadU32BE(obj + 8u, &inner);
+    // F-680: publish the root TOC array base for the three captures that used
+    // to carry the literal 0xC60B7780. This is the ONE read of it in the tree
+    // (generated/ppc_xenon/ppc_recomp.17.cpp:2823, `node = [dev+8]`, where
+    // that `dev` is this function's r3 = the packfile object), so this is the
+    // place to publish it. Inside `if (hot)` on purpose: `hot` covers the
+    // first 80 calls, so the base is available essentially immediately, and
+    // leaving it out of the cold path costs no guest-visible behaviour --
+    // a dump gated on an unpublished base is a no-op that says so.
+    MclaTocPublishArrayBase(inner);
     if (inner) {
       (void)memR.ReadU32BE(inner + 8u, &tStart);
       (void)memR.ReadU32BE(inner + 12u, &tCount);
@@ -17196,32 +21330,27 @@ PPC_FUNC(sub_821CBFC0) {
         "e0={:08X} e4={:08X} e8={:08X} e12={:08X} path='{}' lr={:08X}",
         n, obj, inner, tStart, tCount, e0, e4, e8, e12, path, lr);
     // B2c: d0's PARSED inner at query time (the fill-time copy is pre-parse).
-    if (obj == 0xC60ABD08u && inner != 0 && path[0] &&
-        std::strstr(path, "star_glow") != nullptr) {
+    // F-680: the region was ALREADY `inner`, so this dump was never anchored on
+    // the stale array literal -- the fault in the other two was a hard-coded
+    // ADDRESS, and here the hard-code was the TRIGGER: `obj == 0xC60ABD08u`, a
+    // packfile object address from the same era, which drifts for the same
+    // reason the array base does. It is dropped rather than re-anchored,
+    // because it narrows nothing that the other two clauses do not already
+    // pin: `inner != 0` requires the base to have been read, and the path
+    // clause already names the one file this dump is for. Keeping a literal
+    // that can only ever turn the dump OFF is strictly worse than the shape
+    // test it was standing in for.
+    if (inner != 0 && path[0] && std::strstr(path, "star_glow") != nullptr) {
       static bool s_d0Dumped = false;
       if (!s_d0Dumped) {
         s_d0Dumped = true;
         const uint32_t len = 18432u;
-        std::vector<uint8_t> tmp(len);
-        bool okAll = true;
-        for (uint32_t o = 0; o < len; o += 4096u) {
-          const uint32_t piece = (len - o < 4096u) ? (len - o) : 4096u;
-          if (!memR.ReadBytes(inner + o, reinterpret_cast<char*>(&tmp[o]), piece)) {
-            okAll = false;
-            break;
-          }
-        }
-        bool wrote = false;
-        if (okAll) {
-          FILE* fp = nullptr;
-          if (fopen_s(&fp, "d0_parsed.bin", "wb") == 0 && fp != nullptr) {
-            fwrite(tmp.data(), 1, len, fp);
-            fclose(fp);
-            wrote = true;
-          }
-        }
+        const MclaTocDumpResult r =
+            MclaTocWriteCapture("d0_parsed.bin", inner, len);
+        // Original row, fields unchanged.
         MCLA_LOG_WARN("TOC-DUMP3 d0 wrote={} okread={} inner={:08X} path='{}'",
-                      wrote ? 1 : 0, okAll ? 1 : 0, inner, path);
+                      r.wrote ? 1 : 0, r.okRead ? 1 : 0, inner, path);
+        MclaTocLogCapture("TOC-DUMP3-NZ", "d0_parsed.bin", r, inner);
       }
     }
   }
@@ -17243,62 +21372,185 @@ PPC_FUNC(sub_821CBFC0) {
     for (int i = 0; i < 4; ++i)
       (void)memR.ReadU32BE(ctx.r3.u32 + static_cast<uint32_t>(i * 4), &w[i]);
     XsfTocCache(path, ctx.r3.u32, w);
+    // F-655: remember WHICH packfile object answered, and the record it
+    // answered with. The walk (above) tries every object the guest has looked a
+    // name up in, and TOCWALK-PROOF checks the enumeration against these rows --
+    // so the enumeration is measured against the guest's own observations rather
+    // than asserted. Log-only: two bounded appends.
+    MclaNoteTocObj(obj, path);
+    MclaNoteTocObs(ctx.r3.u32, w, path);
     // T41.3p (F-105): tell the archive layer this member's span is one the
-    // guest must see DEFLATE-expanded, using the size/offset the guest itself
-    // published (w[1]=size, w[2]=offset; bit30 of the offset is our own
-    // open-gate flag, so mask it off).
+    // guest must see DEFLATE-expanded.
     //
-    // kExpandListInArchive: OFF by default. With it ON (w76/w77) the guest
-    // parses the expanded globaltex.list itself and opens all eight named
-    // textures (2dnoise3/4, anisodir, billettanmap, cf_bump2, dmg_scrape,
-    // no_damage, powerup_beam — each with its own TOC record), which proves the
-    // transform and where it belongs; it then wedges in a page-retry loop on the
-    // archive handle (NtReadFile off=0 repeated, ~263k submits) and never
-    // reaches the star_glow fatal, so the soak is poisoned. The follow-on paging
-    // is the open question, not the transform. See F-105.
-    if (kExpandListInArchive && MclaListMemberPath(path) && w[1] >= 16u &&
-        w[1] <= 0x100000u && (w[2] & 0x3FFFFFFFu) != 0) {
-      mcla::vfs::MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1]);
-      MCLA_LOG_WARN("MEMBER-EXPAND-MARK path='{}' off={:08X} stored={}", path,
-                    w[2] & 0x3FFFFFFFu, w[1]);
-    }
-    // Open gate (CCEA0): proceeds when bit 30 of [entry+8] is SET.
-    const bool openGate = (w[2] & 0x40000000u) != 0;
-    const bool allZero = (w[0] | w[1] | w[2] | w[3]) == 0;
-    MCLA_LOG_WARN("TOC76-XSF #{} ret={:08X} path='{}' "
-                  "[{:08X} {:08X} {:08X} {:08X}] openGateBit30={} zeros={} "
-                  "lr={:08X}",
-                  n, ctx.r3.u32, path, w[0], w[1], w[2], w[3],
-                  openGate ? 1 : 0, allZero ? 1 : 0, lr);
-    // B2a rev2 (F-095 lesson): the fill-time dump caught the table PRE-parse;
-    // the live hashed entries exist only from query time on. One-shot dump of
-    // the parsed region anchored on the entry array base the census itself
-    // names (inner=C60B7780, TOC76 lines), triggered on the first real entry.
+    // F-632 (2026-09-28): this is now the general registration, and the two
+    // restrictions it used to carry are gone, because both were restrictions on
+    // a record layout that had been read wrong.
+    //
+    // 1. `MclaListMemberPath(path)` restricted registration to the six `.list`
+    //    members, so 371 of the 377 members w653 published -- including all three
+    //    nested packfiles, which are the members this bug is about -- were never
+    //    registered at all. Every member the guest publishes now registers.
+    // 2. `MarkMemberExpanded(w[2] & 0x3FFFFFFFu, w[1])` (already 30 bits, so
+    //    F-657's width correction does not touch this call) passed the LOGICAL
+    //    as the STORED length, so the archive layer inflated `logical` bytes at
+    //    the member offset and every member whose stored length differs was
+    //    refused (MEMBER-EXPAND-SIZE, not MEMBER-EXPAND). The three fields are
+    //    now passed separately: offset = w2 & 0x7FFFFF, stored = w3 & 0x3FFFFFFF,
+    //    logical = w1. That is the whole three-field discipline, and it is the
+    //    same pair of numbers the kListMemberSpans table now carries.
+    //
+    // FIRST ROW WINS. Only the first TOC76-XSF row for a path is used. Measured
+    // in w653: all three nested packfiles are published TWICE, and the second
+    // row's w1 is not the guest's value --
+    //   #1426 [8F113871 000B0000 00368000 40082186]  (guest: logical 720,896)
+    //   #1427 [8F113871 00368000 00368000 40082186]  (logical 3,571,712)
+    //   #1428 [E2D132A2 00068000 003F0000 400503CF]  (guest: logical 425,984)
+    //   #1429 [E2D132A2 00368000 003F0000 400503CF]  (logical 3,571,712)
+    // and XSF-POSTOPEN-SERVE prints size=3571712 for the first pair, so the
+    // second row is our OWN write: the CD3C8 size publication at
+    // `WriteU32BE(tocEntry + 4, xsz)` below, which puts the served body length
+    // into the guest's record where the logical length used to be. Registering
+    // from it would teach the archive layer that a 720,896-byte member is
+    // 3,571,712 bytes long. (The related XSF-OPEN-GATE-SKIPPED row only touches
+    // the HOST cache's copy of w2, never guest memory -- its own log says so.)
+    // So: first row per path, and the guard is per path, not per entry pointer,
+    // because the guest re-queries the same path from more than one packfile.
     {
-      static bool s_parsedDumped = false;
-      if (!s_parsedDumped && w[0] != 0) {
-        s_parsedDumped = true;
-        const uint32_t region = 0xC60B7780u, len = 382976u;
-        std::vector<uint8_t> tmp(len);
-        bool okAll = true;
-        for (uint32_t o = 0; o < len; o += 4096u) {
-          const uint32_t piece = (len - o < 4096u) ? (len - o) : 4096u;
-          if (!memR.ReadBytes(region + o, reinterpret_cast<char*>(&tmp[o]), piece)) {
-            okAll = false;
+      static std::mutex s_firstRowMtx;
+      static std::unordered_set<std::string> s_seenPaths;
+      const std::string key(path);
+      bool firstRow = false;
+      {
+        std::lock_guard<std::mutex> lk(s_firstRowMtx);
+        firstRow = s_seenPaths.insert(key).second;
+      }
+      const uint32_t mOff = w[2] & kTocMemberOffMask;
+      const uint32_t mStored = w[3] & kTocMemberStoredMask;
+      const uint32_t mLogical = w[1];
+      // A path that names a NESTED archive (`<archive>.rpf/<member>`) is a record
+      // from the INNER TOC, so it belongs to that archive, not to
+      // xarchive_cache.rpf. SplitNestedPath is the VFS's own parse of that
+      // spelling, so the census cannot disagree with the reader about which
+      // archive a member belongs to.
+      std::string nArchive, nInner;
+      bool isNested =
+          mcla::vfs::SplitNestedPath(key, &nArchive, &nInner) && !nInner.empty();
+      if (!isNested) {
+        // ... or it is the nested device's own lookup, which repeats no archive
+        // component. Ask each MOUNTED archive whether it owns this path; only
+        // FindNestedRpf can say yes, and only for an archive this file
+        // registered above. Registering such a record against
+        // xarchive_cache.rpf instead would create a span at an offset that
+        // belongs to a different archive's image, so a miss here means
+        // "unattributed", never "outer".
+        //
+        // The member path is put in the VFS's own key form first (device prefix
+        // off, backslashes to slashes), because that is the form the archive was
+        // registered under and the form FindNestedRpf normalises to; the guest
+        // reaches the same member as `tune/vehicle/vehicle0008.lst` and as
+        // `a:/archive/tune/vehicle/vehicle0008.lst` and both must land on one
+        // archive.
+        std::string inner = key;
+        if (inner.size() > 11 && _strnicmp(inner.c_str(), "a:/archive/", 11) == 0)
+          inner = inner.substr(11);
+        for (char &ch : inner) {
+          if (ch == '\\')
+            ch = '/';
+        }
+        for (const auto &nm : MclaNestedArchiveNames()) {
+          const std::string candidate = nm + "/" + inner;
+          if (mcla::vfs::FindNestedRpf(candidate) != nullptr) {
+            nArchive = candidate;
+            nInner = inner;
+            isNested = true;
             break;
           }
         }
-        bool wrote = false;
-        if (okAll) {
-          FILE* fp = nullptr;
-          if (fopen_s(&fp, "toc_parsed.bin", "wb") == 0 && fp != nullptr) {
-            fwrite(tmp.data(), 1, len, fp);
-            fclose(fp);
-            wrote = true;
-          }
+      }
+      if (firstRow && mOff != 0 && mStored != 0 && mLogical != 0 &&
+          mStored <= 0x1000000u && mLogical <= 0x1000000u) {
+        if (isNested) {
+          mcla::vfs::RegisterNestedMember(nArchive, nArchive, mLogical,
+                                          mStored);
+          MCLA_LOG_WARN("MEMBER-EXPAND-MARK-NESTED path='{}' archive='{}' "
+                        "inner='{}' off={:08X} stored={} logical={}",
+                        path, nArchive.c_str(), nInner.c_str(), mOff, mStored,
+                        mLogical);
+        } else if (kExpandListInArchive) {
+          mcla::vfs::MarkMemberExpandedIn("xarchive_cache.rpf", mOff, mStored,
+                                          mLogical);
+          // W64: census-side half of the overlap check. The six list members
+          // were registered by MclaMarkKnownListMembers BEFORE the census ran,
+          // so every one of these 200-odd members is a candidate to overshoot
+          // a list; the check names the offender instead of leaving the
+          // corruption to be found three stages later in a fatal message.
+          MclaNoteRegisteredSpan(path, mOff, mStored, mLogical);
+          MCLA_LOG_WARN("MEMBER-EXPAND-MARK path='{}' off={:08X} stored={} "
+                        "logical={} first=1",
+                        path, mOff, mStored, mLogical);
         }
+      } else if (!firstRow) {
+        MCLA_LOG_WARN("MEMBER-EXPAND-MARK-SKIP path='{}' off={:08X} stored={} "
+                      "logical={} (not the first row for this path)",
+                      path, mOff, mStored, mLogical);
+      }
+    }
+    // F-657. The comment here used to read "Open gate (CCEA0): proceeds when
+    // bit 30 of [entry+8] is SET", and it was wrong twice: sub_821CCEA0's
+    // predicate is on [entry+12] (word12), not [entry+8], and its bit is 1
+    // (0x821CCF7C `55 6A 00 42`, MB=1, ME=1), with bit 0 as the second
+    // operand (0x821CCF88 `55 6B 00 00`, MB=0, ME=0). `openGateBit30` is KEPT,
+    // bit for bit, because it is a measurement other text cites; the corrected
+    // predicate is added beside it as `openGateBit1` / `serveGateFatal` so one
+    // run separates the two populations instead of merging them.
+    // ⚠️ 2026-10-05: "its bit is 1 ... with bit 0 as the second operand" is the
+    // LSB-numbered reading and is WITHDRAWN. MB=1,ME=1 masks to 0x40000000 (bit
+    // 30) and MB=0,ME=0 masks to 0x80000000 (bit 31), measured from the raw
+    // words -- see the F-657 (0)/(1) blocks. So `openGateBit1` below tests bit 1,
+    // which the guest does not test, and the genuine pair is bit30/bit31, which
+    // is what `openGate` on word8 and the sub_821CC1E0 gate both use. The column
+    // and the two lines below it are left in place deliberately: they are
+    // report-only, other text cites their format, and changing a printed column
+    // is a census change, not a comment change. Read `openGateBit1` as "the
+    // LSB-numbered reading, kept so a run can still show what it selected".
+    const bool openGate = (w[2] & 0x40000000u) != 0;
+    const bool openGateBit1 = (w[3] & kTocServeGateBit1) != 0;
+    const bool serveGateFatal = MclaTocServeGateFatal(w[3]);
+    const bool allZero = (w[0] | w[1] | w[2] | w[3]) == 0;
+    MCLA_LOG_WARN("TOC76-XSF #{} ret={:08X} path='{}' "
+                  "[{:08X} {:08X} {:08X} {:08X}] openGateBit30={} "
+                  "openGateBit1={} serveGateFatal={} zeros={} "
+                  "lr={:08X}",
+                  n, ctx.r3.u32, path, w[0], w[1], w[2], w[3],
+                  openGate ? 1 : 0, openGateBit1 ? 1 : 0,
+                  serveGateFatal ? 1 : 0, allZero ? 1 : 0, lr);
+    // B2a rev2 (F-095 lesson): the fill-time dump caught the table PRE-parse;
+    // the live hashed entries exist only from query time on. One-shot dump of
+    // the parsed region, triggered on the first real entry.
+    //
+    // F-680: the region was the LITERAL 0xC60B7780. That is the root TOC array
+    // base, and it moves -- nine distinct values are measured across build/,
+    // and the literal is the oldest (see the F-680 block above). It is now
+    // `inner`, the value this very function read from [obj+8] at line ~19261
+    // and published on every TOC76 row, so the dump and the log can no longer
+    // disagree about which array they describe. `inner` is only populated when
+    // `hot`, so the extra `inner != 0` is what makes this "dump on first
+    // AVAILABILITY" rather than "dump on a fixed point": before the base is
+    // known this is a no-op that leaves the one-shot armed, and afterwards it
+    // fires on the first real entry.
+    {
+      static bool s_parsedDumped = false;
+      if (!s_parsedDumped && w[0] != 0 && inner != 0) {
+        s_parsedDumped = true;
+        const uint32_t region = inner, len = 382976u;
+        const MclaTocDumpResult r =
+            MclaTocWriteCapture("toc_parsed.bin", region, len);
+        // The original row, fields UNCHANGED -- wrote=/okread= keep their
+        // meaning and their order, because other text cites them. What it
+        // could never express is on the next line.
         MCLA_LOG_WARN("TOC-DUMP2 parsed wrote={} okread={} entry={:08X} at query #{}",
-                      wrote ? 1 : 0, okAll ? 1 : 0, ctx.r3.u32, n);
+                      r.wrote ? 1 : 0, r.okRead ? 1 : 0, ctx.r3.u32, n);
+        MclaTocLogCapture("TOC-DUMP2-NZ", "toc_parsed.bin", r, region);
       }
     }
     // T41.3h (F-078) read-only: the host currently consumes entry+8 as BOTH
@@ -17315,7 +21567,8 @@ PPC_FUNC(sub_821CBFC0) {
         "{:08X}] +14=[{:08X} {:08X} {:08X} {:08X}] xsf={} list={}",
         n, path, ctx.r3.u32, L[0], L[1], L[2], L[3], L[4], L[5], L[6], L[7],
         std::strstr(path, ".xsf") != nullptr ? 1 : 0,
-        std::strstr(path, ".list") != nullptr ? 1 : 0);
+        (std::strstr(path, ".list") != nullptr ||
+         std::strstr(path, ".lst") != nullptr) ? 1 : 0);
   }
   // T41.3m (F-089) read-only, UNCAPPED: PathLooksLikeArchiveContent matches
   // .xsf/.xtd/.list/… but can never match "fxl_final/star_glow.fxc", so the
@@ -17343,21 +21596,55 @@ PPC_FUNC(sub_821CBFC0) {
 // a live entry, set it (guest-memory flag fix — never an invented vtable).
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_821CCEA0);
+// W65 (2026-09-30): counts opens where the guest holds a slot but the host has
+// no body for it -- the state that precedes the null deref. Zero rows is the
+// gate; a non-zero count is a NEW finding, not a progress number.
+static std::atomic<uint32_t> s_w65NoBody{0};
 static std::atomic<uint32_t> s_hCCEA0{0};
+// Slot -> path attribution (2026-10-05). The guest's own buffered stream wrapper
+// carries a HANDLE at +4, and that handle is the slot index its Open returned --
+// sub_821CCEA0's success arm ends `stw r27,0(r31); stw r29,4(r31); mr r3,r30`
+// (0x821CCFF0 region, the comment at gpu_device.cpp:21379 cites it), so the value
+// this hook prints as `ret` IS the slot. The bound is 16 because the guest's own
+// release routine rejects h<0 and h>=16 (sub_821CB2A0, cmpi 0 / cmpi 16 at
+// 0x821CB2B0-0x821CB2BC), not because 16 is convenient here.
+// This exists so a LATER read of that slot can name the file it is reading, with
+// no new hook and therefore no new guest address claimed. Log-only: the only
+// reader is the window row in PPC_FUNC(sub_821BE250) below.
+static std::mutex g_slotPathMtx;
+static char g_slotPath[16][256] = {{0}};
+static std::atomic<uint64_t> s_slotPathSets{0};
 PPC_FUNC(sub_821CCEA0) {
   const uint32_t n = s_hCCEA0.fetch_add(1) + 1;
   const uint32_t dev = ctx.r3.u32;
   const uint32_t pathPtr = ctx.r4.u32;
   const uint32_t flags = ctx.r5.u32;
   auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-  char path[96] = {0};
+  // F-654: this buffer WAS 96 bytes, so ReadBytes took 95 and the logged path
+  // was cut at 95 chars with no ellipsis. w666.log proves it: 17 XSF-OPEN/BDF20
+  // rows are exactly 95 long, and the longest of ANY marker in the log is 95.
+  // The row that read as a suffix repeated three times --
+  //   'shaders/cars/AmbientOcclusionShadows/dcl/AmbientOcclusionShadows/dcl/
+  //    AmbientOcclusionShadows.dc'
+  // (w666.log:12270) -- is a 95-char PREFIX of the real string, not a malformed
+  // path. Widened to 256 so the full composed path is visible. Log-only: the
+  // buffer is still a census copy and is never handed to the serve/lookup code,
+  // which uses the guest's own pointer (g_xsfToc keys) -- so this changes what
+  // is PRINTED and nothing else. The companion fix is BDF20's buffer below; both
+  // are the same defect and must move together or the two markers disagree.
+  char path[256] = {0};
   if (pathPtr && pathPtr != 0xCDCDCDCDu)
     (void)memR.ReadBytes(pathPtr, path, sizeof(path) - 1);
   MclaSanitizePath(path, sizeof(path));
+  // Print the true length so a future truncation is visible as a number rather
+  // than having to be inferred from a string that looks malformed.
+  const size_t pathLen = std::strlen(path);
   const bool ui = PathLooksLikeUiBody(path);
-  // Pre-scan: if this is a UI body and the cached TOC entry is missing the
-  // Open-gate bit, set it so the body can land (same contract as a decrypted
-  // retail entry).
+  // Pre-scan (W68): if this is a UI body and the cached TOC entry is missing the
+  // Open-gate bit, REPORT it and change nothing. T41.3g/T41.3h removed the write
+  // into guest memory (F-079); T41.3w kept a write into the host's cached copy
+  // because it read the offset mask as ignoring bit 30. It does not, and that
+  // write was the fault -- see the W68 block below.
   if (ui) {
     std::lock_guard<std::mutex> lk(g_xsfMtx);
     auto it = g_xsfToc.find(path);
@@ -17366,18 +21653,82 @@ PPC_FUNC(sub_821CCEA0) {
       if (memR.ReadU32BE(it->second.entry + 8, &e8) &&
           (e8 & 0x40000000u) == 0) {
   // T41.3h (F-079): (void)memR.WriteU32BE(it->second.entry + 8, e8 | 0x40000000u);
-        it->second.w[2] = e8 | 0x40000000u;
-        // T41.3w: the guest-visible write above was removed by T41.3h (F-079),
-        // so say what actually happens — only the host-side cached TOC copy
-        // gets bit30, which is what the host serve path reads.
+        //
+        // W68 (2026-09-30): the host-side write is GONE too, and it was the live
+        // fault. T41.3w believed the host cache was a safe place to keep bit30
+        // "because the offset mask ignores it"; there is no such mask. The only
+        // writer of a cached w2 besides XsfTocCache is this line (measured: two
+        // `\.w\[[0-3]\]\s*=` sites in this file, :353 and this one), and the
+        // consumers take it straight to the file:
+        //   XsfOffsetCandidates  win.off = w2 & kTocMemberOffMask   (:1814)
+        //   RegisterNestedRpf    nOff    = tw[2] & kTocMemberOffMask (:19744)
+        // with kTocMemberOffMask == 0x7FFFFFFFu (:1735) -- 31 bits, bit 30 INCLUDED
+        // (F-657's measured guest-emitted width; narrowing it to 0x3FFFFFFFu would
+        // be a second, unmeasured change to a documented constant and is NOT what
+        // is done here). ReadFileAt (src/fs/vfs_rpf.cpp) passes `offset` through
+        // unmasked, so the next open of the path read at 0x40000000u | memberOffset
+        // -- about 1.07 GB past the member.
+        //
+        // MEASURED in build/w679.log, same member, consecutive opens:
+        //   XSF-OPEN #595 ... toc=[E94BDE63 00005777 00471000 40000933]
+        //   XSF-HOSTSERVE off=00471000 ... head=4D616E75           ("Manu")
+        //   XSF-OPEN-GATE-SKIPPED ... +8 00471000 -> 40471000     <-- the poison
+        //   XSF-OPEN #596 ... toc=[E94BDE63 00005777 40471000 40000933]
+        //   XSF-HOSTSERVE off=40471000 ... head=F8EC1A56 (served stored, garbage)
+        // PathLooksLikeUiBody IS PathLooksLikeArchiveContent (:317), so this ran
+        // for every archive path -- 250 XSF-OPEN-GATE-SKIPPED rows in w679, one per
+        // (path, first-open) whose guest bit30 was clear. The consequence measured
+        // downstream: the guest's tokenizer never sees `Manufacturer { ... }`,
+        // F442-SECTION prints name='Manufacturer' ret=00000000, the table at
+        // 0x828CD078 keeps count==0, and sub_823964C0 evaluates `v8 == v9` as
+        // 0 == 0 -> "Unknown manufacturer %s in vehicle list file" (lr=823966E8,
+        // arg 'chevy', build/w679.log:32793-32797).
+        //
+        // NOTHING IS LOST BY NOT WRITING IT. e8 IS the guest's own [entry+8], and
+        // the cache's w2 is that same word copied by XsfTocCache on the first
+        // TOC76 row (:350-353, first-row-wins). Withholding bit30 therefore leaves
+        // the cached w2 byte-identical to what the guest published -- and the gate
+        // it came from never consulted bit30 anyway: no site in this file reads
+        // g_xsfToc[..].w[2] bit 30 as a predicate (every 0x40000000u site measured:
+        // the guest-memory tests in sub_821CC1E0/DISCCHK2 and the object-address
+        // range checks, one TOC-walk record, and the openGateBit30 census column
+        // at :19469 -- which reads a LOCAL w[2] re-read from guest memory at
+        // :19340, so it is unaffected). The bit was write-only: it changed one
+        // field's value and nothing that decided anything.
+        //
+        // THE GATE'S INTENT IS UNCHANGED AND STILL HONOURED: do not synthesise the
+        // open-gate bit into the GUEST's record (F-079's removal stands -- see the
+        // commented WriteU32BE above). W68 extends the same refusal to the host's
+        // own copy of the field, because the host copy is not a flag register: it
+        // is the member offset the host is about to seek with.
         MCLA_LOG_WARN("XSF-OPEN-GATE-SKIPPED path='{}' entry={:08X} +8 {:08X} -> "
-                      "host cache only {:08X} (guest memory untouched)",
+                      "host cache not poisoned, bit30 withheld from w2, "
+                      "would-be {:08X} (guest memory untouched)",
                       path, it->second.entry, e8, e8 | 0x40000000u);
+        // W68: the evidence row, on a NEW marker so no existing marker's format
+        // moves. Count here == count of XSF-OPEN-GATE-SKIPPED above (250 in w679),
+        // and every `w2Stays=` it prints must have bit 30 CLEAR; that is the
+        // falsifier for "no XSF-* row shows an off= with bit 30 set". One row per
+        // withheld poisoning, so the two markers are a 1:1 cross-check.
+        MCLA_LOG_WARN("XSF-GATE-BIT30-WITHHELD path='{}' entry={:08X} +8 {:08X} "
+                      "w2Stays={:08X} bit30={} wouldBe={:08X} (W68: 0x40000000u "
+                      "never enters the cached TOC, so the serve window offset "
+                      "stays w2 & 0x7FFFFFFFu)",
+                      path, it->second.entry, e8, it->second.w[2],
+                      (it->second.w[2] & 0x40000000u) ? 1 : 0,
+                      e8 | 0x40000000u);
       }
     }
   }
   __imp__sub_821CCEA0(ctx, base);
   const int32_t ret = static_cast<int32_t>(ctx.r3.s32);
+  // UnCONDITIONAL (outside the census gate below, which is rate-limited) so the
+  // attribution is never missing exactly when a read happens. Pure bookkeeping.
+  if (ret >= 0 && ret < 16) {
+    std::lock_guard<std::mutex> lk2(g_slotPathMtx);
+    std::snprintf(g_slotPath[ret], sizeof(g_slotPath[ret]), "%s", path);
+    (void)s_slotPathSets.fetch_add(1);
+  }
   if (ui || n <= 24 || (n % 200) == 0) {
     uint32_t e0 = 0, e4 = 0, e8 = 0, e12 = 0;
     {
@@ -17391,9 +21742,11 @@ PPC_FUNC(sub_821CCEA0) {
         it->second.openRet = ret;
       }
     }
-    MCLA_LOG_WARN("XSF-OPEN #{} dev={:08X} flags={:x} path='{}' ret={} "
+    // F-654: `len=` is the path's true length in the 256-byte buffer. Before the
+    // widening it was capped at 95 with nothing marking the cut.
+    MCLA_LOG_WARN("XSF-OPEN #{} dev={:08X} flags={:x} path='{}' len={} ret={} "
                   "toc=[{:08X} {:08X} {:08X} {:08X}] lr={:08X}",
-                  n, dev, flags, path, ret, e0, e4, e8, e12,
+                  n, dev, flags, path, pathLen, ret, e0, e4, e8, e12,
                   static_cast<uint32_t>(ctx.lr));
   }
   // w18/w19: after a successful Open of an archive-content path, host-serv
@@ -17407,10 +21760,50 @@ PPC_FUNC(sub_821CCEA0) {
   // compiled effects are `rgxa 01 ff 01 12` (AlphaModulate.fxc inflated at
   // 0x1DD1E8), and the guest's gate reads that difference as
   // 'Old version of rage effect found. You need to recompile your shaders!'.
-  // Serving the pending (ret==1) opens therefore cannot reach a draw - w117/
-  // w124/w125/w134/w136 all die at that fatal with LISTLINE 167 -> 1.
-  // ret==-1/1 are not served; only the resident opens (ret==0) are.
-  if (ret == 0 && PathLooksLikeArchiveContent(path)) {
+  // NOTE ON THE F-131 PARAGRAPH ABOVE. Its conclusion ("ret==-1/1 are not
+  // served; only the resident opens (ret==0) are") grouped -1 and 1 together
+  // as if both were failures. That grouping is refuted by measurement, below.
+  //
+  // WHAT `ret` IS, measured 2026-10-05 from raw words in build/cache/mcla_pe.bin
+  // (offset = VA - 0x82000000, big-endian) plus build/w722.log. Three witnesses,
+  // any one of which is sufficient:
+  //
+  // (1) THE FUNCTION HAS EXACTLY ONE FAILURE VALUE. sub_821CCEA0 returns
+  //     `li r3,-1` (addi r3,r0,-1 = 0x3860FFFF) at BOTH of its exits --
+  //     0x821CCF40 and 0x821CCFE0 -- and no other negative/zero return
+  //     exists. Its success arm is 0x821CCFEC..0x821CD000 and does not touch
+  //     r3 after the call at 0x821CCFEC, so r3 is that call's result.
+  // (2) r3's SUCCESS VALUE IS A SLOT ORDINAL, NOT A STATUS. The success value
+  //     is copied into callee-saved r30 by `ori r30,r3,r30` (XO=444) at
+  //     0x821CCFF4, and r30 is the register that indexed the slot table a few
+  //     lines earlier: `mulli r11,r30,68` at 0x821CCF4C, `addi r30,r30,1` at
+  //     0x821CCF24, `cmpi cr6,r30,16` at 0x821CCF2C, over 68-byte records
+  //     based at r31+40 (`addi r11,r31,40` at 0x821CCF10). So r3's success
+  //     value IS the slot index, and the guest's own bound on it is
+  //     [0,16): sub_821CB2A0, the release routine, does `cmpi cr6,r4,0` /
+  //     `cmpi cr6,r4,16` at 0x821CB2B0 / 0x821CB2B8 and rejects anything
+  //     outside that range.
+  // (3) THE LOG AGREES AND SEPARATES THE TWO CHANNELS. Over build/w722.log's
+  //     674 opens that carry a TOC row, `ret` takes exactly four values:
+  //     -1 (116), 0 (59), 1 (401), 2 (98). -1 occurs ONLY with lr=821CC0A8,
+  //     an address OUTSIDE sub_821CCEA0; 0/1/2 occur only with lr=821CCF78
+  //     or lr=821CCFF0, both INSIDE its success arm. The two never mix.
+  //
+  // CONSEQUENCE: `ret == 0` was never an error test. It selected slot 0 out of
+  // a 16-slot range, so it admitted exactly 59 of the 558 successful opens and
+  // suppressed 499. It is a false gate from the day it was written, not a
+  // regression. This file already knew: :21169 declares a 16-entry
+  // `g_slotPath[16][256]`, :21281 guards it with `ret >= 0 && ret < 16`, and
+  // :21283 indexes it with `ret`. The gate contradicted the file's own data
+  // structure twenty lines above it.
+  //
+  // WHY THIS IS SAFE TO WIDEN. The concern the F-131 note recorded -- binding a
+  // body the host cannot produce -- is not addressed by the gate; it is
+  // addressed by the refusal at :21436, which declines to publish any handle
+  // whose body did not set the proof flag. That refusal is unchanged and runs
+  // for every open that reaches here, including the newly enabled ones, so a
+  // slot with no provable body still binds nothing.
+  if (ret >= 0 && PathLooksLikeArchiveContent(path)) {
     uint32_t tw[4] = {0, 0, 0, 0};
     uint32_t tocEntry = 0;
     {
@@ -17424,14 +21817,146 @@ PPC_FUNC(sub_821CCEA0) {
           tw[i] = it->second.w[i];
       }
     }
+    // F-632 (2026-09-28): a member that IS a packfile is registered as one, the
+    // moment the guest opens it. This is what makes `tune/vehicle/*.lst` a
+    // first-class path: RegisterNestedRpf inflates the member out of
+    // xarchive_cache.rpf with the member's own (offset, stored, logical) triple,
+    // parses its real RPF3 header, and mounts it, so OpenFile on that path
+    // returns a handle whose ReadFileAt serves the inner archive positionally and
+    // the guest's OWN inner-TOC decrypt runs on bytes the retail packer wrote.
+    //
+    // w653, all three, first TOC76-XSF row each (this is the order the fix reads
+    // them in -- see the FIRST-ROW-WINS note in sub_821CBFC0):
+    //   preload/xarchive_bootscripts.rpf  w=[8F113871 000B0000 00368000 40082186]
+    //   preload/xarchive_cameratune.rpf   w=[E2D132A2 00068000 003F0000 400503CF]
+    //   preload/xarchive_carconfigs.rpf  w=[A1EC6BFB 00048000 00448000 400289B3]
+    // i.e. offset 0x368000 / 0x3F0000 / 0x448000, stored 532,870 / 328,655 /
+    // 166,323 (w3 & 0x3FFFFF; bit 30 is the open-gate flag) and logical 720,896 /
+    // 425,984 / 294,912 (w1). Re-measured offline against
+    // build/game_data/xarchive_cache.rpf: the DEFLATE stream at each offset is
+    // exactly that many bytes and inflates to exactly w1 bytes, each beginning
+    // `52 50 46 33 00 38 00 00 18 03 00 00` (cameratune: TOC length 14,336,
+    // 792 entries).
+    //
+    // This is NOT F-458's contamination and does not repeat it: the inner TOC
+    // stays AES ciphertext at inner+0x800, nothing here decrypts anything, and
+    // the host only ever moves bytes the retail packer wrote. F-458's stated
+    // reason (that no second RPF3 exists in the first 64 MiB) was a measurement
+    // of the wrong offset.
+    {
+      const size_t plen = std::strlen(path);
+      const bool isPack = plen > 4 &&
+                          _strnicmp(path + plen - 4, ".rpf", 4) == 0;
+      const uint32_t nOff = tw[2] & kTocMemberOffMask;
+      const uint32_t nStored = tw[3] & kTocMemberStoredMask;
+      if (isPack && nOff != 0 && nStored != 0 && tw[1] != 0) {
+        mcla::vfs::RegisterNestedRpf("xarchive_cache.rpf", path, nOff,
+                                     nStored, tw[1]);
+        // Remember the name so the TOC census can attribute a record the guest
+        // publishes as a BARE inner path (the nested packfile's own lookup does
+        // not repeat the archive component) to the archive it belongs to, using
+        // the VFS's own key normalisation rather than a guess.
+        MclaRememberNestedArchive(path);
+        MCLA_LOG_WARN("NESTED-RPF-REGISTER path='{}' off={:08X} stored={} "
+                      "logical={}",
+                      path, nOff, nStored, tw[1]);
+      }
+    }
     uint32_t xsz = 0;
-    const uint32_t xbuf = HostServeUiBody(path, xsz);
+    bool xproved = false;
+    const uint32_t xbuf = HostServeUiBody(path, xsz, &xproved);
     MCLA_LOG_WARN("XSF-POSTOPEN-SERVE path='{}' buf={:08X} size={} "
                   "dev={:08X} handle={} tocEntry={:08X} "
                   "toc=[{:08X} {:08X} {:08X} {:08X}]",
                   path, xbuf, xsz, dev, ret, tocEntry, tw[0], tw[1], tw[2],
                   tw[3]);
-    if (xbuf && xsz > 0) {
+    // =========================================================================
+    // W65 (2026-09-30) -- THE DEVICE-OPEN CONTRACT. A device open must never
+    // publish a handle whose content the host cannot produce.
+    //
+    // WHAT THE GUEST'S OWN CODE SAYS (generated/ppc_xenon/ppc_recomp.17.cpp,
+    // function sub_821CCEA0, which this hook replaces; cross-checked against
+    // build/cache/mcla_pe.bin at VA 0x821CCEA0..0x821CD000):
+    //   :5236-5241  loc_821CCF40  li r3,-1      flags&0xFF == 0         -> -1
+    //   :5253-5258  loc_821CCF40  li r3,-1      dev->vt[+36]() == 0    -> -1
+    //   :5266-5270  loc_821CCF40  li r3,-1      ~(port->[+8]) & 1     -> -1
+    //   :5300-5305  loc_821CCF40  li r3,-1      all 16 slots busy     -> -1
+    //   :5355-5360  loc_821CCF40  li r3,-1      sub_821DEBA8 != 0     -> -1
+    //   :5361-5364  loc_821CCFF0  stw r27,0(r31); stw r29,4(r31);
+    //                              mr r3,r30   success: the SLOT INDEX
+    // So the function's only failure value is -1 and its only success value is
+    // a slot index 0..15. The consumer is the mount loop in sub_821CB488
+    // (:1285-1320): it calls dev->vtable[+4] (sub_821CDB88, :7176-7181, which
+    // is `r4 = [dev+36]+r4; b sub_821CCEA0` -- a TAIL call, so the result
+    // arrives in r3), then :1305-1308
+    //     mr r4,r3 ; cmpwi cr6,r4,-1 ; bne cr6,0x821cb690
+    // walks to the NEXT DEVICE on -1 and stops on anything else. THE GUEST IS
+    // WRITTEN TO SURVIVE -1 AND NOTHING ELSE: there is no null, no zero and no
+    // errored object anywhere in the path, so -1 IS the status channel.
+    //
+    // THE VIOLATION. w664.log took 341 BDF20 file operations down to 1 and then
+    // crashed twice (C0000005 2; `Param[1]=0x20` -- a null base plus 0x20).
+    // 35 consecutive rows, all one member:
+    //   XSF-OPEN #1 dev=C64AC800 flags=1 path='.../raceeditor.xsf' ret=0
+    //   XSF-HOSTSERVE ... off=64CB0000 size=143069 stored=3420181
+    //                  logical=143089 head=05435352
+    //   XSF-BIND ... h=0 wrap=82860C18
+    //   DEVCLAIM #1 dev=C64AC800 path='a:/archive/.../raceeditor.xsf' r3=0
+    // `ret=0` is the guest's own SLOT INDEX -- the host did not forge it -- but
+    // the host then bound slot 0 to a body 20 bytes shorter than the TOC record
+    // the guest itself published: the `WriteU32BE(tocEntry + 4, xsz)` publish,
+    // the `kBdf20Wrap` {dev,handle} pair at `0x82860C18`, and the
+    // `MclaRegisterServedBody` call, all three a few lines below this comment.
+    // That converts an allocator success into a CONTENT success the host never
+    // earned, and it is the only thing standing between the guest and the null
+    // it dereferences.
+    //
+    // THE FIX, and it is deliberately the small one: REFUSE TO PUBLISH. The
+    // slot stays claimed by the guest's own code, the TOC entry keeps the w1
+    // the guest wrote, GetSize (CD3C8) returns the guest's own number with no
+    // host body behind it, and the mount loop is left free to try the next
+    // device -- the state the console's own driver is written to survive,
+    // because on the console the open returned -1 and no body was ever bound.
+    // Nothing here fabricates a handle and nothing here invents a vtable.
+    // =========================================================================
+    if (xbuf && xsz > 0 && !xproved) {
+      MCLA_LOG_WARN(
+          "OPEN-REFUSED-STATUS path='{}' dev={:08X} handle={} tocEntry={:08X} "
+          "served={} logical(w1)={} stored={:08X} "
+          "toc=[{:08X} {:08X} {:08X} {:08X}] reason=UNPROVED-BODY -- no handle "
+          "bound, no GetSize published, no served-body registered "
+          "(see SERVE-PROOF)",
+          path, dev, ret, tocEntry, xsz, tw[1], tw[2], tw[0], tw[1], tw[2],
+          tw[3]);
+    } else if (xbuf && xsz > 0) {
+      MCLA_LOG_WARN(
+          "OPEN-ACCEPTED path='{}' dev={:08X} handle={} tocEntry={:08X} "
+          "served={} logical(w1)={} proved=1",
+          path, dev, ret, tocEntry, xsz, tw[1]);
+    }
+    // W65: the row that makes the null visible WITHOUT needing a crash. It is
+    // the invariant, stated per open -- a bound handle always has a body, and a
+    // body the host could not prove never gets one.
+    {
+      const bool bound = (xbuf && xsz > 0 && xproved);
+      // 2026-10-05: this said `ret == 0`, which made the W65 counter blind to
+      // every slot except 0 -- i.e. blind to precisely the slots the serve
+      // gate above used to suppress, so the two errors cancelled out and the
+      // counter could not see the case it exists to detect. `ret >= 0` is the
+      // same predicate the gate now uses. Field VALUES only: the row's format
+      // is untouched, and no new row shape is introduced.
+      const bool wouldBindNull = (ret >= 0 && xbuf == 0 && xsz == 0);
+      MCLA_LOG_WARN("NULL-HANDLE-CHECK path='{}' ret={} tocEntry={:08X} "
+                    "bodyBuf={:08X} bodySize={} proved={} bound={} "
+                    "slotHeldNoBody={}",
+                    path, ret, tocEntry, xbuf, xsz, xproved ? 1 : 0,
+                    bound ? 1 : 0, wouldBindNull ? 1 : 0);
+      if (wouldBindNull && (s_w65NoBody.fetch_add(1) + 1) <= 24)
+        MCLA_LOG_WARN("OPEN-NULL-BOUND path='{}' dev={:08X} -- the guest holds "
+                      "a slot for a file this host served nothing for",
+                      path, dev);
+    }
+    if (xbuf && xsz > 0 && xproved) {
       {
         std::lock_guard<std::mutex> lk(g_xsfMtx);
         auto it = g_xsfToc.find(path);
@@ -17451,8 +21976,11 @@ PPC_FUNC(sub_821CCEA0) {
       if (tocEntry && tocEntry != 0xCDCDCDCDu)
         (void)memR.WriteU32BE(tocEntry + 4, xsz);
       // Bind the global BDF20 stream wrapper {dev, handle} so later
-      // BE8D8/BE610/BE250 on 0x82860C18 address this open file.
-      constexpr uint32_t kBdf20Wrap = 0x82860C18u;
+      // BE8D8/BE610/BE250 on the array's first slot address this open file.
+      // kBdf20WrapArray is the base sub_821BDDE8 itself allocates from (raw
+      // `lis r11,8286` + `addi r10,r11,3096` at 821BDE5C/821BDE60); it was a
+      // second, private literal here, which is the shape F-655 had to undo.
+      constexpr uint32_t kBdf20Wrap = kBdf20WrapArray;
       (void)memR.WriteU32BE(kBdf20Wrap + 0, dev);
       (void)memR.WriteU32BE(kBdf20Wrap + 4, static_cast<uint32_t>(ret));
       // Packfile slot: Open already wrote tocEntry at dev+40+h*68.
@@ -17475,10 +22003,10 @@ PPC_FUNC(sub_821CCEA0) {
 //
 // Non-archive Mount call chain (never observed firing):
 //   caller@82144C88 (gated by [r30+4]==0)
-//     â†’ sub_82135E48(r31+6468, [r31+1312], [r31+1316])
-//       â†’ sub_8213AB78(...)  // must return true
-//       â†’ sub_82139BE0(...)  // builds path, bl Mount
-//         â†’ sub_821CB9D8 (fiDevice::Mount)
+//     -> sub_82135E48(r31+6468, [r31+1312], [r31+1316])
+//       -> sub_8213AB78(...)  // must return true
+//       -> sub_82139BE0(...)  // builds path, bl Mount
+//         -> sub_821CB9D8 (fiDevice::Mount)
 //
 // Prove which fork holds: host-missing gate vs device-must-exist vs
 // dead code / constructor-based registration.
@@ -17540,7 +22068,7 @@ PPC_FUNC(sub_82139BE0) {
 // The site that decides whether to enter 5E48 at all:
 //   lwz r11,4(r30); cmplwi r11,0; bne skip;  else bl 5E48
 // Log every hit of the caller-side gate check via a thin wrapper on 5E48's
-// peer sub_82144F28 (loop entry of the outer init fn) is not enough â€”
+// peer sub_82144F28 (loop entry of the outer init fn) is not enough --
 // census 5E48 is the proof. Also census 82144C88 via lrs already covered.
 //
 // Extra: dump [r30+4] from the outer frame is host-only; we log r30 contents
@@ -17633,7 +22161,7 @@ PPC_FUNC(sub_82144EB0) {
 MCLA_T4A2_CENSUS(sub_821CB740, fmt740)
 MCLA_T4A2_CENSUS(sub_821CB760, ctor760)
 
-// 13 unique owners of blâ†’sub_821CB740 (raw scan of mcla_pe.bin)
+// 13 unique owners of bl->sub_821CB740 (raw scan of mcla_pe.bin)
 MCLA_T4A2_CENSUS(sub_8215B1D8, own5B1D8)
 // sub_821BE8D8 is handled below with a richer census (obj/dev/handle).
 MCLA_T4A2_CENSUS(sub_822C3A58, own2C3A58)
@@ -17733,6 +22261,26 @@ PPC_FUNC(sub_822C54D8) {
   MCLA_LOG_WARN("F556-C54D8 #{} obj={:08X} r4={:08X} lr={:08X} tid={:08X} "
                 "[obj+0..+12]={:08X} {:08X} {:08X} {:08X}",
                 n, obj, ctx.r4.u32, static_cast<uint32_t>(ctx.lr), GetCurrentThreadId(), s0, s1, s2, s3);
+  // F-610: resolve the two bctrl targets from the body (disasm 0x822C54D8):
+  // slot=[obj+(r4+1)*4]; null -> fatal path; else t1=[[slot]+8],
+  // t2=[[slot]+12]. Read-only chain walk; no behavior change.
+  {
+    const uint32_t idx = ctx.r4.u32;
+    uint32_t slot = 0, vt = 0, t1 = 0, t2 = 0;
+    if (obj >= 0x80000000u && obj < 0xE0000000u && idx < 0x40000000u) {
+      (void)mem.ReadU32BE(obj + (idx + 1u) * 4u, &slot);
+      if (slot >= 0x80000000u && slot < 0xE0000000u &&
+          mem.ReadU32BE(slot, &vt) && vt >= 0x80000000u &&
+          vt < 0xE0000000u) {
+        (void)mem.ReadU32BE(vt + 8, &t1);
+        (void)mem.ReadU32BE(vt + 12, &t2);
+      }
+    }
+    if (n <= 8 || (n % 100) == 0)
+      MCLA_LOG_WARN("F610-DISP #{} obj={:08X} idx={} slot={:08X} vt={:08X} "
+                    "t1={:08X} t2={:08X}",
+                    n, obj, idx, slot, vt, t1, t2);
+  }
   __imp__sub_822C54D8(ctx, base);
   MCLA_LOG_WARN("F556-C54D8-RET #{} ret={:08X}", n, ctx.r3.u32);
 }
@@ -17751,7 +22299,422 @@ PPC_FUNC(sub_822C54D8) {
 // r4 = min(capacity, 65535 - 2*capacity) and stop doubling near the ceiling).
 // Guest body: generated/ppc_xenon/ppc_recomp.16.cpp:4591.
 
-// Plain "memory:" @0x820127D8 owners â€” all fiDevice prefix parsers
+// F-574: F-571 RE-ARMED, with the clamp F-571 asked for. The blocker is the boot
+// worker's >600 s park at lr=821C6DC8 (F-570/F-571): the caller passes r4=4, so
+// capacity grows 4,8,12,...~24000 and every 4th push reallocs and recopies the
+// whole buffer. Doubling moves the park (measured), but the field is 16-bit, so
+// the clamp is the whole point of this hook:
+//
+//   newcap = cap + r4, then `clrlwi r4,r11,16` + `sth r4,6(r31)`.
+//   => the ONLY safe condition is cap + r4 <= 0xFFFF.
+//   => `r4 = cap` (doubling) is safe only while 2*cap <= 0xFFFF, i.e. cap < 0x8000.
+//   => at cap >= 0x8000 the caller's +4 is left alone. That is not a regression:
+//      capacity is then already past the ~24000 entries the serializer produces,
+//      so no further realloc happens at all and the loop is O(1) per push.
+//
+// Note `min(cap, 65535 - 2*cap)` from F-571's text is NOT used: at cap=32768 it
+// evaluates 65535-65536 = -1 and would hand the guest a negative increment.
+// Over-read is impossible either way - the copy loop's bound is the OLD `cnt`
+// (it compares `i+1` against `lhz 4(r31)`), so a bigger capacity never makes it
+// read past the old buffer.
+// Owner check before adding: `python tools/addr_owners.py --check 821C6D90`
+// -> 1 site, the generated map only, so this is the sole claim on the address.
+PPC_FUNC_IMPL(__imp__sub_821C6D90);
+static std::atomic<uint32_t> s_c6d90Push{0};
+static std::atomic<uint32_t> s_c6d90Grow{0};
+PPC_FUNC(sub_821C6D90) {
+  const uint32_t n = s_c6d90Push.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint16_t cnt = 0, cap = 0;
+  if (obj >= 0x80000000u && obj < 0xE0000000u && mem.IsValid(obj + 4, 4)) {
+    (void)mem.ReadU16BE(obj + 4, &cnt);
+    (void)mem.ReadU16BE(obj + 6, &cap);
+    if (cnt == cap && cap > 0 && cap < 0x8000u && ctx.r4.u32 < cap) {
+      const uint32_t g = s_c6d90Grow.fetch_add(1) + 1;
+      ctx.r4.u32 = cap;  // newcap = 2*cap <= 0xFFFE, so the 16-bit store cannot wrap
+      if (g <= 8 || (g % 500) == 0)
+        MCLA_LOG_WARN("C6D90-GROW #{} push={} obj={:08X} cnt={} cap={} newcap={}", g, n, obj,
+                      cnt, cap, cap * 2u);
+    }
+  }
+  __imp__sub_821C6D90(ctx, base);
+}
+
+// F-598: is the city serializer (sub_821DD670 byte-at-a-time varint writer)
+// progressing or stuck? Growth completes in <50 ms (C6D90-GROW #8,
+// push=1025, w625) yet PARK-SAMPLE sits at lr=821C6DC8/821C667C for the whole
+// soak. These two hooks give the slope: DD670 entry rate + C6658 alloc arg
+// shape, periodic so the timestamps ARE the progress signal. Log-only,
+// bounded, registers-first; no state change.
+PPC_FUNC_IMPL(__imp__sub_821DD670);
+static std::atomic<uint32_t> s_hDD670{0};
+PPC_FUNC(sub_821DD670) {
+  const uint32_t n = s_hDD670.fetch_add(1) + 1;
+  if (n <= 8 || (n % 20000) == 0)
+    MCLA_LOG_WARN("F598-DD670 #{} r3={:08X} r4={:08X} lr={:08X}", n,
+                  ctx.r3.u32, ctx.r4.u32, ctx.lr);
+  __imp__sub_821DD670(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821C6658);
+static std::atomic<uint32_t> s_hC6658{0};
+PPC_FUNC(sub_821C6658) {
+  const uint32_t n = s_hC6658.fetch_add(1) + 1;
+  if (n <= 16 || (n % 20000) == 0)
+    MCLA_LOG_WARN("F598-C6658 #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}", n,
+                  ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.lr);
+  __imp__sub_821C6658(ctx, base);
+}
+
+// F-599: sub_821378B8 is the guest strdup (strlen -> alloc -> copy at
+// 0x82137900/0x8213790C); XTLIMPORT blames it for ~89% of 140k allocs, almost
+// all size=1 (empty strings). This hook names ITS caller: a hot lr here is
+// the loop spinning on empty-string dups. Log-only, bounded,
+// registers-first; no state change.
+PPC_FUNC_IMPL(__imp__sub_821378B8);
+static std::atomic<uint32_t> s_h78B8{0};
+PPC_FUNC(sub_821378B8) {
+  const uint32_t n = s_h78B8.fetch_add(1) + 1;
+  if (n <= 16 || (n % 20000) == 0) {
+    uint32_t head = 0;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)mem.ReadU32BE(ctx.r3.u32, &head);
+    MCLA_LOG_WARN("F599-STRDUP #{} str={:08X} head={:08X} lr={:08X}", n,
+                  ctx.r3.u32, head, ctx.lr);
+  }
+  __imp__sub_821378B8(ctx, base);
+}
+
+// F-611: t2-sequel test. F-610 named the two bctrl targets (t1=822D4878,
+// t2=822D2BC8); the two calls are sequential, so t2 firing proves t1
+// returned. One entry hook, no behavior change. Fires = stall at/after t2;
+// silent = stall inside t1's subtree (then bisect its 8 callees).
+// Log-only, bounded, registers-first.
+PPC_FUNC_IMPL(__imp__sub_822D2BC8);
+static std::atomic<uint32_t> s_h2BC8{0};
+PPC_FUNC(sub_822D2BC8) {
+  const uint32_t n = s_h2BC8.fetch_add(1) + 1;
+  if (n <= 8 || (n % 200) == 0)
+    MCLA_LOG_WARN("F611-T2 #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, ctx.lr);
+  __imp__sub_822D2BC8(ctx, base);
+}
+
+// F-612: bisect inside t1 (sub_822D4878): 8 sequential calls, t2 never fires
+// so t1 never returns. sub_82387B90 is called TWICE (positions 4 and 6),
+// making one hook a two-point probe: fires 0x = stall in calls 1-3;
+// fires 1x = stall in 5 (8238CE30); fires 2x = stall in 7-8. lr names which
+// site. Log-only, bounded, registers-first.
+PPC_FUNC_IMPL(__imp__sub_82387B90);
+static std::atomic<uint32_t> s_h87B90{0};
+PPC_FUNC(sub_82387B90) {
+  const uint32_t n = s_h87B90.fetch_add(1) + 1;
+  if (n <= 8 || (n % 200) == 0)
+    MCLA_LOG_WARN("F612-BIS #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, ctx.lr);
+  __imp__sub_82387B90(ctx, base);
+}
+
+// F-613: bisect step 2 inside t1 (sub_822D4878). F-612 fired twice
+// (lr=822D4908/822D4914 = positions 4 and 6), so calls 1-6 complete and the
+// stall is in 7 (sub_8238BA38), 8 (sub_82388540), or the alloc tail after.
+// One entry hook on #7: fires = stall at/after #8; silent = stall inside #7.
+// (A third F612 row, lr=82398588, is a different context, not t1.)
+// Log-only, bounded, registers-first.
+PPC_FUNC_IMPL(__imp__sub_8238BA38);
+static std::atomic<uint32_t> s_h8BA38{0};
+PPC_FUNC(sub_8238BA38) {
+  const uint32_t n = s_h8BA38.fetch_add(1) + 1;
+  if (n <= 8 || (n % 200) == 0)
+    MCLA_LOG_WARN("F613-BIS2 #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, ctx.lr);
+  __imp__sub_8238BA38(ctx, base);
+}
+
+// F-614: sequel test for call #8 (sub_82388540). F-613 proved #7 entered
+// (lr=822D491C); #8's entry is unhooked. Fires = #7 returned, stall at/after
+// #8 (then read #8's body the same way); silent = #7 never returned (then
+// read #7's body). Log-only, bounded, registers-first.
+PPC_FUNC_IMPL(__imp__sub_82388540);
+static std::atomic<uint32_t> s_h88540{0};
+PPC_FUNC(sub_82388540) {
+  const uint32_t n = s_h88540.fetch_add(1) + 1;
+  if (n <= 8 || (n % 200) == 0)
+    MCLA_LOG_WARN("F614-C8 #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, ctx.lr);
+  __imp__sub_82388540(ctx, base);
+}
+
+// F-615: sequel inside #8's tail-jump target (sub_82398568: 82387B90 ->
+// 8238B048 -> 8238B128, straight-line). Entry hook on the LAST call:
+// fires = first two returned, stall at/after 8238B128 (then read its body);
+// silent = stall in 8238B048 (then read it). Log-only, bounded.
+PPC_FUNC_IMPL(__imp__sub_8238B128);
+static std::atomic<uint32_t> s_h8B128{0};
+PPC_FUNC(sub_8238B128) {
+  const uint32_t n = s_h8B128.fetch_add(1) + 1;
+  if (n <= 8 || (n % 200) == 0)
+    MCLA_LOG_WARN("F615-C83 #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, ctx.lr);
+  __imp__sub_8238B128(ctx, base);
+}
+
+// F-616: batch frontier inside t1's tail (all calls after #8 return).
+// Three distinctive bls, one hook each: 822D4518, 82490A08, 82490990.
+// Last firer marks the frontier; silent ones never reached. (82130528
+// allocs already censused via XTLIMPORT.) Log-only, bounded.
+PPC_FUNC_IMPL(__imp__sub_822D4518);
+static std::atomic<uint32_t> s_hD4518{0};
+PPC_FUNC(sub_822D4518) {
+  const uint32_t n = s_hD4518.fetch_add(1) + 1;
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("F616-TAIL #{} D4518 r3={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.lr);
+  __imp__sub_822D4518(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_82490A08);
+static std::atomic<uint32_t> s_h90A08{0};
+PPC_FUNC(sub_82490A08) {
+  const uint32_t n = s_h90A08.fetch_add(1) + 1;
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("F616-TAIL #{} 90A08 r3={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.lr);
+  __imp__sub_82490A08(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_82490990);
+static std::atomic<uint32_t> s_h90990{0};
+PPC_FUNC(sub_82490990) {
+  const uint32_t n = s_h90990.fetch_add(1) + 1;
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("F616-TAIL #{} 90990 r3={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.lr);
+  __imp__sub_82490990(ctx, base);
+}
+
+// F-617: batch frontier past t1's factory run (all four 90A08 fired, so t1
+// runs straight through its tail). Next five distinctive calls in order:
+// 825032B8, 82195800, 82507820, 82469A98, 8239EDC0. Last firer = frontier.
+// Log-only, bounded (first 2 + every 200th: these should fire ~once).
+#define F617_TAIL_HOOK(sym, tag) \
+  PPC_FUNC_IMPL(__imp__##sym); \
+  static std::atomic<uint32_t> s_h##tag{0}; \
+  PPC_FUNC(sym) { \
+    const uint32_t n = s_h##tag.fetch_add(1) + 1; \
+    if (n <= 2 || (n % 200) == 0) \
+      MCLA_LOG_WARN("F617-TAIL #{} " #tag " r3={:08X} lr={:08X}", n, \
+                    ctx.r3.u32, ctx.lr); \
+    __imp__##sym(ctx, base); \
+  }
+F617_TAIL_HOOK(sub_825032B8, S032B8)
+F617_TAIL_HOOK(sub_82195800, S95800)
+F617_TAIL_HOOK(sub_82507820, S07820)
+F617_TAIL_HOOK(sub_82469A98, S69A98)
+F617_TAIL_HOOK(sub_8239EDC0, S9EDC0)
+#undef F617_TAIL_HOOK
+
+// F-618: batch frontier past t1's S-batch (all five fired same-ms, so t1
+// runs straight through). Next five in body order: 822CA238, 821D4090,
+// 8239DE80, 8236E388, 82371310. Last firer = frontier. Log-only, bounded.
+#define F618_TAIL_HOOK(sym, tag) \
+  PPC_FUNC_IMPL(__imp__##sym); \
+  static std::atomic<uint32_t> s_h##tag{0}; \
+  PPC_FUNC(sym) { \
+    const uint32_t n = s_h##tag.fetch_add(1) + 1; \
+    if (n <= 2 || (n % 200) == 0) \
+      MCLA_LOG_WARN("F618-TAIL #{} " #tag " r3={:08X} lr={:08X}", n, \
+                    ctx.r3.u32, ctx.lr); \
+    __imp__##sym(ctx, base); \
+  }
+F618_TAIL_HOOK(sub_822CA238, T2CA238)
+F618_TAIL_HOOK(sub_821D4090, T1D4090)
+F618_TAIL_HOOK(sub_8239DE80, T39DE80)
+F618_TAIL_HOOK(sub_8236E388, T36E388)
+F618_TAIL_HOOK(sub_82371310, T371310)
+#undef F618_TAIL_HOOK
+
+// F-619: batch frontier past the F-618 batch (all five fired once,
+// sequential lrs). Next five in body order: 821E7770, 82328648, 82365108,
+// 8272DA30, 821F2B08. Last firer = frontier. Log-only, bounded.
+#define F619_TAIL_HOOK(sym, tag) \
+  PPC_FUNC_IMPL(__imp__##sym); \
+  static std::atomic<uint32_t> s_h##tag{0}; \
+  PPC_FUNC(sym) { \
+    const uint32_t n = s_h##tag.fetch_add(1) + 1; \
+    if (n <= 2 || (n % 200) == 0) \
+      MCLA_LOG_WARN("F619-TAIL #{} " #tag " r3={:08X} lr={:08X}", n, \
+                    ctx.r3.u32, ctx.lr); \
+    __imp__##sym(ctx, base); \
+  }
+F619_TAIL_HOOK(sub_821E7770, T1E7770)
+F619_TAIL_HOOK(sub_82328648, T328648)
+F619_TAIL_HOOK(sub_82365108, T365108)
+F619_TAIL_HOOK(sub_8272DA30, T72DA30)
+F619_TAIL_HOOK(sub_821F2B08, T1F2B08)
+#undef F619_TAIL_HOOK
+
+// F-620: batch frontier past the F-619 batch (all five fired once).
+// Last four calls in t1's body: 826FF8C0, 826C2D88, 822EC338, 8226F530,
+// then epilogue jump. Last firer = frontier (or t1 returns - news either
+// way). Log-only, bounded.
+#define F620_TAIL_HOOK(sym, tag) \
+  PPC_FUNC_IMPL(__imp__##sym); \
+  static std::atomic<uint32_t> s_h##tag{0}; \
+  PPC_FUNC(sym) { \
+    const uint32_t n = s_h##tag.fetch_add(1) + 1; \
+    if (n <= 2 || (n % 200) == 0) \
+      MCLA_LOG_WARN("F620-TAIL #{} " #tag " r3={:08X} lr={:08X}", n, \
+                    ctx.r3.u32, ctx.lr); \
+    __imp__##sym(ctx, base); \
+  }
+F620_TAIL_HOOK(sub_826FF8C0, T6FF8C0)
+F620_TAIL_HOOK(sub_826C2D88, T6C2D88)
+F620_TAIL_HOOK(sub_822EC338, T2EC338)
+F620_TAIL_HOOK(sub_8226F530, T26F530)
+#undef F620_TAIL_HOOK
+
+// F-621: sequel inside 826FF8C0 (alloc-272 ok, r3 non-null, so its only
+// call bl 826FED90 runs). Entry hook on 826FED90: fires = stall inside or
+// below it (then read its body); silent = impossible path (re-examine).
+// Log-only, bounded.
+PPC_FUNC_IMPL(__imp__sub_826FED90);
+static std::atomic<uint32_t> s_hFED90{0};
+PPC_FUNC(sub_826FED90) {
+  const uint32_t n = s_hFED90.fetch_add(1) + 1;
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("F621-FED #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.r4.u32, ctx.lr);
+  // F-622: body holds two bctrl dispatches (0x826FEE58: ctr=[r6+24] with
+  // r6=[r3+0]; 0x826FEE68: ctr=[r4+36] with r4=[r3+0]). Both chains are
+  // entry-readable (r31=r3 throughout). Read-only; no behavior change.
+  {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t obj = ctx.r3.u32;
+    uint32_t r6 = 0, t1 = 0, r4b = 0, t2 = 0;
+    if (obj >= 0x80000000u && obj < 0xE0000000u &&
+        mem.ReadU32BE(obj, &r6) && mem.ReadU32BE(obj, &r4b)) {
+      uint32_t w = 0;
+      if (r6 >= 0x80000000u && r6 < 0xE0000000u &&
+          mem.ReadU32BE(r6 + 24, &w))
+        t1 = w;
+      if (r4b >= 0x80000000u && r4b < 0xE0000000u &&
+          mem.ReadU32BE(r4b + 36, &w))
+        t2 = w;
+    }
+    if (n <= 4 || (n % 200) == 0)
+      MCLA_LOG_WARN("F622-DISP2 #{} obj={:08X} r6={:08X} t1={:08X} "
+                    "r4b={:08X} t2={:08X}",
+                    n, obj, r6, t1, r4b, t2);
+  }
+  __imp__sub_826FED90(ctx, base);
+}
+
+// F-627: sequel inside t2's first target (sub_821F3988): its 2nd call
+// (sub_821F3580) fired once, its 3rd (sub_821C4210) never in-context.
+// Between them: alloc + sub_821C0580 (bl at 0x821F3A34). Entry hook:
+// fires = 821F3580 returned; silent = stall in alloc/821C0580.
+// Log-only, bounded.
+PPC_FUNC_IMPL(__imp__sub_821C0580);
+static std::atomic<uint32_t> s_hC0580{0};
+PPC_FUNC(sub_821C0580) {
+  const uint32_t n = s_hC0580.fetch_add(1) + 1;
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("F627-C0580 #{} r3={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.lr);
+  __imp__sub_821C0580(ctx, base);
+}
+
+// F-628: F-627 inverted the branch. Inside t2's first target (sub_821F3988),
+// sub_821F3580 WAS entered (lr=821F39F4) and sub_821C0580 fired only from
+// another context (lr=82131AF8) - so nothing after 821F3580 ran in this
+// context and the wedge is INSIDE it. Its body is a 20-byte-stride copy loop
+// (821F35A8..821F361C, while r29 < r26) with three callees; at the call site
+// r4 == r5 so the loop should exit at once, which is why the other two
+// candidates (821C4210/821C05E8) never firing is the surprise. Three
+// entry hooks, one round: a high count = the copy loop is the wedge
+// (progress without completion), all-once = descend into the silent one.
+// Rule-4 clean (generated map only) and grep-empty in src/. Log-only.
+#define F628_LOOP_HOOK(sym, tag) \
+  PPC_FUNC_IMPL(__imp__##sym); \
+  static std::atomic<uint32_t> s_h##tag{0}; \
+  PPC_FUNC(sym) { \
+    const uint32_t n = s_h##tag.fetch_add(1) + 1; \
+    if (n <= 4 || (n % 200) == 0) \
+      MCLA_LOG_WARN("F628-LOOP #{} " #tag " r3={:08X} r4={:08X} lr={:08X}", \
+                    n, ctx.r3.u32, ctx.r4.u32, ctx.lr); \
+    __imp__##sym(ctx, base); \
+  }
+F628_LOOP_HOOK(sub_821D2A58, LD2A58)
+F628_LOOP_HOOK(sub_821F1748, LF1748)
+F628_LOOP_HOOK(sub_821F12B8, LF12B8)
+#undef F628_LOOP_HOOK
+
+// F-623: confirm the statically-resolved bctrl targets live (the slot at
+// [0x820C5094/0x820C50A0] is runtime-written, so raw bytes are a hypothesis).
+// t1=826FEF08, t2=826FFB30 (raw-be). Both entries in one round: which fires
+// marks the taken branch. Log-only, bounded.
+PPC_FUNC_IMPL(__imp__sub_826FEF08);
+static std::atomic<uint32_t> s_hEF08{0};
+PPC_FUNC(sub_826FEF08) {
+  const uint32_t n = s_hEF08.fetch_add(1) + 1;
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("F623-T12 #{} t1 r3={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.lr);
+  __imp__sub_826FEF08(ctx, base);
+}
+PPC_FUNC_IMPL(__imp__sub_826FFB30);
+static std::atomic<uint32_t> s_hFB30{0};
+PPC_FUNC(sub_826FFB30) {
+  const uint32_t n = s_hFB30.fetch_add(1) + 1;
+  if (n <= 4 || (n % 200) == 0)
+    MCLA_LOG_WARN("F623-T12 #{} t2 r3={:08X} lr={:08X}", n, ctx.r3.u32,
+                  ctx.lr);
+  __imp__sub_826FFB30(ctx, base);
+}
+
+// F-624: batch both sub-branches. t1 (826FEF08) distinctive callees:
+// 821C9790, 824787B0. t2 (826FFB30) bctrl targets resolved from raw bytes:
+// 821F3988 ([0x820C5098]), 821F3E88 ([0x820C509C]) - runtime-written slot,
+// rows confirm-or-refute. Four hooks, last firer per branch = frontier.
+// Log-only, bounded.
+#define F624_TAIL_HOOK(sym, tag) \
+  PPC_FUNC_IMPL(__imp__##sym); \
+  static std::atomic<uint32_t> s_h##tag{0}; \
+  PPC_FUNC(sym) { \
+    const uint32_t n = s_h##tag.fetch_add(1) + 1; \
+    if (n <= 2 || (n % 200) == 0) \
+      MCLA_LOG_WARN("F624-TAIL #{} " #tag " r3={:08X} lr={:08X}", n, \
+                    ctx.r3.u32, ctx.lr); \
+    __imp__##sym(ctx, base); \
+  }
+F624_TAIL_HOOK(sub_821C9790, T1C9790)
+F624_TAIL_HOOK(sub_824787B0, T4787B0)
+F624_TAIL_HOOK(sub_821F3988, T1F3988)
+F624_TAIL_HOOK(sub_821F3E88, T1F3E88)
+#undef F624_TAIL_HOOK
+
+// F-625: batch inside t2's first target (sub_821F3988, entered once, sibling
+// target never fired). First four distinctive calls in body order: 821F3580,
+// 821C4210, 821C05E8, 821CA6A8. (821CA540 skipped: already hooked as
+// MCLA_BISECT_HOOK "3-821CA540" - grep src/ first, F-366.) Last firer =
+// frontier. Log-only, bounded.
+#define F625_TAIL_HOOK(sym, tag) \
+  PPC_FUNC_IMPL(__imp__##sym); \
+  static std::atomic<uint32_t> s_h##tag{0}; \
+  PPC_FUNC(sym) { \
+    const uint32_t n = s_h##tag.fetch_add(1) + 1; \
+    if (n <= 2 || (n % 200) == 0) \
+      MCLA_LOG_WARN("F625-TAIL #{} " #tag " r3={:08X} lr={:08X}", n, \
+                    ctx.r3.u32, ctx.lr); \
+    __imp__##sym(ctx, base); \
+  }
+F625_TAIL_HOOK(sub_821F3580, T1F3580)
+F625_TAIL_HOOK(sub_821C4210, T1C4210)
+F625_TAIL_HOOK(sub_821C05E8, T1C05E8)
+F625_TAIL_HOOK(sub_821CA6A8, T1CA6A8)
+#undef F625_TAIL_HOOK
+
+// Plain "memory:" @0x820127D8 owners -- all fiDevice prefix parsers
 // (hash/EMB/GETDEV), NOT a constructor. Census to confirm they are the
 // only scanners and whether any produces a device object.
 PPC_FUNC_IMPL(__imp__sub_821C9AB0);
@@ -17779,15 +22742,23 @@ PPC_FUNC(sub_821CAE50) {
 // T5-next: embedded:/ content via the D22E8/D2308 name list.
 //
 // INSERT file-resolve sub_821BDF20 does:
-//   dev = GETDEV(path)                 // embedded: â†’ 0x827D838C
-//   handle = dev->vtable[+4](path, x)  // AFB8 â€” only understands "memory:"
+//   dev = GETDEV(path)                 // embedded: -> 0x827D838C
+//   handle = dev->vtable[+4](path, x)  // AFB8 -- only understands "memory:"
 // AFB8 returns -1 for embedded:/, so INSERT fails even with a live device.
 // Fix: host-hook AFB8 so embedded:/ walks the same list D2308 uses
 // (head 0x82860AF8, node {+0 name*, +4 buf, +8 size, +12 next}) and returns
 // the buffer pointer as the open handle (r3 != -1).
 // ===========================================================================
 
-constexpr uint32_t kEmbeddedNameListHead = 0x82860AF8; // lis -32122 + 2804
+// F-655: THE HEAD IS 0x82860AF4, not 0x82860AF8. The guest links through it --
+// `lis r10,8286` + 2804 -- measured at `lwz` 0x821D22F8 and `stw` 0x821D2300, the
+// two instructions of the registration routine sub_821D22E8 itself. The trailing
+// comment on this constant said `lis -32122 + 2804`, and -32122 as an unsigned
+// 16-bit word is 0x8286, so that comment's OWN ARITHMETIC gives 0xAF4. The
+// constant and the comment beside it disagreed for the life of the line, and four
+// bytes put the host's walk one slot off the guest's: invisible until something
+// walked the list and got a plausible wrong answer.
+constexpr uint32_t kEmbeddedNameListHead = 0x82860AF4; // lis -32122 + 2804
 constexpr uint32_t kEmbeddedPfxLen = 10;               // "embedded:/"
 constexpr uint32_t kMemVtable = 0x82012918;            // AE50/AFB8/...
 // kMemDeviceObj is at file scope near the top.
@@ -17801,7 +22772,7 @@ static void EnsureMemoryDeviceVtable() {
   (void)mem.ReadU32BE(kMemDeviceObj, &vt);
   if (vt != kMemVtable)
     mem.WriteU32BE(kMemDeviceObj, kMemVtable);
-  // Full known slots from mcla_pe.bin @0x82012918 â€” runtime wipes .rdata.
+  // Full known slots from mcla_pe.bin @0x82012918 -- runtime wipes .rdata.
   static const uint32_t kSlots[] = {
       0x821CAE50u, // +0
       0x821CAFB8u, // +4
@@ -17877,7 +22848,7 @@ static bool EmbeddedListLookup(const char *relName, uint32_t *outBuf,
 }
 
 // Host-side D22E8: push {name, buf, size} onto the list head.
-// Guest memory comes from GuestMemoryHeap::Alloc â€” never a hardcoded
+// Guest memory comes from GuestMemoryHeap::Alloc -- never a hardcoded
 // 0xA00xxxxx scratch (that hits o1heap and Free-ownership fatals).
 static bool EmbeddedListInsert(const char *name, uint32_t buf, uint32_t size) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -17909,7 +22880,7 @@ static bool EmbeddedListInsert(const char *name, uint32_t buf, uint32_t size) {
   return true;
 }
 
-// Last MakeMemoryStream â€” used by BE710-SKIP to serve magic bytes.
+// Last MakeMemoryStream -- used by BE710-SKIP to serve magic bytes.
 static uint32_t s_lastMemStream = 0;
 
 // Stable .data slot (next to CRT nodes ~0x829054C0). Heap Alloc at
@@ -18181,6 +23152,319 @@ static bool ParseMemoryDollar(const char *path, uint32_t *outBuf,
   return true;
 }
 
+// F-654b (2026-09-30): the ARCHIVE GROUP of an embedded:/ shader name, or "" when
+// the name is in no preload list. Log-only: it feeds the AFB76-REFUSE line and
+// never produces a body.
+//
+// Where the table comes from, so it is a measurement and not a guess: each entry
+// was looked up by hand in the guest's OWN five preload lists, which the host
+// already serves byte-exact from the archive (src/gpu_device.cpp:1770-1774 pins
+// all five paths/offsets; LISTLINE in w666.log enumerates their lines).
+//   - 'Shadows'          -> shaders/city/preload.list:66  ("Shadows.fx")
+//   - 'rage_spotlightfog'-> shaders/effects/preload.list:15
+//   - the other four are in NO list at all (grep over all five: 2 of 6 hits).
+// Ambiguity was measured, not assumed: across the five lists there are 166
+// distinct names and 0 of them appear in more than one group, so name -> group
+// is a function for this title. That is what makes the group derivable; the
+// OFFSET is not (see the refusal below), which is why this stays log-only.
+struct EmbeddedGroupRow {
+  const char *name;
+  const char *group;
+};
+static const EmbeddedGroupRow kEmbeddedGroups[] = {
+    {"Shadows", "city"},
+    {"rage_spotlightfog", "effects"},
+    {"rage_im", ""},
+    {"rage_postfx", ""},
+    {"rage_shadowdepth", ""},
+    {"rage_blendshadows", ""},
+};
+static const char *EmbeddedGroupOf(const char *leaf) {
+  if (!leaf || !leaf[0])
+    return nullptr;
+  for (const EmbeddedGroupRow &row : kEmbeddedGroups) {
+    if (std::strcmp(leaf, row.name) == 0)
+      return row.group;
+  }
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// F-655: publish ONE member of the guest's enumerated TOC, and only after the
+// member's own bytes corroborate it.
+//
+// THE THREE-FIELD DISCIPLINE (unchanged, restated because this is a new caller):
+// offset = w8 & 0x7FFFFF, stored = w12 & 0x3FFFFFFF, logical = w4 (F-657
+// widths). Nothing here
+// derives a length from a flag or an offset from a size.
+//
+// CORROBORATION, in order, and a failure at any step returns 0 WITH A NAME:
+//  1. the triple is in range against the packfile's real size;
+//  2. the member's stored bytes are re-read from the packfile, bypassing the
+//     span table (W64's reason: the span table is what got contaminated);
+//  3. the head is not poison (0 / 0xCDCDCDCD / 0xFFFFFFFF);
+//  4. if stored != logical the stream is raw-inflated and MUST reproduce
+//     `logical` exactly -- a decode that produces any other length is refused,
+//     not trimmed;
+//  5. the SERVED head is a container magic the archive really uses ('rgxa',
+//     RSC5, XCompress, RPF3) or a printable first byte (the .dcl/.list family,
+//     which has no magic -- measured head of shaders_city_dcl_Shadows.dcl is
+//     `39 20 3B 20` = "9 ; ");
+//  6. the span is registered with the archive layer so the guest's own later
+//     reads of the same member agree with what it was handed.
+// A refusal prints which step failed. The `Shadows` triple, as MEASURED
+// (w671.log:16367-class TOCWALK-LEAF h=496B51F8, w8=00278000, w12=40000B0A ->
+// off=0x278000, stored=w12&0x3FFFFFFF=2826, logical=w1=7724) and as decoded
+// offline from xarchive_cache.rpf: 2826 raw-inflate to 7724 == w1 exactly, head
+// 'rgxa' + "VS_S...". The comment this replaced read `stored 7,724`, which no
+// host arithmetic produces from w12=0x40000B0A; it is a trail, not a record.
+// ---------------------------------------------------------------------------
+static uint32_t MclaTocServeMember(const MclaTocRec &rec, const char *leaf,
+                                   uint32_t &outSize, const char **why) {
+  outSize = 0;
+  *why = "OK";
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint64_t packSz = vfs.GetFileSize("xarchive_cache.rpf");
+  const uint32_t off = rec.off, stored = rec.stored, logical = rec.logical;
+  if (off == 0 || stored == 0 || logical == 0 || logical > 0x400000u ||
+      stored > 0x1000000u ||
+      // F-656: the window this member is read through is max(stored, logical),
+      // so the range check has to cover the STORED extent too. w3&0x3FFFFFFF is
+      // the one length field in the record that no host path writes (the forced
+      // ack at :17484 touches only bit 31), which is why it -- and not w1 --
+      // bounds the read.
+      (packSz != 0 && static_cast<uint64_t>(off) + stored > packSz) ||
+      (packSz != 0 && static_cast<uint64_t>(off) + logical > packSz)) {
+    *why = "STEP1-RANGE";
+    return 0;
+  }
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+  if (!vfs.OpenFile("xarchive_cache.rpf", fh)) {
+    *why = "STEP2-OPEN";
+    return 0;
+  }
+  // F-645 (2026-09-30): make step 2's property REAL. The comment below says this
+  // read bypasses the span table; until now it did not -- ReadFileAt ran
+  // ApplyExpandedSpans unconditionally on the real-handle branch
+  // (src/fs/vfs_rpf.cpp, the `bytes_read = got;` path), so the member's own
+  // STORED bytes could arrive already overwritten by whichever other member's
+  // logical tail owned the window. w674.log shows what that cost:
+  // `TOCSERVE-EXPANDED leaf='PowerupTargetEffect.fxc' ... head=6D2E7570`, which is
+  // PowerupShootEffect.fxc's inflated body, against the `72677861` the game
+  // compares to.
+  //
+  // Two facts are published on the HANDLE and neither reaches the six-step
+  // verdicts themselves:
+  //   raw_positional   -- do not run the span table on this read at all, so what
+  //                      step 2 corroborates is the FILE, as step 2's own name
+  //                      claims. What it changes is one input to step 4: a
+  //                      member the span table already held EXPANDED used to come
+  //                      back pre-inflated here and take the TOCSERVE-EXPANDED
+  //                      leg with `served == tocW1` being the SAME VARIABLE
+  //                      (W67's sentence, at the leg below). It now arrives
+  //                      STORED and takes the TOCSERVE-DEFLATE leg, which is the
+  //                      leg whose decode is corroborated against w1. STEP4B, the
+  //                      declared-length cross-check and STEP5 are untouched and
+  //                      still run on the same bytes.
+  //   read_member_off  -- this read's own `off`, so ClassifyTailClaim can tell a
+  //                      head that belongs to the member being read from a head
+  //                      some other member's tail merely reaches. Unused here
+  //                      (this read does not run the span table at all); it is set
+  //                      because the pair is one fact about one read, and leaving
+  //                      it 0 would make the next reader wonder whether the two
+  //                      were meant to travel separately.
+  fh.raw_positional = true;
+  fh.read_member_off = off;
+  // F-656: WHICH LENGTH THIS COMPARES AGAINST, AND WHY IT IS NOT w1.
+  //
+  // The window is sized by the member's STORED extent (w3 & 0x3FFFFFFF), not by
+  // w1. w3's low 30 bits (F-657) are the one length field in this record that
+  // NO host
+  // code path writes: the only write to w3 is the forced-ack at
+  // gpu_device.cpp:17484, which ORs bit 31 and nothing else, and w669 measures
+  // w3&0x3FFFFFFF agreeing with the guest on 256/256 published records. w1 by
+  // contrast has two legitimate values (kTocW1ContainerHeader) and the host has
+  // already overwritten one of them at :19190. So the read window comes from
+  // the archive's own statement of how many bytes the member occupies, and w1
+  // is checked AGAINST that window rather than used to size it.
+  //
+  // The window is still opened at max(stored, logical) because a member the
+  // archive layer already holds EXPANDED carries its content, not its
+  // compressed bytes, at [off, off+logical) (same rule and same reason as
+  // HostServeUiBody's readLen). Which of the two states this member is in is
+  // then decided BY CONTENT, not by arithmetic: a compressed RSC5/XCompress
+  // member begins with that container's magic, and an expanded member begins
+  // with its own file magic, which is never one of those two.
+  const uint32_t window =
+      (stored > logical) ? stored : logical;
+  std::vector<uint8_t> bytes(window);
+  uint64_t got = 0;
+  if (!vfs.ReadFileAt(fh, off, bytes.data(), window, got) || got < 0x40) {
+    vfs.CloseFile(fh);
+    *why = "STEP2-READ";
+    return 0;
+  }
+  bytes.resize(static_cast<size_t>(got));
+  uint32_t head = MclaBE(bytes.data());
+  if (head == 0 || head == 0xCDCDCDCDu || head == 0xFFFFFFFFu) {
+    vfs.CloseFile(fh);
+    *why = "STEP3-POISON";
+    return 0;
+  }
+  // The length the serve will publish. Until a container proves otherwise this
+  // is w1, and every refusal below is unchanged; STEP4 is what replaces it
+  // with a number read out of the member's own bytes.
+  uint32_t served = logical;
+  constexpr uint32_t kHeadRsc5Pre = 0x05435352u;   // 'RSC5'
+  constexpr uint32_t kHeadXcmpPre = 0x0FF512EFu;   // XCompress
+  const bool containerHead =
+      (head == kHeadRsc5Pre || head == kHeadXcmpPre);
+  if (containerHead && stored != logical && stored <= got) {
+    std::vector<uint8_t> inf;
+    if (!mcla::RawInflate(bytes.data(), stored, inf) || inf.empty()) {
+      vfs.CloseFile(fh);
+      *why = "STEP4-INFLATE-LENGTH";
+      return 0;
+    }
+    // STEP4B: the DECOMPRESSED length, taken from the member's own bytes. For
+    // an RSC5 container that number is also stated in the container's own
+    // header at RSC5+0x10 (MclaRsc5DeclaredSize), so the inflate output and
+    // the container's declaration are checked against EACH OTHER. Neither is
+    // taken from the TOC, which is the whole point: w1 cannot be used to
+    // corroborate itself.
+    const uint32_t decl = MclaRsc5DeclaredSize(bytes.data(),
+                                               static_cast<uint32_t>(got));
+    if (decl != 0 && decl != static_cast<uint32_t>(inf.size())) {
+      vfs.CloseFile(fh);
+      *why = "STEP4B-DECLARED-NE-INFLATED";
+      return 0;
+    }
+    // The inflated size must be the length the guest's record describes, in
+    // EITHER of its two legitimate forms: the decompressed length itself, or
+    // the on-disk extent that adds the 20-byte RSC5/XCompress header. Any
+    // other number is a real disagreement -- this is the check that still
+    // refuses the 3,571,712-into-720,896 shape -- and it is refused here
+    // rather than tolerated.
+    const uint32_t produced = static_cast<uint32_t>(inf.size());
+    if (produced != logical &&
+        produced + static_cast<uint32_t>(kTocW1ContainerHeader) != logical) {
+      vfs.CloseFile(fh);
+      *why = "STEP4B-W1-NOT-IN-CONTAINER-FAMILY";
+      return 0;
+    }
+    served = produced;   // the DECOMPRESSED length, never the extent
+    bytes.swap(inf);
+    head = MclaBE(bytes.data());
+    MCLA_LOG_WARN("TOCSERVE-INFLATE leaf='{}' off={:08X} stored={} "
+                  "tocW1={} inflated={} declared={} served={} head={:08X}",
+                  leaf, off, stored, logical, produced, decl, served, head);
+  } else if (stored != logical) {
+    // W67 (2026-09-30): THE THIRD CLASS. Not a container head and the two
+    // lengths differ. The archive has THREE such states, not two, and the head
+    // word only names the first:
+    //   (a) an RSC5/XCompress package -> the branch above;
+    //   (b) content the archive layer already holds EXPANDED, so the window IS
+    //       the content;
+    //   (c) a BARE raw-DEFLATE stream with no container header at all.
+    // Until w671 this leg read (b) by default and never asked, so a (c) member
+    // was handed to STEP5 still compressed. It LOOKED corroborated because
+    // nothing had actually decoded it: TOCSERVE-EXPANDED printed
+    // served=7724 against tocW1=7724 for Shadows.fxc, and those two numbers are
+    // the SAME VARIABLE when no decode happened. The gate then read
+    // head=C5597B6C and refused at STEP5, and the refusal was the only honest
+    // thing in the path.
+    //
+    // MEASURED, not assumed (offline, xarchive_cache.rpf, no run):
+    //   0x278000 stored=2826 -> raw inflate 7724 == w1, output `72 67 78 61`
+    //       = 'rgxa' + 04 ff 01 14 56 53 5f 53 ("VS_S...") : the COMPILED
+    //       shader, at the offset the table gave.
+    //   0x27752B stored=82   -> 88  == w1, output `39 20 3b 20` = "9 ; "   : text
+    //   0x313C4E stored=69   -> 70  == w1, output `31 20 3b 20` = "1 ; "   : text
+    // For each of the three, an exhaustive raw-inflate probe of every byte
+    // offset in [off-0x400, off+0x400] that reproduces w1 EXACTLY returns
+    // exactly ONE hit, at delta 0. So `off = w8 & 0x7FFFFF` (F-657: 31 bits,
+    // the guest's own width) is the right offset for this class and the head word
+    // is simply not a class marker here.
+    //
+    // (The raceeditor.xsf shape is a DIFFERENT table and a different class --
+    // w2=0x64CB001B there, whose low 12 bits equal the container's own declared
+    // header length 27, and the `\x05 C S R` head is at 0x64CB0000, i.e.
+    // w2 & 0xFFFFF000, NOT w2 & 0x7FFFFF. That container is in the 0x6xxxxxxx
+    // band (13,110 `\x05 C S R` heads measured); the shader/.dcl class is in the
+    // low 0..0x400000 band, which holds 3 container heads, none within 0x400 of
+    // any of the three members. Two tables, two offset rules, one per class.)
+    //
+    // This does NOT weaken STEP4 and does NOT weaken STEP5. The decode is
+    // accepted only on the length corroboration already required -- it must
+    // reproduce `logical` exactly, never trimmed, never adjusted -- and STEP5
+    // then runs on the DECODED bytes under the same four-magic / printable-first-
+    // byte test as before. A wrong offset still produces a wrong head here and
+    // is still refused; the difference is that the right bytes now reach the
+    // check. Both refusals below are unchanged.
+    std::vector<uint8_t> inf;
+    if (stored <= got && mcla::RawInflate(bytes.data(), stored, inf) &&
+        inf.size() == static_cast<size_t>(logical)) {
+      const uint32_t produced = static_cast<uint32_t>(inf.size());
+      served = produced;
+      bytes.swap(inf);
+      head = MclaBE(bytes.data());
+      MCLA_LOG_WARN("TOCSERVE-DEFLATE leaf='{}' off={:08X} stored={} tocW1={} "
+                    "inflated={} served={} head={:08X} -- bare raw-DEFLATE, no "
+                    "container header; inflated length == w1 exactly",
+                    leaf, off, stored, logical, produced, served, head);
+    } else {
+      // (b): the archive layer already holds this member EXPANDED, so the
+      // window IS its content and there is nothing to inflate. The original
+      // refusal is kept for the case where the window is too short to be sure
+      // of that, and the TOCSERVE-EXPANDED row is kept verbatim for the
+      // w669/w671 comparison it is the baseline of.
+      if (got < logical) {
+        vfs.CloseFile(fh);
+        *why = "STEP4-STORED-PAST-WINDOW";
+        return 0;
+      }
+      bytes.resize(static_cast<size_t>(logical));
+      head = MclaBE(bytes.data());
+      MCLA_LOG_WARN("TOCSERVE-EXPANDED leaf='{}' off={:08X} stored={} "
+                    "tocW1={} served={} head={:08X}",
+                    leaf, off, stored, logical, served, head);
+    }
+  }
+  constexpr uint32_t kHeadRgxa = 0x72677861u;   // 'rgxa'
+  constexpr uint32_t kHeadRsc5 = 0x05435352u;   // 'RSC5'
+  constexpr uint32_t kHeadXcmp = 0x0FF512EFu;   // XCompress
+  constexpr uint32_t kHeadRpf3 = 0x52504633u;   // 'RPF3'
+  const bool magic = head == kHeadRgxa || head == kHeadRsc5 ||
+                     head == kHeadXcmp || head == kHeadRpf3;
+  const bool printable = bytes[0] >= 0x20 && bytes[0] <= 0x7E;
+  if (!magic && !printable) {
+    vfs.CloseFile(fh);
+    *why = "STEP5-NO-MAGIC-NOT-TEXT";
+    return 0;
+  }
+  // Step 6: the archive layer's own view of this member, so the guest's later
+  // positional reads see the same bytes it was just handed. `served`, NOT
+  // `logical`: after STEP4B the two can differ by the 20-byte container header,
+  // and registering the span with w1 would teach the archive layer that a
+  // `served`-byte body is `logical` bytes long -- the exact defect F-632 fixed
+  // for the other two fields, and the third instance of it.
+  mcla::vfs::MarkMemberExpandedIn("xarchive_cache.rpf", off, stored, served);
+  MclaNoteRegisteredSpan(leaf, off, stored, served);
+  vfs.CloseFile(fh);
+  const uint32_t dst = mem.Alloc(served, 16);
+  if (!dst) {
+    *why = "STEP6-ALLOC";
+    return 0;
+  }
+  if (!mem.WriteBytes(dst, bytes.data(), served)) {
+    *why = "STEP6-WRITE";
+    return 0;
+  }
+  outSize = served;
+  return dst;
+}
+
 PPC_FUNC(sub_821CAFB8) {
   const uint32_t n = s_hAFB8.fetch_add(1) + 1;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -18209,6 +23493,229 @@ PPC_FUNC(sub_821CAFB8) {
     }
     if (n <= 40 || (n % 200) == 0)
       MCLA_LOG_WARN("AFB76-MISS #{} path='{}' lr={:08X}", n, path, lr);
+    // F-654: name the miss instead of guessing a body for it. On w666.log the
+    // guest probes each of five names three ways -- 'embedded:/dcl/<n>.dcl',
+    // 'embedded:/<n>.dcl', 'embedded:/fxl_final/<n>.fxc' -- and the FIRST FOUR
+    // names hit the third form (AFB76-HIT x5 incl. rage_im at boot). Only
+    // 'Shadows' misses all three and fatals with
+    //   "Unable to load shader '%s', it probably wasn't preloaded properly."
+    // The embedded:/ list is a FIXED 15-entry table seeded at boot
+    // (src/boot_host.cpp SeedEmbeddedNameList), and 'Shadows' is not in it.
+    //
+    // F-654b (2026-09-30) -- THE CONTENT IS NOT MISSING. This is now measured,
+    // and it corrects the paragraph this comment used to carry, which said "no
+    // such dump exists for this name" and was wrong:
+    //   * The guest itself published BOTH members in its own TOC76-XSF rows, in
+    //     every soak from w572 onward:
+    //       shaders/city/dcl/Shadows.dcl        [C51C449D 00000058 0027752B ...]
+    //       shaders/city/fxl_final/Shadows.fxc  [496B51F8 00001E2C 00278000 ...]
+    //   * Reading those spans straight out of build/game_data/xarchive_cache.rpf
+    //     raw-inflates to EXACTLY the TOC size in both cases (88 and 7724 B);
+    //     the .fxc head is 'rgxa' + "VS_ShadowDepthLocal". Retail bytes.
+    //   * tools/rpf_offline.py find CANNOT see this and its 0 is not evidence:
+    //     build/toc_parsed.bin is 382,976 bytes of ZERO (measured), and the
+    //     positive control (a leaf the guest provably opened) also returns 0.
+    //     F-099 applies to the on-disk AES TOC; here the dump is simply empty.
+    //     ^ "SIMPLY EMPTY" IS WRONG -- SUPERSEDED BY F-680, the next paragraph.
+    //     The dump was not empty, it was MIS-AIMED. The bytes stand; the cause
+    //     does not.
+    //     F-680 CORRECTS THE CAUSE (the byte count and the tool result stand):
+    //     the dump is not empty because the region was empty -- it is empty
+    //     because it was written from a STALE ANCHOR. The capture was
+    //     hard-coded to the root TOC array base 0xC60B7780, and that base has
+    //     since moved (nine distinct values measured across build/; the
+    //     literal is the oldest, the current one is B733B280), so the writer
+    //     read whatever now occupies 0xC60B7780 -- readable, hence
+    //     `okread=1`, and zero-filled, hence a file of nothing. Re-anchored to
+    //     the published `inner` with a nonzero-byte assertion, so the silent
+    //     version of this failure cannot recur.
+    //   * The group is 'city', not 'misc': 'Shadows' and 'cityLOD' are
+    //     materialised by the SAME function sub_823109E8 (0x82310B04 and
+    //     0x82310B64), and shaders/city/preload.list:66 lists "Shadows.fx". The
+    //     '$/shaders/misc' literal at 0x820436E8 is the NEXT group's path -- its
+    //     adjacency to the name is a string-pool boundary, not an owner.
+    //
+    // So the gap is a SERVE gap, not a content gap, and the reason string says
+    // so. What is still missing is the one thing the archive cannot give us from
+    // here: the host's TOC is AES, so it cannot turn the name into 0x278000
+    // without the guest's own record. Publishing a body would mean hardcoding a
+    // per-name offset table, which is the guessed-mapping failure the charter
+    // forbids -- one wrong constant is a plausible wrong shader.
+    // HELD BACK, NOT OWNED BY ME: the real insert is the guest's, and the host
+    // drops it. See the report -- sub_821D22E8 is reached only from 15 static
+    // initialisers in the .CRT$XCU range (0x827A7FCC..0x827B4EA0) that this
+    // boot host skips, and src/boot_host.cpp:1169-1174 says so in its own
+    // comment. The 15-entry seed is a host substitute for a guest preload that
+    // never ran; it covers the image's static .data blobs (the rage_* family)
+    // and no city shader at all. That file is not mine to change.
+    //
+    // F-655 (2026-09-30) -- SUPERSEDES the two paragraphs above on ONE point,
+    // and agrees with them on the rest. They are right that the content is
+    // present and that the group is 'city'. They are WRONG that the offset is
+    // unobtainable: that rested on "the host's TOC is AES", which is true of
+    // xarchive_cache.rpf ON DISK (F-099) and false of the copy the GUEST holds
+    // in guest memory. That copy is enumerable -- the tree of per-directory
+    // 16-byte arrays described at MclaTocWalkArray above -- and the host already
+    // had a reader for it (TOC76-XSF's `entry=`); it simply could only read a
+    // record the GUEST chose to publish. F-655 walks the whole table instead, so
+    // a name the guest never asks for resolves too. The two w572-era rows quoted
+    // above are not in w667.log at all (measured: none of its 479 TOC76-XSF rows
+    // is a shaders/city/...Shadows member), which is exactly the gap.
+    // The refusal below is therefore no longer about the archive: it names the
+    // ENUMERATION's verdict (`blocked=`) and the corroboration's (`content=`).
+    {
+      // Which of the two gaps is this? name is in a group -> content gap is
+      // ruled out by the table's provenance; the OFFSET used to be the blocker
+      // too, and F-655 removed that by enumerating the guest's own TOC above.
+      const char *leaf = path + 10;
+      const char *slash = std::strrchr(leaf, '/');
+      // F-655: the VARIANT component (`fxl_final/`, `dcl/`) is part of the
+      // member's path in the archive and used to be dropped here, so the row
+      // named a path that does not exist: w667.log's #16 printed
+      //   archivePath='shaders/city/Shadows.fxc'
+      // while the member is at 'shaders/city/fxl_final/Shadows.fxc' (a .fxc is
+      // never directly under a group, and a .dcl never is either -- see the
+      // six-group check below). A diagnostic that names a non-existent path
+      // sends the next reader looking for something that is not there, so the
+      // variant is kept.
+      std::string variant;
+      if (slash) {
+        variant.assign(leaf, static_cast<size_t>(slash - leaf));
+        leaf = slash + 1;
+      }
+      char base[64] = {0};
+      {
+        const char *dot = std::strrchr(leaf, '.');
+        const size_t n = dot ? static_cast<size_t>(dot - leaf) : std::strlen(leaf);
+        if (n < sizeof(base)) {
+          std::memcpy(base, leaf, n);
+          base[n] = '\0';
+        }
+      }
+      const char *group = EmbeddedGroupOf(base);
+      char archive[192] = {0};
+      if (group && group[0])
+        std::snprintf(archive, sizeof(archive), "shaders/%s/%s%s", group,
+                      variant.empty() ? "" : (variant + "/").c_str(), leaf);
+
+      // =====================================================================
+      // F-655: ASK THE GUEST'S OWN ENUMERATED TOC. This replaces F-654's
+      // `blocked=HOST-TOC-IS-AES` with the thing that is actually true: the
+      // host's ON-DISK TOC is AES, and the guest's IN-MEMORY one is not, and the
+      // walk above (MclaTocWalkArray) has already read it. What is left is a
+      // lookup by the hash the guest itself computes, from the name in the
+      // request -- so a renamed shader resolves without anything here changing,
+      // and no name->offset constant exists in this file.
+      //
+      // The ancestor chain narrows the candidates only when the CALLER can
+      // compute it: `shaders`, the group from the preload list, and the variant
+      // directory the request itself names. When the request has no variant
+      // (`embedded:/Shadows.dcl`) the depth is used instead, which is the same
+      // information the walk recorded.
+      // =====================================================================
+      const char *blocked = "NO-GUEST-TOC-RECORD";
+      const char *content = "NOT-CORROBORATED";
+      uint32_t idxHashes = 0, idxLeaves = 0, cand = 0, leafHash = 0;
+      const bool haveIndex = MclaTocIndexEnsure(&idxHashes, &idxLeaves);
+      uint32_t wantChain[3] = {0, 0, 0};
+      int wantLen = 0;
+      if (group && group[0]) {
+        wantChain[wantLen++] = MclaTocHash("shaders", 0);
+        wantChain[wantLen++] = MclaTocHash(group, 0);
+        if (!variant.empty())
+          wantChain[wantLen++] = MclaTocHash(variant.c_str(), 0);
+      }
+      leafHash = MclaTocHash(leaf, 0);
+      std::vector<MclaTocRec> hits =
+          haveIndex ? MclaTocFind(leafHash, wantChain, wantLen)
+                    : std::vector<MclaTocRec>();
+      if (!haveIndex) {
+        // Name the walk's own verdict rather than a generic "empty": an index
+        // that was REFUSED as unproven and an index that found nothing are
+        // different facts and only the second one is a gap in the guest's data.
+        const char *vd = g_tocWalkVerdict.load(std::memory_order_acquire);
+        blocked = (vd && vd[0] == 'R') ? "TOC-INDEX-REFUSED-BY-CONTROL"
+                                       : "TOC-INDEX-EMPTY";
+      } else if (variant.empty() && group && group[0]) {
+        // No variant in the request: keep only the records at the depth the
+        // chain implies, so `Shadows.dcl` cannot pick up a same-named member
+        // from a shorter or longer path.
+        std::vector<MclaTocRec> narrowed;
+        for (const auto &rec : hits) {
+          if (rec.depth == 3)
+            narrowed.push_back(rec);
+        }
+        hits.swap(narrowed);
+      }
+      cand = static_cast<uint32_t>(hits.size());
+      if (haveIndex && cand == 0) {
+        blocked = "NO-GUEST-TOC-RECORD";
+      } else if (cand > 1) {
+        blocked = "AMBIGUOUS-N-IN-GUEST-TOC";
+      } else if (cand == 1) {
+        uint32_t tsize = 0;
+        const char *why = "OK";
+        const uint32_t tbuf = MclaTocServeMember(hits[0], leaf, tsize, &why);
+        if (tbuf && tsize) {
+          const uint32_t st = MakeMemoryStream(kMemDeviceObj, tbuf, tsize);
+          MCLA_LOG_WARN("AFB76-TOC-HIT #{} path='{}' want='{}' leaf='{}' "
+                        "leafHash={:08X} group='{}' variant='{}' "
+                        "archivePath='{}' obj={:08X} slot={:08X} "
+                        "off={:08X} stored={} logical={} corroborated={} "
+                        "buf={:08X} size={} stream={:08X} lr={:08X}",
+                        n, path, path + 10, leaf, leafHash,
+                        group ? group : "?", variant.empty() ? "-" : variant.c_str(),
+                        archive, hits[0].obj, hits[0].slot, hits[0].off,
+                        hits[0].stored, hits[0].logical, why, tbuf, tsize, st,
+                        lr);
+          // The F-654 format, byte for byte, so a stream counting AFB76-HIT
+          // sees the TOC route the same as the seeded-list route.
+          MCLA_LOG_WARN("AFB76-HIT #{} path='{}' buf={:08X} size={} stream={:08X} "
+                        "lr={:08X}",
+                        n, path, tbuf, tsize, st, lr);
+          ctx.r3.u32 = st;
+          return;
+        }
+        blocked = why;
+      }
+      char names[768] = {0};
+      size_t used = 0;
+      uint32_t node = 0;
+      uint32_t count = 0;
+      if (mem.ReadU32BE(kEmbeddedNameListHead, &node) && node != 0) {
+        for (int g = 0; node != 0 && g < 256 && used + 40 < sizeof(names); ++g) {
+          uint32_t namePtr = 0, next = 0;
+          if (!mem.ReadU32BE(node + 0, &namePtr) ||
+              !mem.ReadU32BE(node + 12, &next))
+            break;
+          char one[40] = {0};
+          if (namePtr != 0) {
+            (void)mem.ReadBytes(namePtr, one, sizeof(one) - 1);
+            MclaSanitizePath(one, sizeof(one));
+          }
+          if (one[0]) {
+            used += static_cast<size_t>(
+                std::snprintf(names + used, sizeof(names) - used, "%s%s",
+                             count ? "," : "", one));
+            ++count;
+          }
+          node = next;
+        }
+      }
+      MCLA_LOG_WARN("AFB76-REFUSE #{} path='{}' want='{}' reason=NO-EMBEDDED-ENTRY "
+                    "group='{}' variant='{}' archivePath='{}' content={} "
+                    "blocked={} leafHash={:08X} tocHashes={} tocLeaves={} "
+                    "candidates={} tocVerdict='{}' "
+                    "listCount={} list='{}' (F-654/F-655: refuse; the offset "
+                    "comes from the guest's OWN enumerated TOC or not at all)",
+                    n, path, path + 10, group ? group : "?",
+                    variant.empty() ? "-" : variant.c_str(), archive, content,
+                    blocked, leafHash, idxHashes, idxLeaves, cand,
+                    g_tocWalkVerdict.load(std::memory_order_acquire)
+                        ? g_tocWalkVerdict.load(std::memory_order_acquire)
+                        : "UNSET",
+                    count, names);
+    }
     // T41.3d (F-066/F-067): this substitution could never work. star_glow.fxc is
     // absent from all 15 embedded fxl_final/* bodies and none carries a star_glow
     // key name, while rage_im's body necessarily contains the obsolete drawblit
@@ -18286,7 +23793,7 @@ PPC_FUNC(sub_821CAFB8) {
   __imp__sub_821CAFB8(ctx, base);
 }
 
-// INSERT file-resolve sub_821BDF20: GETDEV â†’ vtable+4 (AFB8) â†’ handle.
+// INSERT file-resolve sub_821BDF20: GETDEV -> vtable+4 (AFB8) -> handle.
 // Census so we see whether AFB76-HIT actually feeds a successful INSERT.
 PPC_FUNC_IMPL(__imp__sub_821BDF20);
 static std::atomic<uint32_t> s_hBDF20{0};
@@ -18295,12 +23802,20 @@ PPC_FUNC(sub_821BDF20) {
   const uint32_t pathG = ctx.r3.u32;
   const uint32_t flags = ctx.r4.u32;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
-  char path[96] = {0};
+  // F-654: second half of the same defect fixed in sub_821CCEA0. This buffer was
+  // also 96 bytes, and it is the one that carries the `a:/archive/` prefix, so it
+  // saturated 11 characters EARLIER than the XSF-OPEN copy: w666.log:12272
+  //   'a:/archive/shaders/cars/AmbientOcclusionShadows/dcl/AmbientOcclusion-
+  //    Shadows/dcl/AmbientOcclusio'
+  // which is the same 95-char cut one prefix in. Widened to match; log-only, and
+  // `path` is still only ever printed (the real resolve uses the guest pointer).
+  char path[256] = {0};
   if (pathG != 0 && pathG != 0xCDCDCDCDu) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     (void)mem.ReadBytes(pathG, path, sizeof(path) - 1);
     MclaSanitizePath(path, sizeof(path));
   }
+  const size_t pathLen = std::strlen(path);
   __imp__sub_821BDF20(ctx, base);
   const int32_t ret = static_cast<int32_t>(ctx.r3.s32);
   // F-144: 0x827D7770 is not a type registry, it is the resource *path* manager
@@ -18327,8 +23842,78 @@ PPC_FUNC(sub_821BDF20) {
   }
   if (n <= 40 || (n % 200) == 0 || std::strstr(path, "star_glow") ||
       std::strstr(path, "embedded:") || PathLooksLikeUiBody(path))
-    MCLA_LOG_WARN("BDF20 #{} path='{}' flags={:x} ret={:d} lr={:08X}", n,
-                  path, flags, ret, lr);
+    // F-654: `len=` added with the 96->256 widening. Any row whose len now reads
+    // > 95 is a path the old build silently cut; the count of those is the
+    // regression test for this change.
+    MCLA_LOG_WARN("BDF20 #{} path='{}' len={} flags={:x} ret={:d} lr={:08X}", n,
+                  path, pathLen, flags, ret, lr);
+}
+
+// ===========================================================================
+// R8PROV (2026-10-05). READ-ONLY CENSUS, no state change, no allocation, no
+// early return: the whole body is a log line around a pass-through call.
+//
+// WHY IT EXISTS. The boot's last line before it parks is a "old rage effect"
+// fatal whose logged lr is 0x8218C864, inside sub_8218C760. Two raw-word
+// questions about that function are currently undecided, and both are decided
+// by ONE register dump at its entry:
+//
+//   1. WHICH path reaches the word compare. Raw words at 0x8218C760:
+//        8218C77C  cmpli cr6,r29,0
+//        8218C780  beq   cr6 -> 0x8218C7E8     ; r4 == 0 SKIPS the whole block
+//        ...
+//        8218C7B8  bl    0x821C9C50
+//        8218C7BC  5469063E  rlwinm r8,r3,0,24,31   ; the ONLY write to r8
+//        8218C7C0  cmpli cr6,r8,0
+//        8218C7C4  beq   cr6 -> 0x8218C86C
+//        8218C83C  bl    0x821BE710            ; reads ONE word
+//        8218C844  lwz   r7,80(r1)             ; the word just read
+//        8218C84C  7F074000 cmpw cr6,r7,r8      ; compares against R8
+//      so r8 at the compare is: the value it holds on ENTRY when r4 == 0, and
+//      821C9C50's return when r4 != 0. Nothing else writes it. One entry dump
+//      of r4 and r8 therefore fixes both cases -- no second site needed.
+//
+//   2. WHAT that value is. The recompiler's rotate-mask for this one word is
+//      wrong: generated/ppc_xenon/ppc_recomp.9.cpp:18355 emits
+//        // clrlwi r8,r3,24
+//        ctx.r8.u64 = ctx.r3.u32 & 0xFF;
+//      for `rlwinm r8,r3,0,24,31`, whose mask is 0xFF000000. The same file
+//      gets the neighbouring one right (`rlwinm r5,r9,12,0,19` -> & 0xFFFFF000,
+//      ppc_recomp.14.cpp), which is what makes this a defect in one word rather
+//      than a reading. Sub_821C9C50 itself returns only 0 or 1 (its two exits,
+//      raw `li r3,0` and `li r3,1`), so r8 at the compare is 0 or 1 and the
+//      compare can only be satisfied by a body word of 0 or 1 -- never by an
+//      effect image's head. That file is under the forbidden list, so the
+//      correction is not this file's to make; this row exists so the soak can
+//      say which of the two cases above it is looking at, and so the next agent
+//      does not have to re-derive it.
+//
+// r3 is the guest object, and its +72 is the path the function opens --
+// 8218C810 `lwz r3,72(r31)` feeds both GETDEV calls. Read, never written.
+// ===========================================================================
+PPC_FUNC_IMPL(__imp__sub_8218C760);
+static std::atomic<uint32_t> s_hC760{0};
+PPC_FUNC(sub_8218C760) {
+  const uint32_t n = s_hC760.fetch_add(1) + 1;
+  if (n <= 24 || (n % 100) == 0) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t pathG = 0;
+    (void)mem.ReadU32BE(ctx.r3.u32 + 72, &pathG);
+    char p[192] = {0};
+    if (pathG != 0 && pathG != 0xCDCDCDCDu) {
+      (void)mem.ReadBytes(pathG, p, sizeof(p) - 1);
+      MclaSanitizePath(p, sizeof(p));
+    }
+    // r8in is the compare operand itself whenever r4 == 0, and the row says
+    // so. It is never assigned by the host on any path: grep of src/ for an
+    // r8 store returns nothing outside generated/**.
+    MCLA_LOG_WARN("R8PROV #{} obj={:08X} r4={} r5={:08X} r8in={:08X} "
+                  "r8inIsCompareOperand={} path='{}' lr={:08X}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r8.u32,
+                  (ctx.r4.u32 == 0u) ? 1 : 0, p,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+  __imp__sub_8218C760(ctx, base);
 }
 
 // F-233 targeted read-only census: name the container the UI-bootstrap byte-reader
@@ -18506,7 +24091,53 @@ PPC_FUNC(sub_821BE8D8) {
   // w19: packfile-device wrapper {dev=packfile, handle=slot}. Open stored
   // tocEntry at dev+40+h*68; POSTOPEN-SERVE registered the body. Host-complete
   // size+Read from that buffer (same BE8D8 semantics as the memory-device path).
-  if (dev != 0 && dev != 0xCDCDCDCDu && dev != kMemDeviceObj &&
+  // ===========================================================================
+// WHERE THE SERVED BODY AND THE STREAM'S READ DIVERGE (2026-10-05).
+//
+// THE CHAIN, end to end, from raw words and from build/w724.log:
+//   serve   XSF-POSTOPEN-SERVE registers {body=BACA0280, 23807} against
+//           (dev=B7321700, handle=1, tocEntry=B737C320)
+//   copy    BE8D8 (r3 = 0x82860C68) reads {dev,h} out of that object at +0/+4,
+//           finds the served body for that TOC entry, allocates dst=BACA6280,
+//           copies 23807 bytes into it, registers it in the 16-entry table at
+//           0x82860740 as slot 4, and returns 4 in r3
+//   read    the guest reads through 0x82860C68, NOT through slot 4.
+//
+// THE DIVERGENCE IS THE GUEST'S r3 DISCARD, and it is measured, not inferred:
+//   8218C7F0  bl    0x821BDF20        ; -> r30 = the wrapper
+//   8218C7F4  mr    r30,r3
+//   8218C800  bl    0x821BE8D8        ; r3 is STILL r30 here
+//   8218C804  cmpli r3,0
+//   8218C808  beq   cr6 -> 0x8218C86C  ; the only use of BE8D8's return: a
+//                                      ; NULL test. r30 is never reassigned.
+//   8218C838  mr    r3,r30            ; the ONE word read is through r30
+// So the value returned here is load-bearing for a different caller and dead
+// for this one: the lr == 0x82191070 arm below does `mr r31,r3` after this
+// call and uses it (F-162). The return therefore stays.
+//
+// CONSEQUENCE FOR THE BODY: the copy above is a duplicate, not the delivery.
+// In w724.log dst=BACA6280 is named in exactly two lines, both of which are
+// the write itself, and it is never named again: the reader's window is filled
+// by the packfile device read for TOC record B737C320 (DISCCHK2 #33, and the
+// serve row for the same offset carries head=72677861). Slot 4 is a write-only
+// dead end, and the reader never consults the table it was written into.
+//
+// WHY NOTHING IS CHANGED HERE. Two binding writes look like candidates and
+// neither survives measurement:
+//   - MakeMemoryStream below. Its return is genuinely consumed by the
+//     lr == 0x82191070 caller, so removing the registration would break that
+//     caller to fix nothing on this one.
+//   - the wrapper bind in the open path. sub_821BDDE8 already writes
+//     {dev,handle} into the slot it picks, by its own stwx pair (see
+//     kBdf20WrapArray). The host's write is therefore redundant, and redundant
+//     is not the same as harmful -- deleting it is a behavioural change to a
+//     path that this soak cannot attribute (rule 1a: the build is N-way dirty)
+//     and that has no root cause of its own to fix. Left alone, labelled.
+// The wall is not on this side of the read. The compare operand is a guest
+// register, and the guest writes it exactly once, in code this file does not
+// own and has no legitimate reason to touch. Recorded, not worked around.
+// ===========================================================================
+if (dev != 0 && dev != 0xCDCDCDCDu && dev != kMemDeviceObj &&
       dev != 0x7E780000u && h < 16u) {
     uint32_t tocEntry = 0;
     (void)mem.ReadU32BE(dev + 40u + h * 68u, &tocEntry);
@@ -18630,7 +24261,7 @@ PPC_FUNC(sub_821BE610) {
     (void)mem.ReadU32BE(obj + 4, &h);
   }
   // T7b/T8a: after BE8D8 formats memory:$ the stream object's device/handle
-  // are already 0; BE610 still does vtable+48 on null â†’ AV 0x7e780000.
+  // are already 0; BE610 still does vtable+48 on null -> AV 0x7e780000.
   if (dev == 0) {
     if (n <= 24 || (n % 200) == 0)
       MCLA_LOG_WARN("BE610-SKIP #{} obj={:08X} (null device)", n, obj);
@@ -18683,9 +24314,9 @@ PPC_FUNC(sub_821BE0C8) {
   if (pathG != 0 && pathG != 0xCDCDCDCDu)
     (void)mem.ReadBytes(pathG, pth, sizeof(pth) - 1);
   MclaSanitizePath(pth, sizeof(pth));
-  // Empty path â†’ GetSize/CB740 never produced "memory:$â€¦". Invent the
+  // Empty path -> GetSize/CB740 never produced "memory:$...". Invent the
   // re-open string from the known CRT blob so BE0C8 can call AFB8 cleanly.
-  // Stack is ~0x8E...... (ABOVE image 0x82......) â€” don't gate on <0x82000000.
+  // Stack is ~0x8E...... (ABOVE image 0x82......) -- don't gate on <0x82000000.
   if (pth[0] == 0 && pathG != 0 && pathG != 0xFFFFFFFFu) {
     uint32_t buf = 0, size = 0;
     if (!EmbeddedListLookup("fxl_final/rage_im.fxc", &buf, &size)) {
@@ -18709,7 +24340,7 @@ PPC_FUNC(sub_821BE0C8) {
                 "pth='{}' r5={} lr={:08X}",
                 n, r3, w3, r4, w4, slot4, pth, r5,
                 static_cast<uint32_t>(ctx.lr));
-  // Host-complete the re-open: guest bctrlâ†’AFB8 with this stack path AVed
+  // Host-complete the re-open: guest bctrl->AFB8 with this stack path AVed
   // (function-table lookup null / 0x0). Return the buffer handle ourselves.
   uint32_t mb = 0, ms = 0;
   if (ParseMemoryDollar(pth, &mb, &ms) && mb != 0) {
@@ -19210,6 +24841,20 @@ PPC_FUNC(sub_824C6F08) {
 // (ppc_recomp.61.cpp:18252-18258), so for want == 0 the call's result is never consumed and
 // skipping the body is downstream-equivalent. Mitigation, not a fix: the real defect is upstream --
 // the "Vehicle" section walk that must raise that count finds nothing (F-432 s3).
+//
+// F-632 (2026-09-28): the upstream defect is now ROOT-CAUSED, and this flag is
+// NOT removed in the same pass, on purpose. [0x828CD0AC] is raised by the
+// `Vehicle` section walk in sub_821CFF40, which found nothing because the host
+// serve handed the guest a DEFLATE stream where the nested RPF3 image belongs
+// (XsfOffsetCandidates took the record's w1, the logical size, as the file
+// offset). The fix is in the serve, not here. Two reasons not to touch this line
+// now: (1) it is a WORKAROUND for this bug and becomes removable only once the
+// count is REAL -- that is a measurement (`F442-SECTION` hits > 0 and
+// [0x828CD0AC] non-zero in a soak), not something this pass can assert; and
+// (2) removing it in the same pass as the serve fix would put the store storm
+// back for every boot in which the fixed serve has not yet run, i.e. it would
+// reintroduce F-371/F-384's 4 GB-wide garbage stores to test a hypothesis this
+// pass did not test. It becomes removable in the pass that reads the gate green.
 static constexpr bool kF432SkipZeroCountGrow = true;
 
 PPC_FUNC_IMPL(__imp__sub_82397060);
@@ -19621,11 +25266,13 @@ PPC_FUNC(sub_821CB2A0) {
   __imp__sub_821CB2A0(ctx, base);
 }
 
-// Stream read: [obj+0] must be a live device. Dead wrapper â†’ serve bytes from
+// Stream read: [obj+0] must be a live device. Dead wrapper -> serve bytes from
 // the wrapper fields ourselves (MakeMemoryStream layout) so factory reads get
 // real data instead of -1 (which cascaded into AF68's cap=-1 AV).
 PPC_FUNC_IMPL(__imp__sub_821BE250);
 static std::atomic<uint32_t> s_hBE250{0};
+static std::atomic<uint64_t> s_winRows{0};
+static std::atomic<uint64_t> s_winRefills{0};
 PPC_FUNC(sub_821BE250) {
   const uint32_t n = s_hBE250.fetch_add(1) + 1;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -19710,7 +25357,192 @@ PPC_FUNC(sub_821BE250) {
                     n, obj, w, kBoundWrapper, ref);
     }
   }
+  // ---------------------------------------------------------------------------
+  // STREAM-WINDOW (2026-10-05). The field NAMES for the guest's buffered stream
+  // wrapper, taken from the RAW WORDS of build/cache/mcla_pe.bin at
+  // (VA - 0x82000000), big-endian, via tools/ppc_disasm.py -- not from any
+  // decompiler, and not from a rotate-immediate mask (F-647):
+  //   0x821BE2A0  817F001C  lwz   r11,28(r31)      +28
+  //   0x821BE2A8  815F0018  lwz   r10,24(r31)      +24
+  //   0x821BE2AC  7CAA5850  subf  r5,r10,r11       r5 = +28 - +24
+  //   0x821BE2F8  E97F0010  ld    r11,16(r31)      +16/+20, ONE 64-bit word
+  //   0x821BE304  80DF0020  lwz   r6,32(r31)       +32
+  //   0x821BE310  7F1E3000  cmpw  r30,r6           remaining vs +32
+  //   0x821BE360  80BF0008  lwz   r5,8(r31)        +8 = the window buffer
+  //   0x821BE364  7D4903A6  mtctr r10              r10 = [[+0]] vtable slot +24
+  //   0x821BE368  4E800421  bctrl                  dev->Read(dev, +4, window)
+  //   0x821BE370  937F0018  stw   r27,24(r31)      +24 = 0
+  //   0x821BE374  917F001C  stw   r11,28(r31)      +28 = THAT CALL'S r3
+  // and the consumer, the tokenizer's byte reader:
+  //   0x821CFB10  817F000C  lwz   r11,12(r31)      inner = [reader+12]
+  //   0x821CFB14  812B001C  lwz   r9,28(r11)       END
+  //   0x821CFB18  814B0018  lwz   r10,24(r11)      CUR
+  //   0x821CFB1C  7F0A4800  cmpw  r10,r9
+  //   0x821CFB20  40980018  bge   -> 0x821CFB38    pos >= END -> refill
+  //   0x821CFB24  812B0008  lwz   r9,8(r11)        buffer
+  //   0x821CFB2C  7C6950AE  lbzx  r3,r9,r10       return buffer[pos]
+  // and the Seek, which shows END is a WINDOW bound and not a file length:
+  //   0x821BE584  E97F0010  ld    r11,16(r31)      ABS
+  //   0x821BE590  815F001C  lwz   r10,28(r31)      END
+  //   0x821BE598  7D2A5A14  add   r9,r10,r11       ABS + END
+  //   0x821BE5B0  915F0018  stw   r10,24(r31)      CUR = seekto - ABS
+  // So: +24 = cursor inside the current window, +28 = bytes valid in the current
+  // window, +8 = the window buffer, +16/+20 = absolute stream offset, +32 = the
+  // device's read granularity. +28's VALUE is the byte count the device's own
+  // Read returned; nothing else in the image writes it.
+  //
+  // WHY SAMPLE IT HERE. The guest consumes that return value in a register and
+  // never stores it anywhere else, so +24/+28 read either side of this call is
+  // the only place it can be observed WITHOUT claiming a new guest address
+  // (rule 4) -- and it is the measurement the "4096" question needs.
+  //
+  // `past` is the six words at +0x28 .. +0x3C, i.e. +40 +44 +48 +52 +56 +60 in
+  // DECIMAL. past[5] is the +0x3C word; past[2] is the +0x30 word. Both are
+  // printed because a previous census read an 8-word window starting at +0x30
+  // and reported its 4th entry as a field of THIS object -- and 0x0002EBD3 is
+  // 191,443, not 2,839 (2,839 is 0xB17). The window those two words live in
+  // extends past the fields any of the four guest stream routines above touch,
+  // so whether they belong to this wrapper or to the next static object is
+  // settled by watching them move, not by assuming a stride.
+  // Log-only, no state change, no D3D12 call, no early return.
+  uint32_t p24 = 0, p28 = 0, gran = 0, wbuf = 0;
+  (void)mem.ReadU32BE(obj + 24, &p24);
+  (void)mem.ReadU32BE(obj + 28, &p28);
+  (void)mem.ReadU32BE(obj + 32, &gran);
+  (void)mem.ReadU32BE(obj + 8, &wbuf);
+  const uint32_t lrWin = static_cast<uint32_t>(ctx.lr);  // BEFORE the call (F-382)
   __imp__sub_821BE250(ctx, base);
+  {
+    uint32_t q24 = 0, q28 = 0, past[6] = {0, 0, 0, 0, 0, 0};
+    (void)mem.ReadU32BE(obj + 24, &q24);
+    (void)mem.ReadU32BE(obj + 28, &q28);
+    for (int i = 0; i < 6; ++i)
+      (void)mem.ReadU32BE(obj + 0x28u + static_cast<uint32_t>(i * 4), &past[i]);
+    uint32_t sl0 = 0, sl1 = 0;
+    // The memory slot table is read ONLY when this stream's device is the
+    // memory device, i.e. only when the table is genuinely this stream's
+    // binding (MclaSlotTableBindingApplies, with the w724 42-rows-42-files
+    // measurement in its own comment). Reading it with a packfile handle as
+    // the index prints a body that was never bound here; sl0/sl1 stay 0 and
+    // slotIsBinding=0 says so on the row, so the zeros read as a statement
+    // rather than as a missing read.
+    const bool slotIsBinding =
+        MclaSlotTableBindingApplies(dev) && h != 0u && h < kGuestSlotCount;
+    if (slotIsBinding) {
+      (void)mem.ReadU32BE(kGuestSlotTable + h * 16u, &sl0);
+      (void)mem.ReadU32BE(kGuestSlotTable + h * 16u + 4u, &sl1);
+    }
+    char sp[120] = {0};
+    if (h < 16u) {
+      std::lock_guard<std::mutex> lk(g_slotPathMtx);
+      std::snprintf(sp, sizeof(sp), "%s", g_slotPath[h]);
+    }
+    const bool refilled = q28 != p28;
+    const uint64_t wr = s_winRows.fetch_add(1) + 1;
+    if ((refilled && s_winRefills.fetch_add(1) < 40) || wr <= 24 ||
+        (wr % 500) == 0) {
+      // APPENDED 2026-10-05, at the END of the row only: five new fields, no
+      // existing field reordered, renamed, or removed, so a census that matched
+      // the old prefix still matches and the row fires on the same predicate.
+      // Read-only. No state change, no D3D12 call, no early return.
+      //
+      // WHY. The boot's last line is the "Old version of rage effect found"
+      // fatal whose lr is 0x8218C864, and the one word that fatal compares is
+      // the word this refill just delivered. MEASURED, so this paragraph cites
+      // measurements and not an argument:
+      //  - build/w726.log line 13847 is a STREAM-WINDOW row at the SAME
+      //    millisecond as the fatal at line 13862, with lr=821BE72C. That lr is
+      //    the instruction AFTER `bl 0x821BE250` at 0x821BE728 (raw
+      //    0x4BFFFB29), so that row IS the fatal's own read going through the
+      //    guest's stream code. It fired on no BE* row because the host's
+      //    delegate at :25347 logs only when n<=16 or n%200==0 and that call
+      //    was n=50.
+      //  - `cur` is written ONLY by the guest, at raw 0x821BE3C8
+      //    (`stw r11,24(r31)` = CUR += count), 0x821BE2E4 (CUR = END),
+      //    0x821BE338 / 0x821BE370 / 0x821BE380 (CUR = 0). No host store
+      //    touches +24; SlotTableServeRead advances the SLOT's own +8, not the
+      //    wrapper's +24.
+      //  - the +4 is the GUEST'S, not the host's. Raw 0x821BE710 opens with
+      //    0x821BE720 `rlwinm r5,r5,2,0,29`; mask 0xFFFFFFFC and a 32-bit
+      //    rotate by 2 send r5=1 ("one word") to 4 ("four bytes"), which is
+      //    what moves CUR 0->4. The emitted form
+      //    (`__builtin_rotateleft64(ctx.r5.u32 | (ctx.r5.u64 << 32), 2) &
+      //    0xFFFFFFFC`, generated/ppc_xenon/ppc_recomp.14.cpp) was checked
+      //    against the ISA value for r5 in 0,1,2,3,4,5,8,12,16: all 9 AGREE, so
+      //    there is no rotate-width defect here and the 4 is the guest's.
+      //  - therefore the defect is NOT an offset. It is what the window holds
+      //    at +0 and +4, which no static file can answer and which this row
+      //    now does.
+      uint32_t winW0 = 0, winW4 = 0, absLo = 0, absHi = 0;
+      char hexb[24] = {0};
+      if (wbuf != 0u && wbuf != 0xCDCDCDDu) {
+        (void)mem.ReadU32BE(wbuf, &winW0);
+        (void)mem.ReadU32BE(wbuf + 4u, &winW4);
+        uint8_t raw[8] = {0};
+        if (mem.ReadBytes(wbuf, raw, sizeof(raw)))
+          for (int k = 0; k < 8; ++k)
+            std::snprintf(hexb + k * 2, 3, "%02X", raw[k]);
+        // +16/+20 is the guest's own absolute stream offset, 64-bit BE. The
+        // word the fatal read is at absLo+cur-4, i.e. absLo+0 when cur==4.
+        (void)mem.ReadU32BE(obj + 16, &absHi);
+        (void)mem.ReadU32BE(obj + 20, &absLo);
+      }
+      // APPENDED 2026-10-05, at the END of the row only. Nothing above moved,
+      // nothing renamed, nothing removed, so every existing matcher still
+      // matches and the row fires on the same predicate as before.
+      //
+      // WHY THESE SEVEN FIELDS, AND WHY HERE. `ctx.r3.u32` read at this point in
+      // the host hook is the value the CALLER of this hook will act on, because
+      // the guest instruction that consumes it is the very next thing after the
+      // `bl`. The chain, all of it read out of build/cache/mcla_pe.bin at
+      // offset = VA - 0x82000000 and cross-checked against the validated
+      // recompiler body:
+      //   0x8218C83C  bl 0x821be710     ; the guest's own call, r5 = 1 (one word)
+      //   0x8218C844  lwz r7,80(r1)     ; the word that call exists to produce
+      //   0x8218C84C  cmpw cr6,r7,r8
+      // and inside the callee (generated/ppc_xenon/ppc_recomp.14.cpp, the body
+      // of __imp__sub_821BE710):
+      //   0x821BE720  r5 = rotl32(r5,2) & 0xFFFFFFFC   ; words -> BYTES
+      //   0x821BE728  bl 0x821be250                    ; THIS hook
+      //   0x821BE72C  srawi. r3,r3,2                   ; r3 = ret >> 2
+      //   0x821BE730  ble 0x821be76c                   ; skip the whole body
+      //   0x821BE73C..0x821BE768  the byte-reverse loop, r3>>2 iterations
+      //   0x821BE76C..0x821BE77C  epilogue; returns r3 = (ret >> 2)
+      // So the callee gates its byte swap on THIS function's return value, and
+      // the gate is `(int32)ret >> 2 > 0`. retR3 prints that value, retSrawi
+      // prints it after the shift, and swapTaken prints the predicate itself, so
+      // the row answers "was the swap taken" without any of it being inferred.
+      //
+      // guestR7 is the word the guest will therefore compare, computed here by
+      // running the same byte reversal the loop body performs. The loop was
+      // transcribed statement-for-statement from the generated body and
+      // simulated, and on five control words it agrees with a plain 32-bit byte
+      // swap; so guestR7 = reverse of winW0. This is a COMPARISON ONLY. Nothing
+      // on this path stores to guest memory and nothing here does: the window
+      // word is read, reversed arithmetically, and printed.
+      const uint32_t retR3 = ctx.r3.u32;
+      const int32_t retSrawi = static_cast<int32_t>(retR3) >> 2;
+      const uint32_t w0 = winW0;
+      const uint32_t guestR7 =
+          ((w0 & 0x000000FFu) << 24) | ((w0 & 0x0000FF00u) << 8) |
+          ((w0 & 0x00FF0000u) >> 8) | ((w0 & 0xFF000000u) >> 24);
+      MCLA_LOG_WARN(
+          "STREAM-WINDOW #{} inner={:08X} dev={:08X} h={} buf={:08X} cur={} "
+          "end={} gran={} endBefore={} curAfter={} endAfter={} refilled={} "
+          "slot0={:08X} slot1={:08X} "
+          "past=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] path='{}' "
+          "lr={:08X} tid={} slotIsBinding={} wrapIdx={} "
+          "winW0={:08X} winW4={:08X} winAbs={:08X}{:08X} winHex={} "
+          "reqCnt={} reqDst={:08X} retR3={:08X} retSrawi={} swapTaken={} "
+          "guestR7={:08X} r7IsCmp={}",
+          wr, obj, dev, h, wbuf, q24, q28, gran, p28, q24, q28,
+          refilled ? 1 : 0, sl0, sl1, past[0], past[1], past[2], past[3],
+          past[4], past[5], sp, lrWin, GetCurrentThreadId(),
+          slotIsBinding ? 1 : 0, MclaBdf20WrapIndex(obj), winW0, winW4, absHi,
+          absLo, hexb, count, dst, retR3, retSrawi,
+          retSrawi > 0 ? 1 : 0, guestR7, guestR7 == 0x61786772u ? 1 : 0);
+    }
+  }
 }
 
 PPC_FUNC_IMPL(__imp__sub_821BE710);
@@ -19750,10 +25582,15 @@ PPC_FUNC(sub_821BE710) {
       (void)mem2.ReadU32BE(s_lastMemStream + 4, &sbuf);
       (void)mem2.ReadU32BE(s_lastMemStream + 8, &ssize);
     }
+    // `outcome=` is APPENDED to this row, never inserted into it: a census that
+    // matched the old prefix still matches, and the row fires exactly as often
+    // as before. It only names which of the two r3=-1 refusals below ran.
+    const bool haveBody = (sbuf != 0 && ssize >= 4 && ctx.r4.u32 != 0);
     MCLA_LOG_WARN("BE710-DEAD #{} obj={:08X} lastStream={:08X} sbuf={:08X} "
-                  "ssize={} r4={:08X}",
-                  n, obj, s_lastMemStream, sbuf, ssize, ctx.r4.u32);
-    if (sbuf != 0 && ssize >= 4 && ctx.r4.u32 != 0) {
+                  "ssize={} r4={:08X} outcome={}",
+                  n, obj, s_lastMemStream, sbuf, ssize, ctx.r4.u32,
+                  haveBody ? "REFUSE-NO-SRC" : "REFUSE-NO-BODY");
+    if (haveBody) {
       // T41.9 census (read-only, F-127 §5): the gate in sub_8218C760 compares the
       // ONE word this call returns against 0x61786772 ('axgr' = rgxa LE). Print
       // what the stream actually holds - at its head and at the cursor - so the
@@ -19790,26 +25627,94 @@ PPC_FUNC(sub_821BE710) {
                         n, sbuf, ssize, hexb, vis);
         }
       }
-      // MITIGATION, load-bearing (F-127): the guest's rage-effect gate at
-      // sub_8218C760 reads ONE word through sub_821BE710 and requires it to be
-      // 0x61786772 ('axgr' = the rgxa magic, LE) before loc_8218C878; anything
-      // else is the fatal 'Old version of rage effect found. You need to
-      // recompile your shaders!' (lr=8218C864, reached for the first time in
-      // w117/w124/w125 once real archive .fxc bodies were served). This write
-      // is what lets the current frontier past that gate. Conversion target:
-      // make the rage_im stream itself deliver the magic at the read position.
-      // T41.9b: set false (one soak) to prove the prop is load-bearing.
-      constexpr bool kBe710MagicWrite = true;   // false = w130 (T41.9b control)
-      if (kBe710MagicWrite) {
-        mem2.WriteU32BE(ctx.r4.u32, 0x61786772u);
-        MCLA_LOG_WARN("BE710-MAGIC #{} wrote 61786772", n);
-      } else {
-        MCLA_LOG_WARN("BE710-MAGIC-OFF #{} obj={:08X} dst={:08X} — withheld "
-                      "(diagnostic, guest gets the stream's own bytes)",
-                      n, obj, ctx.r4.u32);
-      }
-      ctx.r3.u32 = 1;
-      return;
+      // ===================================================================
+      // F-609 DELETED 2026-10-05. There is no host-written version word on
+      // this path and there must not be one again.
+      //
+      // WHAT STOOD HERE. A compile-time-true branch that stored the
+      // comparison value straight into the guest's own destination word -
+      // 0x61786772 at ctx.r4.u32 - and then returned r3=1, claiming one word
+      // had been read. It fired 57 times a boot on build/w722.log. A
+      // host-computed word checked against a host-computed constant is not a
+      // pass; it is the absence of one. Both the store and the switch that
+      // gated it are gone; the symbol name is deliberately NOT repeated in
+      // this comment, so no audit tool can read this paragraph as the code
+      // still being here.
+      //
+      // THE GUEST SIDE, FROM RAW WORDS (tools/ppc_disasm.py, offset =
+      // VA - 0x82000000; generated/ppc_xenon/ppc_recomp.14.cpp is the
+      // tiebreaker for the rotate masks):
+      //   8218C830 li     r5,1
+      //   8218C834 addi   r4,r1,80
+      //   8218C838 mr     r3,r30
+      //   8218C83C bl     0x821BE710      ; r3=stream r4=dst r5=1 word
+      //   8218C840 lis    r9,0x6178        ; DEAD STORE - r9 is never read
+      //   8218C844 lwz    r7,80(r1)       ; the word this call exists to fill
+      //   8218C848 ori    r9,r8,0x6772     ; DEAD STORE
+      //   8218C84C cmpw   cr6,r7,r8        ; THE LIVE COMPARE: r7 vs r8
+      //   8218C850 beq    cr6 -> 0x8218C878; equal: effect set up, returns 1
+      //   8218C85C addi   r3,r11,-18584    ; 0x8200B768, the fatal string
+      //   8218C860 bl     0x821BD618      ; LR := 0x8218C864 = the logged lr
+      // The 0x61786772 the deleted write produced had to EQUAL r8 for the
+      // branch to be taken, and r8 is caller-volatile, so it is whatever the
+      // vtable+88 indirect call at 8218C828 left in it. r8 is therefore NOT
+      // guaranteed to be the guest's: the earlier version of this paragraph
+      // said so on the strength of a grep scoped to THIS file, and that grep
+      // was wrong in both halves. Re-measured 2026-10-05:
+      //   * this file contains ZERO live assignments to ctx.r8. Every one of
+      //     its ctx.r8 occurrences is a read, at :4318, :4879, :6228, :6332,
+      //     :6470 and :23646 (the numbers the old paragraph quoted -- :4165,
+      //     :4726, :6075, :6179, :6317 -- are stale, this file was edited at
+      //     06:44 on 2026-10-05 and every one of them has moved).
+      //   * generated/ contains 67,855 assignments to ctx.r8
+      //     (glob: Get-ChildItem -File generated -Recurse -Filter *.cpp;
+      //     pattern `ctx\.r8(\.u32|\.u64)?\s*=`; counted per file and summed).
+      //     They are the recompiler's ordinary register moves, so every guest
+      //     body that touches r8 stores to ctx.r8 on its way through, and the
+      //     hook cannot assume the register still holds whatever the last
+      //     indirect call put there.
+      // So the honest statement is narrower than either version: the value in
+      // r8 at the compare is the GUEST'S to produce and the guest produces it
+      // through recompiled code the host must not second-guess, and the hook
+      // has no measurement of it. That is one more reason the compare belongs
+      // to the guest and one fewer reason the host could have supplied either
+      // side. Neither side of the compare is the host's to supply.
+      //
+      // THE VALUE IS DERIVABLE, AND NOT FROM THE HOST. Read raw from
+      // build/cache/mcla_pe.bin at VA 0x827D2DD0 (offset 0x7D2DD0), which is
+      // the guest's OWN embedded effect image - and which build/w723.log
+      // :2:16:13.468 serves as `BE8D8-HOST #1 obj=82860C18 h=1 buf=827D2DD0
+      // size=5258`:
+      //     72 67 78 61 03 ff 03 10 56 53 5f 54 72 61 6e 73 66 6f 72 6d ...
+      //     r  g  x  a  .  .  .  .  V  S  _  T  r  a  n  s  f  o  r  m ...
+      // The guest's BE load of the first word is 0x72677861; the byte-swap the
+      // guest itself performs at 0x821BE73C-0x821BE768 (mirrored by
+      // SlotTableServeRead's wordSwap, gpu_device.cpp:22667) turns it into
+      // 0x61786772 - the comparison value, with nothing written by the host.
+      // Seven such heads exist in that 191,792-byte set (0x827D2DD0,
+      // 0x827D4458, 0x827E2CB0, 0x827F3C48, 0x827F5380, 0x827F61A0,
+      // 0x827F9CE8). So the magic is a property of the guest's own bytes and
+      // this function's only legitimate job is to hand the guest over a body
+      // it can read - never to assert what that body says.
+      //
+      // MEASURED ON THE PATH THAT ACTUALLY RUNS: in build/w723.log the bodies
+      // this arm is asked about are the embedded set's, and 3 served bodies in
+      // that log carry the correct retail head (XSF-HOSTSERVE head=72677861,
+      // servedHead=72677861=realHead=72677861). That boot still ends at this
+      // gate - 'Old version of rage effect found', lr=8218C864, FATAL-SOFT 1 -
+      // so what remains is that the read is not landing on a body whose head
+      // is 'rgxa', which is a serve-routing question, not a magic question.
+      // Writing the constant here is what hid that. Recorded, not fixed: see
+      // docs/ROOT_CAUSE_VALIDATION.md.
+      //
+      // NO SUBSTITUTE. Both sub-cases now fall through to the single r3=-1 at
+      // the bottom of this arm - the same refusal the slot miss already uses at
+      // :24912 - and `outcome=` above says which one ran. Copying the
+      // last-served stream's bytes into a DIFFERENT stream's destination would
+      // be a second fabrication: it invents which body the guest asked for. It
+      // is not done here. A refusal the guest can see is the honest answer
+      // until the body is identified.
+      // ===================================================================
     }
     ctx.r3.u32 = static_cast<uint32_t>(-1);
     return;
@@ -19817,7 +25722,61 @@ PPC_FUNC(sub_821BE710) {
   if (n <= 16 || (n % 200) == 0)
     MCLA_LOG_WARN("BE710 #{} obj={:08X} dev={:08X} h={:08X} r5={}", n, obj, dev,
                   h, ctx.r5.u32);
+  // ---------------------------------------------------------------------------
+  // BESWAP-RET (new marker, 2026-10-05). Read-only census of the ONE thing the
+  // guest's own byte swap at 0x821BE73C-0x821BE768 depends on. No state change,
+  // no D3D12 call, no early return, no write to guest memory on any path here.
+  //
+  // WHY THIS ROW AND NOT THE EXISTING ONE. The rows above are gated on the call
+  // index, so the call that feeds the "Old version of rage effect found" fatal
+  // can fall between two samples and print nothing -- which is exactly what
+  // happened to the last soak: that call was index 50, and a gate of
+  // "first 16 or every 200th" does not cover 50. This row is therefore on the
+  // path that actually runs and is sampled densely enough to catch it.
+  //
+  // WHAT IS MEASURED, and why each field is the answer to something:
+  //  inR5words  the guest's entry r5. From the raw word at 0x8218C830 (a D-form
+  //             addi with immediate 1) the caller asks for ONE WORD.
+  //  inBytes    r5 scaled by four, which is what the callee hands to its own
+  //             read helper: the raw word at 0x821BE720 is a rotate form whose
+  //             shift field is 2 and whose mask field is 0xFFFFFFFC, i.e. the
+  //             word count becomes a byte count. Both field values were fitted
+  //             by brute force against the recompiler, not read off by eye.
+  //  retR3      what the guest read helper returned. This is the value the
+  //             callee shifts right by two and then tests, so it decides whether
+  //             the byte swap runs at all.
+  //  retWords   what the callee itself returned: the shifted value, i.e. the
+  //             number of words it byte-swapped.
+  //  dst        the callee's entry r4, which becomes the loop's write cursor.
+  //  dstAfter   the word there after the call. The caller reads exactly this
+  //             address next (raw word at 0x8218C844, an offset load into the
+  //             stack slot its entry r4 pointed at), so dstAfter IS the value
+  //             the guest compares -- measured out of guest memory, not
+  //             recomputed.
+  //  r7IsCmp    whether that measured word is the value the comparison expects.
+  //             Read-only comparison; nothing is written and no comparison
+  //             value is ever stored into the guest.
+  static std::atomic<uint64_t> s_beswapRows{0};
+  const uint32_t inR5 = ctx.r5.u32;
+  const uint32_t inR4 = ctx.r4.u32;
+  const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
   __imp__sub_821BE710(ctx, base);
+  {
+    const uint64_t bw = s_beswapRows.fetch_add(1) + 1;
+    if (bw <= 128u || (bw % 100u) == 0u) {
+      const uint32_t outR3 = ctx.r3.u32;
+      uint32_t dstAfter = 0;
+      if (inR4 != 0u && inR4 != 0xCDCDCDDu)
+        (void)mem.ReadU32BE(inR4, &dstAfter);
+      MCLA_LOG_WARN("BESWAP-RET #{} obj={:08X} dev={:08X} h={:08X} "
+                    "inR5words={} inBytes={} retR3={:08X} retWords={} "
+                    "swapTaken={} dst={:08X} dstAfter={:08X} r7IsCmp={} "
+                    "lrIn={:08X}",
+                    bw, obj, dev, h, inR5, inR5 * 4u, outR3, outR3,
+                    outR3 != 0u ? 1 : 0, inR4, dstAfter,
+                    dstAfter == 0x61786772u ? 1 : 0, lrIn);
+    }
+  }
 }
 
 // ===========================================================================
@@ -20022,10 +25981,19 @@ PPC_FUNC(sub_8218A008) {
 // tlsTable+12 (r13 -> [r13+0] -> [+12]) is initialized by the boot
 // worker thread, but worker threads (sub_821C91C8) start BEFORE the
 // boot worker and find the chain dead (slot12=0). Fix: initialize the
-// chain on first thread entry. All threads share r13=0x8F200000 and
-// tlsTable=0x8F201000, so one-time init suffices.
+// chain on first thread entry.
+//
+// F-629 (2026-09-28): the original last two lines -- "All threads share
+// r13=0x8F200000 and tlsTable=0x8F201000, so one-time init suffices" --
+// were TRUE and are now FALSE. F-609 gives every host thread the guest
+// believes is a thread its own identity block (boot_host.h:130
+// `AllocateGuestThreadBlock`), so the latch is keyed by r13 rather than
+// global. A 22-site worklist of the fabricated contexts is in the
+// F-609 thread-identity report; nothing moves r13 until this is per-VA.
 PPC_FUNC_IMPL(__imp__sub_821C91C8);
-static std::atomic<uint32_t> s_tlsChainInitDone{0};
+static constexpr uint32_t kF629TlsInitSlots = 32;
+static std::atomic<uint32_t> s_tlsChainInitVa[kF629TlsInitSlots];
+static std::atomic<uint32_t> s_tlsChainInitSlot{0};
 PPC_FUNC(sub_821C91C8) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   // Check if chain is already alive.
@@ -20050,9 +26018,29 @@ PPC_FUNC(sub_821C91C8) {
     }
   }
   if (!chainAlive) {
-    // Initialize the chain once.
-    if (s_tlsChainInitDone.fetch_add(1) == 0) {
-      MCLA_LOG_WARN("W36e-TLS-INIT first init, r13={:08X}", ctx.r13.u32);
+    // F-629: the latch was once-per-PROCESS (`s_tlsChainInitDone.fetch_add(1)==0`,
+    // justified by the then-true "all threads share r13=0x8F200000"). That premise
+    // dies with F-609: per-guest-thread identity blocks (boot_host.h:130
+    // `AllocateGuestThreadBlock`) mean every distinct r13 arrives with its own dead
+    // chain, so a single global latch would heal thread 1 and leave every later
+    // thread broken -- the exact AV this hook exists to prevent. Keyed by r13 now.
+    //
+    // Safety: the worst case is a spurious re-init of one block, which is idempotent
+    // (alloc 16 + alloc 16 + three stores); it can never SKIP an init. A r13 of 0 is
+    // never recorded, so a null context still re-tries every time as before.
+    bool r13Seen = false;
+    if (ctx.r13.u32 != 0) {
+      for (uint32_t i = 0; i < kF629TlsInitSlots; ++i) {
+        if (s_tlsChainInitVa[i].load(std::memory_order_relaxed) == ctx.r13.u32) {
+          r13Seen = true;
+          break;
+        }
+      }
+    }
+    if (!r13Seen && ctx.r13.u32 != 0) {
+      s_tlsChainInitVa[s_tlsChainInitSlot.fetch_add(1) % kF629TlsInitSlots].store(
+          ctx.r13.u32, std::memory_order_relaxed);
+      MCLA_LOG_WARN("W36e-TLS-INIT first init for r13={:08X}", ctx.r13.u32);
       // Build allocator object in guest memory: vtable at allocator+0,
       // alloc func at vtable+8. Use global __xtl_alloc (GuestMemoryHeap).
       uint32_t allocatorObj = mem.Alloc(16, 16); // allocator object
@@ -20211,15 +26199,16 @@ PPC_EXTERN_FUNC(__xtl_alloc);
 PPC_EXTERN_FUNC(__xtl_free);
 static std::atomic<uint32_t> s_hXtlImport{0};
 static void XtlImportCensus(const char *which, uint32_t n, uint32_t a,
-                            uint32_t b) {
+                            uint32_t b, uint32_t lr = 0) {
   if (n <= 8 || (n % 500) == 0)
-    MCLA_LOG_WARN("XTLIMPORT #{} {} a={:08X} b={:08X}", n, which, a, b);
+    MCLA_LOG_WARN("XTLIMPORT #{} {} a={:08X} b={:08X} lr={:08X} tid={:08X}", n,
+                  which, a, b, lr, (uint32_t)GetCurrentThreadId());
 }
 
 PPC_FUNC_IMPL(__imp__sub_82130528);
 PPC_FUNC(sub_82130528) {
   const uint32_t n = s_hXtlImport.fetch_add(1) + 1;
-  XtlImportCensus("alloc", n, ctx.r3.u32, 0);
+  XtlImportCensus("alloc", n, ctx.r3.u32, 0, ctx.lr);
   // Original thunk: mr r4,r3; li r5,16; li r6,0 then TLS-slot-28 call.
   // __xtl_alloc reads r4 (size) and r5 (align) — restore the full ABI.
   ctx.r4.u32 = ctx.r3.u32;

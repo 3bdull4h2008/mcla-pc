@@ -8,6 +8,7 @@
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "fs/vfs_rpf.h"
 #include "kernel/memory.h"
+#include "kernel/xam.h"
 #include "apu/audio.h"
 
 // Forward declaration for GPU context poller (Phase 4)
@@ -63,6 +64,15 @@ bool App::Initialize() {
     // M5: open the SDL3 audio stream (48 kHz stereo s16). Failure is non-fatal
     // — the game must keep booting even with no output device.
     apu::Init();
+
+    // F-609: open whatever controllers are already attached and take the
+    // first sample BEFORE the guest boot worker is started below. SDL_Init
+    // queued SDL_EVENT_GAMEPAD_ADDED for anything already plugged in, but
+    // those events are not processed until MainLoop runs - and the guest
+    // thread would otherwise poll XamInputGetState against a snapshot that
+    // had never been filled, getting DEVICE_NOT_CONNECTED for port 0 during
+    // exactly the window in which a title decides whether it has a pad.
+    XamInputInit();
 
     // Phase 5 (BOOT_REBUILD_PLAN.md - retired, cf. src/boot_host.cpp:5): load
     // the game image into the 4 GiB guest window and prepare the boot context.
@@ -147,6 +157,10 @@ void App::Shutdown() {
 
     // Unmount VFS
     mcla::vfs::RpfVirtualFileSystem::Instance().Unmount();
+
+    // F-609: stop the motors and release every SDL_Gamepad* before SDL_Quit -
+    // SDL_CloseGamepad must run while the joystick subsystem is still alive.
+    XamInputShutdown();
 
     // Destroy window
     if (m_window) {
@@ -286,10 +300,29 @@ void App::HandleEvents() {
                 m_running = false;
                 break;
 
+            // F-609: hot-plug. SDL_Init(SDL_INIT_GAMEPAD) is set at
+            // src/app.cpp:179 but nothing ever opened a controller, so pads
+            // that were attached at launch and pads attached later were both
+            // invisible to the guest. The main thread owns every SDL_Gamepad*
+            // and does all of the sampling (see the threading model in
+            // kernel/xam.cpp).
+            case SDL_EVENT_GAMEPAD_ADDED:
+                XamInputGamepadAdded(event.gdevice.which);
+                break;
+
+            case SDL_EVENT_GAMEPAD_REMOVED:
+                XamInputGamepadRemoved(event.gdevice.which);
+                break;
+
             default:
                 break;
         }
     }
+
+    // Sample the input snapshot only AFTER the drain: SDL_PollEvent is what
+    // runs SDL_UpdateGamepads, so anything read before it is a frame behind.
+    // The guest thread copies this snapshot under a lock and never calls SDL.
+    XamInputPoll();
 }
 
 void App::OnResize(uint32_t width, uint32_t height) {

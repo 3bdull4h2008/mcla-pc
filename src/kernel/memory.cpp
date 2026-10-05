@@ -1,6 +1,112 @@
 #include <stdafx.h>
 #include "memory.h"
 #include "heap.h"
+#include <atomic>
+#include "logging.h"
+
+// --- GUEST-LOAD-REFUSED / GUEST-REFUSED-SUM ----------------------------------
+// INSTRUMENT ONLY. It records refusals; it never writes *outVal, never changes a
+// return value, and never touches a caller.
+//
+// WHY. Every GuestMemoryHeap::Read* below refuses by `return false` WITHOUT
+// writing *outVal, and callers that drop the bool turn that into a silent 0
+// (src/gpu_cp.cpp:2096 and :2816 are `(void)...ReadU32BE(...)`). A refused read
+// is then indistinguishable from a guest word that really is 0. This is the
+// discriminator for the two competing causes of the current boot's only
+// C0000005 (guest 0x825FB348; host generated/ppc_xenon/ppc_recomp.121.cpp:25113
+// PPC_CALL_INDIRECT_FUNC(ctr.u32) reached with ctr==0):
+//   #1 the guest's *(obj+12) really is 0  -> GUEST-REFUSED-SUM total=0
+//   #2 the host fabricated that 0         -> GUEST-REFUSED-SUM total>0
+//
+// FLOOD CONTROL. These reads sit in the host hot path (gpu_cp.cpp:4078 and :2821
+// call ReadU32BE per loop element), so one persistently out-of-range pointer can
+// refuse thousands of times per frame. F-054: a marker that fires 2,000,000
+// times poisons the log. So the first 16 refusals print, then every 4096th, and
+// GUEST-REFUSED-SUM prints on that SAME cadence carrying the true `total` and the
+// number of rows deliberately dropped (`dropped`). That is the F-379/F-631
+// cap-shape rule: a short burst stays complete, a long one stays visible, and
+// total/dropped stop a reader mistaking the sample for the whole (F-630).
+// lo_va/hi_va bound the refused addresses, so "is the va inside the crashing
+// object's vtable chain" is answerable from the log without a re-run.
+// Because both markers are emission-only, ABSENCE of both across a full soak is
+// itself the measurement: total == 0.
+//
+// `why` is the check that refused: range = !IsValid(), av = the __try guard
+// caught an access violation, nullout = null out-pointer.
+
+namespace {
+
+enum RefusedSite {
+    kRefU8 = 0, kRefU16, kRefU32, kRefU64, kRefF32, kRefBytes, kRefSiteCount
+};
+
+constexpr uint64_t kRefPrintFirst = 16;
+constexpr uint64_t kRefPrintEvery = 4096;
+
+std::atomic<uint64_t> g_refusedTotal{0};  // every refusal, printed or not
+std::atomic<uint64_t> g_refusedRows{0};   // rows actually printed
+std::atomic<uint64_t> g_refusedBySite[kRefSiteCount]{};
+std::atomic<uint32_t> g_refusedLo{0};
+std::atomic<uint32_t> g_refusedHi{0};
+std::atomic<bool> g_refusedAny{false};
+
+// Captured inside the SEH filter, formatted OUTSIDE the handler: allocating for
+// fmt/spdlog while an access violation is being handled can itself fault.
+// A filter expression must be a constant expression, so this is a named
+// function (it cannot be written as an inline-parameter call) and is invoked as
+// __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER).
+struct GuestLoadFault {
+    unsigned long code = 0;
+    unsigned long long addr = 0;
+};
+
+int GuestLoadAvFilter(EXCEPTION_POINTERS* ep, void* ctx) {
+    auto* f = static_cast<GuestLoadFault*>(ctx);
+    if (ep && ep->ExceptionRecord) {
+        f->code = ep->ExceptionRecord->ExceptionCode;
+        // Information[1] is the faulting DATA address; [0] is the access type.
+        if (ep->ExceptionRecord->NumberParameters >= 2)
+            f->addr = ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void LogGuestLoadRefused(const char* fn, uint32_t va, size_t size, const char* why, int site,
+                         unsigned long av_code, unsigned long long av_addr) {
+    uint32_t cur = g_refusedLo.load(std::memory_order_relaxed);
+    while (va < cur && !g_refusedLo.compare_exchange_weak(cur, va, std::memory_order_relaxed)) {}
+    cur = g_refusedHi.load(std::memory_order_relaxed);
+    while (va > cur && !g_refusedHi.compare_exchange_weak(cur, va, std::memory_order_relaxed)) {}
+    g_refusedAny.store(true, std::memory_order_relaxed);
+
+    const uint64_t n = g_refusedTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_refusedBySite[site].fetch_add(1, std::memory_order_relaxed);
+    if (n > kRefPrintFirst && (n % kRefPrintEvery) != 0)
+        return;  // sampled out; the sum line below carries the true total
+
+    const uint64_t rows = g_refusedRows.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t total = g_refusedTotal.load(std::memory_order_relaxed);
+    const uint32_t lo = g_refusedAny.load(std::memory_order_relaxed)
+                            ? g_refusedLo.load(std::memory_order_relaxed) : 0;
+    const uint32_t hi = g_refusedHi.load(std::memory_order_relaxed);
+    MCLA_LOG_ERROR(
+        "GUEST-LOAD-REFUSED va={:08X} size={} why={} fn={} n={} av_code=0x{:X} av_addr=0x{:X} - "
+        "checked read REFUSED, *outVal NOT written: a caller that drops the bool sees a SILENT 0",
+        va, size, why, fn, n, av_code, av_addr);
+    MCLA_LOG_ERROR(
+        "GUEST-REFUSED-SUM total={} rows={} dropped={} fn={} why={} va={:08X} lo_va={:08X} "
+        "hi_va={:08X} by_site=[u8={} u16={} u32={} u64={} f32={} bytes={}]",
+        (unsigned long long)total, (unsigned long long)rows,
+        (unsigned long long)(total - rows), fn, why, va, lo, hi,
+        (unsigned long long)g_refusedBySite[kRefU8].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefU16].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefU32].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefU64].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefF32].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefBytes].load(std::memory_order_relaxed));
+}
+
+}  // namespace
 
 mcla::kernel::Memory::Memory()
 {
@@ -61,14 +167,35 @@ void* MmGetHostAddress(uint32_t ptr)
 // Checked, endian-explicit read/write helpers for GuestMemoryHeap
 bool mcla::kernel::GuestMemoryHeap::ReadU8(uint32_t guestAddr, uint8_t* outVal) const
 {
-    if (!IsValid(guestAddr, sizeof(uint8_t)) || !outVal) return false;
+    // No __try here (and none in ReadU16BE): a bad pointer AVs instead of
+    // refusing, so `why=av` can never originate from these two -- a silent zero
+    // is impossible from ReadU8/ReadU16BE.
+    if (!IsValid(guestAddr, sizeof(uint8_t)))
+    {
+        LogGuestLoadRefused("ReadU8", guestAddr, sizeof(uint8_t), "range", kRefU8, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU8", guestAddr, sizeof(uint8_t), "nullout", kRefU8, 0, 0);
+        return false;
+    }
     *outVal = *reinterpret_cast<const uint8_t*>(Translate(guestAddr));
     return true;
 }
 
 bool mcla::kernel::GuestMemoryHeap::ReadU16BE(uint32_t guestAddr, uint16_t* outVal) const
 {
-    if (!IsValid(guestAddr, sizeof(uint16_t)) || !outVal) return false;
+    if (!IsValid(guestAddr, sizeof(uint16_t)))
+    {
+        LogGuestLoadRefused("ReadU16BE", guestAddr, sizeof(uint16_t), "range", kRefU16, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU16BE", guestAddr, sizeof(uint16_t), "nullout", kRefU16, 0, 0);
+        return false;
+    }
     const uint16_t beVal = *reinterpret_cast<const uint16_t*>(Translate(guestAddr));
     *outVal = Swap16(beVal);
     return true;
@@ -76,58 +203,122 @@ bool mcla::kernel::GuestMemoryHeap::ReadU16BE(uint32_t guestAddr, uint16_t* outV
 
 bool mcla::kernel::GuestMemoryHeap::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const
 {
-    if (!IsValid(guestAddr, sizeof(uint32_t)) || !outVal) return false;
+    if (!IsValid(guestAddr, sizeof(uint32_t)))
+    {
+        LogGuestLoadRefused("ReadU32BE", guestAddr, sizeof(uint32_t), "range", kRefU32, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU32BE", guestAddr, sizeof(uint32_t), "nullout", kRefU32, 0, 0);
+        return false;
+    }
     const uint8_t* ptr = static_cast<const uint8_t*>(Translate(guestAddr));
+    bool ok = false;
+    GuestLoadFault fault;  // filled by the filter, formatted outside the handler
     __try
     {
         const uint32_t beVal = *reinterpret_cast<const uint32_t*>(ptr);
         *outVal = Swap32(beVal);
-        return true;
+        ok = true;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER)
     {
-        return false;
+        // The filter already recorded the code and the faulting address; nothing
+        // is formatted while the exception is being handled.
     }
+    if (!ok)
+    {
+        LogGuestLoadRefused("ReadU32BE", guestAddr, sizeof(uint32_t), "av", kRefU32,
+                            fault.code, fault.addr);
+    }
+    return ok;
 }
 
 bool mcla::kernel::GuestMemoryHeap::ReadU64BE(uint32_t guestAddr, uint64_t* outVal) const
 {
-    if (!IsValid(guestAddr, sizeof(uint64_t)) || !outVal) return false;
+    if (!IsValid(guestAddr, sizeof(uint64_t)))
+    {
+        LogGuestLoadRefused("ReadU64BE", guestAddr, sizeof(uint64_t), "range", kRefU64, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU64BE", guestAddr, sizeof(uint64_t), "nullout", kRefU64, 0, 0);
+        return false;
+    }
     const uint8_t* ptr = static_cast<const uint8_t*>(Translate(guestAddr));
+    bool ok = false;
+    GuestLoadFault fault;
     __try
     {
         const uint64_t beVal = *reinterpret_cast<const uint64_t*>(ptr);
         *outVal = Swap64(beVal);
-        return true;
+        ok = true;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER)
     {
-        return false;
     }
+    if (!ok)
+    {
+        LogGuestLoadRefused("ReadU64BE", guestAddr, sizeof(uint64_t), "av", kRefU64,
+                            fault.code, fault.addr);
+    }
+    return ok;
 }
 
 bool mcla::kernel::GuestMemoryHeap::ReadF32BE(uint32_t guestAddr, float* outVal) const
 {
-    if (!IsValid(guestAddr, sizeof(float)) || !outVal) return false;
+    // Instrumented too: if this guard refuses, the inner ReadU32BE is never
+    // reached, so without its own line the event would be invisible. The two
+    // paths are mutually exclusive, so `total` still counts each refused load
+    // exactly once.
+    if (!IsValid(guestAddr, sizeof(float)))
+    {
+        LogGuestLoadRefused("ReadF32BE", guestAddr, sizeof(float), "range", kRefF32, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadF32BE", guestAddr, sizeof(float), "nullout", kRefF32, 0, 0);
+        return false;
+    }
     uint32_t beVal;
-    if (!ReadU32BE(guestAddr, &beVal)) return false;
+    if (!ReadU32BE(guestAddr, &beVal))
+        return false;  // already reported by ReadU32BE with why=av
     *outVal = *reinterpret_cast<const float*>(&beVal);
     return true;
 }
 
 bool mcla::kernel::GuestMemoryHeap::ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t size) const
 {
-    if (!IsValid(guestAddr, size) || !outBuffer) return false;
+    if (!IsValid(guestAddr, size))
+    {
+        LogGuestLoadRefused("ReadBytes", guestAddr, size, "range", kRefBytes, 0, 0);
+        return false;
+    }
+    if (!outBuffer)
+    {
+        LogGuestLoadRefused("ReadBytes", guestAddr, size, "nullout", kRefBytes, 0, 0);
+        return false;
+    }
     const uint8_t* src = static_cast<const uint8_t*>(Translate(guestAddr));
+    bool ok = false;
+    GuestLoadFault fault;
     __try
     {
         memcpy(outBuffer, src, size);
-        return true;
+        ok = true;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER)
     {
-        return false;
     }
+    if (!ok)
+    {
+        LogGuestLoadRefused("ReadBytes", guestAddr, size, "av", kRefBytes,
+                            fault.code, fault.addr);
+    }
+    return ok;
 }
 
 bool mcla::kernel::GuestMemoryHeap::WriteU8(uint32_t guestAddr, uint8_t val)

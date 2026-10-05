@@ -11,6 +11,19 @@
 #include "xam.h"
 #include "xdm.h"
 #include "kernel_objects.h"
+// F-609 port batch, 2026-09-29 (integration stream). Both are hand-written
+// headers, not generated. port_kobj.h brings the two REAL kernel objects
+// (Mutant, TimerObject) and kobjport::FormatCore, the tree's SINGLE format
+// engine -- DbgPrint below is wired to it rather than sitting as a stub beside
+// a working engine. port_net.h brings the ONE netport last-error cell, so the
+// twelve NetRefuse refusals in this file and the eighteen bodies in port_net.cpp
+// share it instead of each reporting only its own half.
+// INCLUDE ORDER IS LOAD-BEARING for port_kobj.h: it needs <stdafx.h> first (line
+// 1 of this file) for the generated ppc_context.h, and windows.h ahead of
+// <mutex>/<condition_variable>. That is the same order src/kernel/port_kobj.cpp
+// uses, which is the working example.
+#include "port_kobj.h"
+#include "port_net.h"
 #include <boot_host.h>  // F-370: counting-semaphore registry
 #include "logging.h"
 #include <bit>
@@ -49,16 +62,543 @@ void XeCryptRotSumSha();
 void XeKeysGetKey();
 void sub_821305B8_NoOp();
 
+// ---------------------------------------------------------------------------
 // XTL allocator - used by guest code via r13 thread block
+//
+// THE RETURN CONTRACT, read off the guest's own bytes, not assumed. This
+// corrects an earlier brief that described the failure path of this thunk as
+// "a raise" we deleted. It was never a raise, and the guest still returns
+// null here. Measured three independent ways that agree:
+//
+// 1) `sub_82130528` (the guest thunk) loads the allocator descriptor from
+//    *(r13)+28 and does `bctr` to the vfunc at vtable slot +8 with r3=descriptor,
+//    r4=SIZE, r5=16. It does not test the result.
+// 2) Its caller in the refusal path, `sub_821378B8`, is a strlen+1 duplicator:
+//    strlen -> sub_82130528 -> sub_823DA950 (memcpy), with NO null check between
+//    them. So a refusal here runs a memcpy onto 0. That is the guest's business;
+//    it is safe on the console only because the console's pool never refuses.
+// 3) The alleged raise, `sub_82135D38(8)`, is NOT one. It is a 4-byte
+//    tail-call thunk onto a SIX-INSTRUCTION latching error store:
+//
+//      0x82135D38  b     0x82135D40
+//      0x82135D40  lwz   r11, 0x150(r13)
+//      0x82135D44  cmplwi cr6, r11, 0
+//      0x82135D48  bnelr cr6                 ; latch once, then stop writing
+//      0x82135D4C  lwz   r11, 0x100(r13)
+//      0x82135D50  stw   r3,  0x160(r11)      ; *(*(r13+0x100) + 0x160) = code
+//      0x82135D54  blr
+//
+//    No `twi`, no `t`, no `sc`, no `mtspr`, no stack touch, no call out: it
+//    RECORDS and RETURNS NORMALLY. It unwinds nothing. Its sibling
+//    `sub_82135D90` is the matching getter (same guard, `lwz r3,0x160(r11)`, and
+//    `li r3,0` on the other path), and `sub_82135D58` is the same latch fed
+//    through `__imp__RtlNtStatusToDosError` (0x827BD024 =
+//    generated/default/mcla_init.cpp:29710) -- which is what names the family:
+//    Win32 LAST-ERROR, not an exception. All 19 `bl 0x82135D38` sites in the
+//    image pass 0, 3, 5, 8, 122, 996 plus 4 variable codes. It is an
+//    error-code setter.
+//
+// So the console's contract for a refused allocation is precisely:
+//     return 0, having latched the code into the thread's last-error word.
+// The value the allocation wrapper passes is 8 == ERROR_NOT_ENOUGH_MEMORY
+// (`addi r3,r0,8` at 0x821325DC, straight into `bl 0x82135D38`), and
+// `sub_82132578` then does `mr r3,r31` at 0x821325E4 with r31 still 0 and
+// epilogues -- i.e. it returns null to ITS caller too, after latching.
+//
+// CONSEQUENCE FOR THIS FUNCTION. Do not trap, and do not invent an exception
+// the console does not raise. Return the console's 0 -- and make the refusal
+// COUNTED and NAMED, because a bare 0 handed to an unchecked memcpy is exactly
+// the silent failure this tree has spent a day removing. The row below also
+// carries the guest's OWN last-error word, so a soak can tell "the console's
+// failure path ran" (latch == 8) from "we returned null and nothing noticed".
+// ---------------------------------------------------------------------------
+namespace {
+
+// What the guest itself passes as the error code on a refused allocation
+// (`addi r3,r0,8` at 0x821325DC). 8 == ERROR_NOT_ENOUGH_MEMORY. The host does
+// not raise it; it only compares the guest's latch against it.
+constexpr uint32_t kConsoleOomLastError = 8u;
+
+// "the guest error word could not be read" -- distinct from a guest that
+// latched 0, which is a real, reportable answer.
+constexpr uint32_t kXtlLastErrorUnread = 0xFFFFFFFFu;
+
+std::atomic<uint64_t> g_xtlAllocSeen{0};
+std::atomic<uint64_t> g_xtlAllocOk{0};
+std::atomic<uint64_t> g_xtlAllocRefused{0};
+
+// Read the guest's latching last-error word, *(*(r13 + 0x100) + 0x160), using
+// the checked helpers only. r13 is a GUEST value (boot_host.cpp:1078 sets it to
+// the ThreadBlock, 0x8F200000), so this is a census and not a contract: every
+// step is range-checked, a short read is reported as unread rather than
+// guessed to be 0, and nothing here can fault or assert.
+uint32_t XtlGuestLastError() {
+  const uint32_t r13 =
+      g_ppcContext ? static_cast<uint32_t>(g_ppcContext->r13.u32) : 0u;
+  if (r13 == 0u || r13 > 0xFFFFF000u)
+    return kXtlLastErrorUnread;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (!mem.IsValid(r13 + 0x100u, 4))
+    return kXtlLastErrorUnread;
+  uint32_t block = 0;
+  if (!mem.ReadU32BE(r13 + 0x100u, &block))
+    return kXtlLastErrorUnread;
+  if (block == 0u || block > 0xFFFFF000u)
+    return kXtlLastErrorUnread;
+  if (!mem.IsValid(block + 0x160u, 4))
+    return kXtlLastErrorUnread;
+  uint32_t code = 0;
+  if (!mem.ReadU32BE(block + 0x160u, &code))
+    return kXtlLastErrorUnread;
+  return code;
+}
+
+} // namespace
+
 PPC_FUNC(__xtl_alloc) {
   uint32_t align = ctx.r5.u32;
   if (align < 16 || (align & (align - 1)) != 0)
     align = 16;
-  ctx.r3.u32 =
-      mcla::kernel::GuestMemoryHeap::Instance().Alloc(ctx.r4.u32, align);
+  const uint32_t size = ctx.r4.u32;
+  const uint32_t glr =
+      g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+
+  const uint64_t seen =
+      g_xtlAllocSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  // Unchanged: the same call, the same ABI, the same return-into-r3.
+  ctx.r3.u32 = mcla::kernel::GuestMemoryHeap::Instance().Alloc(size, align);
+
+  if (ctx.r3.u32 == 0) {
+    // The console's value for "refused" is 0 and the console does not trap
+    // here (the contract note above). So r3 is left 0, deliberately, and the
+    // refusal is made visible instead of silent. House cadence: first 8, then
+    // every 512th -- a per-call census is what made w38e.log 66% one message
+    // shape (F-054). The running served/refused totals ride along so ONE row
+    // answers "are allocations still being served, and how many were refused".
+    const uint64_t refused =
+        g_xtlAllocRefused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (refused <= 8u || (refused % 512u) == 0u) {
+      const uint32_t le = XtlGuestLastError();
+      MCLA_LOG_WARN(
+          "XTL-ALLOC-REFUSED #{} size={} align={} -> returned 0 (console value) "
+          "glr={:08X} guestLastError={:#x} consoleFailurePath={} seen={} ok={} "
+          "refused={} :: caller does not test r3, sub_821378B8 memcpy follows",
+          refused, size, align, glr, le,
+          (le == kConsoleOomLastError)
+              ? "LATCHED-by-guest"
+              : (le == kXtlLastErrorUnread ? "unread" : "not-latched"),
+          seen, g_xtlAllocOk.load(std::memory_order_relaxed), refused);
+    }
+    return;
+  }
+
+  const uint64_t n =
+      g_xtlAllocOk.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 8u || (n % 512u) == 0u) {
+    MCLA_LOG_WARN("XTL-ALLOC #{} size={} align={} -> {:08X} glr={:08X} seen={} "
+                  "refused={}",
+                  n, size, align, ctx.r3.u32, glr, seen,
+                  g_xtlAllocRefused.load(std::memory_order_relaxed));
+  }
 }
 
-PPC_FUNC(__xtl_free) { ctx.r3.u32 = 1; }
+// F-633: `__xtl_free` used to be `PPC_FUNC(__xtl_free) { ctx.r3.u32 = 1; }` --
+// a body that does nothing and reports success. `build/w658.log` measured what
+// that costs: HEAPLEAK-SUM arena=phys reaches nalloc=79,985 against nfree=15
+// (freed=16.1MB frozen for the rest of the run), o1_free 1468.0 -> 366.8 ->
+// 0.07 -> 0.0005 MB, and 83 printed
+// `AllocPhysical: o1heapAllocate returned null` rows against a 1.494 GiB arena.
+// It is now a real free. The contract below is READ OFF THE GUEST, not assumed.
+//
+// ---------------------------------------------------------------------------
+// THE CONTRACT, FROM THE GUEST'S OWN BYTES (raw-byte rule, F-023:
+// build/cache/mcla_pe.bin, file offset = VA - 0x82000000, big-endian).
+//
+// The title's XTL dispatch is ONE function block with TWO slots, wired once by
+// boot_host.cpp:889-890 (alloc at +8, free at +12) and reached through the r13
+// chain. Both thunks run the same prologue, so they decode as a pair and each
+// one confirms the other:
+//
+//   alloc slot  VA 0x82130528 (raw 0x130528)
+//     82130530  mr   r4,r3          <- arg0 (size) moves to r4
+//     82130534  li   r6,0
+//     82130538  li   r5,16          <- alignment
+//     8213053C  lwzx r3,r10,r11     <- r3 = *(*(r13)+28), the ALLOC DESCRIPTOR
+//     82130544  lwz  r8,8(r9)       <- slot +8
+//     8213054C  bctr
+//   => r3 = descriptor, r4 = SIZE, r5 = ALIGN -- exactly the three registers
+//      __xtl_alloc above reads. That agreement is the cross-check.
+//
+//   free slot  VA 0x82130588 (raw 0x130588)
+//     82130588  mr   r4,r3          <- arg0 (POINTER) moves to r4
+//     8213058C  cmpli cr6,r4,0
+//     82130590  blr  (bo=12)        <- NULL short-circuits IN THE GUEST
+//     8213059C  lwzx r3,r10,r11     <- r3 = the SAME descriptor
+//     821305A4  lwz  r8,12(r9)      <- slot +12
+//     821305AC  bctr
+//   => r3 = descriptor, r4 = POINTER TO FREE. **NO SIZE IS PASSED.**
+//
+// TWO CONSEQUENCES, both load-bearing:
+//
+// 1) r4, NOT r3, IS THE POINTER. r3 holds our TLS descriptor (0x8F202000,
+//    boot_host.cpp:869). An implementation that freed ctx.r3 would be freeing
+//    the host's own descriptor table. This is the single most dangerous
+//    mistake available here and the guest bytes rule it out.
+//
+// 2) NO SIZE IS NEEDED, SO NO HEADER HAS TO BE INVENTED. The question "where
+//    does the size come from" has the answer: nowhere.
+//    GuestMemoryHeap::Free(uint32_t guestAddr, size_t size)
+//    (src/kernel/memory.cpp:346) NEVER READS ITS size ARGUMENT -- it translates
+//    and hands the pointer to g_userHeap.Free(ptr). The footprint is recovered
+//    host-side from the o1heap fragment header 32 bytes below the pointer
+//    (Heap::IsLiveAllocation -> probe.size, then AcctFree(kArenaPhys,
+//    physicalHeap, probe.size) at heap.cpp:1286). So the alloc and free sides
+//    already subtract the SAME unit -- the fragment footprint AcctAlloc added
+//    (heap.cpp:1319) -- and inventing an allocation header would only create a
+//    second, disagreeing size.
+//
+// NO REFERENCE IMPLEMENTATION EXISTS TO COPY. A recursive search of
+// .research/xenia/src/xenia/kernel/xboxkrnl/ and .../xam/ for
+// xtl/_xtl/Xtl/XTL returns ZERO hits: Xenia does not implement this export at
+// all, and .research/XenonRecomp/ carries neither symbol. Xenia does implement
+// the neighbouring ExAllocatePool/ExFreePool pair
+// (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_memory.cc:598-607), but
+// that is a SYSTEM pool with a different signature (ExFreePool(base_address),
+// no descriptor, no alignment) and is NOT this export. So the contract above is
+// derived from the guest alone.
+//
+// THE COUNTERPART QUESTION -- is this the free that pairs with the 79,985? YES,
+// measured, not assumed. The heap's own site ring attributes the leaking
+// allocations (heap.cpp:75-87 RecordSite, printed as last_site_rva/last_site_lr
+// by heap.cpp:618-644):
+//   * last_site_rva=0x24282a resolves to GuestMemoryHeap::Alloc+0x1a
+//     (python tools/host_rva_resolve.py build/mcla.map 0x24282a). That names the
+//     HOST frame, and on its own it proves nothing about __xtl_alloc -- dozens
+//     of other callers reach GuestMemoryHeap::Alloc, including this file's own
+//     XamSessionCreateHandle:187 and ~50 sites in gpu_device.cpp.
+//   * last_site_lr=0x82137904 is what DOES pin it. That address is the
+//     instruction immediately after `bl 82130528` in sub_821378B8 (a
+//     strlen+1 string duplicator), i.e. the return address INTO the guest of a
+//     call that is executing the XTL alloc thunk right now.
+//   * Decisively: ALL 83 printed `o1heapAllocate returned null` rows carry
+//     glr=0x82137904 (67) or glr=0x821C667C (16). 0x821C667C is likewise the
+//     instruction after `bl 82130528`, this time in sub_821C6658. 100% of the
+//     physical refusals are the XTL allocation path, not a host bookkeeping
+//     path. And the 20 `bl 82130588` call sites in the guest are the matching
+//     free side of the same table.
+// So the leak is the XTL pair, and the 15 frees that did land came from
+// unrelated host paths (8 printed PHYS-FREE rows, glr 8244EF00/8244E8A0/
+// 8244DB68 -- note PHYS-FREE #1 and #2 print the SAME ptr 0x1c64ac380, i.e. the
+// second was a double free the live probe refused).
+//
+// WHAT IS **NOT** ESTABLISHED, stated plainly per rule 1a: that making this free
+// real stops the exhaustion. This is a citation plus a self-report, not a
+// single-variable revert -- no build was run (the brief forbids it) and this
+// working tree already differs from the last known-good by N files. The
+// measurement that would settle it is a soak whose `XTL-FREE` rows show `ok=`
+// rising and whose HEAPLEAK-SUM nfree climbs off 15.
+//
+// NOT plumbed, and named rather than faked: the realloc thunk at 0x82130550
+// (slot +8, `mr r11,r3` / `mr r4,r11`) allocates a new block and NEVER calls the
+// free slot, so it leaks by construction. It is a guest-side fact, out of scope
+// for this function, and it is NOT accounted for in any number here.
+namespace {
+
+// F-633: the XTL free census. Deliberately separate from the heap's own
+// PHYS-FREE rows: this one is measured at the ENTRY POINT, so a soak can tell
+// frees ATTEMPTED from frees HONOURED, and a refusal is named with the exact
+// probe reason rather than being a silent non-event.
+std::atomic<uint64_t> g_xtlFreeSeen{0};
+std::atomic<uint64_t> g_xtlFreeOk{0};
+std::atomic<uint64_t> g_xtlFreeRej{0};
+std::atomic<uint64_t> g_xtlFreeDescMismatch{0};
+
+// F-646: THE DENSITY DEFECT, and why every count in this block is UNGATED while
+// the per-event rows are not. Measured on build/w677.log (READ ONLY, 180 s,
+// 137 MB): NINE `XTL-FREE` rows in the whole file. #1..#5 and #4096 are
+// `ptr=00000000` refusals; #6..#8 are `-> HONOURED`. "The frees work" therefore
+// rested on THREE rows, because the house cadence (first 8, then every 4096th)
+// cannot meet the free rate: #1 at 11:40:00.828 and #4096 at 11:40:13.869 is
+// 4,096 attempts in 13.041 s = 299/s, i.e. ~53,900 attempts in a 180 s run, so
+// a 4096th-row cadence yields 13 of them. That is the whole falsifiability
+// problem, and it is a SAMPLING problem, not an allocator problem.
+//
+// The fix is deliberately NOT a tighter per-event gate. At 299/s even 1-in-64
+// is 842 rows (~194 KB of a 137 MB log) but 1-in-1 is gigabytes, and F-054 is
+// the record of what a per-event census did to a soak (w38e.log: 616,824
+// laundered firings = 66% of the file). The fix is: COUNT EVERY ATTEMPT AND
+// EVERY REFUSAL UNGATED, and PRINT A RUNNING SUMMARY ROW, so the honoured rate
+// is one number on one line instead of a quotient a reader has to compute from
+// two counts sampled 4096 apart.
+constexpr uint32_t kXtlFreeSumEvery = 64u;    // XTL-FREE-SUM cadence
+constexpr uint32_t kXtlFreeSumFirst = 2u;     // ...and always at least one row
+constexpr uint32_t kXtlFreeDetailCap = 256u;  // HONOURED detail rows, then 1-in-512
+constexpr uint32_t kXtlFreeDetailAfter = 512u;
+constexpr uint32_t kXtlFreeRejEvery = 512u;   // extra refusal rows on top of first 8
+
+// F-646: refusal buckets, one per value of Heap::LiveProbe::Reason (heap.h:38-47,
+// seven values, none defaulted away) plus one for a value this switch does not
+// know -- whose non-zero count is itself a finding. `ok` is kept as a bucket
+// because a REFUSAL carrying reason `ok` would mean the predicate and the
+// counter disagree, which is worth seeing rather than silently absorbed.
+enum XtlFreeWhy : size_t {
+  kXtlWhyOk = 0,
+  kXtlWhyNull,
+  kXtlWhyOutOfArena,
+  kXtlWhyMisaligned,
+  kXtlWhyBadSize,
+  kXtlWhyNotUsed,
+  kXtlWhyBadPointers,
+  kXtlWhyUnmapped,
+  kXtlWhyCount
+};
+
+// The SAME seven strings `XtlFreeProbeReason` returned before, in one table, so
+// the per-event `reason=` field and the summary's `rej_why[...]=` field cannot
+// drift apart in spelling.
+const char *const kXtlFreeWhyName[kXtlWhyCount] = {
+    "ok",          "null",     "out-of-arena", "misaligned",
+    "bad-size",    "not-used", "bad-pointers", "unknown"};
+
+std::atomic<uint64_t> g_xtlFreeRejWhy[kXtlWhyCount];
+// The three refusal SITES, so a run can separate "the guest passed a null
+// pointer" from "the pointer did not translate" from "the live probe said no"
+// -- which is a different question from WHICH probe reason fired.
+std::atomic<uint64_t> g_xtlFreeRejNullGuard{0};
+std::atomic<uint64_t> g_xtlFreeRejNoTranslate{0};
+std::atomic<uint64_t> g_xtlFreeRejProbe{0};
+std::atomic<uint64_t> g_xtlFreeDetail{0};  // HONOURED per-event rows already printed
+
+int XtlFreeWhyIndex(Heap::LiveProbe::Reason r) {
+  switch (r) {
+    case Heap::LiveProbe::Reason::Ok: return kXtlWhyOk;
+    case Heap::LiveProbe::Reason::Null: return kXtlWhyNull;
+    case Heap::LiveProbe::Reason::OutOfArena: return kXtlWhyOutOfArena;
+    case Heap::LiveProbe::Reason::Misaligned: return kXtlWhyMisaligned;
+    case Heap::LiveProbe::Reason::BadSize: return kXtlWhyBadSize;
+    case Heap::LiveProbe::Reason::NotUsed: return kXtlWhyNotUsed;
+    case Heap::LiveProbe::Reason::BadPointers: return kXtlWhyBadPointers;
+  }
+  return kXtlWhyUnmapped;  // a value this switch does not know: count it, do not fold it
+}
+
+const char *XtlFreeProbeReason(Heap::LiveProbe::Reason r) {
+  return kXtlFreeWhyName[XtlFreeWhyIndex(r)];
+}
+
+// F-646: THE ONE ROW THAT DECIDES IT. `attempted` is `seen`, incremented once per
+// entry before anything else, so `honoured + refused` must equal it -- and
+// `unaccounted` prints that difference instead of leaving it to the reader to
+// infer. A non-zero `unaccounted` would mean an exit path classified nothing,
+// which is a defect in THIS census and not in the allocator.
+void XtlFreeSummary(uint64_t seen, uint32_t ptr, uint32_t desc) {
+  const uint64_t ok = g_xtlFreeOk.load(std::memory_order_relaxed);
+  const uint64_t rej = g_xtlFreeRej.load(std::memory_order_relaxed);
+  const uint64_t accounted = ok + rej;
+  const uint32_t glr =
+      g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+  MCLA_LOG_WARN(
+      "XTL-FREE-SUM attempted={} honoured={} refused={} unaccounted={} "
+      "honoured_pct={:.4f} rej[below-4KiB]={} rej[no-translate]={} "
+      "rej[probe]={} rej_why[ok]={} rej_why[null]={} rej_why[out-of-arena]={} "
+      "rej_why[misaligned]={} rej_why[bad-size]={} rej_why[not-used]={} "
+      "rej_why[bad-pointers]={} rej_why[unknown]={} descmismatch={} "
+      "detail_rows={} last_ptr={:08X} last_desc={:08X} last_glr={:08X}",
+      seen, ok, rej, seen >= accounted ? seen - accounted : 0ull,
+      accounted ? (static_cast<double>(ok) * 100.0 /
+                   static_cast<double>(accounted))
+                : 0.0,
+      g_xtlFreeRejNullGuard.load(std::memory_order_relaxed),
+      g_xtlFreeRejNoTranslate.load(std::memory_order_relaxed),
+      g_xtlFreeRejProbe.load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyOk].load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyNull].load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyOutOfArena].load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyMisaligned].load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyBadSize].load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyNotUsed].load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyBadPointers].load(std::memory_order_relaxed),
+      g_xtlFreeRejWhy[kXtlWhyUnmapped].load(std::memory_order_relaxed),
+      g_xtlFreeDescMismatch.load(std::memory_order_relaxed),
+      g_xtlFreeDetail.load(std::memory_order_relaxed), ptr, desc, glr);
+}
+} // namespace
+
+PPC_FUNC(__xtl_free) {
+  // r3 = the allocator descriptor the guest loaded from *(r13)+28 (0x8F202000,
+  // boot_host.cpp:869). r4 = THE POINTER. See the contract note above: the
+  // pointer is r4, and no size is passed.
+  const uint32_t desc = ctx.r3.u32;
+  const uint32_t ptr = ctx.r4.u32;
+
+  const uint64_t seen =
+      g_xtlFreeSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  // F-646: every exit below goes through `done`, so the running summary is
+  // emitted on ALL of them -- honoured AND refused -- exactly once per attempt.
+  // Without this the summary would exist only on the paths a reader cares
+  // about, which is how "no rows" stays ambiguous between "no frees" and "not
+  // sampled". The r3 value is the console contract's own and is unchanged by
+  // this: the summary is pure accounting.
+  const auto done = [&](uint32_t r3) {
+    ctx.r3.u32 = r3;
+    if (seen <= kXtlFreeSumFirst || (seen % kXtlFreeSumEvery) == 0u) {
+      XtlFreeSummary(seen, ptr, desc);
+    }
+  };
+
+  // The descriptor is ours by construction (boot_host.cpp:889-890), so a
+  // mismatch means the guest is calling a DIFFERENT export through this slot.
+  // Counted, never fatal: the pointer is in r4 either way, and refusing here
+  // would convert a working free back into the leak this function exists to
+  // remove. If the decoding above were wrong, r4 would hold the descriptor,
+  // IsLiveAllocation would reject it as out-of-arena, and the free would degrade
+  // to a counted refusal rather than a corrupted heap.
+  if (desc != 0x8F202000u) {
+    g_xtlFreeDescMismatch.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Guard the values the guest controls, by the same rules the heap itself uses,
+  // before anything is translated or probed. No assert on a guest value, ever.
+  if (ptr == 0 || ptr < 4096u) {
+    g_xtlFreeRej.fetch_add(1, std::memory_order_relaxed);
+    g_xtlFreeRejNullGuard.fetch_add(1, std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 4096) == 0 ||
+        (g_xtlFreeRej.load(std::memory_order_relaxed) % kXtlFreeRejEvery) == 0) {
+      MCLA_LOG_WARN("XTL-FREE #{} ptr={:08X} desc={:08X} -> refused: below the "
+                    "4 KiB null guard (guest=0 or the PAGE_NOACCESS window) "
+                    "rej={} (running tally on XTL-FREE-SUM)",
+                    seen, ptr, desc,
+                    g_xtlFreeRej.load(std::memory_order_relaxed));
+    }
+    done(0);  // 0 = NOT honoured. Never a success we did not earn.
+    return;
+  }
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  void *host = mem.Translate(ptr);
+  if (host == nullptr) {
+    g_xtlFreeRej.fetch_add(1, std::memory_order_relaxed);
+    g_xtlFreeRejNoTranslate.fetch_add(1, std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 4096) == 0 ||
+        (g_xtlFreeRej.load(std::memory_order_relaxed) % kXtlFreeRejEvery) == 0) {
+      MCLA_LOG_WARN("XTL-FREE #{} ptr={:08X} desc={:08X} -> refused: not in the "
+                    "4 GiB guest window rej={} (running tally on XTL-FREE-SUM)",
+                    seen, ptr, desc,
+                    g_xtlFreeRej.load(std::memory_order_relaxed));
+    }
+    done(0);
+    return;
+  }
+
+  // Pre-validate with the heap's OWN predicate, so "honoured" is counted with
+  // the same rule Heap::Free will apply rather than a second, weaker copy of
+  // it. XTL blocks come from GuestMemoryHeap::Alloc -> g_userHeap.AllocPhysical
+  // (src/kernel/memory.cpp:339), so they live in the PHYSICAL arena; the user
+  // arena is probed second only for completeness. IsLiveAllocation is
+  // [[nodiscard]] and cannot fault: it range-checks, alignment-checks, and then
+  // reads a 32-byte fragment header it has already proved in bounds.
+  //
+  // F-646: TWO PROBE OBJECTS, NOT ONE. build/w677.log's `XTL-FREE` rows all read
+  // `reason=out-of-arena` for addresses that heap.cpp's own F-645 note (the
+  // "XTL-FREE refused every free it saw" block, anchored on the literal
+  // "MEASURED, on build/w675.log") shows are INSIDE the pool. The cause is
+  // visible in the call pair below: both `IsLiveAllocation` calls were handed
+  // the SAME `probe`, and `IsLiveAllocation` starts with `probe = {}` -- so the
+  // user-arena call OVERWROTE the physical arena's verdict. The user arena is
+  // [0x20000, 0x7FEA0000), which makes every physical pointer out-of-arena
+  // there, so the row reported the second probe and the first one's reason was
+  // discarded. Same number of probe calls, same order, same short-circuit; only
+  // the destination objects differ, so this is an instrumentation fix and not a
+  // behaviour change.
+  Heap::LiveProbe physProbe{};
+  Heap::LiveProbe usrProbe{};
+  const bool phys = g_userHeap.IsLiveAllocation(
+      g_userHeap.physArenaBase, g_userHeap.physArenaSize, host, &physProbe);
+  const bool usr =
+      !phys && g_userHeap.IsLiveAllocation(g_userHeap.heapArenaBase,
+                                           g_userHeap.heapArenaSize, host,
+                                           &usrProbe);
+
+  if (!phys && !usr) {
+    // F-646: AND THE REASON ATTRIBUTED TO THE ARENA THE POINTER IS ACTUALLY IN.
+    // `IsPhysicalArenaPtr` (heap.h:63-67) is the tree's own bounds test for
+    // exactly this question and costs no probe call -- and it is TRUE in the
+    // F-645 case, where the pointer is a physical one that the first
+    // representation missed, which is precisely the case that was being
+    // mislabelled. Both probes' reasons are printed on the row regardless, so a
+    // reader is never worse informed than before.
+    const Heap::LiveProbe::Reason fired =
+        g_userHeap.IsPhysicalArenaPtr(host) ? physProbe.reason : usrProbe.reason;
+    g_xtlFreeRej.fetch_add(1, std::memory_order_relaxed);
+    g_xtlFreeRejProbe.fetch_add(1, std::memory_order_relaxed);
+    g_xtlFreeRejWhy[XtlFreeWhyIndex(fired)].fetch_add(1,
+                                                      std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 4096) == 0 ||
+        (g_xtlFreeRej.load(std::memory_order_relaxed) % kXtlFreeRejEvery) == 0) {
+      const uint32_t glr =
+          g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+      MCLA_LOG_WARN(
+          "XTL-FREE #{} ptr={:08X} desc={:08X} -> REFUSED reason={} "
+          "phys_why={} usr_why={} bytes kept, r3=0 (not honoured) "
+          "arena=phys/{} glr={:08X} rej={}",
+          seen, ptr, desc, XtlFreeProbeReason(fired),
+          XtlFreeProbeReason(physProbe.reason),
+          XtlFreeProbeReason(usrProbe.reason), phys ? 1 : 0, glr,
+          g_xtlFreeRej.load(std::memory_order_relaxed));
+    }
+    done(0);
+    return;
+  }
+
+  // Hand it back. GuestMemoryHeap::Free's size argument is unused
+  // (src/kernel/memory.cpp:346) and is passed as 0 to say so rather than to
+  // invent a size. The real accounting is the heap's own: Heap::Free re-probes
+  // and, on success, AcctFree subtracts probe.size from liveBytes -- the same
+  // fragment footprint AcctAlloc added (heap.cpp:1319 vs :1286), so the two
+  // sides subtract one unit, not two.
+  mem.Free(ptr, 0);
+
+  const uint64_t ok = g_xtlFreeOk.fetch_add(1, std::memory_order_relaxed) + 1;
+  // F-646: DENSITY, BOUNDED. The old gate was `first 8, then every 4096th`,
+  // and at 299 attempts/s (XTL-FREE #1 at 11:40:00.828 -> #4096 at
+  // 11:40:13.869 in build/w677.log, 4,096 in 13.041 s) that is 13 rows in a
+  // 180 s run -- three of them HONOURED, which is the entire evidence base for
+  // "the frees work". The new gate prints the first kXtlFreeDetailCap (256)
+  // honoured frees in full and then one per kXtlFreeDetailAfter (512), so:
+  //   * honoured == 3   (w677's measured value) -> 3 rows, i.e. no change: there
+  //     is nothing to sample, which the summary row now STATES as honoured=3
+  //     rather than leaving it inferred from an absent row.
+  //   * honoured == 2,000 -> 256 + floor((2000-256)/512) = 259 rows.
+  // The cap is what makes densifying safe against F-054: this branch cannot
+  // exceed ~256 + honoured/512 rows no matter what the run does, so the log
+  // cannot grow without bound. The exact count is reported on every
+  // XTL-FREE-SUM row as `detail_rows=`, so the sample size is never a guess.
+  const bool detailRow = ok <= kXtlFreeDetailCap ||
+                         (ok > kXtlFreeDetailCap &&
+                          (ok % kXtlFreeDetailAfter) == 0u);
+  if (detailRow) {
+    g_xtlFreeDetail.fetch_add(1, std::memory_order_relaxed);
+    const Heap::LiveProbe& okProbe = phys ? physProbe : usrProbe;
+    const uint32_t glr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    MCLA_LOG_WARN("XTL-FREE #{} ptr={:08X} desc={:08X} -> HONOURED frag={:#x} "
+                  "arena={} seen={} ok={} rej={} descmismatch={} glr={:08X} "
+                  "detail={}/{}",
+                  seen, ptr, desc, okProbe.size, phys ? "phys" : "user", seen,
+                  g_xtlFreeOk.load(std::memory_order_relaxed),
+                  g_xtlFreeRej.load(std::memory_order_relaxed),
+                  g_xtlFreeDescMismatch.load(std::memory_order_relaxed), glr,
+                  g_xtlFreeDetail.load(std::memory_order_relaxed), ok);
+  }
+  done(1);
+  // 1 = honoured, 0 = refused. NO measured caller reads this: all 20 guest
+  // `bl 82130588` sites immediately clobber r3 (e.g. 0x82137b3c `stw r27,0(r24)`,
+  // 0x82138a60 `mr r3,r26`) and none branches on it. It is reported honestly for
+  // the log and the gate rather than assumed to be a success. `done(1)` is the
+  // assignment -- it sets ctx.r3.u32 = 1 and then prints the summary row.
+}
 
 // ---- File metadata queries (shared impls, called from the PPC_FUNC wrappers
 // below; these were silent fake-success stubs which made packfile loading fail
@@ -262,62 +802,415 @@ uint32_t XMsgStartIORequest(uint32_t App, uint32_t Message,
   return STATUS_SUCCESS;
 }
 
-uint32_t XamUserGetSigninState(uint32_t userIndex) { return true; }
+// ---------------------------------------------------------------------------
+// THE XAM SIGN-IN / CONTENT FAMILY -- F-609. All five of these fabricated state
+// and reported success. Each is handled on its own evidence below; the shared
+// fact first.
+//
+// THE HOST HAS NO USER PROFILE AND NO CONTENT STORE. That is not a judgement
+// about the code, it is a census of this tree: no profile object, no content
+// manager, nothing to read a saved game from. Xenia's versions all answer from
+// `kernel_state()->user_profile()` or
+// `kernel_state()->content_manager()`; there is nothing here for them to answer
+// from, so every "success" below was a value invented for the guest's benefit.
+//
+// ERROR CONSTANTS, all from .research/xenia/src/xenia/xbox.h:
+//   X_ERROR_SUCCESS               0x00000000  xbox.h:86
+//   X_ERROR_FILE_NOT_FOUND        0x00000002  xbox.h:87
+//   X_ERROR_PATH_NOT_FOUND        0x00000003  xbox.h:88
+//   X_ERROR_ACCESS_DENIED         0x00000005  xbox.h:89
+//   X_ERROR_DEVICE_NOT_CONNECTED  0x0000048F  xbox.h:100
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ==== SYNTH-PROFILE: the one synthetic user in this host ====================
+// F-609, decision (b) HONEST RETENTION. The whole family (XamUserGetSigninState,
+// XamUserGetSigninInfo, XamShowSigninUI, XamUserReadProfileSettings) reads its
+// answer from the single constant below, and every call that uses it emits
+// `SYNTH-PROFILE fabricated`.
+//
+// WHY RETAINED INSTEAD OF REFUSED. Three measurements, not a preference:
+//
+// 1. THERE IS NO REAL PROFILE. Census of src/ for user_profile|xuid|gamertag|
+//    signin_state returns exactly two hits, both in src/kernel/xbox.h:300,302 --
+//    and those are the *output* struct's field declarations, not a store. There
+//    is no profile, no account record, no config file read at boot. So "answer
+//    from real data" is not available; the alternative is not "more honest", it
+//    is just differently honest.
+//
+// 2. THE OLD VALUE WAS ALREADY WRONG FOR THE GUEST'S OWN CHECK. The pre-change
+//    code returned `true` == 1. The guest's call site at 0x8244A6D4
+//    (sub_8244A688) tests `cmpi cr6,r3,2` / `bc bo=12 -> 0x8244A6E8`
+//    (ppc_disasm.py 0x8244A688). 1 != 2, so the old code ALREADY failed that
+//    test and already fell into `li r3,1245; b 0x8244A74C`. There is therefore
+//    no known-good "signed in" answer being disturbed here: the fabrication was
+//    never being read as signed-in at the site's own gate. Dropping it to 0
+//    changes nothing at 0x8244A6D4; it changes 3 of the other 4 sites (see
+//    below), which is the whole risk.
+//
+// 3. NO BUILD WAS RUN AND NONE MAY BE. The (a) precondition -- "the title
+//    depends on a signed-in answer to boot" -- cannot be established from here,
+//    and this working tree differs from HEAD by 51 files (AGENTS.md rule 1a), so
+//    no single-variable revert is possible either. Choosing (a) would be a blind
+//    boot-risk change to a blocked build. Partial removal is the one
+//    unacceptable outcome, so the family is retained *as a set* and made
+//    visible, which is what the native-only charter permits for a fake that is
+//    deliberately and visibly kept.
+//
+// THE BEHAVIOURAL DELTA IS REAL AND MEASURED (ppc_xrefs.py calls 0x827BD314 ->
+// 5 sites; ppc_disasm.py at each). Returning 1 vs 0 changes the guest's road at
+// 3 of them:
+//   0x82457644 / 0x82457674 (sub_82457608) -- a slot-0..3 scan testing
+//     `cmpi cr6,r3,1`. 1 matched slot 0 on the first iteration -> `li r3,1245`
+//     + `stw 0,0(r29)`. 0 matches nothing -> 4 iterations -> `b 0x82457680`,
+//     which calls a DIFFERENT import, `__imp__XamUserCheckPrivilege`.
+//   0x82750BD4 (sub_82750B60) -- `mr r29,r3` then `cmpi cr6,r29,0` /
+//     `bc bo=12 -> 0x82750D24`. 0 takes the 0x82750D24 state-machine arm that 1
+//     skipped.
+//   0x824E6CD8+0xC -- `xori r8,r3,0001` at 0x824E6CF4 inverts bit 0, so 1 gave
+//     false and 0 gives true.
+// Unchanged: 0x8244A6D4 (tests ==2, both fail). Unproven: 0x824E6D38 does
+// `addi r11,r3,-2` (a -2 test, like 0x8244A6D4) but the following op31:26 at
+// 0x824E6D40 is not decoded by our disassembler, so it is not claimed either way.
+//
+// *** REMOVAL TRIGGER. Delete kXamSynthProfile and make every consumer below
+// *** return the truthful no-user answer (0 for GetSigninState; X_E_NO_SUCH_USER
+// *** for GetSigninInfo, per xam_user.cc:93) AS ONE SINGLE COMMIT, the moment
+// *** EITHER of these becomes true:
+// ***   (i)  a real user profile store exists in this tree to answer from -- a
+// ***        profile object, an account record, or a config file read at boot
+// ***        (today's census: none), or
+// ***   (ii) a soak shows the game REACHES THE MENU AND PLAYS with this block
+// ***        deleted, i.e. the dependency the (a) route assumed turns out not to
+// ***        exist.
+// The marker `SYNTH-PROFILE fabricated` is the census handle for (ii): a soak
+// with zero `SYNTH-PROFILE` lines is running in the honest-refusal world; a
+// soak WITH them is running on the synthetic user. The two must never be mixed --
+// that partial state is what this block exists to make impossible.
+// ---------------------------------------------------------------------------
+namespace {
+// Deliberately constant and deliberately visible. Not synthesised per call, and
+// not derived from anything: a constant string the game can print is better
+// than a per-call one, because a per-call value would look like a real profile.
+struct XamSyntheticProfile {
+  uint64_t xuid;
+  uint32_t signinState;
+  const char *name;
+};
+constexpr XamSyntheticProfile kXamSynthProfile = {0xB13EBABEBABEBABEull, 1u,
+                                                  "SWA"};
+
+// One emitter for the whole family, so no consumer can grow its own private
+// lie. `refusals` counts calls that took the truthful no-user path, separately
+// from `attempts`, so a soak can watch refusals rise if this is ever made real.
+struct XamSynthCounters {
+  std::atomic<uint64_t> attempts{0};
+  std::atomic<uint64_t> refusals{0};
+};
+XamSynthCounters g_xamSynthSigninState, g_xamSynthSigninInfo,
+    g_xamSynthSigninUI, g_xamSynthProfileSettings;
+
+void XamSynthEmit(const char *consumer, XamSynthCounters &c, uint64_t n,
+                  const char *detail) {
+  if (n <= 8 || (n % 200) == 0) {
+    const uint64_t refusals =
+        c.refusals.load(std::memory_order_relaxed);
+    MCLA_LOG_WARN("SYNTH-PROFILE fabricated [{}] #{} attempts={} refusals={}: "
+                  "xuid={:016X} signinState={} name=\"{}\" -- this host has NO "
+                  "user profile (census: src/ has no profile store); {} "
+                  "REMOVAL TRIGGER: delete kXamSynthProfile as ONE commit when "
+                  "a real profile store exists, or when a soak reaches the menu "
+                  "with this block deleted. glr={:08X}",
+                  consumer, n, n, refusals, kXamSynthProfile.xuid,
+                  kXamSynthProfile.signinState, kXamSynthProfile.name, detail,
+                  g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+  }
+}
+} // namespace
+
+// XamUserGetSigninState -- F-609, now a consumer of kXamSynthProfile.
+//
+// THE CONTRACT: .research/xenia/src/xenia/kernel/xam/xam_user.cc:60-71 returns
+// 0 for any user_index >= 4, and for slots 1..3; only slot 0 ever reads
+// kernel_state()->user_profile()->signin_state(). We have no profile object, so
+// there is nothing to ask -- which is why the answer is a declared constant
+// rather than a lookup, and why the `user_index < 4` bound is honoured
+// explicitly (see the refusals path below) instead of being ignored.
+//
+// WHAT CHANGED HERE, AND IT IS A REVERT OF THE PARTIAL REMOVAL. This function
+// had just been changed to `return 0` while its two siblings still fabricated,
+// leaving the family inconsistent -- the exact state the task forbids. It is
+// back to the synthetic signin state (1), which is also what the guest's own
+// slot-scan at 0x82457648 tests for. The genuinely new part is not the value:
+// it is that the value now has a name, a single source, a marker, and a written
+// removal trigger, and that the attempt/refusal split is countable.
+uint32_t XamUserGetSigninState(uint32_t userIndex) {
+  const uint64_t n = g_xamSynthSigninState.attempts.fetch_add(
+                         1, std::memory_order_relaxed) +
+                     1;
+  // xam_user.cc:62 notes "Yield, as some games spam this" -- this is a
+  // high-frequency poll, so the census is what makes the poll affordable.
+  if (n <= 8 || (n % 200) == 0) {
+    MCLA_LOG_WARN("XAM-SIGNIN-STATE #{} userIndex={} -> {} (SYNTHETIC signed in)",
+                  n, userIndex, kXamSynthProfile.signinState);
+  }
+  // The xam_user.cc:64 bound, made visible: slot 0 is the only slot that could
+  // ever hold a profile, so every other slot is the truthful no-user answer and
+  // is counted as a refusal rather than answered from the synthetic profile.
+  if (userIndex != 0u) {
+    const uint64_t m = g_xamSynthSigninState.refusals.fetch_add(
+                           1, std::memory_order_relaxed) +
+                       1;
+    if (m <= 8 || (m % 200) == 0) {
+      MCLA_LOG_WARN("XAM-SIGNIN-STATE #{} slot {} -> 0 (NO SUCH USER): "
+                    "xam_user.cc:64-68 only ever reads a profile for slot 0, and "
+                    "this host has none. refusals={}",
+                    n, userIndex, m);
+    }
+    return 0u;
+  }
+  XamSynthEmit("XamUserGetSigninState", g_xamSynthSigninState, n,
+               "slot 0 answered from the constant, not from a profile.");
+  return kXamSynthProfile.signinState;
+}
 
 uint32_t XamGetSystemVersion() {
   // Return 2.0.17559.0 as the system version (similar to Xenia)
   return 0x00021755;
 }
 
+// XamContentDelete -- F-609, refused. Was `return 0;` (ERROR_SUCCESS) for a
+// delete of nothing: the title was told a saved game had been destroyed.
+//
+// Xenia: .research/xenia/src/xenia/kernel/xam/xam_content.cc:393-406 returns
+// `content_manager()->DeleteContent(content_data)`, and when the content is not
+// present that resolves to X_ERROR_PATH_NOT_FOUND (xam_content.cc:320). We
+// have no content manager, so "not present" is not a special case -- it is the
+// only case, and 0x00000003 (xbox.h:88) is the correct answer for it.
+//
+// REACHABILITY: ABSENT from generated/ppc_xenon/ppc_func_mapping.cpp. The hook
+// below is dead wiring; the marker is insurance, not measurement.
 uint32_t XamContentDelete(uint32_t userIndex, void *deviceId,
                           XCONTENT_DATA *contentData,
                           XXOVERLAPPED *overlapped) {
   (void)userIndex;
   (void)deviceId;
   (void)contentData;
+  // The overlapped is deliberately NOT completed. Completing it would tell the
+  // guest the delete finished; it did not, and there is nothing to delete.
   (void)overlapped;
-  return 0; // Success
+  static std::atomic<uint64_t> s_seen{0};
+  const uint64_t n = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 8 || (n % 200) == 0) {
+    MCLA_LOG_WARN("XAM-CONTENT-DELETE #{} -> X_ERROR_PATH_NOT_FOUND "
+                  "(0x00000003): no content store on this host, so nothing was "
+                  "deleted and the overlapped was NOT completed (was "
+                  "ERROR_SUCCESS) glr={:08X}",
+                  n,
+                  g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+  }
+  return 0x00000003u; // X_ERROR_PATH_NOT_FOUND
 }
 
+// XamContentGetCreator -- F-609, refused with Xenia's own else branch. It wrote
+// isCreator=1 and xuid=0xB13EBABEBABEBABE -- a fabricated 64-bit identity the
+// title could store and later compare -- and returned 0.
+//
+// Xenia: .research/xenia/src/xenia/kernel/xam/xam_content.cc:294-321. The
+// not-a-saved-game arm is `*is_creator_ptr = 0; *creator_xuid_ptr = 0;`
+// (xam_content.cc:313-317) and the content-does-not-exist arm is
+// `result = X_ERROR_PATH_NOT_FOUND` (xam_content.cc:320). We are in that arm
+// unconditionally, so BOTH of Xenia's lines are reproduced rather than one of
+// them faked. Writing 0/0 is not merely a refusal: it is the truthful pair of
+// answers, and it is strictly better than leaving the guest's own uninitialised
+// stack values in the out-parameters.
+//
+// REACHABILITY: ABSENT from the import table; the hook is dead wiring.
 uint32_t XamContentGetCreator(uint32_t userIndex,
                               const XCONTENT_DATA *contentData,
                               be<uint32_t> *isCreator, be<uint64_t> *xuid,
                               XXOVERLAPPED *overlapped) {
+  (void)userIndex;
+  (void)contentData;
+  (void)overlapped;
   if (isCreator)
-    *isCreator = true;
-
+    *isCreator = 0; // xam_content.cc:313-314
   if (xuid)
-    *xuid = 0xB13EBABEBABEBABE;
-
-  return 0;
+    *xuid = 0;      // xam_content.cc:315-317
+  static std::atomic<uint64_t> s_seen{0};
+  const uint64_t n = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 8 || (n % 200) == 0) {
+    MCLA_LOG_WARN("XAM-CONTENT-CREATOR #{} -> isCreator=0 xuid=0 + "
+                  "X_ERROR_PATH_NOT_FOUND (0x00000003): no content store, so "
+                  "nobody created anything (was isCreator=1 with a fabricated "
+                  "xuid 0xB13EBABEBABEBABE) glr={:08X}",
+                  n,
+                  g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+  }
+  return 0x00000003u; // X_ERROR_PATH_NOT_FOUND
 }
 
-uint32_t XamContentGetDeviceState() { return 0; }
+// XamContentGetDeviceState -- F-609, refused, AND THE SIGNATURE WAS WRONG.
+// Was `uint32_t XamContentGetDeviceState() { return 0; }`: no parameters, so
+// the hook read no arguments at all, and ERROR_SUCCESS for a device query.
+//
+// Xenia: .research/xenia/src/xenia/kernel/xam/xam_content_device.cc:78-89
+//   auto device_info = GetDummyDeviceInfo(device_id);
+//   if (device_info == nullptr) { ... return X_ERROR_DEVICE_NOT_CONNECTED; }
+// The "no such device" answer is X_ERROR_DEVICE_NOT_CONNECTED = 0x0000048F
+// (xbox.h:100). There is no content device attached to this host, so that is
+// the true answer -- and it is the one Xenia itself returns in exactly our
+// situation, which is what makes it a refusal rather than an invention.
+//
+// The signature is now `(uint32_t deviceId, void *overlapped)` per
+// xam_content_device.cc:78-79, so the guest's arguments are actually read and
+// reported. The overlapping struct is NOT completed: there is no device state
+// to report, and completing it would assert that there is.
+//
+// REACHABILITY: this one IS imported (0x827BD3C4) and ppc_xrefs.py finds 2 call
+// sites, so the guest may well reach it. The refusal may therefore be
+// guest-visible where the previous ERROR_SUCCESS was not.
+uint32_t XamContentGetDeviceState(uint32_t deviceId, void *overlapped) {
+  (void)overlapped;
+  static std::atomic<uint64_t> s_seen{0};
+  const uint64_t n = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 8 || (n % 200) == 0) {
+    MCLA_LOG_WARN("XAM-CONTENT-DEVICE #{} deviceId={:08X} -> "
+                  "X_ERROR_DEVICE_NOT_CONNECTED (0x0000048F): no content device "
+                  "on this host (was ERROR_SUCCESS; the hook also read no "
+                  "arguments at all, the signature took none) glr={:08X}",
+                  n, deviceId,
+                  g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+  }
+  return 0x0000048Fu; // X_ERROR_DEVICE_NOT_CONNECTED
+}
 
+// XamUserGetSigninInfo -- F-609, now a consumer of kXamSynthProfile.
+//
+// THE CONTRACT: .research/xenia/src/xenia/kernel/xam/xam_user.cc:85-102
+//   if (!info) return X_E_INVALIDARG;                       // :87-89
+//   memset(info, 0, sizeof(X_USER_SIGNIN_INFO));            // :91
+//   if (user_index) return X_E_NO_SUCH_USER;                // :92-94
+//   info->xuid         = user_profile->xuid();              // :97
+//   info->signin_state = user_profile->signin_state();      // :98
+//   copy_truncating(info->name, user_profile->name(), ...); // :99-100
+//   return X_E_SUCCESS;                                     // :101
+// The SHAPE here was already Xenia's and is unchanged: null-check, zero-fill,
+// NO_SUCH_USER for a non-zero slot, SUCCESS for slot 0. The only thing that
+// was fabricated is the *source* of the three fields on :97-100 -- Xenia reads
+// them from a profile, we read them from kXamSynthProfile. That is the whole
+// lie, and it is now one named constant instead of three inline literals.
+//
+// WHY THE SUCCESS IS THE LOAD-BEARING PART. This is the call whose return the
+// guest actually gates on: at 0x8275CCA4 (sub_8275CC98) it does
+// `bl 827BDC94` / `cmpi cr0,r3,0` / `bc bo=12 -> 0x8275CCB8`, and the
+// success arm is where the info struct is read. Refusing here would make the
+// title return 0 at 0x8275CCB0 immediately and never look at the profile. So
+// if this family is ever removed, THIS function is the one that must change
+// first, and it must change together with XamUserGetSigninState.
+//
+// THE NAME IS A CONSTANT, NOT SYNTHESISED. "SWA" is a single fixed string; it
+// is not generated per call and is not derived from anything, so a soak sees
+// one unchanging value. That is deliberate: a constant is visibly a constant,
+// whereas a per-call synthesised gamertag would be indistinguishable from a real
+// profile and would be the worse of the two. A constant string the game may
+// print to the user is a known cost of this block and is called out here
+// deliberately rather than hidden in a literal.
 uint32_t XamUserGetSigninInfo(uint32_t userIndex, uint32_t flags,
                               XUSER_SIGNIN_INFO *info) {
-  if (!info) return ERROR_INVALID_PARAMETER;
-  if (userIndex == 0) {
-    memset(info, 0, sizeof(*info));
-    info->xuid = 0xB13EBABEBABEBABE;
-    info->SigninState = 1;
-    strcpy(info->Name, "SWA");
-    return 0;
+  const uint64_t n = g_xamSynthSigninInfo.attempts.fetch_add(
+                         1, std::memory_order_relaxed) +
+                     1;
+  if (!info) {
+    // xam_user.cc:87-89. Counted as a refusal: nothing was fabricated.
+    g_xamSynthSigninInfo.refusals.fetch_add(1, std::memory_order_relaxed);
+    MCLA_LOG_WARN("XAM-SIGNIN-INFO #{} -> ERROR_INVALID_PARAMETER (null info) "
+                  "glr={:08X}",
+                  n, g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+    return ERROR_INVALID_PARAMETER;
   }
-
-  return 0x00000525; // ERROR_NO_SUCH_USER
+  // xam_user.cc:91 -- the zero-fill happens for every slot, including the ones
+  // that then refuse, so a refused call still leaves a well-defined struct
+  // rather than the guest's uninitialised stack.
+  memset(info, 0, sizeof(*info));
+  if (userIndex != 0u) {
+    // xam_user.cc:92-94.
+    const uint64_t m = g_xamSynthSigninInfo.refusals.fetch_add(
+                           1, std::memory_order_relaxed) +
+                       1;
+    if (m <= 8 || (m % 200) == 0) {
+      MCLA_LOG_WARN("XAM-SIGNIN-INFO #{} slot {} -> 0x00000525 "
+                    "ERROR_NO_SUCH_USER (zero-filled per xam_user.cc:91) "
+                    "refusals={}",
+                    n, userIndex, m);
+    }
+    return 0x00000525; // ERROR_NO_SUCH_USER
+  }
+  (void)flags; // Xenia also ignores it (xam_user.cc:86).
+  info->xuid = kXamSynthProfile.xuid;            // was 0xB13EBABEBABEBABE literal
+  info->SigninState = kXamSynthProfile.signinState; // was 1 literal
+  strncpy(info->Name, kXamSynthProfile.name, sizeof(info->Name) - 1);
+  info->Name[sizeof(info->Name) - 1] = '\0'; // was strcpy, which could overrun
+  XamSynthEmit("XamUserGetSigninInfo", g_xamSynthSigninInfo, n,
+               "the three fields Xenia reads from user_profile() are constants.");
+  return 0; // X_ERROR_SUCCESS, as xam_user.cc:101
 }
 
-void XamShowSigninUI() {
-  static std::atomic<uint32_t> s_census{0};
-  const uint32_t n = s_census.fetch_add(1) + 1;
+// XamShowSigninUI -- F-609. THIS WAS NOT MERELY A LIE: IT WAS AN EMPTY BODY
+// WHERE THE REAL API HAS SIDE EFFECTS, AND XENIA SAYS TITLES BLOCK ON THEM.
+//
+// THE CONTRACT: .research/xenia/src/xenia/kernel/xam/xam_user.cc:518-529
+//   dword_result_t XamShowSigninUI_entry(dword_t unk, dword_t unk_mask) {
+//     // To fix game modes that display a 4 profile signin UI (even if playing
+//     // alone): XN_SYS_SIGNINCHANGED
+//     kernel_state()->BroadcastNotification(0x0000000A, 1);
+//     // Games seem to sit and loop until we trigger this notification:
+//     // XN_SYS_UI (off)
+//     kernel_state()->BroadcastNotification(0x00000009, 0);
+//     return X_ERROR_SUCCESS;
+//   }
+// The old body enqueued nothing and logged "auto-bypass", so a title that
+// waits on XN_SYS_SIGNINCHANGED / XN_SYS_UI waits forever. This now performs
+// both of Xenia's notifications for real: XamNotifyEnqueueEvent
+// (src/kernel/xam.cpp:113-122) walks the live listener list and appends to each
+// subscribed listener's queue, which is a real host side effect consumed by the
+// guest through XNotifyGetNext (src/kernel/xam.cpp:124). This is a real
+// implementation of a real API contract, not a substitute for one -- the
+// decision NOT to display UI remains synthetic and is labelled as such.
+//
+// RISK, STATED: this ADDS a side effect the previous body did not have. It is
+// deliberately low-risk because the mechanism is already in this boot path --
+// XamShowDeviceSelectorUI calls the same helper at 0x827BCDA4 with id 9
+// (XamNotifyEnqueueEvent(9, true/false), imports.cpp:703-705), so id 9 has
+// already been broadcast to these listeners by an existing hook. The guest's
+// only call site is the tail-call thunk at 0x82131C18, reached from 0x82272D50
+// (ppc_xrefs.py calls 0x82131C18 -> 1 site), which sets r3=1 and discards the
+// return; no branch there depends on it.
+//
+// SIGNATURE: Xenia returns dword_result_t (:518). This returned void, which
+// under PPC_FUNC/HostToGuestFunction (src/kernel/function.h, GUEST_FUNCTION_HOOK)
+// leaves r3 holding whatever the guest last put there -- the caller at 0x82272D50
+// leaves 1 in r3, so the guest has been reading a leaked 1 where Xenia returns
+// X_ERROR_SUCCESS. Returning 0 explicitly is a real fix with a measured site,
+// not a behaviour gamble. The two Xenia parameters (unk, unk_mask) are not
+// added: ignoring extra register arguments is not a fabrication, and adding
+// them would change the hook's read pattern for no measured gain.
+uint32_t XamShowSigninUI() {
+  const uint64_t n = g_xamSynthSigninUI.attempts.fetch_add(
+                         1, std::memory_order_relaxed) +
+                     1;
   if (n <= 20 || (n % 100) == 0) {
     MCLA_LOG_INFO("XAM-CENSUS[SigninUI] #{:04} lr={:08X}", n,
                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
   }
-  // Auto-success: skip sign-in UI, return immediately
-  MCLA_LOG_INFO("XamShowSigninUI: auto-bypass (lr={:08X})",
-                static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  // xam_user.cc:524 -- XN_SYS_SIGNINCHANGED, value 1.
+  XamNotifyEnqueueEvent(0x0000000A, 1);
+  // xam_user.cc:527 -- XN_SYS_UI off, value 0.
+  XamNotifyEnqueueEvent(0x00000009, 0);
+  XamSynthEmit("XamShowSigninUI", g_xamSynthSigninUI, n,
+               "no UI is displayed; the two XN_SYS_* notifications Xenia sends "
+               "are sent for real instead.");
+  return 0; // X_ERROR_SUCCESS, xam_user.cc:528 (was: void, r3 left leaked)
 }
 
 uint32_t XamShowDeviceSelectorUI(uint32_t userIndex, uint32_t contentType,
@@ -400,23 +1293,47 @@ void XamLoaderLaunchTitle() {
   // No-op - don't launch another title
 }
 
+// XamLoaderMediaGetInfo -- F-609, refused. It fabricated an XAM_MEDIA_INFO
+// record -- MediaType = 0x0C (XAM_MEDIA_TYPE_GAME_DVD), everything else zero --
+// told the title it was running from a game DVD, and returned ERROR_SUCCESS.
+//
+// TWO DEFECTS, not one. The second is the worse one and the brief did not name
+// it: the function SIGNATURE takes `(uint32_t mediaId, void *infoBuffer)` and
+// then IGNORES `infoBuffer` entirely, writing 16 bytes to
+// `g_ppcContext->r4.u32` instead (the old line 647). So even the fabrication
+// was not going where the caller asked -- it was writing to a raw register,
+// and a guest that passed anything else got a 16-byte write to an address it
+// never supplied. The parameter is now actually used, and the buffer is
+// written with NOTHING.
+//
+// THE STATUS: X_ERROR_DEVICE_NOT_CONNECTED (0x0000048F, xbox.h:100), the same
+// honest code XamContentGetDeviceState above uses and the one Xenia returns
+// when there is no device to describe (xam_content_device.cc:80-89). There is
+// no DVD, no media, and no loader media state on this host. ERROR_SUCCESS would
+// assert a disc that does not exist.
+//
+// REACHABILITY: ABSENT from generated/ppc_xenon/ppc_func_mapping.cpp, the
+// guest's static import table, so the hook below is dead wiring today. That is
+// why removing the 16-byte fabrication is low risk -- but the fabrication was
+// writing to a register the caller did not control, so it was a live
+// wild-write hazard for any future caller too.
 uint32_t XamLoaderMediaGetInfo(uint32_t mediaId, void *infoBuffer) {
-  // Xbox 360 media info query. Game expects valid game disc.
-  // Returns XAM_MEDIA_TYPE_GAME_DVD (0x0C) on success.
-  if (g_ppcContext && infoBuffer) {
-    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-    // XAM_MEDIA_INFO structure: MediaType(4), MediaFlags(4), MediaId(4), etc.
-    uint8_t info[16] = {};
-    *reinterpret_cast<uint32_t *>(&info[0]) =
-        __builtin_bswap32(0x0C); // XAM_MEDIA_TYPE_GAME_DVD
-    *reinterpret_cast<uint32_t *>(&info[4]) =
-        __builtin_bswap32(0x0); // MediaFlags
-    *reinterpret_cast<uint32_t *>(&info[8]) = __builtin_bswap32(0x0); // MediaId
-    *reinterpret_cast<uint32_t *>(&info[12]) =
-        __builtin_bswap32(0x0); // SessionId
-    (void)mem.WriteBytes(g_ppcContext->r4.u32, info, 16);
+  // NOTHING is written to infoBuffer. Not zeroed, not filled: the honest
+  // answer carries no media record, and a zeroed record would be a record.
+  (void)infoBuffer;
+  static std::atomic<uint64_t> s_seen{0};
+  const uint64_t n = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 8 || (n % 200) == 0) {
+    MCLA_LOG_WARN("XAM-MEDIA-INFO #{} mediaId={:08X} -> "
+                  "X_ERROR_DEVICE_NOT_CONNECTED (0x0000048F): no media on this "
+                  "host, 0 bytes written to the info buffer (was "
+                  "ERROR_SUCCESS plus a fabricated XAM_MEDIA_TYPE_GAME_DVD "
+                  "record written to r4 rather than to the caller's buffer) "
+                  "glr={:08X}",
+                  n, mediaId,
+                  g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
   }
-  return 0; // ERROR_SUCCESS
+  return 0x0000048Fu; // X_ERROR_DEVICE_NOT_CONNECTED
 }
 
 uint32_t XamLoaderGetDvdTrayState() {
@@ -432,7 +1349,95 @@ uint32_t XGetAVPack() {
   return 3;
 }
 
-void NtOpenFile() { LOG_UTILITY("!!! STUB !!!"); }
+// Forward declaration so NtOpenFile can forward to it. Defined below, in this
+// same file, with this exact signature.
+uint32_t NtCreateFile(be<uint32_t> *FileHandle, uint32_t DesiredAccess,
+                      XOBJECT_ATTRIBUTES *Attributes,
+                      XIO_STATUS_BLOCK *IoStatusBlock, uint64_t *AllocationSize,
+                      uint32_t FileAttributes, uint32_t ShareAccess,
+                      uint32_t CreateDisposition, uint32_t CreateOptions);
+
+// ---------------------------------------------------------------------------
+// NtOpenFile -- FIXED, 2026-09-29 (integration stream). F-609 PORT BATCH.
+//
+// WAS: `void NtOpenFile() { LOG_UTILITY("!!! STUB !!!"); }`. That was not an
+// inert stub, it was a LIVE DEFECT, and it is the reason this function is
+// handled here rather than swept up with the other 63:
+//
+//   * GUEST_FUNCTION_STUB / a `void` hook body leaves r3 EQUAL TO THE INCOMING
+//     r3 (function.h:496-499: the void arm calls the host function and returns
+//     without touching the context at all).
+//   * The guest therefore received its OWN FIRST ARGUMENT -- the stack address
+//     of its handle out-parameter, e.g. 0x8EFFFxxx -- back in r3 where an
+//     NTSTATUS belongs. That value is large and POSITIVE.
+//   * All three guest call sites then test the return as an NTSTATUS and skip
+//     the error branch, because `cmpwi r3,0 / blt` is false for a positive
+//     value. MEASURED, one site each:
+//        generated/ppc_xenon/ppc_recomp.82.cpp:10752-10755 (lr 0x8245FB74)
+//        generated/ppc_xenon/ppc_recomp.82.cpp:11550-11553 (lr 0x824600E8)
+//        generated/ppc_xenon/ppc_recomp.82.cpp:11753-11756 (lr 0x82460220)
+//   * Each of those three proceeds to `lwz r3,<out>(r1)` -- the handle out
+//     parameter, which the void body never wrote -- and feeds that
+//     UNINITIALISED STACK WORD into NtDeviceIoControlFile (whose own call sites
+//     are ppc_recomp.82.cpp:10786 and :10851, in the first of these three
+//     functions). One stack word of garbage became a file handle.
+//
+// The fix is the signature, and the signature comes from the reference rather
+// than from convenience. Xenia
+// .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:173-182:
+//
+//   dword_result_t NtOpenFile_entry(
+//       lpdword_t handle_out, dword_t desired_access,
+//       pointer_t<X_OBJECT_ATTRIBUTES> object_attributes,
+//       pointer_t<X_IO_STATUS_BLOCK> io_status_block, dword_t open_options) {
+//     return NtCreateFile_entry(
+//         handle_out, desired_access, object_attributes, io_status_block,
+//         nullptr, 0, 0, static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
+//         open_options);
+//   }
+//
+// So the return type is dword_result_t -- an NTSTATUS in r3 -- and the body is a
+// forward to NtCreateFile with the disposition forced to kOpen
+// (enum value 1, .research/xenia/src/xenia/vfs/entry.h:51). That is exactly
+// what this does, against this tree's own NtCreateFile, which already returns a
+// real STATUS and already writes a real kernel handle via
+// `FileHandle->set(kernelHandle)`. No second open path was invented.
+//
+// ARITY, MEASURED, WITH THE DIVERGENCE NAMED. The guest sets SIX registers
+// before the call in all three sites (e.g. ppc_recomp.82.cpp:10735-10749:
+// r3=out, r4=0x1000003, r5=attrs, r6=IOSB, r7=0, r8=24). Xenia's entry takes
+// FIVE and does not consume the sixth, so this host also takes five and reads
+// r3..r7. Stated rather than hidden: the guest's r8 (24 at :10738, 16417 at
+// :11536) is IGNORED here. That divergence is behaviourally inert in this tree
+// and not only because of Xenia -- this file's own NtCreateFile already voids
+// AllocationSize, FileAttributes, ShareAccess, CreateDisposition and
+// CreateOptions (its `(void)` lines), so a 5-argument and a 9-argument forward
+// produce identical results here. The measurable gain is the one that matters:
+// a real status in r3 and a real handle in the out-parameter.
+// ---------------------------------------------------------------------------
+uint32_t NtOpenFile(be<uint32_t> *FileHandle, uint32_t DesiredAccess,
+                    XOBJECT_ATTRIBUTES *Attributes,
+                    XIO_STATUS_BLOCK *IoStatusBlock, uint32_t OpenOptions) {
+  // Census, house cadence. The `disp=1` is the kOpen this function FORCES and
+  // is not the guest's value; the real disposition argument is the sixth
+  // register, which the reference does not pass either.
+  {
+    static std::atomic<uint32_t> s_census{0};
+    const uint32_t n = s_census.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20 || (n % 100) == 0) {
+      MCLA_LOG_INFO("NFS-CENSUS[Open] #{:04} disp=1 opts=0x{:X} access=0x{:X} "
+                    "lr={:08X}",
+                    n, OpenOptions, DesiredAccess,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u));
+    }
+  }
+  // kOpen == 1 (.research/xenia/src/xenia/vfs/entry.h:51). AllocationSize
+  // nullptr, FileAttributes 0, ShareAccess 0 -- the reference's own arguments.
+  return NtCreateFile(FileHandle, DesiredAccess, Attributes, IoStatusBlock,
+                      /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
+                      /*ShareAccess=*/0, /*CreateDisposition=*/1,
+                      /*CreateOptions=*/OpenOptions);
+}
 
 void RtlInitAnsiString(XANSI_STRING *destination, char *source) {
   const uint16_t length = source ? static_cast<uint16_t>(strlen(source)) : 0;
@@ -533,6 +1538,33 @@ uint32_t NtCreateFile(be<uint32_t> *FileHandle, uint32_t DesiredAccess,
   // `new` yields host pointers that MapVirtual cannot represent.
   auto *fileObj2 = CreateKernelObject<FileObject>(std::move(fileHandle));
   uint32_t kernelHandle = GetKernelHandle(fileObj2);
+  // Publish the object in the identity map, the same two steps
+  // CreateRegisteredKernelObject performs (xdm.h:131-135). This call site was
+  // the one CreateKernelObject product that never registered, and that is what
+  // left the resolver unable to tell this host object from guest memory: see
+  // the long note at the signature proof in ResolveKernelObjectSafe, which is
+  // why it needed a discriminator that is not a pointer comparison - for this
+  // object Translate(kernelHandle) IS fileObj2, so no address test can tell
+  // them apart, and an unregistered entry is by definition indistinguishable
+  // from a guest page.
+  //
+  // The two steps are both load-bearing and are both already the shape of the
+  // existing template, so no new symbol and no layout change:
+  //   * `identityHdrAddr` is what DestroyKernelObject (xdm.cpp:12-13) erases on,
+  //     so without it the entry would outlive the object and a recycled handle
+  //     could resolve to freed memory.
+  //   * the Type byte is stored verbatim as the ctor left it; nothing here
+  //     rewrites header.Type, so no caller can observe a different Type than
+  //     before. `GetKernelObject` is unaffected: its TryQueryKernelObject probe
+  //     compares the map's Type against the byte at +0 of the object, which for
+  //     a vptr-bearing host object is the low byte of the vptr, not
+  //     header.Type, so that probe still misses and still returns the same
+  //     pointer it returned before this entry existed.
+  fileObj2->identityHdrAddr = kernelHandle;
+  {
+    std::lock_guard guard{g_kernelLock};
+    WrapperIdentityMap()[kernelHandle] = {fileObj2, fileObj2->header.Type};
+  }
   FileHandle->set(kernelHandle);
   MCLA_LOG_INFO("NtCreateFile: '{}' opened, handle={:08X}", virtualPath,
                 kernelHandle);
@@ -569,23 +1601,108 @@ uint32_t NtClose(uint32_t handle) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// NtSetInformationFile -- F-609, REFUSED HONESTLY, per info class.
+//
+// Was: `uint32_t NtSetInformationFile(handle, ioStatus, buffer, length,
+// infoClass) { (void)x5; if (ioStatus) ioStatus->Status.set(STATUS_SUCCESS);
+// return STATUS_SUCCESS; }` -- STATUS_SUCCESS for EVERY class and EVERY handle,
+// and it wrote that success into the guest's own IO_STATUS_BLOCK so the guest
+// could not tell.
+//
+// The brief's instruction was "only claim success for the classes actually
+// handled and refuse the rest". MEASURED: this function handles ZERO classes.
+// The comment it used to carry -- "Common info classes: FilePositionInformation
+// (14), FileEndOfFileInformation (20) For now, return success" -- named two
+// classes and implemented neither; not a single byte of `buffer` was ever
+// written for any class. So there is no "handled" subset to carve out and the
+// refusal is total.
+//
+// THE STATUS: STATUS_INVALID_INFO_CLASS (0xC0000003), already defined at
+// src/kernel/xbox.h:444-445. That is precisely the real kernel's answer for an
+// information class the driver does not implement, so it is not an invention
+// -- it is the correct code for "this class is not one I handle". It also
+// carries the useful information, because the class NUMBER is in the log, so
+// the next pass learns which class the title actually wanted and can implement
+// exactly that one. STATUS_NOT_IMPLEMENTED would claim the request is
+// malformed; STATUS_INVALID_HANDLE would claim the handle is bad, and the
+// handle may well be a real VFS FileObject.
+//
+// `Information` is set to 0 alongside the status. Xenia's failure path
+// (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:419-422) zeroes it,
+// and a class we did not apply moved no bytes.
+//
+// NOT SIGNALLED, for the same reason as NtWriteFile: no completion event is Set
+// for an information class that was not applied.
+// ---------------------------------------------------------------------------
+namespace {
+std::atomic<uint64_t> g_nfsSetInfoSeen{0};
+std::atomic<uint64_t> g_nfsSetInfoRefused{0};
+// Class -> how many times the title asked for it. Bounded at 32 entries so a
+// guest cannot grow this table; an unseen class is folded into "other".
+constexpr uint32_t kSetInfoClassSlots = 32;
+std::atomic<uint64_t> g_nfsSetInfoByClass[kSetInfoClassSlots];
+} // namespace
+
 uint32_t NtSetInformationFile(uint32_t handle, XIO_STATUS_BLOCK *ioStatus,
                               void *buffer, uint32_t length,
                               uint32_t infoClass) {
-  (void)handle;
-  (void)ioStatus;
   (void)buffer;
   (void)length;
-  (void)infoClass;
 
-  // Common info classes: FilePositionInformation (14), FileEndOfFileInformation
-  // (20) For now, return success
-  if (ioStatus)
-    ioStatus->Status.set(STATUS_SUCCESS);
-  return STATUS_SUCCESS;
+  const uint64_t seen =
+      g_nfsSetInfoSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (infoClass < kSetInfoClassSlots) {
+    g_nfsSetInfoByClass[infoClass].fetch_add(1, std::memory_order_relaxed);
+  }
+  g_nfsSetInfoRefused.fetch_add(1, std::memory_order_relaxed);
+
+  if (seen <= 8 || (seen % 200) == 0) {
+    const uint32_t glr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    MCLA_LOG_WARN(
+        "NFS-SETINFO #{} h={:08X} class={} len={} -> REFUSED "
+        "STATUS_INVALID_INFO_CLASS (0xC0000003): this function implements NO "
+        "class (was STATUS_SUCCESS for every class and handle, with nothing "
+        "written). Information=0, completion event NOT signalled. seen={} "
+        "refused={} glr={:08X}",
+        seen, handle, infoClass, length, seen,
+        g_nfsSetInfoRefused.load(std::memory_order_relaxed), glr);
+  }
+
+  if (ioStatus) {
+    ioStatus->Status.set(STATUS_INVALID_INFO_CLASS);
+    ioStatus->Information.set(0);
+  }
+  return STATUS_INVALID_INFO_CLASS;
 }
 
-uint32_t FscSetCacheElementCount() { return 0; }
+// FscSetCacheElementCount -- F-609, refused. Was `return 0;`, i.e.
+// ERROR_SUCCESS for a call that changed nothing: the title was told its file
+// system cache had been resized to a count we never applied.
+//
+// STATUS: ERROR_INVALID_FUNCTION (0x00000001), the Win32 code for "this
+// function is not implemented by this device/driver", which is the true state
+// of affairs. Xenia does not implement this export at all.
+//
+// REACHABILITY, so the next session does not re-derive it: ABSENT from
+// generated/ppc_xenon/ppc_func_mapping.cpp, the guest's static import table.
+// The GUEST_FUNCTION_HOOK below is dead wiring. Signature note preserved: this
+// body declares no parameters, so the hook reads no arguments at all -- if the
+// export ever becomes reachable that is the first thing to fix, and the reason
+// the guest's requested count is not in the marker.
+uint32_t FscSetCacheElementCount() {
+  static std::atomic<uint64_t> s_seen{0};
+  const uint64_t n = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 8 || (n % 200) == 0) {
+    MCLA_LOG_WARN("FSC-CACHECOUNT #{} -> ERROR_INVALID_FUNCTION (0x00000001): "
+                  "not implemented, cache element count NOT changed (was "
+                  "ERROR_SUCCESS with nothing done) glr={:08X}",
+                  n,
+                  g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+  }
+  return 0x00000001u; // ERROR_INVALID_FUNCTION
+}
 
 uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
                                   uint32_t Alertable, be<int64_t> *Timeout) {
@@ -642,6 +1759,81 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
     if (!obj)
       obj = GetKernelObject(Handle);
     if (!obj) { g_ppcContext->r3.u32 = STATUS_INVALID_HANDLE; return STATUS_INVALID_HANDLE; }
+    // F-589: the wait-side twin of RELSEMA-RES. handle = hostPtr - 0x100000000,
+    // so this is directly comparable with the release side's `sem=` field: one
+    // handle must resolve to ONE pointer on both sides, or a permit released on
+    // one object is invisible to a waiter parked on the other. Bounded.
+    {
+      static std::atomic<uint32_t> s_waitRes{0};
+      const uint32_t wn = s_waitRes.fetch_add(1) + 1;
+      if (wn <= 60 || (wn % 500) == 0) {
+        MCLA_LOG_WARN("WAITRES #{} handle={:08X} obj={} to={}ms tid={:08X} "
+                      "lr={:08X}",
+                      wn, Handle, static_cast<const void *>(obj), timeout,
+                      GetCurrentThreadId(),
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      }
+    }
+    // F-609: `obj->Wait(timeout)` drops `Alertable` entirely, because
+    // KernelObject::Wait(uint32_t) (xdm.h:40-44) has no such parameter. Worse,
+    // that base body is `assert(false && "Wait not implemented..."); return
+    // STATUS_TIMEOUT;` - compiled out under /DNDEBUG (defined in
+    // build/compile_commands.json), so an object type that never overrode Wait
+    // silently answered STATUS_TIMEOUT, which is a SUCCESS status meaning
+    // "waited and expired". A caller that ignores the status cannot tell a real
+    // timeout from an unimplemented wait, and the title parks on INFINITE
+    // timeouts, so that fake is a live hang, not a cosmetic one.
+    //
+    // Alertable is not plumbed, because plumbing it means changing the virtual
+    // KernelObject::Wait signature (src/kernel/xdm.h, not ours) and giving every
+    // override an APC-delivery path. Stated plainly instead: it is
+    // UNIMPLEMENTED, and both facts are now visible to a caller and to a census
+    // rather than dropped on the floor.
+    if (Alertable) {
+      static std::atomic<uint32_t> s_alertable{0};
+      const uint32_t an = s_alertable.fetch_add(1) + 1;
+      if (an <= 40 || (an % 500) == 0)
+        MCLA_LOG_WARN("WAIT-ALERTABLE #{} alertable={} is UNIMPLEMENTED "
+                      "(KernelObject::Wait has no Alertable, xdm.h:40-44) - "
+                      "parking non-alertable; guest APC delivery will be missed. "
+                      "handle={:08X} tid={:08X} lr={:08X}",
+                      an, Alertable, Handle, GetCurrentThreadId(),
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+
+    // Wait-implementing types, all `final` so typeid is an exact discriminator:
+    // Event (kernel_objects.h:42), Semaphore (:129), FileObject (:216),
+    // SectionObject (:233), GuestThreadHandle (guest_thread.h:48). A MISS here
+    // is refused, never faked - the failure direction is a visible refusal, not
+    // a silent STATUS_TIMEOUT. Extend this list when a type overrides Wait.
+    //
+    // F-609 PORT BATCH, 2026-09-29: Mutant (port_kobj.h:174) ADDED. This is not
+    // cosmetic. NtCreateMutant in src/kernel/port_kobj.cpp:1690 is REAL and
+    // returns a real object with a real guest handle, and Mutant::Wait
+    // (port_kobj.cpp:222) is a real Win32-recursive-mutex state machine ported
+    // from Xenia threading_win.cc:269-277 -- but without this entry a guest that
+    // parked on one would have been refused with STATUS_INVALID_HANDLE and
+    // would never have reached Wait, so the state machine would have been
+    // unreachable code. src/kernel/port_kobj.h:37 and port_kobj.cpp:1686 both
+    // name this line as a required integration edit.
+    const bool waitImplemented =
+        typeid(*obj) == typeid(Event) || typeid(*obj) == typeid(Semaphore) ||
+        typeid(*obj) == typeid(FileObject) ||
+        typeid(*obj) == typeid(SectionObject) ||
+        typeid(*obj) == typeid(Mutant) ||
+        typeid(*obj) == typeid(GuestThreadHandle);
+    if (!waitImplemented) {
+      static std::atomic<uint32_t> s_noWait{0};
+      const uint32_t nn = s_noWait.fetch_add(1) + 1;
+      MCLA_LOG_WARN("WAIT-UNIMPLEMENTED #{} handle={:08X} type={} does not "
+                    "override KernelObject::Wait -> refused with "
+                    "STATUS_INVALID_HANDLE (was a silent STATUS_TIMEOUT) "
+                    "tid={:08X} lr={:08X}",
+                    nn, Handle, typeid(*obj).name(), GetCurrentThreadId(),
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      return STATUS_INVALID_HANDLE;
+    }
+
     const uint32_t st = obj->Wait(timeout);
     LogDwellHistogramNT(st);
     {
@@ -656,44 +1848,175 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
     }
     return st;
   } else {
-    assert(false && "Unrecognized handle value.");
+    // F-609: this was `assert(false && "Unrecognized handle value.");` and then
+    // FELL THROUGH to `return STATUS_TIMEOUT`. /DNDEBUG is defined in
+    // build/compile_commands.json, so the assert was compiled out and the
+    // unrecognised-handle path silently reported STATUS_TIMEOUT - a SUCCESS
+    // status meaning "waited, then expired". A guest waiting INFINITE on a
+    // handle we do not own was told "timed out" instead of "invalid handle",
+    // and nothing in the log said so. The assert also asserted on a
+    // guest-supplied value, which is never a valid thing to do.
+    //
+    // Now a real refusal: STATUS_INVALID_HANDLE, with a bounded named marker so
+    // a soak can count how often the title waits on a handle we do not own.
+    static std::atomic<uint32_t> s_badHandle{0};
+    const uint32_t bn = s_badHandle.fetch_add(1) + 1;
+    if (bn <= 40 || (bn % 500) == 0)
+      MCLA_LOG_WARN("WAIT-BADHANDLE #{} handle={:08X} to={}ms is not a "
+                    "resolvable kernel object -> STATUS_INVALID_HANDLE (was a "
+                    "silent STATUS_TIMEOUT) tid={:08X} lr={:08X}",
+                    bn, Handle, timeout, GetCurrentThreadId(),
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    g_ppcContext->r3.u32 = STATUS_INVALID_HANDLE;
+    LogDwellHistogramNT(STATUS_INVALID_HANDLE);
+    return STATUS_INVALID_HANDLE;
   }
-
-  LogDwellHistogramNT(STATUS_TIMEOUT);
-  return STATUS_TIMEOUT;
+  // F-609: the trailing `LogDwellHistogramNT(STATUS_TIMEOUT); return
+  // STATUS_TIMEOUT;` used to be the silent fall-through for an unrecognised
+  // handle. Both arms now return, so it is unreachable and was deleted rather
+  // than left as a second, differently-bad answer to the same question.
 }
+
+// ---------------------------------------------------------------------------
+// NtWriteFile -- F-609, REFUSED HONESTLY. This was the single worst
+// success-without-work in the file. It read:
+//
+//   auto bufferAddr = guestMem.MapVirtual(buffer);   // resolve the buffer...
+//   ...
+//   if (ioStatus) { ioStatus->Status.set(STATUS_SUCCESS);
+//                   ioStatus->Information.set(length); }   // ...then lie
+//   return STATUS_SUCCESS;
+//
+// The buffer was resolved and DISCARDED. It returned STATUS_SUCCESS and told
+// the guest `length` bytes were written, having written NONE. A title that
+// saved a file and was told it succeeded was left holding a file of exactly
+// the right length full of whatever was there before -- the worst possible
+// failure mode, because the caller has no way to detect it.
+//
+// WHY REFUSAL AND NOT IMPLEMENTATION. Xenia implements it for real
+// (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:354-430), but its
+// last act is `file->Write(...)` -> `XFile::Write` ->
+// `file_->WriteSync(...)` (.research/xenia/src/xenia/kernel/xfile.cc:239-250).
+// THIS VFS HAS NO WRITE PATH TO CALL. src/fs/vfs_rpf.h:82-89 exposes exactly:
+// OpenFile, ReadFile, ReadFileAt, CloseFile, SeekFile, ListDirectory, Exists,
+// GetFileSize, IsDirectory, IsVirtualPath, GuestToVirtualPath -- there is no
+// WriteFile and no WriteFileAt, on the class or anywhere in the interface.
+// Adding one means editing src/fs/**, which is owned by another agent right
+// now, so it is out of scope here BY OWNERSHIP, not by difficulty. Writing a
+// parallel write path in this file would violate the one-owner-per-address
+// rule (AGENTS.md rule 4) with a second writer on the same VFS objects.
+//
+// THE STATUS, and why this one. STATUS_ACCESS_DENIED (0xC0000022). It is what
+// real hardware returns for a title writing to the DVD/HDD, and it is the
+// truthful answer here: this host does not implement guest file writes. Not
+// STATUS_SUCCESS (the lie), not STATUS_NOT_IMPLEMENTED (which claims the
+// REQUEST is malformed, and the request is fine), and not STATUS_INVALID_HANDLE
+// (the handle may well be a real VFS handle -- NtReadFile proves we resolve
+// exactly these FileObjects).
+//
+// `Information` IS SET TO 0, never to `length`. That is not a style choice: it
+// is Xenia's own failure path, verbatim --
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:419-422
+//     if (XFAILED(result) && io_status_block) {
+//       io_status_block->status = result;
+//       io_status_block->information = 0;
+//     }
+// A guest that reads Information and does not check Status would still be
+// correct here, because a refused write transferred zero bytes.
+//
+// NOT SIGNALLED: the completion `event` is deliberately NOT Set() on the
+// refusal path. Signalling an event for an I/O that did not happen is the same
+// defect one layer up. The guest stays parked on its write event and says so in
+// the log, which is the true state of the world.
+// ---------------------------------------------------------------------------
+namespace {
+// Not in src/kernel/xbox.h:412-451, so declared here rather than in a header
+// another agent may be reading. The value is the NTSTATUS the Xbox 360 kernel
+// returns for a denied write.
+constexpr uint32_t kStatusAccessDenied = 0xC0000022u;
+std::atomic<uint64_t> g_nfsWriteSeen{0};
+std::atomic<uint64_t> g_nfsWriteRefused{0};
+std::atomic<uint64_t> g_nfsWriteEmpty{0};
+} // namespace
 
 uint32_t NtWriteFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
                      uint32_t apcContext, XIO_STATUS_BLOCK *ioStatus,
                      void *buffer, uint32_t length, be<uint64_t> *byteOffset,
                      uint32_t *key) {
-  (void)handle;
-  (void)event;
   (void)apcRoutine;
   (void)apcContext;
   (void)key;
   (void)byteOffset;
 
+  const uint64_t seen =
+      g_nfsWriteSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  // A ZERO-LENGTH WRITE IS REAL WORK, and zero bytes is the correct and
+  // complete answer for it. Xenia's handle checks come first
+  // (xboxkrnl_io.cc:363-372), so a bad handle is still a bad handle here;
+  // but a 0-length write against a handle we do not own must not be reported
+  // as a success either, so it is checked, not waved through.
   if (buffer == nullptr || length == 0) {
-    if (ioStatus)
-      ioStatus->Status.set(STATUS_SUCCESS);
-    return STATUS_SUCCESS;
+    bool resolvable = false;
+    if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle)) {
+      KernelObject *o = GetKernelObject(handle);
+      resolvable = (o != nullptr && o->IsValid());
+    }
+    if (resolvable) {
+      g_nfsWriteEmpty.fetch_add(1, std::memory_order_relaxed);
+      if (ioStatus) {
+        ioStatus->Status.set(STATUS_SUCCESS);
+        ioStatus->Information.set(0); // 0 bytes requested == 0 bytes written
+      }
+      return STATUS_SUCCESS;
+    }
+    g_nfsWriteRefused.fetch_add(1, std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 200) == 0) {
+      MCLA_LOG_WARN("NFS-WRITE #{} h={:08X} len=0 -> STATUS_INVALID_HANDLE "
+                    "(0-length write on a handle we do not own)",
+                    seen, handle);
+    }
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INVALID_HANDLE);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INVALID_HANDLE;
   }
 
+  // Resolve the buffer only to REPORT it, never to claim the write happened.
+  // No bytes are copied to any VFS object and none are dropped on the floor
+  // pretending otherwise.
   auto &guestMem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t bufferAddr = guestMem.MapVirtual(buffer);
-  void *hostPtr = (bufferAddr != 0) ? guestMem.Translate(bufferAddr) : nullptr;
-  if (!hostPtr) {
-    if (ioStatus)
-      ioStatus->Status.set(0xC0000005);
-    return 0xC0000005;
+  const bool bufferOk = (bufferAddr != 0) && (guestMem.Translate(bufferAddr) != nullptr);
+
+  FileObject *fileObj = nullptr;
+  if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle)) {
+    KernelObject *o = GetKernelObject(handle);
+    if (o && o->IsValid())
+      fileObj = dynamic_cast<FileObject *>(o);
+  }
+
+  g_nfsWriteRefused.fetch_add(1, std::memory_order_relaxed);
+  if (seen <= 8 || (seen % 200) == 0) {
+    const uint32_t glr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    MCLA_LOG_WARN(
+        "NFS-WRITE #{} h={:08X} len={} buf={:08X} bufReadable={} "
+        "vfsFile={} -> REFUSED STATUS_ACCESS_DENIED (0xC0000022), 0 bytes "
+        "written, Information=0, completion event h={:08X} NOT signalled "
+        "(was: STATUS_SUCCESS + Information=len with nothing written) "
+        "seen={} refused={} empty={} glr={:08X}",
+        seen, handle, length, bufferAddr, bufferOk ? 1 : 0, fileObj ? 1 : 0,
+        event, seen, g_nfsWriteRefused.load(std::memory_order_relaxed),
+        g_nfsWriteEmpty.load(std::memory_order_relaxed), glr);
   }
 
   if (ioStatus) {
-    ioStatus->Status.set(STATUS_SUCCESS);
-    ioStatus->Information.set(length);
+    ioStatus->Status.set(kStatusAccessDenied);
+    ioStatus->Information.set(0);
   }
-  return STATUS_SUCCESS;
+  return kStatusAccessDenied;
 }
 
 void vsprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
@@ -774,6 +2097,7 @@ constexpr uint32_t kXMemReset = 0x00080000;
 constexpr uint32_t kXMemTopDown = 0x00100000;
 constexpr uint32_t kXMemNozero = 0x00800000;
 constexpr uint32_t kXMemLargePages = 0x20000000;
+constexpr uint32_t kXPageNoAccess = 0x00000001;
 constexpr uint32_t kXPageReadonly = 0x00000002;
 constexpr uint32_t kXPageReadWrite = 0x00000004;
 
@@ -797,6 +2121,195 @@ void LogVirtualAlloc(const char *api, uint32_t baseIn, uint32_t baseOut,
         api, n, baseIn, baseOut, size, type, status,
         static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
   }
+}
+
+// Resolve a guest handle to a real kernel-object wrapper, or nullptr.
+//
+// F-609-BOOTCRASH (build/w657.log 19:19:22, boot worker tid 21620): this
+// resolver was reached with handle = 0xFFFFFFFE and then died on the first
+// guest read. 0xFFFFFFFE is CURRENT_THREAD_HANDLE (guest_thread.h:14,
+// `uint32_t(-2)`) - the XOS idiom for "my own KTHREAD" - so the title asking
+// for its own thread is what killed the boot, not wild memory.
+//
+// Measured chain, resolved against build/mcla.map from the SAME build as the
+// log (rva 0x24dc00 = ResolveKernelObjectSafe, xdm.h inlined into it):
+//   0x24dc0b  cmp eax,0x1001 / jb          handle < 0x1000  -> refused
+//   0x24dc14  call IsKernelObject         (xdm.cpp:32)    -> TRUE
+//   0x24dc27  call GuestMemoryHeap::Translate (memory.cpp:285) -> 0x1FFFFFFFE
+//   0x24dc2f  je  <null>                  non-null, so NOT refused
+//   0x24dc37  call TryQueryKernelObject   (xdm.h:186)     -> nullptr
+//   0x24dc42  cmove rsi,rdi               rsi = the raw guest pointer
+//   0x24dc49  call IsInvalidKernelObject  (xdm.cpp:46)    -> false
+//   0x24dc5d  cmp dword ptr [rsi+0x10],0x584f4258        *** C0000005 ***
+// w657.log's own register dump agrees: rdi=rsi=0x1fffffffe, rdx=0xffffffff.
+//
+// THE ARITHMETIC - this corrects the "double translation" reading of
+// 0x20000000e. There is no second translation; the high '2' is a carry:
+//   0xFFFFFFFE                    the handle, an ordinary guest uint32
+// + 0x100000000                   kBaseAddress (memory.h:18)
+// = 0x1FFFFFFFE                   Translate's result. IN bounds: the last 2
+//                                 bytes of the 4 GiB window, which is why
+//                                 Translate's `guestAddr >= m_size` test
+//                                 (memory.cpp:287) cannot reject it
+// + 0x10                          offsetof(XDISPATCHER_HEADER,
+//                                 WaitListHead.Flink) - the OBJECT_SIGNATURE
+//                                 compare, folded in from
+//                                 KernelObject::IsValid() (xdm.h:46)
+// = 0x20000000E                   14 bytes PAST the window -> AV
+// No sign extension is involved: `mov esi,ecx` (0x24dc06) zero-extends, and
+// r3=0xFFFFFFFE is the title's real -2, not a widened 32-bit value.
+//
+// ROOT CAUSE: all three guards range-check the ADDRESS, never the OBJECT.
+// ResolveKernelObjectSafe and IsKernelObject both rejected only the single
+// sentinel 0xFFFFFFFF BY EQUALITY, and Translate's bounds test is vacuous for a
+// 4 GiB window (every uint32 is "in range"). So the top 16 bytes of the window
+// - the invalid-handle class 0xFFFFFFF0..0xFFFFFFFF, which CONTAINS
+// CURRENT_THREAD_HANDLE - reached a dereference.
+//
+// THE FIX: test the object extent, not the address. A handle may only name a
+// kernel object if a whole XDISPATCHER_HEADER fits inside the window:
+//     handle + sizeof(XDISPATCHER_HEADER) < kSize
+// That rejects the whole 17-value invalid-handle class
+// 0xFFFFFFF0..0xFFFFFFFF - which CONTAINS CURRENT_THREAD_HANDLE - in one
+// deterministic place, needs no new knowledge of the title, and leaves every
+// legitimate handle untouched: the highest handle in w657.log is C65C6880, three
+// orders of magnitude below the class.
+//
+// The 4 KiB null-guard rejection is KEPT (it is the other half of the same
+// window and is the protection this function exists to provide): the NOACCESS
+// page memory.cpp:218 installs, which IsValid rejects at :321-322, so a handle
+// in [1, 0x1000) would fault on the very first field read.
+//
+// The signature proof is now CHECKED and endian-explicit, not a blind host
+// dereference of guest memory: GetKernelObject's raw fallback (xdm.h:72-77)
+// returns `reinterpret_cast<KernelObject*>(Translate(h))`, and calling IsValid()
+// on that is both a reinterpret_cast on guest data and literally the faulting
+// instruction. It reads the same bytes - be<uint32_t> stores byte-swapped
+// (xbox.h:64-72), so the BE read and the old host load agree on 'XBOX' - but
+// cannot fault: IsValid's `end > m_size` test (memory.cpp:327-329) plus a
+// __try guard (memory.cpp:81-89).
+//
+// The Flink ADDRESS is not the same on the two resolution paths, and assuming it
+// is would be the same bug wearing a different hat: `KernelObject` is
+// polymorphic (virtual dtor, xdm.h:30), so a HOST wrapper carries a vptr and its
+// dispatcher header begins at +8 - `handle + 0x10` is precisely the faulting
+// instruction - whereas raw guest memory has no vptr, so `XDISPATCHER_HEADER`
+// begins at +0 and Flink is at +8. So each path uses the read that is correct
+// for the kind of object it actually has; see (3) below.
+KernelObject *ResolveKernelObjectSafe(uint32_t handle) {
+  using HeapT = mcla::kernel::GuestMemoryHeap;
+
+  // (1) 4 KiB PAGE_NOACCESS null guard: memory.cpp:218 installs it and IsValid
+  //     rejects < 4096 at :321-322.
+  if (handle == 0 || handle < 0x1000u)
+    return nullptr;
+
+  // (2) ROOT FIX: the object must fit, not merely the address. This is what
+  //     CURRENT_THREAD_HANDLE (0xFFFFFFFE) and the invalid sentinel
+  //     (0xFFFFFFFF) fail; no dereference happens for any of them. `>=` rather
+  //     than `>` so the WHOLE 17-value class 0xFFFFFFF0..0xFFFFFFFF is rejected
+  //     here, in one place, deterministically - and so every handle that
+  //     survives has handle + 16 < kSize, which makes the read in (3) in-bounds
+  //     by construction rather than by luck.
+  if (static_cast<uint64_t>(handle) + sizeof(XDISPATCHER_HEADER) >=
+      HeapT::kSize)
+    return nullptr;
+
+  if (!IsKernelObject(handle))
+    return nullptr;
+  // `raw` is what GetKernelObject starts from (xdm.h:72) and the address every
+  // guest-visible read below is expressed against. It is kept as an explicit
+  // precondition rather than left implicit: the handle must be translatable
+  // before anything consults the identity map, so that a heap which is not
+  // initialised (Translate returns nullptr, memory.cpp:478-479) cannot reach a
+  // registry comparison. GetKernelObject would return nullptr for it anyway
+  // (xdm.h:73), so this adds no new rejection - it only keeps the ordering
+  // stated instead of assumed.
+  void *raw = HeapT::Instance().Translate(handle);
+  auto *o = GetKernelObject(handle);
+  if (!raw || !o || IsInvalidKernelObject(o))
+    return nullptr;
+
+  // (3) OBJECT_SIGNATURE proof, replacing `!o->IsValid()`. The two kinds of
+  //     object need DIFFERENT reads and conflating them is the bug being fixed:
+  //
+  //       * a registered HOST wrapper: `o` is a real KernelObject, so
+  //         `o->IsValid()` (xdm.h:46) is a legitimate host read of
+  //         `header.WaitListHead.Flink`. The vptr that `virtual
+  //         ~KernelObject` (xdm.h:30) places first is already accounted for by
+  //         the compiler: that read is at wrapper+0x10, which is precisely the
+  //         faulting instruction (`cmp dword ptr [rsi+0x10],0x584f4258`,
+  //         build/mcla.map rva 0x24dc5d).
+  //       * the raw fallback (xdm.h:77): `o` is GUEST MEMORY, so no host method
+  //         may be called on it - that is a reinterpret_cast on guest data, and
+  //         a dereference, and it is the C0000005. Prove it with a CHECKED,
+  //         endian-explicit BE read of the same field instead. Guest memory has
+  //         no vptr, so XDISPATCHER_HEADER starts at +0 and Flink is at
+  //         handle + offsetof(...). be<uint32_t> stores byte-swapped
+  //         (xbox.h:64-72), so the BE read yields the same value the host load
+  //         would have, and ReadU32BE cannot fault (memory.cpp:327-329 + __try).
+  //
+  // Note offsetof is deliberately NOT used on KernelObject: it is not
+  // standard-layout, and clang rejects it with -Winvalid-offsetof (measured on
+  // exactly that line). Reading the member instead of offsetting the handle
+  // keeps the vptr arithmetic in the compiler.
+  //
+  // HOW THE TWO KINDS ARE TOLD APART - registry membership, not pointer equality.
+  // The test that used to stand here was `o != raw`, i.e. "did GetKernelObject
+  // hand back something other than the raw cast". That question cannot be
+  // answered by comparing the two pointers, because for EVERY object this
+  // kernel mints they are the same pointer: the handle IS MapVirtual(obj)
+  // (xdm.cpp:19-23, xdm.h:130), and Translate(MapVirtual(p)) == p for any p
+  // inside the window (memory.cpp:476-481 composed with :490-500). So `o != raw`
+  // was FALSE for our own host wrappers, they were routed into the raw-guest
+  // branch, that branch read offsetof(WaitListHead.Flink) = 8 bytes past the
+  // handle - which is inside the vptr - and a good object was rejected. It was
+  // equally FALSE for real guest memory, so the one test had to mean two
+  // opposite things and could only ever be right about one of them.
+  //
+  // This is not an exotic handle. Measured on the handles the boot actually
+  // passes: NtCreateFile's own "opened, handle={:08X}" rows in build/w719.log
+  // and build/w720.log are B7321280 / B7322280 / B7323280 / B7328280 / B733B280,
+  // and those are exactly the handles the read-path census prints - they are
+  // host objects living in the physical arena, because :1539 allocates the
+  // FileObject in the guest physical heap precisely so the handle round-trips
+  // through Translate(). Translate(B7321280) = 0x1B7321280 = the object, so
+  // `o == raw` for every one of them, and at +8 there is header.Lock, not
+  // Flink: the low byte is the Type the object was created with, and read
+  // big-endian it is 0x16000000, which is not OBJECT_SIGNATURE. The real 'XBOX'
+  // is at +0x10, because the vptr `virtual ~KernelObject` (xdm.h:30) places
+  // first pushes the header down by 8.
+  //
+  // WrapperIdentityMap answers the question soundly, and soundly in BOTH
+  // directions: both of its insertion points (CreateRegisteredKernelObject
+  // xdm.h:134, QueryKernelObject xdm.h:174) store a pointer produced by
+  // CreateKernelObject, so a member is always a HOST object, and a handle that
+  // is not a member is guest memory by definition. The comparison is against
+  // the map's object rather than a bare membership test so that a stale or
+  // replaced entry cannot promote a raw cast: the host read is only legal when
+  // `o` IS the registered wrapper.
+  //
+  // No address-shaped test can replace this, and that is the point: for our own
+  // objects guest VA H and host pointer Translate(H) name ONE object - the same
+  // bytes - because the guest is handed the wrapper's own guest VA as its
+  // handle. "Where did this pointer come from" is not a property of the address.
+  // Conversely this WIDENS nothing: each arm still demands OBJECT_SIGNATURE at
+  // its own offset, and the two arms are the same two as before, only routed by
+  // a discriminator that is true. Probing both offsets and accepting either
+  // would be a widening and is refused: a guest page that happens to spell 'XBOX'
+  // at +0x10 would then be handed to dynamic_cast as a host object.
+  const bool isHostWrapper = (LookupIdentityKernelObject(handle) == o);
+  if (isHostWrapper) {
+    if (!o->IsValid())
+      return nullptr;
+  } else {
+    uint32_t sig = 0;
+    if (!HeapT::Instance().ReadU32BE(
+            handle + offsetof(XDISPATCHER_HEADER, WaitListHead.Flink), &sig) ||
+        sig != OBJECT_SIGNATURE)
+      return nullptr;
+  }
+  return o;
 }
 } // namespace
 
@@ -871,14 +2384,171 @@ uint32_t NtCreateEvent(be<uint32_t> *handle, void *objAttributes,
   return 0;
 }
 
-uint32_t XexCheckExecutablePrivilege() {
-  // Returns 1 if the executable has the required privilege (signed, valid
-  // signature, etc.) For dev mode: always return success so the game proceeds
-  // past the XEX check
+// XexCheckExecutablePrivilege -- F-609, and the verdict here is DELIBERATELY
+// NOT a refusal. Reporting that, with the evidence, because the brief listed it
+// under "return 1; the comment already admits it".
+//
+// IT IS NOT IN THE DEFECT CLASS, and the distinction is the whole answer. The
+// class is "returns a SUCCESS STATUS FOR WORK NOT PERFORMED". This returns a
+// POLICY ANSWER to a query, and the value 1 is a claim about the TITLE, not a
+// completion receipt: nothing was supposed to be written, nothing was written,
+// and the guest has no buffer to have been lied into. A refusal would be
+// strictly worse here -- returning 0 tells the title it lacks a privilege it
+// genuinely needs, and the honest-but-useless answer 0 buys nothing that the
+// current 1 does not already cost.
+//
+// THE CURRENT 1 IS NONETHELESS WRONG, and the reference proves it:
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc:22-39
+//     uint32_t mask = 1 << privilege;
+//     auto module = kernel_state()->GetExecutableModule();
+//     if (!module) { return 0; }
+//     uint32_t flags = 0;
+//     module->GetOptHeader<uint32_t>(XEX_HEADER_SYSTEM_FLAGS, &flags);
+//     return (flags & mask) > 0;
+// It is a real READ of the XEX's XEX_HEADER_SYSTEM_FLAGS opt header
+// (XEX_HEADER_SYSTEM_FLAGS = 0x00030000,
+// .research/xenia/src/xenia/kernel/util/xex2_info.h:299), masked by the
+// privilege BIT POSITION the caller passes. This implementation takes NO
+// ARGUMENT AT ALL and returns 1 for every privilege, so it is provably wrong
+// for every privilege the XEX does not set -- privilege 6
+// (XEX_SYSTEM_INSECURE_SOCKETS, xboxkrnl_modules.cc:27) is the documented
+// example.
+//
+// WHY IT IS NOT FIXED HERE: making it real needs the XEX's system-flags DWORD,
+// and nothing in this tree parses it. The only XEX opt-header reader in
+// .research/xenia is Xenia's own; this file has XexLoadImageHeaders but no
+// opt-header walk, and src/boot_host.cpp (where the XEX is loaded) is owned by
+// another agent right now. Inventing a flags value would be a NEW fabrication
+// on top of the old one, which is worse than the current lie because it would
+// look measured.
+//
+// SO: the value is unchanged, and the fiction is made VISIBLE and COUNTABLE,
+// which is what the stub most lacked -- it had no log line at all, so nothing
+// in any soak said the title depended on this answer.
+uint32_t XexCheckExecutablePrivilege(uint32_t privilege) {
+  static std::atomic<uint64_t> s_seen{0};
+  const uint64_t n = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 8 || (n % 200) == 0) {
+    MCLA_LOG_WARN("XEX-PRIV #{} privilege={} -> 1 (UNCONDITIONAL: the XEX's "
+                  "XEX_HEADER_SYSTEM_FLAGS is not parsed anywhere in this tree, "
+                  "so the real answer is (flags & (1<<privilege)) != 0 per "
+                  "xboxkrnl_modules.cc:22-39 -- this is 1 for every privilege, "
+                  "including ones the XEX does not grant) glr={:08X}",
+                  n, privilege,
+                  g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+  }
   return 1;
 }
 
-void DbgPrint() { LOG_UTILITY("!!! STUB !!!"); }
+// ---------------------------------------------------------------------------
+// DbgPrint -- REAL, F-609 PORT BATCH, 2026-09-29 (integration stream).
+//
+// WAS: `void DbgPrint() { LOG_UTILITY("!!! STUB !!!"); }`. A `void` body means
+// r3 is left equal to the incoming r3, so the guest read its own argument --
+// the format-string pointer -- back as a return value, and nothing was ever
+// printed or counted. Both live properties are fixed here.
+//
+// CONTRACT, from the reference, not from recall. Xenia
+// .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_strings.cc:827-854
+// (DbgPrint_entry):
+//   :828-832  arg 0 is the format pointer; a null one returns
+//             X_STATUS_INVALID_PARAMETER, which is 0xC000000D
+//             (.research/xenia/src/xenia/xbox.h:51) -- the same value this file
+//             already returns from NtCreateFile for the same condition
+//             (imports.cpp NtCreateFile, STATUS_INVALID_PARAMETER).
+//   :835      StackArgList(args, 1) -- firstArg 1, i.e. the first variadic
+//             argument is register ordinal 1, because ordinal 0 is the format
+//             string itself. port_kobj.h:127 names the same convention.
+//   :836-838  StringFormatData over the format, then format_core(..., false).
+//             WIDE IS FALSE here (:838). The wide=true call sites in that file
+//             are :951, :1070, :1144, :1173 (the w* family), not this one.
+//   :839-842  a non-positive character count returns STATUS_SUCCESS.
+//   :844-849  trailing whitespace is trimmed off the end.
+//   :851      the trimmed text is emitted.
+//   :853      STATUS_SUCCESS.
+//
+// The engine is kobjport::FormatCore (port_kobj.h:156, body port_kobj.cpp:599),
+// a faithful port of Xenia format_core (strings.cc:120-683). It is the tree's
+// ONLY format engine and it reads the format string and the 9th-and-beyond
+// arguments through checked, endian-explicit guest memory -- no
+// reinterpret_cast of guest data and no assert on a guest value anywhere in it.
+// The alternative was to leave a stub standing beside a working engine, which
+// is how two engines drift apart, so the wiring was done here instead.
+//
+// SIGNATURE DISCIPLINE: `formatVa` is the RAW GUEST VA handed through r3
+// untouched, not a translated host pointer. ArgTranslator's non-pointer overload
+// (function.h:331) passes an integer argument through unmodified, which is the
+// same discipline src/kernel/port_voice_input.cpp uses throughout, and it is
+// what lets the IsValid() check below be meaningful instead of validating a
+// pointer the framework had already made for us.
+// ---------------------------------------------------------------------------
+uint32_t DbgPrint(uint32_t formatVa) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  // Census, house cadence (first 8, then every 200th), so a soak can count
+  // reachability and distinguish it from a zero.
+  static std::atomic<uint64_t> s_dbgSeen{0};
+  const uint64_t seen = s_dbgSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+  const bool census = (seen <= 8) || ((seen % 200) == 0);
+
+  if (formatVa == 0) {
+    if (census) {
+      MCLA_LOG_WARN("DBGPRINT #{} format=NULL -> STATUS_INVALID_PARAMETER "
+                    "(0xC000000D, xenia xbox.h:51; DbgPrint_entry :829-832) "
+                    "lr={:08X}",
+                    seen,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u));
+    }
+    return 0xC000000Du; // X_STATUS_INVALID_PARAMETER
+  }
+
+  // Checked range test on the GUEST VA before the engine is handed anything. A
+  // bad VA must produce a refusal, never a fault and never a partial write.
+  if (!mem.IsValid(formatVa, 1)) {
+    if (census) {
+      MCLA_LOG_WARN("DBGPRINT #{} format={:08X} is not a readable guest VA -> "
+                    "STATUS_INVALID_PARAMETER (0xC000000D) lr={:08X}",
+                    seen, formatVa,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u));
+    }
+    return 0xC000000Du;
+  }
+
+  kobjport::GuestFormatData data(formatVa);
+  kobjport::GuestStackArgs args(1, mcla::kernel::g_memory.base);
+  const int32_t count = kobjport::FormatCore(data, args, /*wide=*/false);
+
+  if (count <= 0) {
+    // The reference's own early-out (:839-842): an empty or failed format is
+    // not an error, it is nothing to say.
+    if (census && data.formatUnreadable()) {
+      MCLA_LOG_WARN("DBGPRINT #{} count={} the format string was unreadable "
+                    "(guest VA {:08X}) lr={:08X}",
+                    seen, count, formatVa,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u));
+    }
+    return STATUS_SUCCESS;
+  }
+
+  // Trailing-whitespace trim, as Xenia :844-849.
+  std::string text = data.str();
+  const size_t last = text.find_last_not_of(" \t\r\n\f\v");
+  if (last == std::string::npos) {
+    text.clear();
+  } else {
+    text.erase(last + 1);
+  }
+
+  if (census) {
+    MCLA_LOG_INFO("DBGPRINT #{} count={} \"{}\"", seen, count, text);
+  } else if (s_dbgSeen.load(std::memory_order_relaxed) == 9) {
+    // One unconditional line on the 9th call, so a reader can see the marker is
+    // live even if it arrives after the first-8 window.
+    MCLA_LOG_INFO("DBGPRINT reached guest DbgPrint; further lines are sampled "
+                  "every 200th (marker DBGPRINT, counter in this function)");
+  }
+  return STATUS_SUCCESS;
+}
 
 void __C_specific_handler_x() { LOG_UTILITY("!!! STUB !!!"); }
 
@@ -971,7 +2641,133 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable,
   return STATUS_SUCCESS;
 }
 
-void ExFreePool() { LOG_UTILITY("!!! STUB !!!"); }
+// ---------------------------------------------------------------------------
+// ExFreePool(base_address) -- F-609, made REAL. Was `void ExFreePool() {
+// LOG_UTILITY("!!! STUB !!!"); }`: no parameters (so the hook never read r3),
+// no free, and a 15-frees-against-79,985-allocations shape in every soak.
+//
+// THE CONTRACT IS XENIA'S, cited, and it is one line:
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_memory.cc:604-607
+//     void ExFreePool_entry(lpvoid_t base_address) {
+//       kernel_state()->memory()->SystemHeapFree(base_address);
+//     }
+// i.e. a VOID function whose only argument is the base address the matching
+// ExAllocatePoolTypeWithTag returned. The argument is r3: unlike the NetDll
+// family (see the note above NetDll_WSAStartup) xboxkrnl exports take no
+// leading selector, and the sibling allocation side in this same file
+// (ExAllocatePoolTypeWithTag, below) is hooked with four typed parameters and
+// works, which is the cross-check.
+//
+// THE COUNTERPART IS THIS FILE, not Xenia. `kernel_memory()->SystemHeapFree`
+// has no analogue here, so the pool this frees from is the one
+// ExAllocatePoolTypeWithTag (below) actually allocates from:
+//   g_userHeap.Alloc(n)  ->  GuestMemoryHeap::MapVirtual(ptr)
+// so the free is g_userHeap.Free() of the translated guest VA. Xenia's size
+// question does not arise and NO size is invented, for the same reason the
+// XTL free above does not invent one: Heap::Free never reads a size
+// (src/kernel/memory.cpp:346) and the footprint is recovered host-side from
+// the o1heap fragment header by Heap::Free itself.
+//
+// ORDER OF ARENAS IS THE LOAD-BEARING DETAIL and it is the OPPOSITE of the
+// XTL free above. XTL blocks come from GuestMemoryHeap::Alloc ->
+// g_userHeap.AllocPhysical, so __xtl_free probes phys first. THIS pool is
+// g_userHeap.Alloc (the user arena), so the user arena is probed FIRST and
+// phys second. Both arenas are probed, because ExAllocatePoolTypeWithTag is not
+// the only producer of guest-visible pool blocks, and a wrong-arena free is a
+// corruption, not a leak.
+//
+// SAFETY, which matters more here than in most: every guest-controlled value
+// is validated by the heap's OWN predicate (Heap::IsLiveAllocation,
+// src/kernel/heap.h:57) BEFORE anything is handed back. If the register decode
+// were wrong, or the pointer were foreign, interior, or already freed, the
+// probe refuses and this becomes a counted refusal -- it can never reach
+// o1heapFree. No assert on a guest value (asserts are compiled out under
+// /DNDEBUG, src/kernel/function.h:145 etc.).
+// ---------------------------------------------------------------------------
+namespace {
+// F-609: attempts are counted separately from honoured frees and from refused
+// frees, so a soak can distinguish "the title never calls ExFreePool" from
+// "the title calls it and we turn it away". That distinction is the whole
+// measurement, and the old stub could produce neither number.
+std::atomic<uint64_t> g_xpoolFreeSeen{0};
+std::atomic<uint64_t> g_xpoolFreeOk{0};
+std::atomic<uint64_t> g_xpoolFreeRej{0};
+} // namespace
+
+void ExFreePool(uint32_t baseAddress) {
+  const uint64_t seen =
+      g_xpoolFreeSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  // Below the 4 KiB null guard: guest 0, or the PAGE_NOACCESS window. Freed
+  // nothing; say so rather than silently succeeding on a nonsense address.
+  if (baseAddress == 0 || baseAddress < 4096u) {
+    g_xpoolFreeRej.fetch_add(1, std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 200) == 0) {
+      MCLA_LOG_WARN("XPOOL-FREE #{} base={:08X} -> refused: below the 4 KiB null "
+                    "guard (guest 0 or the PAGE_NOACCESS window); no free "
+                    "performed",
+                    seen, baseAddress);
+    }
+    return;
+  }
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  void *host = mem.Translate(baseAddress);
+  if (host == nullptr) {
+    g_xpoolFreeRej.fetch_add(1, std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 200) == 0) {
+      MCLA_LOG_WARN(
+          "XPOOL-FREE #{} base={:08X} -> refused: not inside the guest window; "
+          "no free performed",
+          seen, baseAddress);
+    }
+    return;
+  }
+
+  // Validate with the heap's own predicate so "honoured" is counted under the
+  // same rule Heap::Free will apply, not a second weaker copy of it.
+  // IsLiveAllocation is [[nodiscard]] and cannot fault: it range-checks,
+  // alignment-checks, then reads a 32-byte header it has already proved in
+  // bounds. This pool is the USER arena (see the note above), so user is first.
+  Heap::LiveProbe probe{};
+  const bool usr = g_userHeap.IsLiveAllocation(
+      g_userHeap.heapArenaBase, g_userHeap.heapArenaSize, host, &probe);
+  const bool phys =
+      !usr && g_userHeap.IsLiveAllocation(g_userHeap.physArenaBase,
+                                          g_userHeap.physArenaSize, host, &probe);
+
+  if (!usr && !phys) {
+    g_xpoolFreeRej.fetch_add(1, std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 200) == 0) {
+      const uint32_t glr =
+          g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+      MCLA_LOG_WARN("XPOOL-FREE #{} base={:08X} -> REFUSED reason={} bytes "
+                    "kept (no free performed) seen={} ok={} rej={} glr={:08X}",
+                    seen, baseAddress, XtlFreeProbeReason(probe.reason), seen,
+                    g_xpoolFreeOk.load(std::memory_order_relaxed),
+                    g_xpoolFreeRej.load(std::memory_order_relaxed), glr);
+    }
+    return;
+  }
+
+  // Hand it back. The size argument is unused (src/kernel/memory.cpp:346) and
+  // is passed as 0 to say so rather than to invent a size; Heap::Free
+  // re-probes and AcctFrees probe.size -- the same unit AcctAlloc added.
+  mem.Free(baseAddress, 0);
+
+  g_xpoolFreeOk.fetch_add(1, std::memory_order_relaxed);
+  if (seen <= 8 || (seen % 200) == 0) {
+    const uint32_t glr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    MCLA_LOG_WARN("XPOOL-FREE #{} base={:08X} -> HONOURED frag={:#x} arena={} "
+                  "seen={} ok={} rej={} glr={:08X}",
+                  seen, baseAddress, probe.size, usr ? "user" : "phys", seen,
+                  g_xpoolFreeOk.load(std::memory_order_relaxed),
+                  g_xpoolFreeRej.load(std::memory_order_relaxed), glr);
+  }
+  // void: there is no status to return, so there is no success claim left to
+  // launder. The marker is the whole result surface.
+}
 
 // NtQueryInformationFile: real typed implementation lives above (near
 // NtCreateFile) - it answers X_FILE_STANDARD_INFORMATION with true sizes.
@@ -981,59 +2777,515 @@ void ExFreePool() { LOG_UTILITY("!!! STUB !!!"); }
 // which is exactly why packfile loading reported "Cannot load archive" without
 // a single read. All three are typed + hooked now.
 
+// X_FILE_FS_INFORMATION_CLASS values for the 360 (Xenia
+// .research/xenia/src/xenia/kernel/info/volume.h:18-23 - the same enumeration
+// the reference dispatch uses):
+//   1 XFileFsVolumeInformation, 3 XFileFsSizeInformation,
+//   4 XFileFsDeviceInformation, 5 XFileFsAttributeInformation.
+namespace {
+constexpr uint32_t kXFileFsVolumeInformation = 1;
+constexpr uint32_t kXFileFsSizeInformation = 3;
+constexpr uint32_t kXFileFsDeviceInformation = 4;
+constexpr uint32_t kXFileFsAttributeInformation = 5;
+
+// Minimum buffer the reference requires per class
+// (xboxkrnl_io_info.cc:264-278). 0 == class unknown.
+constexpr uint32_t VolumeInfoMinimumLength(uint32_t infoClass) {
+  switch (infoClass) {
+    case kXFileFsVolumeInformation:
+      return 24; // X_FILE_FS_VOLUME_INFORMATION, volume.h:28-36
+    case kXFileFsSizeInformation:
+      return 24; // X_FILE_FS_SIZE_INFORMATION,    volume.h:39-44
+    case kXFileFsDeviceInformation:
+      return 8;
+    case kXFileFsAttributeInformation:
+      return 16; // X_FILE_FS_ATTRIBUTE_INFORMATION, volume.h:48-55
+    default:
+      return 0;
+  }
+}
+} // namespace
+
+// NtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation,
+//                              FsInformationLength, FsInformationClass).
+//
+// F-609: this used to zero 64 bytes and return STATUS_SUCCESS for EVERY
+// handle and EVERY class - the game could not tell a mounted volume from a
+// disassembled one. Structure/limits now follow the reference
+// (xboxkrnl_io_info.cc:280-356) exactly:
+//
+//   class 1 VOLUME      -> real: our single mount has no creation time, no
+//                          serial number and no label, so all three are 0.
+//   class 3 SIZE        -> HONEST-FAIL. RpfVirtualFileSystem keeps no
+//                          allocation-unit accounting at all (vfs_rpf.h:39-101
+//                          has no size/free fields, and nothing in src/ calls
+//                          space()/GetDiskFreeSpace), so total/available
+//                          allocation units cannot be answered. STATUS_NOT_
+//                          SUPPORTED, logged, rather than a fabricated 0 that
+//                          reads as "the volume is empty".
+//   class 4 DEVICE      -> HONEST-FAIL STATUS_NOT_SUPPORTED (reference asserts
+//                          on it too, xboxkrnl_io_info.cc:341-347).
+//   class 5 ATTRIBUTE   -> real: the mount is a read-only path index with no
+//                          object support, which is what attributes=0,
+//                          component_name_max_length=0, name_length=0 says.
+//   anything else       -> STATUS_INVALID_INFO_CLASS (reference, :284-286).
+//   bad/short buffers   -> STATUS_INFO_LENGTH_MISMATCH (reference, :288-290).
+//   non-file handle     -> STATUS_INVALID_HANDLE (reference, :292-295).
 uint32_t NtQueryVolumeInformationFile(uint32_t handle,
                                       XIO_STATUS_BLOCK *ioStatus, void *fsInfo,
                                       uint32_t length, uint32_t infoClass) {
-  (void)handle;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-  MCLA_LOG_INFO("NtQueryVolumeInformationFile: class={} len={}", infoClass,
-                length);
-  if (fsInfo) {
-    // zero-filled volume info = "empty fixed volume"; refine per class when
-    // boot proves it matters
-    const uint32_t addr = mem.MapVirtual(fsInfo);
-    const uint32_t n = std::min<uint32_t>(length, 64);
-    for (uint32_t off = 0; addr != 0 && off < n; off += 4)
-      (void)mem.WriteU32BE(addr + off, 0);
+
+  const uint32_t minimum = VolumeInfoMinimumLength(infoClass);
+  if (minimum == 0) {
+    MCLA_LOG_WARN("NtQueryVolumeInformationFile: class={} -> "
+                  "STATUS_INVALID_INFO_CLASS lr={:08X}",
+                  infoClass,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INVALID_INFO_CLASS);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INVALID_INFO_CLASS;
   }
+
+  if (length < minimum) {
+    MCLA_LOG_WARN("NtQueryVolumeInformationFile: class={} len={} < {} -> "
+                  "STATUS_INFO_LENGTH_MISMATCH lr={:08X}",
+                  infoClass, length, minimum,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INFO_LENGTH_MISMATCH);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INFO_LENGTH_MISMATCH;
+  }
+
+  // The handle must really be a file in the VFS before we describe its volume.
+  FileObject *fileObj = dynamic_cast<FileObject *>(ResolveKernelObjectSafe(handle));
+  if (!fileObj) {
+    MCLA_LOG_WARN("NtQueryVolumeInformationFile: handle={:08X} is not a VFS "
+                  "file -> STATUS_INVALID_HANDLE lr={:08X}",
+                  handle,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INVALID_HANDLE);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INVALID_HANDLE;
+  }
+
+  if (!fsInfo) {
+    MCLA_LOG_WARN("NtQueryVolumeInformationFile: class={} with a null buffer -> "
+                  "STATUS_INVALID_PARAMETER lr={:08X}",
+                  infoClass,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INVALID_PARAMETER);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  const uint32_t addr = mem.MapVirtual(fsInfo);
+  if (addr == 0 || !mem.IsValid(addr, minimum)) {
+    MCLA_LOG_WARN("NtQueryVolumeInformationFile: buffer outside the guest window "
+                  "(class={} len={}) -> STATUS_ACCESS_VIOLATION lr={:08X}",
+                  infoClass, length,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (ioStatus) {
+      ioStatus->Status.set(0xC0000005);
+      ioStatus->Information.set(0);
+    }
+    return 0xC0000005;
+  }
+
+  // The reference zeroes the caller's whole length up front
+  // (xboxkrnl_io_info.cc:297) so the guest never sees stale bytes past
+  // outLength. `length` is guest-controlled, so the zero fill is clamped twice:
+  // to a bounded scratch size (the largest class here is 24 bytes) and to what
+  // is actually left in the window. Without the first clamp a guest passing
+  // 0xFFFFFFFF would ask the host for a 4 GiB vector.
+  {
+    constexpr uint32_t kMaxZeroFill = 4096;
+    const uint32_t zeroable =
+        std::min<uint32_t>(std::min<uint32_t>(length, kMaxZeroFill),
+                           static_cast<uint32_t>(mem.Size() - addr));
+    std::vector<uint8_t> zeros(zeroable, 0);
+    if (zeroable)
+      (void)mem.WriteBytes(addr, zeros.data(), zeroable);
+  }
+
+  uint32_t outLength = 0;
+  uint32_t status = STATUS_SUCCESS;
+
+  switch (infoClass) {
+    case kXFileFsVolumeInformation: {
+      // X_FILE_FS_VOLUME_INFORMATION, volume.h:28-36:
+      //   creation_time(8) serial_number(4) label_length(4) supports_objects(1)
+      (void)mem.WriteU64BE(addr + 0, 0);  // creation_time: none recorded
+      (void)mem.WriteU32BE(addr + 8, 0);  // serial_number: none assigned
+      (void)mem.WriteU32BE(addr + 12, 0); // label_length: the mount has no name
+      (void)mem.WriteU8(addr + 16, 0);    // supports_objects: no named streams
+      outLength = 20;                     // offsetof(label)
+      break;
+    }
+
+    case kXFileFsSizeInformation: {
+      // No allocation-unit accounting exists anywhere in the VFS. Saying 0
+      // would tell the game the volume is full; failing is the honest answer.
+      static std::atomic<uint32_t> s_sizeQ{0};
+      const uint32_t n = s_sizeQ.fetch_add(1) + 1;
+      MCLA_LOG_WARN("NtQueryVolumeInformationFile: FS_SIZE_INFORMATION on '{}' "
+                    "-> STATUS_NOT_SUPPORTED #{} (no allocation-unit accounting "
+                    "in RpfVirtualFileSystem) lr={:08X}",
+                    fileObj->fileHandle.virtual_path, n,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      status = 0xC00000BB; // STATUS_NOT_SUPPORTED
+      outLength = 0;
+      break;
+    }
+
+    case kXFileFsDeviceInformation: {
+      MCLA_LOG_WARN("NtQueryVolumeInformationFile: FS_DEVICE_INFORMATION on '{}' "
+                    "-> STATUS_NOT_SUPPORTED lr={:08X}",
+                    fileObj->fileHandle.virtual_path,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      status = 0xC00000BB; // STATUS_NOT_SUPPORTED
+      outLength = 0;
+      break;
+    }
+
+    case kXFileFsAttributeInformation: {
+      // X_FILE_FS_ATTRIBUTE_INFORMATION, volume.h:48-55:
+      //   attributes(4) component_name_max_length(4) name_length(4) name[]
+      // The mount IS read-only (every open is GENERIC_READ, vfs_rpf.cpp:498)
+      // and IS a path index with no object support, so the honest report is a
+      // zeroed record - which is exactly what the reference emits for a device
+      // with no name (xboxkrnl_io_info.cc:324-340).
+      (void)mem.WriteU32BE(addr + 0, 0);  // attributes
+      (void)mem.WriteU32BE(addr + 4, 0);  // component_name_max_length
+      (void)mem.WriteU32BE(addr + 8, 0);  // name_length
+      outLength = 12;                    // offsetof(name)
+      break;
+    }
+
+    default:
+      status = STATUS_INVALID_INFO_CLASS;
+      outLength = 0;
+      break;
+  }
+
   if (ioStatus) {
-    ioStatus->Status.set(STATUS_SUCCESS);
-    ioStatus->Information.set(fsInfo ? std::min<uint32_t>(length, 64) : 0);
+    ioStatus->Status.set(status);
+    ioStatus->Information.set(outLength);
   }
-  return STATUS_SUCCESS;
+
+  static std::atomic<uint32_t> s_volQ{0};
+  const uint32_t n = s_volQ.fetch_add(1) + 1;
+  if (n <= 40 || (n % 500) == 0)
+    MCLA_LOG_INFO("NtQueryVolumeInformationFile #{} h={:08X} path='{}' class={} "
+                  "len={} -> st={:08X} out={} lr={:08X}",
+                  n, handle, fileObj->fileHandle.virtual_path, infoClass,
+                  length, status, outLength,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+
+  return status;
 }
 
+// X_FILE_DIRECTORY_INFORMATION record, field offsets from Xenia
+// .research/xenia/src/xenia/kernel/xfile.h:36-49 (NextEntryOffset 0x00,
+// FileIndex 0x04, 4x LARGE_INTEGER times 0x08..0x27, EndOfFile 0x28,
+// AllocationSize 0x30, FileAttributes 0x38, FileNameLength 0x3C, name 0x40).
+namespace {
+constexpr uint32_t kDirInfoHeaderSize = 0x40;
+constexpr uint32_t kFileAttributeDirectory = 0x00000010;
+constexpr uint32_t kFileAttributeNormal = 0x00000080;
+
+// Per-handle enumeration cursor. Real NT keeps a per-file "next index"; the
+// VFS index (RpfVirtualFileSystem::ListDirectory) is a plain vector, so the
+// cursor has to live somewhere. Keyed by the file handle.
+Mutex g_dirScanLock;
+std::unordered_map<uint32_t, size_t> g_dirScanCursor;
+
+// Case-insensitive ASCII compare, no locale, no allocation - directory names
+// come from the host index and the guest pattern is ASCII.
+bool DirNameEqualsNoCase(const char *a, const char *b) {
+  for (;; ++a, ++b) {
+    const char ca = *a, cb = *b;
+    const char la = (ca >= 'A' && ca <= 'Z') ? static_cast<char>(ca + 32) : ca;
+    const char lb = (cb >= 'A' && cb <= 'Z') ? static_cast<char>(cb + 32) : cb;
+    if (la != lb)
+      return false;
+    if (la == '\0')
+      return true;
+  }
+}
+} // namespace
+
+// NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+//                      FileInformation, Length, FileName, RestartScan).
+//
+// SIGNATURE NOTE (F-609): the 360 export is the 9-argument form with an
+// XANSI_STRING* FileName and a RestartScan flag, per Xenia
+// .research/xenia/.../xboxkrnl_io.cc:547-551. The previous declaration here
+// used the Win2k 11-argument NT form, which mis-reads r8/r9 for this title.
+//
+// F-609: it also returned STATUS_NO_MORE_FILES unconditionally, so the game saw
+// "this directory is empty" for every handle, class and buffer - including
+// handles that are not directories at all. Now:
+//
+//   * handle is not a VFS file          -> STATUS_INVALID_HANDLE
+//   * file is not a directory          -> STATUS_INVALID_PARAMETER (this is
+//     what real hardware answers for NtQueryDirectoryFile on a file handle,
+//     xboxkrnl_io.cc:567-576 which fails the same way for a missing object)
+//   * file IS a directory in the index -> REAL enumeration out of
+//     RpfVirtualFileSystem::ListDirectory, packed as
+//     FILE_DIRECTORY_INFORMATION, cursor resumed between calls, exhausted ->
+//     STATUS_NO_MORE_FILES (the honest "no more entries", not a default).
+//
+// KNOWN GAP, and it is an infrastructure gap rather than a missing index:
+// RpfVirtualFileSystem::OpenFile REFUSES directories (vfs_rpf.cpp:493-496),
+// and NtCreateFile only hands back an empty pseudo-file for \\Device\\ paths
+// (imports.cpp NtCreateFile). So no directory handle can be produced by the
+// current open path and the enumeration arm below is currently unreachable.
+// It is implemented anyway, against the real index, so the day directory opens
+// exist the behaviour is already correct - and the unreachable arm says so
+// loudly rather than faking a populated directory.
 uint32_t NtQueryDirectoryFile(uint32_t handle, uint32_t event,
                               uint32_t apcRoutine, uint32_t apcContext,
                               XIO_STATUS_BLOCK *ioStatus, void *fileInformation,
-                              uint32_t length, uint32_t infoClass,
-                              uint32_t singleEntry, uint32_t dirIndex,
+                              uint32_t length, XANSI_STRING *fileName,
                               uint32_t restartScan) {
-  (void)handle;
   (void)event;
   (void)apcRoutine;
   (void)apcContext;
-  (void)fileInformation;
-  (void)length;
-  (void)infoClass;
-  (void)singleEntry;
-  (void)dirIndex;
-  (void)restartScan;
-  MCLA_LOG_INFO("NtQueryDirectoryFile: class={}", infoClass);
-  if (ioStatus)
-    ioStatus->Status.set(0x80000006); // STATUS_NO_MORE_FILES
-  return 0x80000006;
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t status = STATUS_SUCCESS;
+  uint32_t written = 0;
+
+  // ---- resolve the handle to a real VFS file ---------------------------------
+  FileObject *fileObj =
+      dynamic_cast<FileObject *>(ResolveKernelObjectSafe(handle));
+  if (!fileObj) {
+    status = STATUS_INVALID_HANDLE;
+    MCLA_LOG_WARN("NtQueryDirectoryFile: handle={:08X} is not a VFS file -> "
+                  "STATUS_INVALID_HANDLE lr={:08X}",
+                  handle,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  std::vector<std::string> entries;
+  bool enumerated = false;
+  const std::string *path = fileObj ? &fileObj->fileHandle.virtual_path : nullptr;
+
+  if (status == STATUS_SUCCESS) {
+    if (!vfs.IsDirectory(*path)) {
+      // Not a directory. Do NOT answer STATUS_NO_MORE_FILES: that reads to the
+      // guest as "empty directory", which is a different and false statement.
+      status = STATUS_INVALID_PARAMETER;
+      MCLA_LOG_WARN("NtQueryDirectoryFile: '{}' is not a directory -> "
+                    "STATUS_INVALID_PARAMETER lr={:08X} (no directory handle is "
+                    "producible today: vfs_rpf.cpp:493-496 OpenFile refuses "
+                    "directories)",
+                    *path,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    } else if (!vfs.ListDirectory(*path, entries)) {
+      // F-634: neither `ntstatus.h` nor the `NTSTATUS` typedef reaches this TU
+      // (windows.h supplies the STATUS_* macros the file already used, but not
+      // this one), and `status` here is a plain uint32_t like every other status
+      // in this file. The WDK value is fixed: `ntstatus.h`
+      // `STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034L)`.
+      status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+      MCLA_LOG_WARN("NtQueryDirectoryFile: ListDirectory('{}') failed -> "
+                    "STATUS_OBJECT_NAME_NOT_FOUND lr={:08X}",
+                    *path,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    } else {
+      enumerated = true;
+    }
+  }
+
+  // ---- optional guest-side name pattern --------------------------------------
+  // Read through the checked helpers; an unreadable pattern is a real
+  // STATUS_INVALID_PARAMETER, not a silent "match everything".
+  std::string pattern;
+  if (enumerated && fileName) {
+    const uint32_t nameAddr = mem.MapVirtual(fileName);
+    uint16_t nameLen = 0;
+    uint32_t bufAddr = 0;
+    if (nameAddr == 0 || !mem.ReadU16BE(nameAddr + 0, &nameLen) ||
+        !mem.ReadU32BE(nameAddr + 4, &bufAddr)) {
+      status = STATUS_INVALID_PARAMETER;
+      MCLA_LOG_WARN("NtQueryDirectoryFile: unreadable FileName at {:p} -> "
+                    "STATUS_INVALID_PARAMETER lr={:08X}",
+                    (void *)fileName,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    } else if (nameLen != 0) {
+      if (nameLen > 0x1000 || !mem.IsValid(bufAddr, nameLen)) {
+        status = STATUS_INVALID_PARAMETER;
+      } else {
+        pattern.resize(nameLen);
+        (void)mem.ReadBytes(bufAddr, pattern.data(), nameLen);
+      }
+    }
+  }
+
+  // ---- short buffer ------------------------------------------------------------
+  // The reference refuses anything under one header up front
+  // (xboxkrnl_io.cc:552-554). Same rule here.
+  if (status == STATUS_SUCCESS && length < kDirInfoHeaderSize) {
+    status = STATUS_INFO_LENGTH_MISMATCH;
+    MCLA_LOG_WARN("NtQueryDirectoryFile: Length={} < {} -> "
+                  "STATUS_INFO_LENGTH_MISMATCH lr={:08X}",
+                  length, kDirInfoHeaderSize,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+
+  uint32_t infoAddr = 0;
+  if (status == STATUS_SUCCESS) {
+    infoAddr = mem.MapVirtual(fileInformation);
+    if (infoAddr == 0 || !mem.IsValid(infoAddr, length)) {
+      status = 0xC0000005; // STATUS_ACCESS_VIOLATION
+      MCLA_LOG_WARN("NtQueryDirectoryFile: FileInformation buffer outside the "
+                    "guest window -> STATUS_ACCESS_VIOLATION lr={:08X}",
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+  }
+
+  // ---- real enumeration --------------------------------------------------------
+  if (status == STATUS_SUCCESS) {
+    size_t start = 0;
+    {
+      // CTAD, not std::lock_guard<std::mutex>: Mutex derives from
+      // CRITICAL_SECTION on Windows (src/kernel/mutex.h:5-25), it is not a
+      // std::mutex. Same form as src/kernel/xdm.cpp:9.
+      std::lock_guard cursorLock(g_dirScanLock);
+      if (restartScan) {
+        g_dirScanCursor[handle] = 0;
+      } else if (auto it = g_dirScanCursor.find(handle);
+                 it != g_dirScanCursor.end()) {
+        start = it->second;
+      }
+    }
+
+    // One pass: emit records until the caller's buffer is full, and remember
+    // exactly where we stopped so the next call resumes there.
+    uint32_t used = 0;
+    size_t cursor = start;
+    bool sawMatch = false;
+    std::vector<uint32_t> offsets; // buffer offset of each emitted record
+    offsets.reserve(16);
+
+    for (size_t i = start; i < entries.size(); ++i) {
+      const std::string &name = entries[i];
+      if (!pattern.empty() && pattern != "." && pattern != "*" &&
+          !DirNameEqualsNoCase(name.c_str(), pattern.c_str()))
+        continue; // name did not match; the cursor still advances past it
+      sawMatch = true;
+
+      // Real per-entry facts out of the VFS index, not invented ones.
+      const std::string child = *path + "/" + name;
+      const bool isDir = vfs.IsDirectory(child);
+      const uint64_t childSize = vfs.GetFileSize(child);
+      const uint32_t nameLen = static_cast<uint32_t>(name.size());
+      // xfile.h:51-72 walks next_entry_offset, so keeping records 8-aligned is
+      // ours to do.
+      const uint32_t padded = (kDirInfoHeaderSize + nameLen + 7) & ~7u;
+      if (used + padded > length)
+        break; // caller buffer is full: return what fits, keep the cursor
+
+      const uint32_t rec = infoAddr + used;
+      (void)mem.WriteU32BE(rec + 0x00, 0);  // NextEntryOffset, patched below
+      (void)mem.WriteU32BE(rec + 0x04, static_cast<uint32_t>(i)); // FileIndex
+      (void)mem.WriteU64BE(rec + 0x08, 0);  // CreationTime:  none recorded
+      (void)mem.WriteU64BE(rec + 0x10, 0);  // LastAccessTime: none recorded
+      (void)mem.WriteU64BE(rec + 0x18, 0);  // LastWriteTime:  none recorded
+      (void)mem.WriteU64BE(rec + 0x20, 0);  // ChangeTime:     none recorded
+      (void)mem.WriteU64BE(rec + 0x28, childSize); // EndOfFile
+      (void)mem.WriteU64BE(rec + 0x30, childSize); // AllocationSize
+      (void)mem.WriteU32BE(rec + 0x38, isDir ? kFileAttributeDirectory
+                                             : kFileAttributeNormal);
+      (void)mem.WriteU32BE(rec + 0x3C, nameLen);
+      (void)mem.WriteBytes(rec + kDirInfoHeaderSize, name.data(), nameLen);
+
+      offsets.push_back(used);
+      used += padded;
+      cursor = i + 1;
+    }
+
+    // Terminate the chain: every record points at the next one, the last is 0.
+    for (size_t k = 0; k < offsets.size(); ++k) {
+      const uint32_t next = (k + 1 < offsets.size())
+                                ? offsets[k + 1] - offsets[k]
+                                : 0u;
+      (void)mem.WriteU32BE(infoAddr + offsets[k] + 0x00, next);
+    }
+
+    {
+      std::lock_guard cursorLock(g_dirScanLock);
+      g_dirScanCursor[handle] = cursor;
+    }
+
+    written = used;
+    if (used == 0) {
+      // Three genuinely different endings, previously all reported as
+      // STATUS_NO_MORE_FILES:
+      if (sawMatch) {
+        // An entry exists but would not fit the caller's buffer.
+        status = 0x80000005; // STATUS_BUFFER_OVERFLOW
+      } else if (pattern.empty() || pattern == "." || pattern == "*") {
+        // Ran off the end of a real enumeration. This is the ONLY case where
+        // NO_MORE_FILES is the truth, and it is now reached only by actually
+        // exhausting the index.
+        status = STATUS_NO_MORE_FILES;
+      } else {
+        // The search pattern matched nothing in what is left.
+        status = 0xC000000F; // STATUS_NO_SUCH_FILE
+      }
+    }
+  }
+
+  if (ioStatus) {
+    ioStatus->Status.set(status);
+    ioStatus->Information.set(written);
+  }
+
+  {
+    static std::atomic<uint32_t> s_dirQ{0};
+    const uint32_t n = s_dirQ.fetch_add(1) + 1;
+    if (n <= 40 || (n % 500) == 0)
+      MCLA_LOG_INFO("NtQueryDirectoryFile #{} h={:08X} path='{}' len={} "
+                    "restart={} enumerated={} -> st={:08X} out={} lr={:08X}",
+                    n, handle, path ? *path : "<none>", length, restartScan,
+                    enumerated ? 1 : 0, status, written,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+
+  return status;
 }
 
 uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
                     uint32_t apcContext, XIO_STATUS_BLOCK *ioStatus,
                     void *buffer, uint32_t length, be<uint64_t> *byteOffset,
                     uint32_t *key) {
-  // NtReadFile census
+  // NtReadFile census.
+  //
+  // Rate limit RAISED 2026-10-05 (was `n <= 20 || (n % 100) == 0`, 22 printed
+  // rows). Measured, not estimated: the highest `#NNNN` this counter printed in
+  // EITHER recent soak is #0200 (build/w719.log and build/w720.log, both
+  // 22 rows), and #0300 printed in neither, so the boot's true call count is
+  // >= 200 and <= 299 -- rows #201-#299 happened and were invisible. Printing
+  // every row through #320 therefore yields the FULL call count, not a sample,
+  // and stays bounded at 320 rows + one row per further 100 calls. 320 rows is
+  // 0.6% of w719.log's 50,482 lines; the counter is per-NtReadFile-call and
+  // NtReadFile is not a per-byte or per-page loop.
   {
     static std::atomic<uint32_t> s_census{0};
     const uint32_t n = s_census.fetch_add(1) + 1;
-    if (n <= 20 || (n % 100) == 0) {
+    if (n <= 320 || (n % 100) == 0) {
       MCLA_LOG_INFO("NFS-CENSUS[Read] #{:04} h={:08X} len={} off={:#x} "
                     "evt={:08X} apc={:08X} lr={:08X}",
                     n, handle, length,
@@ -1073,7 +3325,106 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     }
   }
 
+  // A handle in the class that cannot name an object at all is REFUSED here, by
+  // name, before either transfer arm runs.
+  //
+  // The class is exactly the one ResolveKernelObjectSafe rejects without ever
+  // touching guest memory (imports.cpp:2177-2178 and :2187-2189):
+  // `handle < 0x1000`, which lands inside the deliberate 4 KiB PAGE_NOACCESS
+  // null guard (memory.cpp:409, documented at :507-513), and
+  // `handle + sizeof(XDISPATCHER_HEADER) >= kSize`, which covers the whole
+  // 0xFFFFFFF0..0xFFFFFFFF invalid-sentinel class.
+  //
+  // Why this guard exists and is not merely the resolver swap: the resolver
+  // returns nullptr for both classes, and a null fileObj below lands in the
+  // zero-fill arm, which memsets the caller's window and then reports
+  // STATUS_SUCCESS with `length` bytes read - a full-length transfer of bytes
+  // that were never read, over content the caller had already put there.
+  // Measured, not assumed: the window arrives holding the caller's own
+  // 0xC0+(i&0xF) pattern and every byte of it is zero on return. So the
+  // one-line swap on its own would trade an access violation for a silent data
+  // lie, which is worse than the bug. Refusing is the only honest arm for a
+  // handle that cannot name a file.
+  //
+  // In-bounds handles that simply are not files - device opens - still reach the
+  // zero-fill arm below, unchanged. That arm is this function's documented
+  // legacy behaviour and removing it is not this fix's business; only the
+  // unnameable class is taken out of it.
+  //
+  // Placement: AFTER the call census at the top of this function, so a refused
+  // call still prints its census row, and BEFORE both arms, so a refusal can
+  // never report a transfer. A refusal is not an arm, so the arm census further
+  // down does not print for it.
+  if (handle < 0x1000u ||
+      static_cast<uint64_t>(handle) + sizeof(XDISPATCHER_HEADER) >=
+          mcla::kernel::GuestMemoryHeap::kSize) {
+    {
+      static std::atomic<uint32_t> s_nfsBadHandle{0};
+      const uint32_t bn = s_nfsBadHandle.fetch_add(1) + 1;
+      if (bn <= 20 || (bn % 100) == 0)
+        MCLA_LOG_WARN(
+            "NFS-BADHANDLE #{} h={:08X} buf={:08X} req={} -> "
+            "STATUS_INVALID_HANDLE (unnameable handle class; no bytes read, "
+            "caller window untouched) lr={:08X}",
+            bn, handle, bufferAddr, length,
+            static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INVALID_HANDLE);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INVALID_HANDLE;
+  }
+
   // Resolve the kernel file object and serve real bytes from the VFS.
+  //
+  // `GetKernelObject` returns the raw reinterpret_cast fallback for any address
+  // that is not a registered host wrapper (xdm.h:72-77), and calling
+  // `IsValid()` on that is a method call through a cast of guest memory. For
+  // handle 1 it reads inside the null guard and faults; ResolveKernelObjectSafe's
+  // comment at :2202-2211 names that read as precisely the faulting
+  // instruction. The guard above stops every handle that can reach it.
+  //
+  // The scatter sibling is the same shape and refuses the same way
+  // (imports.cpp:3464-3476, STATUS_INVALID_HANDLE with Information=0); it has
+  // no zero-fill arm, and neither does NtWriteFile's handle check
+  // (imports.cpp:1946-1956). Only this function had one.
+  //
+  // Resolution is DELIBERATELY left as the original hand-rolled form and NOT
+  // swapped for ResolveKernelObjectSafe, because the swap is NOT
+  // behaviour-preserving here. Measured in the M-imports harness with a single
+  // variable -- two objects differing only in this file's text, both compiled
+  // at the project's real /O2 /Ob1:
+  //
+  //   pre-fix   ARM 1, a real FileObject handle -> 494 real bytes, byte-equal
+  //             to an independent python-zlib oracle built from the raw
+  //             archive bytes.
+  //   resolver  ARM 1 -> all zeros, STATUS_SUCCESS, full-length "transfer".
+  //
+  // The cause is the resolver's `o != raw` discrimination at :2225, measured
+  // gate by gate for that very handle:
+  //
+  //   raw = Translate(h)             = 0x1A0401280
+  //   o   = GetKernelObject(h)       = 0x1A0401280   <-- EQUAL
+  //   o->IsValid()                   = valid (the wrapper's own 'XBOX')
+  //   ReadU32BE(h + offsetof(Flink)) = 0x16000000, != OBJECT_SIGNATURE
+  //
+  // Translate maps a physical-arena guest VA onto the arena's HOST address, so
+  // for a registered host wrapper `raw` and `o` are the same pointer, the
+  // `o != raw` test is false, and the resolver takes its raw-guest-memory
+  // branch: it reads offsetof(Flink)=8 bytes past the handle and rejects a
+  // perfectly good file. Routing NtReadFile through it would trade a fault for
+  // silent zero-fill on every arena-range read -- strictly worse than the bug
+  // being fixed. The defect belongs to the shared helper, so it is left for its
+  // own change under a soak rather than smuggled in through this call site.
+  //
+  // The guard above is what actually removes the fault class, and it needs no
+  // resolver at all. The faulting instruction is the read inside `o->IsValid()`
+  // at obj+0x10, and obj is Translate(handle), so the read lands at
+  // handle+0x10. That is unreadable for exactly two ranges: handle < 0x1000 (the
+  // PAGE_NOACCESS null guard) and handle+0x10 >= kSize (one past the window).
+  // Those are precisely the two ranges the guard refuses, so every handle that
+  // could fault here is now refused by name before any dereference.
   FileObject *fileObj = nullptr;
   if (handle != GUEST_INVALID_HANDLE_VALUE && IsKernelObject(handle)) {
     KernelObject *obj = GetKernelObject(handle);
@@ -1091,6 +3442,10 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
   uint64_t offDbg = 0;
   bool posDbg = false;
   const char *pathDbg = nullptr;
+  // First four bytes already in the guest window, captured ONLY on the
+  // zero-fill arm and BEFORE the fill, so a soak can say whether that arm
+  // destroyed anything the caller had already written there.
+  uint8_t preFill[4] = {0, 0, 0, 0};
   if (fileObj) {
     rawHandle = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
         fileObj->fileHandle.handle));
@@ -1106,10 +3461,13 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
                           bytesRead);
     } else {
       offset = fileObj->fileHandle.position;
+      // F-628: vfs.ReadFile advances fileHandle.position ITSELF
+      // (src/fs/vfs_rpf.cpp:778, and the comment there names this exact
+      // duplicate). The `if (ok) fileObj->fileHandle.position += bytesRead;`
+      // that used to sit here double-advanced it, so every non-positional read
+      // left the stream 2x too far along - the F442-SECTION starvation class,
+      // where the following read starts past the bytes it needed and returns 0.
       ok = vfs.ReadFile(fileObj->fileHandle, hostPtr, length, bytesRead);
-      if (ok) {
-        fileObj->fileHandle.position += bytesRead;
-      }
     }
     offDbg = offset;
     pathDbg = fileObj->fileHandle.virtual_path.c_str();
@@ -1118,9 +3476,48 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
                    offset, length, bytesRead);
   } else {
     // Non-VFS handles (device opens etc): zero-fill keeps legacy behavior.
+    if (length >= sizeof(preFill))
+      (void)guestMem.ReadBytes(bufferAddr, preFill, sizeof(preFill));
     std::memset(hostPtr, 0, length);
     bytesRead = length;
     ok = true;
+  }
+
+  // Which arm ran, and what actually landed in the guest window. Log-only: the
+  // two arms above are unchanged, and this block reads memory it has already
+  // written and nothing else. `arm=READ` means a FileObject resolved and the
+  // VFS served `got` bytes at `off`; `arm=ZERO` means no FileObject resolved and
+  // the window was filled with `req` zero bytes while the call still reports
+  // success and a full-length transfer.
+  //
+  // Rate: first 20 calls, every 100th after that, and EVERY zero-fill arm
+  // through call #60. The zero-fill arm is the one that can silently overwrite a
+  // buffer the caller had already filled, so it is the arm that must not be
+  // sampled away; the per-100 rows keep the ordinary reads visible, including
+  // the #201-#299 band the census limit above used to hide. Bound: <= 60 rows +
+  // one row per further 100 calls.
+  {
+    static std::atomic<uint32_t> s_arm{0};
+    const uint32_t an = s_arm.fetch_add(1) + 1;
+    const bool zeroArm = (fileObj == nullptr);
+    if (an <= 20 || (an % 100) == 0 || (zeroArm && an <= 60)) {
+      uint8_t head8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      (void)guestMem.ReadBytes(bufferAddr, head8, sizeof(head8));
+      char headHex[19] = "................";
+      for (int q = 0; q < 8; ++q) {
+        static const char kHex[] = "0123456789ABCDEF";
+        headHex[q * 2] = kHex[(head8[q] >> 4) & 0xF];
+        headHex[q * 2 + 1] = kHex[head8[q] & 0xF];
+      }
+      MCLA_LOG_WARN(
+          "NFS-ARM #{} arm={} h={:08X} buf={:08X} req={} got={} pos={} "
+          "off={:#x} raw={:08X} pre={:02X}{:02X}{:02X}{:02X} head={} "
+          "path='{}' lr={:08X}",
+          an, zeroArm ? "ZERO" : "READ", handle, bufferAddr, length, bytesRead,
+          posDbg ? 1 : 0, offDbg, rawHandle, preFill[0], preFill[1], preFill[2],
+          preFill[3], headHex, pathDbg ? pathDbg : "",
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
   }
 
   if (ioStatus) {
@@ -1185,9 +3582,227 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
   return ok ? STATUS_SUCCESS : 0xC000000D;
 }
 
-uint32_t NtReadFileScatter() {
-  LOG_UTILITY("!!! STUB !!!");
-  return STATUS_SUCCESS;
+// XFILE_SCATTER_BUFFER element, 8 bytes on the 360:
+//   PHYSICAL_ADDRESS Buffer (4) / ULONG Length (4)
+// (Xenia .research/xenia/.../xboxkrnl_io.cc:268-271 takes the array as a bare
+// guest address; the same 8-byte element is what the guest's own boot-time DMA
+// paths use.)
+namespace {
+constexpr uint32_t kScatterElementSize = 8;
+} // namespace
+
+// NtReadFileScatter(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+//                   ScatterBuffer, Length, Offset, Key).
+//
+// F-609: this was `uint32_t NtReadFileScatter() { LOG_UTILITY(...); return
+// STATUS_SUCCESS; }`. Three defects: the body was a no-op in release, it
+// declared NO PARAMETERS so the hook never read r3-r10 at all (ArgTranslator
+// only populates the tuple the function signature declares,
+// src/kernel/function.h:273-278), and it reported success for a handle and
+// buffer that were never touched. The game saw a successful read and an
+// untouched destination.
+//
+// Real behaviour now: one logical read split across the element array, served
+// through the same VFS path NtReadFile uses
+// (RpfVirtualFileSystem::ReadFileAt, vfs_rpf.h:81), with the offset advancing
+// across elements exactly as a single read would. The element Buffer is a
+// PHYSICAL address, and this model has no paging: the physical arena is mapped
+// into the flat guest window (heap.cpp:232-234), so a physical address is the
+// guest VA of the same page - it is read and written through the checked
+// guest helpers, never through a raw host pointer.
+//
+// The APC routine is deliberately not invoked: this TU has no APC delivery
+// mechanism to hand the completion to, so pretending to queue one would be the
+// same class of lie. Named here so the gap is a stated decision, not an
+// omission.
+uint32_t NtReadFileScatter(uint32_t handle, uint32_t event, uint32_t apcRoutine,
+                           uint32_t apcContext, XIO_STATUS_BLOCK *ioStatus,
+                           void *scatterBuffer, uint32_t length,
+                           be<uint64_t> *byteOffset, uint32_t *key) {
+  (void)key;
+
+  {
+    static std::atomic<uint32_t> s_census{0};
+    const uint32_t n = s_census.fetch_add(1) + 1;
+    if (n <= 20 || (n % 100) == 0)
+      MCLA_LOG_INFO("NFS-CENSUS[ReadScatter] #{:04} h={:08X} elements={} "
+                    "off={:08X} evt={:08X} apc={:08X} lr={:08X}",
+                    n, handle, length,
+                    byteOffset ? static_cast<uint32_t>(byteOffset->get()) : 0,
+                    event, apcRoutine,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  // Resolve the handle first. Reporting success for an unknown handle is
+  // exactly the bug this replaces.
+  FileObject *fileObj =
+      dynamic_cast<FileObject *>(ResolveKernelObjectSafe(handle));
+  if (!fileObj) {
+    MCLA_LOG_WARN("NtReadFileScatter: handle={:08X} is not a VFS file -> "
+                  "STATUS_INVALID_HANDLE lr={:08X}",
+                  handle,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INVALID_HANDLE);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INVALID_HANDLE;
+  }
+
+  if (length == 0) {
+    // Zero elements is a real, complete no-op read.
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_SUCCESS);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_SUCCESS;
+  }
+
+  const uint32_t arrayAddr = mem.MapVirtual(scatterBuffer);
+  const uint64_t arrayBytes =
+      static_cast<uint64_t>(length) * kScatterElementSize;
+  if (arrayAddr == 0 || arrayBytes > 0xFFFFFFFFull ||
+      !mem.IsValid(arrayAddr, static_cast<size_t>(arrayBytes))) {
+    MCLA_LOG_WARN("NtReadFileScatter: element array {:p} ({} elements) is not "
+                  "in the guest window -> STATUS_INVALID_PARAMETER lr={:08X}",
+                  scatterBuffer, length,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    if (ioStatus) {
+      ioStatus->Status.set(STATUS_INVALID_PARAMETER);
+      ioStatus->Information.set(0);
+    }
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  const bool positional = byteOffset != nullptr;
+  uint64_t offset = positional ? static_cast<uint64_t>(byteOffset->get())
+                               : fileObj->fileHandle.position;
+  uint64_t totalBytes = 0;
+  uint32_t status = STATUS_SUCCESS;
+  uint32_t used = 0;
+
+  for (uint32_t i = 0; i < length; ++i) {
+    const uint32_t elemAddr = arrayAddr + i * kScatterElementSize;
+    uint32_t bufferAddr = 0, elemLength = 0;
+    // Read the descriptor through the checked helpers: it is guest data.
+    if (!mem.ReadU32BE(elemAddr, &bufferAddr) ||
+        !mem.ReadU32BE(elemAddr + 4, &elemLength)) {
+      status = 0xC0000005; // STATUS_ACCESS_VIOLATION
+      break;
+    }
+
+    // A zero element is a legitimate hole in a scatter list; skip it without
+    // consuming file bytes.
+    if (elemLength == 0)
+      continue;
+
+    if (!mem.IsValid(bufferAddr, elemLength)) {
+      // The element points outside the window. That is a real parameter error,
+      // not something to paper over by reading into nothing.
+      static std::atomic<uint32_t> s_badElem{0};
+      const uint32_t n = s_badElem.fetch_add(1) + 1;
+      if (n <= 20 || (n % 500) == 0)
+        MCLA_LOG_WARN("NtReadFileScatter #{}: element {} buffer={:08X} "
+                      "len={:X} is outside the guest window "
+                      "(gap to window end={}) lr={:08X}",
+                      n, i, bufferAddr, elemLength,
+                      bufferAddr < mem.Size() ? mem.Size() - bufferAddr : 0u,
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      status = STATUS_INVALID_PARAMETER;
+      break;
+    }
+
+    void *host = mem.Translate(bufferAddr);
+    if (!host) {
+      status = 0xC0000005;
+      break;
+    }
+
+    uint64_t got = 0;
+    if (!vfs.ReadFileAt(fileObj->fileHandle, offset, host, elemLength, got)) {
+      // Host read failed. Report the bytes we DID get and stop, the way a
+      // short transfer does. GetLastError is captured immediately, before any
+      // other call can clobber it - the T41.3r lesson from NtReadFile
+      // (imports.cpp below), where an uncaptured gle made failures uncitable.
+      const DWORD gle = ::GetLastError();
+      static std::atomic<uint32_t> s_fail{0};
+      const uint32_t n = s_fail.fetch_add(1) + 1;
+      if (n <= 20 || (n % 500) == 0)
+        MCLA_LOG_WARN("NtReadFileScatter #{}: element {} read FAILED "
+                      "off={:#x} len={:X} got={} path='{}' gle={} lr={:08X}",
+                      n, i, offset, elemLength, got,
+                      fileObj->fileHandle.virtual_path, gle,
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      if (got == 0)
+        status = 0xC000000D; // STATUS_UNSUCCESSFUL
+      break;
+    }
+
+    totalBytes += got;
+    offset += got;
+    used = i + 1;
+    if (got < elemLength) {
+      // End of file: a short read is a success with fewer bytes, not an error.
+      static std::atomic<uint32_t> s_short{0};
+      const uint32_t n = s_short.fetch_add(1) + 1;
+      if (n <= 20 || (n % 500) == 0)
+        MCLA_LOG_WARN("NtReadFileScatter: SHORT #{} at element {} off={:#x} "
+                      "want={:X} got={} path='{}' lr={:08X}",
+                      n, i, offset - got, elemLength, got,
+                      fileObj->fileHandle.virtual_path,
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      break;
+    }
+  }
+
+  // A non-positional read advances the file's own position by what it served.
+  if (!positional && used != 0)
+    fileObj->fileHandle.position += totalBytes;
+
+  // Signal the completion event if one was supplied - the same contract
+  // NtReadFile honours. The return value stays the real NTSTATUS: there is no
+  // measured PENDING contract for this entry point, so claiming STATUS_PENDING
+  // here would be an invented guess.
+  bool signaled = false;
+  if (event != 0) {
+    Event *evt = nullptr;
+    if (auto *id = LookupIdentityKernelObject(event)) {
+      evt = static_cast<Event *>(id);
+    } else if (IsKernelObject(event)) {
+      if (void *raw = mem.Translate(event))
+        evt = TryQueryKernelObject<Event>(
+            *reinterpret_cast<XDISPATCHER_HEADER *>(raw));
+    }
+    if (evt && evt->IsValid()) {
+      evt->Set();
+      signaled = true;
+    }
+  }
+
+  if (ioStatus) {
+    ioStatus->Status.set(status);
+    ioStatus->Information.set(static_cast<uint32_t>(totalBytes));
+  }
+
+  // Bounded summary census: 40 then every 500th, so soak_census can count it
+  // as real call evidence rather than an accidental sample.
+  {
+    static std::atomic<uint32_t> s_calls{0};
+    const uint32_t n = s_calls.fetch_add(1) + 1;
+    if (n <= 40 || (n % 500) == 0 || status != STATUS_SUCCESS)
+      MCLA_LOG_INFO("NtReadFileScatter #{} h={:08X} path='{}' elements={} "
+                    "used={} bytes={} off={:#x} st={:08X} evt={} "
+                    "apc={:08X}/{:08X} lr={:08X}",
+                    n, handle, fileObj->fileHandle.virtual_path, length, used,
+                    totalBytes, offset, status, signaled ? 1 : 0, apcRoutine,
+                    apcContext,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+
+  return status;
 }
 
 void NtDuplicateObject() { LOG_UTILITY("!!! STUB !!!"); }
@@ -1307,11 +3922,67 @@ uint32_t NtFreeVirtualMemory(be<uint32_t> *baseAddress,
   return status;
 }
 
+// ---- Ob object-reference ledger (F-609) ---------------------------------------
+// KernelObject (src/kernel/xdm.h:17-47) has no reference-count field and xdm.h is
+// not this agent's file, so the outstanding-reference count lives here, keyed by
+// the object's guest address. ObReferenceObjectByHandle increments it and this
+// function decrements it. It is a real ledger, not decoration: it is the only
+// thing that makes an unbalanced guest ObReference visible in a soak instead of
+// invisible. Object LIFETIME is still owned by the handle table (NtClose ->
+// DestroyKernelObject), exactly as before - this does not free anything.
+namespace {
+
+Mutex g_obRefLock;
+std::unordered_map<uint32_t, uint32_t> g_obRefCounts;
+constexpr size_t kObRefMaxTracked = 4096;
+
+bool BumpObRef(uint32_t object, uint32_t *outCount) {
+  std::lock_guard lock(g_obRefLock);
+  if (g_obRefCounts.size() >= kObRefMaxTracked &&
+      g_obRefCounts.find(object) == g_obRefCounts.end()) {
+    return false; // table full: do NOT grow without bound
+  }
+  *outCount = ++g_obRefCounts[object];
+  return true;
+}
+
+bool DropObRef(uint32_t object, uint32_t *outCount) {
+  std::lock_guard lock(g_obRefLock);
+  auto it = g_obRefCounts.find(object);
+  if (it == g_obRefCounts.end())
+    return false; // never referenced through this path
+  *outCount = --it->second;
+  if (it->second == 0)
+    g_obRefCounts.erase(it);
+  return true;
+}
+
+} // namespace
+
 void ObDereferenceObject(uint32_t object) {
-  (void)object;
-  // In the identity handle model, dereferencing is a no-op
-  // The kernel object is managed by the handle table
-  // Object lifetime is tied to handle count
+  if (object == 0 || object == GUEST_INVALID_HANDLE_VALUE)
+    return;
+
+  uint32_t remaining = 0;
+  if (!DropObRef(object, &remaining)) {
+    // A dereference with no matching reference. Not an error the guest should
+    // see (it may be balancing a reference taken before this ledger existed),
+    // but it is a real imbalance and it must be visible.
+    static std::atomic<uint32_t> s_unbalanced{0};
+    const uint32_t n = s_unbalanced.fetch_add(1) + 1;
+    if (n <= 20 || (n % 500) == 0)
+      MCLA_LOG_WARN("OB-UNBALANCED-DEREF #{:04} object={:08X} lr={:08X}", n,
+                    object,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return;
+  }
+
+  static std::atomic<uint32_t> s_derefs{0};
+  const uint32_t n = s_derefs.fetch_add(1) + 1;
+  if (n <= 20 || (n % 500) == 0)
+    MCLA_LOG_INFO("OB-DEREF #{:04} object={:08X} remaining={} lr={:08X}", n,
+                  object, remaining,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
 }
 
 void KeSetBasePriorityThread(GuestThreadHandle *hThread, int priority) {
@@ -1329,20 +4000,144 @@ void KeSetBasePriorityThread(GuestThreadHandle *hThread, int priority) {
 #endif
 }
 
+// ObReferenceObjectByHandle(Handle, ObjectType, Object) -> NTSTATUS.
+//
+// F-609: this used to be `*object = handle; return 0;` with `handle` and
+// `objectType` never examined, so ANY 32-bit value the guest passed came back
+// as a "successfully referenced object" - including 0, 0xFFFFFFFF and every
+// wild pointer. Now the handle is resolved against the real kernel-object table
+// and a handle that is not one fails with the real NTSTATUS.
+//
+// Two resolution paths, both inside ResolveKernelObjectSafe (imports.cpp above):
+//  1. GetKernelObject first consults the durable host-side wrapper map
+//     (TryQueryKernelObject, xdm.h:186-194) populated by
+//     CreateRegisteredKernelObject. This is the authoritative path.
+//  2. failing that, it wraps a guest-owned dispatcher header - accepted only if
+//     the guest-visible signature Flink == 'XBOX' is still intact, and that
+//     proof is now a CHECKED ReadU32BE rather than the host dereference of guest
+//     memory that faulted the boot (see ResolveKernelObjectSafe above).
+//
+// Object lifetime is still the handle table's business; this only takes a
+// reference (see the ledger above) and hands back the object address, which in
+// this identity-handle model IS the handle's own guest VA.
 uint32_t ObReferenceObjectByHandle(uint32_t handle, uint32_t objectType,
                                    be<uint32_t> *object) {
-  if (!object) return STATUS_INVALID_PARAMETER;
+  if (!object)
+    return STATUS_INVALID_PARAMETER;
+
+  // F-609-BOOTCRASH: 0xFFFFFFFE is CURRENT_THREAD_HANDLE (guest_thread.h:14),
+  // NOT a kernel object - it is the title asking for its own KTHREAD. Before
+  // the extent check in ResolveKernelObjectSafe it was dereferenced and killed
+  // the boot worker (w657.log 19:19:22, rva 0x24dc5d). There is no KTHREAD
+  // object to hand back: GuestThreadHandle is not registered in
+  // WrapperIdentityMap under this sentinel, and the calling thread is not
+  // reachable from here BY HANDLE (only by id, via
+  // GuestThread::GetCurrentThreadId). So it is refused, not faked - the old
+  // `*object = handle; return 0` returned 0xFFFFFFFE as a "successfully
+  // referenced object", which is exactly the invented object F-609 removed.
+  // This bounded marker is how a soak shows whether the title tolerates the
+  // refusal instead of faulting on it.
+  if (handle == CURRENT_THREAD_HANDLE ||
+      handle == GUEST_INVALID_HANDLE_VALUE) {
+    static std::atomic<uint32_t> s_sentinel{0};
+    const uint32_t n = s_sentinel.fetch_add(1) + 1;
+    if (n <= 40 || (n % 500) == 0)
+      MCLA_LOG_WARN("OB-REF-SENTINEL #{} handle={:08X} objectType={:08X} "
+                    "(CURRENT_THREAD_HANDLE/invalid - no KTHREAD object) -> "
+                    "STATUS_INVALID_HANDLE lr={:08X}",
+                    n, handle, objectType,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return STATUS_INVALID_HANDLE;
+  }
+
+  KernelObject *obj = ResolveKernelObjectSafe(handle);
+  if (!obj) {
+    MCLA_LOG_WARN("OB-REF: handle={:08X} objectType={:08X} is not a resolvable "
+                  "kernel object -> STATUS_INVALID_HANDLE lr={:08X}",
+                  handle, objectType,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return STATUS_INVALID_HANDLE;
+  }
+
+  uint32_t refs = 0;
+  if (!BumpObRef(handle, &refs)) {
+    MCLA_LOG_WARN("OB-REF: ledger full ({} entries), reference to {:08X} not "
+                  "recorded lr={:08X}",
+                  kObRefMaxTracked, handle,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+
+  {
+    static std::atomic<uint32_t> s_refs{0};
+    const uint32_t n = s_refs.fetch_add(1) + 1;
+    if (n <= 40 || (n % 500) == 0)
+      MCLA_LOG_INFO("OB-REF #{:04} handle={:08X} objectType={:08X} typeByte={:02X} "
+                    "refs={} lr={:08X}",
+                    n, handle, objectType,
+                    static_cast<uint32_t>(obj->header.Type), refs,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+
   *object = handle;
-  return 0;
+  return STATUS_SUCCESS;
 }
 
 void KeQueryBasePriorityThread() { LOG_UTILITY("!!! STUB !!!"); }
 
 uint32_t NtSuspendThread(GuestThreadHandle *hThread, uint32_t *suspendCount) {
-  assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE) &&
-         hThread->GetThreadId() == GuestThread::GetCurrentThreadId());
+  // F-609: this self-check was
+  //   assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE) &&
+  //          hThread->GetThreadId() == GuestThread::GetCurrentThreadId());
+  // with two independent defects, both silent:
+  //  (a) DEAD. /DNDEBUG is defined in build/compile_commands.json, so it was
+  //      compiled out and the self-suspend case was never checked at runtime.
+  //  (b) INVERTED and self-contradictory. The illegal case is suspending the
+  //      CALLER, i.e. hThread->GetThreadId() == GetCurrentThreadId(); as
+  //      written the assert demands the LEGAL case (not-self) AND the illegal
+  //      one simultaneously, so it could not have been the right predicate in
+  //      either polarity. The pointer half is also dead weight: hThread is
+  //      already a resolved GuestThreadHandle*, and GetKernelObject
+  //      (CURRENT_THREAD_HANDLE) returns Translate(0xFFFFFFFE) = 0x1FFFFFFFE
+  //      (xdm.h:72-77), which can never equal a real object pointer.
+  //      (guest_thread.cpp:503-505 cites this line as evidence that the two
+  //      GetThreadId implementations agree - they do, but this assert never
+  //      used that agreement as a check.)
+  //
+  // Now a real runtime check with a named bounded marker on each refusal, so a
+  // mismatch is reported instead of passing. GuestThreadHandle::GetThreadId is
+  // the monotonic allocator id and GuestThread::GetCurrentThreadId() reads the
+  // same space (guest_thread.cpp:332 / :509), so the comparison is like-for-like.
+  if (!hThread) {
+    static std::atomic<uint32_t> s_suspNull{0};
+    const uint32_t n = s_suspNull.fetch_add(1) + 1;
+    if (n <= 40 || (n % 500) == 0)
+      MCLA_LOG_WARN("SUSP-FAIL-NULL #{} NtSuspendThread with a null thread "
+                    "handle -> STATUS_INVALID_HANDLE lr={:08X}",
+                    n,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return STATUS_INVALID_HANDLE;
+  }
+  if (hThread->GetThreadId() == GuestThread::GetCurrentThreadId()) {
+    // STATUS_SUSPEND_FAILED (0xC0000041) from the XOS STATUS enumeration; the
+    // local subset in xbox.h:413-451 does not name it, and xbox.h is not ours.
+    static constexpr uint32_t kStatusSuspendFailed = 0xC0000041u;
+    static std::atomic<uint32_t> s_suspSelf{0};
+    const uint32_t n = s_suspSelf.fetch_add(1) + 1;
+    if (n <= 40 || (n % 500) == 0)
+      MCLA_LOG_WARN("SUSP-FAIL-SELF #{} NtSuspendThread on the CALLING thread "
+                    "(tid={:08X}) refused -> STATUS_SUSPEND_FAILED (was an "
+                    "inverted, NDEBUG-compiled-out assert) lr={:08X}",
+                    n, hThread->GetThreadId(),
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return kStatusSuspendFailed;
+  }
 
-  hThread->suspended = true;
+  // XOS writes the PREVIOUS suspend count through the out-parameter and the
+  // guest reads it; it was never written at all. exchange() stores the same
+  // value the old `suspended = true` did and hands back what was there.
+  const bool wasSuspended = hThread->suspended.exchange(true);
+  if (suspendCount)
+    *suspendCount = wasSuspended ? 1u : 0u;
   hThread->suspended.wait(true);
 
   return S_OK;
@@ -1436,13 +4231,139 @@ void HalReturnToFirmware(uint32_t type) {
   // Return to caller - game will continue
 }
 
-void RtlFillMemoryUlong() { LOG_UTILITY("!!! STUB !!!"); }
+// RtlFillMemoryUlong(Destination, Length, Pattern) - MSDN ff552263; Xenia
+// reference .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:75-85.
+// `Length` is in BYTES and is expected to be a multiple of 4; every ULONG
+// receives the pattern in GUEST (big-endian) order.
+//
+// F-609: this was `LOG_UTILITY("!!! STUB !!!")`, and LOG_UTILITY expands to
+// NOTHING in a release build (.research/UnleashedRecomp/UnleashedRecomp/os/
+// logger.h:14-18) - so the fill silently never happened. Live call site:
+// generated/ppc_xenon/ppc_recomp.78.cpp:18450-18454 fills 0x800 bytes at
+// sp+0xC0 with 0x80000000, i.e. 2048 bytes of uninitialised stack were handed
+// to sub_82412928 as if they had been filled.
+void RtlFillMemoryUlong(void *destination, uint32_t length, uint32_t pattern) {
+  if (!destination || length == 0)
+    return;
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t destAddr = mem.MapVirtual(destination);
+  if (destAddr == 0) {
+    // Also covers destination == guest 0, which is the deliberate NOACCESS null
+    // guard page (src/kernel/memory.cpp:218) - nothing to fill there, and
+    // nothing to pretend about.
+    MCLA_LOG_WARN("RtlFillMemoryUlong: dest outside the guest window, "
+                  "len={} pattern={:08X} lr={:08X}",
+                  length, pattern,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return;
+  }
+
+  // Trailing bytes under a ULONG boundary are not written: the WDK contract
+  // requires Length % 4 == 0 and the reference drops the remainder
+  // (xboxkrnl_rtl.cc:78, `count = length >> 2`).
+  const uint32_t words = length >> 2;
+  if (words == 0)
+    return;
+
+  if (!mem.IsValid(destAddr, static_cast<size_t>(words) * 4)) {
+    MCLA_LOG_WARN("RtlFillMemoryUlong: range {:08X}+{:X} leaves the guest window, "
+                  "lr={:08X}",
+                  destAddr, words * 4,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return;
+  }
+
+  // Guest memory is only ever touched through the checked, endian-explicit
+  // helpers, so the pattern is assembled here in guest byte order and handed
+  // over with WriteBytes. Chunked at 16 KiB so a multi-megabyte fill does not
+  // need a multi-megabyte scratch buffer.
+  constexpr uint32_t kWordsPerChunk = 4096;
+  const uint8_t patBytes[4] = {static_cast<uint8_t>(pattern >> 24),
+                               static_cast<uint8_t>(pattern >> 16),
+                               static_cast<uint8_t>(pattern >> 8),
+                               static_cast<uint8_t>(pattern)};
+  std::vector<uint8_t> chunk(static_cast<size_t>(kWordsPerChunk) * 4);
+  for (size_t w = 0; w < kWordsPerChunk; ++w) {
+    chunk[w * 4 + 0] = patBytes[0];
+    chunk[w * 4 + 1] = patBytes[1];
+    chunk[w * 4 + 2] = patBytes[2];
+    chunk[w * 4 + 3] = patBytes[3];
+  }
+
+  for (uint32_t done = 0; done < words; done += kWordsPerChunk) {
+    const uint32_t n = std::min(kWordsPerChunk, words - done);
+    if (!mem.WriteBytes(destAddr + done * 4, chunk.data(), n * 4)) {
+      MCLA_LOG_WARN("RtlFillMemoryUlong: write of {:X} bytes at {:08X} failed "
+                    "after {} words, lr={:08X}",
+                    n * 4, destAddr + done * 4, done,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      return;
+    }
+  }
+}
 
 void KeBugCheckEx() { __builtin_debugtrap(); }
 
 uint32_t KeGetCurrentProcessType() { return 1; }
 
-void RtlCompareMemoryUlong() { LOG_UTILITY("!!! STUB !!!"); }
+// RtlCompareMemoryUlong(Source, Length, Pattern) -> SIZE_T - MSDN ff552123;
+// Xenia reference .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:
+// 54-71.
+//
+// NOT memcmp: the real 360 export is (Source, Length, Pattern) and returns the
+// COUNT of ULONGs in Source that equal Pattern; unaligned Source or a Length
+// that is not a multiple of 4 returns 0. Every one of the 8 guest call sites
+// uses that shape (generated/ppc_xenon/ppc_recomp.0.cpp:8309-8316, 8406-8413,
+// 8582-8589, 8697-8704, 9185-9191, 9533-9539, 16575-16580, 17531-17536 - each
+// sets r3 = block+24, r4 = a byte length, r5 = the pattern).
+//
+// F-609: this was `void RtlCompareMemoryUlong() { LOG_UTILITY(...) }`. Two
+// defects in one line: the body was a no-op in release, AND `void` meant the
+// hook never assigned r3 - so all 8 call sites read the *incoming* r3, i.e. the
+// Source pointer, as the match count.
+uint32_t RtlCompareMemoryUlong(const void *source, uint32_t length,
+                               uint32_t pattern) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t sourceAddr = source ? mem.MapVirtual(source) : 0;
+
+  // Same refusal as the reference: nothing to count if Source or Length is not
+  // ULONG-granular, or if the address is not in the guest window (guest 0 is
+  // the NOACCESS guard page, memory.cpp:218).
+  if (sourceAddr == 0 || (sourceAddr % 4) != 0 || (length % 4) != 0)
+    return 0;
+
+  const uint32_t words = length >> 2;
+  uint32_t matches = 0;
+  for (uint32_t i = 0; i < words; ++i) {
+    uint32_t value = 0;
+    if (!mem.ReadU32BE(sourceAddr + i * 4, &value)) {
+      // Return only what was actually verified - never a count that implies
+      // the whole range was scanned.
+      static std::atomic<uint32_t> s_shortScans{0};
+      const uint32_t n = s_shortScans.fetch_add(1) + 1;
+      if (n <= 20 || (n % 500) == 0)
+        MCLA_LOG_WARN("RtlCompareMemoryUlong: read failed at word {} of {} "
+                      "(src={:08X} len={}) -> partial count {} #{} lr={:08X}",
+                      i, words, sourceAddr, length, matches, n,
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      return matches;
+    }
+    if (value == pattern)
+      ++matches;
+  }
+
+  {
+    static std::atomic<uint32_t> s_scans{0};
+    const uint32_t n = s_scans.fetch_add(1) + 1;
+    if (n <= 20 || (n % 500) == 0)
+      MCLA_LOG_INFO("RtlCompareMemoryUlong #{} src={:08X} words={} "
+                    "pattern={:08X} matches={} lr={:08X}",
+                    n, sourceAddr, words, pattern, matches,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  return matches;
+}
 
 uint32_t RtlInitializeCriticalSection(XRTL_CRITICAL_SECTION *cs) {
   cs->Header.Absolute = 0;
@@ -2070,16 +4991,131 @@ uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size,
   return guestAddr;
 }
 
+// MmGetPhysicalAddress(BaseAddress) -> PHYSICAL_ADDRESS.
+//
+// WHAT "REAL" MEANS HERE. The Xbox 360 runs with TBR (translation block base)
+// semantics for MmAllocatePhysicalMemory results: the kernel hands back a
+// virtual address that IS the physical address, and MmGetPhysicalAddress of
+// such an address is the identity. There is no page table to walk.
+//
+// Our model matches that for the one address class it actually hands out:
+// MmAllocatePhysicalMemoryEx (imports.cpp above) allocates from the o1heap
+// physical arena, which is bound into the flat guest window
+// (src/kernel/heap.cpp:232-234, physArenaBase = Translate(kPhysArenaBeginVa)),
+// and records every allocation in the size/LR registry via MmTrackAllocation.
+// So for a REGISTERED physical allocation the correct answer is the address
+// itself, and the registry is what makes that a verified fact rather than a
+// guess.
+//
+// F-609: this used to be `return address;` for every input - the 1.6 GiB title
+// heap, the 4 GiB window, 0 and 0xFFFFFFFF all "translated". An address that
+// was never a physical allocation now fails the way the reference does
+// (Xenia .research/xenia/.../xboxkrnl_memory.cc:554-565: no heap -> 0).
 uint32_t MmGetPhysicalAddress(uint32_t address) {
-  LOGF_UTILITY("0x{:x}", address);
-  return address;
+  if (address == 0)
+    return 0;
+
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (!mem.Translate(address)) {
+    MCLA_LOG_WARN("MmGetPhysicalAddress: {:08X} is outside the 4 GiB guest "
+                  "window -> 0 lr={:08X}",
+                  address,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return 0;
+  }
+
+  uint32_t allocBase = 0, allocSize = 0, allocLr = 0;
+  bool exact = false;
+  if (mcla::kernel::MclaPhysAllocInfo(address, &allocBase, &allocSize, &allocLr,
+                                      &exact) &&
+      exact) {
+    return address;
+  }
+
+  // Not a physical allocation we ever handed out. We have no page table, so we
+  // genuinely do not know what physical page backs it - say 0 and be loud,
+  // rather than echoing an address we cannot justify.
+  static std::atomic<uint32_t> s_noPa{0};
+  const uint32_t n = s_noPa.fetch_add(1) + 1;
+  if (n <= 20 || (n % 500) == 0) {
+    uint32_t nearBase = 0, nearSize = 0;
+    const bool haveNear =
+        mcla::kernel::MclaPhysNearestAllocBelow(address, &nearBase, &nearSize);
+    MCLA_LOG_WARN("MmGetPhysicalAddress: {:08X} is not a tracked physical "
+                  "allocation -> 0 #{} [nearest below {:08X}+{:X} found={} "
+                  "allocLr={:08X}] lr={:08X}",
+                  address, n, nearBase, nearSize, haveNear ? 1 : 0, allocLr,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    (void)allocBase;
+    (void)allocSize;
+  }
+  return 0;
 }
 
 void ObDeleteSymbolicLink() { LOG_UTILITY("!!! STUB !!!"); }
 
 void ObCreateSymbolicLink() { LOG_UTILITY("!!! STUB !!!"); }
 
-uint32_t MmQueryAddressProtect(uint32_t guestAddress) { return PAGE_READWRITE; }
+// MmQueryAddressProtect(BaseAddress) -> XDK protect flags.
+//
+// Xenia reference .research/xenia/.../xboxkrnl_memory.cc:413-422: look the
+// address up in the heap, QueryProtect; no heap found -> 0. Our model has no
+// page table, so the answer is derived from the two pieces of REAL protection
+// state that do exist:
+//
+//   * the deliberate PAGE_NOACCESS null guard page - the first 4 KiB of the
+//     guest window is VirtualProtect'ed to NOACCESS at src/kernel/memory.cpp:
+//     218 (and :251 on the Adopt path), and IsValid rejects < 0x1000;
+//   * the guest-virtual allocation state tracked by NtAllocateVirtualMemory /
+//     NtFreeVirtualMemory (GuestMemoryHeap::QueryVirtualRegion) - a reserved
+//     but uncommitted region is genuinely not accessible yet.
+//
+// F-609: this returned PAGE_READWRITE for every address, so a call on a
+// reserved region or on the null guard page told the guest "you may write
+// here" for memory it must not touch.
+uint32_t MmQueryAddressProtect(uint32_t guestAddress) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  // The null guard page: real NOACCESS, not a bookkeeping state.
+  if (guestAddress < 4096u) {
+    return kXPageNoAccess;
+  }
+
+  if (!mem.Translate(guestAddress)) {
+    static std::atomic<uint32_t> s_unmapped{0};
+    const uint32_t n = s_unmapped.fetch_add(1) + 1;
+    if (n <= 20 || (n % 500) == 0)
+      MCLA_LOG_WARN("MmQueryAddressProtect: {:08X} is outside the guest window "
+                    "-> 0 #{} lr={:08X}",
+                    guestAddress, n,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return 0; // no heap: matches the reference's "no mapping" answer
+  }
+
+  VirtualRegionInfo info;
+  if (mem.QueryVirtualRegion(guestAddress, &info)) {
+    if (!info.committed) {
+      // Reserved or FREE in the tracked window: not backed yet. This is the
+      // case the unconditional PAGE_READWRITE was actively wrong about.
+      return kXPageNoAccess;
+    }
+    return kXPageReadWrite;
+  }
+
+  // Mapped, but outside the region tracker (title heap at 0x20000, the physical
+  // arena above kPhysArenaBeginVa, the loaded XEX, the flat window generally).
+  // The model really does hand these out read/write, so PAGE_READWRITE is the
+  // true answer - but count them, because this is the half of the address space
+  // whose protection state is asserted by the flat mapping rather than tracked.
+  static std::atomic<uint32_t> s_flat{0};
+  const uint32_t n = s_flat.fetch_add(1) + 1;
+  if (n <= 20 || (n % 500) == 0)
+    MCLA_LOG_INFO("MmQueryAddressProtect #{} {:08X} -> PAGE_READWRITE from the "
+                  "flat window (untracked region) lr={:08X}",
+                  n, guestAddress,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  return kXPageReadWrite;
+}
 
 void VdEnableDisableClockGating() { LOG_UTILITY("!!! STUB !!!"); }
 
@@ -2172,6 +5208,30 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
       const uint32_t wbVA = mcla::gpu::CpPrimaryWritebackVA();
       if (wbVA != 0)
         (void)memC.ReadU32BE(wbVA, &rptrWb);
+      // F-594: the hot `lr` 0x8242FC1C is the return of this KeWait AND the
+      // branch target of the `lwarx`/`stwcx.` CAS retry loop that follows it
+      // (ppc_recomp.78.cpp:27220-27238). PPCContext has NO r31 member in this
+      // build (PPC_CONFIG_NON_VOLATILE_AS_LOCAL, ppc_config.h:10 — the
+      // volatile regs are function-local in the generated TUs, so a hook
+      // cannot read the callee's r31). Name what IS observable: the thread
+      // block the reservation almost certainly lives in. r13+256 is the block
+      // pointer already used for `pc` above; r13 itself is the context base.
+      {
+        uint32_t blk = 0, f0 = 0, f4 = 0, f8 = 0, f12 = 0, f16 = 0;
+        const uint32_t c13 = g_ppcContext->r13.u32;
+        (void)memC.ReadU32BE(c13 + 256u, &blk);
+        (void)memC.ReadU32BE(c13 + 0u, &f0);
+        (void)memC.ReadU32BE(c13 + 4u, &f4);
+        (void)memC.ReadU32BE(c13 + 8u, &f8);
+        (void)memC.ReadU32BE(c13 + 12u, &f12);
+        (void)memC.ReadU32BE(c13 + 16u, &f16);
+        MCLA_LOG_WARN("CAS-SITE #{} lr={:08X} r13={:08X} blk@+100={:08X} "
+                      "f0..f3={:08X}/{:08X}/{:08X}/{:08X} tid={:08X} "
+                      "obj={:08X} mode={} alertable={}",
+                      n, static_cast<uint32_t>(g_ppcContext->lr), c13, blk, f0,
+                      f4, f8, f12, GetCurrentThreadId(), objAddr, WaitMode,
+                      Alertable ? 1 : 0);
+      }
       MCLA_LOG_INFO("WAIT[KWFSO] #{:05}{} tid={:08X} obj@{:08X} reason={} "
                     "to={}ms lr={:08X} put={} rptrWB={:04X} "
                     "wb@{:08X}={:08X} pc={:08X}:{}",
@@ -2341,16 +5401,67 @@ uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, be<uint32_t> *param1,
   return 0;
 }
 
+// XamUserReadProfileSettings -- F-609. REACHED, so this is not dead wiring:
+// `python tools/ppc_xrefs.py calls 0x827BD324` -> 4 guest sites
+// (0x8244A7B0, 0x8244A820, 0x82750E08, 0x827519D4). It is therefore part of
+// this family and cannot be left silent while its three siblings are labelled.
+//
+// AN EMPTY PROFILE IS TRUTHFUL; THE VALUES IN IT WERE NOT. The old body
+// memset the guest buffer to 0 for *bufferSize bytes. Zero is not an invented
+// identity the way xuid 0xB13EBABEBABEBABE is: "no settings are stored" is
+// genuinely what a host with no profile holds, and all-zero is the encoding of
+// "empty set" that Xenia's own per-setting fill
+// (xam_user.cc:XamUserReadProfileSettingsEx, :153-247) produces for settings it
+// has no record of. So the zero-fill is RETAINED as a truthful empty answer, and
+// it is now counted and labelled as belonging to the synthetic-profile world so
+// a soak can see it.
+//
+// NOT CHANGED, AND THIS IS A DELIBERATE DEFERRAL: the return type. Xenia's is
+// `dword_result_t` (xam_user.cc:302-305, delegating to Ex at :306-308); this
+// hook returns `void`, and under GUEST_FUNCTION_HOOK/PPC_FUNC that leaves r3
+// holding the guest's own last value. At 0x82750E08 the return is genuinely
+// discarded -- the next instruction 0x82750E0C `cmpli cr0,r3,0000` tests the
+// titleId the caller itself loaded with `ori r3,r3,07D1` at 0x82750E04, not a
+// status -- so widening the type would change nothing measurable at that site
+// while perturbing an ABI shared with the other three. Re-measuring all four
+// sites' r3 handling is a separate single-variable pass; guessing at it now,
+// with no build and no soak, is exactly the boot risk this task exists to
+// avoid. The overlap comment below records what is still unverified.
 void XamUserReadProfileSettings(uint32_t titleId, uint32_t userIndex,
                                 uint32_t xuidCount, uint64_t *xuids,
                                 uint32_t settingCount, uint32_t *settingIds,
                                 be<uint32_t> *bufferSize, void *buffer,
                                 void *overlapped) {
-  if (buffer != nullptr) {
-    memset(buffer, 0, *bufferSize);
+  const uint64_t n = g_xamSynthProfileSettings.attempts.fetch_add(
+                         1, std::memory_order_relaxed) +
+                     1;
+  // Truthful answer for a host with no profile: an EMPTY setting set, not a
+  // missing one. Written only up to the caller's own declared buffer size, and
+  // only when a buffer was actually supplied; when it was not, we report the
+  // 4-byte size xam_user.cc's Ex arm reports for an empty result rather than
+  // dereferencing a null buffer. `bufferSize` and `buffer` are guest VAs: they
+  // arrive as translated host pointers from the wrapper, and the size is read
+  // through the big-endian accessor, so no guest value is reinterpret_cast and
+  // nothing is asserted on one.
+  const uint32_t declaredSize = bufferSize ? bufferSize->get() : 0u;
+  if (buffer != nullptr && declaredSize != 0u) {
+    memset(buffer, 0, declaredSize);
   } else {
-    *bufferSize = 4;
+    if (bufferSize) *bufferSize = 4;
+    g_xamSynthProfileSettings.refusals.fetch_add(1, std::memory_order_relaxed);
   }
+  (void)titleId;
+  (void)userIndex;
+  (void)xuidCount;
+  (void)xuids;
+  (void)settingCount;
+  (void)settingIds;
+  // The overlapped is deliberately NOT completed. Completing it would tell the
+  // guest a profile read finished; none did.
+  (void)overlapped;
+  XamSynthEmit("XamUserReadProfileSettings", g_xamSynthProfileSettings, n,
+               "empty setting set (all-zero), not a missing one; overlapped NOT "
+               "completed.");
 }
 
 // NOTE: NetDll_* exports take a leading selector arg (generated wrappers pass
@@ -2388,83 +5499,241 @@ uint32_t NetDll_WSAStartup(uint32_t dllSelector, uint16_t versionRequested,
   return 0; // SUCCESS
 }
 
-uint32_t NetDll_WSACleanup() {
-  return 0; // Success
+// ---------------------------------------------------------------------------
+// THE NetDll FAMILY -- F-609. Every entry below used to discard its arguments
+// and report success, or worse.
+//
+// The contract is DERIVED, and Xenia supplies it exactly. Xenia's pattern for
+// all of these is the same three lines, and it is the "socket not found" arm:
+//   auto socket = kernel_state()->object_table()->LookupObject<XSocket>(h);
+//   if (!socket) { XThread::SetLastError(0x2736); /* WSAENOTSOCK */ return -1; }
+// cited per function below. 0x2736 is WSAENOTSOCK and -1 is SOCKET_ERROR.
+//
+// WHY THAT IS *OUR* ARM AND NOT JUST A POSSIBLE ONE: NetDll_socket in this
+// same file returns 0xFFFFFFFF (INVALID_SOCKET) unconditionally, so this host
+// can NEVER hand the title a live socket. Every downstream call therefore
+// arrives in exactly the state Xenia's `!socket` branch handles, and
+// WSAENOTSOCK/SOCKET_ERROR is the answer the REFERENCE IMPLEMENTATION gives in
+// this exact state. It is not a refusal invented here; it is Xenia's refusal,
+// in the situation Xenia's own socket layer would be in on this host.
+//
+// The three exceptions, and why they are exceptions:
+//  * NetDll_WSACleanup returns 0 -- Xenia returns 0 too, on purpose:
+//    .research/xenia/src/xenia/kernel/xam/xam_net.cc:285-288, "This does
+//    nothing. Xenia needs WSA running." We have no socket layer to tear down
+//    and we do not tear one down, which is the same state Xenia's 0 describes.
+//    Kept, but counted, because "did nothing" should be visible in a soak.
+//  * NetDll_select -- Xenia runs a real host select
+//    (.research/xenia/src/xenia/kernel/xam/xam_net.cc:871-922), which we have
+//    no equivalent of (no sockets exist). Returning 0 would be a FABRICATED
+//    READINESS VERDICT: "I checked, nothing is ready", having checked nothing.
+//    Refused.
+//  * NetDll_socket / NetDll_accept already returned 0xFFFFFFFF, which is
+//    correct and is left alone -- but they are INSTRUMENTED, because "refused"
+//    and "never called" have to be distinguishable and only a marker on the
+//    call itself can tell them apart.
+//
+// A NOTE ON THE `calls` COUNT, so nobody over-reads the reachability data:
+// `python tools/ppc_xrefs.py calls <VA>` reports exactly ONE call site for every
+// NetDll export, and that site is inside the guest's own WinSock thunk table
+// (0x8244A310 etc., the region the NetDll_WSAStartup comment above already
+// names). One site is the thunk, so that count is a property of the thunk
+// table, NOT a measurement of whether the title calls these. The honest
+// statement is that reachability of this family is UNMEASURED, which is what
+// the marker below is for.
+// ---------------------------------------------------------------------------
+namespace {
+// WSAENOTSOCK. Xenia uses the literal with this name at
+// .research/xenia/src/xenia/kernel/xam/xam_net.cc:650, 667, 690, 729, 751, 772,
+// 932, 958, 992 -- it never returns an SOCKET_ERROR without setting this first.
+constexpr uint32_t kWsaENotSock = 0x2736u;
+constexpr uint32_t kSocketError = 0xFFFFFFFFu; // (uint32_t)-1
+
+// The guest has no TLS last-error slot plumbed in this file, so the WSA error
+// is a single host-side cell. That is an APPROXIMATION and is named as one: it
+// is exact for the single networking thread the title uses and wrong if the
+// title ever checks another thread's error. Xenia's is per-thread
+// (XThread::SetLastError, xam_net.cc:650).
+//
+// F-609 PORT BATCH, 2026-09-29 (integration stream): the cell this comment
+// describes, `std::atomic<uint32_t> g_netLastError{0}`, has been DELETED from
+// here. It lived inside this anonymous namespace, so it had internal linkage
+// and src/kernel/port_net.cpp -- which holds the eighteen remaining network
+// bodies, including the NetDll_WSAGetLastError that has to REPORT this error --
+// could not name it. Each half of the family was therefore reporting only its
+// own last error. The cell now lives at mcla::kernel::netport::LastError /
+// SetLastError (src/kernel/port_net.h:36-37, definition port_net.cpp:279) and
+// NetRefuse below writes through it. There is ONE cell, not two, and the
+// approximation named above is the one it still carries.
+std::atomic<uint64_t> g_netSeen{0};
+std::atomic<uint64_t> g_netRefused{0};
+
+// One shared census for the whole family so a single soak line answers "did the
+// title touch the network stack at all, and did we turn it away". House
+// cadence: first 8, then every 200th.
+inline uint64_t NetCensus(const char *op) {
+  const uint64_t seen = g_netSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (seen <= 8 || (seen % 200) == 0) {
+    const uint32_t glr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    MCLA_LOG_WARN("NET-REFUSE #{} op={} -> SOCKET_ERROR, WSAENOTSOCK(0x2736) "
+                  "set for the guest; no socket, no bytes moved "
+                  "(seen={} refused={}) glr={:08X}",
+                  seen, op, seen,
+                  g_netRefused.load(std::memory_order_relaxed), glr);
+  }
+  return seen;
 }
 
-uint32_t NetDll_socket(int af, int type, int protocol) {
+inline uint32_t NetRefuse(const char *op) {
+  NetCensus(op);
+  g_netRefused.fetch_add(1, std::memory_order_relaxed);
+  // F-609 PORT BATCH, 2026-09-29 (integration stream). REPOINTED from
+  // `g_netLastError.store(kWsaENotSock, ...)`.
+  //
+  // g_netLastError is declared ABOVE, inside this anonymous namespace, so it has
+  // internal linkage and no other translation unit can name it. That is why the
+  // eighteen bodies in src/kernel/port_net.cpp could not share it, and why each
+  // half of the family was reporting only its own last error -- a real
+  // incoherence in the one function whose entire job is to tell the title WHY
+  // the previous call failed. mcla::kernel::netport::SetLastError is the
+  // linkable cell (src/kernel/port_net.h:37, definition port_net.cpp:279) and
+  // there is now exactly ONE of them: no second error cell was added. The
+  // declaration above is KEPT as the honest record of the approximation (a
+  // single host cell standing in for Xenia's per-thread
+  // XThread::SetLastError, xam_net.cc:650), but the CELL itself has moved -- see
+  // the note at its old declaration. No second error cell was added.
+  mcla::kernel::netport::SetLastError(kWsaENotSock);
+  return kSocketError;
+}
+} // namespace
+
+uint32_t NetDll_WSACleanup(uint32_t dllSelector) {
+  (void)dllSelector;
+  // Xenia returns 0 for the same reason (xam_net.cc:285-288): there is no host
+  // socket layer to unwind. Counted, not silent -- the old body returned 0
+  // with no log line at all.
+  NetCensus("WSACleanup");
+  return 0;
+}
+
+uint32_t NetDll_socket(uint32_t dllSelector, int af, int type, int protocol) {
+  (void)dllSelector;
   (void)af;
   (void)type;
   (void)protocol;
-  return 0xFFFFFFFF; // INVALID_SOCKET
+  // Unchanged behaviour (INVALID_SOCKET was already correct); instrumented so
+  // the attempt is countable. Xenia's failure arm also sets a last error
+  // (xam_net.cc:636-638) but derives it from a real status we cannot produce.
+  return NetRefuse("socket");
 }
 
-uint32_t NetDll_closesocket(uint32_t s) {
+uint32_t NetDll_closesocket(uint32_t dllSelector, uint32_t s) {
+  (void)dllSelector;
   (void)s;
-  return 0; // Success
+  // Was `return 0; // Success` for a socket that never existed. Xenia:
+  // xam_net.cc:645-659, `!socket` -> WSAENOTSOCK, return -1.
+  return NetRefuse("closesocket");
 }
 
-uint32_t NetDll_setsockopt(uint32_t s, int level, int optname,
-                           const char *optval, int optlen) {
+uint32_t NetDll_setsockopt(uint32_t dllSelector, uint32_t s, int level,
+                           int optname, const char *optval, int optlen) {
+  (void)dllSelector;
   (void)s;
   (void)level;
   (void)optname;
   (void)optval;
   (void)optlen;
-  return 0; // Success
+  // Was `return 0; // Success`: it stored no option anywhere. Xenia:
+  // xam_net.cc:685-698, `!socket` -> WSAENOTSOCK, return -1.
+  return NetRefuse("setsockopt");
 }
 
-uint32_t NetDll_bind(uint32_t s, void *addr, int namelen) {
+uint32_t NetDll_bind(uint32_t dllSelector, uint32_t s, void *addr, int namelen) {
+  (void)dllSelector;
   (void)s;
   (void)addr;
   (void)namelen;
-  return 0; // Success
+  // Was `return 0; // Success`: nothing was bound, and worse, the guest's
+  // sockaddr was never even read. Xenia: xam_net.cc:722-742.
+  return NetRefuse("bind");
 }
 
-uint32_t NetDll_connect(uint32_t s, void *addr, int namelen) {
+uint32_t NetDll_connect(uint32_t dllSelector, uint32_t s, void *addr,
+                        int namelen) {
+  (void)dllSelector;
   (void)s;
   (void)addr;
   (void)namelen;
-  return 0; // Success
+  // Was `return 0; // Success`: the single most dangerous member of the family
+  // -- the title was told it had an established connection to an address we
+  // never parsed. Xenia: xam_net.cc:744-764.
+  return NetRefuse("connect");
 }
 
-uint32_t NetDll_listen(uint32_t s, int backlog) {
+uint32_t NetDll_listen(uint32_t dllSelector, uint32_t s, int backlog) {
+  (void)dllSelector;
   (void)s;
   (void)backlog;
-  return 0; // Success
+  // Was `return 0; // Success`. Xenia: xam_net.cc:766-784.
+  return NetRefuse("listen");
 }
 
-uint32_t NetDll_accept(uint32_t s, void *addr, int *addrlen) {
+uint32_t NetDll_accept(uint32_t dllSelector, uint32_t s, void *addr,
+                       int *addrlen) {
+  (void)dllSelector;
   (void)s;
   (void)addr;
   (void)addrlen;
-  return 0xFFFFFFFF; // INVALID_SOCKET
+  // INVALID_SOCKET was already correct; instrumented. Xenia's failure arm
+  // sets WSAENOTSOCK too (xam_net.cc:786+).
+  return NetRefuse("accept");
 }
 
-uint32_t NetDll_select(int nfds, void *readfds, void *writefds, void *exceptfds,
-                       void *timeout) {
+uint32_t NetDll_select(uint32_t dllSelector, int nfds, void *readfds,
+                       void *writefds, void *exceptfds, void *timeout) {
+  (void)dllSelector;
   (void)nfds;
   (void)readfds;
   (void)writefds;
   (void)exceptfds;
   (void)timeout;
-  return 0; // Success
+  // Was `return 0; // Success` -- a fabricated verdict that nothing is ready,
+  // from a check that never happened. Xenia runs a real host select here
+  // (xam_net.cc:871-922) and even flags its own uncertainty at :920
+  // ("TODO(gibbed): modify ret to be what's actually copied to the guest
+  // fd_sets?"). With no sockets there is no honest readiness answer, so
+  // SOCKET_ERROR.
+  return NetRefuse("select");
 }
 
-uint32_t NetDll_recv(uint32_t s, void *buf, int len, int flags) {
+uint32_t NetDll_recv(uint32_t dllSelector, uint32_t s, void *buf, int len,
+                     int flags) {
+  (void)dllSelector;
   (void)s;
   (void)buf;
   (void)len;
   (void)flags;
-  return 0; // Success (0 bytes received)
+  // Was `return 0; // Success (0 bytes received)`. This is the subtlest of the
+  // family and the reason the brief called it out: WinSock reports a 0-byte
+  // recv as a SUCCESSFUL COMPLETION, so the title was told "the connection
+  // delivered a clean zero-length message" when nothing was ever read. The
+  // guest's buffer was left untouched and uninitialised. Xenia:
+  // xam_net.cc:925-938, `!socket` -> WSAENOTSOCK, return -1.
+  return NetRefuse("recv");
 }
 
-uint32_t NetDll_send(uint32_t s, const void *buf, int len, int flags) {
+uint32_t NetDll_send(uint32_t dllSelector, uint32_t s, const void *buf, int len,
+                     int flags) {
+  (void)dllSelector;
   (void)s;
   (void)buf;
   (void)len;
   (void)flags;
-  return len; // Success (all bytes sent)
+  // Was `return len; // Success (all bytes sent)`. A FLAT lie: it told the
+  // title that `len` bytes had left the machine. Not one byte did. Xenia:
+  // xam_net.cc:985-998, `!socket` -> WSAENOTSOCK, return -1.
+  return NetRefuse("send");
 }
 
 PPC_FUNC(__imp__NetDll_inet_addr) {
@@ -2483,13 +5752,50 @@ void NetDll___WSAFDIsSet() { LOG_UTILITY("!!! STUB !!!"); }
 
 void XMsgStartIORequestEx() { LOG_UTILITY("!!! STUB !!!"); }
 
+// XexGetModuleHandle -- F-609 census. *** THIS IS NOT A FABRICATION. DO NOT
+// "FIX" IT. *** It looks exactly like a hardcoded fake -- `(void)moduleName;`
+// then a constant -- and that appearance is wrong, for a reason specific to this
+// host.
+//
+// 0x82000000 IS THE REAL, DOCUMENTED GUEST IMAGE BASE, and returning it is the
+// correct answer to "what is the module handle" on a recompiler that runs the
+// image in place:
+//   - docs/PROGRAM_GUIDE.md:62 -- "base `0x82000000`, code `0x82130000`".
+//   - docs/PROGRAM_GUIDE.md:85-86 -- "SectionAlignment `0x10000` ... So keep
+//     the identity map (`file offset = true_VA - 0x82000000`)".
+//   - AGENTS.md rule 3 (F-023) -- raw-byte rule, "offset = VA - 0x82000000".
+//   - This file's own header, imports.cpp:71, states the same identity map.
+// Every one of those is the SAME fact: the guest XEX is mapped one-to-one at
+// 0x82000000, so a module base IS an image base and the main executable's is
+// 0x82000000. Ignoring moduleName is therefore not a guess that happens to work;
+// it is the reason the constant is correct, because there is only one module in
+// this image and its base does not vary by name.
+//
+// This is the distinction the task asks for: a hardcoded constant that is a
+// LIE (a fabricated xuid, a fabricated signin state) versus a hardcoded constant
+// that is a FACT (the image base). The first is a bug; the second is the
+// implementation. `XamContentGetCreator`'s 0xB13EBABEBABEBABE and
+// kXamSynthProfile above are the first kind; this is the second.
+//
+// ONE REAL CAVEAT, measured, reported, NOT acted on. The guest does not gate on
+// success the way one would expect. Two of the four call sites
+// (`ppc_xrefs.py calls 0x827BD894` -> 0x8244A298, 0x8244A4D4, 0x824604DC,
+// 0x8275C7DC) read the handle only on the NON-zero return: at 0x8244A29C
+// `cmpi cr0,r3,0` / `bc bo=12 -> 0x8244A2C8` skips the `lwz r3,84(r1)` when the
+// status IS zero, and 0x8275C7E0/`0x8275C7E4` are the same shape over 80(r1).
+// So at those two sites returning X_ERROR_SUCCESS means the guest does not
+// consume the handle we wrote. Changing the returned status to non-zero to
+// "make the guest use it" would be guessing at a convention we have not
+// established, would contradict Xenia, and would be a behavioural gamble on a
+// blocked build -- so it is left alone and recorded here. The handle is written
+// correctly either way, which is what this function is responsible for.
 uint32_t XexGetModuleHandle(uint32_t moduleName, be<uint32_t> *handle) {
-  (void)moduleName;
+  (void)moduleName; // Correct here: one image, one base. See the block above.
   if (handle) {
-    // Return the main executable handle
+    // The main executable handle == the identity-mapped guest image base.
     handle->set(0x82000000);
   }
-  return 0;
+  return 0; // X_ERROR_SUCCESS
 }
 
 bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION *cs) {
@@ -2881,6 +6187,11 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
   }
 
   Semaphore *sem = nullptr;
+  // F-588: which branch of the resolution ladder below actually produced `sem`.
+  // The TYPE-CENSUS[REL] "res=QueryKernelObject(Semaphore)" text is a hardcoded
+  // literal emitted ABOVE the ladder, so it never proved which object the
+  // release landed on - and the whole wake-loss question is exactly that.
+  const char *resBranch = "none";
 
   // SESSION 72 WAKE-LOSS + F-039 (p2o): NtCreateSemaphore mints an identity
   // handle = MapVirtual(host Semaphore*). Wait (NtWaitForSingleObjectEx)
@@ -2902,27 +6213,63 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
     if (IsKernelObject(guestHandle)) {
       if (auto *id = LookupIdentityKernelObject(guestHandle)) {
         sem = static_cast<Semaphore *>(id);
+        resBranch = "identity-map";
       } else {
         void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(
             guestHandle);
         if (raw) {
           auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
           sem = TryQueryKernelObject<Semaphore>(*hdr);
-          if (!sem && g_userHeap.IsPhysicalArenaPtr(raw)) {
-            // CreateKernelObject product living in the physical arena — the
+          if (sem) {
+            resBranch = "try-query-header";
+          } else if (g_userHeap.IsPhysicalArenaPtr(raw)) {
+            // CreateKernelObject product living in the physical arena - the
             // same pointer Wait's GetKernelObject raw-fallback returns.
             auto *host = reinterpret_cast<Semaphore *>(raw);
             if (host->IsValid())
               sem = host;
+            resBranch = "physical-arena-reinterpret";
+          } else {
+            resBranch = "raw-unusable";
           }
+        } else {
+          resBranch = "translate-null";
         }
       }
+    } else {
+      resBranch = "not-kernel-object";
     }
   }
   // Guest-owned XKSEMAPHORE headers (KeInitializeSemaphore path). Only mint
   // a wrapper when we did NOT resolve an identity object above.
   if (!sem) {
     sem = QueryKernelObject<Semaphore>(Handle->Header);
+    resBranch = "MINT-QueryKernelObject";
+  }
+
+  // F-588: report the branch that actually won, per handle, bounded. This is
+  // the measurement the hardcoded res= text was pretending to be.
+  // F-589: also print the RESOLVED POINTER and the CURRENT COUNT. handle =
+  // hostPtr - 0x100000000, so handle 0xC5400280 must resolve to 0x1C5400280.
+  // The SEMA-wait/SEMA-release probe rows at this=0x1c6420280 belong to a
+  // DIFFERENT handle (0xC6420280) - one handle resolving to two pointers, or a
+  // count that never leaves 0, is the wake-loss; this line shows which.
+  {
+    static std::atomic<uint32_t> s_resLogs{0};
+    const uint32_t rn = s_resLogs.fetch_add(1) + 1;
+    if (rn <= 60 || (rn % 500) == 0) {
+      const uint32_t gh =
+          static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
+                                mcla::kernel::g_memory.base);
+      const bool live = (sem != nullptr) && sem->IsValid();
+      const uint32_t sc =
+          live ? sem->count.load(std::memory_order_relaxed) : 0xFFFFFFFFu;
+      MCLA_LOG_WARN("RELSEMA-RES #{} guest={:08X} branch={} live={} rel={} "
+                    "sem={} cnt={} lr={:08X}",
+                    rn, gh, resBranch, live ? 1 : 0, ReleaseCount,
+                    static_cast<const void *>(live ? sem : nullptr), sc,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
   }
 
   // p2f crash-2 guard: the preload completion releases C9B36F00 after the
@@ -3102,13 +6449,163 @@ void KeQuerySystemTime(be<uint64_t> *time) {
 
 void RtlTimeToTimeFields() { LOG_UTILITY("!!! STUB !!!"); }
 
-void RtlFreeAnsiString() { LOG_UTILITY("!!! STUB !!!"); }
+// ---------------------------------------------------------------------------
+// RtlFreeAnsiString -- F-609, partially real, partially a counted refusal. The
+// brief listed it beside ExFreePool as "the same shape"; verified, it is NOT
+// the same shape, and the difference matters.
+//
+// WHAT XENIA DOES, cited: .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:155-163
+//   void RtlFreeAnsiString_entry(pointer_t<X_ANSI_STRING> string) {
+//     if (string->pointer) { kernel_memory()->SystemHeapFree(string->pointer); }
+//     string->reset();
+//   }
+// Two actions: free the buffer, then reset the struct. So yes, it must really
+// release -- the reference implementation does.
+//
+// WHY ONLY THE SECOND HALF IS SAFE HERE, and this is the load-bearing finding.
+// The ONLY producer of an XANSI_STRING reachable in this tree is
+// RtlInitAnsiString in this same file, and it BORROWS -- it stores the
+// caller's own pointer without copying anything:
+//   src/kernel/imports.cpp:667-673
+//     destination->Buffer = xpointer<char>(source);
+// There is no RtlAllocateAnsiString in this file and none in the guest's
+// import table, so no XANSI_STRING buffer here is ever heap-owned. Calling
+// g_userHeap.Free on a borrowed pointer would be a use-after-free of a
+// CALLER's buffer -- converting a leak into heap corruption, which is strictly
+// worse than the stub and is precisely the "never stack a mitigation" rule.
+//
+// So: the free is attempted only when the buffer is provably one of OURS, and
+// when it is not, the refusal is NAMED and counted rather than silent. The
+// struct reset is done unconditionally, because that much is real work we
+// genuinely perform and it is the guest-visible effect of "this string is
+// dead" (Xenia's `string->reset()`, xboxkrnl_rtl.cc:161).
+//
+// REACHABILITY, so the next session does not spend time here:
+// `RtlFreeAnsiString` is ABSENT from generated/ppc_xenon/ppc_func_mapping.cpp,
+// which is the guest's static import table. Combined with XexGetProcedureAddress
+// being an unwired stub in this file, there is no path by which default.xex can
+// reach this export. The GUEST_FUNCTION_HOOK below is dead wiring.
+// ---------------------------------------------------------------------------
+namespace {
+std::atomic<uint64_t> g_ansiFreeSeen{0};
+std::atomic<uint64_t> g_ansiFreeFreed{0};
+std::atomic<uint64_t> g_ansiFreeBorrowed{0};
+} // namespace
+
+void RtlFreeAnsiString(XANSI_STRING *string) {
+  const uint64_t seen =
+      g_ansiFreeSeen.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  if (string == nullptr) {
+    return;
+  }
+
+  // `Buffer.ptr` is a be<uint32_t> holding the GUEST virtual address, and
+  // be<T>::value is the RAW big-endian word (src/kernel/xbox.h:28-70) -- on an
+  // x86 host that is the byte-reversed form, NOT the address. `get()` is the
+  // one that gives back the guest VA; the same is true of the implicit
+  // conversion, which is what NtCreateFile at :715 uses.
+  const uint32_t buf = static_cast<uint32_t>(string->Buffer.ptr.get());
+  if (buf == 0) {
+    // Nothing to release. Xenia's `if (string->pointer)` guard, verbatim.
+    string->Length.set(0);
+    string->MaximumLength.set(0);
+    string->Buffer = xpointer<char>(nullptr);
+    return;
+  }
+
+  // Is this buffer one of ours? The same IsLiveAllocation predicate
+  // ExFreePool above uses: if it is a live fragment of a heap arena, the
+  // allocation is ours and releasing it is correct. If it is not, it is a
+  // caller's buffer that RtlInitAnsiString borrowed, and freeing it would be a
+  // use-after-free -- so we refuse, by name, and say so.
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  void *host = mem.Translate(buf);
+  Heap::LiveProbe probe{};
+  bool ours = false;
+  if (host != nullptr) {
+    ours = g_userHeap.IsLiveAllocation(g_userHeap.heapArenaBase,
+                                       g_userHeap.heapArenaSize, host, &probe) ||
+           g_userHeap.IsLiveAllocation(g_userHeap.physArenaBase,
+                                       g_userHeap.physArenaSize, host, &probe);
+  }
+
+  if (ours) {
+    mem.Free(buf, 0);
+    g_ansiFreeFreed.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    g_ansiFreeBorrowed.fetch_add(1, std::memory_order_relaxed);
+    if (seen <= 8 || (seen % 200) == 0) {
+      const uint32_t glr =
+          g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+      MCLA_LOG_WARN("ANSI-FREE #{} buf={:08X} -> REFUSED the free: not a live "
+                    "fragment of any heap arena, so RtlInitAnsiString borrowed "
+                    "it (src/kernel/imports.cpp:667-673) and it is the caller's "
+                    "buffer; struct reset only, bytes kept. seen={} freed={} "
+                    "borrowed={} glr={:08X}",
+                    seen, buf, seen,
+                    g_ansiFreeFreed.load(std::memory_order_relaxed),
+                    g_ansiFreeBorrowed.load(std::memory_order_relaxed), glr);
+    }
+  }
+
+  // The reset is real work in both arms -- Xenia's `string->reset()`,
+  // xboxkrnl_rtl.cc:161. void, so there is no status to launder here; that is
+  // why this entry is only half the defect the brief described.
+  string->Length.set(0);
+  string->MaximumLength.set(0);
+  string->Buffer = xpointer<char>(nullptr);
+}
 
 void RtlUnicodeStringToAnsiString() { LOG_UTILITY("!!! STUB !!!"); }
 
 void RtlInitUnicodeString() { LOG_UTILITY("!!! STUB !!!"); }
 
-void ExTerminateThread() { LOG_UTILITY("!!! STUB !!!"); }
+// ExTerminateThread (F-609): REPORT ONLY. Still a refusal, deliberately - it
+// must not return to the caller on real hardware, and it cannot not return
+// here.
+//
+// What a correct implementation needs, and why it is not written:
+//
+//  1. AN UNWIND TARGET. The only unwinder this recompiler emits is the
+//     setjmp/longjmp pair for the two reserved import addresses:
+//     .research/XenonRecomp/XenonRecomp/recompiler.cpp:523-535 gates ALL
+//     `longjmp` emission on `config.longJmpAddress` and ALL `setjmp` emission
+//     on `config.setJmpAddress`, and config/mcla_xenonrecomp.toml sets NEITHER
+//     (grep: no such key anywhere in the file). The recompiled guest therefore
+//     contains zero setjmp and zero longjmp. Calling longjmp() from here would
+//     jump into a jmp_buf that nobody ever initialised, and a C++ exception
+//     would unwind through frames with no landing pads. Both are UB, and either
+//     would trade a visible refusal for an unpredictable crash - strictly worse
+//     than what we have. Per project rule 2, mcla_xenonrecomp.toml is not ours
+//     to edit; enabling it is a recompiler-regen decision (skill
+//     mcla-recompiler-regen), not a line in this file.
+//  2. A THREAD REGISTRY. Terminating must also tear down the GuestThreadHandle
+//     and release every guest parked in NtWaitForSingleObjectEx on it, or those
+//     parks hang forever. That is a src/kernel/guest_thread.cpp change, not
+//     ours.
+//  3. A PC-side entry for the teardown, since there is no guest-side KTHREAD
+//     teardown to borrow.
+//
+// Until 1-3 exist, the honest behaviour is to be loud and let the guest
+// continue, so the original STUB marker is preserved verbatim and a bounded
+// census is added: a soak can now show whether the title ever REACHES
+// ExTerminateThread (w657.log never does - the marker count is 0), which is
+// the fact needed to decide whether any of this is worth building.
+void ExTerminateThread() {
+  LOG_UTILITY("!!! STUB !!!");
+  static std::atomic<uint32_t> s_exTerm{0};
+  const uint32_t n = s_exTerm.fetch_add(1) + 1;
+  if (n <= 40 || (n % 500) == 0)
+    MCLA_LOG_WARN("EX-TERMINATE #{} REFUSING and returning: no unwind target "
+                  "exists (recompiler.cpp:523-535 emits longjmp only when "
+                  "config.longJmpAddress is set, setjmp only when "
+                  "config.setJmpAddress is set, and mcla_xenonrecomp.toml sets "
+                  "neither), so terminating here would be UB. The guest "
+                  "continues on this thread. tid={:08X} lr={:08X}",
+                  n, GetCurrentThreadId(),
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+}
 
 uint32_t ExCreateThread(be<uint32_t> *handle, uint32_t stackSize,
                         be<uint32_t> *threadId, uint32_t xApiThreadStartup,
@@ -3210,14 +6707,216 @@ void IoSetShareAccess() { LOG_UTILITY("!!! STUB !!!"); }
 
 void IoRemoveShareAccess() { LOG_UTILITY("!!! STUB !!!"); }
 
-uint32_t NetDll_XNetStartup(void *xnaddr) {
-  (void)xnaddr;
-  return 0; // Success
+// ===========================================================================
+// SYNTH-XNET -- A FABRICATION. This block, and only this block, is synthetic.
+// Read this before "fixing" it, and do not widen it to the socket family.
+//
+// ---------------------------------------------------------------------------
+// WHAT THE TITLE ACTUALLY DOES WITH THE XNetStartup RESULT (measured)
+// ---------------------------------------------------------------------------
+// There is exactly ONE call of the XNetStartup thunk in the image:
+//   `python tools/ppc_xrefs.py calls 0x8244A548` -> 1 site, 0x821E44F0, inside
+//   sub_821E44A0. `calls 0x821E44A0` -> 2 sites, 0x821D5F68 (a bare
+//   tail-branch thunk) and 0x82500F70. Neither caller inspects anything;
+//   sub_821E44A0 owns the only check on the result, and it is:
+//     0x821E44F0  bl   8244A548
+//     0x821E44F4  cmpi cr6,r3,0
+//     0x821E44F8  bc    (branch IF EQUAL -- verified against w659.log below)
+//     0x821E44FC  lis r11,8201 / addi r3,r11,32300 / bl 821BD618
+//   with 0x82017E2C == "XNetStartup failed" (raw bytes, mcla_pe.bin +
+//   0x17E2C, F-023). So: tested against zero exactly once, and a non-zero
+//   answer is FATAL. There is no tolerance, no retry, no offline branch. The
+//   branch polarity is not guessed: w659.log:305-316 shows the fatal printing
+//   for a return of 0x32, i.e. the `bc` is "branch if equal". (`tools/
+//   ppc_disasm.py` prints a raw BO/BI whose BI field it decodes wrong -- every
+//   `cmpi cr6` / `bc ... bi=26` pair in this image is bo=12 => branch-if-equal,
+//   bo=4 => branch-if-not-equal. The log is the arbiter.)
+//
+// This wrapper is the boot worker's step 2. sub_821BD7C0 stores two words,
+// calls 821BD648, then 0x821BD7F8 -> 821D5F68 (this), then goes on to
+// 821C06F0 / 82130000 / 821C45D8. w659.log:321 mirror stack
+// f0=821E44F4 f1=821BD7FC f2=82132454: the refusal killed the whole boot, one
+// second in, at "Fatal error dispatcher invoked" 0 -> 1.
+//
+// The same wrapper then does WinSock: `bl 8244A300` (0x827BD0F4 is
+// __imp__NetDll_WSAStartup, generated/ppc_xenon/ppc_func_mapping.cpp:44815),
+// fatal on non-zero with "InitWinSock - Couldn't find a usable WinSock DLL"
+// (0x82017DF8), then requires WSADATA.wVersion == 0x0002 or fatals again
+// (0x82017DB8). NetDll_WSAStartup above already returns 0 and already stores
+// the echoed version word, so that half of the wrapper is already satisfied and
+// nothing in this block is needed for it.
+//
+// The decisive question -- can the title proceed with startup succeeding and
+// no server? YES, and statically so. XNetGetTitleXnAddr is a DIFFERENT export
+// with 7 call sites (`calls 0x8244A670` -> 0x824E6148 x2, 0x824E61F0 x2,
+// 0x825019B0, 0x82501A28, 0x82501AC0), every one of them inside the RakNet /
+// "is there a network" helpers, and NONE of them on the boot path. It is also
+// not a pointer return, so there is no NULL to dereference: the guest passes
+// its own XNADDR buffer and tests the status word (sub_824E6148: r3 == 0 is
+// the success branch at 0x824E6190-0x824E61B0) plus the abEnet bytes the
+// guest itself copies out of that buffer at XNADDR+0x10. So the title reaches
+// its menu with no server; it fails later, where the server is actually
+// needed, and it fails there for an honest reason.
+//
+// ---------------------------------------------------------------------------
+// IS A REAL IMPLEMENTATION POSSIBLE HERE? No, and the reason is structural.
+// ---------------------------------------------------------------------------
+// XNet is Xbox Live's session/broker layer, not a socket. There is no Live
+// service to join and no peer to broker to; and the only networking primitive
+// the guest has is NetDll_socket, which returns INVALID_SOCKET
+// unconditionally (measured, and correct), so even a real XNet would have
+// nothing to ride on. The reference implementation agrees and does not try:
+//   .research/xenia/src/xenia/kernel/xam/xam_net.cc:172-191
+//     NetDll_XNetStartup_entry -- copies the params, has the XNet construction
+//     COMMENTED OUT at :181-188, and `return 0;` at :190.
+// "XNet started, nothing behind it" is Xenia's own state. It is still a
+// fabrication, and it is labelled as one here, with a trigger below.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS REAL IN THIS BLOCK
+// ---------------------------------------------------------------------------
+//  1. The 13 XNetStartupParams bytes are really read out of guest memory
+//     through the checked helper with explicit byte reads, and really stored
+//     host-side. Xenia asserts the same 13 bytes (xam_net.cc:154-168 and the
+//     assert_true at :175) and stores the same struct (xam_net.cc:170, :176),
+//     so state a guest could later read back through NetDll_XNetGetOpt
+//     (xam_net.cc:206-222) genuinely exists here.
+//  2. XNetGetTitleXnAddr really zeroes the caller's XNADDR, because the guest
+//     does NOT initialise it before the call (0x824E6188 and 0x82501AE4 pass
+//     an uninitialised stack buffer), so "do nothing" would hand the title
+//     uninitialised guest stack. 36 bytes is the size the guest itself memsets
+//     (`li r5,36` at 0x825019D0 and 0x82501AD0), not an assumed one.
+//
+// WHAT IS NOT REAL: the `return 0` in both functions. Nothing was started and
+// no address exists. "XNetStartup succeeded" is a claim about a subsystem that
+// does not exist, and the title believes it. Nothing here invents a server,
+// an IP or a MAC.
+//
+// NOT DONE, DELIBERATELY: Xenia also plants a loopback ina and a 0xCC-filled
+// 6-byte abEnet (xam_net.cc:455, :470) and says in the comment there that "a
+// zero value will cause RakPeer::Startup to fail". That is deferred, because
+// it is a SECOND fabrication for a code path the boot does not reach, and
+// because reaching it honestly (as "we are not online") is the better failure.
+// If the boot ever reaches RakPeer, that is the moment to reconsider it -- and
+// the reconsideration is recorded at those two sites, not here.
+//
+// REMOVAL TRIGGER -- delete this whole block and restore the refusal
+// (NetRefuse("XNetStartup") + return 0x32) exactly when ANY of these holds:
+//   (a) a second native peer exists that can answer XNet session requests, so
+//       a real XNet can be built and its real status returned;
+//   (b) the title is run against a real Xbox Live service or a LAN bridge to
+//       one (no such thing exists in this tree -- grep for it before assuming);
+//   (c) the boot reaches code that needs a live session and fails there, in
+//       which case the answer is (a), not a longer life for this stub.
+// Until one of those holds, THE BOOT DEPENDS ON THE `return 0` BELOW.
+//
+// SIGNATURE (F-609 Task 3): both entries gained the leading `dllSelector`, and
+// the old one-argument form was binding the WRONG REGISTER. The thunk at
+// 0x8244A548 is `mr r4,r3 ; li r3,1 ; b 8244A490` -- the guest calls
+// (1, params) -- so the old `NetDll_XNetStartup(void *xnaddr)` was reading the
+// selector 1 as `xnaddr` and never saw the params at all. Same at 0x8244A670
+// for XNetGetTitleXnAddr. That is the off-by-one the socket family's fix
+// already removed everywhere else; these two were missed.
+// ===========================================================================
+namespace {
+// SYNTH-XNET census. Attempts and outcomes are counted separately, by house
+// rule. `attempts` is every entry into this block; `outcomes` is every entry
+// that went on to return the fabricated success. They are equal by
+// construction today; the moment they differ, a refusal path has been added
+// and this comment is stale.
+std::atomic<uint64_t> g_synthXnetAttempts{0};
+std::atomic<uint64_t> g_synthXnetOutcomes{0};
+std::atomic<uint64_t> g_synthXnetParamsCaptured{0};
+std::atomic<uint32_t> g_synthXnetSizeOfStruct{0};
+std::atomic<uint32_t> g_synthXnetFlags{0};
+
+// 13 bytes. Xenia's XNetStartupParams is thirteen uint8_t
+// (xam_net.cc:154-168) and the guest agrees: sub_821E44A0 builds it with
+// `stb r9,80(r1)` where r9 = 13 (0x821E44CC/0x821E44E8), then `stb r8,81(r1)`
+// where r8 = 1 (0x821E44D0/0x821E44EC).
+constexpr uint32_t kXnetStartupParamsBytes = 13u;
+// The XNADDR extent the guest zeroes itself with `li r5,36`
+// (0x825019D0, 0x82501AD0, 0x82501A7C).
+constexpr uint32_t kXnetXnAddrBytes = 36u;
+const uint8_t kXnetZeroes[kXnetXnAddrBytes] = {};
+} // namespace
+
+uint32_t NetDll_XNetStartup(uint32_t dllSelector, const void *xnaddr) {
+  const uint64_t attempt =
+      g_synthXnetAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  // REAL: read the params the title actually filled in. Checked helper,
+  // explicit byte granularity, no reinterpret_cast on guest data, no assert.
+  bool paramsRead = false;
+  if (xnaddr != nullptr) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t guestAddr = mem.MapVirtual(xnaddr);
+    uint8_t params[kXnetStartupParamsBytes] = {};
+    if (guestAddr != 0 && mem.ReadBytes(guestAddr, params, sizeof(params))) {
+      paramsRead = true;
+      g_synthXnetSizeOfStruct.store(params[0], std::memory_order_relaxed);
+      g_synthXnetFlags.store(params[1], std::memory_order_relaxed);
+      g_synthXnetParamsCaptured.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // The marker. SYNTH-XNET advances on EVERY call; the line prints on the
+  // house cadence (first 8, then every 200th) so a soak can attribute the
+  // whole running title to this block.
+  if (attempt <= 8 || (attempt % 200) == 0) {
+    const uint32_t glr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    MCLA_LOG_WARN(
+        "SYNTH-XNET #{} op=XNetStartup attempts={} outcomes={} "
+        "params_captured={} sizeOfStruct={} flags={} selector={:08X} "
+        "paramsRead={} -> returning 0 (SUCCESS) with NOTHING started behind it "
+        "glr={:08X}",
+        attempt, attempt,
+        g_synthXnetOutcomes.load(std::memory_order_relaxed),
+        g_synthXnetParamsCaptured.load(std::memory_order_relaxed),
+        g_synthXnetSizeOfStruct.load(std::memory_order_relaxed),
+        g_synthXnetFlags.load(std::memory_order_relaxed), dllSelector,
+        paramsRead ? 1 : 0, glr);
+  }
+  g_synthXnetOutcomes.fetch_add(1, std::memory_order_relaxed);
+  return 0; // <-- THE FABRICATION. Nothing was started. See the trigger above.
 }
 
-uint32_t NetDll_XNetGetTitleXnAddr(void *xnaddr) {
-  (void)xnaddr;
-  return 0; // Success
+// F-609 Task 3, and a correction to a claim the previous pass left in this
+// file: this does NOT return a pointer, and 0 is not NULL. It returns an
+// XnAddrStatus word and fills the caller's XNADDR. That is why the value 0
+// is right for this guest: sub_824E6148 (0x824E6188-0x824E61B0) and
+// sub_82501AC0 (0x82501AE4) both take the r3 == 0 branch as SUCCESS, and
+// sub_824E6148 then copies 6 bytes out of XNADDR+0x10. Note that 0 is
+// Xenia's XNET_GET_XNADDR_PENDING (xam_net.cc:431), not its NONE (1, :433) --
+// the guest's own encoding differs from the reference's, and the bytes win.
+// Real work: zero the buffer (see the block comment). Not done: an address.
+uint32_t NetDll_XNetGetTitleXnAddr(uint32_t dllSelector, void *xnaddr) {
+  const uint64_t attempt =
+      g_synthXnetAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  bool zeroed = false;
+  if (xnaddr != nullptr) {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t guestAddr = mem.MapVirtual(xnaddr);
+    if (guestAddr != 0) {
+      zeroed = mem.WriteBytes(guestAddr, kXnetZeroes, kXnetXnAddrBytes);
+    }
+  }
+
+  if (attempt <= 8 || (attempt % 200) == 0) {
+    const uint32_t glr =
+        g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
+    MCLA_LOG_WARN(
+        "SYNTH-XNET #{} op=XNetGetTitleXnAddr attempts={} outcomes={} "
+        "selector={:08X} xnaddr_zeroed={} -> returning 0 (no address, no "
+        "server, no MAC) glr={:08X}",
+        attempt, attempt,
+        g_synthXnetOutcomes.load(std::memory_order_relaxed), dllSelector,
+        zeroed ? 1 : 0, glr);
+  }
+  g_synthXnetOutcomes.fetch_add(1, std::memory_order_relaxed);
+  return 0; // SYNTH-XNET: the guest's success value, with an empty address.
 }
 
 uint32_t KeWaitForMultipleObjects(uint32_t Count,
@@ -3666,147 +7365,94 @@ GUEST_FUNCTION_HOOK(__imp__XMACreateContext, XMACreateContext);
 GUEST_FUNCTION_HOOK(sub_821305B8, sub_821305B8_NoOp);
 
 // Missing Xam/NetDll imports referenced by generated code
-void XamShowFriendsUI() {}
-void XamShowGamerCardUIForXUID() {}
-void XamShowAchievementsUI() {}
-void XamShowPlayerReviewUI() {}
-void XamShowMarketplaceUI() {}
-void KeSetDisableBoostThread() {}
-void XamLoaderSetLaunchData() {}
-void XamLoaderGetLaunchData() {}
-void XamLoaderGetLaunchDataSize() {}
-void XamCreateEnumeratorHandle() {}
-void XamGetPrivateEnumStructureFromHandle() {}
+//
+// F-609 PORT BATCH, 2026-09-29 (integration stream). The dead host definitions
+// that used to sit under that heading are GONE, and this heading is kept
+// verbatim on instruction. It is now only half true, so the correction is
+// recorded here rather than left to the next reader to discover:
+//
+//   * "Missing" is no longer accurate for the 63 exports this batch ported.
+//     19 now have real bodies and 44 have honest, counted refusals, in
+//     src/kernel/port_net.cpp, src/kernel/port_xam_user.cpp,
+//     src/kernel/port_kobj.cpp and src/kernel/port_voice_input.cpp. Each of
+//     those files registers its own GUEST_FUNCTION_HOOK, so there is exactly
+//     one owner of each guest address (AGENTS.md rule 4) and the empty
+//     GUEST_FUNCTION_STUB bodies are gone rather than merely unreachable.
+//   * "Missing ... referenced by generated code" IS still true of the wider
+//     tree, and this heading is therefore still a real statement, just a
+//     smaller one.
+//   * What the deletion also removed, and why it mattered: two of the deleted
+//     bodies were LIVE FABRICATIONS. `NetDll_XNetGetConnectStatus` returned
+//     1 (commented "Connected") and `NetDll_XNetGetEthernetLinkStatus`
+//     returned 1 (commented "Link up"). Both told the title it had a network
+//     this host does not have. port_net.cpp refuses both instead.
+//   * Also deleted: `int NetDll_WSAGetLastError()`, which was DEAD code (its
+//     GUEST_FUNCTION_STUB body was empty, so the guest read its own r3 back as
+//     its error code). port_net.cpp:297 is the live one. See the F-609 note
+//     that used to precede it, kept below.
+//   * NOT deleted, and deliberately so: `void _snprintf()` and
+//     `void _vsnprintf()` further down this file. They are SINGLE-underscore
+//     symbols. The stubs this batch removed are `__imp___snprintf` /
+//     `__imp___vsnprintf` (double underscore after the prefix), which had
+//     empty bodies and therefore never called `_snprintf`/`_vsnprintf` at all.
+//     Those two are pre-existing orphans for a different (also empty) import
+//     pair; they are out of scope here and are named rather than swept up.
 
-uint32_t NetDll_ioctlsocket(uint32_t s, int cmd, uint32_t *argp) {
-  (void)s;
-  (void)cmd;
-  (void)argp;
-  return 0;
-}
 
-uint32_t NetDll_getsockname(uint32_t s, void *addr, int *addrlen) {
-  (void)s;
-  (void)addr;
-  (void)addrlen;
-  return 0;
-}
+// F-609, beyond the brief's list. Was `int NetDll_WSAGetLastError() { return 0; }`
+// -- "no error", unconditionally, forever. That is the load-bearing partner of
+// the whole NetDll family: it is the function the title calls to find out WHY a
+// socket call failed, and with every failure above reporting SOCKET_ERROR, a
+// hardcoded 0 would tell it there was no reason. So this now reports the
+// WSAENOTSOCK that the refusals above set.
+//
+// TASK 3 CORRECTION (measured, this pass): the body below was correct and was
+// NOT REACHABLE. `GUEST_FUNCTION_STUB(__imp__NetDll_WSAGetLastError)` expands
+// to `PPC_FUNC(name) { }` (src/kernel/function.h:640-641) -- an empty body that
+// leaves r3 holding whatever the caller passed, so the title was reading its
+// own argument back as its error code and the host definition was dead code.
+// It is a real HOOK now, at the single site that import already had
+// (`addr_owners.py --check 0x827BD204` -> one map row, one binding, no
+// duplicate).
+//
+// ARITY, verified not assumed: the guest thunk is `sub_8244A480`, a bare
+// `b 827BD204` with no register setup at all (0x8244A478 and 0x8244A484 are
+// the only instructions either side of it). So this entry takes NO leading
+// selector, unlike the rest of the family, and the zero-argument signature is
+// correct as written.
+//
+// Xenia: NetDll_WSAGetLastError_entry (xam_net.cc:291-294) returns
+// XThread::GetLastError() -- a per-thread cell. This is a single host cell
+// (g_netLastError, declared with the family), which is exact for the one
+// networking thread this title uses and would be wrong if a second thread ever
+// asked. That approximation is named rather than hidden.
+//
+// F-609 PORT BATCH, 2026-09-29 (integration stream) -- SUPERSEDING. Two changes
+// to the paragraph above, both measured, neither erasing the F-609 finding:
+//
+//   1. THE DEFINITION IS GONE from this file. `int NetDll_WSAGetLastError()`
+//      was DEAD CODE, exactly as the TASK 3 CORRECTION note says: the
+//      GUEST_FUNCTION_STUB body was empty, so the host definition was never
+//      called and the title was reading its own r3 back as its error code. The
+//      live one is src/kernel/port_net.cpp:297. Leaving the definition here
+//      would have been a LNK2005 duplicate external symbol, since both are at
+//      global scope with external linkage and the same signature.
+//   2. THE BINDING MOVED. The note above says the hook lives "at the single
+//      site that import already had". That is no longer true: the single site is
+//      now src/kernel/port_net.cpp:694, and the
+//      GUEST_FUNCTION_HOOK(__imp__NetDll_WSAGetLastError, ...) that used to sit
+//      further down this file has been DELETED from it. That deletion is the
+//      point, not an accident: keeping both would be two owners of one guest
+//      function (AGENTS.md rule 4) and a second duplicate symbol. One owner
+//      remains, and it is the one that has a body.
+//   3. The g_netLastError cell named above still exists, but it is no longer
+//      the whole story. It is file-static inside an anonymous namespace, so
+//      port_net.cpp could not name it. There is now ONE cell, reachable as
+//      mcla::kernel::netport::SetLastError / LastError (src/kernel/port_net.h:
+//      36-37), and NetRefuse below writes through it -- so the twelve refusals
+//      in this file and the eighteen in port_net.cpp finally share one
+//      last-error, which is the whole point of the function.
 
-uint32_t NetDll_recvfrom(uint32_t s, void *buf, int len, int flags, void *from,
-                         int *fromlen) {
-  (void)s;
-  (void)buf;
-  (void)len;
-  (void)flags;
-  (void)from;
-  (void)fromlen;
-  return 0;
-}
-
-uint32_t NetDll_sendto(uint32_t s, const void *buf, int len, int flags,
-                       const void *to, int tolen) {
-  (void)s;
-  (void)buf;
-  (void)len;
-  (void)flags;
-  (void)to;
-  (void)tolen;
-  return len;
-}
-
-int NetDll_WSAGetLastError() { return 0; }
-
-void NetDll_XNetCleanup() {}
-
-uint32_t NetDll_XNetRegisterKey(uint32_t keyType, void *key, uint32_t keyLen) {
-  (void)keyType;
-  (void)key;
-  (void)keyLen;
-  return 0;
-}
-
-void NetDll_XNetUnregisterKey(uint32_t keyType) { (void)keyType; }
-
-uint32_t NetDll_XNetXnAddrToInAddr(void *xnAddr, void *inAddr, void *xnkid) {
-  (void)xnAddr;
-  (void)inAddr;
-  (void)xnkid;
-  return 0;
-}
-
-uint32_t NetDll_XNetServerToInAddr(void *xnAddr, void *inAddr, void *xnkid) {
-  (void)xnAddr;
-  (void)inAddr;
-  (void)xnkid;
-  return 0;
-}
-
-void NetDll_XNetUnregisterInAddr(void *inAddr) { (void)inAddr; }
-
-uint32_t NetDll_XNetConnect(void *xnAddr) {
-  (void)xnAddr;
-  return 0;
-}
-
-uint32_t NetDll_XNetGetConnectStatus(void *xnAddr) {
-  (void)xnAddr;
-  return 1; // Connected
-}
-
-uint32_t NetDll_XNetQosListen(void *socket, uint32_t flags) {
-  (void)socket;
-  (void)flags;
-  return 0;
-}
-
-uint32_t NetDll_XNetQosLookup(void *xnAddr, uint32_t qosFlags, void *probe) {
-  (void)xnAddr;
-  (void)qosFlags;
-  (void)probe;
-  return 0;
-}
-
-void NetDll_XNetQosRelease(void *probe) { (void)probe; }
-
-uint32_t NetDll_XNetGetEthernetLinkStatus() {
-  return 1; // Link up
-}
-void XNetLogonGetTitleID() { LOG_UTILITY("!!! STUB !!!"); }
-void XamUserGetXUID() { LOG_UTILITY("!!! STUB !!!"); }
-void XamUserGetName() { LOG_UTILITY("!!! STUB !!!"); }
-void XamFree() { LOG_UTILITY("!!! STUB !!!"); }
-void XamAlloc() { LOG_UTILITY("!!! STUB !!!"); }
-void XamTaskShouldExit() { LOG_UTILITY("!!! STUB !!!"); }
-void XamTaskCloseHandle() { LOG_UTILITY("!!! STUB !!!"); }
-void XamTaskSchedule() { LOG_UTILITY("!!! STUB !!!"); }
-void IoDismountVolume() { LOG_UTILITY("!!! STUB !!!"); }
-void IoDismountVolumeByFileHandle() { LOG_UTILITY("!!! STUB !!!"); }
-void KeTryToAcquireSpinLockAtRaisedIrql() { LOG_UTILITY("!!! STUB !!!"); }
-void NtCancelTimer() { LOG_UTILITY("!!! STUB !!!"); }
-void NtCreateMutant() { LOG_UTILITY("!!! STUB !!!"); }
-void NtCreateTimer() { LOG_UTILITY("!!! STUB !!!"); }
-void NtDeviceIoControlFile() { LOG_UTILITY("!!! STUB !!!"); }
-void NtReleaseMutant() { LOG_UTILITY("!!! STUB !!!"); }
-void NtSetTimerEx() { LOG_UTILITY("!!! STUB !!!"); }
-uint32_t XMsgCancelIORequest(uint32_t App, XXOVERLAPPED *lpOverlapped) {
-  (void)App;
-  (void)lpOverlapped;
-  // For synchronous I/O completion, cancellation is a no-op
-  // If we had a real async queue, we'd remove the overlapped from the queue
-  return STATUS_SUCCESS;
-}
-void XamInputGetKeystrokeEx() { LOG_UTILITY("!!! STUB !!!"); }
-void XamParseGamerTileKey() { LOG_UTILITY("!!! STUB !!!"); }
-void XamReadTileToTexture() { LOG_UTILITY("!!! STUB !!!"); }
-void XamUserAreUsersFriends() { LOG_UTILITY("!!! STUB !!!"); }
-void XamUserCheckPrivilege() { LOG_UTILITY("!!! STUB !!!"); }
-void XamUserCreateAchievementEnumerator() { LOG_UTILITY("!!! STUB !!!"); }
-void XamUserCreateStatsEnumerator() { LOG_UTILITY("!!! STUB !!!"); }
-void XamVoiceClose() { LOG_UTILITY("!!! STUB !!!"); }
-void XamVoiceCreate() { LOG_UTILITY("!!! STUB !!!"); }
-void XamVoiceHeadsetPresent() { LOG_UTILITY("!!! STUB !!!"); }
-void XamVoiceSubmitPacket() { LOG_UTILITY("!!! STUB !!!"); }
-void XamWriteGamerTile() { LOG_UTILITY("!!! STUB !!!"); }
 void XexLoadImage() {
   // XexLoadImage: loads an XEX module from a file handle.
   // Guest args: r3 = FileHandle, r4 = ModuleTypeFlags, r5 = Version, r6 =
@@ -3874,77 +7520,111 @@ void XexCheckExecutablePages() {
 
 void _snprintf() { LOG_UTILITY("!!! STUB !!!"); }
 void _vsnprintf() { LOG_UTILITY("!!! STUB !!!"); }
-void sprintf() { LOG_UTILITY("!!! STUB !!!"); }
 
-GUEST_FUNCTION_STUB(__imp__XamShowFriendsUI);
-GUEST_FUNCTION_STUB(__imp__XamShowGamerCardUIForXUID);
-GUEST_FUNCTION_STUB(__imp__XamShowAchievementsUI);
-GUEST_FUNCTION_STUB(__imp__XamShowPlayerReviewUI);
-GUEST_FUNCTION_STUB(__imp__XamShowMarketplaceUI);
-GUEST_FUNCTION_STUB(__imp__KeSetDisableBoostThread);
+// F-609 PORT BATCH, 2026-09-29 (integration stream). `void sprintf()` used to
+// sit here too and is GONE: the guest import `sprintf` was registered as
+// GUEST_FUNCTION_STUB(__imp__sprintf), an empty body, so this definition was
+// never called. src/kernel/port_kobj.cpp:2349 now registers
+// GUEST_FUNCTION_HOOK(__imp__sprintf, ::kobjport::XkSprintf), a real engine
+// (Xenia strings.cc:897-925). The two single-underscore bodies above are KEPT:
+// they are a different import pair, pre-existing orphans, and out of scope here
+// (see the F-609 note under the "Missing Xam/NetDll imports" heading above).
+
+// ---- F-609 PORT BATCH, 2026-09-29: GUEST_FUNCTION_STUB bodies removed. -------
+// Every line of this run expanded to `PPC_FUNC(name) { }` -- an EMPTY body that
+// leaves r3 equal to the incoming r3, so each caller read a POINTER back where
+// an NTSTATUS, a count or a handle belonged. Each is now registered by the port
+// file named beside it, which is the single owner of that guest address.
+//   XamShowFriendsUI / XamShowGamerCardUIForXUID / XamShowAchievementsUI /
+//   XamShowPlayerReviewUI / XamShowMarketplaceUI / XamLoaderSetLaunchData /
+//   XamLoaderGetLaunchData / XamLoaderGetLaunchDataSize /
+//   XamCreateEnumeratorHandle / XamGetPrivateEnumStructureFromHandle /
+//   KeSetDisableBoostThread ................ src/kernel/port_xam_user.cpp,
+//                                               src/kernel/port_kobj.cpp
+//   NetDll_ioctlsocket / getsockname / recvfrom / sendto / XNetCleanup
+//   NetDll_XNetRegisterKey / XNetUnregisterKey / XNetXnAddrToInAddr /
+//   XNetServerToInAddr / XNetUnregisterInAddr / XNetConnect /
+//   XNetGetConnectStatus / XNetQosListen / XNetQosLookup / XNetQosRelease /
+//   XNetGetEthernetLinkStatus / XNetLogonGetTitleID ... src/kernel/port_net.cpp
+//   NetDll_WSAGetLastError ......... KEPT AS A HOOK HERE UNTIL 2026-09-29; the
+//   single live registration has MOVED to src/kernel/port_net.cpp:694, so the
+//   line is deleted below. It was the one member of this family that was
+//   already a live registration rather than a stub, and keeping it here while
+//   port_net.cpp registered it too would have been two owners of one guest
+//   function (AGENTS.md rule 4) and a duplicate external symbol.
+// ---------------------------------------------------------------------------
+
 GUEST_FUNCTION_HOOK(__imp__MmAllocatePhysicalMemoryEx,
                     MmAllocatePhysicalMemoryEx);
-GUEST_FUNCTION_STUB(__imp__XamLoaderSetLaunchData);
-GUEST_FUNCTION_STUB(__imp__XamLoaderGetLaunchData);
-GUEST_FUNCTION_STUB(__imp__XamLoaderGetLaunchDataSize);
-GUEST_FUNCTION_STUB(__imp__XamCreateEnumeratorHandle);
-GUEST_FUNCTION_STUB(__imp__XamGetPrivateEnumStructureFromHandle);
-GUEST_FUNCTION_STUB(__imp__NetDll_ioctlsocket);
-GUEST_FUNCTION_STUB(__imp__NetDll_getsockname);
-GUEST_FUNCTION_STUB(__imp__NetDll_recvfrom);
-GUEST_FUNCTION_STUB(__imp__NetDll_sendto);
-GUEST_FUNCTION_STUB(__imp__NetDll_WSAGetLastError);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetCleanup);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetRegisterKey);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetUnregisterKey);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetXnAddrToInAddr);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetServerToInAddr);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetUnregisterInAddr);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetConnect);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetGetConnectStatus);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetQosListen);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetQosLookup);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetQosRelease);
-GUEST_FUNCTION_STUB(__imp__NetDll_XNetGetEthernetLinkStatus);
-GUEST_FUNCTION_STUB(__imp__XNetLogonGetTitleID);
-GUEST_FUNCTION_STUB(__imp__XamUserGetXUID);
-GUEST_FUNCTION_STUB(__imp__XamUserGetName);
-GUEST_FUNCTION_STUB(__imp__XamFree);
-GUEST_FUNCTION_STUB(__imp__XamAlloc);
-GUEST_FUNCTION_STUB(__imp__XamTaskShouldExit);
-GUEST_FUNCTION_STUB(__imp__XamTaskCloseHandle);
-GUEST_FUNCTION_STUB(__imp__XamTaskSchedule);
-GUEST_FUNCTION_STUB(__imp__IoDismountVolume);
-GUEST_FUNCTION_STUB(__imp__IoDismountVolumeByFileHandle);
-GUEST_FUNCTION_STUB(__imp__KeTryToAcquireSpinLockAtRaisedIrql);
-GUEST_FUNCTION_STUB(__imp__NtCancelTimer);
-GUEST_FUNCTION_STUB(__imp__NtCreateMutant);
-GUEST_FUNCTION_STUB(__imp__NtCreateTimer);
-GUEST_FUNCTION_STUB(__imp__NtDeviceIoControlFile);
-GUEST_FUNCTION_STUB(__imp__NtReleaseMutant);
-GUEST_FUNCTION_STUB(__imp__NtSetTimerEx);
+// F-609, 2026-09-29 (integration stream): the F-609 TASK 3 CORRECTION block
+// that used to stand here is preserved in full further up this file, at the
+// "Missing Xam/NetDll imports" heading, together with the superseding note that
+// the binding has MOVED to src/kernel/port_net.cpp:694 and the definition is
+// src/kernel/port_net.cpp:297. Nothing is lost by deleting it here: the arity
+// proof it carried (NetDll_WSAGetLastError is the one NetDll thunk with no
+// leading selector, so it takes zero arguments) is restated independently at
+// src/kernel/port_net.cpp:92-100, against a separate measurement
+// (ppc_recomp.82.cpp:6464-6468).
+//
+// Also removed here, all eighteen network family members, each of which was
+// GUEST_FUNCTION_STUB(__imp__X) == `PPC_FUNC(name) { }`:
+//
+//   NetDll_getsockname, NetDll_ioctlsocket, NetDll_recvfrom, NetDll_sendto,
+//   NetDll_XNetCleanup, NetDll_XNetConnect, NetDll_XNetGetConnectStatus,
+//   NetDll_XNetGetEthernetLinkStatus, NetDll_XNetQosListen,
+//   NetDll_XNetQosLookup, NetDll_XNetQosRelease, NetDll_XNetRegisterKey,
+//   NetDll_XNetServerToInAddr, NetDll_XNetUnregisterInAddr,
+//   NetDll_XNetUnregisterKey, NetDll_XNetXnAddrToInAddr, XNetLogonGetTitleID
+//       -> registered at src/kernel/port_net.cpp:695-711 (17 of the 18; the
+//          eighteenth, WSAGetLastError, is :694).
+//
+// The arity bug the port file documents (F-609's "missing leading
+// caller/selector") is the reason these were invisible: the empty body meant
+// the guest's own r3 came back, so a wrong-arity body could not be observed
+// here either. Seventeen of the eighteen thunks do `li r3,1` and an N-deep `mr`
+// shift, so seventeen take a leading selector; XNetLogonGetTitleID takes none
+// because the guest `bl 0x827bd304` directly with the user index in r3.
+// ---------------------------------------------------------------------------
+
+// F-609 PORT BATCH, 2026-09-29. Removed: XamUserGetXUID, XamUserGetName,
+// XamFree, XamAlloc, XamTaskShouldExit, XamTaskCloseHandle, XamTaskSchedule
+//     -> src/kernel/port_xam_user.cpp:1128-1145 (registering hooks).
+//   IoDismountVolume, IoDismountVolumeByFileHandle, KeSetDisableBoostThread,
+//   KeTryToAcquireSpinLockAtRaisedIrql, NtCancelTimer, NtCreateMutant,
+//   NtCreateTimer, NtDeviceIoControlFile, NtReleaseMutant, NtSetTimerEx,
+//   XMsgCancelIORequest ... src/kernel/port_kobj.cpp:2334-2346.
+//     XMsgCancelIORequest and KeSetDisableBoostThread had `void` bodies here
+//     that returned the incoming r3 (a pointer) where a status belonged; the
+//     port versions return the reference's status (Xenia xam_msg.cc:89-102 and
+//     threading.cc:286-295). KeTryToAcquireSpinLockAtRaisedIrql is a genuine
+//     behavioural fix in the same family: the old `void` body could not report
+//     either outcome of the one CAS it stands for, so a waiter could not be told
+//     it failed to acquire.
+//   XamInputGetKeystrokeEx, XamParseGamerTileKey, XamReadTileToTexture,
+//   XamWriteGamerTile, XamUserAreUsersFriends, XamUserCheckPrivilege,
+//   XamUserCreateAchievementEnumerator, XamUserCreateStatsEnumerator,
+//   XamVoiceClose, XamVoiceCreate, XamVoiceHeadsetPresent,
+//   XamVoiceSubmitPacket ... src/kernel/port_xam_user.cpp:1146-1155 for the
+//     Xam ones, src/kernel/port_voice_input.cpp:568-575 for the four voices.
+//   XeKeysConsolePrivateKeySign, XeKeysConsoleSignatureVerification
+//     ... src/kernel/port_voice_input.cpp:576-578. Both refuse. A
+//     "verification" that always answers "verified" is a security-relevant lie
+//     and is not acceptable in this tree at any point; there is no console
+//     private key to verify against and no remote party to fool.
+//   __snprintf, __vsnprintf, sprintf
+//     ... src/kernel/port_kobj.cpp:2347-2349, backed by
+//     kobjport::FormatCore, the tree's single format engine
+//     (Xenia xboxkrnl_strings.cc format_core :120-683). __snprintf is a live,
+//     heavily used path: all 7 guest call sites go through three wrappers
+//     (sub_8244DC68, sub_8244E178, sub_8244E1F8).
+// ---------------------------------------------------------------------------
+
 GUEST_FUNCTION_HOOK(__imp__XAudioGetSpeakerConfig, XAudioGetSpeakerConfig);
-GUEST_FUNCTION_STUB(__imp__XMsgCancelIORequest);
-GUEST_FUNCTION_STUB(__imp__XamInputGetKeystrokeEx);
-GUEST_FUNCTION_STUB(__imp__XamParseGamerTileKey);
-GUEST_FUNCTION_STUB(__imp__XamReadTileToTexture);
+// Not part of the F-609 port batch and NOT removed -- XamSessionCreateHandle and
+// XamSessionRefObjByHandle are already-ported live hooks that live here, and
+// they are preserved verbatim through the 2026-09-29 edit above.
 GUEST_FUNCTION_HOOK(__imp__XamSessionCreateHandle, XamSessionCreateHandle);
 GUEST_FUNCTION_HOOK(__imp__XamSessionRefObjByHandle, XamSessionRefObjByHandle);
-GUEST_FUNCTION_STUB(__imp__XamUserAreUsersFriends);
-GUEST_FUNCTION_STUB(__imp__XamUserCheckPrivilege);
-GUEST_FUNCTION_STUB(__imp__XamUserCreateAchievementEnumerator);
-GUEST_FUNCTION_STUB(__imp__XamUserCreateStatsEnumerator);
-GUEST_FUNCTION_STUB(__imp__XamVoiceClose);
-GUEST_FUNCTION_STUB(__imp__XamVoiceCreate);
-GUEST_FUNCTION_STUB(__imp__XamVoiceHeadsetPresent);
-GUEST_FUNCTION_STUB(__imp__XamVoiceSubmitPacket);
-GUEST_FUNCTION_STUB(__imp__XamWriteGamerTile);
-GUEST_FUNCTION_STUB(__imp__XeKeysConsolePrivateKeySign);
-GUEST_FUNCTION_STUB(__imp__XeKeysConsoleSignatureVerification);
-
-GUEST_FUNCTION_STUB(__imp___snprintf);
-GUEST_FUNCTION_STUB(__imp___vsnprintf);
-GUEST_FUNCTION_STUB(__imp__sprintf);
 GUEST_FUNCTION_HOOK(__imp__XAudioRegisterRenderDriverClient,
                     XAudioRegisterRenderDriverClient);
 GUEST_FUNCTION_HOOK(__imp__XAudioUnregisterRenderDriverClient,

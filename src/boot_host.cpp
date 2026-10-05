@@ -28,6 +28,10 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 
 #include <windows.h>
 #include <dbghelp.h>
+// F-616: _ReturnAddress() so PARK-SAMPLE can print the SAMPLER's own pc next to the
+// worker's. The two are both routinely inside GuestMemoryView::ReadU32BE/WriteU32BE,
+// which is how the worker's rawrip came to be read as a sampler address.
+#include <intrin.h>
 #include <unordered_map>
 
 // s_skipSub822FA958 (generated/ppc_xenon/ppc_recomp.49.cpp:18142) has had no writer in src/ since T38.3.
@@ -61,6 +65,12 @@ PPC_EXTERN_FUNC(__xtl_free);
 
 namespace mcla::boot {
 
+// F-640: the physical-view alias probe + the init row. Defined at the foot of this TU with
+// the other F-640 entry points, and declared HERE, in mcla::boot scope, BEFORE the anonymous
+// namespace opens -- a declaration inside that namespace would be a different function with
+// internal linkage, which is the exact trap F-637 had to be documented around.
+void F640PhysAliasInit();
+
 namespace
 {
     uint8_t* g_base = nullptr;
@@ -68,6 +78,197 @@ namespace
     constexpr size_t GuestMemorySize = 0x100000000ull; // 4 GiB, matches PPC_MEMORY_SIZE
     constexpr uintptr_t GuestMemoryBase = 0x100000000ull;
 
+    // ==========================================================================
+    // F-640: THE CONSOLE'S THREE PHYSICAL VIEWS, AND WHAT THIS TREE DOES ABOUT THEM
+    // ==========================================================================
+    // WHAT THE HARDWARE PROMISES. The reference emulator declares physical memory
+    // ONCE (`.research/xenia/src/xenia/memory.cc:171-172`:
+    // `heaps_.physical.Initialize(this, physical_membase_, kGuestPhysical, 0x00000000,
+    // 0x20000000, 4096)`) and then hands that same parent heap to THREE guest-visible
+    // regions, each declared with the FULL 0x20000000, differing only in page size
+    // (memory.cc:173-180): 0xA0000000 / 64 KiB, 0xC0000000 / 16 MiB, 0xE0000000 / 4 KiB.
+    // So `0xA0000000 + pa` and `0xC0000000 + pa` are THE SAME BYTES. That is a hardware
+    // aliasing guarantee, and it is what `PhysToKernelVA` (src/gpu_cp.cpp:1755-1756,
+    // `addr < 0x20000000u ? (addr | 0xC0000000u) : addr`, commented "X360: kernel maps phys
+    // windows at +0xC0000000") converts a physical address into. The same 0x20000000
+    // threshold is written out at gpu_cp.cpp:2328, gpu_mmio.cpp:83 and :74, and
+    // native_renderer.cpp:120/226/277/294/308 -- five sites, one number.
+    //
+    // WHAT THIS TREE HAS. One flat 4 GiB host window from a single VirtualAlloc
+    // (`AllocateGuestMemory`, :677, or the reservation `Memory::Initialize` made and this
+    // function adopts), and `GuestMemoryHeap::Translate` is PURE ARITHMETIC --
+    // `return m_base + guestAddr;` (src/kernel/memory.cpp:285-297), with `MapVirtual` the
+    // exact inverse (`:299-309`). The virtual-region table next to it is bookkeeping only
+    // and says so: "The flat window remains identity-mapped; only STATE is tracked"
+    // (memory.cpp:366-368); `DecommitVirtual` flips a bool and calls no OS API
+    // (memory.cpp:563-576). Therefore one guest VA is one host page, forever.
+    //
+    // WHY (a) MAPPING-THE-VIEWS IS NOT FEASIBLE HERE, and it is not a matter of effort:
+    //  1. TWO VIEWS OF ONE HOST RANGE REQUIRE A SECTION. Windows shares pages between two
+    //     guest-visible VAs only if both are views of one section object. The pool's bytes
+    //     are a sub-range of one private VirtualAlloc (:677), and a private allocation
+    //     cannot be retroactively turned into a second view of itself. Making the pool a
+    //     section (as Xenia does, `physical_membase_ = mapping_base_ + 0x100000000`,
+    //     memory.cc:158) would move the pool's HOST address, and then
+    //     `Translate(0xA0400000)` (src/kernel/heap.cpp:1561, the pool binding) and every
+    //     other `Translate` caller in the tree would read the wrong bytes. That is a
+    //     mapping layer in `Translate`/`MapVirtual` -- src/kernel/memory.cpp, owned by
+    //     another stream, and a rewrite of the one primitive this whole tree assumes.
+    //  2. THE TARGET ADDRESSES ARE ALREADY COMMITTED. All three views live INSIDE the flat
+    //     4 GiB window, which is `MEM_COMMIT|MEM_RESERVE` as a single reservation. A view
+    //     cannot be mapped over committed pages, and a private reservation cannot be
+    //     released in the middle (`MEM_RELEASE` is whole-region). So the window itself would
+    //     have to be torn into reserve-only islands with three holes -- i.e. exactly the
+    //     restructure (1) forbids.
+    //  3. THE 16 MiB VIEW'S ALIGNMENT IS NOT MET BY THE POOL'S BASE. The C view is the
+    //     16 MiB-page GPU write-back window, so its backing must be 16 MiB-aligned;
+    //     `kPhysArenaBeginVa & 0xFFFFFF` = 0x400000, not 0 (measured from the constant, not
+    //     typed here). The pool base is 4 MiB into the A view precisely because F-391 moved
+    //     it off the title's XTL slab region at 0xA0001000..0xA002FFC0, and that relocation
+    //     is NOT to be redone (F-631, and the instruction for this change).
+    //  4. THE THREE VIEWS TILE [0xA0000000, 0x100000000) EXACTLY -- 3 x 0x20000000 -- so
+    //     they can only be line up with the pool by binding the pool at 0xA0000000, which
+    //     is (3) inverted and forbidden.
+    // CONCLUSION: (a) is out. (b) -- translate the accesses -- is the only honest mechanism,
+    // and the primitives for it are below. The call sites that must adopt them are named in
+    // `F640-PHYSALIAS phase=init`'s `adopt=` field; the two that matter most are the CP rptr
+    // write-back (src/gpu_cp.cpp:3673, `PhysToKernelVA(rptrWritebackAddr)` ->
+    // `memP.WriteU32BE(vaForm, publish)`) and the present-surface resolve
+    // (src/native_renderer.cpp:294, `mcla_gpu_AddSurfaceCandidate(swap_info | 0xC0000000u, ...)`).
+    //
+    // MEASURED CONSEQUENCE, and the arithmetic is worth stating exactly because it is NOT
+    // uniform across the three views. `poolVa(pa) = kPhysArenaBeginVa + (pa - 0x400000)`
+    // collapses, because F-391 moved the base by exactly 0x400000, to `0xA0000000 + pa` --
+    // which IS the A view's address for pa. So THE A VIEW IS THE POOL, already, for every pa
+    // in [0x400000, 0x20400000): `A(pa) == poolVa(pa)` is an identity here, not an
+    // approximation, and the A view needs no work at all. The C and E views are each exactly
+    // 0x20000000 ABOVE that, for every pa (measured, not typed: `C(pa) - poolVa(pa)` is
+    // 0x20000000 at pa = 0, at pa = 0x4E0D30 and at pa = 0x10400000 alike).
+    //
+    // SO THE HOLE IS PRECISE AND IT IS EXACTLY ONE CONSTANT: every `pa | 0xC0000000` in this
+    // tree -- `PhysToKernelVA` (gpu_cp.cpp:1755-1756), `MmioAddrSpace` (gpu_mmio.cpp:83), the
+    // five native_renderer.cpp sites -- produces an address 0x20000000 above the pool byte the
+    // console means, and the access therefore lands in flat memory. F-612's own present
+    // surface is the worked example: pa = 0x004E0D30, the console's byte is at 0xA04E0D30, the
+    // tree computes 0xC04E0D30, and 0xC04E0D30 is NOT inside the pool at all (pool ends at
+    // 0xC0400000) -- so the present resolve reads flat memory that nothing wrote.
+    //
+    // AND ONE OVERLAP IS NOT MERELY INEFFECTIVE, IT IS CORRUPTING. `F640ViewOverlapBytes`
+    // computes how much of each view lands inside the pool: the A view by 508 MiB (all of it
+    // correct, it is the pool) and the C view by 4 MiB -- and that 4 MiB is the pool's TAIL,
+    // bytes for physical 0x20400000..0x207FFFFF, which the console does not have. So a C-view
+    // access for pa in [0, 0x3FFFFF) does not vanish: it LANDS INSIDE OUR POOL, in live
+    // pool-managed memory, at the wrong offset. A silent pool write is the one failure mode
+    // in this project that produces a black screen with no error anywhere.
+    //
+    // TWO CONSEQUENCES OF THE 0x400000 SKEW, both reported rather than fixed (the relocation
+    // is out of bounds for this change and F-631 already reverted one): the pool does not
+    // hold physical [0, 0x400000) at all, so every access to the console's low 4 MiB has no
+    // pool byte here (`kNoPoolByte`, the honest refusal, and the exact case
+    // `PhysToKernelVA(0)` produces); and the pool holds 4 MiB the console does not have
+    // (physical 0x20400000..0x207FFFFF), which is what the C view's 4 MiB overlap lands on.
+    enum class F640View : uint8_t { kNone = 0, kA64K = 1, kC16M = 2, kE4K = 3 };
+    enum class F640Map : uint8_t { kNotAView = 0, kMapped = 1, kNoPoolByte = 2 };
+
+    struct F640ViewDesc
+    {
+        uint32_t base;
+        uint32_t size;      // kConsolePhysicalBytes, NOT a literal (see above)
+        uint32_t pageShift; // log2 of the view's page size: 16 / 24 / 12
+        const char* name;
+    };
+    constexpr F640ViewDesc kF640Views[] = {
+        {0xA0000000u, mcla::kernel::kConsolePhysicalBytes, 16u, "A64K"},
+        {0xC0000000u, mcla::kernel::kConsolePhysicalBytes, 24u, "C16M"},
+        {0xE0000000u, mcla::kernel::kConsolePhysicalBytes, 12u, "E4K"},
+    };
+    static_assert(kF640Views[1].pageShift == 24,
+                  "F-640: the C view is the 16 MiB-page GPU write-back window (memory.cc:173-180). "
+                  "If this fires, the view table is not the reference's.");
+
+    // F-640: THE POOL'S OWN PHYSICAL WINDOW, DERIVED. F-391 moved the pool to
+    // kPhysArenaBeginVa so the title's XTL slab region would not be inside it, and that move
+    // is +0x400000 relative to the A view's base. So our pool's FIRST byte presents as
+    // physical 0x00400000, not physical 0 -- that single skew is the whole reason no view
+    // aliases the pool here, and it is derived from the two constants rather than restated.
+    constexpr uint64_t F640PoolPhysBase()
+    {
+        return (uint64_t)(mcla::kernel::kPhysArenaBeginVa - kF640Views[0].base);
+    }
+    constexpr uint64_t F640PoolPhysTop()
+    {
+        return F640PoolPhysBase() + (uint64_t)mcla::kernel::PhysArenaSizeBytes();
+    }
+
+    F640View F640ClassifyView(uint32_t guestVa)
+    {
+        for (uint32_t i = 0; i < (uint32_t)(sizeof(kF640Views) / sizeof(kF640Views[0])); ++i)
+        {
+            const F640ViewDesc& v = kF640Views[i];
+            if (guestVa >= v.base &&
+                (uint64_t)guestVa < (uint64_t)v.base + (uint64_t)v.size)
+                return static_cast<F640View>(i + 1);
+        }
+        return F640View::kNone;
+    }
+
+    // The translation. Pure, no memory touched, no guest value asserted on: a physical
+    // address below the pool's window is a MISS, not a fault and not a clamped value.
+    F640Map F640MapViewToPool(uint32_t viewVa, uint32_t* outPoolVa)
+    {
+        const F640View view = F640ClassifyView(viewVa);
+        if (view == F640View::kNone)
+            return F640Map::kNotAView;
+        const uint64_t pa = (uint64_t)viewVa - (uint64_t)kF640Views[(uint32_t)view - 1].base;
+        if (pa < F640PoolPhysBase() || pa >= F640PoolPhysTop())
+            return F640Map::kNoPoolByte;  // the console's low 4 MiB has no pool byte in this tree
+        const uint64_t poolVa =
+            (uint64_t)mcla::kernel::kPhysArenaBeginVa + (pa - F640PoolPhysBase());
+        if (poolVa >= (uint64_t)mcla::kernel::kPhysArenaEndVa)
+            return F640Map::kNoPoolByte;  // belt: the extent is the allocator's, not this file's
+        if (outPoolVa != nullptr)
+            *outPoolVa = (uint32_t)poolVa;
+        return F640Map::kMapped;
+    }
+
+    // How much of a view lands INSIDE the pool. For the A view this is 508 MiB and every byte
+    // of it is CORRECT (the A view is the pool). For the C view it is 4 MiB and every byte of
+    // it is WRONG -- it is the pool's tail. Read with the block comment above, not alone.
+    uint64_t F640ViewOverlapBytes(F640View view)
+    {
+        if (view == F640View::kNone)
+            return 0;
+        const F640ViewDesc& v = kF640Views[(uint32_t)view - 1];
+        const uint64_t vLo = v.base, vHi = (uint64_t)v.base + (uint64_t)v.size;
+        const uint64_t pLo = mcla::kernel::kPhysArenaBeginVa;
+        const uint64_t pHi = (uint64_t)mcla::kernel::kPhysArenaEndVa;
+        const uint64_t lo = vLo > pLo ? vLo : pLo;
+        const uint64_t hi = vHi < pHi ? vHi : pHi;
+        return hi > lo ? (hi - lo) : 0;
+    }
+
+    // ---- F-640 counters. Attempts and outcomes are counted SEPARATELY and the two sets are
+    // published with a row that makes them add up, so a zero can never be read as "nothing
+    // happened" when in fact nothing called (F-057(6): a tracked marker whose producer is dead
+    // reports zero and means nothing). `adopted` is the number of call sites that adopted the
+    // translation; while it is 0, `dropped == 0` is NOT a measurement.
+    struct F640Counters
+    {
+        std::atomic<uint64_t> calls{0};        // every F640TranslateViewToPoolVa call
+        std::atomic<uint64_t> notAView{0};     // outcome: the address is not a view address
+        std::atomic<uint64_t> translated{0};   // outcome: mapped onto a pool byte
+        std::atomic<uint64_t> dropped{0};      // outcome: in a view, no pool byte -> THE number
+        std::atomic<uint64_t> dropSeq{0};      // monotonic, for the bounded print of the drop row
+        std::atomic<uint32_t> adopted{0};      // distinct call sites that registered themselves
+    };
+    F640Counters g_f640;
+
+    constexpr uint64_t kF640PrintHead = 32;  // K in `n <= K || (n % 200) == 0`
+    constexpr uint64_t kF640PrintMod = 200;
+    bool F640Allow(uint64_t n) { return n <= kF640PrintHead || (n % kF640PrintMod) == 0; }
+
+    // A call site that adopts the translation registers itself here, so the row can say how
+    // many there are. Until one does, `zero_is_measured=0` and the zero means nothing.
     std::mutex g_reportMutex;
     BootReport g_report;
     std::atomic<bool> g_bootDone{false};
@@ -271,6 +472,11 @@ namespace
     // faulted again -> storm. The page is therefore only guarded while NO heap operation is in
     // flight: Heap::Alloc/Free disarm it under the heap mutex on entry and re-arm on exit (see
     // HeapGuardDisarm/HeapGuardArm), and the handler never re-arms.
+    // F-637: forward decls, in mcla::boot (NOT in the anonymous namespace below, which would declare
+    // different functions). The F388 cross-thread repair self-test runs inside PhysGuardArmImpl, which
+    // is inside that namespace, and has to drive a window open and closed to reach the repair branch.
+    void HeapGuardDisarmImpl();
+    void HeapGuardArmImpl();
     namespace {
         constexpr uint32_t kHeapHdrVa = mcla::kernel::kUserHeapArenaVa;  // F-384: follows the arena
         constexpr uintptr_t kHdrCapEnd = 8;   // 'cap' bucket: bins[0..1] (capacity is +0x208)
@@ -307,6 +513,23 @@ namespace
         std::atomic<uint32_t> g_pgSelfTests{0};
         std::atomic<uint32_t> g_pgTrips{0};
         std::atomic<uint32_t> g_pgLogged{0};
+        // F-637: the trip generation -- the repair obligation, made decidable from ANY thread.
+        // The armed state of both guard pages used to be a pure function of g_hgDepth: open while
+        // depth > 0, NOACCESS at depth 0. A trip BREAKS that function. PhysGuardHandle/HeapGuardHandle
+        // must force the page open (w380 forbids re-arming inside the handler), so the page is now open
+        // with g_pgLive=false at a depth of ZERO, and the only code in the tree that can put it back is
+        // HeapGuardArmImpl, which returns early while any other thread's window is still open. So one
+        // trip plus one stranded window leaves both pages PAGE_READWRITE for the rest of the run and
+        // logs NOTHING: a guard that can strand silently is worse than no guard (F-637). Bumped by both
+        // handlers on every forced open; compared by HeapGuardArmImpl, which then re-arms and says so
+        // once. Cheap, and it makes "the window is disarmed after a trip" a property rather than a hope.
+        std::atomic<uint32_t> g_hgTripGen{0};
+        // g_hgMtx-guarded: the g_hgTripGen that the last successful arm accounted for. Only consulted
+        // when g_hgDepth != 0; the normal depth-0 path arms unconditionally.
+        uint32_t g_hgArmedTripGen = 0;
+        // F-637: one-shot. A repair is expected exactly once per stranded window; a flood is the
+        // F-054 log-poisoning class, and the depth it reports is already the loud part.
+        std::atomic<uint32_t> g_hgRepairLog{0};
 
         // F-386 / F-412: ONE nesting depth covering BOTH guards, serialised by ONE mutex.
         // Before this the two arms were plain bools toggled from two different heap locks --
@@ -338,6 +561,23 @@ namespace
             VirtualProtect((void *)g_pgPage, 4096, PAGE_READWRITE, &old);
         }
 
+        // F-637: the cross-thread half of the guard self-test, and the only part that reaches the
+        // repair path. PhysGuardHandle force-opens the page and may never re-arm it (w380), so a trip on
+        // a thread that no other code path can reach leaves the page PAGE_READWRITE for the rest of the
+        // run -- under the old `depth != 0 -> return` arm, silently. This reproduces exactly that state
+        // change from a SECOND OS thread -- no fault, no VEH re-entry, no guest involvement -- touching
+        // only the three words PhysGuardHandle touches, and returns only once the writes are visible, so
+        // the caller's discharge is genuinely cross-thread rather than a same-thread accident.
+        void PhysGuardForeignTripForTest() {
+            std::thread t([] {
+                g_pgLive.store(false, std::memory_order_relaxed);
+                DWORD old = 0;
+                VirtualProtect((void*)g_pgPage, 4096, PAGE_READWRITE, &old);
+                g_hgTripGen.fetch_add(1, std::memory_order_relaxed);
+            });
+            t.join();
+        }
+
         void PhysGuardArmImpl() {
             // ~(uintptr_t)0 is the "this guard is broken" marker, so an arm-FAIL does not turn into a
             // VirtualProtect attempt on every heap call.
@@ -362,9 +602,47 @@ namespace
                 // physical-heap window ran unguarded. Same re-close as the user-heap side.
                 if (VirtualProtect((void *)g_pgPage, 4096, PAGE_NOACCESS, &old))
                     g_pgLive.store(true, std::memory_order_relaxed);
-                MCLA_LOG_WARN("F388-PHYSGUARD SELFTEST done page={:X} selftests={} "
-                              "(selftests MUST be 1, else this probe is blind)",
-                              g_pgPage, g_pgSelfTests.load());
+                // F-637: the CROSS-THREAD repair proof, and the reason `xthread` appears on the SELFTEST
+                // done line below. Steps, on this thread except (a):
+                //   (a) a foreign thread force-opens the page exactly as PhysGuardHandle does: page
+                //       PAGE_READWRITE, g_pgLive=false, g_hgTripGen bumped -- with no window open,
+                //       which is what a trip always looks like from the guard's side;
+                //   (b) two windows are opened, so the next arm still finds depth>0 AFTER its decrement.
+                //       Depth is the only thing the old early-return consulted, so this is the one shape
+                //       that reaches the repair branch at all;
+                //   (c) the first arm closes: stranded=true AND a trip is unaccounted for, so it re-arms
+                //       OVER the still-open window and logs F637-GUARDREPAIR;
+                //   (d) the second arm returns depth to 0;
+                //   (e) a deliberate read must FAULT -- and that read is the entire oracle. Were the page
+                //       left writable, the read would succeed, PhysGuardHandle would never run, and
+                //       g_pgSelfTests would not advance. A rising selftests count is therefore proof the
+                //       page is NOACCESS, NOT proof that a log line printed. The single-arm selftest
+                //       above cannot distinguish this: it runs at depth 0, where old and new agree.
+                const uint32_t stBefore = g_pgSelfTests.load();
+                uint32_t xthread = 0;
+                try {
+                    PhysGuardForeignTripForTest();
+                    HeapGuardDisarmImpl();  // depth 2
+                    HeapGuardDisarmImpl();
+                    HeapGuardArmImpl();     // depth 1 -- stranded, repays the foreign trip
+                    HeapGuardArmImpl();     // depth 0
+                    g_pgSelfTest.store(true);
+                    volatile uint32_t sink2 = 0;
+                    sink2 = *reinterpret_cast<volatile uint32_t *>(g_pgPage);
+                    (void)sink2;
+                    g_pgSelfTest.store(false);
+                    xthread = g_pgSelfTests.load() - stBefore;
+                } catch (...) {
+                    // A thread that could not be created proves nothing; say 0 rather than guess, so a
+                    // soak can tell "the repair is broken" from "the test could not run".
+                    xthread = 0;
+                }
+                // The (e) trip force-opened the page again, so pay the same debt the first selftest does.
+                if (VirtualProtect((void *)g_pgPage, 4096, PAGE_NOACCESS, &old))
+                    g_pgLive.store(true, std::memory_order_relaxed);
+                MCLA_LOG_WARN("F388-PHYSGUARD SELFTEST done page={:X} selftests={} xthread={} "
+                              "(selftests MUST be 1 and xthread MUST be 1, else this probe is blind)",
+                              g_pgPage, g_pgSelfTests.load(), xthread);
                 return;
             }
             if (g_pgLive.load(std::memory_order_relaxed)) return;
@@ -384,6 +662,9 @@ namespace
             const bool wasLive = g_pgLive.exchange(false);  // no re-arm here: see w380
             DWORD old = 0;
             VirtualProtect((void *)g_pgPage, 4096, PAGE_READWRITE, &old);
+            // F-637: this force-open is a repair obligation no depth-0 path will ever discharge, because
+            // the only re-arm (HeapGuardArmImpl) skips while another thread's window is open. Record it.
+            g_hgTripGen.fetch_add(1, std::memory_order_relaxed);
             const uint32_t n = g_pgTrips.fetch_add(1) + 1;
             const uintptr_t rip = (uintptr_t)ei->ContextRecord->Rip;
             const uintptr_t mb = g_moduleBase ? g_moduleBase : 1;
@@ -437,6 +718,9 @@ namespace
             g_hgFragTrips.fetch_add(1);
         DWORD old = 0;
         VirtualProtect((void*)g_hgPage, 4096, PAGE_READWRITE, &old);
+        // F-637: same obligation as PhysGuardHandle, same reason -- the handler cannot re-arm (w380), so
+        // the page is left open and only a later HeapGuardArmImpl on ANY thread can close it again.
+        g_hgTripGen.fetch_add(1, std::memory_order_relaxed);
         const uintptr_t rip = (uintptr_t)ei->ContextRecord->Rip;
         const uintptr_t rv =
             (g_moduleBase != 0 && rip >= g_moduleBase) ? rip - g_moduleBase : rip;
@@ -474,8 +758,32 @@ namespace
         std::lock_guard<std::recursive_mutex> lk(g_hgMtx);
         if (g_hgDepth > 0) --g_hgDepth;
         if (t_hgWin > 0) --t_hgWin;  // F-412: paired with the ++ in HeapGuardDisarmImpl
-        if (g_hgDepth != 0) return;  // another window is still open: leave both pages writable
+        // F-637: an arm is owed whenever a trip has force-opened a page that no arm has accounted for
+        // yet -- and that obligation survives depth > 0, which is the entire point. A trip happens
+        // OUTSIDE every window by construction: if the faulting thread held one, the page would have
+        // been readable and there would be nothing to catch. So "another window is still open" is not
+        // a reason to leave a page open as well, and the old bare `depth != 0 -> return` is exactly
+        // what let one trip plus one stranded window silently disable both guards for the rest of the
+        // run. F-412 fixed the parked-thread strand at two call sites (the VEH park branch and
+        // UnhandledExceptionFilter); it did not fix a strand from any OTHER source, and a guard that
+        // can strand silently is worse than no guard, so the obligation is discharged here instead.
+        const bool stranded = (g_hgDepth != 0);
+        if (stranded && g_hgArmedTripGen == g_hgTripGen.load(std::memory_order_relaxed)) {
+            return;  // another window is open AND no trip is outstanding: leave both pages writable
+        }
         PhysGuardArmImpl();  // F-388: the physical-heap guard shares this window
+        g_hgArmedTripGen = g_hgTripGen.load(std::memory_order_relaxed);
+        if (stranded && g_hgRepairLog.fetch_add(1) == 0) {
+            // BootReportError, NOT MCLA_LOG_*: this TU holds __try and clang 19.1.7 ICEs instantiating
+            // spdlog/fmt here (boot_host.h:161). `depth` is the reason the arm could not happen the old
+            // way; a depth that never returns to 0 is a stuck thread and names itself in this one line.
+            char lbuf[224];
+            std::snprintf(lbuf, sizeof(lbuf),
+                          "F637-GUARDREPAIR depth=%d tripGen=%u armedGen=%u - page(s) re-armed "
+                          "OVER a still-open window; a thread has stranded g_hgDepth",
+                          (int)g_hgDepth, g_hgArmedTripGen, (unsigned)g_hgTripGen.load());
+            BootReportError(lbuf);
+        }
         // F-412: ~(uintptr_t)0 is PhysGuardArmImpl's "this guard is broken" marker. It sits AFTER
         // the two decrements, not at the very top: a top-of-function return would skip them and
         // the park-branch drain (while t_hgWin > 0) would spin forever. With the marker the arm
@@ -651,6 +959,65 @@ namespace
         return buf;
     }
 
+    // F-609: block geometry. Copied from kernel/guest_thread.cpp:11-17, NOT
+    // re-derived -- GuestThreadContext's TOTAL is 0x40E90 and a second,
+    // slightly different block layout is the same class of bug as the alias
+    // itself. TEB_OFFSET there is PCR+TLS (0xBB0), which is where the +0x150 /
+    // +0x160 "want errors" / last-error fields the boot block documents
+    // (boot_host.cpp:731-733) are NOT: in a real block +0x150 is inside the
+    // TEB. Recorded here so the next reader does not reconcile the two
+    // comments and "fix" the offset.
+    //
+    // Declared ABOVE SetupInitialContext, which registers the static block and
+    // self-tests AllocateGuestThreadBlock. Line numbers quoted in the
+    // F-609 comments below are PRE-EDIT values; re-measure with grep (rule 13)
+    // before repeating them in a doc. Post-edit anchors: SetupInitialContext is
+    // called from BootWorker at :1353, after LoadAndPrepare's g_userHeap.Init()
+    // at :2078, so the heap is live when the self-test runs.
+    namespace {
+        constexpr size_t F609PcrSize = 0xAB0;
+        constexpr size_t F609TlsSize = 0x100;
+        constexpr size_t F609TebSize = 0x2E0;
+        constexpr size_t F609StackSize = 0x40000;
+        constexpr size_t F609TotalSize = F609PcrSize + F609TlsSize + F609TebSize + F609StackSize;  // 0x40E90
+        constexpr size_t F609TebOffset = F609PcrSize + F609TlsSize;                                // 0xBB0
+
+        // pcr VA -> owning host thread's tag. Attribution only: nothing the
+        // guest executes reads it, so a miss or a stale entry cannot change
+        // behaviour. Guest-visible PCR bytes are the o1heap payload, NOT here.
+        std::mutex g_f609TagMutex;
+        std::unordered_map<uint32_t, const char*> g_f609Tags;
+
+        void RegisterBlockTag(uint32_t pcrVa, const char* tag)
+        {
+            if (pcrVa == 0 || tag == nullptr)
+                return;
+            std::lock_guard lock(g_f609TagMutex);
+            g_f609Tags[pcrVa] = tag;
+        }
+    } // namespace
+
+// F-635: __except filter for the F-609 block self-test. MSVC restricts
+// GetExceptionInformation() to the filter expression, so the address and the
+// exception information have to be copied out here, through pointers to locals
+// declared in the enclosing function. Returns EXCEPTION_EXECUTE_HANDLER, so the
+// handler body runs and the boot continues instead of dying.
+static int F635CaptureFilter(EXCEPTION_POINTERS* ep, uintptr_t* outAddr,
+                             int* outInfoN, uint32_t* outInfo) {
+    if (ep == nullptr || ep->ExceptionRecord == nullptr) {
+        *outAddr = 0;
+        *outInfoN = 0;
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    *outAddr = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    const ULONG n = ep->ExceptionRecord->NumberParameters;
+    *outInfoN = static_cast<int>(n);
+    for (ULONG i = 0; i < n && i < 4; ++i)
+        outInfo[i] = static_cast<uint32_t>(ep->ExceptionRecord->ExceptionInformation[i]);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+
     void SetupInitialContext(PPCContext& ctx)
     {
         std::memset(&ctx, 0, sizeof(ctx));
@@ -721,6 +1088,59 @@ namespace
 
         InsertFunction(AllocFnGuest, &__xtl_alloc);
         InsertFunction(FreeFnGuest, &__xtl_free);
+
+        // F-609: the static block above STAYS at 0x8F200000. Two measured
+        // dependents make moving it unsafe in this pass, and both are in files
+        // this agent does not own:
+        //   gpu_device.cpp:20489-20496 -- sub_8242FB88 writes the TLS chain
+        //     into a HARD-CODED kBootWorkerTlsTable = 0x8F201000 (= this
+        //     block + 0x1000 = TableBase) and its own comment admits "the boot
+        //     worker may start with a temporary r13; we hardcode the known TLS
+        //     table". Move r13 and that write lands on a dead table.
+        //   gpu_device.cpp:20385, 20500, 20536 -- the three chain-heal guards
+        //     are s_tlsChainInitDone / s_bootWorkerTlsInit /
+        //     s_bootWorkerTlsInit2, each `fetch_add(1) == 0`, i.e. once per
+        //     PROCESS. gpu_device.cpp:20382-20383 justifies that with "all
+        //     threads share r13=0x8F200000 and tlsTable=0x8F201000, so one-time
+        //     init suffices" -- which is FALSE the moment blocks are per-thread.
+        //     Those three must become per-VA before any r13 moves.
+        // So: register the alias by NAME (pure attribution, no register change)
+        // and self-test the new allocator, leaving the guest-visible registers
+        // exactly where they are.
+        RegisterBlockTag(ThreadBlock, "boot-worker:static-8F200000");
+
+        // F-636 (w656): the F-609 self-test is REMOVED from the boot path, not
+        // repaired in place. Measured sequence:
+        //   w655 - the call faulted (0xC0000005, no VEH row) and killed the
+        //           process 160 lines in.
+        //   w656 - wrapped in __except it reported
+        //           `THREW addr=0x0 nParams=2 p0=0x00000000 p1=0xA0400000`,
+        //           i.e. a NULL host pointer dereferenced with a length of
+        //           exactly kPhysArenaBeginVa. The fault is therefore INSIDE
+        //           the allocator, not in the block bookkeeping around it --
+        //           and an exception unwinding out of g_userHeap.Alloc leaves
+        //           the o1heap instance half-updated.
+        //   The consequence is visible and is the reason for removal: w656
+        //   produced 1,154 log lines against w654's 166,256, with no
+        //   BOOTPATH, no DISCCHK, no F556-C54D8 and no CP-DRAW at all. The
+        //   guest never left the installer. A probe that damages the thing it
+        //   is probing is worse than no probe: it costs a boot AND produces a
+        //   fault that the universal gate counts against the change.
+        //
+        //   AllocateGuestThreadBlock / ReleaseGuestThreadBlock / LookupGuestThreadBlockTag stay in the
+        //   tree, UNUSED AND UNPROVED. Nothing may call the first two until a soak can show one
+        //   allocation and one release with PHYS-VERDICT-CHANGE staying `healthy`. The wake-up
+        //   condition is explicit, not a date.
+        //
+        //   F-637 CORRECTION: the "all three unused" claim above was FALSE and was falsified by
+        //   measurement, not by inspection. LookupGuestThreadBlockTag has a live caller at :2677 (the
+        //   park-sampler mirror row) and has had one since it was introduced. It is a pure
+        //   std::unordered_map lookup under g_f609TagMutex (:1202) and reads NO guest memory, so it
+        //   needs no allocation to be reachable -- which is exactly why "unused" was the wrong
+        //   inference to draw from "no F609-BLOCK line in any soak": a map miss is silent, and a
+        //   hit is silent. w657.log:811 prints `tag=boot-worker:static-8F200000` from that call
+        //   19 s into the run. The first two remain genuinely uncalled; that half of the claim stands.
+        (void)0;
     }
 
     // T4-final: faithful replay of the dead memory-device ctor / Mount("memory:")
@@ -746,58 +1166,526 @@ namespace
     //                                 //   path does not scan this table, so
     //                                 //   the link is installed for the
     //                                 //   fallback/no-prefix path only.
-    // Seed the embedded:/ name list with static .data blobs that the CRT
-    // .CRT$XCU inits would have registered via sub_821D22E8. Our boot host
-    // jumps at the game entry and those inits never run — AFB76 therefore
-    // sees an empty list. Nodes live in image .data (no heap Alloc).
-    // Triples decoded from every `bl 0x821d22e8` under 0x827A/0x827B
-    // (recompiled bodies confirm signed addi).
-    // Format matches D22E8: {name*, buf, size, next} pushed at 0x82860AF8.
+    // ======================================================================
+    // F-640: THE .CRT$XCU STATIC-INITIALISER WALK — LAYOUT, CONVENTION, AND
+    // WHY THE 15-ENTRY SUBSTITUTE BELOW IS NOT A SUBSTITUTE ANY MORE
+    // ======================================================================
+    // The comment this block replaces is kept here, quoted, because it is the
+    // record of a real past decision and the next reader needs to know it was
+    // WRONG rather than silently rewritten:
+    //
+    //   WAS: "Seed the embedded:/ name list with static .data blobs that the
+    //   CRT .CRT$XCU inits would have registered via sub_821D22E8. Our boot
+    //   host jumps at the game entry and those inits never run — AFB76
+    //   therefore sees an empty list." + a 15-row hand-typed table.
+    //
+    // BOTH HALVES OF THAT ARE FALSE, and the second one is false in a way that
+    // cost a boot. Re-measured 2026-09-30; nothing below is inherited.
+    //
+    // (1) THE INITIALISERS DO RUN. The entry point this host jumps at IS the
+    //     guest's own C-runtime start. Image entry RVA 0x1322B8 -> VA
+    //     0x821322B8 (`[boot] image base ... entry 0x821322B8`, w666.log:53).
+    //     Its unconditional prefix contains `bl sub_82132820` at 0x82132310
+    //     and `bl sub_82132740` at 0x82132318; the only branch in that
+    //     stretch (0x82132300) skips 0x82132304 alone. sub_82132740 IS the
+    //     XCU walker: `addi r10,r10,16` / `addi r30,r11,5104` at
+    //     0x82132778/0x8213277C over a `mtctr; bctrl` loop. `tools/
+    //     addr_owners.py --check 0x82132740` reports one owner and it is the
+    //     plain recompiled mapping (generated/ppc_xenon/ppc_func_mapping.cpp
+    //     :112) — no host override, no stub. The console's stage and this
+    //     host's stage are the same code, so there is nothing to skip and
+    //     nothing to substitute. Adding a second host-side run here would
+    //     DOUBLE-INITIALISE 1267 constructors: fabrication, and a divergence
+    //     from the hardware in the one place the hardware is the reference.
+    //
+    // (2) THE SEED COULD NOT WIN EVEN IF IT RAN FIRST, and it does: it runs
+    //     here, in LoadAndPrepare, and the initialisers run later, from the
+    //     entry point. The seed's 15 `node` addresses ARE the 15 static nodes
+    //     the initialisers write, so every word is overwritten. The row that
+    //     settles it is w666.log:16255 —
+    //       AFB76-HIT #4 path='embedded:/fxl_final/rage_postfx.fxc'
+    //                  buf=8281BB00 size=38024
+    //     38024 is the literal sub_827B4E80 passes (`lis r6,0` at 0x827B4E8C,
+    //     `ori r6,r6,0x9488` at 0x827B4E9C). The hand-typed table said 48 for
+    //     that same field. All five rage_* hits in w666 carry ctor sizes.
+    //
+    // (3) A 4-BYTE HEAD DEFECT, present in BOTH this file and the reader in
+    //     src/gpu_device.cpp. The guest links the list through `lis r10,8286`
+    //     + 2804 = 0x82860AF4 (`lwz r11,2804(r10)` at 0x821D22F8, `stw r3,
+    //     2804(r10)` at 0x821D2300, sub_821D22E8). This seed writes
+    //     0x82860AF8; gpu_device.cpp's `kEmbeddedNameListHead` is 0x82860AF8
+    //     with the trailing comment `// lis -32122 + 2804`, whose own
+    //     arithmetic gives 0xAF4. So the seed has only ever worked as a
+    //     BRIDGE: its head word is the entry point, its first `next` is
+    //     clobbered by the guest, and the walk continues into the guest's own
+    //     chain at 0x82860AF4 — which is why w666 shows 15 nodes and correct
+    //     sizes from a table that is 14/15 stale. EXACT CHANGE NEEDED in
+    //     src/gpu_device.cpp (NOT this file's, and not edited here):
+    //     `kEmbeddedNameListHead = 0x82860AF8` -> `0x82860AF4`. When that
+    //     lands, SeedEmbeddedNameList() goes with it and nothing else changes.
+    //
+    // (4) STILL NOT THE FIX FOR `Shadows`, and it must not be read as one.
+    //     `Shadows` is registered by NONE of the 15 and cannot be: the call
+    //     sites name exactly these fifteen (`fxl_final/rage_im.fxc` ..
+    //     `fxl_final/rage_postfx.fxc`), see the F640-XCU-REG rows this boot
+    //     prints. The fatal is a SERVE gap. The census prints
+    //     `hostSlotCollisions=0` precisely so nobody re-derives "the ctors
+    //     were skipped" from it a third time.
+    //
+    // WHAT IS HERE NOW: the 15 registrations are DECODED FROM THE INSTALLED
+    // IMAGE at run time, out of the same `bl sub_821D22E8` sites the hardware's
+    // linker emitted, instead of being typed in by hand. For 14 of 15 the
+    // words written are byte-identical to the old table, so the boot is
+    // unchanged; the 15th gets 38024 instead of 48, which is the correction.
+    // Nothing here can drift from the guest again, and no guest value is ever
+    // asserted on: every decoded field is shape-checked and refused by name.
+
+    // The table the walker loops over, from the walker's own two `addi`s. NOT
+    // from the section table: the PE header in build/cache/mcla_pe.bin has 13
+    // sections and no `.CRT` among them, and its raw offsets disagree with its
+    // virtual addresses (.text rawoff 0x12C800 vs vaddr 0x130000; .data
+    // 0x7C9A00 vs 0x7D0000), so the table is found in the bytes and then
+    // verified at run time (the word AT `end` is the zero sentinel) before a
+    // single byte is written. All 1267 entries are present in
+    // generated/ppc_xenon/ppc_func_mapping.cpp, and 1265 of 1266 adjacent
+    // pairs are non-decreasing — the address order a linker emits.
+    //
+    // THE TWO CITATIONS BELOW WERE WRONG UNTIL 2026-09-30; THE VALUES NEVER
+    // WERE. The old comment named sub_82132778 / sub_8213277C, whose raw words
+    // are `394A13E4` (addi r10,r10,5092) and `3BCB13F0` (addi r30,r11,5104):
+    // over the `lis r10,0x827D` / `lis r11,0x827D` pair at 0x82132770/74 those
+    // materialise 0x827D13E4 and 0x827D13F0 -- the bounds of the OTHER loop in
+    // the same function, 0x50 bytes along. The XCU bounds come from the pair
+    // BELOW them: sub_821327C8 `394A0010` (addi r10,r10,16) -> 0x827D0010 and
+    // sub_821327CC `3BCB13E0` (addi r30,r11,5088) -> 0x827D13E0. So the two
+    // constants were right and only the instructions named to justify them
+    // were not, and they named the adjacent array.
+    //
+    // The mis-citation was not cosmetic, because the two loops differ in KIND.
+    // Loop A (0x82132770..0x821327BC) tests `cmpi cr6,r3,0` at 0x82132790 and
+    // bails out of the entire walk on a non-zero constructor return. Loop B
+    // (0x821327C0..0x82132800) -- the one that walks THIS array -- has no such
+    // test; it falls through to `li r3,0` at 0x82132804. And loop B null-skips
+    // 0 (`cmpli cr6,r11,0`, 0x821327E0) and 0xFFFFFFFF (`cmpi cr6,r11,-1`,
+    // 0x821327E8) without leaving. The array whose first word is a NULL prefix
+    // is therefore exactly the array that does not bail on it.
+    //
+    // The .CRT layout, read from build/cache/mcla_pe.bin (offset = VA -
+    // 0x82000000, words big-endian). THREE arrays, and every one of them is
+    // NULL-prefixed and NUL-terminated one word past its last slot:
+    //   0x827D0000 .. 0x827D000C   0, 823D9930, 823E3CB8   end 0 at 0x827D000C
+    //   0x827D0010 .. 0x827D13E0   0, then 1267 .text pointers   <-- THIS ONE
+    //   0x827D13E4 .. 0x827D13F0   0, 823E1170, 823E6590   end 0 at 0x827D13F0
+    // 0x13D0 / 4 = 1268 words, so kCrtXcuMaxSlots = 8192 is a backstop this
+    // table can never reach: of the 1268, one is 0, 1267 are non-null, none is
+    // 0xFFFFFFFF, and all 1267 fall inside [kTextLo,kTextHi]. 1267 of the
+    // 45,190 guest addresses in generated/ppc_xenon/ppc_func_mapping.cpp, 0
+    // missing, 1267 distinct. 1265 of the 1266 adjacent entry pairs are
+    // non-decreasing; the one exception is entry 19, 827A9458 -> 827A78F0.
+    static constexpr uint32_t kCrtXcuBegin = 0x827D0010u; // sub_821327C8: addi r10,r10,16   (loop B)
+    static constexpr uint32_t kCrtXcuEnd   = 0x827D13E0u; // sub_821327CC: addi r30,r11,5088 (loop B)
+    static constexpr uint32_t kCrtWalker   = 0x82132740u; // the function that walks it
+    static constexpr uint32_t kCrtWalkCall = 0x82132318u; // `bl sub_82132740` inside _xstart
+    static constexpr uint32_t kCrtXcuMaxSlots = 8192u;    // 0x13D0 bytes = 1268 slots, measured
+    // kTextHi is INCLUSIVE -- it is the last .text byte, not one past it -- so
+    // the containment test below is `v >= kTextLo && v <= kTextHi`, and the
+    // marker prints the pair as textRange= so "in text" is checkable from the
+    // log instead of taken on trust. Unchanged: making the bound half-open
+    // would move the meaning of the existing nonNull/truncated fields.
+    static constexpr uint32_t kTextLo = 0x82130000u, kTextHi = 0x827BDCE4u;
+    static constexpr uint32_t kRdataLo = 0x82000600u, kRdataHi = 0x82102824u;
+    static constexpr uint32_t kDataLo = 0x827D0000u, kDataHi = 0x8294A72Cu;
+
+    // Words the HOST substitutes in this same function family, i.e. the only
+    // addresses a static initialiser could collide with. The memory-device
+    // vtable slot and its fallback pointer (ReplayDeadMemoryDeviceCtor, below),
+    // the scratch table pointer (SeedPreBootSlots, below), and both candidate
+    // list heads. The census checks all 15 registrations against all of them.
+    static constexpr uint32_t kHostSubstSlots[] = {
+        0x827D8380u, 0x827D838Cu, 0x8288E5ACu, 0x82860AF4u, 0x82860AF8u};
+
+    // The 15 `bl sub_821D22E8` call sites: `tools/ppc_xrefs.py calls
+    // 0x821D22E8` -> 15 sites, every one inside 0x827A..0x827B. A measured
+    // search result, not a discovery, and each one is re-decoded at run time
+    // rather than trusted.
+    static constexpr uint32_t kD22E8Sites[] = {
+        0x827A7FCCu, 0x827A821Cu, 0x827AD164u, 0x827AFC74u, 0x827B0534u,
+        0x827B0554u, 0x827B0574u, 0x827B0594u, 0x827B1044u, 0x827B1064u,
+        0x827B10C4u, 0x827B4B54u, 0x827B4B74u, 0x827B4B94u, 0x827B4EA0u};
+
+    struct CrtReg {
+        uint32_t site, node, name, buf, size;
+    };
+
+    // Decode r3/r4/r5/r6 at one call site by scanning the constructor block that
+    // ENDS at the `bl`. FORWARD, not backward: a constructor materialises its
+    // argument addresses in address order — `lis r11` / `lis r10` / `lis r9` first
+    // (sub_827A7FB0: 0x827A7FB0/B4/B8), then the `addi`s that fold the low halves
+    // (0x827A7FBC/C0/C4), then the size (0x827A7FC8) — so a backward pass meets the
+    // `addi`s before their bases exist. Only `lis`(15) / `addi`(14) / `ori`(24) are
+    // understood; ANY other opcode (the previous constructor's tail `b`, or its
+    // 0x00000000 padding) resets the register state, which is what keeps one
+    // constructor's bases out of the next one's arguments. A register only counts
+    // if it was written AFTER the last reset. The window is 0x30 bytes, the widest
+    // measured block is 0x24 (sub_827B4E80, the one that needs the two-word
+    // `lis r6,0` + `ori r6,r6,imm` size form; the other fourteen use
+    // `addi r6,0,imm`).
+    //
+    // CALLING CONVENTION, verified from those bodies rather than assumed: the
+    // entry is `void(void)`. Each is a leaf with no `mflr`, no `stwu` and no
+    // stack traffic — sub_827A7FB0 is nine instructions ending in a tail `b` — it
+    // clobbers only r9/r10/r11, and the walker itself sets up NO arguments
+    // (`mtctr r11; bctrl` with r3 already 0 from `li r3,0` at 0x82132784). It
+    // also aborts the remaining entries if a constructor returns non-zero in r3
+    // (the `cmpi cr6,r3,0` at 0x82132790), which is the console's behaviour and is
+    // therefore reproduced by NOT running the walk at all.
+    //
+    // `why` names the refusal; nothing here asserts on a guest value.
+    static bool DecodeCrtRegistration(uint32_t site, CrtReg& out, const char** why)
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        static constexpr uint32_t kUnset = 0xDEADBEEFu; // a `lis` result has low 16 bits zero
+        static constexpr int kNoPos = -1;
+        uint32_t hi[32];
+        uint32_t reg[32] = {};
+        int pos[4];
+        int lastReset = kNoPos;
+        for (uint32_t i = 0; i < 32; ++i)
+            hi[i] = kUnset;
+        hi[0] = 0; // r0 reads as zero, so `addi rT,0,imm` materialises
+        for (uint32_t i = 0; i < 4; ++i)
+            pos[i] = kNoPos;
+        int p = 0;
+        for (uint32_t back = 0x30u; back >= 4; back -= 4, ++p)
+        {
+            uint32_t w = 0;
+            if (!mem.ReadU32BE(site - back, &w)) { *why = "UNREADABLE-TEXT"; return false; }
+            const uint32_t op = w >> 26, T = (w >> 21) & 0x1Fu, A = (w >> 16) & 0x1Fu;
+            const uint32_t uimm = w & 0xFFFFu;
+            const uint32_t simm = static_cast<uint32_t>(
+                static_cast<int32_t>(static_cast<int16_t>(static_cast<uint16_t>(uimm))));
+            if (op == 15 && A == 0) { // lis
+                hi[T] = simm << 16; continue;
+            }
+            if ((op == 14 || op == 24) && hi[A] != kUnset) { // addi / ori
+                reg[T] = (op == 14) ? (hi[A] + simm) : (hi[A] | uimm);
+                if (T >= 3 && T <= 6) pos[T - 3] = p;
+                continue;
+            }
+            // Anything else -- a branch, padding, an `addis` with a live base, an
+            // unresolvable addi -- ends the current block.
+            for (uint32_t i = 0; i < 32; ++i)
+                hi[i] = kUnset;
+            hi[0] = 0;
+            for (uint32_t i = 0; i < 4; ++i)
+                pos[i] = kNoPos;
+            for (uint32_t i = 0; i < 32; ++i)
+                reg[i] = 0;
+            lastReset = p;
+        }
+        for (uint32_t i = 0; i < 4; ++i)
+            if (pos[i] <= lastReset) { *why = "ARG-NOT-AFTER-RESET"; return false; }
+        out.site = site; out.node = reg[3]; out.name = reg[4];
+        out.buf = reg[5]; out.size = reg[6];
+        if (out.node == 0 || out.name == 0 || out.buf == 0) { *why = "NULL-ARG"; return false; }
+        if (out.size == 0 || out.size > (64u << 20)) { *why = "SIZE-SHAPE"; return false; }
+        if (out.node < kDataLo || out.node + 16u > kDataHi) { *why = "NODE-NOT-STATIC-DATA"; return false; }
+        if (out.name < kRdataLo || out.name >= kRdataHi) { *why = "NAME-NOT-RDATA"; return false; }
+        if (out.buf < kDataLo || out.buf >= kDataHi) { *why = "BUF-NOT-STATIC-DATA"; return false; }
+        *why = "OK";
+        return true;
+    }
+
+    // Log-only. Prints the measured table, one row per decoded registration with
+    // the collision answer, and a summary naming both halves of the shader
+    // question. It writes no guest memory and calls no guest code, so it cannot
+    // be the thing that breaks a boot (F-636's lesson).
+    static void CensusCrtXcu()
+    {
+        auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+        // 768, not 384: the marker gained a block of APPENDED fields and
+        // std::snprintf truncates SILENTLY, so an undersized buffer would have
+        // dropped the new evidence and left no sign that it was dropped -- the
+        // first 384 bytes would still have looked like a well-formed row. The
+        // numbers, measured by rendering both format strings with the values
+        // read out of build/cache/mcla_pe.bin: the unchanged `begin=`..
+        // `verify=` prefix 162 bytes, the 16 appended fields 253, the row 416
+        // + NUL. The ABSOLUTE worst case -- every %u/%d at 10 digits, every
+        // %08X at 8, %s at its longest verdict REFUSED-END-UNREADABLE -- is 571
+        // + NUL, so 384 would have truncated on the day the table went wrong
+        // and 768 has 197 bytes of headroom. The same buffer serves the
+        // F640-XCU-REG rows and the F640-XCU-SUMMARY row, both far shorter.
+        char lbuf[768];
+
+        // (a) the table itself, verified before it is believed.
+        //
+        // THE GATE IS THE END SENTINEL AND NOTHING ELSE. It used to be
+        // `firstOk && endOk`, and `firstOk` additionally demanded that the word
+        // AT `begin` be a .text pointer. That word measures 0x00000000 in the
+        // image -- the NULL prefix that all three .CRT arrays here carry -- so
+        // the gate could never pass, and the marker has printed
+        // `slots=0 nonNull=0 first=00000000 ... verify=REFUSED-FIRST-NOT-TEXT`
+        // in every soak since w444 while the region held 1268 slots, 1 null and
+        // 1267 non-null .text pointers, all 1267 mappable. A refusal that is on
+        // by construction is not a measurement; it is the same defect as a
+        // tracked marker whose literal cannot be printed, F-057(6). The zeros it
+        // produced were the gate talking, not the table.
+        //
+        // THE TWO READS ARE NOW RECORDED SEPARATELY, because the old `firstOk`
+        // folded "the read failed" into "the value is not text" and one field
+        // cannot say which of the two happened. `beginReadOk` / `endReadOk` are
+        // the read-success flags; `beginWord` / `endWord` are the values. A
+        // failed read leaves its word at 0, so the FLAGS are what make a failed
+        // read distinguishable from a successful read of zero -- the difference
+        // the retired gate erased.
+        //
+        // EVERY PRE-EXISTING FIELD KEEPS ITS MEANING, ITS ORDER, ITS SPELLING
+        // AND ITS POSITION. `slots` is still the number of words walked;
+        // `nonNull` is still the number of walked words that were non-null AND
+        // in [kTextLo,kTextHi] (the out-of-text test still breaks BEFORE the
+        // increment, exactly as before); `first`/`last` are still the
+        // lowest/highest such word; `truncated` is still 0/1/2 for ok / read
+        // failed / non-text value. New fields are APPENDED, after `verify=`, so
+        // the whole `begin=` .. `verify=` prefix is byte-identical to every log
+        // written before this change.
+        //
+        // tools/soak_census.py is unaffected, and not only by luck: its
+        // count_markers() counts MATCHING LINES (`grep -ic` compatible) and
+        // never splits a line into fields, so field count was never a
+        // dependency; and F640-XCU-TABLE is not one of the 204 markers
+        // markers_from_guide() parses out of PROGRAM_GUIDE sec 9, so it has no
+        // tracked row whose meaning could shift. The one string that stops
+        // being printed is `REFUSED-FIRST-NOT-TEXT`, and it stops because the
+        // test it named is gone -- the first word is still measured, as
+        // `beginWord` and `beginInText`.
+        uint32_t firstWord = 0, endWord = 0;
+        const bool beginReadOk = mem.ReadU32BE(kCrtXcuBegin, &firstWord);
+        const bool endReadOk = mem.ReadU32BE(kCrtXcuEnd, &endWord);
+        const bool endSentinelOk = endReadOk && endWord == 0;
+        uint32_t slots = 0, nonNull = 0, lo = 0, last = 0, unmapped = 0, truncated = 0;
+        // New, appended-only. `entries` counts the words the WALKER would enter
+        // -- non-zero and not 0xFFFFFFFF, the two tests at 0x821327E0 and
+        // 0x821327E8 -- which is NOT what `nonNull` counts, so the two are
+        // reported side by side instead of one being taken on trust for the
+        // other. `regionReadFail` marks a second pass that stopped early, so a
+        // partial count is never read as a whole one.
+        uint32_t entries = 0, entriesInText = 0, ffffffff = 0, outOfText = 0;
+        uint32_t firstEntry = 0, orderBreaks = 0, adjacentPairs = 0;
+        uint32_t regionWords = 0, regionReadFail = 0, prevEntry = 0;
+        if (endSentinelOk)
+        {
+            // Pass 1 is the original loop, body unchanged, so the six original
+            // counters keep their exact previous definitions.
+            for (uint32_t va = kCrtXcuBegin; va < kCrtXcuEnd && slots < kCrtXcuMaxSlots; va += 4)
+            {
+                uint32_t v = 0;
+                if (!mem.ReadU32BE(va, &v)) { truncated = 1; break; }
+                ++slots;
+                if (v == 0)
+                    continue;
+                if (v < kTextLo || v > kTextHi) { truncated = 2; break; }
+                ++nonNull;
+                // PRE-FLIGHT, and the only containment that costs nothing: PPC_LOOKUP_FUNC is
+                // an array index, so naming the entries the host could not enter BEFORE
+                // the entry point runs is free and turns a would-be boot-killing jump
+                // through a null slot into a counted row. (A mapped-but-faulting ctor is
+                // NOT containable from here: the walk lives in the guest's entry and this
+                // TU keeps its "no __try around the entry call" contract. Owning
+                // sub_82132740 is the named next step; its gate is `unmapped=0` in
+                // F640-XCU-TABLE plus C0000005 0.)
+                if (g_base != nullptr && PPC_LOOKUP_FUNC(g_base, v) == nullptr)
+                    ++unmapped;
+                if (lo == 0) lo = v;
+                last = v;
+            }
+            // Pass 2 is new and deliberately does NOT break on an out-of-text
+            // word, so `outOfText` and `entries` are totals for the WHOLE region
+            // and not "up to whatever truncated pass 1 hit". It is a second read
+            // of the same 1268 words through the same accessor: 2536 reads once,
+            // no writes, no guest code, nothing a boot can trip over.
+            for (uint32_t va = kCrtXcuBegin; va < kCrtXcuEnd && regionWords < kCrtXcuMaxSlots; va += 4)
+            {
+                uint32_t v = 0;
+                if (!mem.ReadU32BE(va, &v)) { regionReadFail = 1; break; }
+                ++regionWords;
+                if (v == 0xFFFFFFFFu) { ++ffffffff; continue; }
+                if (v == 0) continue;
+                if (firstEntry == 0) firstEntry = regionWords; // 1-based, so a NULL prefix is visible as a number
+                if (prevEntry != 0)
+                {
+                    ++adjacentPairs;
+                    if (v < prevEntry) ++orderBreaks;
+                }
+                prevEntry = v;
+                ++entries;
+                if (v >= kTextLo && v <= kTextHi) ++entriesInText; else ++outOfText;
+            }
+        }
+        std::snprintf(lbuf, sizeof(lbuf),
+                      "F640-XCU-TABLE begin=%08X end=%08X slots=%u nonNull=%u first=%08X "
+                      "last=%08X unmapped=%u truncated=%u walker=%08X callSite=%08X "
+                      "verify=%s",
+                      kCrtXcuBegin, kCrtXcuEnd, slots, nonNull, lo, last, unmapped,
+                      truncated, kCrtWalker, kCrtWalkCall,
+                      endSentinelOk
+                          ? "OK"
+                          : (endReadOk ? "REFUSED-END-NOT-ZERO" : "REFUSED-END-UNREADABLE"));
+        // APPENDED FIELDS. All sixteen are new, and none of the ELEVEN above
+        // (begin, end, slots, nonNull, first, last, unmapped, truncated, walker,
+        // callSite, verify) changes name, order, spelling or meaning.
+        //   beginReadOk   read at kCrtXcuBegin succeeded (1/0) -- the fact the
+        //                  old `firstOk` swallowed.
+        //   endReadOk     read at kCrtXcuEnd succeeded (1/0).
+        //   beginWord     the raw word at kCrtXcuBegin. 00000000 here: the NULL
+        //                  prefix, normal for all three arrays.
+        //   endWord       the raw word at kCrtXcuEnd, i.e. the sentinel.
+        //   beginInText   is beginWord inside [textRange]? The RETIRED gate's
+        //                  own boolean, reported rather than enforced (0 here).
+        //   endSentinel   the LIVE gate's own boolean, endReadOk && endWord==0.
+        //   regionWords   words walked by pass 2; equals `slots` when
+        //                  truncated==0, and is a total (pass 2 never breaks on
+        //                  an out-of-text value).
+        //   entries       non-zero and not 0xFFFFFFFF == what loop B enters.
+        //   entriesInText of those, inside [textRange] == `nonNull` when
+        //                  truncated==0.
+        //   ffffffff      the other skip class; 0 measured.
+        //   outOfText     entered but outside [textRange] -- a slot the guest
+        //                  would bctrl into. A total, not "up to truncated".
+        //   firstEntry    1-based slot index of the first entered word (2
+        //                  measured: the NULL prefix is exactly ONE slot, so
+        //                  0x827D0010 is skipped and 0x827D0014 is entry one).
+        //   adjacentPairs non-decreasing pairs checkable among `entries`.
+        //   orderBreaks   of those, how many decrease -- re-measures the linker
+        //                  address-order claim at run time (1 measured).
+        //   regionReadFail pass 2 stopped on an unreadable word, so every
+        //                  pass-2 count above is partial and must not be read
+        //                  as a whole.
+        //   textRange     kTextLo..kTextHi, INCLUSIVE, so "in text" is
+        //                  checkable from the log rather than trusted.
+        std::snprintf(lbuf + std::strlen(lbuf), sizeof(lbuf) - std::strlen(lbuf),
+                      " beginReadOk=%d endReadOk=%d beginWord=%08X endWord=%08X "
+                      "beginInText=%d endSentinel=%d regionWords=%u entries=%u "
+                      "entriesInText=%u ffffffff=%u outOfText=%u firstEntry=%u "
+                      "adjacentPairs=%u orderBreaks=%u regionReadFail=%d "
+                      "textRange=%08X-%08X",
+                      beginReadOk ? 1 : 0, endReadOk ? 1 : 0, firstWord, endWord,
+                      (firstWord >= kTextLo && firstWord <= kTextHi) ? 1 : 0,
+                      endSentinelOk ? 1 : 0, regionWords, entries, entriesInText,
+                      ffffffff, outOfText, firstEntry, adjacentPairs, orderBreaks,
+                      regionReadFail ? 1 : 0, kTextLo, kTextHi);
+        BootReportInfo(lbuf);
+
+        // Two region dumps, both through the UNCHECKED accessor at
+        // boot_host.cpp:851 (`*(volatile uint32_t*)(base + guestAddr)`) rather
+        // than through `mem`, so the same bytes are read by two independent
+        // paths: this one off the installed window, the census above off the
+        // guest heap. If the two disagree, the marker above is describing an
+        // image that is not the one running. TOTALLY LOG-ONLY and two lines per
+        // boot, so it is not gated -- a dump that only prints when the census is
+        // already happy is a dump that cannot catch the case it exists for.
+        // 8 words at the head covers the NULL prefix and 7 entries; 4 at
+        // 0x827D13D0 covers the last slot, the end sentinel the gate reads, and
+        // the next array's prefix, which is where an off-by-one in the bounds
+        // would show. A whole-table dump would be 1268 words = 33 lines per boot
+        // (DumpImageRegion's 512-byte buffer holds ~53 words), so it is one
+        // argument away if a soak ever needs it.
+        DumpImageRegion(kCrtXcuBegin, 8);
+        DumpImageRegion(kCrtXcuEnd - 16, 4);
+
+        // (b) the 15 embedded-file registrations, and whether any of them lands on
+        //     a word the host has already substituted.
+        uint32_t decoded = 0, refused = 0, collide = 0;
+        for (const uint32_t site : kD22E8Sites)
+        {
+            CrtReg r{};
+            const char* why = "?";
+            if (!DecodeCrtRegistration(site, r, &why))
+            {
+                ++refused;
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "F640-XCU-REG-REFUSE site=%08X reason=%s (nothing written)",
+                              site, why);
+                BootReportInfo(lbuf);
+                continue;
+            }
+            ++decoded;
+            bool hostSlot = false;
+            for (const uint32_t s : kHostSubstSlots)
+                for (uint32_t d = 0; d < 16u; d += 4)
+                    if (r.node + d == s) hostSlot = true;
+            if (hostSlot) ++collide;
+            char name[48] = {0};
+            (void)mem.ReadBytes(r.name, name, sizeof(name) - 1);
+            std::snprintf(lbuf, sizeof(lbuf),
+                          "F640-XCU-REG #%u site=%08X node=%08X name='%s' buf=%08X size=%u "
+                          "nodeInStaticData=%d landsOnHostSubstitutedWord=%d",
+                          decoded, r.site, r.node, name, r.buf, r.size,
+                          (r.node >= kDataLo && r.node < kDataHi) ? 1 : 0, hostSlot ? 1 : 0);
+            BootReportInfo(lbuf);
+        }
+
+        // (c) the summary, stating the two halves separately so a soak cannot
+        //     read one as the other.
+        std::snprintf(lbuf, sizeof(lbuf),
+                      "F640-XCU-SUMMARY tableSlots=%u nonNull=%u unmapped=%u truncated=%u "
+                      "regSites=%u decoded=%u refused=%u hostSubstitutedCollisions=%u "
+                      "walkerRunsThem=1 hostAddsSecondRun=0 ShadowsRegisteredByCtor=0 "
+                      "-> the 'preload' half is closed; Shadows is a SERVE gap "
+                      "(gpu_device.cpp AFB76-REFUSE), not a missing ctor",
+                      slots, nonNull, unmapped, truncated,
+                      static_cast<uint32_t>(sizeof(kD22E8Sites) / sizeof(kD22E8Sites[0])),
+                      decoded, refused, collide);
+        BootReportInfo(lbuf);
+    }
+
+    // Seed the embedded:/ name list with the static .data blobs the guest's own
+    // C runtime registers via sub_821D22E8. The 15 registrations are read out of
+    // the image at the measured call sites (see the F-640 block above), not typed
+    // in: 14 of the 15 quadruples are byte-identical to the retired hand-typed
+    // table, and the 15th (rage_postfx) now carries the ctor's own 38024 instead of
+    // the table's stale 48 — the value w666.log:16255 shows reaching the log.
+    // Nodes live in image .data (no heap Alloc). Format matches D22E8:
+    // {name*, buf, size, next}, head at 0x82860AF8 — four bytes above the guest's
+    // real 0x82860AF4, which is the open defect in item (3) above.
     static void SeedEmbeddedNameList()
     {
         auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
         constexpr uint32_t kListHead = 0x82860AF8;
 
-        struct Seed {
-            uint32_t node, name, buf, size;
-        };
-        // node addresses are the CRT-provided static storage (r3 of D22E8).
-        const Seed seeds[] = {
-            {0x828395B8u, 0x820093D4u, 0x827D2DD0u, 5258u},   // rage_im
-            {0x82839D7Cu, 0x8200A06Cu, 0x827D4458u, 5406u},   // fastmipmap
-            {0x8288B8E0u, 0x820418B0u, 0x827E2CB0u, 10331u},  // spotlightfog
-            {0x828D47A4u, 0x8206ABDCu, 0x827F3C48u, 3187u},   // rage_bink
-            {0x828D4D2Cu, 0x8206DD30u, 0x827F5380u, 3612u},   // rmptfx_default
-            {0x828D4D60u, 0x8206DD50u, 0x827F61A0u, 8133u},   // rmptfx_litsprite
-            {0x828D4D3Cu, 0x8206DD70u, 0x827F8168u, 138u},    // dcl rmptfx_default
-            {0x828D4D1Cu, 0x8206DD88u, 0x827F81F8u, 138u},    // dcl rmptfx_litsprite
-            {0x828D5054u, 0x8206FD38u, 0x827F9CE8u, 32280u},  // atmoscatt_clouds
-            {0x828D5044u, 0x8206FD5Cu, 0x82801B00u, 5713u},   // perlinnoise
-            {0x828D5074u, 0x820700A0u, 0x82803540u, 4564u},   // rmptfx_collision
-            {0x829019ECu, 0x82086280u, 0x82813908u, 5112u},   // shadowcollector
-            {0x829019FCu, 0x820862A4u, 0x82814D00u, 4347u},   // shadowdepth
-            {0x82901A1Cu, 0x82086678u, 0x82815E48u, 18323u},  // blendshadows
-            {0x829054C0u, 0x82089394u, 0x8281BB00u, 48u},     // rage_postfx
-        };
-
         uint32_t head = 0;
         mem.ReadU32BE(kListHead, &head);
         int n = 0;
-        for (const Seed& s : seeds)
+        int refused = 0;
+        for (const uint32_t site : kD22E8Sites)
         {
-            mem.WriteU32BE(s.node + 0, s.name);
-            mem.WriteU32BE(s.node + 4, s.buf);
-            mem.WriteU32BE(s.node + 8, s.size);
-            mem.WriteU32BE(s.node + 12, head);
-            head = s.node;
+            CrtReg r{};
+            const char* why = "?";
+            if (!DecodeCrtRegistration(site, r, &why)) { ++refused; continue; }
+            mem.WriteU32BE(r.node + 0, r.name);
+            mem.WriteU32BE(r.node + 4, r.buf);
+            mem.WriteU32BE(r.node + 8, r.size);
+            mem.WriteU32BE(r.node + 12, head);
+            head = r.node;
             ++n;
         }
-        mem.WriteU32BE(kListHead, head);
-        char lbuf[128];
+        // Refuse rather than write a half-list: with nothing decoded there is no
+        // bridge into the guest's chain, and a silent zero here would read as
+        // "the preload half is broken" rather than "the image did not decode".
+        if (n > 0)
+            mem.WriteU32BE(kListHead, head);
+        char lbuf[160];
         std::snprintf(lbuf, sizeof(lbuf),
                       "[boot] embed-seed %d CRT triples, listHead=%08X", n,
-                      head);
+                      n > 0 ? head : 0u);
         BootReportInfo(lbuf);
+        if (refused != 0)
+        {
+            std::snprintf(lbuf, sizeof(lbuf),
+                          "[boot] embed-seed %d sites refused (decoded from image, not "
+                          "written; the guest's own initialisers still run)",
+                          refused);
+            BootReportInfo(lbuf);
+        }
     }
 
     static void ReplayDeadMemoryDeviceCtor()
@@ -831,6 +1719,12 @@ namespace
 
     void SeedPreBootSlots()
     {
+        // F-640: measure and publish the .CRT$XCU layout BEFORE anything writes, so
+        // a soak has the table's real bounds, the 15 decoded registrations and the
+        // collision answer in the log next to whatever the entry point then does
+        // with them. Log-only, no guest writes, no guest calls.
+        CensusCrtXcu();
+
         ReplayDeadMemoryDeviceCtor();
 
         // The fatal-error dispatcher (Function_821BD618) reads slot 0x8285FEA0
@@ -871,6 +1765,117 @@ namespace
     }
 
 } // namespace boot internals (keep NearestFunctionName below in same ns)
+
+// F-609: hand out one real, per-host-thread guest identity block.
+//
+// The five stores below are GuestThreadContext's, one for one
+// (kernel/guest_thread.cpp:40-45), because the point of this function is that a
+// synthetic host thread becomes indistinguishable from an ExCreateThread one to
+// every guest reader of r13+off. Big-endian via __builtin_bswap32 rather than
+// the ByteSwap() helper guest_thread.cpp uses: that symbol lives in
+// kernel/xbox.h, which boot_host.cpp does not include, and SetupInitialContext
+// already spells the same conversion at :740. guest_thread.cpp:44 stores
+// 0xFFFFFFFF UNSWAPPED; it is a palindrome, so the swap is a no-op either way.
+//
+// Note for the consumer: block r1 is the top of the block's own 0x40000 stack
+// (== pcrVa + 0x40E90, guest_thread.cpp:47), NOT the 2 MiB static stack at
+// 0x8F000000 that the boot worker and the vsync ISR use. A guest stack living
+// inside the user arena is a new exposure: heap_arena.h records the open
+// F-377 question that "something hands the title our arena base and it
+// initialises its own allocator metadata over it". Whoever moves a context onto
+// a heap block must confirm the title's XTL metadata never lands on a live
+// stack, and stack depth must fit 0x40000 (real guest threads get the same).
+GuestThreadBlock* AllocateGuestThreadBlock(const char* tag, uint32_t cpuNumber)
+{
+    // Descriptor and payload are separate allocations: the payload has to be a
+    // contiguous PCR..stack window the guest can address, and the descriptor is
+    // host-side bookkeeping that must stay OUTSIDE the guest window (a guest
+    // pointer to it would be a wild write waiting to happen). Descriptor uses
+    // ordinary new/delete rather than g_userHeap.Alloc<T>: that template was
+    // never instantiated anywhere before this, so its placement-new path is
+    // unproven in this build, and the payload path below is the one
+    // guest_thread.cpp:23 already runs for every real guest thread. Freed
+    // together by ReleaseGuestThreadBlock, so the pairing cannot leak.
+    GuestThreadBlock* block = new GuestThreadBlock();
+    if (block == nullptr)  // not reachable without -fno-exceptions; checked anyway
+        return nullptr;
+
+    block->pcr = static_cast<uint8_t*>(g_userHeap.Alloc(F609TotalSize));
+    if (block->pcr == nullptr)
+    {
+        // F-370 in the F-609 shape. guest_thread.cpp:26-37 logs before it
+        // returns so "the guest wanted N blocks and got M<N" is answerable
+        // from the log; the unnamed version of this path is what used to
+        // memset(nullptr, 0x40E90) and kill a thread silently (w373). Log
+        // through BootReportInfo, NOT MCLA_LOG_*: this TU holds __try and
+        // clang 19.1.7 ICEs instantiating spdlog/fmt here (boot_host.h:161).
+        static std::atomic<uint32_t> s_f609Oom{0};
+        const uint32_t n = s_f609Oom.fetch_add(1) + 1;
+        if (n <= 16 || (n % 100) == 0)
+        {
+            char lbuf[192];
+            std::snprintf(lbuf, sizeof(lbuf),
+                          "F609-BLOCK-NULL #%u size=0x%zX cpu=%u tag=%s - block NOT published",
+                          n, F609TotalSize, cpuNumber, tag ? tag : "?");
+            BootReportInfo(lbuf);
+        }
+        delete block;
+        return nullptr;
+    }
+
+    std::memset(block->pcr, 0, F609TotalSize);
+    block->tag = tag;
+    block->cpuNumber = cpuNumber;
+
+    const uint32_t pcrVa = mcla::kernel::g_memory.MapVirtual(block->pcr);
+    const uint32_t tlsVa = mcla::kernel::g_memory.MapVirtual(block->pcr + F609PcrSize);
+    const uint32_t tebVa = mcla::kernel::g_memory.MapVirtual(block->pcr + F609TebOffset);
+    const uint32_t topVa = mcla::kernel::g_memory.MapVirtual(block->pcr + F609TotalSize);
+
+    const auto storeU32 = [pcr = block->pcr](size_t off, uint32_t value) {
+        *reinterpret_cast<uint32_t*>(pcr + off) = __builtin_bswap32(value);
+    };
+    storeU32(0x000, tlsVa);                        // *(r13+0x000) = TLS array
+    storeU32(0x100, tebVa);                        // *(r13+0x100) = TEB
+    block->pcr[0x10C] = static_cast<uint8_t>(cpuNumber);
+    storeU32(F609PcrSize + 0x10, 0xFFFFFFFF);     // the one quirky TLS entry
+    storeU32(F609TebOffset + 0x14C, GetCurrentThreadId());  // TEB thread id
+
+    block->pcrVa = pcrVa;
+    block->tlsVa = tlsVa;
+    block->tebVa = tebVa;
+    block->stackTopVa = topVa;
+
+    RegisterBlockTag(pcrVa, tag);
+
+    char lbuf[224];
+    std::snprintf(lbuf, sizeof(lbuf),
+                  "F609-BLOCK tag=%s pcr=%08X tls=%08X teb=%08X r1=%08X cpu=%u host=%p",
+                  tag ? tag : "?", pcrVa, tlsVa, tebVa, topVa, cpuNumber,
+                  static_cast<void*>(block->pcr));
+    BootReportInfo(lbuf);
+    return block;
+}
+
+void ReleaseGuestThreadBlock(GuestThreadBlock* block)
+{
+    if (block == nullptr)
+        return;
+
+    {
+        std::lock_guard lock(g_f609TagMutex);
+        g_f609Tags.erase(block->pcrVa);
+    }
+    g_userHeap.Free(block->pcr);  // PCR..stack window, one allocation
+    delete block;                 // descriptor, ordinary new in AllocateGuestThreadBlock
+}
+
+const char* LookupGuestThreadBlockTag(uint32_t pcrVa)
+{
+    std::lock_guard lock(g_f609TagMutex);
+    const auto it = g_f609Tags.find(pcrVa);
+    return it == g_f609Tags.end() ? nullptr : it->second;
+}
 
 // CRT .CRT$XCU initializer that would install the BASE vtable 0x8201206C into
 // the static memory-device object at 0x827D838C. Override so the object keeps
@@ -1234,12 +2239,61 @@ void BootWorker(uint32_t entryGuest)
             fprintf(crashFile, "  rip owner=%s\n", GuestFnAtHostAddr(pc));
 
             // PPC context
-            if (const PPCContext* fc = g_faultCtx) {
+            // F692-FIX-1 (2026-10-01): THE GATE IS SPLIT BY WHAT IT ACTUALLY OWNS.
+            // One `if (g_faultCtx)` used to cover three groups that do not have
+            // the same dependency. Measured, not assumed: g_faultCtx is
+            // thread_local and is assigned in exactly two places -- the boot
+            // root at :2184 and FaultContextScope's ctor at :2902 -- and
+            // w685.log:376 prints `ppc ctx=nil tag=none tid=9068`, i.e. the
+            // faulting thread was neither, so the whole block was skipped. The
+            // group below is the one that would have named the bad call target.
+            //   * DEPENDS on g_faultCtx, and correctly so: `ppc ctx=` and the
+            //     `ppc r1..r13` GPR row. They ARE the context. With no context
+            //     there is nothing to print, and substituting another frame's
+            //     registers is exactly F-046/F-692.
+            //   * DEPENDS on nothing g_faultCtx owns: `g_base=`, the `y = 0`
+            //     member of `probe y=`, and the CTRFROMFAULTADDR row added
+            //     below. These read only the process-wide g_base and Param[1].
+            const PPCContext* fc = g_faultCtx;
+            if (fc != nullptr) {
                 fprintf(crashFile, "  ppc ctx=%p tag=%s tid=%lu (registers below belong to THIS context)\n",
                         (const void*)fc, g_faultCtxTag, GetCurrentThreadId());
                 fprintf(crashFile, "  ppc r1=%08X lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r13=%08X\n",
                         fc->r1.u32, (uint32_t)fc->lr, fc->r3.u32, fc->r4.u32, fc->r5.u32,
                         fc->r6.u32, fc->r7.u32, fc->r8.u32, fc->r9.u32, fc->r10.u32, fc->r13.u32);
+            } else {
+                fprintf(crashFile, "  ppc ctx=nil tag=%s tid=%lu — nothing published on the faulting thread;"
+                                   " any GPR read from this dump would be another frame's (F-046)\n",
+                        g_faultCtxTag, GetCurrentThreadId());
+                // The gate is now NAMED rather than silent. A missing row and a
+                // row that is absent because nothing produced it are different
+                // facts, and only one of them is diagnosable.
+                fprintf(crashFile,
+                        "  FAULTCTX-GATE gate=thread_local g_faultCtx value=nullptr "
+                        "tag=%s tid=%lu "
+                        "suppressed=[ppc r1..r13, probe y in {r8,r9,r3,lr}] "
+                        "why=no-FaultContextScope-on-this-thread "
+                        "(ctor is at :2902, the boot root assignment at :2184; "
+                        "measured nil at w685.log:376) "
+                        "recovered=[CTRFROMFAULTADDR, below] "
+                        "not-recoverable=[live guest ctr/xer/r11/r30 -- host locals "
+                        "per ppc_config.h, not PPCContext members]\n",
+                        g_faultCtxTag, GetCurrentThreadId());
+            }
+
+            // ---- F692-FIX-1: everything below is UNCONDITIONAL. It sat inside
+            // the `if (g_faultCtx)` above and therefore printed only when a
+            // context existed -- i.e. never on the faults that needed it. Each
+            // row is hoisted verbatim (same format string, same values) and the
+            // ORDER relative to the rows it used to follow is unchanged, so a run
+            // that DOES have a context emits byte-identical rows in byte-identical
+            // order. Nothing here dereferences `fc` without checking it first.
+            {
+                const uint64_t b = (uint64_t)(uintptr_t)g_base;
+                fprintf(crashFile, "  g_base=0x%llX table=0x%llX\n",
+                        (unsigned long long)b,
+                        (unsigned long long)(b + PPC_IMAGE_BASE + PPC_IMAGE_SIZE));
+
                 // T38.2 (revised at build time): PPCContext has NO ctr/xer/r11/r30
                 // members — ppc_config.h makes them host locals
                 // (PPC_CONFIG_CTR_AS_LOCAL / _NON_ARGUMENT_AS_LOCAL / _NON_VOLATILE_AS_LOCAL),
@@ -1247,12 +2301,21 @@ void BootWorker(uint32_t entryGuest)
                 // identity-testing the fault address against the function-table probe
                 // PPC_LOOKUP_FUNC(base,y) for the candidate targets, because the generated
                 // code does `ctr.u64 = ctx.rN.u64` straight before the call.
-                const uint64_t b = (uint64_t)(uintptr_t)g_base;
-                fprintf(crashFile, "  g_base=0x%llX table=0x%llX\n",
-                        (unsigned long long)b,
-                        (unsigned long long)(b + PPC_IMAGE_BASE + PPC_IMAGE_SIZE));
-                for (const uint32_t cand :
-                     { (uint32_t)0u, fc->r8.u32, fc->r9.u32, fc->r3.u32, (uint32_t)fc->lr }) {
+                // The candidate set is split the same way the gate is: `y = 0` needs
+                // no register at all and the other four read registers, so with no
+                // context the printed set is exactly {0}. No register is ever
+                // synthesised to pad the list (charter F-609).
+                uint32_t probeCands[5];
+                int nProbeCands = 0;
+                probeCands[nProbeCands++] = (uint32_t)0u;
+                if (fc != nullptr) {
+                    probeCands[nProbeCands++] = fc->r8.u32;
+                    probeCands[nProbeCands++] = fc->r9.u32;
+                    probeCands[nProbeCands++] = fc->r3.u32;
+                    probeCands[nProbeCands++] = (uint32_t)fc->lr;
+                }
+                for (int probeI = 0; probeI < nProbeCands; ++probeI) {
+                    const uint32_t cand = probeCands[probeI];
                     const uint64_t s64 = (uint64_t)PPC_IMAGE_BASE + PPC_IMAGE_SIZE +
                                          (uint64_t(uint32_t(cand) - PPC_CODE_BASE) * 2);
                     const bool hit = code == 0xC0000005 && nInfo >= 2 &&
@@ -1260,10 +2323,86 @@ void BootWorker(uint32_t entryGuest)
                     fprintf(crashFile, "  probe y=%08X -> off32=0x%08X%s\n", cand,
                             (uint32_t)s64, hit ? " == Param[1] (base contributed 0)" : "");
                 }
-            } else {
-                fprintf(crashFile, "  ppc ctx=nil tag=%s tid=%lu — nothing published on the faulting thread;"
-                                   " any GPR read from this dump would be another frame's (F-046)\n",
-                        g_faultCtxTag, GetCurrentThreadId());
+
+                // ---- CTRFROMFAULTADDR: the value `ctr` would have had, RECOVERED
+                // FROM Param[1]. This is the row the old layout structurally could
+                // not print, and it is what makes the next 0x7E780000-family AV one
+                // line instead of a disassembly hunt.
+                //
+                // WHY IT IS A MEASUREMENT AND NOT A FABRICATION (charter F-609).
+                // Both inputs were produced by something other than this code:
+                // Param[1] is the address the CPU faulted on, g_base is the window
+                // the guest ran in. The middle step is the macro's own expression,
+                // quoted rather than recalled -- src/ppc_context.h:124:
+                //   x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE
+                //       + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2)
+                // No PPCContext is touched, so this row cannot inherit another
+                // frame's registers (the F-046 failure), and it does not claim to
+                // BE a register value: it names the unique 32-bit `y` that makes
+                // the load address equal Param[1], and refuses when there is none.
+                //
+                // TWO ARITHMETIC TRAPS, both found by evaluating the expression and
+                // round-tripping it over 69,632 values of y -- not by reasoning:
+                //   (1) `uint32_t(y) - PPC_CODE_BASE` is a 64-BIT subtraction.
+                //       PPC_CODE_BASE is `0x82130000ull` and unsigned long long
+                //       represents every uint32_t, so `y` is promoted and the
+                //       subtraction does NOT wrap at 32 bits. For y = 0 the term is
+                //       0xFFFFFFFF7ED00000, *2 wraps, and the resulting address
+                //       0x7E780000 lands BELOW base = 0x100000000 (measured,
+                //       w688.log). An inversion that rejected `p1 < base` would
+                //       refuse exactly the case that matters, and one done on the
+                //       low 32 bits cannot recover it at all -- the high bits it
+                //       needs are the ones that truncation drops.
+                //   (2) halving the wrapped product is ambiguous by 2^63, because
+                //       the true term has its top bit set for every y below
+                //       PPC_CODE_BASE. Resolved without guessing: y is 32-bit, so
+                //       the term must lie in [-0x82130000, 0x7ED00000); the two
+                //       candidates are 2^63 apart, so at most one is in range, and
+                //       when NEITHER is the row REFUSES instead of rounding.
+                if (g_base != nullptr && nInfo >= 2) {
+                    const uint64_t p1 = (uint64_t)(uintptr_t)info[1];
+                    const uint64_t t2 = (p1 - b - PPC_IMAGE_BASE - PPC_IMAGE_SIZE);
+                    uint64_t ctrInv = 0;
+                    bool solved = false;
+                    bool termWrapped = false;
+                    if ((t2 & 1u) == 0) {
+                        // A plain array, not a braced-init-list range: the list
+                        // form needs <initializer_list>, which this TU only has
+                        // transitively, and a standalone compile of this block
+                        // proved it is not guaranteed.
+                        const uint64_t ctrCands[2] = { t2 >> 1, (t2 >> 1) + (1ull << 63) };
+                        for (const uint64_t cand : ctrCands) {
+                            const int64_t sv = (int64_t)cand;
+                            if (sv >= -(int64_t)PPC_CODE_BASE &&
+                                sv <= (int64_t)(0xFFFFFFFFull - PPC_CODE_BASE)) {
+                                ctrInv = (uint32_t)(cand + PPC_CODE_BASE);
+                                solved = true;
+                                termWrapped = (sv < 0);
+                                break;
+                            }
+                        }
+                    }
+                    if (solved) {
+                        fprintf(crashFile,
+                                "  CTRFROMFAULTADDR code=%08X param1=0x%llX base=0x%llX "
+                                "invert=OK ctr=0x%08X term=%s "
+                                "note=\"unique 32-bit y with PPC_LOOKUP_FUNC(base,y)"
+                                "==Param[1]; NOT a register read\"\n",
+                                (unsigned)code, (unsigned long long)p1,
+                                (unsigned long long)b, (unsigned)ctrInv,
+                                termWrapped ? "wrapped_neg" : "plain");
+                    } else {
+                        fprintf(crashFile,
+                                "  CTRFROMFAULTADDR code=%08X param1=0x%llX base=0x%llX "
+                                "invert=%s "
+                                "note=\"Param[1] is NOT base+PPC_IMAGE_BASE+PPC_IMAGE_SIZE"
+                                "+2*(uint32 y - PPC_CODE_BASE) for any 32-bit y; this "
+                                "fault address is not a function-table load\"\n",
+                                (unsigned)code, (unsigned long long)p1,
+                                (unsigned long long)b,
+                                (t2 & 1u) ? "ODD_DELTA" : "NO_32BIT_CTR");
+                    }
+                }
             }
             
             // Host registers
@@ -1273,6 +2412,42 @@ void BootWorker(uint32_t entryGuest)
                         (PVOID)c->Rip, (PVOID)c->Rax, (PVOID)c->Rbx, (PVOID)c->Rcx, (PVOID)c->Rdx,
                         (PVOID)c->Rsi, (PVOID)c->Rdi, (PVOID)c->R8, (PVOID)c->R9,
                         (PVOID)c->R10, (PVOID)c->R11, (PVOID)c->Rsp);
+            }
+
+            // F-640: A FAULT INSIDE A PHYSICAL VIEW IS NAMED AS ONE. The three views
+            // (0xA0000000/64K, 0xC0000000/16M, 0xE0000000/4K, memory.cc:173-180) are flat
+            // memory in this tree, so a fault there is not "some flat address" -- it is a
+            // physical access that never reached the pool, and the crash file is the only
+            // place that can say so while the row is still cheap. Prints the view, the
+            // physical address it carries, the pool address that address SHOULD have used,
+            // and the fact that no alias exists here. Read-only: it classifies, it does not
+            // touch the window, and it cannot change guest behaviour.
+            if (code == 0xC0000005 && addr != nullptr && g_base != nullptr)
+            {
+                const uintptr_t ab = (uintptr_t)g_base;
+                const uintptr_t a = (uintptr_t)addr;
+                if (a >= ab && (uint64_t)(a - ab) < GuestMemorySize)
+                {
+                    const uint32_t gva = (uint32_t)(a - ab);
+                    if (F640ClassifyView(gva) != F640View::kNone)
+                    {
+                        uint32_t poolVa = 0;
+                        const F640Map map = F640MapViewToPool(gva, &poolVa);
+                        char poolStr[16] = "NONE";
+                        if (map == F640Map::kMapped)
+                            std::snprintf(poolStr, sizeof(poolStr), "%08X", poolVa);
+                        fprintf(crashFile,
+                                "  F640-CVIEW-FAULT guest=%08X view=%s pa=%08X pool_va=%s "
+                                "verdict=%s\n",
+                                gva, PhysViewName(gva),
+                                gva - kF640Views[(uint32_t)F640ClassifyView(gva) - 1u].base,
+                                poolStr,
+                                (map == F640Map::kMapped
+                                     ? "ALIAS_ABSENT: reached flat memory, not the pool"
+                                     : "NO_POOL_BYTE: this physical address has no pool byte "
+                                       "in this tree (F-640)"));
+                    }
+                }
             }
 
             // Session 76b: locate the faulting value in guest memory —
@@ -1290,11 +2465,20 @@ void BootWorker(uint32_t entryGuest)
                     const Range ranges[] = {
                         {0x00600000, 0x00800000, "stacks"},
                         {0x50000000, 0x60000000, "inflate-out"},
-                        // F-412: the pool follows F-391 to kPhysArenaBeginVa (0xA0400000), and its
-                        // upper bound is where the allocator says it ends --
-                        // heap.cpp:251 physArenaSize = 0x100000000 - kPhysArenaBeginVa. The old
-                        // 0xA0000000..0xB0000000 band was pre-F-391.
-                        {mcla::kernel::kPhysArenaBeginVa, 0x100000000ull, "phys-heap"},
+                        // F-412: the pool follows F-391 to kPhysArenaBeginVa (0xA0400000). F-640:
+                        // its upper bound is the ALLOCATOR's extent, kPhysArenaEndVa, which is
+                        // kPhysArenaBeginVa + kConsolePhysicalBytes = 0xC0400000. This row used
+                        // the 4 GiB window top (`0x100000000`), which after the 512 MiB cap
+                        // over-reports by exactly 0x100000000 - 0xC0400000 = 0x3FC00000 =
+                        // 1,022.0 MiB of memory that is no longer ours -- a 1.5 GiB byte-by-byte
+                        // scan in a crash handler, and (worse for triage) a scan that could spend
+                        // its `hits < 8` budget on flat memory above the pool and suppress a real
+                        // in-pool hit. The 4 MiB of C-view addresses that used to sit inside this
+                        // band are now correctly EXCLUDED: on the console 0xC0000000+pa is pool
+                        // offset pa, which is not what those bytes are here (see F-640's block
+                        // comment at the top of this file).
+                        {mcla::kernel::kPhysArenaBeginVa,
+                         (uint64_t)mcla::kernel::kPhysArenaEndVa, "phys-heap"},
                         {0x82000000, 0x82AD3000, "image+bss"},
                     };
                     uint8_t* guestBase = (uint8_t*)mcla::kernel::g_memory.base;
@@ -1332,11 +2516,17 @@ void BootWorker(uint32_t entryGuest)
             // faulting ppc r6 (the device object whose name ptr = garbage).
             if (code == 0xC0000005 && g_faultCtx) {
                 const uint32_t r6v = g_faultCtx->r6.u32;
-                // F-412: F-391 moved the pool to kPhysArenaBeginVa (0xA0400000). Its upper bound
-                // is the end of the 4 GiB window (heap.cpp:221), so for a uint32 guest VA the
-                // `>=` test alone is the whole bound -- the old 0xA0000000..0xB0000000 band cut
-                // the pool in half at a stale address.
-                if (r6v >= mcla::kernel::kPhysArenaBeginVa) {
+                // F-412: F-391 moved the pool to kPhysArenaBeginVa (0xA0400000); the old
+                // 0xA0000000..0xB0000000 band cut the pool in half at a stale address. F-640:
+                // the upper bound is the allocator's extent, kPhysArenaEndVa, NOT the end of the
+                // 4 GiB window. This predicate is what this dump is gated on, so the old `>=`
+                // alone admitted r6 anywhere in the top 1.5 GiB and printed a "device dump
+                // around r6" for a pointer that is not a pool address at all -- after the
+                // 512 MiB cap that is 1,020.0 MiB of guest VA that no longer belongs to the
+                // pool (0xC0400000..0xFFFFFFFF). A guest VA is never asserted on: the test is
+                // two unsigned comparisons and the dump is skipped, not sanitised.
+                if (r6v >= mcla::kernel::kPhysArenaBeginVa &&
+                    r6v < mcla::kernel::kPhysArenaEndVa) {
                     uint8_t* guestBase = (uint8_t*)mcla::kernel::g_memory.base;
                     uint8_t* p = guestBase + (r6v & ~0xFu) - 0x40;
                     fprintf(crashFile, "  device dump around r6=%08X:\n", r6v);
@@ -1398,7 +2588,18 @@ void BootWorker(uint32_t entryGuest)
         // Register-independent attribution: the translated guest function that
         // contains the faulting host instruction.
         MCLA_LOG_ERROR("  rip owner={}", GuestFnAtHostAddr(pc));
-        if (const PPCContext* fc = g_faultCtx)
+        // F692-FIX-1 (2026-10-01): the gate is split by what it owns. See the
+        // long form of this comment in the crash_dump.txt block above, which is
+        // the same VEH lambda. Measured: g_faultCtx is thread_local, assigned
+        // only at :2184 (boot root) and at :2902 (FaultContextScope ctor), and
+        // w685.log:376 prints `ppc ctx=nil tag=none` -- so this whole block used
+        // to be skipped on the faults that needed it.
+        //   DEPENDS on g_faultCtx: `ppc ctx=` and `ppc r1..r13` (they ARE the
+        //     context; substituting another frame's is F-046/F-692).
+        //   DEPENDS on nothing it owns: `g_base=`, the `y = 0` member of
+        //     `probe y=`, and CTRFROMFAULTADDR (Param[1] + g_base only).
+        const PPCContext* fc = g_faultCtx;
+        if (fc != nullptr)
         {
             MCLA_LOG_ERROR("  ppc ctx={:p} tag={} tid={} (registers below belong to THIS context)",
                            (const void*)fc, g_faultCtxTag, GetCurrentThreadId());
@@ -1406,18 +2607,54 @@ void BootWorker(uint32_t entryGuest)
                            "r7={:08X} r8={:08X} r9={:08X} r10={:08X} r13={:08X}",
                            fc->r1.u32, (uint32_t)fc->lr, fc->r3.u32, fc->r4.u32, fc->r5.u32,
                            fc->r6.u32, fc->r7.u32, fc->r8.u32, fc->r9.u32, fc->r10.u32, fc->r13.u32);
+        }
+        else
+        {
+            MCLA_LOG_ERROR("  ppc ctx=nil tag={} tid={} — nothing published on the faulting thread;"
+                           " any GPR read from this dump would be another frame's (F-046)",
+                           g_faultCtxTag, GetCurrentThreadId());
+            // Name the gate rather than leave the omission silent.
+            MCLA_LOG_ERROR("  FAULTCTX-GATE gate=thread_local g_faultCtx value=nullptr tag={} tid={} "
+                           "suppressed=[ppc r1..r13, probe y in {{r8,r9,r3,lr}}] "
+                           "why=no-FaultContextScope-on-this-thread "
+                           "(ctor is at :2902, the boot root assignment at :2184; "
+                           "measured nil at w685.log:376) "
+                           "recovered=[CTRFROMFAULTADDR, below] "
+                           "not-recoverable=[live guest ctr/xer/r11/r30 -- host locals "
+                           "per ppc_config.h, not PPCContext members]",
+                           g_faultCtxTag, GetCurrentThreadId());
+        }
+
+        // ---- F692-FIX-1: UNCONDITIONAL. Hoisted verbatim from inside the
+        // `if (fc)` above (same format strings, same values, same order relative
+        // to the rows they used to follow), so a run WITH a context emits
+        // byte-identical rows in byte-identical order. Nothing dereferences `fc`
+        // without checking it first.
+        {
+            const uint64_t b = (uint64_t)(uintptr_t)g_base;
+            MCLA_LOG_ERROR("  g_base=0x{:X} table=0x{:X}", b,
+                           b + PPC_IMAGE_BASE + PPC_IMAGE_SIZE);
+
             // T38.2 (revised at build time): ctr/xer/r11/r30 are NOT PPCContext members
             // (ppc_config.h PPC_CONFIG_CTR_AS_LOCAL / _NON_ARGUMENT_AS_LOCAL /
             // _NON_VOLATILE_AS_LOCAL make them host locals), so the dump can never carry
             // them. Identity-test the fault address against the function-table probe
             // instead — the generated code copies a ctx register into ctr immediately
             // before PPC_CALL_INDIRECT_FUNC, so one of these candidates must match.
-            const uint64_t b = (uint64_t)(uintptr_t)g_base;
-            MCLA_LOG_ERROR("  g_base=0x{:X} table=0x{:X}", b,
-                           b + PPC_IMAGE_BASE + PPC_IMAGE_SIZE);
-            for (const uint32_t cand :
-                 { (uint32_t)0u, fc->r8.u32, fc->r9.u32, fc->r3.u32, (uint32_t)fc->lr })
-            {
+            // Split the same way the gate is: `y = 0` reads no register, the other
+            // four do, so with no context the printed set is exactly {0}. No
+            // register is ever synthesised to pad the list (charter F-609).
+            uint32_t probeCands[5];
+            int nProbeCands = 0;
+            probeCands[nProbeCands++] = (uint32_t)0u;
+            if (fc != nullptr) {
+                probeCands[nProbeCands++] = fc->r8.u32;
+                probeCands[nProbeCands++] = fc->r9.u32;
+                probeCands[nProbeCands++] = fc->r3.u32;
+                probeCands[nProbeCands++] = (uint32_t)fc->lr;
+            }
+            for (int probeI = 0; probeI < nProbeCands; ++probeI) {
+                const uint32_t cand = probeCands[probeI];
                 const uint64_t s64 = (uint64_t)PPC_IMAGE_BASE + PPC_IMAGE_SIZE +
                                      (uint64_t(uint32_t(cand) - PPC_CODE_BASE) * 2);
                 MCLA_LOG_ERROR("  probe y={:08X} -> off32=0x{:08X}{}", cand, (uint32_t)s64,
@@ -1426,12 +2663,61 @@ void BootWorker(uint32_t entryGuest)
                                    ? " == Param[1] (base contributed 0)"
                                    : "");
             }
-        }
-        else
-        {
-            MCLA_LOG_ERROR("  ppc ctx=nil tag={} tid={} — nothing published on the faulting thread;"
-                           " any GPR read from this dump would be another frame's (F-046)",
-                           g_faultCtxTag, GetCurrentThreadId());
+
+            // CTRFROMFAULTADDR: `ctr` recovered from Param[1] alone. A measurement
+            // (charter F-609), not a register read: Param[1] is what the CPU faulted
+            // on, g_base is the window the guest ran in, and the middle step is
+            // src/ppc_context.h:124 quoted verbatim:
+            //   x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE
+            //       + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2)
+            // Two arithmetic traps, both found by round-tripping 69,632 values of y
+            // rather than by reasoning (see the crash_dump.txt block for the full
+            // derivation): `uint32_t(y) - PPC_CODE_BASE` is a 64-bit subtraction, so
+            // for y=0 the resulting address 0x7E780000 lands BELOW base=0x100000000
+            // (a `p1 < base` guard would refuse the case that matters); and halving
+            // the wrapped product is ambiguous by 2^63, resolved without guessing
+            // because y is 32-bit and the two candidates are 2^63 apart -- when
+            // NEITHER is in range the row refuses instead of rounding.
+            if (g_base != nullptr && nInfo >= 2) {
+                const uint64_t p1 = (uint64_t)(uintptr_t)info[1];
+                const uint64_t t2 = (p1 - b - PPC_IMAGE_BASE - PPC_IMAGE_SIZE);
+                uint64_t ctrInv = 0;
+                bool solved = false;
+                bool termWrapped = false;
+                if ((t2 & 1u) == 0) {
+                    // A plain array, not a braced-init-list range: the list form
+                    // needs <initializer_list>, which this TU only has
+                    // transitively, and a standalone compile of this block proved
+                    // it is not guaranteed.
+                    const uint64_t ctrCands[2] = { t2 >> 1, (t2 >> 1) + (1ull << 63) };
+                    for (const uint64_t cand : ctrCands) {
+                        const int64_t sv = (int64_t)cand;
+                        if (sv >= -(int64_t)PPC_CODE_BASE &&
+                            sv <= (int64_t)(0xFFFFFFFFull - PPC_CODE_BASE)) {
+                            ctrInv = (uint32_t)(cand + PPC_CODE_BASE);
+                            solved = true;
+                            termWrapped = (sv < 0);
+                            break;
+                        }
+                    }
+                }
+                if (solved) {
+                    MCLA_LOG_ERROR("  CTRFROMFAULTADDR code={:08X} param1=0x{:X} base=0x{:X} "
+                                   "invert=OK ctr=0x{:08X} term={} "
+                                   "note=\"unique 32-bit y with PPC_LOOKUP_FUNC(base,y)"
+                                   "==Param[1]; NOT a register read\"",
+                                   (unsigned)code, p1, b, (unsigned)ctrInv,
+                                   termWrapped ? "wrapped_neg" : "plain");
+                } else {
+                    MCLA_LOG_ERROR("  CTRFROMFAULTADDR code={:08X} param1=0x{:X} base=0x{:X} "
+                                   "invert={} "
+                                   "note=\"Param[1] is NOT base+PPC_IMAGE_BASE+PPC_IMAGE_SIZE"
+                                   "+2*(uint32 y - PPC_CODE_BASE) for any 32-bit y; this "
+                                   "fault address is not a function-table load\"",
+                                   (unsigned)code, p1, b,
+                                   (t2 & 1u) ? "ODD_DELTA" : "NO_32BIT_CTR");
+                }
+            }
         }
 
         // Host GP registers - session 17: pin which pointer is the bad raw
@@ -1716,6 +3002,108 @@ struct WorkerResumeGuard
     ~WorkerResumeGuard() { Release(); }
 };
 
+// F-616: the PARK sampler's proof that it can SEE. The false "65% of samples at guest
+// lr=821C6DC8" was not a misread of a live field -- it was a sampler with NO WAY TO TELL
+// "the worker did not move" from "I am blind", so a field that had been frozen for 97 s
+// (last real F598-C6658 call 18:13:19.977, first PARK row claiming it 18:13:20.351, last
+// 18:14:57.694) was believed for eight rounds. Same discipline as F388-PHYSGUARD SELFTEST
+// and F374-HEAPGUARD SELFTEST: prove the probe fires on a change you made, or the probe
+// is blind and its zeros/constancy mean nothing. s_parkBlind rides on every PARK-* line.
+//
+// Sink for the probe thread so its varying frame is addressable and cannot be elided.
+    volatile uint8_t g_parkProbeSink = 0;
+    std::atomic<uint32_t> s_parkBlind{1};  // 1 until ParkSamplerSelfTest says otherwise
+
+// A probe thread that varies its OWN frame depth, so the one register the sampler claims
+// to read from a suspended thread (Rsp) takes three distinct values. Deliberately NOT a
+// write to a global: a global write proves the WRITE path, not the suspend/GetThreadContext
+// path this probe exists to test. 3 x 1024 B of stack => 3 distinct Rsp by construction.
+// Each depth is held for ~100 ms (100 x Sleep(1)) and the sequence runs 4 times, so the
+// self-test gets ~1.2 s of wall time to observe all three -- bounding the self-test by
+// COUNT instead (the first version) let the probe finish before the reads spread out,
+// which would have reported blind=1 on a sampler that is fine.
+    DWORD WINAPI ParkProbeThread(LPVOID)
+{
+    uint8_t depth[3][1024];
+    std::memset(depth, 0, sizeof(depth));
+    for (int round = 0; round < 4; ++round)
+    {
+        for (int d = 0; d < 3; ++d)
+        {
+            depth[d][0] = (uint8_t)(d + 1);
+            for (int k = 0; k < 100; ++k)
+            {
+                g_parkProbeSink = depth[d][0];
+                Sleep(1);
+            }
+        }
+    }
+    return 0;
+}
+
+// Returns 1 = the sampler is trustworthy, 0 = BLIND (every PARK-* row then carries blind=1
+// and no conclusion may be drawn from it). Asserts, in order:
+//   1. SuspendThread on a thread this process created does not fail,
+//   2. GetThreadContext fills Rsp/Rip at all (an all-zero context is a fake read),
+//   3. RtlLookupFunctionEntry describes that Rip, so PARK-UNWIND is armed (F-412 saw
+//      frames=0/frames=2 come out of a build where the walk could not step),
+//   4. THE ONE THAT MATTERS: reads taken 3 distinct Rsp values from a probe the sampler
+//      did not have to cooperate with -- "I can see a change", not "I read a value".
+// Criterion is distinct>=2, not 3: two values are the minimum that falsifies "constant".
+    uint32_t ParkSamplerSelfTest(uintptr_t modBase, uint32_t* sawRva, uint32_t* sawFrames,
+                                 uint32_t* sawDistinct)
+    {
+    *sawRva = 0;
+    *sawFrames = 0;
+    *sawDistinct = 0;
+        HANDLE probe = CreateThread(nullptr, 0, ParkProbeThread, nullptr, 0, nullptr);
+    if (probe == nullptr)
+        return 0;
+    uint64_t seen[3] = {0, 0, 0};
+    uint32_t distinct = 0, reads = 0;
+    // F-616: bounded by DEADLINE, not by spin count -- see ParkProbeThread's comment. The
+    // deadline is 1.5 s, the probe lives ~1.2 s, so the reads are guaranteed to span all
+    // three of its frames without this costing the boot anything measurable (once).
+    const uint64_t deadline = GetTickCount64() + 1500;
+    while (distinct < 3 && GetTickCount64() < deadline)
+    {
+        CONTEXT tc;
+        std::memset(&tc, 0, sizeof(tc));
+        tc.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (SuspendThread(probe) == (DWORD)-1)
+            break;
+        const bool got = GetThreadContext(probe, &tc) != 0;
+        if (got)
+        {
+            ++reads;
+            bool dup = false;
+            for (uint32_t k = 0; k < distinct; ++k)
+                dup = dup || (seen[k] == tc.Rsp);
+            if (!dup && distinct < 3)
+                seen[distinct++] = tc.Rsp;
+            if (*sawFrames == 0)
+            {
+                *sawRva = (modBase != 0 && tc.Rip >= modBase)
+                              ? (uint32_t)(tc.Rip - modBase)
+                              : 0;
+                uint64_t u[8] = {0}, ownerRva = 0, ownerOff = 0;
+                uint32_t n = 0;
+                ParkUnwindCapture(tc, u, &n, &ownerRva, &ownerOff);
+                *sawFrames = n;
+            }
+        }
+        ResumeThread(probe);  // never leave the probe suspended: it must reach its 2nd frame
+        // Yield often enough that the probe advances frames between our reads, but not so
+        // often that the suspend/read/resume path stops being the thing under test.
+        if ((reads % 16) == 0)
+            Sleep(0);
+    }
+    WaitForSingleObject(probe, 3000);
+    CloseHandle(probe);
+    *sawDistinct = distinct;
+    return (reads > 0 && distinct >= 2 && *sawFrames > 0) ? 1u : 0u;
+}
+
     DWORD WINAPI BootThreadProc(LPVOID param)
     {
         const uint32_t entryGuest = (uint32_t)(uintptr_t)param;
@@ -1795,7 +3183,15 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
         }
         else
         {
-            BootReportInfo("[boot] reserved func-table guest 0x8B9E0000 +8MB");
+            // F692-FIX-2 (2026-10-01): THIS LITERAL WAS WRONG -- it read
+            // 0x8B9E0000, while the constant this branch reserved one line up is
+            // kFTableGuest = 0x829E0000u. Only the message was wrong; the
+            // reservation itself went to the right address all along (the WARN
+            // arm above prints kFTableGuest and never had the bug). Reported, not
+            // silently patched, by src/guest_memory.h:194-197, which measured the
+            // row in w688.log and cited the same two lines. Fixed by editing the
+            // digits; the format string is otherwise byte-identical.
+            BootReportInfo("[boot] reserved func-table guest 0x829E0000 +8MB");
         }
     }
 
@@ -1893,6 +3289,14 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // left heap==physicalHeap==nullptr and the first allocation crashed inside
     // o1heapAllocate reading handle->diagnostics.capacity at instance+0x208.
     g_userHeap.Init();
+
+    // F-640: the physical-view alias probe + the model row. After g_userHeap.Init(), so the
+    // pool exists and the probe's save/restore lands in real (untouched) pool space; before
+    // the XEX is installed and before any guest thread exists, so nothing else can be inside
+    // the byte it borrows. It publishes which alias mechanism is in force -- read off the
+    // probe, not asserted in source -- and the extents the two reporting sites below now use.
+    F640PhysAliasInit();
+
     {
         const auto mainDiag = o1heapGetDiagnostics(g_userHeap.heap);
         const auto physDiag = o1heapGetDiagnostics(g_userHeap.physicalHeap);
@@ -2023,18 +3427,98 @@ void Start(uint32_t entryGuest)
     {
         std::thread([workerHandle]() {
             s_parkSamplerTid = GetCurrentThreadId();  // F-412: named so the VEH never parks us
+            // F-616: the base is printed here ONCE and every host address the sampler
+            // emits is ALSO printed as an RVA against it, because F-616 was eight rounds
+            // lost to a reader having to go hunting for `base=` before host_rva_resolve.py
+            // would name a rawrip. `wrva` = the suspended WORKER's pc, `srva` = the
+            // SAMPLER's own pc (which is inside ReadU32BE/WriteU32BE just as often,
+            // which is exactly how rawrip got mistaken for a sampler address).
+            const uintptr_t modBase = (uintptr_t)GetModuleHandle(nullptr);
+            {
+                char lbuf[256];
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "PARK-SAMPLE base=%llx -- host pcs are RVAs against this; "
+                              "resolve with: python tools/host_rva_resolve.py build/mcla.map "
+                              "--base %llx <rva>  (map from the SAME build as this log)",
+                              (unsigned long long)modBase, (unsigned long long)modBase);
+                BootReportInfo(lbuf);
+            }
+            // F-616: the field dictionary, printed once so no reader has to infer what a
+            // token means. This is the guard against the exact failure that cost a day --
+            // a field with no name-to-source binding was read as the worker's location.
+            {
+                char lbuf[1024];
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "PARK-KEY wrva/srva=host module RVA of the SUSPENDED WORKER pc / "
+                              "of the SAMPLER's own pc | live:* = read from the suspended thread's "
+                              "real CONTEXT (trustworthy for where the worker is NOW) | "
+                              "mirror:* = read from g_bootWorkerCtx, the LAST guest frame that "
+                              "published a context (STALE by construction once the guest stops "
+                              "calling; NEVER a location, NEVER a dwell %%) | sw*=raw top-of-stack "
+                              "words of the worker, which are DATA not return addresses "
+                              "(boot_host.cpp:1819-1822) | dev/cur/vbl/flg/ud*=guest MEMORY read BY "
+                              "THE SAMPLER at print time, not worker registers (cur = ring write "
+                              "pointer, the second liveness witness) | polls=all samples, rows=only "
+                              "printed ones, rows-moved/-frozen = did ANY live field change between "
+                              "consecutive rows (a spin loop repeats its rip legitimately) | "
+                              "blind=0 means ParkSamplerSelfTest saw a change it made; blind=1 "
+                              "means every PARK-* row below is a lie");
+                BootReportInfo(lbuf);
+            }
+            // F-616: selftest BEFORE the first sample, so `blind=` on row #1 is already
+            // meaningful. Rule: selftests MUST be 1, else this probe is blind (F388/F374).
+            uint32_t probeRva = 0, probeFrames = 0, probeDistinct = 0;
+            const uint32_t selftest =
+                ParkSamplerSelfTest(modBase, &probeRva, &probeFrames, &probeDistinct);
+            s_parkBlind.store(selftest == 0 ? 1u : 0u, std::memory_order_relaxed);
+            {
+                char lbuf[256];
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "PARK-SELFTEST ok=%u (MUST be 1) distinct-rsp-seen=%u/3"
+                              " change-visible-to-suspend=%s probe-rva=%x probe-unwind-frames=%u",
+                              selftest, probeDistinct, selftest ? "yes" : "NO-BLIND", probeRva,
+                              probeFrames);
+                BootReportInfo(lbuf);
+            }
+            // F-601: name the sampled worker thread once, so per-thread
+            // censuses (XTLIMPORT tid=, WAIT tid=) can be joined to these
+            // parks: same tid = the parked boot worker is the churner.
             {
                 char lbuf[128];
-                std::snprintf(lbuf, sizeof(lbuf), "PARK-SAMPLE base=%llx",
-                              (unsigned long long)(uintptr_t)GetModuleHandle(nullptr));
+                std::snprintf(lbuf, sizeof(lbuf), "PARK-SAMPLE worker-tid=%08X",
+                              (uint32_t)GetThreadId(workerHandle));
                 BootReportInfo(lbuf);
             }
             uint64_t lastRip = 0;
-            // Per-PC dwell histogram over 0x10-byte host-RVA buckets
-            // (session-5: sampled PCs were our own guest_memory accessors —
-            // the histogram quantifies which accessor dominates).
+            // F-616: per-PC sample COUNTS over 0x10-byte host-RVA buckets, from the
+            // LIVE worker rip only. Deliberately counts and NEVER a percentage: this
+            // loop polls every 500 ms, so a count is a count of POLLS, not of wall time.
+            // "X% of wall time at address Y" is not a quantity this sampler can measure
+            // even when every field it reads is live -- and the one time such a number
+            // was published (F-616) every field behind it was stale. So the percentage
+            // is gone from the tool, not just relabelled.
             std::unordered_map<uint32_t, uint32_t> hist;
             uint32_t samples = 0;
+            // F-616: the sound replacement for the dwell percentage -- did the worker's
+            // LIVE state move between consecutive samples? `frozen` counts samples where
+            // NONE of rip/rsp/rp-write-pointer changed, which is a fact about the worker
+            // rather than about a field that stopped being written. A spin loop repeats
+            // its rip legitimately (w654: 40/203 rows share rawrip ...0ad), so rip alone
+            // would read as "frozen" while the guest is demonstrably progressing.
+            uint32_t frozen = 0, movedRows = 0, printed = 0;
+            // prevRip is separate from lastRip on purpose: lastRip drives the print gate
+            // and is set to tc.Rip before the comparison below, so reusing it would make
+            // "rip changed" permanently false. prevRip is the liveness witness only.
+            uint64_t prevRip = 0, lastRsp = 0, lastCur = 0;
+            // F-616: mirror freshness. g_bootWorkerCtx is published by whichever guest
+            // function last stored its frame (boot_host.cpp:1367) and NEVER cleared on
+            // return, so it is a LAST-REGISTERED value: printing it without a freshness
+            // stamp is what let a frozen lr be reported for 97 s as a live location.
+            // age_ms is measured with GetTickCount64 -- no allocation, 15 ms resolution,
+            // and the threshold (1 s) is two orders of magnitude above that.
+            uint64_t mirrorChangeTick = GetTickCount64();
+            uint64_t lastMirrorTup = 0;
+            constexpr uint64_t kMirrorStaleMs = 1000;
             // T41.5a: the old bound was 120 x 500ms = 60s, and a line printed
             // ONLY when the host RIP changed -- so a thread parked in one place
             // for the rest of the boot produced total silence that read like
@@ -2111,29 +3595,58 @@ void Start(uint32_t entryGuest)
                         (void)mem.ReadU32BE(ud, &ud1);
                     (void)mem.ReadU32BE(0x80003080, &ud8);
                 }
-                // Live guest state of the parked boot worker. T41.5b: this used
-                // to read g_faultCtx, which is thread_local -- from the sampler
-                // thread that is always null, so every field below printed 0 and
-                // looked like "no guest context" (it was the wrong thread's TLS).
-                // g_bootWorkerCtx is the process-wide mirror. Context carries
-                // arg/TLS regs only (PPC_CONFIG_NON_VOLATILE_AS_LOCAL);
-                // callee-saved r30/r31 + lr sit in the guest frame per the
-                // generated prologue convention (stw lr,-8(r1); std
-                // r30,-24(r1); std r31,-16(r1)) -- read here as raw slots.
+                // F-616: the mirror, and the ONLY thing the pre-F-616 line called "the
+                // live guest state of the parked boot worker". It is not live. T41.5b
+                // already moved it off thread_local g_faultCtx (which was always null on
+                // the sampler thread, so every field printed 0); that fixed the WRONG-TLS
+                // bug and left a new one, because g_bootWorkerCtx is a plain pointer store
+                // at boot_host.cpp:1367 and is never cleared on guest return. What it
+                // holds is the frame of whichever guest function last wrote a context --
+                // a LAST-REGISTERED value, and after that function stops being called it
+                // is frozen forever. Measured on w654: F598-C6658 (the sub_821C6658
+                // realloc, whose call site 0x821C6DC4 makes lr=821C6DC8 a live value)
+                // fired 16 times, last at 18:13:19.977; the sampler then reported
+                // lr=821C6DC8 on 132/203 rows through 18:14:57.694, i.e. for 97.3 s after
+                // the call it names had stopped happening, and r3=r4=00000000 on 78 of
+                // them. Every field derived from bwctx is therefore printed under
+                // `mirror:` and carries a freshness verdict computed below.
                 const PPCContext* bwctx =
                     g_bootWorkerCtx.load(std::memory_order_relaxed);
                 uint32_t gr3 = 0, gr4 = 0, gr13 = 0, glr = 0;
                 uint32_t swM8 = 0, swM16 = 0, swM24 = 0, tls0 = 0;
+                uint32_t msp = 0;
+                const char* r13tag = nullptr;
                 if (bwctx != nullptr)
                 {
                     gr3 = bwctx->r3.u32;
                     gr4 = bwctx->r4.u32;
                     gr13 = bwctx->r13.u32; // TLS/PCR base
                     glr = (uint32_t)bwctx->lr;
+                    msp = bwctx->r1.u32;
+                    // F-616 / F-609: name WHICH host thread the alias r13 belongs to.
+                    // Every non-ExCreateThread host context hard-aliases r13=0x8F200000
+                    // (boot_host.h:111-124), so a bare 0x8F200000 cannot distinguish the
+                    // boot worker from the ~20 synthesized contexts in gpu_device.cpp --
+                    // which is the same class of unattributable number that cost F-616 a
+                    // day. Read-only; a miss prints "-" and changes nothing.
+                    // F-637: MEASURED, this call CANNOT be the F388-PHYSGUARD tripper. It was
+                    // nominated as one (a sampler that reads a guarded page is the classic way to
+                    // trip a page you are only printing), and it is innocent: LookupGuestThreadBlockTag
+                    // is `lock_guard + unordered_map::find` over g_f609Tags (:1202) and dereferences no
+                    // guest VA at all, so it cannot reach kPhysHdrVa. The trip is attributed by
+                    // w657.log:980-995, whose backtrace is self-referential -- frames 0/1/5 are
+                    // PhysGuardHandle+0x2b6 and BootWorker::<lambda_3>+0x395/+0x770, i.e. the VEH
+                    // itself, and frame 9 is rva=0x24DC5D = ResolveKernelObjectSafe+0x5d, the SAME rva
+                    // as the C0000005 616 ms later. The read of phys+0 came from that resolver. The
+                    // invariant the sampler does owe, and now does not have to, is that an
+                    // instrumentation thread must not be able to change guest-visible page
+                    // permissions as a side effect of printing a field; with F637-GUARDREPAIR a trip
+                    // from ANY thread is now discharged by the next arm instead of stranding the guard.
+                    r13tag = LookupGuestThreadBlockTag(gr13);
                     auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
                     if (gr13 != 0)
                         (void)mem.ReadU32BE(gr13 + 0x0, &tls0);
-                    const uint32_t sp = bwctx->r1.u32;
+                    const uint32_t sp = msp;
                     if (sp != 0)
                     {
                         (void)mem.ReadU32BE(sp - 8, &swM8);   // saved lr slot
@@ -2141,24 +3654,82 @@ void Start(uint32_t entryGuest)
                         (void)mem.ReadU32BE(sp - 24, &swM24); // saved r30 slot
                     }
                 }
-                char rbuf[3][64];
-                char lbuf[1024];
-                std::snprintf(lbuf, sizeof(lbuf),
-                              "PARK-SAMPLE rawrip=%llx nf=%s s0=%s s1=%s s2=%s dev=%08X cur=%08X vbl=%u flg=%u ud=%08X ud1=%08X ud8=%08X"
-                              " | r3=%08X r4=%08X lr=%08X r13=%08X tls0=%08X [r1-8]=%08X [r1-16]=%08X [r1-24]=%08X",
-                              (unsigned long long)tc.Rip,
-                              NearestFunctionName(tc.Rip),
-                              (std::snprintf(rbuf[0], sizeof(rbuf[0]), "%s", NearestFunctionName(rets[0])), rbuf[0]),
-                              (std::snprintf(rbuf[1], sizeof(rbuf[1]), "%s", NearestFunctionName(rets[1])), rbuf[1]),
-                              (std::snprintf(rbuf[2], sizeof(rbuf[2]), "%s", NearestFunctionName(rets[2])), rbuf[2]),
-                              dev, cursor, vbl, flg, ud, ud1, ud8,
-                              gr3, gr4, glr, gr13, tls0, swM8, swM16, swM24);
-                BootReportInfo(lbuf);
-                // T41.71: the caller chain behind that RIP. RVAs, not names -- this build
-                // has no PDB and NearestFunctionName is what produced the 94 KB-off `nf`
-                // artifact. Resolve offline: python tools/host_rva_resolve.py build/mcla.map
-                // <owner> <frame0> <frame1> ...  A frame whose symbol is
-                // __imp__sub_82XXXXXX / sub_82XXXXXX names the GUEST function directly.
+                // F-616: freshness verdict for the mirror, from a cheap monotonic stamp.
+                // Any change to the published tuple (lr/r3/r4/r13/sp) restarts the clock;
+                // if none has happened for kMirrorStaleMs the mirror is provably not
+                // tracking a running thread, and the line says so in its first tokens.
+                const uint64_t nowTick = GetTickCount64();
+                const uint64_t mirrorTup = ((uint64_t)glr << 32) ^ ((uint64_t)gr3 << 8) ^
+                                           ((uint64_t)gr4 << 20) ^ ((uint64_t)gr13 << 4) ^ msp;
+                if (mirrorTup != lastMirrorTup)
+                {
+                    lastMirrorTup = mirrorTup;
+                    mirrorChangeTick = nowTick;
+                }
+                const uint64_t mirrorAgeMs = nowTick - mirrorChangeTick;
+                const bool mirrorStale = (bwctx == nullptr) || (mirrorAgeMs > kMirrorStaleMs);
+                // F-616: did the WORKER move, from live fields only. rip repeats
+                // legitimately in a spin loop, so the ring write pointer (cursor, the same
+                // device+0x30 the guest bumps) is the second, independent witness: w654 had
+                // 40 rows sharing one rawrip while cur changed on every one of them.
+                uint32_t moved = 0;
+                if (printed > 0)
+                {
+                    if (tc.Rip != prevRip) ++moved;
+                    if (tc.Rsp != lastRsp) ++moved;
+                    if (cursor != lastCur) ++moved;
+                    if (moved == 0) ++frozen; else ++movedRows;
+                }
+                ++printed;
+                prevRip = tc.Rip;
+                lastRsp = tc.Rsp;
+                lastCur = cursor;
+                {
+                    // F-616: the WORKER's own pc and the SAMPLER's own pc, both as module
+                    // RVAs so host_rva_resolve.py names them without a `base=` hunt. The
+                    // audit that produced the false 65% resolved `rawrip`, got
+                    // ReadU32BE/WriteU32BE, and concluded it was reading the sampler's own
+                    // code -- because the sampler DOES call those (the dev/cur probe below
+                    // and the mirror reads). It is not: PARK-UNWIND #1 in w654 walks
+                    // 63e80d -> 63eb46 -> __xstart+0x55e -> BootWorker+0x1d9 ->
+                    // BootThreadProc+0x14, which only the suspended worker can unwind to.
+                    // Printing both on one line makes that argument checkable in place.
+                    const uintptr_t sRip = (uintptr_t)_ReturnAddress();
+                    const unsigned long long wrva =
+                        (modBase != 0 && tc.Rip >= modBase)
+                            ? (unsigned long long)(tc.Rip - modBase)
+                            : (unsigned long long)tc.Rip;
+                    const unsigned long long srva =
+                        (modBase != 0 && sRip >= modBase)
+                            ? (unsigned long long)(sRip - modBase)
+                            : (unsigned long long)sRip;
+                    char lbuf[1536];
+                    std::snprintf(
+                        lbuf, sizeof(lbuf),
+                        "PARK-SAMPLE mirror=%s(age_ms=%llu) blind=%u polls=%u rows=%u rows-moved=%u"
+                        " | live:{rsp=%llx rip-host=%llx wrva=%llx srva=%llx(sampler) moved=%u}"
+                        " live:sw0=%llx sw1=%llx sw2=%llx(stack-top-words,NOT-ret-addr)"
+                        " | dev=%08X cur=%08X vbl=%u flg=%u ud=%08X ud1=%08X ud8=%08X"
+                        " | mirror:STALE/LAST-REGISTERED lr=%08X r3=%08X r4=%08X"
+                        " r13=%08X tag=%s tls0=%08X sp=%08X [r1-8]=%08X [r1-16]=%08X [r1-24]=%08X",
+                        mirrorStale ? "STALE" : "fresh", (unsigned long long)mirrorAgeMs,
+                        s_parkBlind.load(std::memory_order_relaxed), samples, printed, movedRows,
+                        (unsigned long long)tc.Rsp, (unsigned long long)tc.Rip, wrva, srva, moved,
+                        (unsigned long long)rets[0], (unsigned long long)rets[1],
+                        (unsigned long long)rets[2], dev, cursor, vbl, flg, ud, ud1, ud8,
+                        glr, gr3, gr4, gr13, r13tag ? r13tag : "-", tls0, msp, swM8, swM16, swM24);
+                    BootReportInfo(lbuf);
+                }
+                // T41.71 / F-616: the caller chain behind the WORKER's pc. This one IS
+                // live -- it walks the suspended thread's stack, and the w654 frame lists
+                // terminate in BootWorker/BootThreadProc, so it can be trusted for "where
+                // is the worker". RVAs, not names -- this build has no PDB and
+                // NearestFunctionName is what produced the 94 KB-off `nf` artifact (which
+                // is why `nf=` is no longer printed on PARK-SAMPLE at all: a name that is
+                // wrong by 94 KB is worse than an RVA the reader can resolve).
+                // Resolve offline: python tools/host_rva_resolve.py build/mcla.map --base
+                // <base from PARK-SAMPLE base=> <owner> <frame0> <frame1> ...  A frame whose
+                // symbol is __imp__sub_82XXXXXX / sub_82XXXXXX names the GUEST function.
                 {
                     static uint32_t s_pu = 0;
                     const uint32_t pu = ++s_pu;
@@ -2171,7 +3742,8 @@ void Start(uint32_t entryGuest)
                         char ubuf[320];
                         size_t uoff = (size_t)std::snprintf(
                             ubuf, sizeof(ubuf),
-                            "PARK-UNWIND #%u frames=%u owner=%llx+%llx rip=[", pu, nU,
+                            "PARK-UNWIND #%u blind=%u source=live-suspended-worker frames=%u owner=%llx+%llx rip=[",
+                            pu, s_parkBlind.load(std::memory_order_relaxed), nU,
                             (unsigned long long)ownerRva, (unsigned long long)ownerOff);
                         for (uint32_t f = 0; f < nU && uoff + 24 < sizeof(ubuf); ++f)
                             uoff += (size_t)std::snprintf(
@@ -2181,22 +3753,26 @@ void Start(uint32_t entryGuest)
                         BootReportInfo(ubuf);
                     }
                 }
-                // T41.5b: name WHERE the boot worker sits. Host RIPs are
-                // unnameable in this build (no mcla.pdb, so llvm-symbolizer
-                // returns '??' -- F-118), but the guest frame chain is readable:
-                // the generated prologues keep the back-chain at [r1] and the
-                // caller's return address at [r1-8] (stw lr,-8(r1)); the stack
-                // grows down, so each caller frame sits at a HIGHER address.
-                // Each fNN= value is resolved offline against
-                // generated/ppc_xenon/ppc_func_mapping.cpp.
+                // T41.5b / F-616: the guest frame chain. Renamed PARK-MIRROR-STACK because
+                // every word of it is read through bwctx->r1, i.e. out of the FROZEN mirror
+                // frame -- it describes a stack the guest has since left, not the worker's.
+                // The generated prologues keep the back-chain at [r1] and the caller's
+                // return address at [r1-8] (stw lr,-8(r1)); the stack grows down, so each
+                // caller frame sits at a HIGHER address. Each fNN= is resolved offline
+                // against generated/ppc_xenon/ppc_func_mapping.cpp. It is still worth
+                // printing -- it names the guest call chain as of the last context publish
+                // -- and the mirror verdict rides along so it cannot be read as current.
                 if (bwctx != nullptr)
                 {
                     auto& mem2 = mcla::kernel::GuestMemoryHeap::Instance();
                     char sbuf[512];
                     size_t so = (size_t)std::snprintf(
-                        sbuf, sizeof(sbuf), "PARK-STACK sp=%08X lr=%08X:",
-                        bwctx->r1.u32, (uint32_t)bwctx->lr);
-                    uint32_t sp = bwctx->r1.u32;
+                        sbuf, sizeof(sbuf),
+                        "PARK-MIRROR-STACK mirror=%s(age_ms=%llu) blind=%u sp=%08X lr=%08X:",
+                        mirrorStale ? "STALE" : "fresh",
+                        (unsigned long long)mirrorAgeMs,
+                        s_parkBlind.load(std::memory_order_relaxed), msp, glr);
+                    uint32_t sp = msp;
                     for (int fr = 0; fr < 8 && sp >= 0x80000000u &&
                                     sp < 0x90000000u;
                          ++fr)
@@ -2219,8 +3795,25 @@ void Start(uint32_t entryGuest)
                 }
             }
             {
+                // F-616: COUNTS, never percentages, and never a number derived from the
+                // mirror. Two reasons, both measured:
+                //   (a) provenance -- the histogram is built from tc.Rip, the LIVE worker
+                //       pc, so it is sound; but the buckets sit 0x10 apart and 40 of
+                //       w654's 203 rows share one rip, which reads like a dwell fact and is
+                //       not one.
+                //   (b) units -- this loop POLLS every 500 ms. A count is a count of
+                //       polls, not of wall time. "65% of wall time at X" is not a
+                //       quantity this instrument can produce, and the one time it was
+                //       published (F-616) every field behind it had been frozen for 97 s.
+                // The sound worker-state statistic is `frozen`/`moved` above: did any LIVE
+                // field (rip, rsp, ring write pointer) change between consecutive samples.
                 char lbuf[2048];
-                size_t off = (size_t)std::snprintf(lbuf, sizeof(lbuf), "PARK-HIST samples=%u buckets=%zu top:", samples, hist.size());
+                size_t off = (size_t)std::snprintf(
+                    lbuf, sizeof(lbuf),
+                    "PARK-HIST source=live-worker-rip counts-not-pct blind=%u polls=%u rows=%u"
+                    " rows-moved=%u rows-frozen=%u buckets=%zu top:",
+                    s_parkBlind.load(std::memory_order_relaxed), samples, printed, movedRows,
+                    frozen, hist.size());
                 std::vector<std::pair<uint32_t, uint32_t>> top(hist.begin(), hist.end());
                 std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
                 for (size_t k = 0; k < top.size() && k < 16 && off < sizeof(lbuf); ++k)
@@ -2376,6 +3969,254 @@ bool CountingSemaAllow(uint32_t handle)
         }
     }
     return false;
+}
+
+// ============================================================================
+// F-640: the physical-view translation, published so the sites that need it can
+// adopt it in one line. The map itself lives in the F-640 block at the top of this
+// TU; these are the entry points, the counters, and the rows.
+// ============================================================================
+
+namespace {
+// F-640: which call sites have adopted the translation. Bounded, and published in
+// the init row, because `dropped == 0` only means "no write was lost" once at least
+// one writer is actually routing through here.
+constexpr size_t kF640WriterCap = 8;
+const char* g_f640Writers[kF640WriterCap] = {};
+std::mutex g_f640WriterMtx;
+} // namespace
+
+void F640RegisterWriterImpl(const char* site)
+{
+    if (site == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(g_f640WriterMtx);
+    for (size_t i = 0; i < kF640WriterCap; ++i)
+    {
+        if (g_f640Writers[i] == nullptr)
+        {
+            g_f640Writers[i] = site;
+            g_f640.adopted.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (std::strcmp(g_f640Writers[i], site) == 0)
+            return; // already registered; a per-boot re-registration is not a new site
+    }
+    // Full: count it anyway so the row can never under-report the number of adopters.
+    g_f640.adopted.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RegisterPhysAliasWriter(const char* site)
+{
+    F640RegisterWriterImpl(site);
+}
+
+const char* PhysViewName(uint32_t viewVa)
+{
+    switch (F640ClassifyView(viewVa))
+    {
+    case F640View::kA64K:  return "A64K";
+    case F640View::kC16M:  return "C16M";
+    case F640View::kE4K:   return "E4K";
+    case F640View::kNone:  break;
+    }
+    return "-";
+}
+
+void LogPhysAliasRow(const char* reason)
+{
+    const uint64_t calls = g_f640.calls.load(std::memory_order_relaxed);
+    const uint64_t notA = g_f640.notAView.load(std::memory_order_relaxed);
+    const uint64_t tr = g_f640.translated.load(std::memory_order_relaxed);
+    const uint64_t dr = g_f640.dropped.load(std::memory_order_relaxed);
+    const uint64_t ad = (uint64_t)g_f640.adopted.load(std::memory_order_relaxed);
+    MCLA_LOG_WARN("F640-PHYSALIAS-SUM reason={} calls={} not_a_view={} translated={} dropped={} "
+                  "adopted_sites={} zero_is_measured={} sum_ok={}",
+                  (reason != nullptr ? reason : "-"), calls, notA, tr, dr, ad,
+                  (ad > 0 ? 1 : 0),
+                  ((notA + tr + dr == calls) ? 1 : 0));
+}
+
+void F640CountAndLog(uint32_t viewVa, F640Map map, uint32_t poolVa)
+{
+    const uint64_t call = g_f640.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    switch (map)
+    {
+    case F640Map::kMapped:
+    {
+        const uint64_t n = g_f640.translated.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (F640Allow(n))
+            MCLA_LOG_WARN("F640-CVIEW-TRANSLATE #{} view={} view_va={:08X} pool_va={:08X} "
+                          "pa={:08X} translated_total={}",
+                          n, PhysViewName(viewVa), viewVa, poolVa,
+                          (uint32_t)((uint64_t)viewVa -
+                                     (uint64_t)kF640Views[(uint32_t)F640ClassifyView(viewVa) - 1].base),
+                          n);
+        return;
+    }
+    case F640Map::kNoPoolByte:
+    {
+        // F-640: THE ROW THAT MUST READ ZERO. Its own line, its own budget, and it prints
+        // the attempt number it belongs to -- a `dropped=0` with no attempt index beside it
+        // is indistinguishable from "nothing was ever routed here" (F-057(6)).
+        const uint64_t n = g_f640.dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint64_t seq = g_f640.dropSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (F640Allow(n))
+            MCLA_LOG_ERROR("F640-CVIEW-DROPPED #{} attempt={} view={} view_va={:08X} "
+                           "pa={:08X} pool_va=NONE reason=NO_POOL_BYTE adopted_sites={} "
+                           "NOTE=this_access_is_NOT_reaching_the_pool",
+                           n, call, PhysViewName(viewVa), viewVa,
+                           (uint32_t)((uint64_t)viewVa -
+                                      (uint64_t)kF640Views[(uint32_t)F640ClassifyView(viewVa) - 1].base),
+                           (uint64_t)g_f640.adopted.load(std::memory_order_relaxed));
+        (void)seq;
+        return;
+    }
+    case F640Map::kNotAView:
+        g_f640.notAView.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+}
+
+PhysViewResult TranslatePhysViewToPoolVa(uint32_t viewVa, uint32_t* outPoolVa)
+{
+    uint32_t poolVa = 0;
+    const F640Map map = F640MapViewToPool(viewVa, &poolVa);
+    F640CountAndLog(viewVa, map, poolVa);
+    switch (map)
+    {
+    case F640Map::kMapped:
+        if (outPoolVa != nullptr)
+            *outPoolVa = poolVa;
+        return PhysViewResult::kMapped;
+    case F640Map::kNoPoolByte:
+        if (outPoolVa != nullptr)
+            *outPoolVa = 0;  // never leave a stale value beside a refusal
+        return PhysViewResult::kNoPoolByte;
+    case F640Map::kNotAView:
+        break;
+    }
+    if (outPoolVa != nullptr)
+        *outPoolVa = 0;
+    return PhysViewResult::kNotAView;
+}
+
+// F-640: THE ALIAS PROBE. One byte, written into the pool, read back through all three
+// views, then restored and re-read. It is the only test that can decide the question,
+// because `Translate` is arithmetic (memory.cpp:285-297): comparing host pointers would only
+// re-derive `base + va` and would "prove" aliasing that is not there.
+//
+// The byte is the pool byte for a physical address in the MIDDLE of the console's window,
+// not the pool's last byte: the pool's last byte presents as physical 0x203FFFFF, which is
+// ABOVE the console's 0x20000000 limit, and `0xE0000000 + 0x203FFFFF` is 0x1003FFFFF -- past
+// the end of the 4 GiB window, so the E-view read would have wrapped. That is why the probe
+// address is derived from the console's size, not from the pool's end.
+//
+// It is free space and stays that way: o1heap grows from the arena base, this runs after
+// g_userHeap.Init() but before the XEX is installed and before any guest thread exists, and
+// the original value is restored and re-read either way -- reported as `canary_restored=`, so
+// a soak can confirm the probe left no mark.
+void F640PhysAliasInit()
+{
+    const uint64_t pa = F640PoolPhysBase() +
+                        ((uint64_t)mcla::kernel::PhysArenaSizeBytes() / 2u);
+    const uint8_t kCanary = 0xA5u;
+
+    uint32_t poolVa = 0;
+    const F640Map self = F640MapViewToPool(kF640Views[0].base + (uint32_t)pa, &poolVa);
+    uint8_t before = 0, after = 0, seen[3] = {0, 0, 0};
+    // The CHECKED accessors, and the same instance heap.cpp:974-980 uses for its own needle
+    // reads: GuestMemoryHeap::ReadBytes/WriteBytes are IsValid-checked and __try-guarded.
+    // `g_memory` is the flat base holder and has no such members.
+    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const bool gotBefore = (self == F640Map::kMapped) && mem.ReadBytes(poolVa, &before, 1);
+    const bool wrote = (self == F640Map::kMapped) && mem.WriteBytes(poolVa, &kCanary, 1);
+    if (wrote)
+    {
+        for (uint32_t i = 0; i < 3; ++i)
+            (void)mem.ReadBytes(kF640Views[i].base + (uint32_t)pa, &seen[i], 1);
+    }
+    if (self == F640Map::kMapped)
+        (void)mem.WriteBytes(poolVa, &before, 1);
+    const bool gotAfter = (self == F640Map::kMapped) && mem.ReadBytes(poolVa, &after, 1);
+
+    uint32_t shared = 0;
+    for (uint32_t i = 0; i < 3; ++i)
+        if (seen[i] == kCanary)
+            ++shared;
+    // The mechanism in force is READ OFF the probe, not asserted in source: 3 shared views
+    // would mean the window really is three views of one pool; 0 means the flat window, and
+    // the only mechanism left is per-access translation. A PARTIAL result would mean the
+    // window is something this file's model does not describe, and is reported as such
+    // instead of being rounded to one of the two expected answers.
+    const char* mech = (shared == 3)  ? "view-alias(MAPPED)"
+                        : (shared == 0) ? "flat-window(TRANSLATE-BY-CALLER)"
+                                        : "PARTIAL(alias-broken)";
+
+    // The second probe needs no canary: physical 0 is the address `PhysToKernelVA(0)`
+    // produces, and this tree's pool starts 4 MiB into the console's window, so it has no
+    // pool byte. All three views must refuse it -- and must refuse it for the stated reason.
+    uint32_t mappedAtZero = 0;
+    for (uint32_t i = 0; i < 3; ++i)
+        if (F640MapViewToPool(kF640Views[i].base, &mappedAtZero) == F640Map::kMapped)
+            ++mappedAtZero;  // 0 is the answer; a non-zero count is a real defect, not a style
+
+    // Why (a) is closed, measured on THIS process's window rather than argued: one
+    // reservation, committed, private (Type == MEM_PRIVATE), covering the whole 4 GiB.
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool haveMbi = (g_base != nullptr) && (VirtualQuery(g_base, &mbi, sizeof(mbi)) != 0);
+    const bool oneRegion = haveMbi && (mbi.RegionSize >= GuestMemorySize);
+
+    MCLA_LOG_WARN(
+        "F640-PHYSALIAS phase=init mech={} canary_shared_views={}/3 probe_pa={:08X} "
+        "probe_pool_va={:08X} canary_written={} canary_restored={} zero_pa_mapped_views={}/3 | "
+        "pool=[{:08X}..{:08X}) cap={:#x} cap_mb={:.1f} pool_phys=[{:08X}..{:08X}) "
+        "console_window_below_pool={}MiB pool_tail_above_console={}MiB | "
+        "views=A:{:08X}/{}KiB C:{:08X}/{}MiB E:{:08X}/{}KiB (size_each={:#x} from "
+        "kConsolePhysicalBytes) | A_view_is_pool={} C_minus_pool={:#x} E_minus_pool={:#x} "
+        "overlap_in_pool: A={}MiB C={}MiB E={}MiB | window=one_allocation:{} committed:{} "
+        "private:{} region_mb={:.1f} | calls={} translated={} dropped={} adopted_sites={} "
+        "zero_is_measured={} | adopt=gpu_cp.cpp:3673(rptr-writeback) "
+        "native_renderer.cpp:294(present) gpu_mmio.cpp:83(MMIO-physForm)",
+        mech, shared, (uint32_t)pa, poolVa, (wrote ? 1 : 0),
+        ((gotBefore && gotAfter && before == after) ? 1 : 0), mappedAtZero,
+        mcla::kernel::kPhysArenaBeginVa, mcla::kernel::kPhysArenaEndVa,
+        (uint64_t)mcla::kernel::PhysArenaSizeBytes(),
+        (double)mcla::kernel::PhysArenaSizeBytes() / (1024.0 * 1024.0),
+        (uint32_t)F640PoolPhysBase(), (uint32_t)F640PoolPhysTop(),
+        (double)F640PoolPhysBase() / (1024.0 * 1024.0),
+        (double)(F640PoolPhysTop() - (uint64_t)mcla::kernel::kConsolePhysicalBytes) /
+            (1024.0 * 1024.0),
+        kF640Views[0].base, 1u << (kF640Views[0].pageShift - 10),
+        kF640Views[1].base, 1u << (kF640Views[1].pageShift - 20),
+        kF640Views[2].base, 1u << (kF640Views[2].pageShift - 10),
+        (uint64_t)mcla::kernel::kConsolePhysicalBytes,
+        (poolVa == kF640Views[0].base + (uint32_t)pa ? 1 : 0),
+        (uint64_t)(kF640Views[1].base - kF640Views[0].base),
+        (uint64_t)(kF640Views[2].base - kF640Views[0].base),
+        (double)F640ViewOverlapBytes(F640View::kA64K) / (1024.0 * 1024.0),
+        (double)F640ViewOverlapBytes(F640View::kC16M) / (1024.0 * 1024.0),
+        (double)F640ViewOverlapBytes(F640View::kE4K) / (1024.0 * 1024.0),
+        (oneRegion ? 1 : 0), (haveMbi && mbi.State == MEM_COMMIT ? 1 : 0),
+        (haveMbi && mbi.Type == MEM_PRIVATE ? 1 : 0),
+        (haveMbi ? (double)mbi.RegionSize / (1024.0 * 1024.0) : 0.0),
+        g_f640.calls.load(std::memory_order_relaxed),
+        g_f640.translated.load(std::memory_order_relaxed),
+        g_f640.dropped.load(std::memory_order_relaxed),
+        (uint64_t)g_f640.adopted.load(std::memory_order_relaxed),
+        ((uint64_t)g_f640.adopted.load(std::memory_order_relaxed) > 0 ? 1 : 0));
+
+    // F-640: the two reporting sites this file corrected, published at INIT so a soak can
+    // see the corrected extent without waiting for a crash to produce the crash file.
+    MCLA_LOG_WARN("F640-POOLSCAN phase=init needle_scan_range=[{:08X}..{:08X}) label=phys-heap "
+                  "bytes={} r6_device_dump_predicate=in[{:08X}..{:08X}) outside_pool_no_dump=1 "
+                  "replaced_ceiling=0x100000000 over_report_bytes={} over_report_mib={:.1f}",
+                  mcla::kernel::kPhysArenaBeginVa, mcla::kernel::kPhysArenaEndVa,
+                  (uint64_t)mcla::kernel::PhysArenaSizeBytes(),
+                  mcla::kernel::kPhysArenaBeginVa, mcla::kernel::kPhysArenaEndVa,
+                  (uint64_t)0x100000000ull - (uint64_t)mcla::kernel::kPhysArenaEndVa,
+                  (double)((uint64_t)0x100000000ull - (uint64_t)mcla::kernel::kPhysArenaEndVa) /
+                      (1024.0 * 1024.0));
 }
 
 } // namespace mcla::boot

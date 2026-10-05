@@ -4,8 +4,12 @@
 #include <atomic>
 #include <intrin.h>   // F-374b: _ReturnAddress() for the heap-instance store report
 #include <windows.h>   // F-374b: GetModuleHandleA() to turn the caller into an RVA
+#include <algorithm>   // F-635: std::sort for the capped exact-set dumps
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 // PAGE-WATCH hooks (session 24): defined in gpu_cp.cpp which owns the full
 // PPCContext includes - keeps this hot-path TU free of ABI header chains.
@@ -19,15 +23,36 @@ void HeapInstanceStoreReport(uint32_t guestAddr, uint32_t value);
 
 static constexpr uint32_t kWatchPage = 0x50000000u;
 
-// F-374b: the guest user heap's o1heap INSTANCE occupies guest 0x20000..0x20240 (src/kernel/
-// o1heap.c:133-138 -- 64 free-bin pointers, a bin mask, then the diagnostics block; `capacity` is
-// the constant at +0x208). Only o1heap writes there, and it does so through raw host pointers. A
-// store that reaches that window through the GUEST-facing checked writers is a wild destination by
-// definition: the F-374 guard page caught exactly one such store live in w382.log (17:30:56.311,
-// hostRIP = GuestMemoryView::WriteU32BE+0x7d, guest lr 821BC998), and 155 ms later Heap::Alloc
-// began refusing every request -- F-370's dead header and uncreated thread #16. This names the
-// CALLER of the store, which is the line to fix:
-//     python tools/host_rva_resolve.py build/mcla.map <caller_rva>
+// F-374b/F-631: the guest user heap's o1heap INSTANCE occupies guest 0x20000..0x20240
+// (src/kernel/o1heap.c:133-138 -- 64 free-bin pointers, a bin mask, then the diagnostics block;
+// `capacity` is the constant at +0x208). Only o1heap writes there, and it does so through raw host
+// pointers. A store that reaches that window through the GUEST-facing checked writers is a wild
+// destination by definition.
+//
+// F-631 -- THIS WINDOW IS 0x240 BYTES AND THAT IS THE WHOLE PROBLEM WITH IT. F-630 read `w654`'s
+// eight `F375-HEAPSTORE` rows as "the guest zeroed the allocator header", i.e. as the COMPLETE event.
+// It is a 0.240 KB sample of a much larger write. `python tools/ppc_xrefs.py fn 0x821C667C` resolves
+// the `lr` on all eight rows to `sub_821C6658 +0x24` -- a return address INSIDE the guest's own
+// `memset(ptr,0,n*12)` wrapper, not a function entry -- and the same rows carry `r4=0x6F1E0`, so the
+// store loop was walking ~0x6F1E0 elements of 12 bytes: roughly 5.2 MB starting at 0x20004, of which
+// the window could show 8 stores. Every count, byte range and "extent" claim derived from this probe
+// is therefore a lower bound, and the two instruments below exist so no future reader has to know
+// that to be told the truth:
+//
+//   * `F631-HEAPEXT` -- one row per BULK copy that overlaps the window, carrying the copy's real
+//     destination and length. A 5.2 MB memset is ONE row with `len=0x5081A0`, not eight dword rows,
+//     and it is emitted from `WriteBytes` where the length is still known. This is the primary
+//     instrument: `WriteBytes` is the only entry point that knows the extent of a write, and it
+//     previously reported nothing at all for the heap window.
+//   * `F631-HEAPWIN` -- a bounded rollup of the per-dword path: cumulative store count, the lowest
+//     and highest address the window has seen, and `saturated=` saying whether the observed range
+//     reached the window's own end (which is what "truncated" looks like from inside the probe).
+//
+// Both are capped on the house cadence, because the log-quality rule (F-054) is the difference
+// between a soak that can be read and a soak that cannot. The old `F374-HEAPSTORE` rows are left
+// exactly as they are: they are the only per-store attribution in the tree (caller_rva + tid) and
+// they resolve with `tools/host_rva_resolve.py`, so they stay and gain an explicit `sample_of` note
+// rather than being replaced.
 namespace {
 // F-384: these two follow the arena; they are NOT a hardcoded address any more. Watching a stale
 // range after a relocated arena would read as "the corruption stopped" when it only moved out of
@@ -39,6 +64,31 @@ inline bool HeapInstanceStoreHit(uint32_t guestAddr) {
     return guestAddr >= kHeapInstanceLo && guestAddr < kHeapInstanceHi;
 }
 
+// F-631: SPAN overlap, not point containment. The write that matters starts at 0x20004 and runs for
+// megabytes; a test on the start address alone sees it, a test on the window alone does not. Mirrors
+// the range logic `RangeOverlapsWatch` already uses for the dynamic ranges (guest_memory.cpp:183).
+inline bool HeapWindowOverlaps(uint32_t guestAddr, uint32_t size) {
+    if (size == 0) return false;
+    const uint64_t end = static_cast<uint64_t>(guestAddr) + size;
+    return guestAddr < kHeapInstanceHi && static_cast<uint64_t>(kHeapInstanceLo) < end;
+}
+
+// Cumulative extent of the per-dword path. Monotonic and never reset: this measures the whole boot's
+// writing into the window, which is the quantity F-630 got wrong by treating 8 as the total. Widen
+// with a CAS-free exchange-max: a lost race can only under-report the low bound by one address, and
+// the rollup is a census, not a lock.
+std::atomic<uint64_t> g_winStores{0};
+std::atomic<uint32_t> g_winLo{0xFFFFFFFFu};
+std::atomic<uint32_t> g_winHi{0};
+
+void CountWindowStore(uint32_t guestAddr) {
+    g_winStores.fetch_add(1, std::memory_order_relaxed);
+    uint32_t cur = g_winLo.load(std::memory_order_relaxed);
+    while (guestAddr < cur && !g_winLo.compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
+    cur = g_winHi.load(std::memory_order_relaxed);
+    while (guestAddr > cur && !g_winHi.compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
+}
+
 void ReportHeapInstanceStore(const char *op, uint32_t guestAddr, uint64_t val, void *ra) {
     static std::atomic<uint32_t> s_storeN{0};
     const uint32_t n = s_storeN.fetch_add(1) + 1;
@@ -46,14 +96,57 @@ void ReportHeapInstanceStore(const char *op, uint32_t guestAddr, uint64_t val, v
     // printed exactly 16 rows regardless of how long the copy actually was, so "16 dwords" was the
     // cap, not a measurement. First 16 plus every 4096th row keeps a short burst complete (cap-shape
     // rule) while making a long one visible. tid separates bursts from different threads.
-    if (n > 16 && (n % 4096) != 0) return;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    // F-631: `sample_of` and `win_stores` are what stop the next reader making F-630's mistake again.
+    // `win_stores` is the number of stores the window has actually seen; a burst far larger than the
+    // 16 rows below it is a sample of something bigger, and the row now says so in the same line.
+    if (n <= 16 || (n % 4096) == 0) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+        const uintptr_t abs = reinterpret_cast<uintptr_t>(ra);
+        const uint64_t total = g_winStores.load(std::memory_order_relaxed);
+        MCLA_LOG_ERROR("F374-HEAPSTORE #{} op={} guest={:08X} inst_off={:#x} val={:#x} "
+                       "caller_rva={:#x} tid={} sample_of={} (window is 0x240 bytes: these rows are "
+                       "a SAMPLE, the whole event is F631-HEAPEXT or F631-HEAPWIN)",
+                       n, op, guestAddr, guestAddr - kHeapInstanceLo, val, base ? abs - base : abs,
+                       GetCurrentThreadId(), (unsigned long long)total);
+        mcla::gpu::HeapInstanceStoreReport(guestAddr, static_cast<uint32_t>(val));
+        // F-631: the rollup, on the same cadence as the rows it qualifies. `saturated` is the whole
+        // point -- it is true once the window has seen its own last byte, which means the observed
+        // range is bounded by the window and NOT by the writer.
+        if (n <= 16 || (n % 4096) == 0) {
+            const uint32_t lo = g_winLo.load(std::memory_order_relaxed);
+            const uint32_t hi = g_winHi.load(std::memory_order_relaxed);
+            MCLA_LOG_ERROR("F631-HEAPWIN #{} op={} win_stores={} lo={:08X} hi={:08X} "
+                           "saturated={} window=[{:08X},{:08X}) window_bytes=0x{:X} tid={}",
+                           n, op, (unsigned long long)total, lo, hi,
+                           (hi >= kHeapInstanceHi - 4u) ? 1 : 0, kHeapInstanceLo, kHeapInstanceHi,
+                           (unsigned)(kHeapInstanceHi - kHeapInstanceLo), GetCurrentThreadId());
+        }
+    }
+    CountWindowStore(guestAddr);
+}
+
+// F-631: the primary extent instrument. A bulk copy that overlaps the instance window is ONE event
+// with a real destination and a real length, which is the thing F-630 needed and the dword window
+// could not provide. `len` is the whole copy, not the part that landed in the window, and the row
+// says how much of it did -- so a 5.2 MB memset reads as a 5.2 MB memset.
+void ReportHeapWindowExtent(const char *op, uint32_t guestAddr, uint32_t size, void *ra) {
+    static std::atomic<uint64_t> s_extN{0};
+    const uint64_t n = s_extN.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Cadence: the first 4, then every 64th. A guest that memsets its own allocator state once per
+    // frame is not interesting; one that does it in a loop is, and 64 keeps a loop visible without
+    // letting it become the log.
+    if (n > 4 && (n % 64) != 0) return;
+    const uint32_t hi = guestAddr + size;  // size is bounded by IsValidRange (<= 4 GiB window)
+    const uint32_t ovLo = guestAddr > kHeapInstanceLo ? guestAddr : kHeapInstanceLo;
+    const uint32_t ovHi = hi < kHeapInstanceHi ? hi : kHeapInstanceHi;
+    const uintptr_t mbase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
     const uintptr_t abs = reinterpret_cast<uintptr_t>(ra);
-    MCLA_LOG_ERROR("F374-HEAPSTORE #{} op={} guest={:08X} inst_off={:#x} val={:#x} "
-                   "caller_rva={:#x} tid={}",
-                   n, op, guestAddr, guestAddr - kHeapInstanceLo, val, base ? abs - base : abs,
-                   GetCurrentThreadId());
-    mcla::gpu::HeapInstanceStoreReport(guestAddr, static_cast<uint32_t>(val));
+    MCLA_LOG_ERROR("F631-HEAPEXT #{} op={} dst={:08X} len={:#x} window_overlap=[{:08X},{:08X}) "
+                   "overlap_bytes={:#x} covers_window={} caller_rva={:#x} tid={}",
+                   (unsigned long long)n, op, guestAddr, size, ovLo, ovHi,
+                   (unsigned)(ovHi > ovLo ? ovHi - ovLo : 0u),
+                   (guestAddr <= kHeapInstanceLo && hi >= kHeapInstanceHi) ? 1 : 0,
+                   mbase ? abs - mbase : abs, GetCurrentThreadId());
 }
 }  // namespace
 
@@ -201,6 +294,362 @@ inline bool RangeOverlapsWatch(uint32_t guestAddr, uint32_t size)
     return false;
 }
 
+// F-633 -- READ-REFUSAL CENSUS FOR GuestMemoryView::ReadU32BE (the class this file owns).
+//
+// WHY THIS EXISTS. `mcla::native::ReadGuestU32` (src/guest_memory.h:82-86) pre-zeroes `val` and
+// DISCARDS ReadU32BE's bool:
+//     uint32_t val = 0; GetActiveGuestMemoryView().ReadU32BE(guestAddr, &val); return val;
+// so a refusal is a SILENT 0 handed back to the recompiler as if it were memory. Measured
+// consequence, w682.log (the boot's only guest access violation):
+//     Param[0]=0 (READ) Param[1]=0x7E780000 r8=0xFFFFFFFF7E780000 rdx=0x100000000
+//     rip owner=guest 0x825FB348 -> generated/ppc_xenon/ppc_recomp.121.cpp:25113
+//     = PPC_CALL_INDIRECT_FUNC(ctr.u32), i.e.
+//         lwz r3,4(r30) ; lwz r11,0(r3) ; lwz r10,12(r11) ; mtctr r10 ; bctrl
+//     (ppc_recomp.121.cpp:25102/25106/25108/25110/25113) where each lwz is PPC_LOAD_U32 ->
+//     ReadGuestU32 -> ReadU32BE (ppc_context.h:57, guest_memory.h:82).
+// 0xFFFFFFFF7E780000 is the compiler's fold of `base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE -
+// 2*PPC_CODE_BASE` from PPC_LOOKUP_FUNC (src/ppc_context.h:124), and with base = 0x100000000
+// the log's Param[1] implies ctr == 0 -- the host dereferenced 0x81880000 bytes below its own
+// allocation. THREE causes produce that identical machine state and the log separates none of
+// them:
+//   (1) the guest's vtable slot really holds 0 (unconstructed object) -- a guest bug;
+//   (2) r3 == 0 -> ReadU32BE(0) refuses -> fabricates 0 -> r11 = 0 -> ReadU32BE(12) refuses ->
+//       fabricates 0 -> ctr = 0                      -- a HOST bug, cascading, silent;
+//   (3) r3 in range but unreadable -> same cascade     -- a HOST bug, cascading, silent.
+// The register dump cannot break the tie (the crash row says `ppc ctx=nil` and F-046 says any
+// GPR read from that dump is another frame's), so the discriminator has to be the refusal itself.
+// `LogGuestLoadRefused` (src/kernel/memory.cpp:74) instruments the OTHER class
+// (GuestMemoryHeap) and therefore cannot see this path at all -- which is why that census
+// returned rows that said nothing about this crash. THIS file is the only place that can.
+//
+// WHAT IS REPORTED. One row per refusal, on the house cadence, carrying the guest VA, the size,
+// which check refused, the thread, and the cumulative totals; plus one SUMMARY on the same
+// cadence so a zero is distinguishable from a dropped sample. Because ReadU32BE is a hot path
+// the rows are sampled: first 16, then every 4096th (kGvPrintFirst/kGvPrintEvery). A hard cap
+// is NOT used: an earlier burst was capped at 16 rows, both soaks printed exactly 16, and the
+// "16" was then read as a measurement (F-379, guest_memory.cpp:91-94) -- the burst length became
+// unmeasurable. Sampling keeps a short burst complete while making a long one visible, and the
+// `total=`/`rows=`/`dropped=` fields in the same line say which is which.
+//
+// FABRICATED ZEROS (the decisive number). A refusal with va < 0x1000 -- below the NOACCESS guard
+// page that IsValidRange rejects (guest_memory.cpp:307) -- cannot come from any legitimate
+// recompiled `lwz`: the guest image is mapped at 0x82000000 and no Xenon guest address lives in
+// the first page. So each one is a zero this host invented and handed to the recompiler as
+// memory. `GUESTVIEW-U32-FABZERO` counts those on its own cadence, independent of the row
+// sampling, so it is conclusive on its own.
+//     fab_zero > 0 on tid 16332 within ms of the crash  => cause (2) or (3): the host
+//                                                          fabricates the 0 and the crash is a
+//                                                          CASCADE, not the root cause.
+//     total == 0 across a full soak that still crashes => cause (1): the guest really stored 0
+//                                                          into a vtable slot, and the host's only
+//                                                          defect is the missing range check on the
+//                                                          dispatch index.
+// FALSIFIER for the instrument itself: rows from another thread but nothing on 16332 -- the
+// marker demonstrably works, and the crash is cause (1).
+//
+// TWO THINGS THAT PRODUCE ROWS THAT ARE NOT THE CRASH -- read before interpreting a FABZERO:
+//   * `VerifyGuestMemoryViewForTests` (this file, ~line 750) deliberately calls ReadU32BE(0,
+//     nullptr), ReadU32BE(0,&v) and ReadU32BE(0x100,&v) to prove the guard page refuses, and
+//     `InstallNativeRenderer` (src/native_renderer.cpp:502) runs it at boot. That is exactly 3
+//     refusals, va=00000000 x2 and va=00000100, on the renderer-install thread. They are
+//     separable from the crash without guessing: the self-test runs on a LOCAL `GuestMemoryView`
+//     whose base is a 0x3000-byte stack array, so those three rows carry a `view_base` that is a
+//     stack address, while the recompiler's view is the real allocation (0x100000000 in w682.log,
+//     `rdx=0x100000000`). `caller_rva` + `tools/host_rva_resolve.py` names the caller as well.
+//   * Host-side census/probe callers of ReadU32BE (src/boot_host.cpp, src/gpu_cp.cpp,
+//     src/capture_hooks.cpp) also drop the bool, so a probe of an absent guest address lands here
+//     too. They are NOT reccompiled `lwz`s and must not be read as guest evidence. Same key:
+//     `caller_rva` (a recompiled load resolves to `ReadGuestU32` in ppc_recomp.*.cpp; a host probe
+//     resolves to the probing function) and `view_base`.
+//
+// BEHAVIOUR: none changed. Same `false` returns, same untouched *outVal, same MMIO routing, same
+// PageWatchOnRead. The one shape change is that the `__except` handler now only sets a flag and
+// the log call happens after the SEH scope: formatting inside a handler that is running off an
+// access violation can fault again, which is the same reason src/kernel/memory.cpp:53-57
+// captures the exception in a filter and formats outside. The bool that ReadGuestU32 drops is
+// NOT fixed here -- that is src/guest_memory.h, a different file, a separate task.
+namespace {
+enum GvU32Why { kGvRange = 0, kGvNullOut, kGvAv, kGvWhyCount };
+const char* const kGvU32WhyName[kGvWhyCount] = {"range", "nullout", "av"};
+
+// kGvGuardPage duplicates the `guestAddr < 0x1000` floor in IsValidRange on purpose: this
+// counter is the *interpretation* of that constant, and it must keep working even if someone
+// later tunes IsValidRange. Verified equal by reading guest_memory.cpp:307.
+constexpr uint32_t kGvGuardPage = 0x1000u;
+constexpr uint64_t kGvPrintFirst = 16;
+constexpr uint64_t kGvPrintEvery = 4096;
+
+std::atomic<uint64_t> g_gvTotal{0};                        // every refusal, printed or not
+std::atomic<uint64_t> g_gvRows{0};                         // rows actually printed
+std::atomic<uint64_t> g_gvByWhy[kGvWhyCount]{};           // range / nullout / av
+std::atomic<uint64_t> g_gvFabZero{0};                     // refusals with va < 0x1000
+std::atomic<uint64_t> g_gvFabRows{0};                     // FABZERO rows printed
+std::atomic<uint32_t> g_gvLo{0xFFFFFFFFu};
+std::atomic<uint32_t> g_gvHi{0};
+
+// Exception facts, captured in the filter and formatted outside it (see above).
+struct GvU32Fault {
+    unsigned long code = 0;
+    unsigned long long addr = 0;
+};
+
+// A filter expression must be a constant expression, hence a named function. Returning
+// EXCEPTION_EXECUTE_HANDLER keeps the original control flow exactly.
+int GvU32AvFilter(EXCEPTION_POINTERS* ep, void* ctx) {
+    auto* f = static_cast<GvU32Fault*>(ctx);
+    if (ep && ep->ExceptionRecord) {
+        f->code = ep->ExceptionRecord->ExceptionCode;
+        // Information[1] is the faulting DATA address, [0] the access type.
+        if (ep->ExceptionRecord->NumberParameters >= 2)
+            f->addr = ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void ReportGuestViewU32Refused(uint32_t guestAddr, int why, unsigned long avCode,
+                               unsigned long long avAddr, const void* ra,
+                               const void* viewBase, uint64_t viewSize) {
+    const uint64_t n = g_gvTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (why >= 0 && why < kGvWhyCount)
+        g_gvByWhy[why].fetch_add(1, std::memory_order_relaxed);
+    uint32_t cur = g_gvLo.load(std::memory_order_relaxed);
+    while (guestAddr < cur && !g_gvLo.compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
+    cur = g_gvHi.load(std::memory_order_relaxed);
+    while (guestAddr > cur && !g_gvHi.compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
+    const uintptr_t mbase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    const uintptr_t cabs = reinterpret_cast<uintptr_t>(ra);
+    const uint64_t caller_rva = (mbase && cabs > mbase) ? (cabs - mbase) : cabs;
+
+    // Fabricated zero, on its OWN counter and its own cadence: if the main rows are all sampled
+    // out, this one still reports, and a non-zero value cannot be argued down to a sampling
+    // artefact because the cadence is printed in the row with its own total.
+    if (guestAddr < kGvGuardPage) {
+        const uint64_t f = g_gvFabZero.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (f <= kGvPrintFirst || (f % kGvPrintEvery) == 0) {
+            const uint64_t frows = g_gvFabRows.fetch_add(1, std::memory_order_relaxed) + 1;
+            MCLA_LOG_ERROR(
+                "GUESTVIEW-U32-FABZERO #{} va={:08X} size=4 why={} fab_total={} fab_rows={} "
+                "refusals_total={} caller_rva={:#x} tid={} - va is BELOW the 0x1000 guard-page floor: "
+                "IsValidRange refused it, *outVal was NOT written, and ReadGuestU32 "
+                "(src/guest_memory.h:82) drops the bool, so the RECOMPILER SAW THIS 0 AS MEMORY. "
+                "No legitimate guest `lwz` can land here.",
+                (unsigned long long)f, guestAddr, kGvU32WhyName[why], (unsigned long long)f,
+                (unsigned long long)frows, (unsigned long long)n, caller_rva,
+                GetCurrentThreadId());
+        }
+    }
+
+    if (n > kGvPrintFirst && (n % kGvPrintEvery) != 0) return;  // sampled out; SUMMARY carries total
+
+    const uint64_t rows = g_gvRows.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t total = g_gvTotal.load(std::memory_order_relaxed);
+    const uint32_t lo = g_gvLo.load(std::memory_order_relaxed);
+    const uint32_t hi = g_gvHi.load(std::memory_order_relaxed);
+    const uint64_t fab = g_gvFabZero.load(std::memory_order_relaxed);
+    MCLA_LOG_ERROR(
+        "GUESTVIEW-U32-REFUSED #{} va={:08X} size=4 why={} av_code=0x{:X} av_addr=0x{:X} "
+        "n={} rows={} dropped={} lo_va={:08X} hi_va={:08X} "
+        "by_why=[range={} nullout={} av={}] fab_zero={} view_base=0x{:X} view_size=0x{:X} "
+        "caller_rva={:#x} tid={} - ReadU32BE REFUSED, *outVal NOT written; ReadGuestU32 drops the "
+        "bool, so this is a SILENT 0 to the recompiler (cadence: first {} then every {}th)",
+        (unsigned long long)n, guestAddr, kGvU32WhyName[why], avCode, avAddr, (unsigned long long)n,
+        (unsigned long long)rows, (unsigned long long)(total - rows),
+        lo, hi, (unsigned long long)g_gvByWhy[kGvRange].load(std::memory_order_relaxed),
+        (unsigned long long)g_gvByWhy[kGvNullOut].load(std::memory_order_relaxed),
+        (unsigned long long)g_gvByWhy[kGvAv].load(std::memory_order_relaxed),
+        (unsigned long long)fab, reinterpret_cast<uintptr_t>(viewBase), viewSize, caller_rva,
+        GetCurrentThreadId(), (unsigned long long)kGvPrintFirst, (unsigned long long)kGvPrintEvery);
+
+    // The SUMMARY is what makes "zero" and "sampled out" different readings of the same log:
+    // no rows + no summary means total==0 for the whole run, which is the cause-(1) signature.
+    if ((n % kGvPrintEvery) == 0) {
+        MCLA_LOG_ERROR(
+            "GUESTVIEW-U32-SUMMARY total={} rows={} dropped={} fab_zero={} fab_rows={} "
+            "by_why=[range={} nullout={} av={}] lo_va={:08X} hi_va={:08X} view_base=0x{:X} "
+            "view_size=0x{:X} tid={}",
+            (unsigned long long)total, (unsigned long long)rows, (unsigned long long)(total - rows),
+            (unsigned long long)fab, (unsigned long long)g_gvFabRows.load(std::memory_order_relaxed),
+            (unsigned long long)g_gvByWhy[kGvRange].load(std::memory_order_relaxed),
+            (unsigned long long)g_gvByWhy[kGvNullOut].load(std::memory_order_relaxed),
+            (unsigned long long)g_gvByWhy[kGvAv].load(std::memory_order_relaxed),
+            lo, hi, reinterpret_cast<uintptr_t>(viewBase), viewSize, GetCurrentThreadId());
+    }
+}
+}  // namespace
+
+// ===========================================================================
+// F-635 (2026-10-01) -- IMPLEMENTATION OF THE `ctr` OUT-OF-RANGE CENSUS. The
+// design, the range derivation and the guard-asymmetry note are all in
+// src/guest_memory.h next to the macro; this is the counter.
+// ===========================================================================
+//
+// REPEATED HERE BECAUSE IT IS THE PART THAT GETS COPIED: this counts and
+// prints. It does not refuse. Control returns to the stock expansion
+// immediately, the load executes, and the access violation still happens at the
+// same address with the same registers. Rule 1 (census before fix) is why the
+// refusal is somebody else's task.
+//
+// CADENCE. The XSF-LASTSERVE-MISMATCH marker shipped unconditional and wrote
+// 8,649,924 rows = 96.91% of w687.log (F-634). Same failure class as F-054. So
+// this one is bounded by construction:
+//   rows 1..32          verbatim, unfiltered -- the first out-of-range `ctr` of a
+//                       boot is the diagnostic one and a sparse sample would
+//                       hide it (src/gpu_device.cpp:1709-1714)
+//   then every 4096th   floor(N/4096) rows
+//   powers of two       the SUMMARY, so a TRUNCATED soak still bounds the truth:
+//                       the last SUMMARY's total=N is a power of two, so the true
+//                       total is in [N, 2N) -- the property F-634 argued for and
+//                       the reason there is no atexit (spdlog's sinks are gone by
+//                       then: src/app.cpp:30-33, :173).
+// ESTIMATED ROWS PER SOAK: w688.log contains ONE real C0000005 (rva 0x28EC537,
+// thread 20864; the other row is the benign 0x406D1388 thread-exit pseudo-
+// exception on thread 25980) and the thread is then parked, so the expected
+// total is 1 and the expected output is 1 row + 1 SUMMARY = 2 rows. To exceed
+// the ~200-row target, N would have to exceed ~668,000 out-of-range indirect
+// calls in one soak; that number is the falsifier for the cadence, and a total
+// of 0 is the falsifier for the RANGE (it would mean the predicate is wrong,
+// not that the fault is gone).
+//
+// THE SETS ARE EXACT, NOT SAMPLED (F-634 JOB 2). `ctr` and `lr` cardinalities
+// are exact and never capped, so "how many distinct bad `ctr` values" -- the
+// question the rows cannot answer -- is answered by a number. The value LISTS
+// are capped at kF635SetCap and always print `*_shown=` beside the exact count,
+// so a capped list can never be read as the whole set.
+// ===========================================================================
+namespace mcla::native {
+namespace census {
+namespace {
+
+constexpr uint64_t kF635Head = 32;      // first N out-of-range events, verbatim
+constexpr uint64_t kF635Stride = 4096;  // then every Mth
+constexpr size_t kF635SetCap = 64;      // value-list cap; COUNTS are uncapped
+
+// One struct, one mutex: the counter and both sets must be snapshotted
+// together or `total=` and `n_ctr=` are two different runs of the world. Same
+// shape and same reason as MclaLastServeTally (src/gpu_device.cpp:1786-1791).
+struct F635Tally {
+    std::mutex mtx;
+    uint64_t total = 0;  // EXACT out-of-range count, never sampled, never capped
+    uint64_t rows = 0;   // EXACT count of F635-CTR-OOR rows actually printed
+    std::unordered_set<uint32_t> ctrs;
+    std::unordered_set<uint32_t> lrs;
+};
+
+F635Tally g_f635;
+
+// Sorted so two soaks diff; capped so a pathological population cannot re-
+// poison the log this marker exists to keep readable. The caller prints the
+// exact size; this only bounds the text.
+std::string JoinCapped(const std::unordered_set<uint32_t>& s, size_t* shown) {
+    std::vector<uint32_t> v(s.begin(), s.end());
+    std::sort(v.begin(), v.end());
+    if (v.size() > kF635SetCap)
+        v.resize(kF635SetCap);
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i)
+            out += ',';
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%08X", v[i]);
+        out += buf;
+    }
+    *shown = v.size();
+    return out;
+}
+
+}  // namespace
+
+void ReportCtrOutOfRange(uint32_t ctr, uintptr_t base, uint32_t lr) {
+    // Recompute the address from the SAME expression the macro loads through, so
+    // `load_addr=` is the number the CPU used and not a re-derivation. Verified
+    // against w688.log: base=0x100000000, ctr=0 -> 0x7E780000 = logged Param[1].
+    const uint64_t slotOff = (static_cast<uint64_t>(ctr) - kPpcCodeBase) * 2u;
+    const uint64_t slotVa = static_cast<uint64_t>(kFuncTableGuestVa) + slotOff;
+    const uint64_t loadAddr = static_cast<uint64_t>(base) + slotVa;
+    const uint64_t ctrSpanHi = static_cast<uint64_t>(kCtrLo) + kCtrSpan;
+
+    // Host site, so a row names the call even where `lr` does not (below).
+    const uintptr_t mbase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    const uintptr_t cabs = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uint64_t callerRva = (mbase && cabs > mbase) ? (cabs - mbase) : cabs;
+
+    uint64_t n = 0;
+    bool printRow = false;
+    bool printSummary = false;
+    uint64_t total = 0;
+    uint64_t rows = 0;
+    size_t nCtr = 0;
+    size_t nLr = 0;
+    size_t shownCtr = 0;
+    size_t shownLr = 0;
+    std::string sCtr;
+    std::string sLr;
+    {
+        std::lock_guard<std::mutex> lk(g_f635.mtx);
+        n = ++g_f635.total;
+        g_f635.ctrs.insert(ctr);
+        g_f635.lrs.insert(lr);
+        // `n` is the EXACT ordinal, so the printed `#` is the true event index,
+        // never a row counter (F-634's point about XSF-LASTSERVE-MISMATCH).
+        printRow = (n <= kF635Head) || ((n % kF635Stride) == 0);
+        if (printRow)
+            ++g_f635.rows;
+        // Powers of two: guarantees a SUMMARY after a single event (1 is 2^0)
+        // and bounds a truncated soak's true total to [N, 2N).
+        printSummary = ((n & (n - 1)) == 0);
+        if (printRow || printSummary) {
+            total = g_f635.total;
+            rows = g_f635.rows;
+            nCtr = g_f635.ctrs.size();
+            nLr = g_f635.lrs.size();
+            sCtr = JoinCapped(g_f635.ctrs, &shownCtr);
+            sLr = JoinCapped(g_f635.lrs, &shownLr);
+        }
+    }  // snapshot under the lock, emit outside it
+
+    if (printRow) {
+        // `lr` is ctx.lr, i.e. the guest return address the recompiler wrote on
+        // the line above the macro (14,304 of 14,832 sites -- measured). The
+        // other 528 sites emit no `ctx.lr = ` at all, so there `lr` is INHERITED
+        // from the guest and is not this call's site; `caller_rva` is the
+        // disambiguator for those (resolve it with tools/host_rva_resolve.py
+        // against the same build's build/mcla.map). It is not printed as 0 when
+        // unavailable, because a fabricated 0 reads as a measurement.
+        MCLA_LOG_ERROR(
+            "F635-CTR-OOR #{} ctr={:08X} slot_off=0x{:X} slot_guest_va=0x{:X} load_addr=0x{:X} "
+            "base=0x{:X} lr={:08X} caller_rva={:#x} tid={} n={} total={} rows={} dropped={} "
+            "n_ctr={} ctr_set_shown={} n_lr={} lr_set_shown={} ctr_set=[{}] lr_set=[{}] "
+            "in_range=[{:08X},{:08X}] - CENSUS, NOT A FIX, NO REFUSAL: this `ctr` is outside "
+            "the span every function-table registration in this tree has ever used, so "
+            "PPC_LOOKUP_FUNC indexed the guest image at ctr_set address ABOVE; the stock "
+            "load then ran unchanged and faulted as it always does. Resolve caller_rva with "
+            "tools/host_rva_resolve.py. CADENCE: first {} verbatim then every {}th; the "
+            "-SUMMARY carries the EXACT total and EXACT distinct counts.",
+            (unsigned long long)n, ctr, (unsigned long long)slotOff,
+            (unsigned long long)slotVa, (unsigned long long)loadAddr, (unsigned long long)base, lr,
+            (unsigned long long)callerRva, GetCurrentThreadId(), (unsigned long long)n,
+            (unsigned long long)total, (unsigned long long)rows, (unsigned long long)(total - rows),
+            (unsigned long long)nCtr, (unsigned long long)shownCtr, (unsigned long long)nLr,
+            (unsigned long long)shownLr, sCtr, sLr, kCtrLo, ctrSpanHi,
+            (unsigned long long)kF635Head, (unsigned long long)kF635Stride);
+    }
+    if (printSummary) {
+        MCLA_LOG_ERROR(
+            "F635-CTR-OOR-SUMMARY total={} rows={} dropped={} n_ctr={} ctr_set_shown={} "
+            "n_lr={} lr_set_shown={} ctr_set=[{}] lr_set=[{}] in_range=[{:08X},{:08X}] "
+            "tid={} - EXACT totals: `total` is every out-of-range `ctr`, `rows` is how many "
+            "F635-CTR-OOR rows were printed, so total-rows=dropped by sampling and NOT by "
+            "discard. total==0 across a full soak that still faults means the RANGE is wrong.",
+            (unsigned long long)total, (unsigned long long)rows,
+            (unsigned long long)(total - rows), (unsigned long long)nCtr,
+            (unsigned long long)shownCtr, (unsigned long long)nLr, (unsigned long long)shownLr,
+            sCtr, sLr, kCtrLo, ctrSpanHi, GetCurrentThreadId());
+    }
+}
+
+}  // namespace census
+}  // namespace mcla::native
+
 namespace mcla::native {
 
 GuestMemoryView::GuestMemoryView() = default;
@@ -258,15 +707,35 @@ bool GuestMemoryView::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const {
         GpuMmioReadFn handler = GetGpuMmioReadHandler();
         if (handler && outVal && handler(guestAddr, outVal)) return true;
     }
+    // F-633: the two refusal sites below are instrumented; nothing else about this function
+    // changes. `!ptr` and `!outVal` used to share one guard and so could not be told apart in the
+    // log -- they are different bugs (an out-of-range VA vs a caller passing no destination), so
+    // they are now split. Same two `return false`, same untouched *outVal.
     const uint8_t* ptr = GetHostPtr(guestAddr, sizeof(uint32_t));
-    if (!ptr || !outVal) return false;
+    if (!ptr) {
+        ReportGuestViewU32Refused(guestAddr, kGvRange, 0, 0, _ReturnAddress(), m_base, m_size);
+        return false;
+    }
+    if (!outVal) {
+        ReportGuestViewU32Refused(guestAddr, kGvNullOut, 0, 0, _ReturnAddress(), m_base, m_size);
+        return false;
+    }
+    // F-633: capture the AV, then log OUTSIDE the SEH scope -- formatting while an access
+    // violation is being handled can itself fault (same reasoning as src/kernel/memory.cpp:53-57).
+    GvU32Fault fault;
+    bool av = false;
     __try
     {
         uint32_t val;
         std::memcpy(&val, ptr, sizeof(val));
         *outVal = Swap32(val);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    __except (GvU32AvFilter(GetExceptionInformation(), &fault)) { av = true; }
+    if (av) {
+        ReportGuestViewU32Refused(guestAddr, kGvAv, fault.code, fault.addr, _ReturnAddress(),
+                                  m_base, m_size);
+        return false;
+    }
     if (PageWatchHit(guestAddr))
         mcla::gpu::PageWatchOnRead(guestAddr, *outVal);
     return true;
@@ -393,6 +862,16 @@ bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t s
         std::memcpy(ptr, src, size);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    // F-631: the heap-window EXTENT census, and the only place in this file that knows how many
+    // bytes a bulk copy actually moved. `WriteBytes` had no heap-window arm at all, so a guest
+    // `memset` of megabytes across 0x20000 was visible only as the handful of dword stores that
+    // happened to land inside the 0x240-byte census window (guest_memory.cpp:55-56) -- which is how
+    // eight rows came to be read as a complete event in F-630. One row here says the whole thing:
+    // destination, length, and how much of the length overlapped the window. Placed after the
+    // `__except` so it reports only copies that actually landed, and before the `size >= 4` block
+    // so it does not depend on the copy being long enough to have endpoints.
+    if (HeapWindowOverlaps(guestAddr, size))
+        ReportHeapWindowExtent("bulk", guestAddr, size, _ReturnAddress());
     if (size >= 4)
     {
         // Watch coverage for bulk copies of ANY size: check first + last

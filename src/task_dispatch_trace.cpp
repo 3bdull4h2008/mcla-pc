@@ -1142,9 +1142,118 @@ PPC_FUNC(sub_825FDBF8)
 // lr=825FB14C). Guard: dispatch only when the child's vtable pointer is a
 // plausible guest image address (< image top, non-poison); otherwise skip
 // — same semantics as the function's own [+216]==0 null path.
+//
+// F-633 (w658.log, read-only): this hook is 27% of that soak — 270,216 rows,
+// every one `obj=CB139580 child=B7921000 childVt=82085364 +4=0 +12=0
+// lr=825EDCF8 POISON-SKIP`, 1.0M lines total, ~2,252 entries/s for 105 s.
+// The guest body, re-read from the raw image (tools/ppc_disasm.py 825FB0D8):
+//   825FB0F4  mr   r31,r3            ; r31 = obj
+//   825FB0F8  lbz  r11,79(r31)       ; [+0x4F] live flag
+//   825FB100  beq  -> 825FB328       ; !live -> the whole body is skipped
+//   825FB104  lwz  r11,216(r31)      ; [+0xD8]
+//   825FB128  lwz  r10,68(r11)       ;   vtable slot +0x44, bctrl
+//   825FB134  lwz  r3,4(r31)         ; = the logged `child`
+//   825FB140  lwz  r10,16(r11)       ;   child vtable slot +0x10, bctrl
+//   825FB14C  <- returns here; the recorded AV (crash-2) was this dispatch
+//   825FB260  bl   825F8C70          ; NOT a free -- it builds a stack string
+//                                     ; (op59 `*32` runs) and calls 825EF518
+// The hot caller is sub_825EDC08: `r29 = lwz 32(r31)` at 825EDCC8 feeds
+// `bl sub_825FB0D8` at 825EDCF4 (hence lr=825EDCF8 on every row), and its
+// loop 825EDCB0..825EDD40 re-reads that SAME r29 each pass while only ever
+// writing 36(r31) and the globals at 0x8290xxxx. Nothing in the loop
+// advances the item.
+//
+// So the loop only terminates if the dtor itself unlinks the node -- and it
+// never runs here: `bodyPoison`'s third clause fires on
+// `childP4==0 && childP12==0 && childVt!=0`, and those two zeros are what
+// F-563's own EF100-PREPOP wrote into B7921000 (see sub_825EF100 below;
+// the row is `EF100-PREPOP #001 obj=B7921000` at 19:41:29.162, 0.02 s
+// before FB0D8-DTOR #001 at 19:41:29.183). An EMPTY-but-well-formed swfC
+// (real vtable 82085364, zero walk fields) is being read as poison.
+//
+// Verdict: this is a live defect, not a hot path and not a logging bug. The
+// short-circuit makes `sub_825EDC08` livelock on one never-destroyed node
+// for 105 s. Bounding the row is correct and necessary, but it is NOT the
+// fix; the fix is the guard's third clause. Per do-not #1 that change is NOT
+// made here (single-variable revert not shown, and the +0x4F early-out at
+// 825FB100 means an inert dtor is not provably safe to dispatch) -- this hook
+// only makes the spin countable and names it.
+//
+// Task 3 ruling: sub_825FB0D8 is not a physical-arena allocator and on this
+// soak it never even reaches its body -- all 270,216 entries returned at the
+// POISON-SKIP below, so it made 0 allocations and 0 frees against the arena
+// whose nfree=15 / nalloc=79,985. It is ruled out of the memory exhaustion.
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_825FB0D8);
 static std::atomic<uint32_t> s_hFB0D8{0};
+
+// F-633: one FB0D8 entry = one object destroyed. w658.log measured 270,216
+// entries, 27% of the whole log, ALL of them the single pair
+// obj=CB139580/child=B7921000 from the single call site lr=825EDCF8
+// (the instruction after `bl sub_825FB0D8` at 825EDCF4, inside the
+// 825EDCB0..825EDD40 loop of sub_825EDC08). The old gate was
+// `n <= 12 || poisonVt`, and `poisonVt` is STABLY true for this pair
+// (bodyPoison's third clause: childVt=82085364 is a real swfC vtable and
+// child+4/child+12 are the zeros F-563's EF100-PREPOP wrote into B7921000
+// and nothing ever refilled) -- so the gate degenerated to "always print".
+//
+// So the flood is not a rate, it is a stuck state, and the row's only real
+// content is "a NEW (obj,child) pair arrived in this state". This table
+// makes that the print rule: the full row prints once per distinct pair,
+// and a bounded FB0D8-REPEAT marker names the pathology (an object entered
+// the destructor a second time) with the prior destroy's state. The
+// counters below keep the 270,216 answer readable after the rows stop.
+namespace {
+struct Fb0d8Pair {
+    std::atomic<uint32_t> obj{0};    // r3 of the first sighting
+    std::atomic<uint32_t> child{0};  // [obj+4] of the first sighting
+    std::atomic<uint32_t> hits{0};   // destroys of this exact pair
+    std::atomic<uint32_t> firstN{0}; // s_hFB0D8 value at the first sighting
+    std::atomic<uint32_t> lastN{0};
+    std::atomic<uint32_t> lastLr{0};
+    std::atomic<uint32_t> lastVt{0};
+};
+constexpr int kFb0d8Slots = 8;
+Fb0d8Pair g_fb0d8[kFb0d8Slots];      // key 0 in BOTH fields == free slot
+std::atomic<uint32_t> g_fb0d8Pairs{0};       // distinct (obj,child) pairs seen
+std::atomic<uint32_t> g_fb0d8Untracked{0};   // calls with no free slot left
+std::atomic<uint32_t> g_fb0d8Suppressed{0};  // rows the OLD gate would have printed
+
+// Find the slot owning (obj,child), else claim a free one. No allocation, no
+// guest value is asserted on -- an unreadable obj simply gets its own slot and
+// stays countable. Returns nullptr only when all kFb0d8Slots are in use.
+Fb0d8Pair* Fb0d8SlotFor(uint32_t obj, uint32_t child, bool* isNew)
+{
+    for (Fb0d8Pair& s : g_fb0d8)
+    {
+        if (s.obj.load(std::memory_order_acquire) == obj &&
+            s.child.load(std::memory_order_acquire) == child)
+        {
+            *isNew = false;
+            return &s;
+        }
+    }
+    for (Fb0d8Pair& s : g_fb0d8)
+    {
+        // Claim on the child word (0 = free) and publish obj first, so a
+        // reader never sees a half-written key.
+        if (s.child.load(std::memory_order_acquire) != 0)
+            continue;
+        s.obj.store(obj, std::memory_order_relaxed);
+        uint32_t expect = 0;
+        if (s.child.compare_exchange_strong(expect, child,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire))
+        {
+            *isNew = true;
+            g_fb0d8Pairs.fetch_add(1, std::memory_order_relaxed);
+            return &s;
+        }
+    }
+    return nullptr;
+}
+}  // namespace
+
 PPC_FUNC(sub_825FB0D8)
 {
     const uint32_t n = s_hFB0D8.fetch_add(1) + 1;
@@ -1172,12 +1281,74 @@ PPC_FUNC(sub_825FB0D8)
     const bool poisonVt =
         !readable || childVt == 0 || childVt == 0xCDCDCDCDu ||
         (childVt & 0xFFF00000u) != 0x82000000u || bodyPoison;
-    if (n <= 12 || poisonVt)
+    // F-633: count by (obj,child) FIRST, so the flood is bounded without
+    // losing the one fact the row exists to carry -- WHICH object, how many
+    // times, from where. `hits == 2` is the moment this object is entered a
+    // second time: that is the pathology (a node whose dtor is short-circuited
+    // below is never unlinked, so its caller loop re-enters it forever), so it
+    // gets its own named, bounded marker carrying the prior destroy's state
+    // rather than one more identical row.
+    bool isNew = false;
+    Fb0d8Pair* slot = Fb0d8SlotFor(obj, child, &isNew);
+    const uint32_t hits = slot
+        ? slot->hits.fetch_add(1, std::memory_order_relaxed) + 1
+        : g_fb0d8Untracked.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool reEnter = slot && hits == 2;
+    if (slot)
+    {
+        if (isNew)
+        {
+            slot->firstN.store(n, std::memory_order_relaxed);
+            slot->lastVt.store(childVt, std::memory_order_relaxed);
+        }
+        slot->lastN.store(n, std::memory_order_relaxed);
+        slot->lastLr.store(static_cast<uint32_t>(ctx.lr), std::memory_order_relaxed);
+    }
+    // The old gate's `|| poisonVt` term is what let a STABLY-poisoned pair
+    // print 270,216 times; the new rule keeps the full row for a new pair and
+    // drops the recurring one to the house cadence. `suppressed` keeps the
+    // withheld rows countable: printed + suppressed == s_hFB0D8.
+    const bool oldGate = (n <= 12 || poisonVt);
+    const bool printRow = isNew || n <= 12 || (n % 200) == 0;
+    if (oldGate && !printRow)
+        g_fb0d8Suppressed.fetch_add(1, std::memory_order_relaxed);
+    if (printRow)
         MCLA_LOG_WARN("FB0D8-DTOR #{:03} obj={:08X} child={:08X} childVt={:08X} "
-                      "+4={:08X} +12={:08X} lr={:08X}{}",
+                      "+4={:08X} +12={:08X} lr={:08X} hits={} suppressed={}{}",
                       n, obj, child, childVt, childP4, childP12,
-                      static_cast<uint32_t>(ctx.lr),
+                      static_cast<uint32_t>(ctx.lr), hits,
+                      g_fb0d8Suppressed.load(std::memory_order_relaxed),
                       poisonVt ? " POISON-SKIP" : "");
+    // slot != nullptr is REQUIRED here, not incidental: the (n % 200) arm can
+    // fire on a call that found no free slot. Those are still counted, in
+    // g_fb0d8Untracked, which FB0D8-TALLY prints.
+    if (slot && (reEnter || (n % 200) == 0))
+        MCLA_LOG_WARN("FB0D8-REPEAT #{:06} obj={:08X} child={:08X} hits={} "
+                      "first=#{:06} priorVt={:08X} priorLr={:08X} nowLr={:08X} "
+                      "dtorSkipped={} span_calls={}",
+                      n, obj, child, hits,
+                      slot->firstN.load(std::memory_order_relaxed),
+                      slot->lastVt.load(std::memory_order_relaxed),
+                      slot->lastLr.load(std::memory_order_relaxed),
+                      static_cast<uint32_t>(ctx.lr), poisonVt ? 1 : 0,
+                      n - slot->firstN.load(std::memory_order_relaxed));
+    if ((n % 2000) == 0)
+    {
+        uint32_t topHits = 0;
+        for (Fb0d8Pair& s : g_fb0d8)
+        {
+            const uint32_t h = s.hits.load(std::memory_order_relaxed);
+            if (h > topHits)
+                topHits = h;
+        }
+        // pairs=1 with topHits=n is the "one object, one child" signature.
+        MCLA_LOG_WARN("FB0D8-TALLY n={:06} pairs={} untracked={} suppressed={} "
+                      "topHits={} peak={}",
+                      n, g_fb0d8Pairs.load(std::memory_order_relaxed),
+                      g_fb0d8Untracked.load(std::memory_order_relaxed),
+                      g_fb0d8Suppressed.load(std::memory_order_relaxed),
+                      topHits, topHits == n ? 1 : 0);
+    }
     if (poisonVt)
     {
         // Child is the unfilled container (CDCD body): any virtual dtor
@@ -1220,6 +1391,11 @@ PPC_FUNC(sub_825EF100)
     // structure prevents the fatal in sub_825FDA90 (swfOBJECT::Fixup) and
     // lets the boot proceed. The guest's own FDBF8 will overwrite [obj+0]
     // with the real vtable (82085364).
+    // F-633: the +4=0 / +12=0 written below are read back forever after as
+    // "poison" by sub_825FB0D8's bodyPoison guard (see the header on that
+    // hook) and livelock sub_825EDC08 on obj=CB139580 -- measured 270,216
+    // re-entries in w658.log. An empty container is not poison; that guard's
+    // third clause is the defect. NOT changed here (do-not #1).
     const bool isCdcdTarget = (obj == 0xB7921000u || obj == 0xB7B41000u);
     const bool needsPrepop = isCdcdTarget && (vt == 0xCDCDCDCDu);
     if (needsPrepop)
