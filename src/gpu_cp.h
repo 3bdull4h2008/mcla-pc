@@ -82,6 +82,50 @@ void CpInstallMmioRouting();
 uint64_t CpSwapCount();
 uint64_t CpDrainCount();
 
+// F-647: READ-ONLY export of the Xenos register file (F-646's missing link).
+//
+// Reads up to `count` register values by Xenos register INDEX (not by dword
+// offset) and, for each, whether the guest has EVER WRITTEN that index.
+// `present[i]` non-zero == `values[i]` is the guest's value. `present[i] == 0`
+// == `values[i]` is the initialiser zero and MUST NOT be decoded: "never
+// written" and "written as 0" are different facts, and conflating them is how a
+// legal-but-wrong default (e.g. PA_SU_SC_MODE_CNTL=0 -> solid triangles, both
+// faces, CCW) gets built into a rasteriser. Either out-param may be null.
+//
+// `values`/`present` must each have room for `count` entries. Returns false if
+// any index was out of file range (counted as `oob`, not asserted); `indices`
+// are compile-time constants at every call site, so oob is a programming error,
+// never a guest value.
+//
+// THREAD SAFETY / LOCK ORDERING: no lock is taken. The register file and the
+// per-register presence bitmap are atomics, so this is safe to call from the
+// render thread while the command-processor thread pokes. Consistency is PER
+// REGISTER, not across registers -- there is no seqlock. This function takes no
+// other lock, so it is safe to call while holding the microcode window's mutex.
+// Full rationale and the rule for adding a seqlock later: the CpReadGuest-
+// Registers definition comment in src/gpu_cp.cpp.
+bool CpReadGuestRegisters(const uint32_t* indices, uint32_t count,
+                          uint32_t* values, uint32_t* present);
+
+// F-647: the three registers the renderer needs for raster/clip/viewport state
+// (F-646). Named HERE, at the producer, from the same table the consumer cites
+// (.research/xenia/src/xenia/gpu/register_table.inc:540-542,
+// XE_GPU_REGISTER(0x2204, kDword, PA_CL_CLIP_CNTL) / 0x2205 PA_SU_SC_MODE_CNTL
+// / 0x2206 PA_CL_VTE_CNTL), so the producer and
+// renderer::kXenosRegPa{ClipCntl,SuScModeCntl,ClVteCntl}
+// (src/renderer/pipeline_cache.h:101-103) cannot drift apart. These are
+// XENOS REGISTER INDICES.
+constexpr uint32_t kCpRegPaClipCntl = 0x2204u;
+constexpr uint32_t kCpRegPaSuScModeCntl = 0x2205u;
+constexpr uint32_t kCpRegPaClVteCntl = 0x2206u;
+// F-647: SQ_VS_CONST / SQ_PS_CONST, the guest VAs of the vertex and pixel
+// constant banks (register_table.inc:578-579). Read by index, exactly like the
+// three above; the VALUES are 32-bit guest VAs and must be read out of guest
+// memory through the checked, endian-explicit helpers -- never
+// reinterpret_cast, never asserted.
+constexpr uint32_t kCpRegSqVsConst = 0x2307u;
+constexpr uint32_t kCpRegSqPsConst = 0x2308u;
+
 // Advance guest publication counter (subctx+0) for all tracked devices.
 // Used to unblock guest fence waits when CP is idle but guest thinks work is pending.
 void CpAdvanceGuestPublication(uint32_t windowsCompleted);

@@ -64,6 +64,16 @@ extern "C" {
         /// The number of times an allocation request could not be completed due to the lack of memory or
         /// excessive fragmentation. OOM stands for "out of memory". This parameter is never decreased.
         uint64_t oom_count;
+
+        /// 2026-09-30, ADDED (see o1heapAllocateGranular): the number of times the fixed-granularity
+        /// search gave up because it walked O1HEAP_GRANULAR_MAX_HOPS links without finding a run.
+        /// A well-formed heap never reaches the cap, so a non-zero value here is a CORRUPTION SIGNAL
+        /// (a cyclic or self-referencing free list), not an out-of-memory signal. It exists because
+        /// O1HEAP_ASSERT is compiled out under -DNDEBUG on every build of this file, so a property
+        /// that must be observed at run time has to be observable through the diagnostics copy.
+        /// Appended LAST on purpose: the fields above keep their offsets, which the host reads by
+        /// hardcoded instance offsets (mask at instance+0x200, capacity at instance+0x208).
+        uint64_t granular_walk_capped;
     } O1HeapDiagnostics;
 
     /// The arena base pointer shall be aligned at O1HEAP_ALIGNMENT, otherwise NULL is returned.
@@ -95,6 +105,50 @@ extern "C" {
     /// The function is executed in constant time.
     /// The allocated memory is NOT zero-filled (because zero-filling is a variable-complexity operation).
     void* o1heapAllocate(O1HeapInstance* const handle, const size_t amount);
+
+    /// 2026-09-30, ADDED. Same semantics as o1heapAllocate() -- the returned pointer is aligned at
+    /// O1HEAP_ALIGNMENT, the 32 bytes below it are the fragment header, and the block is released by
+    /// passing the SAME pointer to o1heapFree() -- but the block is sized by rounding the request up to
+    /// `granularity` instead of up to a power of two. Everything else about the block, its neighbours,
+    /// its header and the diagnostics, is identical, so the two allocators are interchangeable.
+    ///
+    /// It exists because o1heap's sizing rule cannot express some requests at all. The power-of-two
+    /// charge is `roundUpToPowerOf2(amount + O1HEAP_ALIGNMENT)`, and a fragment that is the size of
+    /// the WHOLE arena can only be held by the arena itself: a request whose class exceeds the
+    /// capacity is unservable at every occupancy, so a pool can hold nearly all of its bytes free and
+    /// still be unable to answer. Use this for a physical/page-backed pool; leave o1heapAllocate()
+    /// alone for a heap whose size classes are part of the contract.
+    ///
+    /// `granularity` must be a power of two that is a multiple of FRAGMENT_SIZE_MIN; anything else is
+    /// REFUSED (NULL) rather than rounded, because the arena is a grid of FRAGMENT_SIZE_MIN cells.
+    ///
+    /// 2026-09-30 (F-642), SCOPE WIDENED, and the note above is what made that necessary. This header
+    /// previously said to call it "only for requests o1heapAllocate() has already proved it cannot
+    /// serve, so the scan is paid on a refusal path and never on the hot path". That was the F-641
+    /// threshold, and it was too narrow: being SERVABLE does not mean being served CHEAPLY. The
+    /// power-of-two rule wastes up to half the arena on every request, and on a 512 MiB console pool
+    /// that is the difference between a game that runs and one that exhausts its RAM (measured
+    /// 1.5130x charged bytes over the same requests; see the F-642 block beside kO1PageGranule in
+    /// src/kernel/heap.cpp). The reference allocator this sizing imitates has no size class at all --
+    /// BaseHeap::AllocRange reduces the request to a PAGE COUNT and scans a per-page table
+    /// (.research/xenia/src/xenia/memory.cc:924, :934, :949-988) -- so the page rule, not the
+    /// power-of-two rule, is the faithful one for that pool, and it is now used for the whole pool.
+    ///
+    /// THE COST OF THE SCAN, MEASURED, so the widening is not taken on trust. Unlike every other
+    /// entry point in this library, o1heapAllocateGranular() WALKS a free list rather than taking a
+    /// bin head, so it is not constant time and that is a real difference. On this machine, replaying
+    /// the request sequence measured in build/w672.log against a 512 MiB arena, it cost +24.9 ns per
+    /// allocation (+2.77%) alloc-only and +4.2 ns (+25.3%) with a free every third request, i.e.
+    /// 15-167 us across the whole 180-second run's 6,691 allocations. An instrumented COPY of
+    /// o1heap.c (the library file itself unmodified) counted the links the scan skips: ZERO, on all
+    /// 13,386 calls. The reason is structural rather than lucky: the scan starts at the charge's own
+    /// bin and walks up, every split leftover is binned strictly BELOW the class that produced it, and
+    /// o1heapFree() coalesces adjacent free runs, so free space migrates out of the bins the scan
+    /// would have to search. O1HEAP_GRANULAR_MAX_HOPS still bounds the pathological case and
+    /// `diagnostics.granular_walk_capped` still counts it, because O1HEAP_ASSERT is compiled out under
+    /// -DNDEBUG and a property that must be observed at run time has to be observable in the
+    /// diagnostics copy.
+    void* o1heapAllocateGranular(O1HeapInstance* const handle, const size_t amount, const size_t granularity);
 
     /// The semantics follows free() with additional guarantees the full list of which is provided below.
     ///

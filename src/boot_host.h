@@ -108,10 +108,108 @@ bool IsCountingSema(uint32_t handle, uint32_t *initOut = nullptr);
 // counter and says whether this row should be printed.
 bool CountingSemaAllow(uint32_t handle);
 
+// F-609: a real per-guest-thread identity block, for host threads the guest
+// believes are threads but which were NOT created by ExCreateThread -- the boot
+// worker, the vsync ISR, the audio thread, and the ~20 synthesized contexts in
+// gpu_device.cpp. Every one of those hard-aliases r13 = 0x8F200000
+// (SetupInitialContext's ThreadBlock, boot_host.cpp:731; kernel/imports.cpp:1735-1737;
+// apu/audio.cpp:73; gpu_device.cpp:20270,20285,20392 per its own comment), so the
+// owner key in
+// RtlEnterCriticalSection -- g_ppcContext->r13 (kernel/imports.cpp:1390, not r3
+// as the audit said) -- is the SAME value on all of them: spin-lock holders,
+// the TLS table at 0x8F201000 and cs->OwningThread all alias. That alias is
+// why the 5s CS-TIMEOUT force-steal (imports.cpp:1422-1431, which breaks
+// mutual exclusion by design) and KFSPIN-RECOVERY (imports.cpp:1525-1535)
+// exist at all; removing the steal is a separate job blocked on this one.
+//
+// Layout is GuestThreadContext's, copied from kernel/guest_thread.cpp:11-17 and
+// :40-48 rather than re-derived: two different block layouts is precisely the
+// split-brain this exists to remove. Blocks come from g_userHeap, the same
+// o1heap the real guest threads use (guest_thread.cpp:23), so a synthetic block
+// is indistinguishable from a real one to anything that walks r13.
+struct GuestThreadBlock
+{
+    uint8_t* pcr = nullptr;   // host base; MapVirtual(pcrVa) == pcr
+    uint32_t pcrVa = 0;       // guest VA -- this is what r13 must be
+    uint32_t tlsVa = 0;       // *(pcr + 0x000)
+    uint32_t tebVa = 0;       // *(pcr + 0x100)
+    uint32_t stackTopVa = 0;  // r1, top of the 0x40000 stack
+    const char* tag = nullptr;// static string naming the owning host thread
+    uint32_t cpuNumber = 0;   // *(pcr + 0x10C)
+    // False on an honest OOM (the F-370 path). A caller must not publish the
+    // VA in that case -- a half-built block is exactly the 0x8F200000 wipe
+    // that gpu_device.cpp:20559 already had to work around.
+    [[nodiscard]] bool valid() const { return pcr != nullptr; }
+};
+
+// Allocates and initialises one block, or nullptr on OOM. Never silent: the
+// nullptr path logs the F370-THREAD-CTX-NULL-shaped reason and count, because
+// guest_thread.cpp:26-37 showed what the unnamed version costs (memset(0) and a
+// silently dead thread). Log-only budget: first 16 and every 100th, so an OOM
+// storm cannot itself become the flood.
+GuestThreadBlock* AllocateGuestThreadBlock(const char* tag, uint32_t cpuNumber = 0);
+
+// Returns the payload to g_userHeap, erases the tag, and frees the descriptor.
+// Safe on nullptr. Does NOT free the stack -- the stack is inside the payload.
+void ReleaseGuestThreadBlock(GuestThreadBlock* block);
+
+// Attribution: the tag registered for a block's pcr VA, or nullptr if that VA
+// is not a live F-609 block. Lets a CS-TIMEOUT / spin-recovery line name WHICH
+// host thread holds or steals a lock instead of printing a bare 0x8F200000.
+// Read-only; a miss here can never change guest behaviour.
+const char* LookupGuestThreadBlockTag(uint32_t pcrVa);
+
 // Log bridge for the SEH-bearing boot TU. boot_host.cpp contains __try/__except
 // and cannot instantiate spdlog/fmt templates in the same TU (clang 19.1.7
 // ICEs in the X86 assembler); these forward to spdlog from a separate TU.
 void BootReportInfo(const char* line);
 void BootReportError(const char* line);
+
+// ===================== F-640: PHYSICAL-VIEW TRANSLATION =====================
+// The console maps physical memory through THREE page-size views that alias ONE
+// 512 MiB pool -- 0xA0000000 (64 KiB pages), 0xC0000000 (16 MiB pages, the GPU
+// write-back window) and 0xE0000000 (4 KiB pages), each declared with the full
+// 0x20000000 and passed the same parent heap
+// (.research/xenia/src/xenia/memory.cc:171-180). So `0xC0000000 + pa` and
+// `0xA0000000 + pa` are the same bytes, and that is what PhysToKernelVA's
+// `pa | 0xC0000000` (src/gpu_cp.cpp:1755-1756) converts a physical address into.
+//
+// THIS TREE HAS ONE FLAT 4 GiB WINDOW (a single VirtualAlloc, boot_host.cpp:677)
+// and `Translate` is `m_base + guestAddr` (src/kernel/memory.cpp:285-297), so a
+// view address is just more flat memory and NO view aliases the pool. Mapping the
+// views is not possible here -- two views of one host range need a section object,
+// the pool's bytes are a sub-range of a private allocation, and the view addresses
+// are inside an already-committed reservation; the reasoning is in full at the F-640
+// block at the top of boot_host.cpp. The mechanism is therefore translation, and
+// these are its entry points: a call site that holds a console-view address calls
+// TranslatePhysViewToPoolVa and gets the pool address, or an honest refusal.
+//
+//   kMapped      -- *outPoolVa is the pool address; use it.
+//   kNoPoolByte  -- the byte has no pool address in this tree (physical < 4 MiB, or
+//                   past the pool's window). The access CANNOT be honoured; it must be
+//                   dropped and counted, never silently redirected elsewhere.
+//   kNotAView    -- not a view address; the caller's model was wrong, not the memory.
+//
+// Both counters are published, attempts and outcomes separately, and every drop gets
+// its own `F640-CVIEW-DROPPED` line carrying its attempt index -- a bare `dropped=0`
+// with no adopted writer beside it is not a measurement, which is why
+// RegisterPhysAliasWriter exists and why `F640-PHYSALIAS-SUM` prints
+// `zero_is_measured=`.
+// =====================
+enum class PhysViewResult : uint8_t { kNotAView = 0, kMapped = 1, kNoPoolByte = 2 };
+
+PhysViewResult TranslatePhysViewToPoolVa(uint32_t viewVa, uint32_t* outPoolVa);
+
+// "A64K" / "C16M" / "E4K" for a view address, "-" for anything else. Classification only.
+const char* PhysViewName(uint32_t viewVa);
+
+// A call site that routes its accesses through the translation registers itself, so
+// the rows can say how many there are and a zero drop count can be read as a
+// measurement rather than as "nothing was ever routed here". Idempotent per name.
+void RegisterPhysAliasWriter(const char* site);
+
+// The one-line summary: calls / not_a_view / translated / dropped / adopted_sites /
+// zero_is_measured / sum_ok (the three outcomes must add up to calls).
+void LogPhysAliasRow(const char* reason);
 
 } // namespace mcla::boot

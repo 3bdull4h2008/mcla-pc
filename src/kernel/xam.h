@@ -1,6 +1,8 @@
 #pragma once
 #include <xbox.h>
 
+#include <cstddef>
+
 #define MSGID(Area, Number) (uint32_t)((uint16_t)(Area) << 16 | (uint16_t)(Number))
 #define MSG_AREA(msgid)     (((msgid) >> 16) & 0xFFFF)
 #define MSG_NUMBER(msgid)   ((msgid) & 0xFFFF)
@@ -31,3 +33,23 @@ uint32_t XamContentClose(const char* szRootName, XXOVERLAPPED* pOverlapped);
 uint32_t XamInputGetCapabilities(uint32_t unk, uint32_t userIndex, uint32_t flags, XAMINPUT_CAPABILITIES* caps);
 uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* state);
 uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION* vibration);
+
+// Guest controller-port plumbing (F-609). App owns the SDL event pump, so the
+// host side is split into a main-thread half (Init / Added / Removed / Poll /
+// Shutdown) and a read-only port map any caller can query. See the
+// threading-model comment block above XamInputGetCapabilities in
+// kernel/xam.cpp: the main thread owns every SDL_Gamepad* and samples it into
+// a snapshot; the guest thread never calls SDL. The hot-plug entry points
+// take the raw SDL_JoystickID so this header does not have to drag
+// <SDL3/SDL.h> into every translation unit that includes it.
+void XamInputInit();
+void XamInputGamepadAdded(uint32_t sdlJoystickId);
+void XamInputGamepadRemoved(uint32_t sdlJoystickId);
+void XamInputPoll();
+void XamInputShutdown();
+
+// The port map. XamInputPortCount() is the Xbox 360 bay count (4).
+// XamInputPortDevice() returns true only for real hardware; for the labelled
+// keyboard fallback it returns false but still fills outName.
+uint32_t XamInputPortCount();
+bool XamInputPortDevice(uint32_t port, char* outName, size_t cap, uint32_t* pInstance);
