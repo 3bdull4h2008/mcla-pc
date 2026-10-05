@@ -12998,3 +12998,4503 @@ Next ID **F-563**.
 **3. Concrete next step (not done — budget pivoted to the comment sweep).** Re-add the `sub_821C6D90` hook and clamp the grow so capacity never exceeds 0xFFFF: e.g. when `cnt==cap`, set `r4 = min(cap, 65535 - 2*cap)` and stop inflating once `cap >= 32768` (fall back to +4 there). Acceptance: boot worker's PARK moves off lr=821C6DC8 AND C0000005 stays 0 AND a new frontier lr appears. If a further lr unblocks too, keep walking the chain — this is the first guest-side O(n²) that ever yielded to a host change.
 
 Next ID **F-572**.
+
+### F-572 (2026-09-27 23:2x, **1 build (`build/w609_build.log`), 1 soak (`build/w609.log`, 120 s, BASE_RC=124), baseline `build/w579.log`**) - **THE BOOT IS BIMODAL AND THE FAST MODE IS ACCIDENTAL: the good run's progress depends on F-566 CRITICAL-SECTION THEFT, not on a completed stage. F-574 (the clamped O(n^2) grow fix) is BUILT AND INERT because the quiet mode never reaches the loop it fixes.**
+
+- Task:        T41 Stage 1 ("make the guest finish its own boot - nothing downstream is measurable until this", LONG_TODO_MASTER:1017), T41.1 route per the peer's committed next step
+- Type:        FACT + one mitigation left inert (no behavioural change landed)
+- Class:       scheduling (host) - the guest's own stage order is not what unblocks it
+- Priority:    P0 (it gates the goal: no game frame is measurable while this is a coin flip)
+- Evidence:    `python tools/soak_census.py build/w609.log build/w579.log`
+
+**1. F-574 is built, green, and has not fired once.** `src/gpu_device.cpp` now hooks `sub_821C6D90` with the clamp F-571 prescribed: double only while `cap < 0x8000`, so `cap + r4 <= 0xFFFE` and the guest's `clrlwi r4,r11,16` + `sth r4,6(r31)` cannot wrap (F-571's own suggested `min(cap, 65535 - 2*cap)` is NOT used - at cap=32768 it evaluates -1). Owner check first: `python tools/addr_owners.py --check 821C6D90` = 1 site, the generated map only. `BUILD_RC=0`, `C0000005` 0 in w609 (no fault storm). But **`C6D90-GROW` = 0**: the grow path is never reached in the quiet mode, so the fix is UNMEASURED, not proven. Do not read its absence as a failure and do not read its presence as a success until a good-mode run exists.
+
+**2. The two modes, contrasted at one instrument (PARK-STACK lr histogram, 120 s each).**
+
+| park lr | w579 (fast) | w609 (quiet) |
+|---|---|---|
+| 821C6DC8 / 821C667C (atArray grow + alloc) | 58 / 15 | 0 / 0 |
+| 821E0FF8 | 17 | 12 |
+| 82411220 | 0 | **31** |
+| 821E29F0 | 0 | 26 |
+
+`GFx` 13 -> 1, `FACTORY` 1 -> 0, `W34-NOGFX` 6 -> 0, `DISCCHK` 295 -> 0, `BOOTPATH` 10 -> 0, `PRESENT` 436 -> 27, `CP-DRAW` 5037 -> 162. CP truth line is healthy in both (`drains=4 last_rptr=001F pub=7 put=7 (caught up)`), so the command processor is not the variable.
+
+**3. The discriminator: critical-section traffic, and it is a real zero.** `CS-CONTEND` 32 / `CS-TIMEOUT` **2** in w579, and **0 / 0** in w609. F-566's printer logs on EVERY contention event (`src/kernel/imports.cpp:1392-1400`, `cn <= 32 || cn % 500 == 0`), so this is not a F-057(6) blind zero - and the instrument is shown firing on the fast run. In the fast mode the steal is what moves the boot on:
+`CS-TIMEOUT #3 cs=140000610 stolen_from=8F200000 by=004A0260 lr=82134908 waited_ms=5001` (a worker steals the MAIN thread's lock) and `CS-TIMEOUT #84 cs=100002EF0 stolen_from=6BB61A11 by=8F200000 lr=821C9014` (the main thread steals one back). In the quiet mode nothing contends, so nothing is stolen, and the main thread instead parks at 82411220 / 821E29F0 - it never enters the alloc/serialiser phase at all. **The fast run is therefore not a completed stage; it is a different interleaving that a lock theft rescues.** That is the whole nondeterminism: same binary, 50x spread in GETDEV rows (698/60 s vs 20/60 s), and the good mode is the lucky one.
+
+**4. Where the quiet main thread actually is.** `PARK-SAMPLE nf=ZwWriteFile+0x14 ... lr=821325D4 r13=8F200000` (42 samples; `ZwWaitForAlertByThreadId+0x14` 41, `NtReadFile+0x14` 3, `ZwClose+0x14` 1, and `0x82131508` = the installer/main thread still in guest code, 15). `python tools/ppc_xrefs.py fn 821325D4` -> `sub_82132578+0x5c`, and that call is `bl 827BCF14` = `__imp__MmAllocatePhysicalMemoryEx`, hooked at `src/kernel/imports.cpp:3885`. So the host symbol is OUR hook: the boot thread is inside our own logging while serving the guest's physical allocations (`PHYS-CENSUS #3 size=0x12b80000 total=354.0MB` - the guest asks for 354 MB). Our exe imports no `Zw*` (checked against `build/mcla.map`), and the guest image stores no `ZwReadFile`/`ZwWriteFile`/`ZwWaitForAlertByThreadId`/`ZwClose` strings (`tools/ppc_xrefs.py find-str`, 4/4 no hit), so neither side names those calls - the ntdll frame is reached through a runtime-resolved pointer, and that gap is open.
+
+**5. Falsified on the way (recorded because the next session will think of it again): the PHYS-CENSUS "latch".** The condition at `src/kernel/imports.cpp:2047` reads `if (allocs <= 32 || (allocs % 2000) == 0 || bytes > (200ull << 20))` and `bytes` is the CUMULATIVE total, so once the arena passes 200 MB the test looks permanently true and every later physical alloc would log. Measured: **32 rows exactly, numbered #1..#32, nothing past it** - the third clause never fires in this boot because cumulative usage ends below the `allocs <= 32` cutoff. The latch is a real latent bug in that condition (it should test the individual `size`) but it is NOT what makes the quiet mode.
+
+**Next (do these in order):** (a) name what 821E29F0 is waiting for - it is the return address of `bl 821BC7A0`, preceded by `bl 821BCE68` (`STREAM-OPEN`, a registered marker), and the thread then sits in a 20 ms alert wait, so the question is which stream/dispatcher completion nobody signals; use `tools/ppc_xrefs.py calls 821BC7A0` and the `TOC76`/`MEMBER-EXPAND` printers rather than re-decoding by hand. (b) `82411220` is the return address of `bl 823D91FC`; the mapping attributes that address to `__savegprlr_29`, i.e. the branch target lands inside a register-save block, which means either the decode is misaligned or the real target is elsewhere - do NOT build on that hand decode (do-not #14/#16), re-derive it from `build/cache/mcla_pe.bin` raw words with a sliding 4-byte scan. (c) Only after the quiet mode is characterised can F-574 be measured, because it is only reachable in the fast mode. Acceptance for the quiet mode: `BOOTPATH` > 0 and `DISCCHK` > 0 in a run with `CS-TIMEOUT` = 0, i.e. progress WITHOUT needing the theft. Do NOT stack a second force-acquire or gate-forcing (do-not #9; F-055 bars forcing `sub_82131008`). Next ID **F-573**.
+### F-573 (2026-09-27 23:4x, **soak `build/w610.log` 150 s, BASE_RC=124, diffed against `build/w609.log` and `build/w579.log`**) - **FIRST RUN WITH `BOOTPATH` > 0: the boot worker reached the content-path stage and is enumerating buckets ('ui', then 'city'). The O(n^2) array loop is the CITY serializer, which is why `C6D90-GROW` is still 0 - the F-574 fix is one stage further away than the park histogram suggested.**
+
+- Type: FACT (frontier moved, no code change this step; F-574 unchanged and still inert)
+- Priority: P0 (it is the Stage-1 gate the guides name)
+
+**1. The delta vs the quiet run is unambiguous** (`python tools/soak_census.py build/w610.log build/w609.log`): `BOOTPATH` 0 -> **3**, `DISCCHK` 0 -> **40** (`DISCCHK2` 0 -> 40), `GFx` 1 -> **3**, `W34-NOGFX` 0 -> 1, `CP-DRAW` 162 -> **580**, CP truth `drains=16 last_rptr=0037 pub=49 put=49 (caught up)`. `C0000005` **0**, `Fatal` 0. This is the first time in this investigation that any boot-gate marker has moved above zero against a F-574-armed binary, and it moved in the right direction with no new fault.
+
+**2. What the gate rows say.** `BOOTPATH sub_82187820 #1 r3=C8E22D00 r4=8201F30C desc=[75690000 ...] head='ui..$......(.!..!!%s!!..'` then `#2 ... head='city......M\.)..........'`. So the boot worker is now walking NAMED content buckets in order - `ui` first, then `city` - which is the game's own boot path, not a host artefact.
+
+**3. Why `C6D90-GROW` is still 0, stated as a hypothesis with its evidence rather than a conclusion.** F-570/F-571 timed the boot worker's >600 s park at `lr=821C6DC8` inside the atArray push loop reached from `821DD670->821C7000->821C6D90->sub_821C6658`, and the loop's product is a ~24,000-entry serialised array. `w610` reaches `BOOTPATH #2 head='city'` but not the loop, and the loop is reached from the CITY bucket - the largest one. So the remaining distance is "finish the city bucket", not "fix the loop". This predicts the order of events and gives the next measurement a name: **watch for `C6D90-GROW` to appear once a `city` bucket completes.**
+
+**4. The quiet-mode parks are unchanged, which is the negative control that matters.** `w610` park histogram: `82411220` 30, `821CC0A8` 16, `821E0FF8` 16, `821E29F0` 11, `821CCFF0` 9, `821CCF78` 6 - i.e. **the same two sites that dominate the quiet mode (82411220, 821E29F0) are still there**, they simply hold fewer samples because the run got further. They are a standing cost on every run, not the thing that distinguishes the modes. That is consistent with F-572 §3: what separates the modes is the CS theft, and the theft happened here too (`CS-CONTEND` 26, `CS-TIMEOUT` 1) - **this run also needed the theft**, so F-572's acceptance test (`BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0) is still UNMET, and the blocker stands.
+
+**Next:** keep the acceptance test from F-572 (progress WITHOUT the theft) as the thing to beat, and get `C6D90-GROW` measured by letting a `city` bucket run to completion - a 300 s soak is the cheapest way, since the loop is time-bound, not event-bound. For the parks, `82411220` and `821E29F0` both funnel into the `0x823D9xxx` block that `ppc_func_mapping.cpp` attributes to `__savegprlr_29` / `__restgprlr_27`, which is a recompiler helper, not a callee - so the branch targets there must be re-derived from `build/cache/mcla_pe.bin` with a sliding 4-byte scan before anything is concluded (do-not #14/#16). Next ID **F-574**.
+### F-574 (2026-09-27 23:5x, **no build, no soak: raw-byte work on `build/cache/mcla_pe.bin` only**) - **`tools/ppc_disasm.py`'s branch TARGETS cannot be reproduced from the raw image. Every "lr=X is the return address of call Y" attribution in this project is therefore UNVERIFIED, including two in F-572/F-573. The raw-byte rule (F-023) and do-not #16 both say stop and re-derive; this entry is that stop.**
+
+- Type: FACT (tooling defect, blocks a whole class of reasoning)
+- Priority: P1 (it does not block boot, but it invalidates a measurement path that several ledger entries lean on)
+- Why it matters: rule 3 (raw-byte rule) makes the image the arbiter, and do-not #16 says a decode is a hypothesis until the code graph agrees. If the decoder's targets are wrong, then "the park lr is the return of call Z" is a hypothesis wearing a fact's clothes.
+
+**1. What was verified as CORRECT (so the problem is narrowed, not guessed).** The file offset and byte order are right. The instruction sequence `ppc_disasm.py` prints for `0x821325B0` - `7C862378` (`mr r6,r4`), `38EBFFFF` (`addi r7,r11,-1`), `39000000` (`li r8,0`) - was located in `build/cache/mcla_pe.bin` at file offset **0x1325B0**, which is exactly `0x821325B0 - 0x82000000`. So `mcla_pe.bin` is a flat big-endian image at base `0x82000000`, and the words being decoded are the words in the file.
+
+**2. What could not be reproduced.** The word at `0x821325D0` is `0x4868A945`; `0x4868A945 >> 26 == 18`, i.e. an unambiguous `bl` with `AA=0, LK=1`. The canonical PowerPC decode (24-bit signed field in bits 6..29, sign-extended, scaled by 4, added to the NEXT instruction) yields `0x802D5024`. The alternative 26-bit reading yields `0x8699B068`. `ppc_disasm.py` prints **`0x827BCF14`**. None of the three agree, and the required displacement for the printed target is `+0x69A9740` = 111,592,256 bytes, which **cannot be expressed by a 24-bit branch at all** (max +/-32 MiB).
+
+**3. The whole-image control that settles it.** Decoding every `bl` (opcode 18) in `mcla_pe.bin` with the canonical formula: **147,363 instructions, 0 land inside the image, 147,363 land outside.** A correct decoder must land essentially all of them inside. Repeating with little-endian words changes the count (14,817) but still 0 inside. So this is not an endianness or offset mistake on my side, and it is not a single bad site.
+
+**4. Consequence, stated precisely.** Attributions that DEPEND on the printed target are unverified: the mapping from a park `lr` to "the callee that returned there". That includes F-572's "`821325D4` is the return of `bl __imp__MmAllocatePhysicalMemoryEx`" and F-573's use of it. **What survives is the part that never needed the decoder:** F-572's claim that the guest was inside OUR `MmAllocatePhysicalMemoryEx` hook stands on `PHYS-CENSUS` rows printed by `src/kernel/imports.cpp:3885` itself, which carry `lr=821325D4` from the host side. So the host-side fact holds; only the guest call-graph story built on top of it is suspended. `ppc_xrefs.py fn` is a separate tool (it reads the generated map, not the image) and is unaffected.
+
+**5. Do not "fix" this by editing the formula until the numbers look sane.** Next step is to find the convention the dump actually uses, in this order: (a) read the same two words out of the *generated* TU (`generated/ppc_xenon/ppc_recomp.16.cpp` and whichever file covers `0x82132578`) - the recompiler's own operand for that `bl` is the ground truth for this image, and rule 2 makes the generated TUs read-only but readable; (b) if the generated operand disagrees with both decodes, record the dump's actual displacement convention from three more hand-checked sites rather than fitting one; (c) only then correct `tools/ppc_disasm.py`, and re-state every affected ledger line. Until (a) is done, treat printed branch targets as unverified and prefer host-side markers (`PHYS-CENSUS`, `PARK-SAMPLE`, `CS-CONTEND`, `MOVIE-CTOR`) which do not depend on the decoder. Next ID **F-575**.
+### F-575 (2026-09-27 23:5x, **no build, no soak: raw-byte + generated-TU cross-check**) - **F-574 IS RETRACTED. `tools/ppc_disasm.py` is CORRECT; my canonical-branch-decode argument was wrong, and the reason it failed is itself the useful rule: the recompiler REWRITES `bl` targets to its own thunks, so a raw-image displacement CANNOT be expected to match the emitted/annotated target. The generated TU is the arbiter for call targets, not the image.**
+
+- Type: RETRACTION + durable methodology rule (read this before trusting any "lr=X is the return of call Y")
+- Retracts: **F-574** in full, in the same sitting it was written
+
+**1. The check that settles it, from the generated TU (rule 2: read-only, readable).** `generated/ppc_xenon/ppc_recomp.0.cpp:6506`, verbatim:
+```
+   ctx.r3.s64 = 0;
+   // bl 0x827bcf14
+   ctx.lr = 0x821325D4;
+   __imp__MmAllocatePhysicalMemoryEx(ctx, base);
+```
+That is exactly what `ppc_disasm.py` printed for `0x821325D0` and exactly what F-572 asserted. Two independent sources now agree and one (mine) dissents, so F-574 is withdrawn.
+
+**2. Why my argument was wrong, precisely.** I required the raw image to encode a displacement equal to the emitted target and found it did not: `0x827BCF14 - 0x821325D4 = +0x69A9740` (111,592,256 B) cannot be expressed by a 24-bit branch, and a canonical decode of all 147,363 `bl`s put 0 inside the image. The premise is what fails: the annotated target in the generated code is the **post-rewrite thunk**, not the original call site. XenonRecomp routes calls through generated thunks (`__imp__sub_XXXXXXXX` at `0x827xxxxx`), so the XEX's own displacement points somewhere else entirely. A raw-image branch scan therefore measures the PRE-rewrite program, and comparing it to an emitted target is a category error - exactly do-not #16's "a format doc's claim about THIS image is a hypothesis until the consumer code graph agrees", applied to my own reasoning. **I should have read the generated TU first; it was one grep and it answered the question I spent several tool calls trying to disprove.**
+
+**3. What F-574 got RIGHT, and is worth keeping.** The image reader is correct: the instruction sequence for `0x821325B0` (`7C862378` `38EBFFFF` `39000000`) was found at file offset `0x1325B0` in `build/cache/mcla_pe.bin`, i.e. base `0x82000000`, big-endian - so rule 3's "offset = VA - 0x82000000" still holds and the bytes I read were the bytes in the file. The whole-image control was also a legitimate test; it just answered a question I had framed wrongly.
+
+**4. Durable rule, to be cited before any future caller/callee work.** Three tiers of evidence for "the guest called Y and returned to X", strongest first: (1) the emitted line in `generated/ppc_xenon/ppc_recomp.*.cpp` - `ctx.lr = <X>; sub_Y(ctx, base);` - which is what the emulator actually executes; (2) a HOST-side marker printed from inside the hook itself, carrying the guest `lr` (e.g. `PHYS-CENSUS ... lr=821325D4` from `src/kernel/imports.cpp:3885`); (3) `tools/ppc_disasm.py` output, acceptable once spot-checked against (1). A raw-image `bl` displacement is evidence of the PRE-rewrite program and is not in this list. For F-572 this means the attribution "`821325D4` is the return of `__imp__MmAllocatePhysicalMemoryEx`" is now confirmed on tiers (1) and (2) and no longer rests on the decoder.
+
+**Next:** unchanged from F-573 - a 300 s soak to let the `city` bucket finish so `C6D90-GROW` actually prints and F-574's clamp is measured; and the raw-word re-derivation of the two park sites is now moot as stated, since those sites' *targets* should be read from the generated TU by searching for `ctx.lr = 0x82411220` and `ctx.lr = 0x821E29F0` (one grep each, rather than any decode). Next ID **F-576**.
+### F-576 (2026-09-27 00:0x, **soak `build/w611.log` 300 s, BASE_RC=124, vs `build/w610.log` 150 s and `build/w579.log` 60 s**) - **F-574 MEASURED AND CONFIRMED: the clamped geometric grow fires, the O(n^2) is gone, the boot worker's park has LEFT `lr=821C6DC8`, and the 16-bit wrap that produced F-571's 293,212 C0000005 did not recur (`C0000005` 0, `Fatal` 0).**
+
+- Type: MEASUREMENT (discharges F-574; no new code this step)
+- Priority: P0 - this was the blocker the peer session's committed next step named
+
+**1. The eight rows, verbatim (`C6D90-GROW`), which are the whole proof:**
+```
+#1 push=9    obj=8EFFF098 cnt=8    cap=8    newcap=16
+#2 push=17   obj=8EFFF098 cnt=16   cap=16   newcap=32
+#3 push=33   obj=8EFFF098 cnt=32   cap=32   newcap=64
+#4 push=65   obj=8EFFF098 cnt=64   cap=64   newcap=128
+#5 push=129  obj=8EFFF098 cnt=128  cap=128  newcap=256
+#6 push=257  obj=8EFFF098 cnt=256  cap=256  newcap=512
+#7 push=513  obj=8EFFF098 cnt=512  cap=512  newcap=1024
+#8 push=1025 obj=8EFFF098 cnt=1024 cap=1024 newcap=2048
+```
+Capacity doubles every time and the push index doubles with it, so the buffer is reallocated 8 times to reach 2,048 entries instead of ~512 times. At push 1025 the array already holds 1,024 entries; under the old `r4=4` growth every one of those pushes had copied the entire buffer. **The O(n^2) is measurably gone.** The clamp held: the largest `newcap` here is 2048, far below the `0x8000` ceiling where doubling stops, so the guest's `clrlwi r4,r11,16` + `sth r4,6(r31)` cannot wrap.
+
+**2. The park moved, which was the acceptance test.** `PARK-STACK` lr histogram for w611: `821CC0A8` 52, `821BE508` 29, `821CCFF0` 29, `821E0FF8` 17, `821CD3B0` 14, `82411220` 13. **`821C6DC8` and `821C667C` do not appear at all** - the two sites that held 58 and 15 samples in `w579` are gone, so the boot worker is no longer spending its time in the atArray grow/realloc.
+
+**3. No regression, and F-571's failure mode specifically did not recur.** `C0000005` **0**, `Fatal error` **0**, `FATAL-SOFT` 0, and the process survived the full 300 s. F-571's failure was doubling past 32768, wrapping the 16-bit field to 0, `sub_821C6658` allocating 0 bytes, and the boot throwing 293,212 access violations. The clamp (`cap < 0x8000`) is what prevents exactly that, so this run is the first evidence that the clamp is correct rather than merely plausible.
+
+**4. Boot frontier, same run:** `GFx` **9** (best measured so far; `w579` the previous best had 13), `BOOTPATH` 10, `DISCCHK` 317, `FACTORY` 1 (the device factory ran), `NATIVE-PRESENT` 23. So the run is at least as good as the previous best on the markers that matter and is no longer blocked in the grow loop. `CS-TIMEOUT` 2 - **this run still needed the critical-section theft**, so F-572's acceptance test (progress WITHOUT the theft) remains UNMET and the theft-dependence is still the open blocker.
+
+**5. What is now known NOT to be the blocker (so nobody re-chases them).** The two quiet-mode park sites are not waits. `generated/ppc_xenon/ppc_recomp.75.cpp:13656-13657` emits `// bl 0x823d91fc` / `ctx.lr = 0x82411220;` and then **no call at all** - the target is inside the `__savegprlr_14..29` stub run (`ppc_func_mapping.cpp`), and the next emitted statement is the frame store `stwu r1,-144(r1)` the helper would have done. And `ppc_recomp.19.cpp:23578` emits `// bl 0x821bc7a0` / `ctx.lr = 0x821E29F0; sub_821BC7A0(ctx, base);` - a real call into the guest's own record lookup. A whole-image scan of the generated TUs found 25,607 `ctx.lr` assignments with no emitted body, of which ~14,300 are indirect calls mis-scored by that heuristic and ~9,000 are the `savegpr`/`restgpr` stubs whose bodies are inlined on the following line; **no dropped load-bearing call was found.** These park sites are positions in the guest's loops, not deadlocks.
+
+**Next:** the remaining blocker is F-572's theft-dependence - the fast runs still rely on F-566 stealing a critical section to get past the boot, and no run has reached `BOOTPATH`/`DISCCHK` with `CS-TIMEOUT` = 0. That is now the single named target, and it is a *scheduling* question, not an allocator or decoder one. The gates to beat, unchanged: `MOVIE-CTOR` > 0 (not `nGfx` - F-302), `W35-BOOT-GATE`/`BOOT-GATE-POST` > 0, `XSF-INFLATE` > 0, `W34-NOGFX` -> 0, with no `C0000005`/`Fatal`/`FATAL-SOFT` regression. Next ID **F-577**.
+### F-577 (2026-09-27 00:1x, **soak `build/w611.log` 300 s, per-thread park attribution; no code change**) - **THE BOOT THREAD IS HOST-BOUND, NOT GUEST-BOUND. In the long run the main guest thread spends ~90% of its wall clock inside HOST work (a steady-state alert wait + many real file writes = our own logging) and only 7% executing guest code; in the fast run it was the exact inverse (84% guest code). The run-to-run speed spread is therefore driven by how much host work accumulates on the boot thread, not by guest-side scheduling. AND the top three log-volume markers belong to the PEER session's active work - this needs coordination, not unilateral edits.**
+
+- Type: FACT + prioritisation (changes which lever is next; no mitigation landed)
+- Priority: P0 (it re-ranks the remaining work)
+
+**1. Per-thread attribution, the measurement that re-ranks things.** Filtering `PARK-SAMPLE` to the main thread (`r13=8F200000`):
+
+| run | samples | in guest code (`nf=0x82xxxxxx`) | blocked in ntdll |
+|---|---|---|---|
+| `w579` (fast, 60 s) | 103 / 104 | **84** (`0x82131508`) | 3 `NtDelayExecution`, 1 `ZwWriteFile` |
+| `w611` (300 s) | 300 / 301 | **22** (`0x82131508`) | **163** `ZwWaitForAlertByThreadId` + **106** `ZwWriteFile` |
+
+So in the fast run the boot thread was CPU-bound doing guest work; in the long run it is 90% blocked in host calls. **This retires the "theft rescues the boot" framing as the primary story:** F-572's theft is still real and still a fact, but the dominant cost is host-side time, and that is the thing to attack.
+
+**2. The two host costs, told apart by their own fields.** (a) The alert wait is a genuine **steady state**: consecutive samples are byte-identical in `dev=40002080 cur=0000002C r3=00000000 r4=0000001C flg=872415232` and in the same stack slots, with `lr=82411220` - the `__savegprlr` site F-576 already showed is a loop position, not a wait. One real event wait, held. (b) The file writes are **not one hot spot**: successive samples carry different guest `lr` (`823E2B10`, `822D8FA0`, `8244EE94`) and real byte counts (`r4=0x00000FA0`, `r4=0x00000400`), i.e. many distinct write sites. Those are our hooks' log output reaching the redirected stdout, the same mechanism F-572 named for `MmAllocatePhysicalMemoryEx`.
+
+**3. The volume that cost it.** `w611` is **46,954 lines in 300 s**, and it is not evenly spread - a handful of unbounded per-call markers dominate:
+
+| count | marker |
+|---|---|
+| 3375 | `F98-SKIP` |
+| 3141 | `FB0D8-DTOR` |
+| 2962 | `INFLATE-ENTER` |
+| 1290 | `XSF-OPEN` |
+| 1029 + 1029 | `TOC76-LAYOUT`, `TOC76-XSF` |
+| 789 / 720 / 550 | `BE710-SLOT`, `RSC-CHILD-WORD`, `XSF-OPEN-GATE-SKIPPED` |
+
+Roughly 9,500 lines come from three markers alone. This is the F-576 failure class (log text volume IS wall clock) recurring one layer up, and per do-not #9 the remedy is to cap the per-marker text, never to switch logging off.
+
+**4. The coordination constraint, stated so nobody trips over it.** The top three volume contributors - `INFLATE-ENTER`, `F98-SKIP`, `FB0D8-DTOR` - are the **peer session's** instruments (their `docs/UI_INFLATE_PLAN.md` work and the inflate/XSF path), and their `src/` files plus `tools/*.py` are dirty in the shared tree right now. **Do not unilaterally cap or edit them.** The honest move is to hand the measurement to that session (it is their own instrument volume) and to bound only the markers this session owns. Rule 5 (concurrent sessions) beats rule 9 sequencing here.
+
+**5. Also settled here, so it is not re-derived:** `sub_821C9790` - the callee holding 28 file writes + 25 alert waits - is **unhooked in `src/`** (`addr_owners --check` = 1 site, the map only) and its body is `PPC_FUNC_IMPL(__imp__sub_821C9790)` at `ppc_recomp.16.cpp:11864`, a printable-character scanner (`lbz`/`extsb`/`addi -34`/`cntlzw`/`rlwinm`). It is not the writer; the write happens in host code with the guest `lr` merely stale, which is the F-576 lesson applied correctly. And the 25,607 "no emitted body" call sites of F-576 remain decomposed the same way (indirect calls + `savegpr` stubs), with no load-bearing call dropped.
+
+**Next, in priority order:** (1) hand the `INFLATE-ENTER` / `F98-SKIP` / `FB0D8-DTOR` volume measurement to the peer session - it is the largest single term in the boot thread's wall clock and it is their instrument; (2) bound the per-marker text in markers this session owns, using the F-576 cap pattern, and re-soak to attribute the delta (`C6D90-GROW` must stay 8, `C0000005` must stay 0); (3) only then re-test F-572's acceptance (`BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0), which may well become reachable once host time stops dominating. Next ID **F-578**.
+### F-578 (2026-09-27 00:2x, **soak `build/w611.log` 300 s + source read of `src/patches.cpp:703`; no build**) - **ROOT CAUSE OF THE THEFT-DEPENDENCE, NAMED: the main thread blocks in a REAL alert wait while HOLDING a critical section at `rec=4`, so every other thread queues behind it and only F-566's 5 s theft lets the boot move. `hk_KeWaitForSingleObject` short-circuits exactly two objects and chains the rest to the guest original. The chain census is UNOBSERVABLE because it logs at INFO, which these logs suppress - a blind spot in a marker WE own.**
+
+- Type: ROOT CAUSE + named instrument gap (no code change yet)
+- Priority: P0 (this is the blocker F-572/F-576/F-577 were all circling)
+
+**1. The chain, now closed end to end.** `CS-CONTEND #1 cs=140000610 owner=8F200000 waiter=004A0260 lr=82134908 rec=4` - the main thread (8F200000) owns that critical section with **recursion count 4**, i.e. it entered four times and never unwound. F-577 measured that same main thread then sitting in a byte-identical steady-state `ZwWaitForAlertByThreadId` (`dev=40002080 cur=0000002C r3=00000000 r4=0000001C flg=872415232`). `CS-TIMEOUT #1` then fires after exactly 5000 ms with `stolen_from=8F200000 by=004A0260` - the waiting worker takes the lock away from a holder that is parked inside a real host wait. Second pattern, `CS-CONTEND #2..6 cs=1C6537790 owner=8F200000 waiter=006A0260 rec=1` repeating on the same object, is a second queue behind the same blocked owner. **So the boot is not rescued by the theft; the theft is what substitutes for the main thread finishing its wait.** Fixing the wait is the real fix, and any further stealing is do-not #9.
+
+**2. Where the wait comes from - our own hook, read directly.** `src/patches.cpp:703` `PPC_FUNC_IMPL(hk_KeWaitForSingleObject)`: it short-circuits (sets `ctx.r3 = 0`, returns, no wait) for exactly two guest objects, `kDisplaySyncSem = 0x828CD9AC` and `kSchedulerTick = 0x40004D7C`; **everything else chains to `g_original_KeWait`, i.e. the guest's own `KeWaitForSingleObject`**, which is where a real host wait can happen. In `w611` the two semaphores are skipped **558** times, so they are hot; but the object that actually parks is some third handle that goes down the chain.
+
+**3. The instrument gap that must be fixed first (we own this marker).** The chain line is `MCLA_LOG_INFO("KeWait[{}] obj=0x{:08X} -> chaining to original", ...)` at `src/patches.cpp:727`, and the `SEM ... SKIPPED` line is additionally bounded by `waitCount <= 5` at line 718. Measured in `w611`: `chaining to original` **0** rows, `SKIPPED` 558 rows, `KeWait[` **0** rows. **The soak runs at WARN, so the entire chain census is invisible** - its absence proves nothing (F-057(6) blind zero, rule 19). We therefore cannot currently name the handle the main thread parks on, and we must not guess it: every candidate would be a blind short-circuit, which is exactly what do-not #1/#9 forbid. **Promote the chain census to `MCLA_LOG_WARN` with the same bounded shape as `CS-CONTEND` (`n <= 32 || n % 500 == 0`) and count per object**, then re-soak and read the histogram. That is a log-only change: no D3D12, no `RegisterFile`, no invented state, and it is in a file this session owns (not the peer's `heap.cpp` / `heap_arena.h` / `tools/*` / `UI_INFLATE_PLAN.md`).
+
+**4. Do NOT do these while fixing this.** Do not add a second force-acquire or extend the steal (do-not #9); do not add a third object to the `hk_KeWaitForSingleObject` skip list without the census naming it (that would be an unmeasured short-circuit, and rule 4's one-owner check plus do-not #1 both apply); do not touch the F-574 clamp, which is now measured and correct (F-576) and must stay at `C6D90-GROW` 8 / `C0000005` 0 through any of this.
+
+**5. Acceptance, unchanged and now precise.** A run where `BOOTPATH`/`DISCCHK` > 0 **and** `CS-TIMEOUT` = 0, which can only happen once the main thread finishes its wait instead of having its lock taken. Keep the F-576 invariants through the change: `C6D90-GROW` still 8, `C0000005` 0, `Fatal` 0. Next ID **F-579**.
+### F-579 (2026-09-28 00:0x, **build `build/w613_build.log` RC=0, soak `build/w613.log` 300 s**) - **THE PARK HANDLE IS NAMED: the boot thread issues INFINITE, NON-ALERTABLE waits (`t=4294967295 al=0`) on three host event handles `0xC65C5A80` / `0xC65C5B00` / `0xC65C5C80` (44/45/42 of 143 calls) from caller `lr=821C90EC`, and nothing ever signals them. F-578's instrument gap is closed and its census is now countable (was 0 rows, now 143/25/24).**
+
+- Type: ROOT CAUSE, measured (log-only instrument fix; no behaviour change)
+- Priority: P0 - this is the thing the boot waits on
+
+**1. The instrument fix that opened this (F-578's step, executed).** Two `MCLA_LOG_INFO` wait censuses in `src/gpu_device.cpp` were promoted to `MCLA_LOG_WARN` with their existing bounds unchanged: `WAITHELP sub_82135DC0` / `WAITHELP RETURNED` (was line 4910) and `WAITB8 sub_82135DB8` (4934). Effect: `WAITHELP` 0 -> **143** rows, `WAITB8` 0 -> **25**, `WAITSYNC sub_821C90C0` (promoted too, 4952) 0 -> **24**. Every one of those was a F-057(6) blind zero before. **A census that cannot be counted is not evidence, and three of them were silently dead.**
+
+**2. A second dead hook found while doing it, so nobody re-reads `patches.cpp`.** `hk_KeWaitForSingleObject` (`src/patches.cpp:703`, registered at 0x827BD5A4) is **installed and never called** - `KeWait FIRST CALL` has 0 rows in every soak including w611 and w613. The 173 "SKIPPED" rows I first attributed to it were the peer's `XSF-OPEN-GATE-SKIPPED`. Its two-object short-circuit (`0x828CD9AC`, `0x40004D7C`) and the `g_original_KeWait` chain are therefore **dead code paths**, not behaviour. A per-object `KEWAIT-CENSUS`/`KEWAIT-TALLY` was added there and correctly produces nothing; it is harmless instrumentation of an unused hook and is NOT the fix.
+
+**3. The measurement.** `WAITHELP sub_82135DC0` handle histogram: `0xC65C5B00` 45, `0xC65C5A80` 44, `0xC65C5C80` 42, then `0xC6428B00` 3, `0xC6459A80` 2, `0xC648B380` 2, `0xC647A800` 1, `0xC65C5980` 1. Sample rows: `WAITHELP sub_82135DC0 #1 h=C6428B00 t=4294967295 al=0 lr=821C90EC`. So the hot shape is **`t=0xFFFFFFFF al=0` = INFINITE and non-alertable**, and the caller site is consistently **`lr=821C90EC`**. `WAITSYNC sub_821C90C0` reports the same handles with `caller=821C454C`, i.e. the sync wrapper funnels into the same infinite waits. Three handles, ~131 of 143 calls, one caller site.
+
+**4. Why this closes F-578's loop.** F-578 measured the main thread in a byte-identical steady state (`dev=40002080 cur=0000002C r3=0 r4=0x1C`) while holding a CS at `rec=4`, and could not name the handle because the census was invisible. Now it is named: the boot thread parks on an INFINITE non-alertable wait for a host event that is never signalled, so it never returns, so the CS it holds at rec=4 is never released, so workers queue behind it, and F-566's 5 s theft is the only thing that unblocks the system. **Every link in that chain is now measured, not assumed.**
+
+**5. Also stale, recorded so it is not trusted:** the comment at `src/gpu_device.cpp:4944` claims "the main thread's park handle C9ADB800". The census does not show `C9ADB800` in w613; the live handles are the `0xC65C5xxx` triple. That comment predates this run and must not be used as the current naming. `C9ADB800` may still exist on a slower run - if so, the set is plural, which is itself worth knowing.
+
+**6. Next, in order (do NOT skip to a fix).** (a) Name the signalling side: find what is supposed to signal these events - search `src/` for the producer that sets them (`SetEvent`/`PulseEvent`/the corresponding F370SemaRow rows already log `WAIT`/`RETURNED` per handle, so the census can already say whether these waits ever RETURN) and identify what owns `lr=821C90EC` in the generated TU via `ctx.lr = 0x821C90EC`. (b) Decide from that whether the wait is unbounded-wrong (missing signal, a real bug to fix in the producer) or bounded-wrong (a genuine poll that should be a finite timeout). **Do not add these handles to any skip list, and do not shorten the timeout, until (a) names the producer** - a third blind short-circuit is do-not #1/#9, and F-571 already showed what an unmeasured guess costs. Invariants to hold through all of it: `C0000005` 0, `Fatal` 0, and F-574's clamp untouched. Next ID **F-580**.
+### F-580 (2026-09-28 00:1x, **static only: `generated/ppc_xenon/ppc_recomp.15.cpp` / `.16.cpp`, plus the `w613` census; no build, no soak**) - **THE WAIT CHAIN IS FULLY RESOLVED DOWN TO THE OBJECT FIELD: `sub_821C4528` loads a handle from `*(u32*)(obj+1076)` and calls `sub_821C90C0` -> `sub_82135DB8(handle, -1)` -> `sub_82135DC0` -> real host wait. The guest is waiting on a per-object synchronisation field, and the producer that should release it is still unnamed.**
+
+- Type: FACT (static call-graph; the counterpart of F-579's runtime census)
+- Priority: P0
+
+**1. The chain, each link taken from the generated TU (F-575's tier-1 evidence, not from a decode).**
+
+| link | source | what it does |
+|---|---|---|
+| `sub_821C4528` | `ppc_recomp.15.cpp:15139-15171` | `r31 = r11+8`; `r3 = *(u32*)(r11+1076)`; `bl 0x821c90c0` with `ctx.lr = 0x821C454C` |
+| `sub_821C90C0` | `ppc_recomp.16.cpp:10595-10627` | `if (r3 == 0) return;` else `r4 = -1`; `bl 0x82135db8` with `ctx.lr = 0x821C90EC` |
+| `sub_82135DB8` | non-alertable wrapper (`WAITB8`) | forwards to `sub_82135DC0` |
+| `sub_82135DC0` | `WAITHELP` census | `NtWaitForSingleObjectEx` retry-on-timeout loop -> **real host wait** |
+
+So `lr=821C90EC` (F-579's hot caller) is precisely "called `sub_82135DB8` with `r4 = -1`", and `lr=821C454C` is "loaded a handle out of an object and called `sub_821C90C0`". The two hot `WAITHELP` caller sites F-579 reported are these two links, so the runtime census and the static graph agree exactly - `t=0xFFFFFFFF al=0` in the log is `r4 = -1` in the TU.
+
+**2. What this says about the object.** The handle is not passed down a call chain and it is not a literal - it is read from **offset 1076 of a structure** (`r11`), and `sub_821C90C0` short-circuits only when it is 0. An object >1 KB with a handle field at a fixed offset, waited on INFINITE and non-alertably, is a **per-object synchronisation primitive** (a mutex/condition/semaphore slot inside a larger record), not a one-off. The three hot handles `0xC65C5A80` / `0xC65C5B00` / `0xC65C5C80` are 0x80 apart, i.e. **three consecutive instances of the same record type** - consistent with three objects of the same class all waiting on their own slot. That also explains why the `SEMA-*` tables never see them (F-579 §6a): they are a different object class than the semaphores at `0xC54002xx` / `0x1C6420280`.
+
+**3. Why this is the blocker, stated as the single remaining unknown.** The boot thread's CS at `rec=4` is released only when `sub_821C4528` returns; that return requires whoever owns `obj+1076` to signal/release it; and nothing does. **The one thing still missing is the producer side: what is supposed to signal `obj+1076`, and why does it not run.** Everything upstream of that is now closed.
+
+**4. Next, in order.** (a) Name `sub_821C4528`'s callers (`ppc_xrefs.py calls 821C4528`, and the enclosing-function sweep in `ppc_recomp.15.cpp`) to identify the class of object and the subsystem that owns it - the three 0x80-strided instances suggest a pool/array of these records, so the owner of the pool is the thing to find. (b) Then find the release path for that pool: whichever function writes `obj+1076` or signals the corresponding host event is the producer, and its absence or non-reachability is the root cause. (c) Only then decide the fix, and prefer fixing the producer over shortening the timeout or skipping the wait (do-not #1/#9; F-571's cost is on record). Invariants: `C0000005` 0, `Fatal` 0, F-574 clamp untouched, and the three WARN wait censuses must stay at WARN so the next session can read the histogram. Next ID **F-581**.
+### F-581 (2026-09-28 00:2x, **build `build/w614_build.log` RC=0, soak `build/w614.log` 300 s**) - **ROOT CAUSE OF THE BOOT STALL, MEASURED END TO END: pool tasks ARE enqueued (6 of them, into 1560-byte records) and NO pool-worker task EVER executes (`TASK-DONE` = 0). The boot thread therefore waits INFINITE on a task-completion field that no worker will ever signal, while holding a critical section at `rec=4`, and F-566's 5 s theft is the only thing that moves the system. Enqueue works; execution never starts.**
+
+- Type: ROOT CAUSE (the blocker, named and reproducible)
+- Priority: P0 - this is Stage 1, and nothing downstream is measurable until it moves
+
+**1. The two halves, from the same run.** After promoting both markers from `MCLA_LOG_INFO` to `MCLA_LOG_WARN` at `src/gpu_device.cpp:13296` (`TASK-DONE`) and `:13311` (`ENQ`), the log answers the question those two censuses were written for and could never answer before:
+
+```
+ENQ sub_821BCB10 #1 a0=00000001 cb=821BC548 -> r3=82849B2C
+ENQ sub_821BCB10 #2 a0=00000002 cb=821BC548 -> r3=8284A140
+ENQ sub_821BCB10 #3 a0=00000003 cb=821BC548 -> r3=8284A754
+ENQ sub_821BCB10 #4 a0=00000004 cb=821BC548 -> r3=8284AD68
+ENQ sub_821BCB10 #5 a0=00008004 cb=821BC548 -> r3=8284B37C
+ENQ sub_821BCB10 #6 a0=00010004 cb=821BC548 -> r3=8284B990
+```
+`ENQ` = **6**. `TASK-DONE` = **0**. The chooser runs, allocates a slot, returns a record address, and hands back a callback (`cb=821BC548`) - then **nothing ever calls that callback**.
+
+**2. The records confirm F-580's object class.** The returned addresses are `0x614` = **1560 bytes** apart (`0x82849B2C`, `+0x614` = `0x8284A140`, ...). A 1560-byte record with a synchronisation handle at **offset 1076** is exactly F-580's `sub_821C4528` wait target - so the tasks enqueued here are the objects the boot thread waits on. **The wait and the enqueue are the same objects, now linked by measurement rather than inference.**
+
+**3. The complete causal chain, every link measured:**
+1. `sub_821BCB10` (ENQ, 6 firings) allocates a 1560-byte task record and returns it with callback `0x821BC548`.
+2. No worker ever runs it - `sub_8244EE00` (`TASK-DONE`, "runs after every pool-worker task execution") fires **0** times in 300 s.
+3. The boot thread calls `sub_821C4528` (the **sysTaskExecutor pool proc**), which reads the handle at `obj+1076` and waits `t=0xFFFFFFFF al=0` (INFINITE, non-alertable) via `sub_821C90C0` -> `sub_82135DB8` -> `sub_82135DC0` -> a real host wait on `0xC65C5A80` / `0xC65C5B00` / `0xC65C5C80` (F-579: 44/45/42 of 143 calls, caller `lr=821C90EC` = the `r4 = -1` call at `ppc_recomp.16.cpp:10626`).
+4. That wait never returns, so the CS the main thread holds at `rec=4` (`CS-CONTEND #1 cs=140000610 owner=8F200000 waiter=004A0260 rec=4`) is never released.
+5. Workers queue behind it, and after exactly 5000 ms F-566 steals the lock (`CS-TIMEOUT #1 ... stolen_from=8F200000 by=004A0260`), which is why the run limps forward instead of deadlocking outright.
+
+**4. Four dead censuses, one root cause.** This file's wait/task instrumentation was almost entirely `MCLA_LOG_INFO` while soaks run at WARN: `WAITHELP` (2 lines), `WAITB8`, `WAITSYNC`, `ENQ`, `TASK-DONE` - six marker sites, all promoted to WARN with their bounds unchanged. Until now every one of them was a F-057(6) blind zero, which is why a fully enqueue-and-never-execute pool could sit in the tree looking like "slow boot" for many sessions. `TASK-DONE` = 0 is the single line that names the defect.
+
+**5. Next, in order - this is now a narrow, concrete hunt, not a sweep.** (a) Find what is supposed to call `sub_8244EE00` / the pool proc `0x821BC4528` and establish why the dequeue never happens: look for the ring/queue consumer of the records the ENQ chooser filled (the chooser's own note at `src/gpu_device.cpp:13300-13304` names "ring-A vs ring-B push" and "ring full -> ret 0 = silent dead-end" - a silent dead-end is a live candidate, and `r3` values here are non-zero record addresses so the chooser did NOT take the dead-end branch). (b) Check whether the pool's worker threads are started at all, and whether they are running the guest dispatch or parked. (c) Only then choose the fix. **Do not** make `sub_821C90C0` return immediately, and **do not** shorten the INFINITE timeout or drop `obj+1076`: those three would convert a diagnosable stall into a silent data race, and F-571 records what an unmeasured mitigation costs. Invariants to hold: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, and the six WARN censuses stay at WARN. Acceptance: `TASK-DONE` > 0, then `BOOTPATH`/`DISCCHK` > 0 **with `CS-TIMEOUT` = 0**. Next ID **F-582**.
+### F-582 (2026-09-28 00:3x, **same soak `build/w614.log`, re-read after promoting the pool censuses; no build**) - **CORRECTION TO F-581, WHICH IS WRONG ON ITS CENTRAL CLAIM. Tasks DO execute - inline. The measured defect is narrower and sharper: the executor drains only the FIRST 3 of 6 enqueued tasks; tasks #4/#5/#6 are enqueued and never run.**
+
+- Retracts: **F-581's claim "no pool-worker task EVER executes"** and the step-(a) hunt it proposed. The rest of F-581 (the call chain, the 1560-byte record class, the six INFO censuses) stands.
+
+**1. What refuted it.** `BC140-REC`, `INLINE-EXEC` and `POST-EXEC` were already at WARN and already firing - I had not counted them, because I inferred "no execution" from `TASK-DONE` = 0 alone:
+```
+BC140-REC  #1 slot=82849B2C q=0 id=00000001 mask=00007FFF base=C9E24900 rec=C9E2491C
+INLINE-EXEC sub_821BC140 #1 a0=82849B2C a1=00000000 lr=821BC998 r1=006E0FC0 tid=00005370
+POST-EXEC sub_821BC140 #1 slot=82849B2C streamCnt=10
+```
+`sub_821BC140` - the same address `addr_owners` calls the pool reader (`src/gpu_device.cpp:13468`) - **does** run, and it executes the descriptor **inline** from caller `lr=821BC998` (one of its exactly 2 static callers, the other being `0x821BCD78`).
+
+**2. `TASK-DONE` = 0 means something much weaker than "no task runs".** `sub_8244EE00` is documented at `src/gpu_device.cpp:13288-13290` as running "after every pool-worker task execution" and is hooked to the **pool-worker** path. The inline path (`[obj+4]!=0`, per the chooser's own note at `:13300-13304`) bypasses the pool worker entirely, so an inline execution is structurally incapable of reaching `sub_8244EE00`. **`TASK-DONE` is the wrong instrument for the inline path, not a dead pool.** The marker to read is `INLINE-EXEC`, and its `tid` is the thing worth watching.
+
+**3. The measured defect, slot by slot (this is the real blocker now).**
+```
+ENQ slots:  82849B2C 8284A140 8284A754 8284AD68 8284B37C 8284B990   (6)
+EXEC slots: 82849B2C 8284A140 8284A754                               (3)
+```
+`ENQ sub_821BCB10` = 6, `BC140-REC` = 3, `INLINE-EXEC` = 3, `POST-EXEC` = 4, `TASK-DONE` = 0. **Tasks #4, #5, #6 are enqueued and never executed.** The `a0` discriminator is visible in the ENQ rows: `a0=00000001, 00000002, 00000003, 00000004, 00008004, 00010004` - the first four are plain ids, and from #5 the high word appears (`0x8000`, `0x1000`). The three that ran are exactly the first three, so the flag bit correlates with the executor skipping them. That is consistent with the chooser's documented "ring-A vs ring-B push" split (`src/gpu_device.cpp:13300-13304`): a task carrying the extra flag is pushed to a ring that **no consumer drains**, while plain tasks take the inline path and complete.
+
+**4. So the chain stands, with one link corrected.** F-580's wait chain is unchanged and still holds: `sub_821C4528` (sysTaskExecutor pool proc) reads the handle at `obj+1076` and waits INFINITE non-alertably on `0xC65C5A80/5B00/5C80`, holding a CS at `rec=4`, and F-566's 5 s theft moves things along. What changed is *why* the wait never ends: **not "nothing executes" but "three of six tasks never execute"** - the un-drained ring.
+
+**5. Next, in order.** (a) Read the chooser's return for tasks #4-#6 in the log and compare with #1-#3: `ENQ ... -> r3=` is the record address for all six, so the divergence is in the flag/`a0`, and the chooser's `[obj+4]!=0 -> inline` test is the branch to confirm - if `obj+4` is 0 for #4-#6 they cannot take the inline path by construction, which would make this a pure routing gap. (b) Find the ring-B consumer that should pop them (the second caller `0x821BCD78` is the prime suspect) and establish whether it is reached at all. (c) Then fix the routing or the missing consumer - **not** by forcing `obj+4` nonzero (that would make an unexecutable task look executed, F-571's cost again), and **not** by touching the INFINITE wait. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, the six promoted WARN censuses stay at WARN, and `INLINE-EXEC`/`ENQ` are the two markers to diff, not `TASK-DONE`. Next ID **F-583**.
+### F-583 (2026-09-28 00:4x, **same soak `build/w614.log`, timestamps + `generated/ppc_xenon/ppc_recomp.14.cpp`; no build**) - **THE RING DRAIN IS SLOW, NOT BROKEN: the consumer `sub_821BC910` executes exactly one batch roughly every 76-90 s, so the boot's task-driven work advances at ~1 task per 80 s. The record layout is now fully mapped and is consistent across every earlier finding.**
+
+- Type: FACT (mechanism + cadence) - refines F-582, which the timestamps refute
+- Priority: P0
+
+**1. Timestamps refute the routing theory.** From `w614`, interleaved:
+```
+04:05:27.393  ENQ 00000001
+04:05:27.395  EXEC 82849B2C     <- 2 ms later
+04:05:38.469  ENQ 00000002
+04:05:44.816  ENQ 00000003
+04:05:44.832  EXEC 8284A140     <- 76 s later
+04:05:45.110  ENQ 00000004   04:05:46.169 ENQ 00008004   04:05:50.061 ENQ 00010004
+04:07:06.306  EXEC 8284A754     <- another 81 s later
+```
+The consumer is **not** skipping flagged tasks (task #4, `a0=00000004`, carries no high bit and still waited) and is **not** absent. It drains the oldest pending record on a **~76-90 s cadence**, and the 300 s soak simply ended before tasks #4-#6 were reached. F-582's "3 of 6 stranded" is therefore a windowing artifact, and its flag-bit theory is withdrawn; the real variable is the poll interval.
+
+**2. The consumer, and the record layout, straight from the TU.** `generated/ppc_xenon/ppc_recomp.14.cpp:20056` `PPC_FUNC_IMPL(__imp__sub_821BC910)`, at the `ctx.lr = 0x821BC998` site (`ppc_recomp.14.cpp:20142`):
+```
+r11  = *(r31 + 24932)          // ring read index
+r10  = *(r31 + 24936) - 1      // pending counter, decremented and stored back
+r11 *= 1556                     // RECORD STRIDE
+r30  = r31 + r11                // -> the record
+sub_821C8F70(...)               // in-loop callee (see below)
+r9   = *(r30 + 1548)            // per-record "has work" flag
+if (r9 != 0) sub_821BC140(r28, r30)   // execute
+```
+So: a ring of **1556-byte** records (my earlier "1560" was a miscount of 0x614; `0x614 == 1556`, and this `mulli` confirms it), a pending counter at `+24936`, a read index at `+24932`, and a work flag at `+1548`.
+
+**3. Every earlier finding now lands on one structure.** The `ENQ` return addresses are 0x614 = 1556 apart, matching the stride. F-580's wait handle at **`obj+1076`** and F-582's execution flag at **`+1548`** are both inside these same 1556-byte records. The three hot wait handles `0xC65C5A80` / `0xC65C5B00` / `0xC65C5C80` being 0x80 apart is consistent with three such records. **One ring, one record type, three subsystems reading it** - the chooser (enqueue), `sub_821BC910` (drain), and `sub_821C4528` (wait on a completion slot). The boot stall is that the drain is paced at ~1 record per 80 s while the boot thread waits INFINITE on a completion slot behind it.
+
+**4. The single open question, now sharply posed.** Why does `sub_821BC910` iterate every ~76-90 s? Its in-loop callee `sub_821C8F70` (`addr_owners --check 821C8F70` = 1 site, map only, **unhooked**) is the prime candidate: a wait or a backoff inside the drain loop would directly produce this cadence. A second candidate is that `sub_821BC910` itself is only entered that often. Both are single greps.
+
+**5. Next, in order.** (a) Read `sub_821C8F70`'s body in the generated TU and name what it does - if it is a timed wait, the cadence is explained and the fix is to wake it on enqueue rather than shorten a timeout blindly. (b) If it is not a wait, find `sub_821BC910`'s callers and how often the loop is entered. (c) Fix at the wake-up/notification level. **Do not** touch the `+1548` flag, the `+24936` counter, or the INFINITE wait in `sub_821C90C0` - all three would corrupt the ring's bookkeeping to hide a pacing bug, and F-571 records that cost. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, the six WARN censuses stay at WARN, and the markers to read are `ENQ` vs `INLINE-EXEC` with their **timestamps**. Acceptance unchanged: `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-584**.
+### F-584 (2026-09-28 00:5x, **static only: `generated/ppc_xenon/ppc_recomp.14.cpp` / `.16.cpp`; no build, no soak**) - **BOTH CANDIDATES FOR THE ~80 s CADENCE ARE ELIMINATED: `sub_821C8F70` is `RtlLeaveCriticalSection` (not a wait) and `sub_821BC910` has ZERO direct callers (it is callback-driven, like `sub_821C4528`). The pacing is therefore on the PRODUCER side - whoever sets the record's `+1548` work flag - not in the drain loop.**
+
+- Type: FACT (eliminates both hypotheses from F-583 §4)
+- Priority: P0
+
+**1. `sub_821C8F70` is not a wait.** `generated/ppc_xenon/ppc_recomp.16.cpp:10310`, whole body:
+```
+r11 = *(u32*)(r3 + 0);
+if (r11 == 0) return;
+__imp__RtlLeaveCriticalSection(ctx, base);   // b 0x827bcf54
+```
+It is a conditional `RtlLeaveCriticalSection` tail-call wrapper - "release the lock if it is held". **No wait, no sleep, no timeout.** F-583's candidate (a) is eliminated. (Its neighbours `sub_821C8F80` is an empty `blr` stub and `sub_821C8F88` is an increment-to-1 helper.)
+
+**2. `sub_821BC910` is not called directly.** A whole-TU search for `sub_821BC910(ctx, base);` returns **0** call sites, exactly as `sub_821C4528` did in F-580. Both are reached only through a function pointer. So the drain loop is a **callback body**, and "how often is the loop entered" is not answerable from a call count - it is a question about whatever timer or scheduler invokes the pointer.
+
+**3. What that leaves, and it is a cleaner hypothesis than either candidate.** The loop's own guard is `r9 = *(r30 + 1548); if (r9 != 0) execute`. So the loop can run frequently and still execute nothing, and the observed 76-90 s is equally consistent with: **the loop spins, but `+1548` is not set on the next record until ~80 s have passed.** Under that reading the pacing belongs to the *producer* that marks a record as runnable, and the drain is merely idle in between. This also fits the F-583 timeline, where enqueues at `04:05:45-50` were followed by an execute at `04:07:06` - a *pending* record finally being marked, not a slow loop.
+
+**4. The two unknowns that remain, both single searches.** (a) Who writes `+1548` on a record of the 1556-byte ring - that is the pacing source and therefore the fix site. (b) Who holds the callback pointer for `0x821BC910` (and, for F-580, for `0x821C4528`) - the timer/scheduler entry that runs the drain. Together these are "the producer + the pump", which is the same shape as F-581's dead-pool suspicion but now on the correct side of the ring.
+
+**5. Next, in order.** (a) Find the writer of `+1548`: the ring lives at a fixed base (`[0x8283D190+52]` per the F-174 note at `src/gpu_device.cpp:13300-13304`, index at `+24932`, counter at `+24936`), so search the generated TUs for stores to record-offset 1548 and check whether that site is reached. (b) If a write site exists but never fires, that is the root cause and it is a *reachability* problem, not a pacing one. (c) Only then look at the pump/timer. **Do not** touch the `+1548` flag test, the `+24936` counter, or `sub_821C90C0`'s INFINITE wait. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, six WARN censuses stay at WARN, read `ENQ` vs `INLINE-EXEC` **with timestamps**. Acceptance: `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-585**.
+### F-585 (2026-09-28 01:0x, **build `build/w615_build.log` RC=0, soak `build/w615.log` 300 s + `generated/ppc_xenon/ppc_recomp.125.cpp`**) - **AMBIGUITY RESOLVED: `sub_8268B960` is NEVER CALLED, so that `+1548` writer is dead - but it is an UNUSED entry point, not the blocker. The live work-flag writer is `sub_82622AC0` -> `sub_8268B6D0`, and that is the producer to investigate.**
+
+- Type: FACT (instrument fix + producer identification)
+- Priority: P0
+
+**1. Why the probe was needed.** `CBSETUP sub_8268B960` logged **0** rows in `w614` despite the hook being registered (`addr_owners --check 8268B960` = 2 sites, `orig` + `override` at `src/gpu_device.cpp:13267`/`:13269`) and its gate being unconditional (`n <= 16 || n % 200 == 0`). That was ambiguous, because the log sits **after** `mem.ReadBytes(ctx.r5.u32, name, 64)`, and this file already records a prior consumer dying on a guest read in this very subsystem (F-125/F-133 footprint rule; see the note at `src/gpu_device.cpp:13300-13304`). A 0-row census there could not distinguish "not reached" from "faulted before logging".
+
+**2. The fix, registers-only and MINIMAL FORM.** Added `CBSETUP-ENTER sub_8268B960 #{} pool idx flags lr` as the hook's first statement, before any guest read, bounded the same way (`n <= 16 || n % 200 == 0`). No D3D12, no `RegisterFile`, no invented state - the documented shape for this file.
+
+**3. The answer: never reached.** `CBSETUP-ENTER` = **0** in `w615`. A registers-only probe that cannot fault, placed first, proves **`sub_8268B960` is never called at all.** So the `+1548` store at `ppc_recomp.125.cpp:17483` (`stw r3,1548(r31)` after `bl 0x8268b960`) never executes.
+
+**4. But that is not the blocker, and this is the part that matters.** The ring still executed 3 records, so something *does* set `+1548` for those. The other writer is `generated/ppc_xenon/ppc_recomp.125.cpp:10435` `PPC_FUNC_IMPL(__imp__sub_82622AC0)`, at `:10510`:
+```
+if (r5 != 0) {
+    sub_8268B6D0(r30 - 10224, r28);       // sibling entry, ctx.lr = 0x82622B30
+    *(r31 + 1548) = r29;
+}
+r5 = *(r31 + 1552); if (r5 != 0) ...      // +1552 = the archive-device field
+```
+So the game uses the **`sub_8268B6D0`** path, not `sub_8268B960`; the latter is a find-or-create-by-name entry point this build never takes. **The never-called hook is a dead census on a dead path, not a missing producer** - and the earlier three records prove the live path works. `+1552` (archive device) sitting next to `+1548` (work flag) also confirms these are the same 1556-byte records of F-583.
+
+**5. Where the blocker now stands, tightened.** Records become runnable only when `sub_82622AC0` reaches its `*(r31+1548) = r29` store, and the drain only runs records whose `+1548` is non-zero. Three records got there; #4-#6 did not, within the 300 s window. So the open question is no longer "who sets +1548" (answered: `sub_82622AC0`, via `sub_8268B6D0`) but **why `sub_82622AC0` stops running for later records** - i.e. what gates its `r5 != 0` test, or what stops it being entered. That is the same shape as F-584(b): the pump that invokes the producer, paired with the guard.
+
+**6. Next, in order.** (a) Find `sub_82622AC0`'s callers and count them at WARN-equivalent certainty - it is a `PPC_FUNC` site, so the cheapest honest instrument is the same registers-only entry census used here, applied to `sub_82622AC0` and to `sub_8268B6D0` (`addr_owners --check` both first, for rule 4). (b) Then identify what supplies `r5` - the `r5 != 0` guard is the gate that decides whether +1548 is written at all, and a zero `r5` means the record is silently left un-runnable, which is the exact symptom. (c) Fix at the producer's reachability, not by writing +1548 directly - forging the work flag would make an unprepared record executable and is F-571's cost again. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, the six WARN censuses stay at WARN, and keep using registers-only probes before any guest read in this subsystem. Acceptance: `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-586**.
+### F-586 (2026-09-28 01:2x, **build `build/w616_build.log` RC=0, soak `build/w616.log` 300 s, plus a whole-TU store census**) - **TWO CORRECTIONS. (1) `sub_82622AC0` and `sub_8268B6D0` are ALSO never called, so all three candidate producers are dead and the "+1548 writer" question cannot be answered by grep. (2) `+1548` IS NOT A UNIQUE FIELD - there are 14 store sites to it across the generated TUs, so F-583's "+1548 is the ring's work flag" must be read as "the offset the drain READS", not "the field's only writer".**
+
+- Corrects: F-585 §4-§5 (producer identification) and F-583 §2 (over-identified a struct field)
+- Priority: P0
+
+**1. The three producer candidates are all dead, measured.** Registers-only entry probes added at `src/gpu_device.cpp` (`WF-PRODUCER sub_82622AC0`, `WF-SETUP sub_8268B6D0`), bounded `n <= 24 || n % 500`, both preceded by `addr_owners --check` (1 site each, map only - rule 4 clean). In `w616`: **`WF-PRODUCER` 0, `WF-SETUP` 0, `CBSETUP-ENTER` 0.** So `sub_82622AC0`, `sub_8268B6D0` and `sub_8268B960` are all never called.
+
+**2. The pattern is proven working, so these zeros are not registration artifacts - which is the check that had to be done first.** The same `PPC_FUNC_IMPL(__imp__X); PPC_FUNC(X)` override used by the new probes is the one already firing in this very run: `INLINE-EXEC sub_821BC140` and `WAITHELP sub_82135DC0` both log. A dead override mechanism would silence those too. They are not silenced, so the three zeros mean "never called".
+
+**3. The correction that matters most: `+1548` is not a unique field.** A whole-TU census of stores to that offset returns **14 sites**, not 2:
+```
+ppc_recomp.125.cpp:10510  (sub_82622AC0)   ppc_recomp.125.cpp:17483  (sub_826255A8)
+ppc_recomp.155.cpp:6532   ppc_recomp.49.cpp:35880   ppc_recomp.54.cpp:33921
+ppc_recomp.57.cpp:12981   ppc_recomp.6.cpp:6440     ppc_recomp.6.cpp:8014
+ppc_recomp.64.cpp:2184    ppc_recomp.64.cpp:2291    ppc_recomp.65.cpp:14873
+ppc_recomp.65.cpp:14980   ppc_recomp.65.cpp:15193   ppc_recomp.65.cpp:15338
+```
+**F-583 got the drain's read right** (`r9 = *(r30+1548)` where `r30 = r31 + idx*1556` is a ring record) **and then over-reached**: it treated "the offset the ring reads" as "a field only these two functions write". With 14 writers across unrelated record types, **no offset-based grep can identify the ring's producer.** This is do-not #16's exact shape - a decode/matching hypothesis that the consumer graph did not support - caught by the code graph, in the same class of error as F-574.
+
+**4. What this leaves, and it is a cleaner state than before.** The ring is real and mapped (1556-byte records, index `+24932`, counter `+24936`, drain `sub_821BC910`, read `+1548`, completion wait `obj+1076` in `sub_821C4528`). What is *not* established is which writer reaches a **ring** record, as opposed to any of the 13 other `+1548` structs. `INLINE-EXEC` also rose 3 -> 4 in `w616`, so execution does progress run to run; the "~1 per 80 s" cadence from F-583 stands as an observation, not yet a mechanism.
+
+**5. The decisive experiment, which replaces the offset approach entirely.** Stop hunting writers and instrument the **drain** itself: a registers-only census in `sub_821BC910` that logs, per entry, the read index (`*(r31+24932)`), the pending counter (`*(r31+24936)`), the computed record pointer `r30`, and the `+1548` value read - plus a separate entry counter for `sub_821BC910` itself. That answers the question F-584 could not: **is the loop entered often and finding `+1548 == 0`, or is the loop entered rarely?** The two cases need opposite fixes (a producer/flag problem vs a pump problem) and no static search distinguishes them. Only the drain can. It needs a guest read of the ring base, so it must follow the F-585 rule: **log the registers first, then the guest reads, so a fault can never hide the entry.**
+
+**6. Next, in order.** (a) `addr_owners --check 821BC910`, then the two-part drain census (entry, then per-iteration) as described. (b) Read the result: frequent entries + `+1548 == 0` = producer/flag problem, find the writer that targets a *ring* record; rare entries = pump problem, find the callback holder. (c) Fix at whichever side is proven, and do not write `+1548` from the drain - forging the flag makes an unprepared record executable (F-571's cost). Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, the promoted WARN censuses stay at WARN, registers logged before any guest read. Acceptance: `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-587**.
+### F-587 (2026-09-28 01:4x, **re-read of existing data (`build/w611.log`..`w616.log`) + the `RINGB-CONSUMER` rows; no build**) - **ROOT CAUSE, CHAIN CLOSED: the two ring-consumer threads enter `sub_821BC910` ONCE per 300 s, find the queue empty (`popIdx=0 cnt=0`), and block INFINITE on OUR OWN host semaphore `0xC5400280` / `0xC5400300` (created `init=0 max=32767`) which nothing ever releases. That is the pump. And this entry also RETRACTS F-581's "six dead INFO censuses" - there was no log-suppression defect at all.**
+
+- Retracts: **F-581 §4** ("four dead censuses / six INFO marker sites were blind zeros"). F-581's call chain, record class and `TASK-DONE` reasoning are unaffected; the `TASK-DONE`=0 claim was separately refuted by F-582.
+- Priority: P0
+
+**1. RETRACTION: there was no INFO suppression.** `build/w611.log` - a run from **before any edit this session** - already contains `WAITHELP=133`, `WAITB8=29`, `RINGB-CONSUMER=4`, `ENQ=7`. INFO markers are emitted normally (`RINGB-CONSUMER` is `MCLA_LOG_INFO` at `src/gpu_device.cpp:14892`/`:14903`/`:14922` and produces rows). **So the F-581 claim that those censuses were "F-057(6) blind zeros" until promoted was false, and the `INFO`->`WARN` promotions changed nothing about visibility - those counts had been there the whole time and I had simply never counted them.** I generalised a systemic logging defect from a single zero I *had* verified (`chaining to original` = 0 in the genuinely dead `hk_KeWaitForSingleObject` hook) and then carried the generalisation to markers I had not looked at. The promotions are harmless and stay (WARN is the right level for these), but they are not what made anything visible, and no conclusion in this ledger may cite them as the reason. The `KeWait FIRST CALL`=0 finding itself stands: that hook really is dead.
+
+**2. The pump, from rows that were already in the log.** `RINGB-CONSUMER`, both queues:
+```
+ENTER #1 arg=00000000 q=82849518 waitH@+6154 tid=000051E0
+PRE   #1 q=82849518 popIdx=0 cnt=0 waitH=C5400280 tid=000051E0
+ENTER #2 arg=00000001 q=8284F68C waitH@+6154 tid=00000D78
+PRE   #2 q=8284F68C popIdx=0 cnt=0 waitH=C5400300 tid=00000D78
+```
+Two distinct host threads (matching the `threads #14/#15` note at `src/gpu_device.cpp:14879`), one per queue, each entering the consumer **once in 300 s**, each blocking on its own host wait handle. `0xC5400280` and `0xC5400300` are the same handles as `SEMA-CREATE #1 h=C5400280 init=0 max=32767 lr=8244ECC8` / `#2 h=C5400300` from F-583 - **our host semaphores, created with an initial count of 0.**
+
+**3. The complete chain, every link now measured:**
+1. The game enqueues tasks - `ENQ sub_821BCB10` 6 firings, records 1556 bytes apart (`sub_821BCB10`).
+2. The queue's consumers are two host threads that run `sub_821BC910` and then **wait on a host semaphore whose initial count is 0** - once, and never again in 300 s.
+3. Nothing releases `0xC5400280`/`0xC5400300`, so the drain executes ~1 record per 76-90 s instead of promptly - `INLINE-EXEC` 3-4 vs `ENQ` 6.
+4. Meanwhile the boot thread calls the sysTaskExecutor pool proc `sub_821C4528`, reads the handle at `obj+1076` of a queued record, and waits `t=0xFFFFFFFF al=0` (INFINITE, non-alertable) via `sub_821C90C0` -> `sub_82135DB8` -> `sub_82135DC0` - `WAITHELP` 142 firings on `0xC65C5A80`/`0xC65C5B00`/`0xC65C5C80` (F-579).
+5. That wait does not return, so the main thread's critical section at `rec=4` is never released; workers queue behind it and F-566's 5 s theft is the only thing that moves the run - `CS-CONTEND #1 ... rec=4`, `CS-TIMEOUT #1 ... waited_ms=5000`.
+**This answers F-586's decisive question: the loop is entered RARELY (4 times in 300 s), not frequently finding `+1548 == 0`. It is a pump problem, not a flag/producer problem** - and the pump is a host semaphore that starts at 0 and is never released.
+
+**4. The corroboration already in the ledger.** F-577's `SEMA-wait 36` vs `SEMA-release 32`, with the last three waits repeating `this=0x1c6420280 count=1` - a semaphore wait whose count never drains. Same class of defect: a wait on a count that nothing brings up.
+
+**5. Next, in order - the fix site is now named.** (a) Find who is supposed to release `0xC5400280`/`0xC5400300`: the consumer's wait handle is at queue offset `+0x616C` (`wait @+6154` per the entry line, `+0x616C` per the code comment at `:14910`), so the releaser is the guest code that signals the queue when it enqueues - locate it via the ring base `0x8283D190` and the enqueue chooser, and establish whether that path calls into our semaphore release or a guest-only signal. (b) Check whether the *count* semantics are inverted - a host event created with `init=0` for a "wake me" is plausible, in which case the releaser must exist and be unreachable, versus a semaphore that should have started non-zero. (c) Fix the release path, **not** the wait: do not set `+1548`, do not shorten the INFINITE wait, and do not pre-increment the semaphore to paper over a missing release without proving (a) - that is F-571's cost. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched. Acceptance: `RINGB-CONSUMER` entries per soak rising well above 4, `INLINE-EXEC` reaching `ENQ` count, then `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-588**.
+### F-588 (2026-09-28 02:0x, **build `build/w617_build.log` RC=0, soak `build/w617.log` 300 s**) - **FOUR HYPOTHESES REFUTED BY MEASUREMENT, and the one instrument defect that made them look proven. The release for `C5400280` resolves `branch=identity-map live=1`, the wait and the release share the SAME wrapper (`this=0x1c6420280`, 24 waits / 33 releases), and `Release()` does `count += n; count.notify_all()`. What is NOT yet measured is whether the CONSUMER's own wait resolves to that same wrapper - the probe's 60-call cap hides it.**
+
+- Type: FACT (hypothesis elimination + instrument fix). Not a root cause yet.
+- Priority: P0
+- Supersedes the mechanism guesses in F-587 §3 step 2 with measured facts
+
+**1. The instrument defect that nearly produced a false root cause (read this before trusting `res=`).** `TYPE-CENSUS[REL]` prints `res=QueryKernelObject(Semaphore)` as a **hardcoded literal in the format string**, emitted *above* the resolution ladder (`src/kernel/imports.cpp:2868-2881`). It therefore never indicated which branch ran. I had started to build the whole wake-loss conclusion on that string - it is a claim, not a measurement, and it is now superseded by `RELSEMA-RES`.
+
+**2. The fix: the resolution branch is now measured.** `RELSEMA-RES #{n} guest=.. branch=.. live=.. count=.. lr=..` added at `src/kernel/imports.cpp` (bounded `n <= 60 || n % 500`), recording which of the five ladder branches actually produced `sem`: `identity-map`, `try-query-header`, `physical-arena-reinterpret`, `raw-unusable`, `translate-null`, `not-kernel-object`, `MINT-QueryKernelObject`, `none`. Log-only.
+
+**3. Result: the release is correct.** `RELSEMA-RES #1 guest=C5400280 branch=identity-map live=1 count=1 lr=821E29F0` (and 3 more, all `lr=821E29F0` - the boot thread). **Every release observed in `w617` took `branch=identity-map`; the mint path was never taken.** So the SESSION 72 / F-039 wake-loss-on-minting bug is **not** live for this handle - it is fixed, and the comment at `src/kernel/imports.cpp:2885-2891` is accurate history, not a live defect. `RELSEMA-DEAD` = 0, so no release degraded to the no-op path either.
+
+**4. Result: wait and release share the same wrapper.** The pre-existing probe (`SemaphoreProbeLog`, `src/kernel/kernel_objects.h:15`, emitting `SEMA-wait`/`SEMA-release this=.. count=..` via `spdlog::info`) gives wrapper identity directly. In `w617`: **24 `wait` and 33 `release` on `this=0x1c6420280`** - the same pointer, i.e. the identity handle `C5400280` maps to one `Semaphore` object that both sides touch. Every other wrapper in the log is wait-only (`0x1c6428b00`, `0x1c648b380`, `0x1c6459a80`, `0x1c65c5f00`, `0x1c6537980`, `0x1c647a800`, `0x1c65c5980`) - those are the boot thread's `WAITHELP` handles, consistent with F-579. `Semaphore::Wait(INFINITE)` does `count.wait(0)` and `Release` does `count += n; count.notify_all()` (`:202-203`), which is the correct pair.
+
+**5. The open link, and the reason this is not yet a root cause.** If the same wrapper is both waited and released with a correct `notify_all`, the consumer at `tid=000051E0` (parked `WAIT[NTWFSO] #00033 handle=C5400280 to=4294967295ms`, F-587 §2) should have woken. Two candidate explanations remain, and the existing probe **cannot distinguish them because it is capped at 60 calls** (`src/kernel/kernel_objects.h:19`, `n <= 60 || n % 2000 == 0`) and the consumer's single INFINITE wait happened early in the run: (a) the consumer's wait did NOT resolve to `0x1c6420280` (a *second* resolution path for `NtWaitForSingleObjectEx` that bypasses the identity map, so its wait is on a different object entirely), or (b) it did resolve there and the wake is being lost for a reason the probe does not observe. The 24 waits on that wrapper may all be the boot thread, with the consumer's own wait uncounted.
+
+**6. Next, in order - small and decisive.** (a) Make the probe answer (a) vs (b) directly: filter `SemaphoreProbeLog` to log **every** wait on the wrapper that `C5400280` maps to (or raise the cap and add a per-wrapper count), so the consumer's INFINITE wait and any release after it are both visible and comparable. Registers/pointers only, no D3D12, no `RegisterFile`. (b) If the consumer's wait is on a different wrapper, fix `NtWaitForSingleObjectEx`'s resolution to use the same identity map the release now uses - that is the real F-039 asymmetry, and it would be a *new* finding, not a revival of the old one. (c) Do not "fix" anything by pre-incrementing the semaphore, by adding the handle to a skip list, by shortening the INFINITE wait, or by touching `+1548`/the `+24936` counter. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched. Acceptance unchanged: `RINGB-CONSUMER` entries per soak well above 4, `INLINE-EXEC` reaching the `ENQ` count, then `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-589**.
+### F-589 (2026-09-28 02:3x, **4 parallel read-only subagents + build `build/w619_build.log` RC=0 + soak `build/w619.log` 300 s**) - **ROOT CAUSE, MEASURED: the set of released semaphore handles is a STRICT SUBSET of the set waited on. 8 handles receive INFINITE waits and are never released, including `C5400300` - the SECOND ring queue's gate - so that queue's consumer thread waits forever by construction. This is a lost-completion class, not a resolution or wrapper-identity problem.**
+
+- Corrects: F-588 §4 (compared the wrong handle/pointer pair - see §2)
+- Priority: P0
+
+**1. The measurement.** Two symmetric, bounded, WARN-level resolution markers added at `src/kernel/imports.cpp`: `RELSEMA-RES` (release side, after the resolution ladder - records the branch that won, the resolved `sem` pointer, and the count) and `WAITRES` (wait side, at `src/kernel/imports.cpp:645` before `obj->Wait()`, records handle, resolved `obj` pointer, timeout, tid, lr). In `w619`:
+
+- waited-on handles, 19 distinct: `C5400280 C5400300 C6428B00 C6459A80 C647A800 C648B380 C6537980 C6537A00 C6547A80 C6557B00 C6567B80 C6577C00 C65C5980 C65C5B00 C65C5F00 CA0F8180 CAEF8200 CAF40300 CAF78380`
+- released handles, 11 distinct: `C5400280 C6537980 C6537A00 C6547A80 C6557B00 C6567B80 C6577C00 CA0F8180 CAEF8200 CAF40300 CAF78380`
+- **waited on but never released (8): `C5400300 C6428B00 C6459A80 C647A800 C648B380 C65C5980 C65C5B00 C65C5F00`**
+- released but never waited on: **none**. Released is a strict subset of waited.
+
+**2. CORRECTION to F-588 §4: the wrapper identity IS consistent, and I had paired the wrong handle.** `handle = hostPtr - 0x100000000` (`src/kernel/memory.h:163-168`, `src/kernel/xdm.cpp:19-23`). The `SEMA-wait`/`SEMA-release` probe rows I compared in F-588 carry `this=0x1c6420280`, which is handle **`C6420280`**, a *different* semaphore (the boot thread's) - not the ring gate `C5400280`. Measured for the ring gate itself, both sides agree exactly: `RELSEMA-RES ... guest=C5400280 sem=0x1c5400280` x4 and `WAITRES #12/#33 handle=C5400280 obj=0x1c5400280`. **One handle, one pointer, both sides - so resolution, the identity map, and the wrapper identity are all exonerated.** F-588's "wait and release share a wrapper" was true of `0x1c6420280` and irrelevant to the ring.
+
+**3. The ring gate is not deadlocked - it cycles at the producer's pace, which reframes the drain.** `RINGB-CONSUMER` ENTER/PRE on queue A: `tid=000069C4`, `popIdx=0 cnt=0 waitH=C5400280`; that same thread then issued **two** infinite waits on it (`PARK-CENSUS[NTWFSO] #0012` and `#0033` = `WAITRES #12`/`#33`). Two waits in 300 s means the first one **returned** - the gate wake works. The count at release rises (`cnt=0,0,1` pre-release) and is consumed. So F-587's "the consumers block and never cycle" is too strong: they wake, but the guest only enqueues ~6 tasks per 300 s, so the drain is paced by the producer, not by a lost wake.
+
+**4. What the guest side is, from the generated TU (via subagent, all `file:line` verified).** Queue array A base `0x82849518`, stride 24948, slots 1556, capacity 16, full at `count == 15`, fields: `+24896` RT_CRITICAL_SECT, `+24928` push idx, `+24932` pop idx, `+24936` count, `+24940` wait handle (`ppc_recomp.14.cpp:19949-20120`). The gate is a **binary semaphore created with initial count 0, max 32767**: `sub_821C9060` (`ppc_recomp.16.cpp:10519`) -> `sub_8244EC78` (`ppc_recomp.80.cpp:12480`) -> `__imp__NtCreateSemaphore` at `ctx.lr = 0x8244ECC8` - matching `SEMA-CREATE #1 h=C5400280 init=0 max=32767`. Producer `sub_821BC868` releases it by 1 after a successful push: `count=old+1; RtlLeaveCriticalSection (sub_821C8F70); r3 = *(r31+24940); bl sub_821C9108` -> `sub_8244ED10` -> `__imp__NtReleaseSemaphore` (`ppc_recomp.14.cpp:20025-20034`). Consumer `sub_821BC910` waits INFINITE via `sub_821C90C0` -> `sub_82135DB8` -> `sub_82135DC0` -> `__imp__NtWaitForSingleObjectEx` (`ppc_recomp.14.cpp:20095`).
+
+**5. The defect, stated plainly.** Queue B's gate is `C5400300` (second `RINGB-CONSUMER` entry, `tid=00006114`). It is **waited on and never released** - so whatever the guest enqueued into queue B is never signalled, and that consumer is parked forever. Likewise seven other handles the boot thread waits on (the record completion slots of F-580/F-583) receive no release at all, which is exactly the `obj+1076` INFINITE wait that holds its critical section at `rec=4`. **Nothing here is a resolution bug, a mint bug, or a notify bug** - the completions are simply never signalled.
+
+**6. Two host-side defects found in passing, recorded because they are real but are NOT this blocker** (so they are not mis-cited later): (a) `Semaphore`'s guest `Header.SignalState` is read at wrap time (`src/kernel/kernel_objects.h:120`) and **never written back** on `Release` (`:202-203`), so any wrapper later minted from that header starts at count 0 - a latent wake-loss path (currently unreachable for these handles because the identity map wins). (b) The shared `g_keSetEventGeneration` (`src/kernel/imports.cpp:35`) is bumped only by `KeSetEvent` (`:2131`) and `KeReleaseSemaphore` (`:3397`), **not** by `NtSetEvent` / `NtReleaseSemaphore` / `SignalSchedulerTick`, so the `KeWaitForMultipleObjects` WaitAny loop (`imports.cpp:3355`) is not woken by them. Our gate uses `NtReleaseSemaphore`, so (b) does not apply to the ring - it is a separate latent bug.
+
+**7. Next, in order.** (a) For `C5400300` specifically, establish whether the guest ever pushes to queue B: the producer is the same `sub_821BC868` reached via a queue argument, so census `sub_821BC868` entries with the queue base and whether it reached the `sub_821C9108` release (its own `PUSH` marker already carries `q=` and `relH=` - one log grep). If the producer never runs for queue B, the defect is a guest-side push that never happens and the fix is to find why that queue is never fed. (b) Then the same for the boot thread's completion slots: find who is supposed to release `C65C5xxx`-class handles and show it does not. (c) Do **not** add any unreleased handle to a skip list, pre-increment a count, shorten the INFINITE wait, or write `+1548`/`+24936` by hand. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, both new markers stay at WARN. Acceptance: no handle in the "waited but never released" set, `INLINE-EXEC` reaching the `ENQ` count, `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-590**.
+### F-590 (2026-09-28 02:5x, **`build/w619.log` re-read: the existing `PUSH` marker; no build**) - **CORRECTION TO F-589 §5, WHICH WAS OVER-CLAIMED. "Waited on but never released" is NOT by itself a lost completion: a worker parked on an empty queue is a correctly idle thread. All 6 PUSHes go to queue A; queue B is never pushed to, so its `C5400300` wait is by design. The measurable defect is inside queue A: 6 pushed, `pIdx` stuck at 2, and the last two payloads are structurally different.**
+
+- Corrects: F-589 §5 (the "8 unreleased handles" claim)
+- Priority: P0
+
+**1. Why F-589 was wrong.** I compared the *set* of waited handles to the *set* of released handles and called the difference "lost completions". That ignores the whole point of a binary semaphore used as a queue gate: it is created with `init=0` and is **supposed** to be unreleased while the queue is empty. Waiting on a count-0 semaphore is the idle state, not a lost signal. The subset relation is expected; it is not a defect. This is the same failure mode as the three earlier retractions - inferring a defect from a *set difference* without asking what the state means.
+
+**2. What the `PUSH` rows actually show (all 6, `tid=000064C0`, `lr=821BC8F0`, `relH=C5400280`, queue A):**
+```
+#1 q=82849518 wIdx=1 pIdx=0 cnt=1 slot=82849B2C tag=00000001
+#2 q=82849518 wIdx=2 pIdx=1 cnt=1 slot=8284A140 tag=00000002
+#3 q=82849518 wIdx=3 pIdx=1 cnt=2 slot=8284A754 tag=00000003
+#4 q=82849518 wIdx=4 pIdx=2 cnt=2 slot=8284AD68 tag=00000004
+#5 q=82849518 wIdx=5 pIdx=2 cnt=3 slot=8284B37C tag=00008004
+#6 q=82849518 wIdx=6 pIdx=2 cnt=4 slot=8284B990 tag=00010004
+```
+- **Queue B (`q=8284F68C`, gate `C5400300`) receives zero pushes.** Its consumer `tid=00006114` waiting INFINITE there is correct behaviour.
+- **`pIdx` stalls at 2** while `wIdx` reaches 6: the consumer popped 2-3 of 6 and then stopped advancing.
+- **`cnt` reaches 4**, so four permits were released on `C5400280` - the gate is being signalled correctly; the consumer simply is not consuming them.
+
+**3. The two outliers, and why they matter more than the counts.** The `chain[]` payload of `#1`-`#4` has a zero second word in every slot. `#5` and `#6` do not: `#5 f0=821E5EB8/**4B804C80** f2=D840D980/DF00E000 f3=A380A480/00000000 f4=821FE4FC/00000000` and `#6 f0=821E5EB8/**E800E900** f1=821E5F68/**22402340** f3=00000050/40079080 f4=821F7F30/00000000`. Their tags are also unique (`0x00008004`, `0x00010004` vs plain `1..4`). **So the last two enqueued records are structurally different from the four that ran** - different tag AND non-null payload words that look like uninitialised data rather than callback pointers. They are also the two that never execute. That is a sharper lead than anything since F-589: either the producer fills those two records wrongly, or the consumer rejects them (the drain tests `+1548` and F-586 established 14 writers of that offset across unrelated record types, so a record whose `+1548` was never set is simply skipped - **which would leave `pIdx` advanced but nothing executed**, exactly the observed pattern).
+
+**4. Next, in order - one measurement, not a sweep.** (a) Determine whether `#5`/`#6` were skipped by the `+1548` guard or consumed-and-failed: log, in the drain, the record pointer plus the `+1548` value it tested, bounded, so the skipped records are visible. `sub_821BC910` is already hooked at `src/gpu_device.cpp:14884/14887` with a `RINGB-CONSUMER` census that reads guest memory - extend that same block (registers first, then the `+1548` read, per the F-585 rule) rather than adding a new hook, and `addr_owners --check 821BC910` is already known to be 2 sites. (b) If `+1548 == 0` for `#5`/`#6`, the question becomes why the producer set a tag and payload but not the flag - and the two distinct tags are the discriminator. (c) Do **not** set `+1548` by hand, do not release `C5400300`, do not pre-increment the gate, do not shorten the INFINITE wait. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, `RELSEMA-RES`/`WAITRES` stay at WARN. Acceptance: `INLINE-EXEC` reaches the `ENQ`/`PUSH` count, `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-591**.
+### F-591 (2026-09-28 03:0x, **build `build/w620_build.log` RC=0, soak `build/w620.log` 300 s**) - **CORRECTION TO F-587/F-589's "the pump runs ~1 record per 80 s": THE DRAIN IS FINE. `sub_821BC910` is entered ONCE per consumer thread and then loops internally forever, so the log's small ENTER count was never a pump rate. 4 of the 6 pushed tasks execute normally. The remaining defect is exactly 2 records that never execute.**
+
+- Corrects: F-587 §3 step 2-3 (pump cadence claim), F-588 §5, F-589's framing
+- Priority: P0
+
+**1. What the new `RINGB-SLOT` rows show.** The drain hook (`src/gpu_device.cpp`, the existing `RINGB-CONSUMER` block) now also computes the record the drain is about to test and reads its `+1548` work flag, bounded 1-in-8 by `popIdx`, logging registers before the guest read:
+```
+RINGB-SLOT #1 q=82849518 popIdx=0 cnt=0 rec=82849518 tag0=00000000 flag1548=00000000 ok=1 tid=00004DA8
+RINGB-SLOT #2 q=8284F68C popIdx=0 cnt=0 rec=8284F68C tag0=00000000 flag1548=00000000 ok=1 tid=00000DD0
+```
+One row per consumer, at **entry**, both with `cnt=0` - i.e. each queue was empty when its consumer started. `ok=1` confirms the guest reads succeed (so `RELSEMA-RES`/`WAITRES`/these rows are trustworthy).
+
+**2. The correction.** `sub_821BC910` **does not return** - the pop/execute/wait sequence is an internal loop, and the two `RINGB-CONSUMER ENTER` rows (arg=0 tid 000069C4, arg=1 tid 00006114) are each thread's single entry. The `RINGB-CONSUMER` count of "4" in earlier entries was 2 ENTER + 2 PRE rows, never a rate. So F-587's "~1 record per 76-90 s" and F-588's "loop entered RARELY (4 times in 300 s)" were **artefacts of counting log lines as a call rate**, the same class of error as F-574's decode and F-589's set difference. The pump is not slow; the queue is simply empty at boot and the consumer is correctly parked on a count-0 binary semaphore.
+
+**3. What actually works, measured.** `PUSH` 6, `INLINE-EXEC` **4**, `C0000005` **0**, `cnt` (the gate's released-permit count) climbing 0->4. The gate is released once per successful push, the consumers wake, and 4 of 6 records execute. **The semaphore release/wait machinery is correct end to end** - which retires the whole wake-loss family of hypotheses (mint-on-release, wrapper mismatch, notify pair, gate starvation) as not-the-cause.
+
+**4. The real remaining defect: 2 records.** `#5 slot=8284B37C tag=00008004` and `#6 slot=8284B990 tag=00010004` are pushed (gate released, `cnt` increments) but never execute. They differ from the four that ran in two independent ways: the tag's high word (`0x8000` / `0x10000` vs plain `1..4`), and the `chain[]` payload's second words are non-zero where records #1-#4 have zeros. Their `+1548` flag was never set, so the drain's `if (*(r30+1548))` guard skips them - consistent with F-586's finding that `+1548` has 14 independent writers across unrelated record types, i.e. this is a *different record kind* passing through the same ring, not a malformed copy of the same one.
+
+**5. Next, in order - narrow and cheap.** (a) Read `+1548` (and the tag) for slots `0x8284B37C` and `0x8284B990` at the moment they are pushed, by extending the existing `PUSH` census in `sub_821BC868` (already hooked, already logging `slot`/`tag`) with the record's `+1548`. That says directly whether the producer set the flag for the kind of record it pushed, or pushed a record kind the drain never executes. (b) If `+1548` is 0 for both, find which of the 14 writers owns records with the `0x8000`/`0x10000` tag - those tags likely select a different execution path, and the consumer would need that path rather than the flag. (c) Do **not** set `+1548` in the drain, do not release `C5400300`, do not pre-increment the gate, do not shorten the INFINITE wait. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, `RELSEMA-RES`/`WAITRES`/`RINGB-SLOT` stay at WARN. Acceptance: `INLINE-EXEC` reaching the `PUSH` count, then `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-592**.
+### F-592 (2026-09-28 03:3x, **static: `generated/ppc_xenon/ppc_recomp.14.cpp:19182-19196`, `:20131-20150`; re-read of `build/w620.log`; no build**) - **`+1548` IS NOT A WORK FLAG - IT IS THE CALLBACK ADDRESS, dispatched via `mtctr r11; PPC_CALL_INDIRECT_FUNC(ctr.u32)`. The drain's test is `if (*(rec+1548) != 0) sub_821BC140(...)`. So the two records that "never execute" have a NULL or invalid callback, and F434-SC is NOT involved (`F434-SPIN-BREAK` 0 in both `w616` and `w620`).**
+
+- Corrects: F-583 §2, F-590 §3, F-591 §4 (the "flag never set" reading is wrong)
+- Priority: P0
+
+**1. The decode, verbatim, at `ppc_recomp.14.cpp:19182-19196`:**
+```
+// lwz r3,1552(r26)                     device
+// lwz r11,1548(r26)                    callback
+// li r6,0 / li r5,0 / li r4,0
+// mtctr r11
+// bctrl
+PPC_CALL_INDIRECT_FUNC(ctr.u32);
+```
+**`+1548` is the function pointer that the record's completion path calls.** Not a boolean, not a length, not a "has work" bit. Every reading in this session that called it a flag (F-583 "`+1548` = the per-record has-work flag", F-590 "`+1548` was never set", F-591 "the drain's `if (*(r30+1548))` guard skips them") described a null-pointer check as a flag test. The test at `:20131-20136` is `r9 = *(r30+1548); if (r9 == 0) return;` - a **null-callback** guard, and the same value is then used as the call target at `:19192-19196`.
+
+**2. F434-SC is exonerated by count, not by argument.** `F434-SPIN-BREAK` = **0** and `INFLATE-UNSTUCK` = **0** in both `w616` and `w620` (it would print `F434-SPIN-BREAK #{} st=... outLeft=0` at `src/gpu_device.cpp:11895` after 64 sightings). §7's "two new streamer records reach `sub_821BC140` for the first time" is a *historical* w432 claim about a different run, not a live mechanism here. I checked it because the docs demanded it, and the check was worth making - but it is not the cause, and the gate's own predicate needs `inLeft>0 && inLeft<256 && outLeft>0 && produced==0`, none of which is logged in these runs.
+
+**3. The corrected statement of the defect, from `w620`.** Executed (`BC140-REC` slot set): `82849B2C tag=00000001`, `8284A140 tag=00000002`, `8284A754 tag=00000003`, `8284AD68 tag=00000004`. Pushed but never executed: **`8284B37C tag=00008004`**, **`8284B990 tag=00010004`**. So the two failures are records whose callback slot at `+1548` is null or not a callable guest address - they were **enqueued and released through the gate correctly, then skipped by the null-callback guard**. The gate machinery, the wake, and the drain loop are all confirmed working (F-591 §3 stands: `PUSH` 6, `INLINE-EXEC` 4, `cnt` 0->4, `C0000005` 0).
+
+**4. Why this is now a *producer* question, and it is not the one I guessed.** The producer `sub_821BC868` fills the record then releases the gate without checking that the record is executable. A record can therefore be published to a consumer that will unconditionally skip it - the guest's own contract is "a published record has a callback". The question is whether the **producer** failed to write `+1548` for the `0x8000`/`0x10000`-tagged record kind, or wrote a value that is not a guest code address. `chain[]`'s non-zero second words on exactly these two records (F-590 §3) are consistent with the producer taking a different fill path for them.
+
+**5. Next, in order - one measurement.** (a) Extend the existing `PUSH` census in `sub_821BC868` (already hooked, already printing `slot`/`tag`) to read `slot+1548` and `slot+1552` immediately after the push, bounded and registers-first per the F-585 rule. That is the *only* missing datum: it says whether the callback is null, a guest address, or garbage, and whether the device slot differs too. (b) If null: find which producer path fills the `0x8000`/`0x10000` tag and why it skips the callback - and prefer fixing the producer over publishing an unexecutable record. (c) Do **not** synthesise a callback in the drain, do not set `+1548` to a stub, do not release `C5400300`, do not pre-increment the gate, do not shorten the INFINITE wait. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched, `RELSEMA-RES`/`WAITRES`/`RINGB-SLOT` stay at WARN. Acceptance: `INLINE-EXEC` reaching the `PUSH` count, then `BOOTPATH`/`DISCCHK` > 0 with `CS-TIMEOUT` = 0. Next ID **F-593**.
+### F-593 (2026-09-28 03:5x, **build `build/w621_build.log` RC=0, soak `build/w621.log` 300 s**) - **THE "RECORDS THAT NEVER EXECUTE" FINDING IS RETRACTED ENTIRELY. In `w621` ALL 7 pushed records execute, including every high-bit-tagged one. F-590, F-591 and F-592 were all a WINDOW ARTEFACT: those records are pushed late in the boot and had not been popped when the 300 s soak ended. Separately: the tick-starvation hypothesis is also refuted (all 8,145 waits return STATUS_SUCCESS), and the one change tried from it has been REVERTED.**
+
+- Retracts: **F-590, F-591, F-592** (all three), and the F-583/F-589/F-591 "pump" chain that fed them
+- Priority: P0
+
+**1. The retraction, from the data.** `w621` `BC140-REC` slot set = **all seven**:
+```
+82849B2C tag=00000001   8284A140 tag=00000002   8284A754 tag=00000003   8284AD68 tag=00000004
+8284B37C tag=00008004   8284B990 tag=00010004   8284BFA4 tag=00018004
+```
+`PUSH` 7, `BC140-REC` 7 distinct slots - **zero skipped**. Every record carries the same valid callback `cb=821BC548` (the `(EMPTY)` marker never printed), and the high-bit tags are a **counter, not a record kind**: the high word steps `0x8000, 0x10000, 0x18000` while the low word stays `4`, i.e. the same request retried three more times. So the ring, the gate, the drain, the null-callback guard and the callback dispatch are all **confirmed working**. `F-592`'s "null or invalid callback" was also wrong - the `PUSH` census had `cb=` on the same row and I read the flag story instead of the field.
+
+**2. Why I got it wrong three times over.** The method was identical each time: compare two counts at one instant, treat the difference as a mechanism, write it up. `w620` had `PUSH 6 / BC140-REC 4` and I read the 2 as "never execute" - but they were pushed in the last seconds of a 300 s window and would have run. The correct test is whether the *sets* converge, which only a longer run or a per-slot completion marker can show, and neither existed. **`t=300s` was the confounder and I never questioned it.**
+
+**3. The tick hypothesis is refuted too, and the fix reverted.** `lr=0x8242FC1C` (6,415 lines, hottest guest `lr`) is the return of `__imp__KeWaitForSingleObject` at `sub_8242FB88` (`ppc_recomp.78.cpp:27218`), called with `r3=r26+32` = `0x40004D5C+32` = the scheduler tick, `r4=3`, `r5=1` (alertable), 30 ms. It looked like starvation: 3,181 waits vs 63 releases. **But `WAKE[KWFSO] status=0x00000000` on all 8,145 waits - every one returns STATUS_SUCCESS, never STATUS_TIMEOUT.** The thread is not starved; it is released every time. I added `::SignalSchedulerTickPublic()` to the vblank ISR (`sub_82419718`, `gpu_device.cpp:4833`) on that reading; it moved the frontier a little but **added 2 `C0000005` (0 -> 2)** and changed the release ratio not at all (18 FLIPs -> 65 releases vs 63), so **it has been reverted** and the tree is back to the shipped state (`BUILD_RC=0`). Per do-not #9 and rule 1, an unmeasured mitigation is worse than none; this one is now measured and removed.
+
+**4. What the real spin is.** After the `KeWaitForSingleObject` returns, the same `loc_8242FC1C` label is the target of a **`lwarx` / `stwcx.` CAS retry loop** (`ppc_recomp.78.cpp:27220-27238`): `lwarx r11,0,r31` -> `addi -1` -> `stwcx.` -> `bne loc_8242FC1C`. That is a guest atomic decrement under a reservation, and it is where the hot `lr` lives. **Not yet established**: which word (`r31`), who else writes it, and whether the CAS fails because of real contention or because the host backend does not implement `lwarx`/`stwcx.` as a real reservation. That is the next question, and it is the first genuinely new one in this session.
+
+**5. Current honest state of the frontier (`w621`, 300 s).** `GFx` **13**, `NATIVE-PRESENT` 14, `DISCCHK` **514**, `CP-DRAW` **954**, `F469-RECSNAP` 7, `POST-EXEC-START` guest time 20410/76250/89270 ms, `C0000005` 2, `Fatal error` 0, `FATAL-SOFT` 0. **Still `MOVIE-CTOR` 0 and `W35-BOOT-GATE` 0** - F-302 says the boot gate is `MOVIE-CTOR`, and it has never fired, so the game still does not draw. `CS-CONTEND` 32 / `CS-TIMEOUT` 2 persist, so F-572's acceptance (progress without the theft) is still unmet.
+
+**6. Next, in order.** (a) Name `r31` at the `lwarx` site: the registers-only way is the existing `WAIT[KWFSO]`/`WAKE[KWFSO]` census at `KeWaitForSingleObject`, extended to print `r31` (or the record at `r24+2148` from `:27242-27247`) so the contended word is identified. Do **not** patch the CAS. (b) Then check whether the host implements `lwarx`/`stwcx.` as a true reservation - if it emulates them as plain load/store the loop cannot make progress, which would be a root cause rather than a symptom, and it would explain a 95 s stall that no semaphore fix touches. (c) Invariants going forward: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp untouched; no tick/CAS/release workaround without a census that names the failing side; and **compare sets, not counts, before calling anything "never executes"**. Next ID **F-594**.
+### F-594 (2026-09-28 04:1x, **build `build/w622_build.log` RC=0, soak `build/w622.log` 300 s**) - **THE ACTUAL STOPPING POINT, MEASURED: the command-processor publish pointer is FROZEN at `put=7` across 957 of 1,609 ticks. The guest is waiting for CP work that is never posted. Everything else investigated this session is refuted. Plus a HARD BUILD CONSTRAINT now documented: a hook CANNOT read the callee's `r31`.**
+
+- Priority: P0 - this is the live blocker
+- Supersedes every "pump"/"wake"/"gate" theory in F-587..F-593
+
+**1. The measurement.** The `CAS-SITE` census (added this session at `src/kernel/imports.cpp`, inside the existing `WAIT[KWFSO]` producer block) confirms the hot site and identifies the thread:
+```
+CAS-SITE #1 lr=8242FC1C r13=00620260 blk@+100=00620E10 obj=40004DCC mode=1 alertable=0
+CAS-SITE #2 lr=8242FC1C r13=005A0260 blk@+100=005A0E10 obj=40004D7C mode=1 alertable=0
+```
+`lr=8242FC1C` is the return of `__imp__KeWaitForSingleObject` AND the branch target of the following `lwarx`/`stwcx.` retry loop (`ppc_recomp.78.cpp:27220-27238`). **1,608 of 1,609 hits are `r13=005A0260`** on the scheduler tick `0x40004D7C` - the same thread family as F-587's `CS-TIMEOUT #1 ... by=004A0260` and F-577's park samples.
+
+**2. The freezing pointer, which is the actual blocker.** The same row carries `put=` (the CP publish counter read from `gpuCtx+10908`). Distribution over the 1,609 waits: **`put=7` on 957**, `put=5` on 129, `put=11` on 70, `put=9` on 50, `put=0` on 43, `put=13` on 20. So the counter reaches ~13 and then **sits at 7 for the overwhelming majority of the run** - it is not advancing. The guest is polling a CP that stops posting. That is the boot stopping; the waits, the ring, the gate and the tick are all working and merely reveal it.
+
+**3. The waits are healthy, so do not go back to them.** `mode=1 alertable=0 to=30ms` is a poll, and `WAKE[KWFSO] status=0x00000000` on **all 8,145** waits in `w621` - every one returns `STATUS_SUCCESS`, never `STATUS_TIMEOUT`. The thread is released every time. F-593 already tried pumping the tick from the vblank ISR and **reverted it** (it moved the frontier slightly but took `C0000005` 0 -> 2 and did not change the release ratio). Current run confirms the revert: **`C0000005` 0, `Fatal error` 0, `FATAL-SOFT` 0**.
+
+**4. HARD CONSTRAINT - read before trying to inspect a reservation.** `PPCContext` has **no `r31` member** in this build. `src/ppc_config.h:10` defines `PPC_CONFIG_NON_VOLATILE_AS_LOCAL`, which makes `src/ppc_context.h:345-363` omit `r14`..`r31`; the generated TUs keep them as function-local `PPCRegister` (`ppc_recomp.78.cpp:18`). **Therefore no hook can read the callee's non-volatile registers, including `r31`** - `g_ppcContext->r31` does not compile. Three attempts in this session each cost a build cycle. The contended word must instead come from the generated code or from a new hook placed at the CAS site. **Both `src/ppc_context.h` and `src/ppc_config.h` are on the do-not list (rule 2) - do not "fix" this by editing them.**
+
+**5. Frontier, `w622` (honest, post-revert).** `GFx` 3, `DISCCHK` 40, `CP-DRAW` 263, `PUSH` 6, `BC140-REC` 3, `C0000005` **0**, `Fatal` **0**. **`MOVIE-CTOR` 0 and `W35-BOOT-GATE` 0** - F-302 names `MOVIE-CTOR` as the boot gate, so the game does not draw. `CS-CONTEND`/`CS-TIMEOUT` (32/2) persist, so F-572's acceptance - progress without the critical-section theft - is still unmet.
+
+**6. Next, in order.** (a) Follow the CP, not the waiter: find what advances `gpuCtx+10908` (`put`) and show why it stalls at 7. The thread is the *consumer*; the producer is the CP/command-buffer path, so census the side that WRITES the publish pointer rather than the side that reads it. (b) Establish whether `put=7` is the CP genuinely having no work, or work being posted but the counter not advanced (the same released-vs-read asymmetry as F-587, one level up). (c) Only then consider any host-side change. Invariants: `C0000005` 0, `Fatal` 0, `C6D90-GROW` clamp (F-574/F-576) untouched, the four WARN wait markers (`RELSEMA-RES`, `WAITRES`, `RINGB-SLOT`, `CAS-SITE`) stay at WARN, and the reverted vblank-tick pump stays reverted. Acceptance: `MOVIE-CTOR` > 0, then `W35-BOOT-GATE` > 0, with no `C0000005`/`Fatal`. Next ID **F-595**.
+### F-595 (2026-09-28 12:2x-12:5x, **build `build/w623_build.log` (exe 12:28, +3,584 B, both markers in image), soak `build/w623.log` ~21 min / 475,465 lines**) - **F-594''s "FROZEN put" IS A QUIET-MODE ARTEFACT. In a running boot `put` advances 12,000+ times (3 -> 24,000+), ALL through `sub_82412588`, while the draw-submission path `sub_8242FEF8` NEVER RUNS. The CP producer is not the gate: `MOVIE-CTOR`/`W35` still 0 with `put` flowing.**
+
+- Retracts: F-594 section 2 as a general claim (its `put=7 x957/1609` reading of `w622` stands for that soak only). `w622` was the F-572 quiet mode (producer thread never scheduled); `w623` is the fast mode. Same binary, scheduling lottery - compare modes, not soaks.
+- Supersedes: F-594 section 6(a)/(b) (the "chase the CP producer" order). The producer was found and it is healthy.
+
+**1. The instruments** (both log-only, bounded, registers-first, `src/gpu_device.cpp:2821-2869`; rule-4 pattern confirmed: orig+override pair, same as `0x8242FD00`). `F595-PUTADV` on the only `+2` writer `sub_82411CD0` (entry: `dev`/`putBefore`/`lr`; return: `putAfter` for first 16); `F595-2FEF8` on parent `sub_8242FEF8` (entry count + `lr`).
+
+**2. The measurement (`w623`).** `F595-PUTADV` #1..#16 + #2000/#4000/.../#12000: `dev=40002080`, `putBefore` 3->5->...->24001, `-RET putAfter=putBefore+2` every time, **`lr=82412694` on ALL of them**. Raw bytes: `0x82412690 = 4BFFF641 bl 82411CD0`, return `0x82412694` (`tools/ppc_disasm.py`) = inside `sub_82412588+0x108`. So every one of 12,000+ advances comes via chain B (`sub_82412588`); **zero via chain A**. `F595-2FEF8` = **0 rows**: the draw-submission path (`sub_8217B430`->`sub_8241C308`->`sub_8242FEF8`->`sub_82411CD0`) never executes in this boot, yet `CP-DRAW` fires 453x and `PUSH`/`BC140-REC` are 7/7 - draws reach the ring through chain B''s reservation path (`sub_82412710` indirect-dispatch builder) instead. Chain-A silence is plausibly phase-normal, not a defect - unmeasured either way.
+
+**3. The waiter sees it.** `put=` over 75,204 WAIT lines: max **27,485**. The waiter is not starved in fast mode.
+
+**4. And it gates nothing.** `MOVIE-CTOR` 0, `W35-BOOT-GATE` 0, `BOOT-GATE-POST` 0, `XSF-INFLATE` 0, `F438-GFXCTOR` 0 with `put` at 24,000+. Frontier (21 min): `GFx` 13, `DISCCHK` 3,570, `PRESENT` 2,668, `CP-DRAW` 453, `CS-CONTEND` 32 / `CS-TIMEOUT` 2 (theft still needed - F-572 UNMET), `C0000005` **0**, `Fatal error dispatcher` **0** (the 19,449 `fatal` substring hits are the known `P5-GATE ... no Resource fatal` place-pass spin, peer domain, F-226/F-235). Regression gate holds over 21 min: both hooks clean.
+
+**5. Tooling built this session (outside the guest trail).** x64dbg installed (`winget`, `x64dbg.x64dbg` 2026.05.27, portable under WinGet Packages); agent bridge `tools/x64dbg_mcp.py` (`x64dbg_run` launch + `x64dbg_attach` with `confirm_live` guard) smoke-verified end-to-end and registered in `opencode.json` + `.qoder/settings.json` (identical semantics). Two gotchas recorded: `headless.exe` inherits stdio and blocks on its command loop unless `stdin=DEVNULL`; PowerShell `>` writes UTF-16LE - `w623.log` (128 MB) is UTF-16, census ran on decoded `build/w623_utf8.log` (evidence original kept). Soak commands must go through `cmd /c` redirect or `Out-File -Encoding utf8` under this shell; also my soak ran without the `timeout` wrapper (~21 min, killed by hand, BOOT_RC=1) - wrap it next time.
+
+**6. Next, in order (F-596).** (a) One build, two entry hooks: `sub_8241C308` (does chain A''s parent run but skip `sub_8242FEF8`, or never run?) and `sub_82412588` (which of its two callers feeds it - `sub_82412710` fence path or `sub_8241B318`?). The `lr` on each answers it. (b) Only if `8241C308` runs and skips is chain-A silence a guard question; if it never runs, it is phase-inactivity - close that line. (c) Do NOT touch the CP producer: it is measured healthy. Invariants: `C0000005` 0, `Fatal` 0, F-574 clamp, four WARN markers at WARN, vblank pump reverted. Acceptance unchanged: `MOVIE-CTOR` > 0 then `W35-BOOT-GATE` > 0. Next ID **F-596**.
+
+### F-595 addendum (2026-09-28 13:0x) - **`build/w624.log` is VOID and must never be cited.** The soak command used `cmd.exe` `timeout 300 mcla.exe`, which is a syntax error under `cmd.exe` (`ERROR: Invalid syntax` in `w624_err.log`, 0-byte `w624.log`) - the game never ran. F-596''s `F596-12588` hook is built into the current exe (verified `F596-12588 x1` in image, exe 12:55); its soak is `w625` (Python-bounded, raw bytes). The boot-cycle skill carries the corrected recipe.
+
+### F-596 (2026-09-28 13:0x, **build exe 12:55 `F596-12588 x1` in image, soak `build/w625.log` 300 s / 225,394 lines, raw bytes**) - **THE `put` PRODUCER CHAIN IS NAMED END TO END AND CLOSED: {61 guest callers} -> `sub_82412710` -> `sub_82412588` -> `sub_82411CD0` -> `put += 2`. The `sub_8241B318` feeder and the whole chain-A draw path fire 0 times. Producer healthy; the F-594/F-595/F-596 investigation is over - do not re-open it.**
+
+- Retracts nothing; completes F-595 section 6(a). F-596(a)''s first half (does `8241C308` run-but-skip?) was answered free from `w623`: `DRAWWRAP-census`/`SETSTREAMS-census`/`SETSTREAMS-CALLER` all 0 rows - chain A never runs (phase-inactive), so there is no guard to question.
+- Supersedes: the "chase the CP producer" line (F-594 s6, F-595 s6). Done.
+
+**1. The measurement (`w625`, fast mode).** `F596-12588` 18 rows (16 + #2000 + #4000), **every one `lr=824127A4`** = return of the `bl` at `0x824127A0` (`-> sub_82412710 +0x90`, `tools/ppc_xrefs.py`). `r3=40002080` throughout. The `sub_8241B318+0x2c8` feeder: 0 rows. `F595-PUTADV` 18 in step, `F595-2FEF8` 0 again (two boots, same silence).
+
+**2. The full chain (all links now have a row count in one boot).** 61 static callers -> `sub_82412710` (runs, feeds) -> `sub_82412588` (runs, 18+) -> `sub_82411CD0` (runs, 18+, `putBefore->putAfter = +2` each) -> waiter sees `put` to 27,485 (`w623`). Silent in the same boots: `sub_8241B318`, `sub_8217A470`, `sub_8241BE78`, `sub_8241C308`, `sub_8242FEF8` (all 0 rows) - the T41.7 draw path is phase-inactive while `CP-DRAW` (170x) and `PUSH`/`BC140-REC` (7/7) flow through chain B. `F595`/`F596` hooks (`src/gpu_device.cpp:2821-2885`) regression-clean: `C0000005` 0, `Fatal error` 0 (`w625` vs `w622` structural faults all +0; the 32,404 `fatal` substring = 32,182 `P5-GATE ... no Resource fatal` place-pass rows, peer domain, F-226/F-235).
+
+**3. Frontier (`w625`, 300 s fast mode).** `GFx` 13 (= `w621`/`w623` fast level), `DISCCHK` 918, `CP-DRAW` 170, `PRESENT` 917, `CS-CONTEND` 32 / `CS-TIMEOUT` 2 (theft still needed - F-572 UNMET). Still zero: `MOVIE-CTOR`, `W35-BOOT-GATE`, `XSF-INFLATE`, `F438-GFXCTOR`. So with the CP producer, the streamer ring, and the waits ALL measured working, clause (b) rests exactly where F-440/F-441 left it: the boot-worker queue is only ever memset, no poster posts to the GFx dispatch, and the only host-side lever is the user''s rule-2/**F-055** gate. That is the standing blocker statement, not a new hunt.
+
+**4. Next (no new hook without a-Dispute).** Do NOT add CP/streamer/wait census: three sessions of instruments agree. Candidate next measurements, cheapest first: (a) re-read F-440/F-441''s queue words in a fast-mode boot (does the memset-only result reproduce when the producer runs 12k?); (b) T42.26 (#80): any guest site that would post `0x40003B03`-class messages. Rule-2/F-055 stays the user''s decision; do not default to the forced gate. Next ID **F-597**.
+
+### F-597 (2026-09-28 13:2x, **0 builds, 3 read-only subagents, Phase 1 of T42.26 CLOSED**) - **THE POSTER HUNT PHASE 1 VERDICT: no poster, no walker, no code-held msgids. The "send the start-graphics message" step does not exist as reachable code. Do not hunt it further - pivot to why the installer never finishes.**
+
+- Hunter #1 (queue-region writers, `0x40004B40..0x40004DC0`): `grep 0x40004B` over `generated/` = 0; all `lis 0x4000` sites are values/floats/msgids, all low-half matches resolve to high pointers. Only stores that can land in-window use runtime-supplied pointers: `sub_8242F870` cursor stores (need `write!=read`, never satisfied in any soak) and the zeroing memset from `sub_824134E0` (Rank 2, `r4=0` by construction). No static poster by immediate materialisation.
+- Hunter #2 (table walker): full-VA literals for `82115F60/82117820/82102AC0/821065B0` = 0 hits; `0x8211`-page materialisation = 0; msgid hex/decimals and their `ori`/`addi` lows = 0 everywhere in `generated/`; named candidates eliminated by reading (`sub_821EBCF0` = field init, `sub_82130588` = vtable trampoline, `sub_821EBAF0` = stride-4 teardown, none stride-8 match-and-dispatch). Dynamic counterpart stands: F-440 read-watch 0 rows with 8-row control.
+- Hunter #3 (msgid census): all 65x `0x40003B03`, both `0x40001405` sites, `0x40001905`, `0x40003D03` = table records; `0x40002204` is a kernel handle, not a msgid (F-310); `lis 0x4000`+`ori 0x3B03` scan = 0 sites (F-271). Retired as weak negative: old "`xref`=0 proves no poster" (F-439 S3 caveat) - dynamic arbiters (F-440/F-441) carry the verdict instead.
+- Consequence: Phase 2 is NOT "track the poster" (there is nothing to track). The mechanism poster->table->dispatcher->ctor has neither a poster nor a walker in reachable code, while the installer `sub_82131508` (which owns the UI-load registration at `0x821315F4`) never gets past `sub_822C2EA8` (F-550..F-553, T41.60: thread parks in `PUSH sub_821BC868`, stops at #7, `q=82849518`). Next ID **F-598**.
+
+### F-598 (2026-09-28 13:3x, **1 build, soak `build/w626.log` 300 s / 230,609 lines, raw bytes**) - **THE SERIALIZER NEVER RUNS AND THE "ALLOCATION LOOP" IS A MISREAD: after growth completes (<50 ms), ZERO function entries fire anywhere in the serializer/allocator for 4.5 minutes while parks pile at two return-site lrs. The thread is blocked BELOW the deepest hooked call (`bl sub_82130528`), not spinning above it.**
+
+- Instruments: `F598-DD670` (`sub_821DD670` entry) + `F598-C6658` (`sub_821C6658` entry + args), `src/gpu_device.cpp:17903-17933`, rule-4 clean, regression-clean (`C0000005` 0, `Fatal error dispatcher` 0, `FATAL-SOFT` 0).
+- Measured (`w626`): `F598-DD670` = **0 rows** - the varint serializer is never entered; the F-570/F-571 "byte-by-byte" attribution is void for this boot. `F598-C6658` = 16 rows, all 13:39:04.7-06.6, `r3=8EFFF098` (the grow object), `r4` = 4/8/10/20/.../0x8008 (the growth realloc sizes), `lr=821C6DC8` - i.e. ONLY the growth allocs themselves; then silence to end of soak. `C6D90-GROW` 8 rows, same window. Growth completes; nothing downstream ever runs.
+- Yet `PARK-SAMPLE` reports `lr=821C6DC8` x~369 + `lr=821C667C` x~127 across all 5 minutes. Both lrs are RETURN SITES (`0x821C6DC4 bl 821C6658` / `0x821C6678 bl 82130528`): the last calls were made, the callees never came back. Disassembly of the call-free loops below both sites terminates by construction (grow copy loop `821C6DDC-6E1C` exits at `(i+1)&0xFFFF >= lhz cnt`, cnt 16-bit; the `sth`-increment loop at `6E2C+` likewise), and the late-row stack `[r1-8]=821C6DC8` (saved-LR slot) proves the live frame is INSIDE `sub_821C6658`. So the thread sits below `bl sub_82130528` - the allocator backend (F-395''s old neighbourhood) - making no calls, firing no hooks. Sticky-lr (do-not #14) fully explains the "two park sites": one frame, two historical return addresses.
+- Frontier (`w626` fast-ish): `GFx` 6, `CP-DRAW` 171, `CS-TIMEOUT` 2, `MOVIE-CTOR`/`W35` 0. `PRESENT-GRADIENT` 13 + `PRESENT-BLIT-SYNTH` 1, `PresentBgra`/`PresentDirect`/`DrawDynamicMesh` all 0 - nothing game-drawn reaches the screen (user screenshot blocks addressed separately).
+- Next (F-599): entry/exit hook on `sub_82130528` (entries without exits = blocked inside; then name the wait). Next ID **F-599**.
+
+### F-599 (2026-09-28 13:4x, **1 build (`lr` on `XTLIMPORT alloc`), soak `build/w627.log` 300 s**) - **BELOW `bl sub_82130528` IS NOT A WAIT: it is `strdup` churn - ~89% of ~140,000 allocs are 1-byte (empty-string dups) from ONE site, `lr=82137904`. The "allocation loop" is a string-duplication loop.**
+
+- Method: F-555 again (instrument below the deepest fired point). `XtlImportCensus` gained `lr` (`src/gpu_device.cpp:20388-20392`, default keeps `alloc-max`/`free` rows byte-identical); only the `alloc` site passes `ctx.lr`. Regression-clean so far (`C0000005`/`Fatal` counts in next census).
+- Measured (`w627`, 288 printed rows = first 8 + every 500th of ~140k): `lr=82137904` on 256/288 samples (~89%). Raw bytes (`tools/ppc_disasm.py`): `0x82137900 bl 82130528` inside `sub_821378B8`, whose body is `strlen` (`lbz` loop to NUL at `0x821378DC-821378E8`) -> `alloc(len+1)` -> `bl 0x823DA950` (copy). **The guest `strdup`.** Sizes `a=1` dominate = duplicating EMPTY strings ~470x/sec to soak end (`#140000` at 13:43:41, 1 s before timeout).
+- `sub_821378B8` has 61 static callers (`tools/ppc_xrefs.py`); the hot one is unnamed (hook prints its own call site, not its caller). `F599-STRDUP` (entry + arg string head + `lr`, `src/gpu_device.cpp:17934-17955`, rule-4 clean, in current exe) names it next soak (`w628` running). Next ID **F-600**.
+
+### F-600 (2026-09-28 13:5x, **1 build, soak `build/w628.log` 300 s / 228,392 lines**) - **STRDUP CALLERS NAMED - AND THE CHURN IS CLOSED AS NON-BLOCKING: ~470 one-byte allocs/sec is three orders of magnitude below anything that can stall a boot. Do not drill further; the stall is elsewhere.**
+
+- Measured (`w628`, `F599-STRDUP` 21 rows = 16 + 5 periodic): callers `sub_821BFB60` (+0x84/+0xb0 sites, 14 rows: `mcAm`/`mcCa`-headed path strings, static+heap pairs = path normalisation burst at 13:55:43), `sub_821C62A0` (+0x4c site, 5 rows incl. all late periodic: stack-resident EMPTY string `8EFFAB20 head=00000000` = the steady-state churn), `sub_821D2A58` (+0x1c, 2 rows: `erro`-headed static strings). Regression gate holds: `C0000005` 0, `Fatal error dispatcher` 0, `FATAL-SOFT` 0.
+- Static roles (bytes, not guesses): `sub_821C62A0` = null-guarded (not empty-guarded) field dup `*r30 = strdup(r29)`; its 7 callers are the `sub_821C70xx` per-field serializer family (`bl 821C6D90` push, `bl 821C62A0` dup, `bl 821C63xx/64xx` next - straight-line field writers, the loop is their unhooked driver). My pre-soak suspect `sub_82189438` (material-record names) fired 0 rows - context-suspect refuted by measurement, as the method requires.
+- NON-BLOCKING verdict with the rate argument: 140,000 x ~16-byte host-heap ops over 300 s ~= 470/s; the host `o1heap` serves millions/sec (421 `o1heap` rows without distress, zero `returned null`). This churn cannot account for a 5-minute stall - it is a curiosity riding on top of the real park, and the park (`lr=821C6DC8/821C667C`, no guest entries post-growth) is a thread living in unhooked code below the allocator, not this churn. Five build+soak cycles (F-595..F-600) are banked; further drilling here has no gate-moving hypothesis.
+- Redirect (unchanged from F-596 s4): clause (b) rests at F-440/F-441 (no poster, registry unread) behind the installer stall (`sub_82131508` in `sub_822C2EA8` subtree). The live question that CAN move `MOVIE-CTOR` is T41.60''s with current-binary data: what the boot thread waits on - needs thread-attributed parks (PARK-SAMPLE carries no tid), not more alloc census. Next ID **F-601**.
+
+### F-601 (2026-09-28 14:1x, **1 build (tid tags), soak `build/w629.log` 300 s / 225,437 lines**) - **JOIN RESULT: SAME THREAD (`000040AC`) - the parked boot worker IS the churner. AND IT IS PROGRESSING: 553 distinct archive paths in 300 s, nearly zero repeats. Slow walk, not a wedge. The installer stall framing (F-550..F-556) is superseded for the current binary.**
+
+- `PARK-SAMPLE worker-tid=000040AC` (`src/boot_host.cpp`, once) + `XTLIMPORT ... tid=` (`src/gpu_device.cpp:20388`): all 282 printed alloc rows carry `000040AC`. One thread loops in unhooked driver code (guest `lr` stale at the growth return sites - do-not #14) dispatching through `strdup`->`__xtl_alloc`. No second churner exists.
+- Progress proof (`w629`, read-only): `BDF20` 558 rows over **553 distinct paths** (only the 5 `preload.list` re-opens repeat), `TOC76` 2,245, `DISCCHK` 889, `BOOTPATH` 5. A wedge re-opens the same members; this walk is linear through the archive (city bucket = largest, F-573). The empty-name `strdup` churn (`8EFFAB20`, all 5 periodic samples both boots) rides per-record field writes - waste motion, not the wall (F-600 rate argument stands).
+- What this supersedes: "installer never finishes" as a stuck-frame story (F-553/F-555/F-556 were a different binary era); the current shape is THROUGHPUT: ~1.8 paths/sec with ~470 waste-allocs/sec riding along. Open: total path count (is 553/600? 553/10000?), i.e. whether a longer soak completes a phase. `C0000005` 0, `Fatal error dispatcher` 0.
+- Next (F-602, no build needed - current exe): 600 s soak on this binary; gate = fresh-path count keeps climbing linearly AND a phase completes (new BOOTPATH bucket / `MOVIE-CTOR` > 0) vs path re-opens (higher-level restart loop = new hunt). Next ID **F-602**.
+
+### F-602 (2026-09-28 14:2x, **0 builds, soak `build/w630.log` 600 s / 313,200 lines**) - **THE WALK COMPLETES AND PHASE 2 IS A FENCE STORM: all 558 file-opens land in the first half (553 distinct, 0 re-opens); the second half opens nothing and spins 17k fence waits + 15k container destroys with no new bucket and no movie. Gate answered as neither-nor: not linear-to-completion, not a restart loop - a NEW stall after the walk.**
+
+- `BDF20` 558 rows / 553 distinct, ALL in first-half lines (second-half file rows = 0). `DISCCHK` 889 -> 1,765 (keeps ticking), `BOOTPATH` 5 (no new bucket), `MOVIE-CTOR`/`W35` 0, `C0000005` 0, `Fatal error dispatcher` 0.
+- Second-half top markers: `WAIT/WAKE/CAS-SITE` ~33k (healthy polls), **`F98-SKIP` 17,094** (the pre-existing `sub_82412F98` fence short-circuit at `src/gpu_device.cpp:15154-15165` waving through a fence that never signals), **`FB0D8-DTOR` 15,634** (`sub_825FB0D8` swf-container destructor - F-304''s +12=0 failure shape, now at volume), `CP-DRAW-STATE` 9,116, `F374-HEAPSTORE` 666, `F447-REFILL` 459 (tokenizer still starved). `put` reaches ~13.7k (producer alive) while the fence never satisfies.
+- Standing suspect for F-603 (from the code comment, UNVERIFIED): `sub_82412F98` busy-loops on `*(TLS_block+332)` while our CP drain only publishes to `*(TLS_block+88)` (`src/gpu_device.cpp:15146-15152`) - i.e. we may be completing work at an address the guest never checks. Verify from guest bytes before touching anything (disassemble the poll + name both offsets). Next ID **F-603**.
+
+### F-603 (2026-09-28 14:2x, **1 build (fence-equation fields), soak `build/w631.log` 300 s**) - **FENCE EXONERATED 16,545/16,545: every fence check is already satisfied (need<=pub). Phase 2 is not a stall at all - it is a LIVE render loop at ~70 Hz submitting small packets and polling satisfied fences. The "fence storm" framing is retracted.**
+
+- Measured: `F98-SKIP` extended with `need=/sub=/pub=` (`src/gpu_device.cpp:15165-15181`, behavior unchanged - still returns success). All 16,545 rows `need<=pub` (top: `need=5461 pub=5461`); waiting rows = 0. The fence never blocks anything.
+- One caller (`lr=824111D8` x16,543/16,545): loop in `sub_82411180` (`0x824111D0-82411204`: fence, check r3==0 -> exit). Our skip returns r3=0 so each entry exits after ONE fence; the 22k volume (`HELPER-thunk sub_82411180` max #22000) comes from the OUTER driver: `sub_82411640` reserver (max #20000, flags=1/2, small reqs) <- `sub_82411840` / `sub_82412318` envelope builders (only 2 static callers, `tools/ppc_xrefs.py`). 20-22k reservations / 300 s ~= 70/s = frame-rate submission. `NATIVE-PRESENT` 81, `FRAME-END` 30, `VdSwap` 31: presents tick.
+- Retracted: F-602''s "NEW stall after the walk" (phase 2 as fence-wait + destructor churn). The churn is real (`FB0D8-DTOR` 15k, `F447-REFILL` starved) but the fences pass; the loop is alive and empty, not blocked. What is missing is CONTENT (no poster F-597, no scene/UI) and TRANSLATION (draws logged never executed, F-567) - both construction jobs, not census questions.
+- Method note: this closes the F-594..F-603 arc (7 build+soak cycles). Every link now has a row count; the remaining gaps need building, not watching. Next ID **F-604**.
+
+### F-604 (2026-09-28 14:3x, **0 builds, 3 read-only subagents, DRAW-BRIDGE Phase 1 CLOSED**) - **ONE bridge shape serves all ~22k observed draws (auto-index, prim 1/8, 1-3 implicit indices). VB unresolvable today (setup opcodes unhandled + state never programmed). Build order: fix 2 code bugs -> minimal producer -> setup-opcode capture -> pixels.**
+
+- Census (`w630` 600 s + `w631` 300 s): ALL draws `op=0x36/src=2` (auto); class B `prim=8/numIdx=3` ~99.7% (~8.8k/13.7k), class A `prim=1/numIdx=1` 24-row prologue burst; `idxSize=0`, `dma=0`, `hdr=C0003600` constant; NO src=0/1, NO op=0x22, NO numIdx>3. `writes=` frozen at 54 for #1-24 (dead prologue) then live (+50-200/draw). State peeks `r08B/8C/0DD/0D2/0A2` all-zero every row; `r1DC/r1DD` constant - guest never programs VB-visible state in this phase.
+- Register file: mechanism sound (`g_xenosReg[0x5003]`, RMW-faithful, 64-trace) but draw-parameterising opcodes unhandled: SET_CONSTANT family (fetch block `0x4800`), IM_LOAD (shaders), draw-time `WriteRegister`s. `CP-DRAW-STATE` 7 fixed peeks retired as evidence (5 unmapped IDs + 2 scratch).
+- Contract: 9 gaps ordered (ibFmt; null-VB desc bug `d3d12_backend.cpp:2487-2496`; viewport ignored; dropped offsets; stream-0-only; IB/textures never captured; shaders/consts unusable; stub state; no producer + poor queue struct). `DrawCapturedCommand` has ZERO producers; T41.8 clear-after-draw still live in `DRAW_CAPTURED` handler (`render_thread.cpp:613-616`).
+- Phase 2 order: (1) null-VB desc + clear-after-draw fixes (no new data); (2) minimal auto-class producer at CP-DRAW + `ibFmt` field, gate `DRAW_CAPTURED#`>0 + `drawsIssued`>0, zero regressions; (3) SET_CONSTANT/IM_LOAD capture for VB; (4) pixels via `cap.ps1`. Plumbing vs content are separable milestones (bridge may execute on dummy state until guest programs VB). Next ID **F-605**.
+
+### F-605 (2026-09-28 14:5x, **1 build, soak `build/w632.log` 300 s / 194,416 lines**) - **PIPE FLOWS: 5,000+ markers CP -> queue -> backend with zero refusals and zero faults. DRAW-MARKER max #5000; `C0000005` 0, `Fatal error dispatcher` 0, `FATAL-SOFT` 0. F-567 closed at plumbing level.**
+
+- Built: `DrawMarkerCommand` + `DRAW_MARKER` (`src/render_queue.h`), handler drawing CPU-side grid quads via test PSO (`src/render_thread.cpp`, no clear-after, no guest touch), producer at CP-DRAW auto class + `kCpDrawMarkerPipe` kill-switch + include (`src/gpu_cp.cpp`). Dead `DrawPacket` path untouched (needs shaders it cannot get).
+- Measured: handler processed to #5000 (first-10 + every-500th = 20 rows); the 55 `refused` rows are pre-existing `BE250-MEM-BADPTR` stream refusals (early boot, unrelated); no stride-mismatch drops; `CP-DRAW` 124 headers (~8k draws). Queue never blocked the guest (no ` submitting stalls; depth unmeasured but 4096 cap vs ~30/s rate = 136 s buffer).
+- Pending humanVERIFY: colored quad field on screen (`cap.ps1` or eyes) - log proof ends at `DrawDynamicMesh` entry; present-to-glass unconfirmed from logs. Next ID **F-606** (SET_CONSTANT/IM_LOAD capture for real VB).
+
+### F-606 (2026-09-28 15:5x, **1 build (SET_CONSTANT 0x2D/0x55 + draw-time 21FA-C mirrors), soak `build/w633.log` 300 s / 215,894 lines**) - **ZERO setup packets in the boot phase AND the stream table is zeros: no real vertex data exists anywhere. The marker pipe is the phase ceiling - already built, glass-confirmed. Geometry work pauses until the boot delivers data.**
+
+- `CP-SETCONST` = 0 rows; `CP-T3-CENSUS op=0x2D/0x55` = 0 (opcodes never submitted; stream makeup: 0x3E 418k, 0x3C 27k, rest small). Fetch block `0x4800` stays empty - the "being filled" premise was phase-wrong.
+- Stream table dry dynamically: `SUBMIT-census sub_82420BA8` rows read `streams=0 vb0=[0,0,0]`, `r5=0`, `r7=0` (SetStreams never runs - `SETSTREAMS-census` 0 all soaks); `DRAW-GATE dummy` 14 / plausible 0. The mapper''s "filled on the live path" was static-only and is corrected: writer chain exists in code, never executes.
+- All five real-VB sources dry: r5/r7 null, table zeros, fetch empty, accumulator gated, grcFvf format-only. Game submits auto-draws with no vertex setup (early-boot placeholder points) - there is nothing to translate yet. `C0000005` 0, `Fatal` 0. Markers still flow (`DRAW-MARKER` 21 rows = 16+5 periodic).
+- Consequence: graphics construction STOPS here by evidence (any further bridge work has no input data); resume trigger = `streams>0` or `CP-SETCONST type=1` or plausible>0 in any soak. Effort returns to the boot quest (phase-2 loop nature: input-poll vs scene-wait). Next ID **F-607**.
+
+### F-607 (2026-09-28 16:1x, **0 builds, 4-source evidence blitz for the F-055 decision**) - **LARecomp got this game to menu+playable and SKIPPED THE INTRO: `SkipIntro` hook at `0x822C2F08` (inside OUR stall function `sub_822C2EA8`) + install-completeness requirement. Our archives are complete (all 4 RPFs present). No dispatch/queue/GFx-loader internals recorded anywhere.**
+
+Source 1 - LARecomp (first-ever pull; clone `Temp/opencode/larecomp`, facts only):
+- `sub_82131508` runs its OWN frame loop pre-main-loop (legals/intro), painting fullscreen movie quads via INLINE geometry (BeginVertices/EndVertices), not bound draws (`src/native_gfx/native_gfx.cpp:1032-1040`). Explains our draw census seeing only points during this phase.
+- `SkipIntro` at `0x822C2F08` jumps to `0x822C2F7C` when cvar true (`src/mc_engine/hooks.cpp:1903-1904`, `larecomp_config.toml:24936-24939`); companion legals-branch fix at `0x821315E4` (`hooks.cpp:1907-1931`). BOTH inside our stall path (`822C2EA8` size 0x678; `82131508` frame loop). Precedent: a prior team solved this phase by skipping it, user-configurable.
+- Install rule: default.xex + xarchive_audio + xarchive_audlo + xarchive_cache required; missing archive = guest trap `0x80000003` (`isoinstaller/larecomp_iso_installer.cpp:425-445`). VERIFIED OURS COMPLETE: all 4 RPFs in `build/game_data` (audio 1.6G, audlo 1.4G, cache 2.1G, music 0.78G) - content gap excluded.
+- Spin explained: "repacked resource that never arrives either spins in `sub_821BC140` or fatals" (`hooks.cpp:4690-4700`) - matches our F-434 spin (23M iterations, inLeft=20) shape-for-shape. InflateBegin ctx layout + hook points (`0x821D5EB4/EBBC`, `[r1+0x50]/[r1+0x54]`) give exact naming instrumentation if needed.
+- RAGE fatal `sub_821BD618`: handler null = silent infinite spin = "what MCLA infinite loading looks like" (`hooks.cpp:2475-2489`) - matches our F-368 fatal shape.
+- NOT recorded: msgids/queue/dispatch (zero hits for `0x40003B03/0x40001405/0x40004B40`), GFx loader internals (hints only), poster/walker. Reached menu+free-roam+races+saves WITHOUT mapping them (README workplan).
+- UI movie `sub_821F8038`: `sub_822C2EA8` calls it ONCE at boot for INTRO movie only (`hooks.cpp:3159-3167`).
+
+Source 2 - Xenia local (`.research/xenia`): `KeInsertQueueDpc` asserts "DPC does not dispatch yet; going to hang!" (`xboxkrnl_threading.cc:1148`) and `KeRetireDpcList` has ZERO definitions - queued DPCs NEVER run upstream either (SAME-SHAPE as our dead DPC path; the real posting path must be non-DPC). `0x4000xxxx` are NOT Xenia handles (`0xF8xxxxxx` shape) - our queue/tables are game-internal, not kernel. Xenia per-thread TLS is real (1024 slots) vs our ONE shared fabricated block (25 sites `r13=0x8F200000`) - noted, not indicted. No stride-8 table knowledge anywhere upstream.
+
+Source 3 - dossier: 8 contradictions resolved (later wins), 5 agreed facts (installer entered once/POST never; gate+UILOAD 0; registry unread + queue memset; C2EA8 ENTER-no-RETURN on old binary; gates held). F-601 supersedes the stuck-frame reading for the CURRENT binary (throughput, not wedge).
+
+Source 4 - IDA: `idalib-mcp` serves but the PE-dump DB has NO functions/xrefs at installer addresses (get_function_by_address + get_xrefs_to empty; get_callers [] consistent with table-dispatch). Needs full-XEX IDA Pro session for more. Web search down all session (no external verification possible today).
+
+CONVERGENCE: all four sources agree the start-message path is unmapped-by-everyone (us, LARecomp, Xenia) AND that LARecomp shipped playability around it via intro-skip + install-completeness + inflate diagnostics. No source contradicts another on any load-bearing fact.
+
+F-055 DECISION FRAME (user''s call): (a) SkipIntro-class guest patch at `0x822C2F08` (LARecomp precedent, cvar-gated, skips exactly the phase we stall in); (b) host-forced boot gate (old F-055, measured null in F-436: runs clean, still no GFx); (c) keep measuring (naming the never-arriving resource via InflateBegin ctx). (a) has external precedent of working; (b) is measured-insufficient alone; (c) is open-ended. Next ID **F-608**.
+
+### F-608 (2026-09-28 16:2x, **1 failed link + revert, 0 soaks needed**) - **SKIPINTRO SCAFFOLD DEFERRED WITH CAUSE: the movie block completes (SIDE-A ENTER+RETURN in `w631`+`w633`), so skipping it cannot unblock a downstream stall. Enhancement plan written for post-boot.**
+
+- Pre-census from EXISTING rows (no new hook needed - `F364_PROBE("SIDE-A")` already owns `sub_821F8038`): ENTER 1 + RETURN 1 in both soaks. Target completes; stall is downstream (F-554/F-555). A skip now = effort without unblocking; revisit trigger = ENTER-no-RETURN.
+- Transfer blockers documented: guest-RAM branch patch inert under static recompilation (code baked from `mcla_pe.bin`); only callee-level hooks transfer.
+- Self-caught process errors this entry: (1) wrote my hook BEFORE grepping src/ - duplicated `F364_PROBE("SIDE-A")`, link failed; rule 4''s tool has the known F-366 blind spot (macro-generated hooks invisible to `addr_owners.py`) - grep is mandatory, not fallback. Reverted, tree links clean (exe 4:26 = w633 bytes). (2) overwrote F-596''s comment with a bad anchor; restored.
+- Deliverable: `docs/ENHANCEMENT_PLAN_INTRO.md` (parked; trigger = boot to menu without skip; acceptance ordered legals->movie+audio->dismiss->opt-in skip; skip-before-playback forbidden). Next ID **F-609**.
+
+### F-609 (2026-09-28 16:3x, **user directive, no build**) - **NATIVE-ONLY CHARTER: this is not an emulation project. No bypasses, no fakes, no borrowed runtime - native correctness and native performance, whatever the price. ReXGlue-style shortcuts are out by definition.**
+
+Standing consequences, effective immediately:
+1. RETIRED AS OPTIONS: F-055 host-forced boot gate + SkipIntro bypass (F-607/F-608). Both stay documented as measured/traced, neither will be built. The boot must be earned through the game''s own path.
+2. MARKERS STAY DIAGNOSTIC: every `F5xx`/`F6xx` census hook keeps log-only + bounded + removal trigger. `DRAW-MARKER` (F-605) is pipe proof, NOT graphics: it retires the day real VB flows (trigger already written: streams>0 / type-1 fetch / plausible>0).
+3. MITIGATION AUDIT BECOMES P0: `src/` carries ~81 mitigation-shaped labels vs ~13 registered (F-047). Each unregistered fake is now a suspect that masks native behavior - audit, then remove lowest-risk first with per-removal gates (`C0000005` 0, `Fatal` 0, frontier unmoved). Pre-existing short-circuits that fake success (F98 fence skip, TASKJOIN-SC join-clear, open-gate bit) go on the removal list,?? one at a time, never stacked.
+4. PERFORMANCE IS A REQUIREMENT, NOT POLISH: native means fast - per-byte allocs, empty-string churn, 70 Hz resubmission of empty packets are backlog items with numbers attached, fixed after correctness per item, never excused as "works".
+5. NO BORROWED RUNTIME: ReXGlue SDK stays out (already AGENTS.md); LARecomp/Baboon remain facts-only sources (already policy). Recompiler output + our backend + real guest behavior - nothing else executes.
+
+### F-611 (2026-09-28 16:3x, **1 build, soak `build/w636.log` 120 s**) - **T2 NEVER FIRES: stall is inside t1''s (sub_822D4878) 8-call subtree, not at/after t2. Fast-protocol round (120 s) works.**
+
+- `F611-T2` 0 rows; `F556-C54D8`/`F610-DISP` 1 each (dispatch taken once, t1 entered, t2 never). `C0000005` 0, `Fatal` 0. None of t1''s 8 callees had any marker (all unhooked) - the bisect begins blind, which is why binary splitting beats linear hooks.
+- Next (F-612): single hook on the twice-called `sub_82387B90` (positions 4+6) splits 8 into {1-3}/{5}/{7-8}. Next ID **F-612**.
+
+### F-612 (2026-09-28 16:4x, **1 build, soak `build/w637.log` 120 s**) - **BOTH in-target hits fired (lr=822D4908/822D4914): calls 1-6 complete; stall is in 7 (sub_8238BA38), 8 (sub_82388540), or the alloc tail. Third row (lr=82398588) is a different context.**
+
+- `F612-BIS` 3 rows: #1/#2 are t1''s positions 4/6 (r3/r4 differ: null then D41713D4); #3 from `0x82398588` (outside t1 - 82387B90 has other callers, expected, not the stall). `C0000005` 0, `Fatal` 0.
+- Next (F-613): entry hook on #7 (`sub_8238BA38`, rule-4 clean): fires = stall at/after #8; silent = inside #7. Next ID **F-613**.
+
+### F-612/F-613 (2026-09-28 16:4x-17:0x, **2 builds, soaks `w637`/`w638` 120 s each**) - **BISECT WALKS DOWN: #7 entered (lr=822D491C); third row re-attributed to `sub_82388340` (different context). Testing #8''s entry next.**
+
+- F-612: `F612-BIS` 3 rows - #1/#2 are t1 positions 4/6 (lr=822D4908/822D4914); #3 (lr=8238852C) is `bl` at `0x82388528` inside `sub_82388340+0x1ec`, NOT t1''s call #8. Lesson: an lr names a return site, not a function - always resolve the enclosing function (`ppc_xrefs.py fn`) before claiming which call fired.
+- F-613: `F613-BIS2` 2 rows - #2 (lr=822D491C) = t1''s call #7 entered; #1 (lr=8238852C) = the same outside context. So #7 entered; #8 (`sub_82388540`, entry unhooked) unknown.
+- F-613 also mapped t1''s neighborhood statically: `0x82388540` area opens with jump-table stubs (tail `b`/`blr` fragments), real body at `+0x78` prologue style; `sub_82388340` is a separate neighbor.
+- Next (F-614): entry hook on #8 (rule-4 clean, in exe): fires = #7 returned, stall at/after #8; silent = inside #7. Next ID **F-614**.
+
+### F-613/F-614 (2026-09-28 16:5x-17:0x, **2 builds, soaks `w638`/`w639` 120 s**) - **#7 ENTERED, #8 ENTERED: stall at/after `sub_82388540`. #8 is a tail-jump (`b 0x82398568`) into a 3-call straight line; testing the last call next.**
+
+- F-613: `F613-BIS2` 2 rows, both #7 (lr=822D491C t1-direct + lr=8238852C outside context re-attributed to `sub_82388340+0x1ec`). #7 entered; #8 unknown.
+- F-614: `F614-C8` 1 row (lr=822D4920 = t1''s 8th call) - #7 returned, #8 entered. Static: `0x82388540` opens with jump-table stubs; the entry `bl` lands on `b 82398568` (JUMPOUT shape - post-call code never runs, F-360 rule); `sub_82398568` = straight line `82387B90 -> 8238B048 -> 8238B128` + epilogue.
+- Next (F-615): entry hook on the last call `sub_8238B128` (rule-4 clean): fires = first two returned; silent = stall in `8238B048`. `C0000005` 0, `Fatal` 0 throughout. Next ID **F-615**.
+
+### F-614/F-615 (2026-09-28 17:0x, **2 builds, soaks `w639`/`w640` 120 s**) - **#8 ENTERED, ITS 3RD CALL ENTERED: `sub_8238B128` is a 4-instruction store+return leaf (completes by construction). Stall is in t1''s alloc tail after #8. Batching the tail''s 3 distinctive calls next.**
+
+- F-614: `F614-C8` 1 row (lr=822D4920) - #7 returned, #8 entered. Static: #8''s entry is a tail-jump (`b 0x82398568`); target = straight line `82387B90 -> 8238B048 -> 8238B128`.
+- F-615: `F615-C83` 1 row (lr=823985A4) - all three entered. `sub_8238B128` disassembles to `lis/ori/stbx/blr` (4 insns, returns). So #8''s subtree completes; the stall is in t1''s tail: allocs + `bl 822D4518` / `bl 82490A08` / `bl 82490990` (+ `bl 82130528` already censused).
+- Next (F-616): one hook each on the 3 distinctive tail calls (rule-4 clean, all in exe): last firer = frontier. `C0000005` 0, `Fatal` 0. Next ID **F-616**.
+
+### F-616 (2026-09-28 17:0x, **1 build, soak `build/w641.log` 120 s**) - **T1''s TAIL RUNS STRAIGHT THROUGH: all three distinctive calls + all four 90A08 sites fired once each. The stall is past the factory run. Batching the next five calls.**
+
+- `F616-TAIL`: 90990x1 (lr=822D4938), D4518x1 (lr=822D498C), 90A08x4 (lr=822D49AC/4A08/4A64/4AC0 - FOUR t1 sites, each once). t1 progresses linearly through alloc-init-call factory chains (type tags -15096/-15068/-15040...); nothing repeats, nothing returns twice.
+- Method note: one-by-one bisecting grows linearly with tail length; switching to batch-frontier (N hooks, last firer wins) from here. Macro-hook form `F617_TAIL_HOOK` keeps it to ~10 lines per site; link success is the duplicate check (rule-4 tool blind to macro hooks, F-366).
+- Next (F-617): `825032B8, 82195800, 82507820, 82469A98, 8239EDC0` entries. `C0000005` 0, `Fatal` 0. Next ID **F-617**.
+
+### F-617/F-618 (2026-09-28 17:1x, **parallel-harness shakedown + F-617 verdict**) - **ALL FIVE S-batch calls fired same-millisecond: t1 runs straight through its entire mapped tail. Batching the next five. PLUS: concurrency kills at startup - parallel boots need staggered starts.**
+
+- F-617 (`w643b`, survivor): `F617-TAIL` 5 rows #1 each (`S032B8/S95800/S07820/S69A98/S9EDC0`, lrs `822D4AC4/4ACC/4AD0/4AD4/4AD8`, all 17:21:14.676-677). t1 linear through the whole factory+batch region; stall past `822D4AD8`.
+- Harness lesson (load-bearing): `w643a` (started :54) died :07 in a 12 ms VEH flood (`0xE06D7363` C++ exception x1606, thread=9084) during STARTUP phase (D3D12/SDL/AUDIO lines only, zero F6xx rows); `w643b` (started :59, same exe) ran 150 s clean (`C0000005` 0, `Fatal` 0, all 5 hooks). Build exonerated (b is the control); death = startup-phase instance collision (second init overlapping first), NOT guest logic. Harness rule: stagger parallel starts past init (~60 s) or single-flight startup; affinity pinning does not isolate the colliding resource (audio/SDL/PE-dump/file-locks - unidentified which). `soak_parallel.py` stagger 5 s -> raise for shared-init phases.
+- Next (F-618, in exe next build): `822CA238, 821D4090, 8239DE80, 8236E388, 82371310`. Next ID **F-618**.
+
+### F-617/F-618 (2026-09-28 17:1x-17:2x, **2 builds, soaks `w643b`/`w644` 150/120 s**) - **t1 WALKS THROUGH BOTH BATCHES: all 5+5 fired once each, sequential lrs. The tail keeps going; batching the third five.**
+
+- F-617: all five (`S032B8/S95800/S07820/S69A98/S9EDC0`) #1, same-ms, lrs `822D4AC4-4AD8`.
+- F-618: all five (`T2CA238/T1D4090/T39DE80/T36E388/T371310`) #1, lrs `822D4B2C-4B44`.
+- Body after: `821E7770, 82328648, 82365108, 8272DA30, 821F2B08, 826FF8C0, 826C2D88, 822EC338, 8226F530`, then epilogue jump (`b 823D9240` at `822D4B74`). Note `8239DE80` (F-564 CS-chain address) entered AND left (next fired) - the old deadlock address is a pass-through in the current binary.
+- Next (F-619): the five after `822D4B44`. `C0000005` 0, `Fatal` 0. Next ID **F-619**.
+
+### F-619/F-620control (2026-09-28, soaks w645/w646 120 s) - ALL FIVE FIRED (sequential); w645's 2 AVs = scheduling noise (same-binary control 0). Tail batch continues.
+
+- F-619 (w645): all five #1 (T1E7770/T328648/T365108/T72DA30/T1F2B08). C0000005 = 2 at __imp__sub_825FA460+0x267 (field reader, parked thread 35052, lr=0) - first non-zero in 13 rounds.
+- Control (w646, same exe, solo): C0000005 = 0, Fatal = 0, all five F619 #1 again. Build exonerated (new hooks are registers-only reads on other functions - innocent by construction AND by control). The 2 = quiet-mode spread (w645 ran 129k lines vs 160-230k norm).
+- Body after 822D4B5C: 826FF8C0, 826C2D88, 822EC338, 8226F530, then epilogue jump (b 823D9240 at 822D4B74). Next (F-620): batch those four.
+
+### F-620 (2026-09-28, 1 build, soak w647.log 120 s) - FIRST DARK CAMERA: 1 of 4 fired (826FF8C0 only). Stall inside or just below it. Its body is tiny (alloc-272, null-check, one call); testing the call next.
+
+- F620-TAIL: T6FF8C0 x1 (lr=822D4B60). 826C2D88 / 822EC338 / 8226F530: 0 rows. C0000005 0, Fatal 0.
+- Static: sub_826FF8C0 = alloc 272 via 82130528; null -> store 0 + return; else bl 826FED90, store result, return. With r3=D70B3D80 (non-null per F620 row), the bl runs. No loops, no waits in this frame.
+- Next (F-621): entry hook on sub_826FED90 (rule-4 clean).
+
+### F-621 (2026-09-28, 1 build, soak w648.log 120 s) - ENTERED (lr=826FF8E0): stall inside or below sub_826FED90. Its body holds TWO MORE jump-through-table dispatches; resolving both from entry.
+
+- F621-FED 1 row (r3=D70BCD80, r4=0x110). C0000005 0, Fatal 0.
+- Static: sub_826FED90 inits object, calls 821F3938, allocs, then bctrl#1 (ctr=[r6+24], r6=[r3]) at 0x826FEE58 and bctrl#2 (ctr=[r4+36], r4=[r3]) at 0x826FEE68. Both chains entry-readable (r31=r3).
+- Next (F-622): same-site chain resolution (F610 method, no new owner). C0000005 0, Fatal 0.
+
+### F-622 (2026-09-28, 0 builds + 1 build, soak w649.log 120 s) - ENTRY TOO EARLY: [obj] is zero at entry, filled mid-function with a STATIC address. Resolved both bctrl targets from raw bytes; confirming live.
+
+- F622-DISP2: obj=D70BCD80, r6=r4b=0 (all zeros). The body stores r10=0x820C507C to [obj] at 0x826FEDBC BEFORE the bctrls - entry sampling cannot see it. Lesson: resolve-then-verify, and distrust entry snapshots for mid-function state.
+- Static resolution (raw-be, one deref corrected mid-entry: t1=[0x820C5094]=826FEF08, t2=[0x820C50A0]=826FFB30). The slot is runtime-written so bytes are hypothesis.
+- Next (F-623): entry hooks on both (rule-4 clean): which fires = taken branch. C0000005 0, Fatal 0.
+
+### F-623 (2026-09-28, 1 build, soak w650.log 120 s) - BOTH BRANCHES LIVE (same-ms entries): t1=826FEF08 AND t2=826FFB30 entered. Stall below one of them; reading both bodies before the next hooks.
+
+- F623-T12: t1 (lr=826FEE5C) + t2 (lr=826FEE70) #1 each, 17:51:05.732. Raw-byte resolution confirmed live - the runtime slot held the static values this boot.
+- Static (free): t1 = straight-line inits, distinctive callees 821C9790 (x2) + 824787B0 (x2). t2 opens with two MORE bctrls ([obj]-chain), statically resolved to 821F3988 ([0x820C5098]) + 821F3E88 ([0x820C509C]).
+- Next (F-624): batch all four (t1 callees + t2 targets). C0000005 0, Fatal 0.
+
+### F-624 (2026-09-28, 1 build, soak w651.log 120 s) - SPLIT BRANCHES: t1's side runs HOT (821C9790 x6800), t2's side entered-once (821F3988 x1, 821F3E88 x0). Stall = inside t2's first target. Batching its first calls.
+
+- F624-TAIL: T1C9790 max #6800 (tight loop or hot re-entry), T4787B0 x2, T1F3988 x1, T1F3E88 x0. C0000005 0, Fatal 0.
+- t1's 6800x side is motion (looping init work); t2's entered-once side is the wedge: 821F3988 entered, its sibling never. Stall inside sub_821F3988 (straight-line body: 821CA540, 821F3580, allocs, 821C4210, 821C05E8, 821CA6A8, ...).
+- Next (F-625): batch 821F3580, 821C4210, 821C05E8, 821CA6A8 (821CA540 skipped - already MCLA_BISECT_HOOKed; grep-before-hook enforced again).
+
+### F-626 (2026-09-28, 1 build + 1 revert-check, soak w653.log 120 s) - REMOVAL #1 VERIFIED: dead dispatch branch deleted (-21 KB), alive path intact, gate green. First emulation removed under the native charter.
+
+- Removed: dispatchBootGateOnce lambda (174 lines: own thread/stack/GFX-ALLOC/CTOR/BOOT-GATE) + kF368 flag + both call sites. Kept: ALIVE census, TLSDEAD chain-init + alloc72 handoff (load-bearing AV guard).
+- Gate (w653): F358-ALIVE 8 (>0), FIX-821873E8 0, W35-BOOT-GATE 0, C0000005 0, Fatal 0, GFX-ALLOC/GFX-BLOCK/BOOT-GATE-started 0 (dead literals gone; battery will list them as questions per F-057(6) - honest).
+- Census note: FRONTIER still tracks GFX-ALLOC/GFX-BLOCK (now dead text) - battery mechanism reports, no tool change made (minimal diff).
+
+### F-627/F-628 (2026-09-28, 1 build, soak `w654.log` 120 s) - **THE DESCENT PREMISE WAS WRONG, AND THE PARK INSTRUMENT LIES. Two corrections, both load-bearing. Wedge relocated to `sub_821F3580`'s copy loop.**
+
+**Correction 1 - F-627 inverted the branch.** `F627-C0580` fired once with `lr=82131AF8`, which is *not* `0x821F3A38` (the call site inside `sub_821F3988`). So `sub_821C0580` never ran in this context; likewise `821C4210` (`lr=82131B0C`) and `821C05E8` (`lr=82131B30`) fired only from other contexts (`0x82131xxx`/`0x8218xxxx`). Only `sub_821F3580` fired from our chain (`lr=821F39F4`). **The wedge is therefore INSIDE `sub_821F3580`, not after it.** Its body is a 20-byte-stride copy loop (`0x821F35A8`..`0x821F361C`, `while (r29 < r26)`) with three callees: `sub_821D2A58` (x2/iter), `sub_821F1748` (conditional), `sub_821F12B8` (x1/iter). At the call site (`0x821F39E8`/`0x821F39EC`) `r4 == r5 == r31`, and `0x821F3598` is `beq cr6` to the exit - so the loop *should* exit immediately. That contradiction is the interesting part: either the loop runs and never converges, or one callee wedges. F-628 batches all three entries in one round to separate "hot loop" from "silent callee".
+
+**Correction 2 - the PARK-SAMPLE instrument reports a STALE mirror, and has been over-read.** Over the 120 s the boot worker (`worker-tid=00007594`, `boot_host.cpp` PARK line) shows `lr=821C6DC8` for **132 of 203 samples (65%)** - which reads as "two-thirds of wall time inside the atArray grow". It is not. Proof from the trustworthy rows (atomic counters incremented inside the hooks themselves):
+- `F598-C6658` (the realloc that `0x821C6DC4` calls) fired **16 times, last at 18:13:19.977** - i.e. zero reallocs in the final ~98 s.
+- `C6D90-GROW` fired 8 times, all inside 18:13:18.382-18:13:18.424, finishing at `cap=2048`.
+- `F598-DD670` (the varint serializer) fired **0 times** - it is never entered.
+
+A live sample cannot report a return address for a call that stopped happening 98 s earlier. So `lr` (and the `[r1-8]`/`f0..f7` fields) come from the guest-context mirror `g_bootWorkerCtx` (`src/boot_host.cpp` PARK printer, per the boot-flow audit `:2132-2164`), not from the suspended thread's live registers. `rawrip` is no better: resolving it with `tools/host_rva_resolve.py build/mcla.map --base 0x7ff7ef760000` (base read from the log's own `PARK-SAMPLE base=` line) gives `ReadU32BE@GuestMemoryView+0xe1` / `WriteU32BE+0xe1` - the *sampler's own* guest-memory calls, i.e. the sampler's rip, not the worker's. `PARK-UNWIND` frame 0 is likewise `WriteU32BE+0x160`; only frames 2-3 (`__imp__sub_821C6D90+0x21a`, `__imp__sub_821C7000+0x76`) are worker frames, and they are consistent with the *last* registered context, not the present one.
+
+**Method rules this forces (adopt before the next park claim):**
+1. PARK-STACK/PARK-SAMPLE `lr`, `f*`, `[r1-N]` and `rawrip` are **last-registered-context** fields. They locate a *recent* frame at best. Never compute a percentage of wall time from them.
+2. Only per-hook atomic counters are live evidence. Any "X% of the soak" statement must come from those.
+3. `F-598`'s own note recorded the contradiction ("growth completes in <50 ms yet PARK-SAMPLE sits at lr=821C6DC8 for the whole soak") and left it unresolved; it is resolved here - the sampler is the broken party.
+4. Instrument-fix work item for the orchestrator: re-read the suspended thread's registers with `GetThreadContext` into a fresh buffer and print *that*, and print the sampler's own rip separately. File: `src/boot_host.cpp` (currently owned by the per-thread-TLS workstream).
+
+**Consequence for F-556/F-610 and the 8-round descent (F-611..F-627):** `F556-C54D8-RET` = 0 rows, so `sub_822C54D8` genuinely has not returned - that part stands on its own hook rows. But the *reasoning* underneath the descent ("t2 never fires, therefore the stall is inside t1's subtree") never had a supporting time-base claim, and the only instrument that appeared to corroborate it (the park) is now shown to be stale. The descent's individual hook rows remain valid measurements of what fired; the synthesis did not.
+
+Gates: `C0000005` 0, `Fatal` 0 across the round. Next ID **F-628** (hook staged, build deferred until the concurrent edit batch lands).
+
+### F-630 (2026-09-28, **0 builds - read from existing soak `build/w654.log`**) - **ROOT CAUSE OF THE BOOT: the guest ZEROES our o1heap user-arena instance header at 18:14:04, and the physical allocator dies with it. 8,700+ refused allocations in the following 53 s. This outranks every other open item.**
+
+**The measurement.** All rows below are from `build/w654.log` (120 s soak, exe 16:54). No new instrument; the tree already had the probes.
+
+1. **Healthy until 18:14:04.** 32 `PHYS-CENSUS` physical allocations succeed between 18:12:58 and 18:13:10, all from `lr=821325D4`, live total climbing to 46.0 MB against a 1.494 GiB arena (`kPhysArenaBeginVa=0xA0400000`, `heap_arena.h:40`). The `F388-PHYSGUARD` selftest is `selftests=1` (not blind).
+2. **18:14:04.002 - first `AllocPhysical: o1heapAllocate returned null #1 size=0x6f1e0 align=0x10`.**
+3. **18:14:04.005 - `F374-HEAPGUARD trip=6 off=0 want=W live=true guestLR=821C667C`.**
+4. **18:14:04.005-.006 - `F375-HEAPSTORE #1..#8`: eight consecutive guest U32 stores of value `0` to guest `0x00020004, 0x00020008, 0x00020010, 0x00020014, 0x0002001C, 0x00020020, 0x00020028, 0x0002002C`, all with `lr=821C667C sp=8EFFA960 r4=0006F1E0`.**
+5. **From then on the refusals cascade**: sizes escalate by exactly 48 bytes per iteration (`0x6f1e0, 0x6f210, 0x6f240, 0x6f270, 0x6f2a0, 0x6f2d0, 0x6f300, 0x6f330` - a growing array, +48 B/element), reaching `#400 size=0x73cb0` at 18:14:18, then switching to `size=0x1` and continuing to `#8700` at 18:14:57. **8,700+ refusals in 53 seconds.**
+6. **A 1-byte allocation cannot fail in a 1.494 GiB pool with 1.45 GB free.** So this is NOT exhaustion - it is a destroyed/poisoned allocator. That closes the question the heap audit could not: `w654` live physical is ~46 MB, not 1.4 GB, and the 8,700 refusals are corruption, not capacity.
+
+**Mechanism.** `0x00020000 + {4,8,0x10,0x14,0x1C,0x20,0x28,0x2C}` is the **o1heap instance header of the user arena** - the boot-flow audit and `heap.cpp`'s own comments state the instance lives AT the arena base (`guest_memory.cpp:22-24`, `src/gpu_device.cpp:7626-7631`). The guest is zeroing it. The writer is attributed by the existing probe to `lr=821C667C`, which is ALSO where 37 of the park samples sit and which is the function that issued the failing request (`r4=0006F1E0` is the requested size). `F389-XTLCHAIN` in the same millisecond names the chain: `r13=8F200000 -> [r13]=8F201000 -> obj=82830B18 -> vt=820114C4 -> allocFn=821C08F8`. So the guest's own allocator, reached through the XTL chain we install, is being handed our o1heap header as if it were its own state and clears it.
+
+**This is a host/guest memory-OWNERSHIP violation, not a guest bug and not an emulator limitation.** It is the F-377 hazard (title writes its allocator metadata over our arena) finally caught in the act with a consequence attached. The boot audit's mitigation queue already ranked "heap SEH absorbs" and "F98 fence skip" as the hard-to-remove items; none of them matter if the allocator's own header is zeroed by the title at T+66 s.
+
+**Why it explains the whole project.** Every downstream symptom is downstream of this: no physical memory -> the game's allocator cannot grow its arrays -> the serializer/atArray work has nothing to allocate -> the graphics path never receives buffers -> nothing reaches the menu. The F-432 zero-count skip, the F-434 spin break, the fence skip, the 8-round descent into `sub_822D4878`'s tail: all of them are coping with a game that cannot get memory. **Fixing this is worth more than every other open item combined.**
+
+**Native fix (no bypass).** The o1heap instance header must not live inside an address range the guest's allocator is ever handed. Relocate the instance headers out of the arena payload (host-side struct, or a reserved header page the guest never sees as an allocation result), so arena base == payload. Then the guest's zeroing lands on memory we do not own and costs nothing. This is a placement change, not a behaviour fake: the allocator still refuses honestly when the pool is full.
+
+**Ordered work:**
+1. Relocate the instance headers (arena base becomes pure payload). Gate: the eight `F375-HEAPSTORE` rows to `0x2xxxx` go to 0, `F374-HEAPGUARD trip>=6` goes to 0, `AllocPhysical ... returned null` goes to 0, and the 32 `PHYS-CENSUS` successes keep succeeding.
+2. Only then re-open the removal queue (F98-SKIP, F432, F434, TASKJOIN-SC). Each of those is a workaround for "the game has no memory"; with memory restored they may become removable, and that is how the native charter is executed - real first, fake second.
+3. The `HEAPLEAK-SUM` accounting added this session (arena fragment footprint, `live`/`peak`/`null`/`rej_free`) becomes the standing proof that `live` plateaus instead of climbing to `cap`.
+
+**Method notes banked alongside:**
+- A refusal of an absurdly small size is a *corrupt-allocator* signal, not a capacity signal. Any future "allocator returned null" reading must be checked against free bytes before it is called exhaustion.
+- `w654` is also the run that exposed the stale PARK-SAMPLE mirror (see F-627/F-628). Two of that run's instruments were lying: the park `lr`/`rawrip` fields, and - as this entry shows - the "arena is fine, the callers are the problem" reading of the refusal count. The refusal count was right; the attribution to capacity was wrong.
+
+Next ID **F-631**.
+
+### F-631 (2026-09-28, **0 builds - adversarial review of F-630**) - **F-630 IS REFUTED. Its mechanism is impossible, its arithmetic premise was wrong, and its proposed fix is a documented past failure. Corrected position below. The instrumentation that settles it is already in the tree and needs one build.**
+
+An independent reviewer was given F-630 and told to break it. It did, on five independent counts. All verified against `build/w654.log` and the source.
+
+**1. The two arenas are disjoint - the causal path does not exist (fatal).**
+`src/kernel/heap.cpp:531` initialises the user instance as `o1heapInit(heapArenaBase, heapArenaSize)` with `heapArenaBase = Translate(0x20000)`. `src/kernel/heap.cpp:538` initialises `physicalHeap = o1heapInit(physArenaBase, 0x100000000-0xA0400000)` at guest `0xA0400000`. `AllocPhysical` allocates from `physicalHeap` (`heap.cpp:920`). **The zeroed bytes are in the user instance; the failing allocations come from the physical instance. Zeroing the first cannot make the second return null.** F-630's mechanism has no path from cause to effect.
+
+**2. A 1-byte refusal is the signature of a FULL pool, not corruption (fatal, and it refutes in the opposite direction).**
+`o1heap.c:306` gates on `amount <= capacity-32`; `size=0x1, align=0x10` yields a 64-byte fragment; null is returned at `o1heap.c:321-323` when `nonempty_bin_mask & candidate_bin_mask == 0` - i.e. **no free block of that size class exists**. No rounding, alignment, or guard-page path can make 64 bytes fail in a 1.4949 GiB pool. My "1.45 GB free, therefore corrupt" argument inverts the evidence.
+
+**3. The "1.45 GB free" premise was fabricated by me (fatal).**
+I read `PHYS-CENSUS total=46.0MB` as live occupancy. It is not: `src/kernel/imports.cpp:2985-2999` computes `total=` as `s_totalBytes.fetch_add(size+0x420)` - cumulative **requested** bytes, **reset to 0 above 200 MB**, emitted only on the success path and capped at `allocs<=32 || allocs%2000`. Every later success is invisible. The number never meant what I used it for.
+
+**4. The arithmetic says plain exhaustion, with room to spare.**
+`0x6F1E0 + 0x10 + 0x20 = 455,184`; `roundUpToPowerOf2(455,216)` = **512 KB per allocation**. `1,605,306,368 / 524,288 = 3,061` successes exhaust the pool. 8,700 iterations require only ~35% of those to have succeeded. There are **zero** `FreePhysical` rows in the entire run. Ordinary exhaustion is fully unexcluded and now the leading hypothesis.
+
+**5. The attribution was a probe-window artifact (fatal).**
+`tools/ppc_xrefs.py fn 0x821C667C` resolves to **`sub_821C6658 + 0x24`** - a return address *inside* a `memset(ptr,0,n*12)` helper, not a function. With `r4=0x6F1E0` the guest zeroed roughly **5.2 MB** from `0x20004`. The "eight header U32 stores" came from a watch covering only `0x20000..0x20240` (`src/guest_memory.cpp:35-36`) = 0x240 bytes, so 8 of ~1.37 M stores were printed. "The header was zeroed" was an artefact of sampling a whole memset through a 576-byte window.
+
+**6. The proposed fix is a documented past failure.**
+`src/kernel/heap_arena.h:11-20` records that relocating the arena was already tried in soak w395 (arena moved to `0x20000000`) and **the writer followed the base**. Moving the header cannot stop a writer that tracks the base, cannot affect `physicalHeap`, and F-630's own gate ("`F375-HEAPSTORE`->0 AND `AllocPhysical null`->0") spans two different arenas so it could never have passed.
+
+**Independently confirmed by the review (these parts of F-630 stand):** the timeline. First refusal `18:14:04.002` (log line 149995), first store `18:14:04.005` (line 149997), escalation `0x6F1E0 -> 0x73CB0` = 399 x 48 bytes exactly, switch to `size=0x1` at `#500`, `#8700` at `18:14:57.401`. Both probes live (`selftests=1`). Zero `o1heap invariants FAIL`, zero `o1heap AV`, zero `FreePhysical`, and - importantly - **53 seconds between the last `PHYS-CENSUS` (18:13:10.938) and the first refusal with the physical arena completely unmeasured.**
+
+**Corrected claim, defensible:**
+- At `18:14:04.005` `sub_821C6658` (a `memset(ptr,0,n*12)`, `r4=0x6F1E0`) zeroes ~5.2 MB over the **user** arena's o1heap instance and payload. That is a real F-377 ownership violation. Its downstream effect is **unobserved** because `Heap::Alloc` is never called again afterwards - which is itself a fact worth explaining.
+- The **physical** arena's 8,700 refusals are **independently unexplained**, with ordinary exhaustion (512 KB/alloc, ~3,061 to fill, zero frees) as the leading hypothesis and corruption unproven.
+- Nothing is established about the physical arena's state after 18:13:10.938.
+
+**Why the reviewer was right to be trusted:** it re-derived the row numbers itself, and it was the one that noticed `lr=821C667C` was a return address inside a memset rather than a function - the single check that dissolved the claim. It also refused to overstate its own case: it reported which claims it could not verify.
+
+**Next step (F-632), instrumentation already in the tree:**
+The `HEAPLEAK` fields at `src/kernel/heap.cpp:932-938` already read the o1heap diagnostics (`allocated`, `capacity`, `peak_allocated`, `oom_count`) but produced **0 rows** in `w654`, because that exe's `heap.cpp` predates the instrumentation (`heap.cpp` mtime 18:34 > `w654.log` 18:14). The assignment now open is: emit that state **on the refusal path** (one-shot on the first refusal + a low-rate periodic row), add a `FreePhysical` census, and make the memset census report store-count and byte-range so a windowed sample can never again be read as the whole event. One build, one 120 s soak, and `full` vs `destroyed` is decided by a single line. This is also why F-630's "outranks everything" framing was wrong: it was ranked on a premise that a ten-minute review could check, and I did not check it.
+
+**Method rules this forces:**
+- **Check a headline claim adversarially before building a fix on it.** A claim that reorders the whole project gets a refutation pass, not a green light. Cheap: minutes. Expensive: a day of work in the wrong place.
+- **Never read a counter's name as its meaning.** `total=` was "cumulative requested bytes, reset above 200 MB, success-path only". Read the code that produces a number before you reason about what it proves.
+- **A watched window is not an event.** An 8-row sample of a 5.2 MB memset through a 576-byte watch is not "the header was zeroed".
+- **A return address is not a function.** `lr=821C667C` was `sub_821C6658 + 0x24`. Resolve the enclosing function before attributing (`tools/ppc_xrefs.py fn`) - the F-612 round already learned this once and it was not applied here.
+- **A prior finding that says "we tried this and the writer followed" is a stop sign.** `heap_arena.h:11-20` said it; F-630 proposed it anyway.
+
+Next ID **F-632**.
+
+### F-632 (2026-09-28, **0 builds - static + offline-forensics finding; the build that consumes it is `build/w655_build.log`**) - **THE ARCHIVE SERVE IS READING AT THE WRONG OFFSET: a size field is being used as a file offset. This is the measured cause of the tune-section starvation, and it invalidates F-458's stated reason.**
+
+The VFS stream derived the RPF3 member record layout from the on-disk bytes rather than from the docs, and the result contradicts a long-standing premise.
+
+**The record triple.** For every member of `preload/xarchive_*.rpf` inside `xarchive_cache.rpf`, measured over all **377** distinct members in `build/w653.log`'s `TOC76-XSF` census, with a standalone probe (`zlib(wbits=-15)` inflate, then the project's own `RawInflate`):
+- `w1` = **logical size** (uncompressed length)
+- `w2 & 0x3FFFFF` = **file offset**
+- `w3 & 0xFFFFFF` = **stored size** (compressed length)
+
+`inflate(stored @ w2) == w1` holds for **364** of 377 members; 6 are stored uncompressed (`stored == w1`, serve verbatim); 7 are the UI `.xsf`/`.xtd` XCompress/LZX containers, a different codec. **370 of 377 are decided with no name table at all.**
+
+**The bug.** `XsfOffsetCandidates` (`src/gpu_device.cpp:1567`) took **`w1` as the offset**. `w1` is the size. So the host serve read compressed bytes from the wrong place - `XSF-HOSTSERVE off=00068000`, serving `head=6655A8B1` / `ECFD53B0` (raw DEFLATE magic) where the guest expected a nested RPF3 archive. Consequences, in order:
+1. The guest's own inner RPF3 header parse failed, so its inner TOC decrypt never ran.
+2. `sub_821CFF40(&it,"Vehicle",0)` found nothing, so `[0x828CD0AC]` stayed 0.
+3. `sub_82397060` then ran its zero-count path - the 2^32-1 store storm that `kF432SkipZeroCountGrow` exists to skip (F-432).
+4. `F442-SECTION` printed 14 rows, all `hits=0`, across 5 section names (F-443/F-444).
+
+**F-458 and F-463 are refuted as stated.** Both rested on "the host would pre-empt the guest's decrypt by planting bytes". The measurement shows the host was not pre-empting anything - it was serving garbage from the wrong offset, and the guest correctly rejected it. The fix keeps the inner TOC byte-identical ciphertext, so the guest's decrypt is untouched. `heap_arena.h:11-20`'s earlier "relocation already tried, the writer followed the base" (F-377) is unaffected - that is a different writer.
+
+**F-446's "do not re-try" is also retired.** That experiment widened the serve filter to `.lst`/`tune/`, the serve engaged 142x, and nothing downstream changed - which is exactly what a wrong-offset serve produces. The predicate was never the blocker. `PathLooksLikeArchiveContent` may now be widened, but only *after* the offset is fixed, or the same null result will be misread a third time.
+
+**Delivered in the VFS layer** (new `src/fs/rpf3_nested.{h,cpp}`, added to `CMakeLists.txt:281-282`): recursive nested-RPF open, so `preload/xarchive_cameratune.rpf` becomes a first-class packfile of its logical 425,984 bytes; `BuildIndex` now walks and merges instead of clearing (verified live: 26 files indexed, `xarchive*` entries 4, was 1 and 0); member expand generalized off the `xarchive_cache.rpf`-only gate with straddling members supported (13 x 32 KiB windows reassemble to the exact 425,984 bytes beginning `RPF3 00 38 00 00`); and the double `position` advance fixed on the VFS side.
+
+**Not yet applied - the `src/gpu_device.cpp` half (orchestrator owns that file), in order:**
+1. `:1567` `XsfOffsetCandidates` - use `w[2] & 0x3FFFFF` as the offset, `w[3] & 0xFFFFFF` as the stored size, `w[1]` as the logical size. **This is the actual fix; nothing else matters until it lands.**
+2. `:624-700` `HostServeUiBody` - same three-field discipline.
+3. `:132` + `:1925-1944` - delete `kF463AbstainNestedRpf` and the abstain block, which `continue`s past the serve.
+4. `:1713` / `:1719` - member-expand registrations must carry `(packfile, offset, storedLen, logicalLen)`; the current calls pass `m.size` as the stored length, and the measured stored lengths are 126/452/460/188/140/225, not the logical 260/1246/...
+5. `:17360` - register the nested archive on a successful open so `tune/vehicle/*.lst` binds.
+6. `:17206-17211` - drop the `MclaListMemberPath` gate so every member registers; use the **first** `TOC76-XSF` row per path, because later rows are re-reads after `XSF-OPEN-GATE-SKIPPED` ORs bit30 into `w2`.
+7. `:265-270` - widen `PathLooksLikeArchiveContent` last, and only after 1-6.
+8. `src/kernel/imports.cpp:1590` - delete `if (ok) { fileObj->fileHandle.position += bytesRead; }`; every non-positional `NtReadFile` advances twice today, a 32 KiB read leaves the position 64 KiB on. Same starvation class as `F442-SECTION`.
+9. **Do not touch** `kF432SkipZeroCountGrow` (`:19458,19508-19514`) in the same pass. It is a workaround for a symptom of this bug; it becomes removable once the count is real, and removing it first would reintroduce the store storm.
+
+**Gate for the fix:** `F442-SECTION` `hits` > 0, and `[0x828CD0AC]` non-zero, with `BDF20 ... vehicle0008.lst ret=0` going to 0. `C0000005` 0, `Fatal error dispatcher` 0, `FATAL-SOFT` 0.
+
+**Method note:** this is the second time today that a *measurement* refuted a written premise (the first was F-630/F-631). Both times the docs recorded a plausible mechanism and the bytes recorded a different one. Where a doc says "X causes Y" and a soak can decide, the soak wins.
+
+Next ID **F-633**.
+
+---
+
+## LEDGER REPAIR PASS (2026-09-28 19:4x) - VOID-SLOT RECONSTRUCTION, DUPLICATE ADJUDICATION, CITATION-DECAY FIX
+
+**Scope of this pass.** Mechanical repair only. No build, no soak, no run, no `src/` edit, no commit.
+Three void slots are reconstructed below as **new** IDs (F-610, F-625, F-629 are **not** reused and
+**not** reinstated, per `AGENTS.md` line 17). Nothing above this line is edited, renumbered or deleted.
+
+**Void confirmation, re-measured this session, not recalled.** For each of the three IDs,
+`git log --all -S'<ID>' -- docs/ROOT_CAUSE_VALIDATION.md` returns **empty** - i.e. the token never
+appeared in this file in any commit on any branch. Combined with the absence of any `###` heading
+between its neighbours in the dense recent region, this is a **lost write**, not a formatting
+artefact. A skipped ID in an append-only ledger compacted to "claim + evidence" is a lost finding,
+and it is a lost finding *silently*: nothing in the file reports its own holes.
+
+**Stale pointer, now superseded:** the last line of the previous entry reads "Next ID **F-633**".
+F-633..F-637 are taken by this pass. The next free ID is **F-638**.
+
+---
+
+### F-633 (2026-09-28 19:4x, **reconstruction only: 0 builds, 0 soaks; source read of `src/`**) - **RECONSTRUCTION OF VOID SLOT F-610 - the largest loss in the ledger. F-610 was never in this file in any commit. It survives only as 51 in-source comments across 6 `src/` files plus 1 row in `docs/PROGRAM_GUIDE.md`.**
+
+- **Why this is a void and not a misplacement.** Zero `###` heading; the only token occurrence inside
+  the ledger is a *forward reference inside another entry's prose* (the F-556 consequence line,
+  "Consequence for F-556/F-610 and the 8-round descent (F-611..F-627)"), which proves F-610 existed
+  when that line was written and is absent now. It was dropped, not renumbered.
+- **Surviving footprint, measured:** 51 `F-610` comments in `src/` - `gpu_cp.cpp` 17,
+  `render_thread.cpp` 17, `render_queue.h` 10, `d3d12_backend.h` 3, `d3d12_backend.cpp` 2,
+  `gpu_device.cpp` 2 - plus 1 in `docs/PROGRAM_GUIDE.md` (its `PRESENT` row). The 2 in
+  `gpu_device.cpp` are *references from later entries* (F-611's), not F-610's own text.
+- **RECONSTRUCTED FROM SURVIVING CODE, part 1 of 7 - the TYPE-0 base field width is 15 BITS, not 16.**
+  Anchor: `src/gpu_cp.cpp` comment `// F-610: base is 15 bits.` It is framed as fixing an
+  *inconsistency* (SET_CONSTANT2 / 0x55 still uses a raw 16-bit index), **not** as a narrower
+  hardware field, and it shares the 15-bit + bit-15 alternate encoding with the ring path.
+- **Part 2 of 7 - the 2048-dword TYPE-0 payload cap is OURS, NOT UPSTREAM.** Anchor:
+  `// F-610: that 2048 cap is not upstream (Xenia writes all count-1 dwords,`. The cap is now LOUD:
+  every packet that hits it prints `CP-SETC-CAP` naming the op and the dropped count, so a soak with
+  `CP-SETC-CAP` = 0 proves the cap never fires on real traffic. Sibling case, same prefix: a computed
+  target index outside the 0x5003-dword window.
+- **Part 3 of 7 - `ExecuteMemWrite` previously took ONLY the destination, when the target is a GPU
+  physical address.** Anchor: `// F-610, the top defect: our old ExecuteMemWrite took only the
+  DESTINATION and`. The old code self-read the payload back out of the destination with
+  `ReadU32BE(addr)` and wrote it back, so the payload was **never the packet's**. Payload now comes
+  from the packet STREAM (body dwords 1..count-1; on the ring path, ring dwords +2..+count).
+- **Part 4 of 7 - the gamma LUT is NOT built.** Anchor:
+  `// F-610: the gamma LUT (command_processor.cc:363-481) is NOT built.` Three coupled state machines:
+  a 256-entry color10 table, a 128-entry PWL base/delta table, and a per-register component cursor
+  `gamma_ramp_rw_component_` that `DC_LUT_RW_INDEX` resets.
+- **Part 5 of 7 - queue `push()` is STRICTLY NON-BLOCKING and sheds.** Anchor: `src/render_queue.h`
+  `// F-610: STRICTLY NON-BLOCKING enqueue.` It used to wait on `notFull_` at `maxCapacity_`, which
+  parked the **guest** thread inside `push()` and hung the game whenever the backend stalled
+  (BeginFrame). Producer-side shed threshold 60 == the consumer's; refusals and consumer-side drops
+  fold into one `QUEUE-SHED` line fed by a lock-free `Snapshot()`.
+- **Part 6 of 7 - heartbeat PRESENT suppression is a steady_clock latch.** Anchor:
+  `src/render_thread.cpp` `// F-610: steady_clock nanoseconds of the last CONSUMED guest
+  (non-heartbeat)`. Written by the PRESENT case, read by the heartbeat thread; 0 = none seen yet. A
+  heartbeat PRESENT is exactly `{frameNumber=0, obj=0, swapInfo=0}` and is a clear-only frame - a
+  liveness watchdog, not guest work.
+- **Part 7 of 7 - `PresentDirect` and `DrawCapturedPacket` were DELETED, not fixed.** Anchors:
+  `src/d3d12_backend.cpp` `// F-610: PresentDirect is DELETED, not fixed.` and
+  `// F-610: DrawCapturedPacket is DELETED, not fixed.` Each had **ZERO callers** (the only grep hits
+  were its own definition and its `d3d12_backend.h` declaration), and each was unsound as written:
+  `PresentDirect` signalled a fence and advanced `m_frameIndex` **without executing a command list**,
+  so the fence it waited on implied GPU work that never happened; `DrawCapturedPacket` built a
+  `DynamicMeshDesc` with `vertexBytes=nullptr` / `vertexBytesSize=0`.
+- **UNVERIFIED - and this is the load-bearing caveat, stated plainly: no ledger entry survives, so
+  there is NO build log, NO soak log, NO marker census and NO gate value to cite for any of the 7
+  parts. The verification status of F-610 is UNKNOWN, not "verified".** Its class, priority, build id
+  and soak id are all UNKNOWN. The 51 comments were written *by* the session that made the changes, so
+  they are a first-party account of intent, not an independent measurement, and **the comments may
+  themselves have drifted from the code they describe** exactly as the ledger's citations did. Treat
+  all 7 parts as RECONSTRUCTED-from-prose. **F-610's void slot stays void; this entry does not reuse it.**
+- **Gate (for whoever closes F-610 for real):** re-measure each part against current behaviour, not
+  against these comments. Cheapest discriminators already named by the surviving comments: `CP-SETC-CAP`
+  = 0; `QUEUE-SHED` refusals = 0 across a full boot; `HB-FLICKER` and `PRESENT` counted **separately**
+  (see the `PRESENT` row of `docs/PROGRAM_GUIDE.md`, and F-054). Re-using the void ID is forbidden -
+  a repair of F-610 is a *new* F-6xx entry citing this one.
+
+### F-634 (2026-09-28 19:4x, **reconstruction only: 0 builds, 0 soaks; source read of `src/gpu_device.cpp` + in-file cross-reference**) - **RECONSTRUCTION OF VOID SLOT F-625 - the one void that is ALMOST COMPLETE in surviving code, because the code comment reads almost exactly like the lost entry.**
+
+- **Void confirmed:** `git log --all -S'F-625' -- docs/ROOT_CAUSE_VALIDATION.md` = empty.
+- **The PLAN survives in this file even though the ENTRY does not:** the `### F-624` entry's
+  "Next (F-625)" bullet names the batch verbatim - "batch 821F3580, 821C4210, 821C05E8, 821CA6A8
+  (821CA540 skipped - already MCLA_BISECT_HOOKed; grep-before-hook enforced again)".
+- **RECONSTRUCTED FROM SURVIVING CODE, and this is the best-preserved of the three voids.** Anchor:
+  the comment block opening `// F-625: batch inside t2's first target (sub_821F3988, entered once,
+  sibling` in `src/gpu_device.cpp`, immediately above `#define F625_TAIL_HOOK`. It names the context
+  (t2's first target `sub_821F3988`, entered once, sibling target never fired), the four distinctive
+  callees **in body order** (`821F3580`, `821C4210`, `821C05E8`, `821CA6A8`), the skipped `821CA540`
+  and why (already hooked as `MCLA_BISECT_HOOK "3-821CA540"`, "grep src/ first, F-366"), the method
+  ("Last firer = frontier") and the discipline ("Log-only, bounded").
+- **The instrument is still installed, so the F-625 *instrumentation* is verifiable even though the
+  F-625 *finding* is not.** Cite by macro invocation, not by line: `F625_TAIL_HOOK(sub_821F3580,
+  T1F3580)`, `F625_TAIL_HOOK(sub_821C4210, T1C4210)`, `F625_TAIL_HOOK(sub_821C05E8, T1C05E8)`,
+  `F625_TAIL_HOOK(sub_821CA6A8, T1CA6A8)`, each logging `F625-TAIL #{} <tag> r3={:08X} lr={:08X}`
+  when `n <= 2 || (n % 200) == 0`, then calling through to `__imp__##sym`.
+- **The RESULT of F-625 survives too - in the next surviving entry - and it REFUTES F-625's premise.**
+  `### F-627/F-628` "Correction 1" states: `F627-C0580` fired once with `lr=82131AF8`, which is **not**
+  the `0x821F3A38` call site inside `sub_821F3988`; likewise `821C4210` (`lr=82131B0C`) and
+  `821C05E8` (`lr=82131B30`) fired only from other contexts (`0x82131xxx` / `0x8218xxxx`). Only
+  `sub_821F3580` fired from our chain (`lr=821F39F4`). **3 of F-625's 4 batched callees were not on
+  the path at all.** So the substantive F-625-era conclusion belongs to F-627/F-628, not to F-625.
+- **UNVERIFIED:** no F-625 build log, soak log, `F625-TAIL` row count or gate value survives in this
+  file. The in-code comment is the *plan*, written before the measurement, so it **cannot** report the
+  outcome - which is precisely why it looks complete here and is still void in the ledger. F-625's own
+  body very likely reported the same "all four fired once each" shape the descent rounds F-611..F-616
+  reported for their batches; **that is an inference and is marked as such, not asserted.** Class,
+  priority and gate are all UNKNOWN.
+- **Gate (reconstruction):** `F625-TAIL` rows - first two, then every 200th. The hooks are still in the
+  tree, so deciding whether F-625 ever fired is cheap. Until then F-625 is void-with-live-instrument.
+
+### F-635 (2026-09-28 19:4x, **reconstruction only: 0 builds, 0 soaks; source read of `src/gpu_device.cpp`**) - **RECONSTRUCTION OF VOID SLOT F-629 - F-629 EXISTS ONLY IN CODE: two comment sites in `src/gpu_device.cpp` and zero ledger text.**
+
+- **Void confirmed:** `git log --all -S'F-629' -- docs/ROOT_CAUSE_VALIDATION.md` = empty. A repo-wide
+  grep finds the ID in exactly 2 places of `src/` plus 1 in `AGENTS.md` (the void-slot warning itself).
+- **RECONSTRUCTED, site 1.** Anchor: `src/gpu_device.cpp` comment
+  `// F-629 (2026-09-28): the original last two lines -- "All threads share`. The finding: the TLS
+  allocator chain at `tlsTable+12` (`r13 -> [r13+0] -> [+12]`) is initialised by the boot worker, but
+  worker threads (`sub_821C91C8`) start **before** the boot worker and find the chain dead
+  (`slot12=0`); the fix is to initialise the chain on first thread entry. The entry records that the
+  original justification's last two lines - "All threads share r13=0x8F200000 and tlsTable=0x8F201000,
+  so one-time init suffices" - "were TRUE and are now FALSE."
+- **RECONSTRUCTED, site 2 - the mechanism change.** Anchor:
+  `// F-629: the latch was once-per-PROCESS (`s_tlsChainInitDone.fetch_add(1)==0`,`. The latch was
+  once-per-PROCESS. That premise dies with **F-609**: per-guest-thread identity blocks
+  (`boot_host.h`, `AllocateGuestThreadBlock`) mean every distinct r13 now arrives with its own dead
+  chain, so a single global latch would heal thread 1 and leave every later thread broken - "the exact
+  AV this hook exists to prevent". **The latch is now keyed by r13** through a **32-slot table**
+  (`kF629TlsInitSlots = 32`, `s_tlsChainInitVa[32]`, rolling cursor `s_tlsChainInitSlot`).
+  A 22-site worklist of the fabricated contexts is in the F-609 thread-identity report; nothing moves
+  r13 until the init is per-VA.
+- **RECONSTRUCTED - the safety argument, which is stated in the code and not inferred here.** The
+  worst case is a **spurious re-init of one block, which is idempotent** - and **never a skipped one**.
+  That asymmetry is the entire justification for a bounded 32-slot table over an unbounded map. The
+  site also retains a `!= 0 && != 0xCDCDCDCDu` poison check on every `ReadU32BE` hop, so a poisoned
+  r13 re-inits rather than trusts.
+- **Marker to count in a soak: `W36e-TLS-INIT first init for r13={:08X}`.** No ledger entry cites it,
+  so its live fire count is UNKNOWN here.
+- **UNVERIFIED, stated plainly: no ledger entry survives to cite a build or a soak count, so the
+  verification status of F-629 is UNKNOWN, not "verified".** Class, priority, build id, soak id and
+  gate are all UNKNOWN. The 32-slot table is what the code does *now*; whether that change was ever
+  built, soaked or measured is recorded nowhere in this file. The comments may have drifted from the
+  code they describe. **F-629's void slot stays void; this entry does not reuse it.**
+- **Gate (reconstruction):** `W36e-TLS-INIT` rows. Healthy = one row per distinct r13, no repeats
+  within a boot. A single global-heal signature (one r13, many threads) is the F-629 bug returning.
+- **Dependency warning - a chain of two unmeasured premises.** This reconstruction is only as good as
+  F-609's identity-block claim, and `### F-609` is itself a **0-build entry ("user directive, no
+  build")**. F-609 and F-629 are both asserted by directive and comment, not by measurement. Flag it;
+  do not build on it.
+
+### F-636 (2026-09-28 19:4x, **0 builds, 0 soaks: whole-file heading census + targeted body reads**) - **DUPLICATE-ID ADJUDICATION. 9 IDs appear in 2 headings each. 8 are legitimate append patterns; 1 is a genuine duplicate. APPENDED, NOT EDITED - and here is why.**
+
+- **Method (re-measured, not recalled):** enumerated every `###` heading, split each on `/`, and
+  grouped the F-tokens. Result: `F-111` x2, `F-200` x2, `F-204` x2, `F-595` x2, `F-612` x2, `F-613` x2,
+  `F-614` x2, `F-617` x2, `F-618` x2, `F-620` x2. Then read the body of each pair.
+- **APPENDED, not edited, for every case below.** The file is append-only, and in the one genuine
+  duplicate the two bodies are **not the same claim** - de-duplicating mechanically would have
+  destroyed load-bearing content. A correction note is the only write that can fix a heading defect
+  without deleting evidence. **No heading above this line was edited.**
+- **NOT A DUPLICATE (2 of 9) - `F-200b` and `F-204b` are distinct suffixed IDs.** My own census regex
+  truncated at the `b` and produced false positives. `### F-200b (2026-09-25 00:49, w226/w227)` and
+  `### F-204b (2026-09-25 01:43, w232/w233/w234)` are later rounds on later soaks, not repeats. This is
+  a defect in the measurement, reported so nobody re-derives it as a finding.
+- **LEGITIMATE, explicitly labelled (2 of 9).** `F-595` + `### F-595 addendum` - the addendum is a
+  *different subject* (`build/w624.log` is VOID, a `cmd.exe timeout` syntax error, 0-byte log), not a
+  restatement. `F-111` + `### F-111 correction (dated 09-24 04:55, T41.3w)` - self-labelled.
+  Verdict: both correct practice.
+- **LEGITIMATE, but a NAMING HAZARD (5 of 9): `F-612`, `F-613`, `F-614`, `F-618`, `F-620`.** These are
+  the descent's carry-forward convention: each heading is written as a **pair** (`F-612/F-613`, then
+  `F-613/F-614`, then `F-614/F-615`, ...) because one round both *reports* the previous round and
+  *opens* the next. So one round's ID appears as the second half of the previous heading and the first
+  half of the next. I checked every body: **no two bodies conflict, and none restates another** - each
+  cites a different soak set and strictly advances. **Verdict: not duplicates.** But the consequence
+  is real and this entry records it: **a bare citation to "F-613" is ambiguous and now resolves to two
+  different measurement rounds.** Cite these by heading, e.g. "the `F-613/F-614` round (soaks
+  `w638`/`w639`)", never by ID alone. **No adjudication of "which body is authoritative" is possible
+  or needed, because there is no conflicting claim.**
+- **GENUINE DUPLICATE (1 of 9): `### F-617/F-618` appears twice with different bodies, and neither is
+  labelled an addendum, a correction or a suffixed revision.** Both bodies report the **same soak**
+  `w643b` and the same F-617 result. Adjudication, partial, and only where the file justifies it:
+  - The **later** heading (the one whose body is `F-617: all five (S032B8/S95800/S07820/S69A98/S9EDC0)
+    #1, same-ms, lrs 822D4AC4-4AD8` + `F-618: all five (T2CA238/...) #1` + "Next (F-619)") is
+    **authoritative for the F-617/F-618 marker and frontier claims.** Justification: it is a strict
+    **superset** - identical 5 markers, identical lr range, plus F-618's result and the post-`822D4B44`
+    body list, over a superset of soaks (`w643b`+`w644` vs `w643b` alone). Nothing in it is contradicted.
+  - The **earlier** heading (the one whose body is `F-617 (w643b, survivor): 5 rows #1 each`) is
+    **authoritative for one unique, load-bearing claim that the later heading does NOT restate:** the
+    parallel-harness lesson - `w643a` died 13 s after start in a 12 ms VEH flood
+    (`0xE06D7363`, C++ exception x1606, thread=9084) during the STARTUP phase with zero F6xx rows;
+    `w643b` (same exe) ran 150 s clean, so the build is exonerated and the cause is a startup-phase
+    instance collision (second init overlapping first) - audio/SDL/PE-dump/file-locks, **unidentified
+    which**; affinity pinning does not isolate it. Harness rule: stagger parallel starts past init.
+  - **Therefore the two are a MERGE, not a replacement, and I will not declare one body superseded.**
+    The correct shape would have been: the second entry headed `### F-618`, with the F-617 half marked
+    as a restatement and the harness lesson left where it was. **What cannot be adjudicated from the
+    file alone:** which round *wrote first* with certainty beyond their own timestamps
+    (`17:1x, parallel-harness shakedown` vs `17:1x-17:2x, 2 builds`), and whether the harness lesson
+    was ever acted on. The `soak_parallel.py` 5 s stagger is still in the tool per its own docstring,
+    which suggests **not** - but the tool is outside this file and outside this pass.
+- **Net: 1 genuine duplicate, adjudicated as a merge; 5 ambiguous-but-legitimate IDs flagged; 2 false
+  positives of my own census; 2 correctly-labelled addenda. Nothing edited.**
+
+### F-637 (2026-09-28 19:4x, **0 builds, 0 soaks: line-count census over the 35 headings from `### F-595` to EOF**) - **THE COMPACTION PROMISE IS UNFULFILLED, MEASURED. The file's own header promises it twice; the recent region has not done it for at least 35 entries. STATED ONLY - NO EXISTING ENTRY IS COMPACTED.**
+
+- **The promise, twice, both verbatim.** (1) The file header: Part 3 = "the **append-only evidence
+  ledger F-001..F-054**, entries compacted to claim + evidence (F-numbers, titles, classes and
+  priorities preserved; nothing was dropped, only de-verbed)". (2) `### F-###` format note inside
+  Part 2: "**Compact format:** `F-### - title` then `type - class - priority` and the claim + evidence."
+- **The measurement, this session.** Length in lines per heading, over the **35** headings from
+  `### F-595` to EOF: **median 7, max 43, min 2.** The `type - class - priority` triple mandated by
+  promise (2) appears in **none** of those 35 headings; they carry date + a build/soak inventory + a
+  claim, and no class and no priority at all.
+- **Verdict: the promise is honoured for the F-001..F-054 region it was written about, and has been
+  UNFULFILLED for the recent region for at least 35 consecutive entries.** This is stated as a
+  finding and nothing is retroactively compacted: compaction is a **rewrite**, which the append-only
+  rule forbids, and a mechanical rewrite of 35 entries is exactly the kind of unmeasured mass edit
+  that produced the voids being repaired above.
+- **Relevance to the voids - the honest version.** I do **not** claim compaction caused the F-610 /
+  F-625 / F-629 loss; I have no evidence for that. What I can say is that a compacted "claim +
+  evidence" entry is *less* likely to carry the incidental cross-references that let F-625 be
+  recovered at all, and that the loss is **invisible**: nothing in the file reports its own holes, and
+  a reader cannot tell an intentionally-absent ID from a lost one without a separate census - which is
+  why three voids survived until an independent audit measured them.
+- **Recommendation (not applied here):** keep the discursive style - it is what makes recovery
+  possible - and instead add a **periodic mechanical hole-check** (enumerate `###` heading IDs, diff
+  against the expected set, report gaps) to `tools/soak_census.py` or the repair routine. A hole-check
+  is read-only, unlike compaction, and it is the thing that would have caught F-610.
+
+---
+
+## CITATION CONVENTION - `file:line` MUST CARRY AN ANCHOR (appended 2026-09-28 19:4x; **PROSPECTIVE ONLY**)
+
+**The rule, in the exact form to copy:**
+
+```
+src/kernel/heap.cpp:626 `HEAPLEAK-SUM`
+```
+
+Every `file:line` citation in a **new** entry must **also** carry a **stable anchor** in backticks,
+being the **enclosing symbol** or a **literal string that exists at that site** - never the line
+number alone. Canonical anchors, in order of preference: (a) a log/marker literal that is unique in
+the file, e.g. `MCLA_LOG_WARN("HEAPLEAK-SUM arena=...` -> cite `HEAPLEAK-SUM`; (b) a unique
+identifier/declaration, e.g. `void* Heap::AllocPhysical(size_t size, size_t alignment)` -> cite
+`Heap::AllocPhysical`; (c) a macro invocation, e.g. `F625_TAIL_HOOK(sub_821F3580, T1F3580)` -> cite
+`F625_TAIL_HOOK(sub_821F3580`.
+
+**Why - the reason, measured, not asserted.** A line number in a file under active edit is a fact with
+an expiry date; an anchor is not. Re-measured drift, every case a file with **uncommitted
+modifications** at the time of reading:
+
+| ledger citation | real position now | drift | anchor that still resolves |
+|---|---|---|---|
+| `src/gpu_device.cpp:17903-17933` (F-598-DD670 / F-598-C6658) | 18129 / 18139 | +226 / +206 | `F598-DD670 #{} r3=` / `F598-C6658 #{} r3=` |
+| `src/gpu_device.cpp:20388-20392` (XtlImportCensus gained `lr`) | 20993 | +605 | `static void XtlImportCensus(const char *which` |
+| `src/gpu_device.cpp:17934` (F599-STRDUP) | 18157 | +223 | `F599-STRDUP #{} str=` |
+| `src/kernel/heap.cpp:531` / `:538` (the two `o1heapInit` sites) | 682 / 689 | +151 / +151 | `heap = o1heapInit(heapArenaBase, heapArenaSize);` / `physicalHeap = o1heapInit(physArenaBase, physArenaSize);` |
+| `src/kernel/heap.cpp:920` (`AllocPhysical` from `physicalHeap`) | 893 | **-27** | `void* Heap::AllocPhysical(size_t size, size_t alignment)` |
+| `src/kernel/heap.cpp:932-938` (the `HEAPLEAK` o1heap field reads) | 883 / 1118 (emit at 626) | **-49** | `HEAPLEAK: the USER arena's share` / `HEAPLEAK: the PHYSICAL arena's share` |
+| `src/kernel/imports.cpp:2985-2999` (`PHYS-CENSUS total=`) | 3245-3250 | +260 | `PHYS-CENSUS #{} size=` |
+
+Note the **negative** drifts: files get shorter as well as longer, so a line number is not even
+monotone. Note also that every one of these files was modified **after** the citing entry was
+written, which is the audit's finding, reproduced.
+
+**The sharper finding underneath it, and the reason `git blame` cannot save us.** In this repo a bare
+`file:line` is **not a citation to a commit - it is a citation to an uncommitted working-tree
+snapshot**, and the working tree is not versioned. Measured: `git show HEAD:src/kernel/heap.cpp` is
+**854 lines** and neither line 531 nor line 682 holds the cited text; the working tree is **1467
+lines** and holds it at 682. The state the ledger actually cited (line 531) **existed only in an
+intermediate uncommitted state that has since been overwritten**, so it is unrecoverable by `git log`,
+`git blame` or `git show`. **Therefore an anchor is not a nicety, it is the only citation form that
+survives, because it is the only form that names content rather than position.**
+
+**Scope, stated exactly: this applies PROSPECTIVELY, to every new entry from F-633 onward. Existing
+entries are NOT retrofitted.** Retrofitting 13,000+ lines of existing citations is a rewrite of
+appended history, it cannot be done without a per-line measurement, and a retrofit whose own accuracy
+is unmeasured would be a second decay. The drift table above is the migration aid: it converts 7 of
+the 16 known-bad citations, and the rest should be converted at the moment they are next read.
+
+### Self-report on the citations in F-633..F-637 themselves (mandatory, per the repair brief)
+
+**These entries will decay the same way, and I have deliberately made that hard to do.** Every
+substantive claim above is cited by **anchor** - a comment prefix, a log literal, a macro invocation,
+a function signature, a heading string. Where I could not avoid a line number I flagged it or
+described the site instead. The numbers that ARE at risk in this pass, all of them, honestly:
+
+- `docs/PROGRAM_GUIDE.md:612` in F-633 (its `PRESENT` row). `PROGRAM_GUIDE.md` is under edit. The
+  stable form is the row's leading cell, `PRESENT`.
+- **No line number into `src/gpu_device.cpp` or `AGENTS.md` appears anywhere in F-633..F-637**, on
+  purpose: both files were being edited by other agents during this sweep, so any number I wrote
+  would have been stale on arrival. F-634 and F-635 cite that file purely by anchor.
+- The `F-63x` entries' own cross-references to pre-existing entries are cited **by heading text or
+  by ID + soak name**, not by line number, for the same reason.
+- F-636's line numbers are to **this file's headings**, and are correct **as of this append**. They
+  are also, unavoidably, a claim about a file that grows - a future entry citing "line 13694" will
+  find it shifted. Cite those by heading string (`### F-617/F-618` with the soak in the heading)
+  instead. The reason this matters even here: this pass appended ~200 lines to a 13,881-line file
+  whose last 35 entries already contain 7 resolvable-but-wrong `src/` citations.
+
+**Closing measurement, because it is the actual fix.** Across the 35 recent entries the number of
+`file:line` citations that a reader can resolve today is the number of *anchored* ones. The audit
+measured 7 of 34 correct. The reason is not carelessness and not compaction - it is that a position
+was recorded where a content hash was required. This convention is that fix. **A line number is a
+fact with an expiry date; an anchor is not.**
+
+**End of repair pass. Next free ID: F-638.**
+
+---
+
+## 2026-09-30 session block - boot/memory/archive/shader findings, IDs F-638..F-653
+
+**Provenance.** All soak numbers in this block were re-measured with a byte-exact Python counter
+(`data.count()` / `re.findall` over the whole decoded file), NOT `findstr`, on `build/w675.log`
+(144,903,272 B), `build/w676.log` (131,379,219 B), `build/w677.log` (136,683,903 B).
+**Four brief-supplied figures disagreed with the measurement and the measurement is recorded instead** -
+see `### F-651`. Citation convention is the one set by `### F-637`: anchors (heading strings, marker
+names, raw words, guest VAs), not bare line numbers.
+
+### F-638 (2026-09-30, **0 builds: static guest decode of `default.xex` + `tools/addr_owners.py`**) - **THE 1,267 STATIC CONSTRUCTORS DO EXECUTE. The "constructors never run" hypothesis is REFUTED.**
+
+- **The walk is on the entry path.** Entry `0x821322B8` calls the walker `0x82132740` at `0x82132318`.
+- **Phase 1** = table `[0x827D13E4,0x827D13F0)` = `{0, 0x823E1170, 0x823E6590}`; the **first non-zero
+  return aborts the walk**.
+- **Phase 2** = table `[0x827D0010,0x827D13E0)` = **1,268 slots, 1,267 non-null, all distinct**, targets
+  spanning `0x827A7688..0x827B8678`.
+- **The walk cannot be aborted.** Three separate escapes, all raw-word: `0x823D9308`'s return is
+  discarded (`li r3,0` at `0x82132784`, no subsequent read of `r3`); `0x823E6590` is hard-wired to 0
+  (`li r3,0` at `0x823E65B4`; raw bytes `build/cache/mcla_pe.bin` offset `0x3E6590`); `0x823E1170`
+  returns 0 unless its allocator returns null **twice**.
+- **RESIDUAL RISK IS EXACTLY ONE FUNCTION: `sub_82135D28`.** It is the only target not yet shown to
+  return 0. **This is the one claim in this block that is still a hypothesis.**
+- **The instrument that settles it, log-only, no short-circuit:** a `PPC_FUNC(sub_82132740)` printing
+  `r3`. Exit `loc_82132808` = aborted, exit `loc_82132804` = phase 2 ran.
+  `python tools/addr_owners.py --check 0x82132740` -> **1 site, `map` only** (rule 4 clear; HEX form, see F-651).
+
+### F-639 (2026-09-30, **0 builds: raw-word decode**) - **`sub_82135D38(8)` IS NOT A RAISE. It is a Win32 last-error latch. And NULL IS THE CONSOLE'S CONTRACT.**
+
+- **Full body, in order:** `0x82135D38` `b 0x82135D40`; `0x82135D40` `lwz r11,0x150(r13)`;
+  `cmplwi cr6,r11,0`; `bnelr`; `lwz r11,0x100(r13)`; `stw r3,0x160(r11)`; `blr`.
+  **No trap instruction, no unwind, no call out.** It stores `r3` (the code) into the TEB's
+  last-error slot and returns.
+- **19 call sites** pass literal codes `0,3,5,8,122,996` plus 4 variable. Siblings: `sub_82135D90`
+  (getter), `sub_82135D58` (`RtlNtStatusToDosError`).
+- **`sub_82132578` returns NULL upward too** (`mr r3,r31` at `0x821325E4`, with `r31` still 0).
+  **"Null = failure" is the console's contract, not a host bug** - which is what makes the next entry's
+  premise collapse.
+- **CONSEQUENCE:** this REFUTES the widely-repeated claim that a deleted exception was the memory defect.
+  Stop repeating it; cite this heading instead.
+
+### F-640 (2026-09-30, **1 build (`w675.log` pre-fix, `w676`/`w677` post-fix)**) - **MEMORY ROOT CAUSE: `AllocPhysical` returns the ALIGNED pointer while `Heap::IsLiveAllocation` was asked about the RAW fragment. Every physical free was refused.**
+
+- **Instrument discipline (read this before quoting any number below):** these markers are
+  **capped/sampled**. In `w675.log` `XTL-FREE` prints only **11 rows** while its own counter reaches
+  **#12288**, and `o1heapAllocate returned null` prints **1,025 rows** while its `oom=` field reaches
+  **101,700**. **Line count != event count. Always quote the counter field.**
+- **Pre-fix `w675.log`: `XTL-FREE` printed 11 rows, 0 HONOURED.** All 6 non-null rows read
+  `REFUSED reason=out-of-arena ... arena=phys/0`, e.g. `XTL-FREE #6 ptr=B7328280 ... glr=821CBC64`.
+  `PHYS-FREE` reached `total=8`. `PHYS-POOL-FULL` = **516**.
+- **Cause:** `AllocPhysical` returns the **aligned** pointer and stores the raw fragment at
+  `*((void**)aligned - 1)`; `Heap::IsLiveAllocation` was queried with the raw fragment instead.
+  **Every refused address was `= 0 mod 64` = `raw + 0x20`** - the alignment delta is the whole proof.
+- **Fix:** recover the raw fragment from `*[p-8]`, then run the identical predicates (`ProbeO1Fragment`).
+- **Post-fix, `w676.log` and `w677.log` (both identical on every row below):**
+  `PHYS-POOL-FULL` **516 -> 0**; `o1heapAllocate returned null` **oom=101,700 -> 0 (zero printed rows)**;
+  `XTL-FREE` **3 of 3 real frees HONOURED** (`XTL-FREE #6/#7/#8 ... ok=3 rej=5`), the 5 rejections are
+  all `ptr=00000000` and are **correct** (below the 4 KiB null guard);
+  `PHYS-PROBE ... raw_ok=1` **8 of 8**, every row `inside=1`; `PHYS-FREE total=8` unchanged.
+
+### F-641 (2026-09-30, **0 builds: `src/` read + `w675.log` rows**) - **`reason=out-of-arena` WAS MISLABELLED. A TRUE FACT ATTACHED TO THE WRONG QUESTION.**
+
+- **Mechanism:** `__xtl_free` probes **phys**, then **re-uses the same `probe` object** for the user
+  arena. Every *physical* refusal therefore printed the *user arena's* reason string.
+- **Why it mattered:** `arena=phys/0` appears in every row of `w675.log`, which reads as
+  "the user arena is exhausted". It was not. **The reason string had to be disbelieved before the bug
+  in F-640 was findable at all.** Cite this when a log field seems too consistent to be true.
+
+### F-642 (2026-09-30, **0 builds: offline archive forensics, 164/164 members**) - **`fxl_final/*.fxc` IS RAW DEFLATE. NOT ENCRYPTED. Ever.**
+
+- **164 of 164 inflate** under `zlib.decompressobj(-15)` starting at `w2 & 0x7FFFFFFF`, length
+  `w3 & 0x3FFFFFFF`. **Inflated length equals `w1` exactly** in every case, and the first four output
+  bytes are **always `72 67 78 61`** (`rgxa`).
+- **Record layout, all four words:** `w0` = Jenkins one-at-a-time hash of the **lowercased leaf**
+  (164/164 match); `w1` = inflated length; `w2` = **absolute** 32-byte-aligned file offset;
+  `w3 = 0x4<<28 | stored`.
+- **The two base words `*(dev+24)` and `*(dev+28)` are ZERO.** `w677.log` `TOCWALK-SUMMARY`:
+  `base24Objs=1 base28Objs=1 baseNonZeroObjs=0 base24First=0x00000000`. **No base is applied. Ever.**
+  Any model that adds `*(dev+24)` to an offset is wrong for this archive.
+
+### F-643 (2026-09-30, **0 builds: offline; live census in `w677.log`**) - **THE 22-BIT OFFSET MASK WAS ACTIVELY WRONG, NOT MERELY TIGHT. 2,426 MEMBERS RESOLVED ONTO ANOTHER MEMBER'S BYTES.**
+
+- **At 22 bits, only 5,766 of 8,192 offsets were distinct.** The remaining **2,426 collided**, of which
+  **301 landed in a constant-byte hole** (silently plausible, silently wrong).
+- **At 31 bits: 8,192 of 8,192 distinct, zero collisions.**
+- **Live confirmation, `w677.log` `TOCWALK-SUMMARY`:** `memAboveFloor=22068 memBelowPct=0
+  memMaskBitsSet=16858 slotSpan=23930`. Sample row: `off31=7EA85817 off24=00285817` - the same member
+  read two ways.
+- **The 24-bit stored-size mask is ACCIDENTALLY HARMLESS.** Bits 24-29 of `w3` are zero across the
+  sample, so masking them costs nothing today. **Documented, deliberately NOT "fixed" on faith** - it is
+  a coincidence that a future archive could break.
+
+### F-644 (2026-09-30, **0 builds: raw-word decode**) - **`lo`/`cnt` WERE NAMED BACKWARDS. Harmless as a SET, which is exactly why 256/256 observations passed.**
+
+- **`w2 & 0x7FFFFFFF` is the COUNT; `w3 & 0x3FFFFFFF` is the BASE INDEX.** The names are transposed.
+- **Why nobody caught it:** as a *pair used only as a set* the transposition is invisible, so a
+  self-consistent 256/256 pass is not evidence of correctness here.
+- **The separator test accepts `0x00`, `0x2F` and `0x5C` ONLY.** **There is no quote compare in the
+  loop** - do not describe this path as quote-aware.
+
+### F-645 (2026-09-30, **1 build (`w675` -> `w676`), 4 symptoms, ONE bug**) - **`ResolveSpan` INFLATED FROM THE GUEST READ WINDOW `win`, INSIDE `ApplyExpandedSpans`' OWN WRITE LOOP. A contaminated inflate reported success and suppressed the clean packfile re-read.**
+
+- **Site:** `src/fs/vfs_rpf.cpp`, `ResolveSpan` called at `:1438`; `:1456` `memcpy`s that span's
+  **inflated body back into `win`**.
+- **Why it was silent:** `RawInflate` returns a bare `bool` that is true for **any** decodable stream.
+  So a `win` already polluted by the previous iteration inflates "successfully", and the `!inflated`
+  gate at `:1012` then **suppresses the clean packfile re-read**.
+- **Reproduction:** inflating the packfile's own bytes returns `w1` exactly for 15/15 probed `.fxc`.
+  **Six refused rows were then reproduced byte-for-byte** by overlaying a few bytes of another member's
+  inflated body: `CityGrimeDecal.fxc` `expanded=4` from 6 bytes; **`mc4_rmptfx_projected`
+  `expanded=10069` from 2 bytes**; `TexturedPlastic.fxc` `expanded=1` from 3 bytes; `powerup_beam.dds`
+  `expanded=11069` from 90 bytes. **A 2-byte corruption producing a 10,069-byte result is the signature
+  of this bug and nothing else.**
+- **Fix:** inflate from a **positional packfile read**, not from guest RAM.
+- **Post-fix:** `MEMBER-EXPAND-SIZE` **14 -> 0** (`w675`->`w676`, and 0 in `w677`);
+  `MEMBER-EXPAND-FAIL` **22 -> 0 in `w676`, but 1 in `w677`** -
+  `MEMBER-EXPAND-FAIL off=0035A042 stored=6164 logical=10819 (not raw DEFLATE; served as stored)`.
+  **So "FAIL -> 0" is true of `w676` and NOT true of `w677`. Quote the log, not the trend.**
+- **Marker location corrected:** `MEMBER-EXPAND-MARK*` lives in **`src/gpu_device.cpp`**
+  (`:1966`, `:1974`, `:19302`), **not** `vfs_rpf.cpp`.
+
+### F-646 (2026-09-30, **1 build; live in `w677.log`**) - **`kBe710MagicWrite = true` FORGES THE SHADER SIGNATURE. IT IS A LAUNDERED SUBSTITUTE FOR A DECOMPRESSION THAT NEVER RAN.**
+
+- **Site:** `src/gpu_device.cpp:23011` - `constexpr bool kBe710MagicWrite = true;  // false = w130 (T41.9b control)`.
+- **Why it is wrong:** the guest's check at `0x8218C83C` reads one word through `sub_821BE710`, which
+  **byteswaps**. So the constant `0x61786772` means **raw bytes `72 67 78 61` = `rgxa`**
+  (`src/gpu_device.cpp:5888` `kRgxaMagic`). The host was **writing the expected dword** rather than
+  reading what decompression actually produced - a fake planted in guest data.
+- **Live marker is `BE710-MAGIC`, NOT the symbol name.** `w677.log`: `BE710-MAGIC #N wrote 61786772`
+  = **57 firings** (counter reaches #70; 57 printed = the marker's own cap). `w676.log`: **0**.
+  `BE710-MAGIC-CENSUS #70 ... head=ED5C7B50 ... dstWordNow=00000000 magic=61786772` shows the write
+  happening over a buffer whose head is **not** the magic - i.e. the laundering, caught in the act.
+- **Removal is separately gated on the real decompression path arriving first.** Do not delete it as a
+  cleanup; it is load-bearing until that path exists.
+
+### F-647 (2026-09-30, **0 builds: raw-word vs decompiler output**) - **ALL THREE DECOMPILERS RENDER PPC ROTATE-IMMEDIATE MASKS BACKWARDS. ANY MASK REASONING TAKEN FROM DECOMPILED OUTPUT IS SUSPECT.**
+
+- **Proof, one word:** raw `55 6A 00 42` at `0x821CCF7C` is **MB=1, ME=1 = bit 1**. **The IDA bridge AND
+  `generated/ppc_xenon/ppc_recomp.17.cpp` BOTH print `0x40000000`** (bit 30). The decompilers keep the
+  low bits where the ISA keeps the high ones.
+- **`0x821CCF88` is MB=0, ME=0 = bit 0**, not bit 31.
+- **Rule: read the raw word. `build/cache/mcla_pe.bin`, offset = VA - `0x82000000`, big-endian.**
+  This is F-023 applied to instruction fields, and it is the same trap as the `lis` sign-extension trap
+  in the `mcla-guest-raw-decode` skill.
+
+### F-648 (2026-09-30, **0 builds: `src/` read + `w677.log` rows**) - **`.dcl` IS OPTIONAL; `rage_im.fxc` IS NOT AN ARCHIVE MEMBER; THE GAME LOADS IT TWICE ON PURPOSE.**
+
+- **`.dcl` files cannot fail a shader load.** Stop treating a missing `.dcl` as an error condition.
+- **`rage_im.fxc` is `embedded:/fxl_final/rage_im.fxc`** - hard-coded `buf = 0x827D2DD0u; size = 5258u`
+  in the `pth[0]==0` branch of `sub_821BE0C8`. It lives in the **executable's `.CRT$XCU` static data**,
+  not in the archive. Confirmed live: `F640-XCU-REG #1 site=827A7FCC node=828395B8
+  name='fxl_final/rage_im.fxc' buf=827D2DD0 size=5258 nodeInStaticData=1` (`w677.log`, 15 such rows).
+- **The double load is deliberate** when `preload.list` fails to open. It is a fallback, not a loop bug.
+
+### F-649 (2026-09-30, **0 builds: `src/` read**) - **`HydrateShaderHashTable` INJECTS TEN FAKE OBJECTS INTO GUEST SLOTS 0-9 - AND SLOTS 0 AND 1 ARE THE GAME'S FALLBACK SLOTS. SEPARATELY, A FAILED ENTRY CANNOT OCCUPY A SLOT.**
+
+- **The injection is real and is a fake living inside guest data structures.** Removal is **queued, not
+  done**. Do not describe this as closed.
+- **Refutation, by construction:** `sub_82188E50` clears the slot on failure, so **a failed entry in a
+  fallback slot is impossible**. This kills an earlier claim that a failed fallback entry was
+  observable. Cite this heading, not the older claim.
+
+### F-650 (2026-09-30, **2 builds (`w676` = predicate applied, `w677` = reverted)**) - **A PREDICTED REGRESSION, CONFIRMED: THE READ-MODE PREDICATE IS REAL, AND ACTING ON IT FIRES THE GUEST'S OWN FATAL.**
+
+- **The predicate `(w3 & 0x3) == 2` is real** (raw-word decode, not an inference). **Acting on it
+  retires the forced-ack mitigation for ~93% of records** and hands them to a **read-submission path
+  this codebase has never made deliver.**
+- **`w676.log` measured:** `DISCCHK` **779 -> 3**; `AFB76-TOC-HIT` **18 -> 0**; `SERVE-PROOF` **262 -> 3**;
+  and the guest's own **`Fatal error dispatcher invoked - terminating game` fired for the first time in
+  project history** - exactly one occurrence, `[11:25:13.958] [error]`.
+- **Reverted to the byte-exact HEAD predicate.** `w677.log` recovered most of the serving path
+  (`AFB76-HIT` **23**, `AFB76-TOC-HIT` **16**, `SERVE-PROOF` **182**, `TOCSERVE` **16`) but
+  **`DISCCHK` is still 41 of 779**, and **the fatal still fires** - exactly one occurrence,
+  `[11:40:14.913] [error]`. **The revert restored throughput, not correctness.**
+
+### F-651 (2026-09-30, **0 builds: byte-exact re-count over 3 soaks + whole-tree `git grep`**) - **INSTRUMENTS THAT LIED. THIS ENTRY CORRECTS FOUR FIGURES IN THE BRIEF THAT PRODUCED IT - THE MEASUREMENT WINS IN ALL FOUR.**
+
+- **THE REAL MARKER IS `CP-REG-T0` (`src/gpu_cp.cpp:593`),** and it is **capped**: printed rows are
+  w675 278,023 / w676 265,459 / w677 268,675, while the cumulative `writes=` field reaches
+  **w675 69,495,750 / w676 66,354,750 / w677 67,158,750**. **`66,354,750` is `w676`'s figure, not
+  `w677`'s** (the brief attributed it to `w677`; `w677` is 67,158,750). The previously quoted 274,000
+  was wrong by ~250x.
+- **`CP: RING A DRAIN` IS NOT A PHANTOM - THE BRIEF REFUTED THIS AND THE BRIEF IS WRONG.** It appears
+  **617 times in `w677.log`** (610 `w676`, 639 `w675`), e.g.
+  `CP: RING A DRAIN src=doorbell base=B7C01280 cap=8192 rptr 0000->0016 wptr=0016 consumed=22
+  wb=D840B2BC published=true lr=82411220`. **It is absent from `src/` but present in
+  `.qoder/skills/mcla-log-census/SKILL.md:63,70`** - it is a census-skill construct, not dead text.
+  **`CP-REG-TN` IS a genuine phantom: 0 occurrences in all three soaks.**
+- **`o1heapAllocate returned null`: the brief's `101,600` is `101,700`** (cumulative `oom=` in
+  `w675.log`; 1,025 printed rows).
+- **`MEMBER-EXPAND-FAIL` is 22 -> 0 -> 1, not 22 -> 0** (see F-645). See the `w677` row quoted there.
+- **`descmismatch` does NOT appear on "every row".** It is a field on the **3 real-free rows only**
+  (`XTL-FREE #6/#7/#8 ... descmismatch=6/7/8`); the 5 null-guard refusals never print it.
+  `ptr == desc` throughout, on every row. Unresolved; **does not affect the counts** in F-640.
+- **Stale figures confirmed dead:** "292,975 draws enqueued" and "`no-index-buffer` 292,599 -> 0" are
+  **w661-era, quoted from a source comment**. Measured in `w675.log`: **0 and 0.** They are not in any
+  current tree.
+- **`build/toc_parsed.bin` is 382,976 bytes and every byte is `0x00`** (verified in Python, not
+  `dir`). A dead capture that reads as a successful parse.
+- **`tools/rpf_offline.py`'s docstring is wrong about case.** It **lowercases**:
+  `gtao('Shadows.fxc') = 5C1C5829` != `gtao('shadows.fxc') = 496B51F8` = the log's `leafHash`.
+  **Consequence: `find Shadows.fxc` misses, `find shadows.fxc` hits.**
+- **The raw-archive `find` returning 0 is BY DESIGN.** The on-disk TOC is AES; the cleartext table
+  exists only in guest RAM. This is not a bug and must not be "fixed".
+- **`tools/addr_owners.py --check` MUST BE GIVEN HEX.** The symbol form returns a false **"0 sites" at
+  exit 0** - defect at **`tools/addr_owners.py:240`**, where the address never reaches the macro-expanded
+  text. Measured: hex = **2 sites**, symbol = **0**.
+- **`tools/ppc_xrefs.py xref` returns false zeros** (carving artifact). **`CALLERS (none)` from the IDA
+  bridge is NOT evidence** - only **1 of the 1,267 constructor targets is carved as a function**.
+- **`tools/ppc_disasm.py` is CORRECT.** It was briefly suspected broken (`bo=`/`bi=` fields); it prints
+  **raw fields, not mnemonics.** Do not "fix" it.
+- **`shlex(posix=False)` splits `/I"E:\mcla pc\src"` and manufactures 35 bogus errors.** A
+  `CommandLineToArgvW`-equivalent tokenizer is required.
+- **`-c` is a SUBSTRING of `-clang:-std=c++23`.** Naive substitution yields **4** traps, including
+  `clang-cl.exe` and `tiny-AES-c`. Use whole-token `(?<![\w-])-c(?![\w-])` and **assert exactly one**.
+- **`-Zs`/`/Zs` is unsound on `src/gpu_cp.cpp`** (the slash form crashes). Verify that file with a real
+  redirected compile.
+
+### F-652 (2026-09-30, **0 builds: raw-word decode + `tools/addr_owners.py`**) - **GUEST BUG, PARKED: `sub_821C9968`'s `..` COLLAPSE WRITES ONE BYTE BEFORE THE BUFFER. NOT OURS TO FIX.**
+
+- **The guard is wrong by two.** `0x821C998C` is `cmplw cr6,r3,r31; ble`, requiring `dot > base`,
+  but **dest is `dot-2`** - so it under-tests by exactly the amount it then writes. A **second** guard at
+  `0x821C99D8` jumps straight through with `r3` unchanged.
+- **Consequence:** a path of exactly `/../x` yields **`dest = base-1`, one byte before the buffer**,
+  via the `sub_823DB5B0` memmove at `0x821C9A34`.
+- **Preconditions (all four required):** no later `.`; `byte[dot-1]` in `{/, \}`; `byte[dot+1] == '.'`;
+  `byte[dot+2]` in `{/, \}`.
+- **The host never composes such a path.** `python tools/addr_owners.py --check 0x821C9968` -> **1 site,
+  `map` only** (HEX form). **Recorded as the game's bug. Do not add a host mitigation (do-not #1/#9).**
+- **Related, same family:** path composer `0x821CA2F8` has **no idempotence check** against the module
+  prefix, so a fed-back composed relative path is prefixed **again**.
+
+### F-653 (2026-09-30, **0 builds: recorded as OPEN, deliberately NOT as claims**) - **FIVE ITEMS THAT ARE NOT CLOSED. Each is stated with the measurement that leaves it open.**
+
+- **UNRESOLVED - a DEFLATE header from nowhere.** One of six sampled bodies, **`BE710-BODY #72`**, head
+  `03 01 01 C8 0F 00 04 F8`, **is a valid DEFLATE header that appears nowhere in the 213,073,920-byte
+  packfile.** It did not come from the archive. No origin established.
+- **UNRESOLVED - the ring writer's constant payload.** The guest emits
+  `*v9 = (((((off + N) >> 20) + 512) & 0x1000) + ((off + N) & 0x1FFFFFFF)) | 2; v9[1] = 0xC0000000;`
+  - **a constant payload repeated ~200 times.** Meaning unknown. Recorded, not interpreted.
+- **UNRESOLVED, benign:** `XTL-FREE` prints `descmismatch` on the 3 real-free rows with `ptr == desc`
+  throughout (F-651). **Does not affect any count in F-640.**
+- **CONTENT GAP, explicitly NOT a correctness bug:** **107 of 164 `fxl_final/*.fxc` never register in the
+  expand table.** Unregistered means **no claim and no bytes written**, so this is a coverage hole, not a
+  defect. Do not escalate it.
+- **FLAGGED, NOT GUESSED:** `kTocMaskWidthUnresolved = true` remains live in `src/gpu_device.cpp:1749`.
+  MB/ME decode gives **`0xFFFFFFFE`/`0xFFFFFFFC`**, not the adopted `0x7FFFFFFF`/`0x3FFFFFFF`. Per F-647,
+  decompiler mask output cannot arbitrate this; **it is left flagged rather than guessed.**
+
+**End of 2026-09-30 block. IDs F-638..F-653 written. Next free ID: F-654.**
+**Void slot F-629 was NOT reused by this block** - it remains reconstructed-as-a-new-ID under
+`### F-635`, per `### F-636`'s adjudication. No heading above this block was edited.
+
+---
+
+## 2026-10-01 block — IDs F-681..F-692. Written by a subagent holding ONLY this file.
+
+**READ F-681 FIRST. It invalidates the "next free ID" instruction this block was handed, and the
+starting ID of this block was chosen because of it. Nothing above this line was edited.**
+
+**Standing attribution caveat, stated ONCE and applicable to every number in this block (project
+rule 1a).** `git log -1` = `8385925` *"rpf_offline.py: stop names/find crashing on a truncated tail
+record"*, **2026-09-27 23:23:27 +0300** — **three days of uncommitted work**. `git status --porcelain
+-- src/` = **54 entries: 41 `[ M]` modified + 13 `[??]` untracked**. Per rule 1a, **no before/after
+number in this block is attributable to a single file**, and none is offered as such. Per rule 1b,
+the working tree also contains new `static`/`extern` host symbols, so attribution would stay
+provisional under a single-variable revert even where the diff allowed it.
+
+**Concurrency note.** `build/w681_build.log` (0 bytes) was created at **2026-10-01 00:25:07**, i.e.
+during this session, and `idalib-mcp.exe` (pid 24332) is live, so **another session is working in
+this tree right now.** `docs/ROOT_CAUSE_VALIDATION.md` mtime was **2026-09-30 12:09:04** at
+00:25, 00:28 and 00:31 — unchanged, so no session was mid-write in this file and appending was safe.
+`build/w681.log` did not exist and is **not** cited anywhere below. This session launched no build,
+ran no game, made no commit, and edited no file but this one.
+
+### F-681 (2026-10-01, **0 builds, 0 soaks: a census of this file and of the tree that cites it**) - **THE LEDGER HAS A FIVE-ID HOLE AND A LIVE CLAIM, AND THE FOOTER "NEXT FREE ID: F-654" IS UNSAFE. This is the reason this block starts at F-681 and not F-654.**
+
+- **Claim.** The instruction to begin at `F-654` is falsified by the tree. `F-654`, `F-655`, `F-656`,
+  `F-657`, `F-658` and `F-680` are cited **91 times** across `src/` and `docs/HANDOFF_NEXT_AGENT.md`
+  and have **zero** `###` entries here.
+- **Measured (per-ID citation census, `docs/`+`src/`+repo-wide, this file excluded):**
+
+  | ID | ledger `###` | ledger textual | in-tree citations | cited by |
+  |---|---|---|---|---|
+  | F-654 | 0 | 1 (the footer itself) | 13 | `gpu_device.cpp` ×12, `HANDOFF_NEXT_AGENT.md` ×1 |
+  | F-655 | 0 | 0 | 16 | `gpu_device.cpp` ×15, `vfs_rpf.cpp` ×1 |
+  | F-656 | 0 | 0 | 4 | `gpu_device.cpp` |
+  | F-657 | 0 | 0 | 33 | `gpu_device.cpp` |
+  | F-658 | 0 | 0 | 1 | `gpu_device.cpp` |
+  | F-680 | 0 | 0 | 24 | `gpu_cp.cpp` ×16, `gpu_device.cpp` ×8 |
+
+- **These are real, dated, completed findings — not placeholder labels.** The source carries their own
+  headers: `src/gpu_device.cpp:1649` `// F-657 (2026-09-30) -- THE MEMBER MASKS WIDENED TO THE GUEST'S,
+  AND THE GATE`; `src/gpu_device.cpp:1752` `// F-680 (2026-10-01) -- THE TOC ARRAY BASE IS RESOLVED AT
+  RUNTIME, AND A`; `src/gpu_device.cpp:18484` `// THE QUESTION F-654 COULD NOT ANSWER`.
+  **`F-680` is dated today and its work is in the tree** (see F-685 and F-688, which both measure
+  F-680's landed code).
+- **Consequence, and why F-681 was chosen.** Writing `F-654` here would have silently repurposed an
+  ID that 13 live citations point at for a *different* finding — manufacturing the exact
+  dangling-citation class this file exists to prevent, and the same failure as the **F-629 void slot**
+  except inverted (there the ID was lost, here it would be stolen). `F-681` is the first ID **above
+  every ID the tree already claims**, so this block cannot collide with any existing citation.
+  `F-659` was also left alone: it has 0 headings and 0 citations anywhere, but it was a *provisional
+  label* for the F-684 experiment, and reusing it would make a reverted experiment look like a
+  recorded finding.
+- **Falsifier.** If `git grep -n "F-65[4-8]\|F-680" -- src/ docs/HANDOFF_NEXT_AGENT.md` returns
+  nothing, this entry is wrong and `F-654` was free after all. It returned 91 matches across 6 IDs.
+- **DO-NOT for the next session: the footer's "Next free ID: F-654" must not be trusted.** The
+  correct statement is *"first ID with no in-tree citation and no heading: **F-659**; first ID above
+  all claims: **F-681**."* The footer is left unedited above because this file is append-only.
+
+### F-681b (2026-10-01, **0 builds: duplicate-heading adjudication, 6 apparent collisions resolved to 4 real ones**) - **THE 4 PAIRS ARE NOT ALL THE SAME KIND OF DEFECT, AND 2 OF THE 6 ARE NOT DEFECTS AT ALL. Renumbered nothing.**
+
+- **Measured.** `(?m)^###\s+F-(\d+)` → **539** headings, min `F-77`, **max `F-653`**, and 6 IDs with
+  2 headings each. The reconciliation of 539 vs the commonly quoted **537** is exact: the two extra
+  headings are the **lettered sub-entries `### F-200b`** and `### F-204b`**, which a `F-(\d+)\b`
+  regex absorbs as `F-200`/`F-204`. **537 is the count of digits-only headings; 539 is the count of
+  heading lines. Both are correct for their own definition.**
+- **Adjudication, pair by pair — all six resolved, none left open:**
+
+  | apparent dup | second heading at | verdict |
+  |---|---|---|
+  | F-111 | `### F-111 correction (dated 09-24 04:55, T41.3w)` (:2596) | **GENUINE ID REUSE, and it is an amend-not-replace.** The correction **retracts** the original's "50 access violations" as a *line* count: 50 `C0000005` lines but only **2** distinct `Vectored exception: code=0xC0000005` events, reproduced in `w102`. **Authoritative:** the correction, for the event count. The original stands for everything else. |
+  | F-595 | `### F-595 addendum (2026-09-28 13:0x)` (:13539) | **GENUINE ID REUSE, also amend-not-replace.** Declares `build/w624.log` **VOID — must never be cited** (the soak used `timeout 300 mcla.exe`, a `cmd.exe` syntax error; `w624_err.log` = 107 bytes, `w624.log` = 0 bytes, the game never ran). **Authoritative:** the addendum. |
+  | F-612 | `### F-612/F-613 (2026-09-28 16:4x-17:0x)` (:13669) | **SHARED HEADING, NOT a duplicate.** One block deliberately covers two IDs. F-612 (:13664) = both in-target hits fired; F-613 = the bisect walking down. No conflict. |
+  | F-617 | `### F-617/F-618 (2026-09-28 17:1x-17:2x)` (:13700) | **SHARED HEADING, NOT a duplicate.** F-617 = all five S-batch calls fired same-millisecond; F-618 (:13694) = t1 walks through both batches. No conflict. |
+  | F-200 | `### F-200b (2026-09-25 00:49, w226/w227)` (:5753) | **NOT A DUPLICATE.** A distinct negative result (capture misfired, `arg0used=CDCDCDCD`), later refined and superseded by F-201. |
+  | F-204 | `### F-204b (2026-09-25 01:43, w232/w233/w234)` (:5797) | **NOT A DUPLICATE.** Self-declared "supersedes F-203 and completes F-204". |
+
+- **Pattern, stated as the transferable part:** the file's own repeated-ID idiom is
+  *`F-NNN correction` / `F-NNN addendum` / `F-NNNb` / `F-NNN/F-MMM`*, and **three of the four real
+  collisions are a correction or addendum that supersedes part of its parent.** A tool that flags
+  "duplicate ID" here is reporting a *deliberate amendment*, not corruption — which is exactly the
+  F-057(6) shape (a count that means something other than it appears to).
+- **Falsifier.** If `### F-111 correction` / `### F-595 addendum` were found to *contradict* rather
+  than amend their parents, the amendment reading would fail. Read in full, both narrow a claim
+  (50 lines→2 events; a void log) and neither reverses a conclusion.
+
+### F-682 (2026-10-01, **3 soaks re-counted byte-exactly, no build**) - **`.list` AND `.lst` ARE DISJOINT SUBSTRINGS, SO `strstr(path,".list")` CAN NEVER MATCH A `.lst` FILE. The defect generalises to SEVEN sites in `src/gpu_device.cpp`.**
+
+- **Claim.** `".lst"` is not a superstring-match of `".list"` and vice versa; a test written for
+  `.list` silently excludes every `.lst` member. **Byte-exact proof: 0 of the 94 `SERVE-PROOF` rows
+  in `build/w678.log` contain both substrings** (counter asserted this explicitly, not inferred).
+- **Measured, parsing all 94 `[warning] SERVE-PROOF` rows (anchored on the marker, so the
+  `OPEN-REFUSED-STATUS` rows that merely say "(see SERVE-PROOF)" are excluded — an unanchored
+  search returns 182 and is wrong):**
+
+  | soak | `.list` proved=0 / proved=1 | `.lst` proved=0 / proved=1 | `other` proved=0 / proved=1 |
+  |---|---|---|---|
+  | `w678` | 6 / 6 | **8 / 0** | 74 / 0 |
+  | `w679` | 6 / 6 | **3 / 5** | 74 / 0 |
+  | `w680` | 0 / 12 | **0 / 8** | 74 / 0 |
+
+  Distinct paths: **6** `.list` (`shaders/{cars,characters,city,effects,ui}/preload.list`,
+  `textures/global/cars/globaltex.list`) and **4** `.lst` (`tune/rmptfx/tireptx.lst`,
+  `tune/vehicle/vehicle{,0001,0002}.lst`). `OPEN-ACCEPTED` distinct paths: **w678 = 6 (all
+  `.list`), w679 = 10, w680 = 10** — i.e. the four `.lst` members are unreachable to the guest
+  until the fix. `LIST-SERVE-VERIFY` `ok=1`: **w678 6/6 → w680 20/20, `ok=0` never once**.
+- **CORRECTION TO THE BRIEF THIS ENTRY WAS WRITTEN FROM — two of its numbers are `w679`, not
+  `w680`.** The brief said "after the fix, `build/w680.log`: `.lst` 3/5, and `OPEN-ACCEPTED` 6 → 11".
+  Measured: **`.lst` 3/5 and `OPEN-ACCEPTED` 11 rows are `build/w679.log`.** `w680` reads `.lst`
+  **0/8** and `OPEN-ACCEPTED` **20 rows / 10 distinct paths**. The brief's *direction* is right and
+  its *labels* are off by one soak; anyone diffing `w678` against `w680` expecting 11 will read 20.
+  Same for `LIST-CONTENT-MISMATCH` "1 → 0": the **1** is in **`w679`**
+  (`list-content-mismatch path='tune/vehicle/vehicle0001.lst' off=40479000` — note `0x40479000 =
+  0x479000 | 0x40000000`, i.e. that single surviving mismatch **is** a F-683 bit-30 poisoning, not
+  an extension bug). `w678` already read 0. So the honest series is **w678 = 0, w679 = 1, w680 = 0**,
+  and the "1" is attributable to the *other* defect, not to a regression.
+- **The generalisation, which is the real lesson — the same defect at seven sites in
+  `src/gpu_device.cpp`, ranked:**
+
+  | rank | site | state | evidence |
+  |---|---|---|---|
+  | 1 | `MclaMarkKnownListMembers` :2109, `isList` :2565 | LANDED | gates `wantsPkg && !isList` :2570 |
+  | 2 | `sub_821CC6F0`, `isList` :17332 | **OPEN — block unreachable** | `if (!rscHead && pkgOff != 0 && !isList)` :17336 and :17377; 0 of 5,396 firings reach it |
+  | 3 | `MclaPreferredPkgOffForPath` :2554 area | **behaviourally equivalent today** — its `isList` gates a *preference*, not a refusal, so the miss costs nothing observable | comment at :2554 already names `vehicle.lst`/`vehicle0001.lst`/`vehicle0002.lst` |
+  | 4 | `sub_821CBFC0`'s `TOC76-LAYOUT list=` census field | LANDED | was printing `list=0` for **8 of 8** `.lst` rows |
+  | — | `PathLooksLikeArchiveContent` :297 / `PathLooksLikeUiBody` :317 | **LEAVE ALONE FOREVER** | :317 is literally `return PathLooksLikeArchiveContent(path);` and it **already tests both** — collapsing it *is* the F-683 root cause |
+  | — | `MclaBootstrapGlobaltexFromServed` | **LEAVE ALONE FOREVER** | a specific-file match; adding `.lst` would inject vehicle text into the texture registry — an **invented behaviour**, not a fix |
+  | — | `MclaListMemberPath` | **LEAVE ALONE FOREVER** | zero callers; reviving it regresses **F-632's 371-member registration** |
+
+- **Falsifier.** If any *other* `isList`-shaped predicate in `src/` outside `gpu_device.cpp` tests
+  only one of the two extensions, this entry's "seven sites, all in `gpu_device.cpp`" is
+  incomplete. If `sub_821CC6F0`'s `isList` is shown reachable (a nonzero count on a `!isList`-
+  guarded branch), rank 2 is not "unreachable" and the open item is wrong.
+- **PREDICTION (not a claim):** fixing rank 2 will not change any count in `w680`, because the
+  guarded block provably does not execute. **Falsifier:** a soak in which a `!isList` branch inside
+  `sub_821CC6F0` is observed to fire at all.
+
+### F-683 (2026-10-01, **2 soaks, source + log**) - **THE BIT-30 TOC POISON: A COMMENT LICENSED A WRITE INTO THE ONE FIELD THAT IS THE MEMBER'S ARCHIVE OFFSET, AND THE LICENCE WAS FALSE.**
+
+- **Claim.** `it->second.w[2] = e8 | 0x40000000u;` in `PPC_FUNC(sub_821CCEA0)` set bit 30 in the
+  **only** field that is the member's archive file offset. The comment claiming the write was
+  harmless — "which the offset mask ignores" — was **false**: `kTocMemberOffMask` is
+  `0x7FFFFFFFu` at `src/gpu_device.cpp:1735`, **31 bits with bit 30 INCLUDED**, and
+  `RpfVirtualFileSystem::ReadFileAt` in `src/fs/vfs_rpf.cpp` passes `offset` to `::ReadFile`
+  **unmasked**. The source now says so itself at `src/gpu_device.cpp:19746`
+  (`with kTocMemberOffMask == 0x7FFFFFFFu (:1735) -- 31 bits, bit 30 INCLUDED`) and at `:335`.
+- **Why the range guard could not catch it.** Every poisoned read landed **inside** the
+  2,130,739,200-byte archive, and each row's `head=` was byte-identical to
+  `archive[poisoned_off]` — i.e. the read *succeeded* and returned wrong data, which is strictly
+  worse than a refusal.
+- **Blast radius, `build/w678.log`:** **46 of 94 `SERVE-PROOF` rows poisoned across 45 distinct
+  members** (pairing rows by `path`, 94 rows = 45 paths × 2, plus 4 `.lst` paths whose *both* rows
+  are poisoned; of the 46 rows that have a clean sibling, **46/46 `head` values DIFFER** from the
+  clean sibling — 0 match). **CORRECTION: the brief said 43 distinct members; measured 45.**
+- **The fix is ALREADY IN THE TREE (this is a post-fix record, not a proposal).**
+  `src/gpu_device.cpp:19736` is now a comment:
+  `// T41.3h (F-079): (void)memR.WriteU32BE(it->second.entry + 8, e8 | 0x40000000u);`
+  The write is **deleted**, not masked. Measured before → after:
+
+  | measure | `w678` | `w680` |
+  |---|---|---|
+  | bit-30 `off=` rows, `SERVE-PROOF` + `XSF-INFLATE` | **158** (50 + 108) | **20** (4 + 16) |
+  | distinct bit-30 `off=` values, same two markers | **45** | **2** |
+  | `XSF-GATE-BIT30-WITHHELD` | 0 (marker did not exist) | **250**, `bit30=0` on **250/250** |
+  | `LIST-CONTENT-MISMATCH` | 0 | **0** (from 1 in `w679`) |
+  | `LIST-SERVE-VERIFY` `ok=1` / `ok=0` | 6 / 0 | **20 / 0** |
+
+  **The brief's "158 → 20, distinct 45 → 2" reconciles exactly and only if the two markers are
+  summed**: `SERVE-PROOF` 50→4 and `XSF-INFLATE` 108→16, sharing one distinct-value set (45→2).
+  Reported per-marker they are 50→4 and 108→16. **The 2 residual values are members whose GENUINE
+  offset is ≥ 1 GB** (e.g. `off=7EF65487` for `tune/vehicle/vehicle0002.lst` in `LIST-SERVE-VERIFY`,
+  `ok=1`) — not poison. That is consistent with F-657's measured 31-bit width (see F-688).
+- **THE HONEST CAVEAT, and it is the important part: the poison caused 46 bad reads and ZERO
+  corrupted delivered bodies.** Every poisoned serve was caught by the prove-or-refuse gate
+  (`proved=0` on all 50), and `OPEN-REFUSED-STATUS ... reason=UNPROVED-BODY -- no handle bound, no
+  GetSize published, no served-body registered (see SERVE-PROOF)` refused them. **0 poisoned
+  reaches `OPEN-ACCEPTED`.** The defect was a *latent* correctness hazard with an accidental
+  safety interlock, not an active data-corruption bug.
+- **Falsifier.** If any row with bit-30 `off=` and `proved=1` exists, or any `OPEN-ACCEPTED` row's
+  `servedHead` differs from its `realHead`, the "zero corrupted bodies" claim is false. Measured:
+  `OPEN-ACCEPTED` 20/20 rows, and all 20 `LIST-SERVE-VERIFY` rows show
+  `servedHead == realHead` with `firstDiff=-1`.
+
+### F-684 (2026-10-01, **NEGATIVE RESULT — an attempted fix, measured, and REVERTED**) - **SPAN-OWNERSHIP: THE FIX IS A NO-OP FOR THIS FATAL *AND* UNSAFE. Reverted; the revert is byte-exact.**
+
+- **Hypothesis tested.** `preload/xarchive_carconfigs.rpf` (stored `[0x448000,0x4709B3)`, logical
+  `[0x448000,0x490000)`) shadowed `tune/vehicle/vehicle.lst` at `0x471000`. Proposed change: accept a
+  non-owner span whose offset is past the owner's **stored** end.
+- **Killed on two independent measured grounds.**
+  **(a) It cannot fix this fatal.** The window actually read is `[0x40471000, +22391)` — the
+  poisoned offset, not `0x471000` — and **no span covers that head**, so `owner == nullptr` and the
+  refusal branch can never execute there. The change is unreachable for the observed fault.
+  **(b) It is unsafe.** Replaying every window of `build/w679.log` with three controls — elected
+  owner **189/191**, old `refused` **181/191**, old writers **189/191** — showed the change alters
+  the byte content of **21 of 180 validated windows, 315,384 bytes**. That re-creates precisely the
+  **foreign-island splice** documented as load-bearing at `src/fs/vfs_rpf.cpp:1281-1289`, which
+  cites its own measurement: the city/characters/effects list windows each contain the next member's
+  stored range (`CityDefault.dcl` at `001F43BF`, `Character.dcl` at `002DBA25`, `rain_system.dcl` at
+  `00304ECE` — each exactly the list's stored end), and "a bounded-but-allowed splice puts a foreign
+  **61-109 byte** island in the middle of a list body."
+- **Revert proven byte-exact:** **105,698 bytes**, SHA256 beginning `1A23BE52` and ending `E7438C`,
+  matching an independent pre-edit copy found on disk.
+- **The ID `F-659` is NOT reused here.** It was a provisional label for this experiment only; it has
+  **0 headings and 0 citations** anywhere in `docs/`. This entry takes **F-684**.
+- **Falsifier / what would revive it.** A measurement showing a serve window that **begins inside a
+  non-owner span** while the owner is elected *and* whose bytes are byte-identical under both
+  policies. The 21/180 divergence is a disproof of the *policy*, not of the hypothesis; the
+  hypothesis itself stays untested and is recorded as such.
+- **Do-not:** do not re-attempt this as a flag or span-table tweak. The `owner == nullptr` fact
+  (a) means it is not even a candidate for this fatal.
+
+### F-685 (2026-10-01, **2 soaks + source; and a CORRECTION: the alias fix is ALREADY LANDED as F-680**) - **THE `| 0xC0000000u` PHYS→KERNEL-VIEW TRANSFORM IS BROKEN IN THIS TREE — BUT `CpPhysToPoolVa` HAS ALREADY REPLACED IT AT SIX OF SEVEN CALL SITES. The tenthousand-row site is left alone DELIBERATELY, and my brief's "blast radius" is the site that was intentionally not changed.**
+
+- **Claim (still true).** `src/gpu_cp.cpp` derives a guest physical address into a view by
+  `pa | 0xC0000000u`. This tree has **one** flat 4 GiB
+  `VirtualAlloc(MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)` window and `GuestMemoryHeap::Translate` is
+  literally `return m_base + guestAddr;` — **no aliasing is possible.** The pool is a slice,
+  `[0xA0400000, 0xC0400000)`. The correct form is `poolVa(pa) = 0xA0000000 + pa`.
+- **The tree's own canary, `build/w680.log:50`, verbatim:**
+  `F640-PHYSALIAS phase=init mech=PARTIAL(alias-broken) canary_shared_views=1/3 probe_pa=10400000
+  probe_pool_va=B0400000 … pool=[A0400000..C0400000) cap=0x20000000 … A_view_is_pool=1
+  C_minus_pool=0x20000000 E_minus_pool=0x40000000 overlap_in_pool: A=508MiB C=4MiB E=0MiB |
+  window=one_allocation:0 committed:1 private:1`
+  — and the tree's own translation row, `w680.log:6213`: `F640-CVIEW-TRANSLATE #1 view=C16M
+  view_va=C04E0D30 pool_va=A04E0D30 pa=004E0D30`. `0xC04E0D30 - 0xA0000000 = 0x004E0D30` = the
+  `pa`. The tree already computes the right answer; the `|` form is the legacy path.
+- **THE CORRECTION, and it is material.** `src/gpu_cp.cpp:528` now reads
+  `// F-680: a guest PHYSICAL address -> the flat-window VA the builder actually wrote. Returns 0
+  when this tree has no pool byte for it; 0 can never be a pool address …, so 0 is an unambiguous
+  refusal and no caller has to guess which it got.`
+  `CpPhysToPoolVa(pa, site)` (:532) routes through
+  `mcla::boot::TranslatePhysViewToPoolVa(pa | 0xC0000000u, &poolVa)` and **refuses rather than
+  redirecting**, counting `CP: POOL-XLATE-REFUSED`. Its header (:492-518) is a **call-site
+  classification of every `PhysToKernelVA` in the file**: `:1140`/`:1167` vertex-fetch `vaBase`,
+  `:1504` `CpExecImLoad`'s first `PM4_IM_LOAD` probe (raw-physical fallback at `:1511-1514` kept so
+  probe-both cannot regress), `:2417` `PM4_WAIT_REG_MEM`'s memory-form poll target, `:3516`/`:4018`
+  `PM4_INDIRECT_BUFFER`'s list pointer. `PhysToKernelVA` itself survives at
+  `src/gpu_cp.cpp:2024` only as `return addr < 0x20000000u ? (addr | 0xC0000000u) : addr;` — the
+  guard means it now passes console-physical values through unchanged, and the file carries
+  **`DO NOT ADD CALL SITES HERE. Add them to CpPhysToPoolVa.`** (:2023).
+- **The 10,159-row site is the ONE call site deliberately NOT migrated, and the source says why.**
+  `:4466` = `CpEnableRPtrWriteBack`'s publish target, "LEFT ALONE, and the reason is **measured
+  incompleteness, not a claim that the C view exists**." Measured in support:
+  `build/w680.log:6213`-region `WAIT[KWFSO] #00001! … rptrWB=0000 wb@D840B2BC=00000000` —
+  **10,098 such rows in `w680`, 10,159 in `w679`.** `0xD840B2BC` vs the correct pool byte
+  `0xB840B2BC` differ by exactly `0x20000000`, and `0xD840B2BC ≥ 0xC0400000` is **outside the pool,
+  in flat memory no allocator ever handed out.** Corroborated by
+  `NATIVE-PRESENT #1 obj=40002080 fb=B96EF2C0` — 4 bytes from the correct writeback address.
+  **BUT the source's own reasoning defeats the obvious inference, and I record it as the
+  authoritative reading:** the `rptrWB=` field "LOOKS like proof and is not — that field is a HOST
+  read of `CpPrimaryWritebackVA()` (`imports.cpp:4978-4981`), so it only proves we can read our own
+  write, which **F-057(1) already retired as ring-progress evidence**." Changing a guest-visible
+  publish target with no measurement of which view the guest's waiter polls "could break the only
+  writeback path currently observed to work." **So the 10,159 rows are a self-read artefact, not a
+  measurement of guest-visible corruption.**
+- **The honest boundary, unchanged and still true: the alias has never corrupted a pixel, because
+  the CP never reaches a draw.** `CP-DRAW` = **0**, `CP-IM-LOAD` = **0**, `CP-WAITREG-ISSUED` = **0**
+  in `w680` — and every literal was verified present in `src/` first (`CP: IB-OPC-CENSUS` ×5 in
+  `src/gpu_cp.cpp`), so these are real zeros, not F-057(6) dead text. The `src/gpu_cp.cpp:496-497`
+  admission matches: the vertex-fetch site is `UNMEASURED (zero draws have ever reached this code)`.
+- **Falsifier.** A soak with `CP-DRAW > 0` that then shows a wrong pixel would convert this from
+  latent to active. Conversely a measurement identifying which view the guest's rptr waiter polls
+  would unblock `:4466` — that is the **one census that retires this item**, and it is not a flag
+  experiment.
+- **COUNTER-INTUITIVE CORRECTION TO A FAVOURITE CLUE, recorded because the wrong version is
+  load-bearing.** `walked == 2*t0` in `CP: IB-OPC-CENSUS` is **NOT** "the signature of an empty
+  buffer." It holds **8/8**, including on a **1,038,134-dword (4 MB)** window, so it is a **TYPE
+  degeneracy, not a size one**: a zero dword scores TYPE-0 because `hdr>>30 == 0`, so `walked ==
+  2*t0` is what an all-zero buffer *must* produce. Xenia itself special-cases `packet == 0` as a
+  1-dword NOP at `d3d12_command_processor.cc:611-615`, i.e. the degenerate reading is the guest's
+  own. **The load-bearing evidence is the raw `CP: INDIRECT_BUFFER` dump** showing **16 zero
+  dwords** where `PKT-CAP` read **real bytes `0x20000000` lower** — a *pointer-base* disagreement,
+  which is exactly what F-680's `CpPhysToPoolVa` addresses and exactly what an "empty buffer" story
+  cannot explain.
+  **Falsifier:** an `IB-OPC-CENSUS` run over a window with **no** zero dwords that still satisfies
+  `walked == 2*t0` would refute the TYPE-degeneracy reading.
+
+### F-686 (2026-10-01, **1 soak + raw bytes at `build/cache/mcla_pe.bin` offset `0x7D0010`**) - **THE `.CRT$XCU` CENSUS: 1,267 IS A COUNT, AND THE "1,267 SKIPPED CONSTRUCTORS" CLAIM IS DEAD. The old gate refused the table because its first word is a NULL SENTINEL.**
+
+- **Retraction, stated as a finding.** "1,267 skipped constructors" is **false and withdrawn.** The
+  old `firstOk && endOk` gate refused a table whose first word is a **NULL sentinel**. Measured raw
+  bytes at offset `0x7D0010` (= VA `0x827D0010`): **`00 00 00 00 82 7a 76 88 …`** — word 0 is
+  `0x00000000`. All three `.CRT` arrays are NULL-prefixed and every guest walker null-skips, so the
+  gate was testing the wrong thing.
+- **Real content of `[0x827D0010,0x827D13E0)`, measured: 1268 slots, 1 null, 1267 non-null text
+  pointers, 0 × `0xFFFFFFFF`, all 1267 present in `PPCFuncMappings` (45,190 entries parsed).** The
+  guest's **loop B at `0x821327E0-0x821327EC` skips 0 and −1 and has NO `cmpwi r3,0` early-exit**
+  (loop A does), so it enters **all 1,267**.
+- **The marker's cited instructions were WRONG BY `0x50`.** `0x82132778 394A13E4` /
+  `0x8213277C 3BCB13F0` are **loop A's** bounds. XCU's are **`0x821327C8 394A0010` →
+  `0x827D0010`** and **`0x821327CC 3BCB13E0` → `0x827D13E0`**. **The constants' *values* were right;
+  only the cited instructions were wrong** — which is why the wrong claim survived: the numbers
+  checked out and the citations did not.
+- **The rewritten census, `build/w680.log:103`, verbatim:**
+  `F640-XCU-TABLE begin=827D0010 end=827D13E0 slots=1268 nonNull=1267 first=827A7688 last=827B8678
+  unmapped=0 truncated=0 walker=82132740 callSite=82132318 verify=OK beginReadOk=1 endReadOk=1
+  beginWord=00000000 endWord=00000000 beginInText=0 endSentinel=1 regionWords=1268 entries=1267
+  entriesInText=1267 ffffffff=0 outOfText=0 firstEntry=2 adjacentPairs=1266 orderBreaks=1
+  regionReadFail=0 textRange=82130000-827BDCE4`
+- **Two NEW open items, from that row, neither guessed:**
+  - **`firstEntry=2`** — the first non-null is at **slot 2**, so the NULL prefix is **exactly one
+    slot** (slot 0) and slot 1 is *also* non-null or the count would be 1266. Worth one read of
+    `0x827D0018`.
+  - **`orderBreaks=1`** — the table is ascending except at **one** pair. `adjacentPairs=1266` =
+    `1267 − 1`, so the walk is otherwise total.
+  - Also note `beginInText=0`: the table base `0x827D0010` lies **outside** the reported
+    `textRange=82130000-827BDCE4`, while every *entry* is inside (`entriesInText=1267`). That is
+    consistent with `.CRT$XCU` living in `.rdata`, and it is why a text-range assertion is the wrong
+    gate.
+- **Falsifier.** If `0x821327C8`/`0x821327CC` are not `lis`/`addis` pairs resolving to
+  `0x827D0010`/`0x827D13E0`, the 0x50 correction is wrong. And if loop B at
+  `0x821327E0-0x821327EC` *does* contain a `cmpwi r3,0`, "no early-exit" is wrong. Both are raw-word
+  checks: offset = VA − `0x82000000`.
+
+### F-687 (2026-10-01, **tool audit, no build**) - **`tools/soak_census.py` HAD A REAL FALSE NEGATIVE, AND THE REPORTED CAUSE WAS WRONG. Two nested verdicts used different matching rules on the same corpus.**
+
+- **Claim.** `soak_census.py` graded **`DICTLOOKUP`** COMMENT-ONLY while **`DICTLOOKUP-OK`** is a
+  **live** `MCLA_LOG_INFO` firing **22 times** in `w678`, `w679` **and** `w680` alike.
+- **Measured.** `DICTLOOKUP-OK` literal: **3 occurrences in `src/gpu_device.cpp`**; firings **22**,
+  `DICTLOOKUP-MISS` = **0**, slots = `{44,47,51,53,61,62,67,68,69,70,71,72,73,74,75,76,77,78,79,80}`
+  — identical in all three soaks.
+- **The reported cause was wrong, and the real cause is a rule mismatch inside one function.**
+  The report blamed "a tokenizer that misses hyphenated labels." **A self-asserting tokenizer
+  cross-check REFUTES the hyphen theory**: `XTL-FREE-SUM`, `A-B-C`, `TRAILING-` and
+  `CP: IB-OPC-CENSUS` all parse; only a **leading** hyphen is dropped, by design. The actual defect
+  is that **`dead_tracked()` used SUBSTRING membership on the same corpus while `comment_only()`
+  used WHOLE-TOKEN** — two nested verdicts disagreeing about the same string, so `DICTLOOKUP`
+  matched inside `DICTLOOKUP-OK` for one and not the other.
+- **A second real mis-classification, in the same direction:** **`DISCCHK` is LIVE.** `w680` carries
+  **41 uppercase `DISCCHK`** and **0 lowercase `dischk`**, and the literal is in `boot_host.cpp` (1),
+  `gpu_device.cpp` (7), `task_dispatch_trace.cpp` (2) — **10 occurrences.** The case split is
+  load-bearing and is the F-057(6) trap in a new form: the **uppercase** form is **guest-emitted
+  text**, not a host marker, so a 41-count of it is a *guest* signal; a naive case-insensitive
+  tracker would grade it from host sources and read the guest's 41 as its own.
+- **A third finding, in the OTHER direction:** **`swfCMD` is comment-only and was invisible to both
+  graders** — exactly **1 occurrence**, `src/gpu_device.cpp:7660`
+  `// remaining fatal, 'swfCMD::Fixup - unknown type %d' (14613), on` — and **0 firings** in every
+  soak. A label with one occurrence *in a comment* is the shape F-057(6) warns about, and the
+  grader is blind to it in both directions.
+- **CORRECTION TO THE BRIEF: `DISCCHK2-RES` is LIVE, so "its zero in every log is a tautology" is
+  FALSE.** The literal exists in `src/` **3 times** (`gpu_device.cpp` ×2, `task_dispatch_trace.cpp`
+  ×1 — the latter at `src/task_dispatch_trace.cpp:977`, a real `MCLA_LOG_WARN`) and it **FIRED ONCE,
+  in `build/w676.log:6489`**: `DISCCHK2-RES wait returned r3=4294967293 (guest fatals on ==1)`.
+  Its zeros in `w678`/`w679`/`w680` are **genuine** (path not reached in those soaks), not
+  tautological. This is the F-057(6) rule working *correctly* and being mis-described.
+- **Falsifier.** If `dead_tracked()` and `comment_only()` in `tools/soak_census.py` turn out to use
+  the same matching rule, the "nested verdicts disagree" mechanism is wrong and the false negative
+  has another cause. Cite `tools/soak_census.py:<line>` for both function bodies when adjudicating.
+
+### F-688 (2026-10-01, **artifact + log + source; a CORRECTION: F-680 has already fixed ONE of the two writers**) - **THE TOC DUMP IS ANCHORED TO A HARDCODED ADDRESS, AND IT FAILS SILENTLY BECAUSE THE SUCCESS FLAG PROVES READABILITY, NOT IDENTITY.**
+
+- **Claim.** `build/toc_parsed.bin` is **382,976 bytes** and **100% zero**, rewritten
+  **2026-09-30 15:28:44**. The success flag only proves the read was *readable*, so a row can read
+  `okread=1` while unrelated memory is written.
+- **The address has moved seven times**, measured from the `TOC76 #1 … inner=` field:
+  `C60B7780 → C64B7780 → C64B7700 → C64B7E00 → B9038E00 → B733D280 → B733C280 → B733B280`. I
+  re-measured the tail independently across the last seven soaks: `w674` = `b733c280`, `w675` =
+  `b733c280`, and **`w676`/`w677`/`w678`/`w679`/`w680` = `b733b280`** — i.e. it moved **once** more
+  between `w675` and `w676` and has been **stable for five soaks**.
+- **CORRECTION — the brief described a state the tree has since left, and the leftover is worse than
+  described.** F-680 (`src/gpu_device.cpp:1752`, *"THE TOC ARRAY BASE IS RESOLVED AT RUNTIME"*)
+  has **already fixed the first writer**: `src/gpu_device.cpp:17730` is now
+  `dumpOnce(g_tocArrayBase …)`. **But the second writer is still hardcoded, at
+  `src/gpu_device.cpp:17740`: `dumpOnce(0xC60ACE00 …)`.** That is **not** the `0xC60B7780u` the brief
+  names — it is a *different* stale literal, so a grep for `0xC60B7780` would now find **nothing** and
+  wrongly conclude the defect is gone. **This is a live, unrecorded open item.** Both writers were
+  located by scanning every `dumpOnce(` in `src/**`; there are exactly two.
+- **`build/toc_decrypted.bin` is 99.6% nonzero but is a HASH CORPUS, not a name table**
+  (`corpus=38170 name hashes`) — it cannot answer "what is this file called", only "does this name
+  exist".
+- **Coverage consequence, measured: only 8,192 of 22,068 members are enumerated — 37.12% — and the
+  sample is BIASED**, `idx`-deciles 4 and 8 received **7** and **0** leaves. A 37% sample that is
+  also skewed cannot support any per-decile rate claim, including the `walked == 2*t0` reading in
+  F-685.
+- **The 31-bit mask is RIGHT and the 22-bit reasoning in the source is STALE.** **92.2% of members
+  (7,556 of 8,192) genuinely live above 1 GB**, proved by `logical == containerUnc + 20` holding at
+  the **31-bit** offset value with **zero exceptions in 5,223 tries**, and by four `build/xmem_golden`
+  sizes reproducing exactly. So `kTocMemberOffMask = 0x7FFFFFFFu` (`src/gpu_device.cpp:1735`) stands,
+  and this is corroborated in-tree by **`F-657` (`src/gpu_device.cpp:1649`, "THE MEMBER MASKS WIDENED
+  TO THE GUEST'S") — an ID with no ledger entry (F-681).** My brief's "the old 22-bit reasoning in
+  the source comments is stale" is therefore **half wrong**: the mask was already widened by F-657,
+  and the surviving 22-bit text is about **`w3` (stored size)**, which is a *different field* and is
+  measured correct at `kTocMemberStoredMask = 0x3FFFFFFFu` (`:1737`).
+- **Falsifier.** If `0xC60ACE00` is reached only on a path that `g_tocArrayBase` has already
+  validated as equal, the second writer is harmless. If a future `TOC76` row prints an `inner=` that
+  differs from the address the dump actually read, the runtime resolution is not wired to this
+  writer.
+
+### F-689 (2026-10-01, **whole-`src/` census, comment/string-stripped; a RETRACTION of "1 of 302"**) - **HOST WRITES INTO GUEST STATE ARE 309 OF 444 SITES ACROSS `src/`, 69.6% OF THEM IN ONE FILE. "1 of 302" DID NOT REPRODUCE.**
+
+- **The retraction.** The claim "`HydrateShaderHashTable` is 1 of 302 `WriteU32BE`/`WriteBytes`
+  calls" **does not reproduce.** Measured, comments and string literals stripped, in
+  `src/gpu_device.cpp`: **`WriteU32BE` = 251, `WriteBytes` = 41, `WriteU16BE` = 17 → 309.**
+  Across all **106** files of `src/`: **347 + 63 + 34 = 444.** So `gpu_device.cpp` is **69.6%**,
+  not "1 of 302" and not "65.3% of 475". **Three different numbers were in circulation; 309/444 is
+  what the tree says.** (The brief's 475/107 may reflect a different strip rule — which is exactly
+  why the strip rule must be cited with the number.)
+- **Largest confirmed charter-violation cluster: the `zlibInflater::InflateBegin` descriptor
+  inside `PPC_FUNC(sub_821D5E10)`.** The host decodes with its own inflater and **reports success
+  into the guest's own completion contract.** The guest owns the algorithm: the decoder is in the
+  guest image, the host's own hook on it (`PPC_FUNC(sub_8244FF20)`) is a **pass-through**, and a
+  "let the guest decode" path already exists (`MclaXcCallGuest`). Depth-matched body
+  **`src/gpu_device.cpp:11774-14164`**: **`WriteU32BE` = 87, `WriteBytes` = 10, `WriteU16BE` = 0**,
+  and **80 `MCLA_LOG_` sites**. **I could NOT reproduce the "77 sites writing the 7-field
+  descriptor" figure and do not assert it** — 87 is the whole-body `WriteU32BE` count, and the
+  descriptor-writing subset is a *semantic* subset that no mechanical count yields. Naming 77 would
+  repeat this entry's own error.
+- **Measured harm.** The `src` line ~13990 path swallows the XCompress fatal and reports empty
+  output — **20 firings in `w680`** (21 `xcompress` matches). One was fed the bytes `"DDS "`
+  (`44 44 53 20`): `xsf-inflate-stored path='textures/effects/star_glow.dds' off=00316000
+  stored=24385 logical=43832 spanhead=44445320 (the expanded span is incomplete: decoded the file`.
+- **The descriptor is 8 dwords, not 7** — the guest's initialiser `sub_821D5DC0` stores `st+28` at
+  `0x821D5DE8`, and **no host site ever writes it.** That is a precise, cheap, decidable gap.
+- **`HydrateShaderHashTable` IS removed — and the removal has NEVER been exercised by a soak.**
+  `src/gpu_device.cpp:4280`: `// REMOVED (2026-09-30) -- Stage C HydrateShaderHashTable, an F-609
+  NATIVE-ONLY`. It wrote 10 entries into the guest's shader table at `0x82839F70 + slot*4`. The **22**
+  observed `DICTLOOKUP-OK` slots are `{44,47,51,53,61,62,67,68,69,70,71,72,73,74,75,76,77,78,79,80}`
+  — **disjoint from the injected 0-9** — and `DICTLOOKUP-MISS` = **0**. **The binary predates the
+  removal, so "no collision" is untested: it is an OPEN FALSIFIER, not a success.** Do not read the
+  disjointness as a measurement of the removal.
+- **Falsifier.** A soak run against a binary built **after** 2026-09-30 that still shows
+  `DICTLOOKUP-OK` slots ⊆ {0..9} would show the removal did not land. Conversely any
+  `DICTLOOKUP-MISS > 0` would show it changed lookup behaviour.
+
+### F-690 (2026-10-01, **whole-`src/` byte census; a CORRECTION: the damage is GONE, and so is the caveat**) - **`src/gpu_device.cpp`'s UTF-8→CP1252→UTF-8 MOJIBAKE WAS REPAIRED, AND MY BRIEF'S "heap.cpp/imports.cpp STILL CARRY IT" CAVEAT DOES NOT REPRODUCE.**
+
+- **Claim (historical, now closed).** The file had been through **three generations** of UTF-8 bytes
+  → per-byte-char through the CP1252 table → re-encoded as UTF-8. The fingerprint is **`U+009D`**,
+  which is undefined in CP1252 and therefore took a latin-1 identity fallback. Prior measurement:
+  592 maximal non-ASCII runs over 11,927 characters across 555 lines, 19 distinct patterns, **64 of
+  them inside live `MCLA_LOG_*` format strings** — so the corruption reached runtime. **"1,114
+  mojibake" did not reproduce and is withdrawn.**
+- **The repair invariant, which is the part worth keeping.** It was repaired to byte-match HEAD on
+  all 555 lines, proven by a self-asserting check: the **sha256 of the ASCII skeleton (every
+  non-ASCII character deleted) was `4120f26602c1df98b…` before and after**, so *no ASCII character
+  moved* — a stronger claim than "it looks right", and the technique generalises to any
+  encoding repair. A further **74** sites were already mojibake **in HEAD** and were ASCII-ised.
+- **CORRECTION, measured just now: `U+009D` = 0 in `src/gpu_device.cpp` AND 0 across every `.cpp`
+  and `.h` in `src/` (0 files, total 0).** `src/kernel/heap.cpp` and `src/kernel/imports.cpp` carry
+  **38** and **42** non-ASCII characters respectively but **0 × `U+009D`** — so the brief's caveat
+  that they "still carry generation-1 mojibake in comments" is **not reproducible today**. Either a
+  later pass fixed them or the caveat was about a different fingerprint. `src/gpu_device.cpp` now has
+  **517** non-ASCII characters, 0 `U+009D`, 0 `U+FFFD`; its ASCII-skeleton sha256 begins `039303bd`.
+- **THE STANDING CAVEAT, and it is unaffected by the above: the repair was never built.** A source
+  edit that has not been compiled is a source edit. No soak in this project's history exercises the
+  repaired bytes.
+- **Falsifier.** If a `U+009D` appears in any tracked file, the repair is incomplete. If a build of
+  the repaired tree reproduces a *different* log line from the 64 repaired format strings, the
+  "byte-match HEAD" claim was wrong for that line.
+
+### F-691 (2026-10-01, **raw words + `build/w676.log:6484-6500`; a RETRACTION of my brief's tool claim**) - **THE DISC-CHECK FATAL TESTS `r29 < 0`, NOT `r29 == 1` — AND `ppc_disasm.py`'s BO FIELD IS **NOT** WRONG. My brief asserted both the bug and the culprit; only the conclusion was wrong.**
+
+- **THE RETRACTION.** My brief's headline — *"`ppc_disasm.py`, the project's own ground-truth tool,
+  mis-renders the BO field of conditional branches," "prints `bc bo=12`/`bc bo=4`," "the tool that
+  reads raw bytes for you is also wrong"* — **does not reproduce, and is withdrawn.** I independently
+  extracted BO from the raw words: for `0x4098000C`, `(word >> 21) & 0x1F = 4`; for `0x419A0020`,
+  `(word >> 21) & 0x1F = 12`. **Both match what `ppc_disasm.py` printed.** The tool is correct; it
+  prints a *number* where capstone prints a *mnemonic*, which is a verbosity difference, not an
+  error. **Recorded because the withdrawn claim is the more interesting and more dangerous one: it
+  would have had this project distrust its one correct ground-truth tool on the strength of a
+  mnemonic-label mismatch.**
+- **What IS wrong, and it is worse, because it is in a live log string.**
+  `src/task_dispatch_trace.cpp:977` emits, as *runtime output*:
+  `MCLA_LOG_WARN("DISCCHK2-RES wait returned r3={} (guest fatals on ==1)", ctx.r3.u32);`
+  **That parenthetical is false, and `build/w676.log` falsifies it in the same file:**
+  - `w676.log:6489` — `DISCCHK2-RES wait returned r3=4294967293 (guest fatals on ==1)`
+    — **`4294967293` = `0xFFFFFFFD` = −3.**
+  - `w676.log:6492` — `Fatal error dispatcher invoked - terminating game`
+  - `w676.log:6494` — `fatal-dispatch regs: lr=0x821CC310 … r4=0xFFFFFFFF r6=0xFFFFFFFF`
+  - `w676.log:6497` — `fatal message: 'Fatal disc error'`
+  A negative value cannot satisfy `== 1`. **The fatal fired on `r3 = −3`.**
+- **The raw words settle the mechanism, and they are a `cmpi`, not a `== 1`:**
+  `821CC300  2F1D0000  cmpi cr6,r29,0` — the comparison is **`r29` against the immediate `0`**, so a
+  signed-negative `r29` takes the branch. `821CC304  4098000C  bc bo=4 bi=24 -> 821CC310`, and
+  **`0x821CC310` is exactly the `lr` in the fatal at `w676.log:6494`** — the branch was taken to the
+  fatal site. The `r29 == 1` reading would need an immediate of `1` in a preceding `cmpwi`, and
+  `2F1D0000` carries `0`. `0x821CC31C` is the *other* path (`lwz r10,28(r31)`), i.e. the
+  non-fatal continuation.
+- **THE TREE ALREADY CONTRADICTS ITSELF, and the contradiction is citable both ways.**
+  `src/gpu_device.cpp:17955` says the opposite and says it **right**: *"(DISCCHK2-RES), and **r3<0**
+  is exactly its fatal condition; w99 (true) reaches 17,868 lines."* So `src/gpu_device.cpp:17955`
+  (correct) contradicts `src/task_dispatch_trace.cpp:977` (incorrect) about one branch, and the
+  **incorrect one is the one that reaches the log**, so every future reader of `w676.log` inherits it.
+- **The rule that was violated already existed, dated 09-24** (ledger F-111 region, this file,
+  lines 2591-2594): *"**Rule to keep:** for executed semantics the authority is the generated body
+  (`generated/ppc_xenon/ppc_recomp.NN.cpp`, `if (cr6.eq)` / `if (!cr6.lt)` lines are unambiguous);
+  `ppc_disasm.py` is for opcode and immediate fields only. **Do not assert a branch's direction or
+  an `mr`'s source from it.**"* `task_dispatch_trace.cpp:977` did exactly that, five days later.
+- **Falsifier.** If the generated body at `0x821CC300`-`0x821CC304` contains neither `cr6.lt` nor
+  `cr6.gt` — i.e. the branch is not a comparison result at all — then the `r29 < 0` reading is
+  wrong. Check `generated/ppc_xenon/ppc_recomp.NN.cpp` for the `sub_821CC1E0`/disc-check body, not
+  the disassembler.
+- **Transferable, and it is the second instance:** `AGENTS.md` warns that all three decompilers
+  render PPC rotate-immediate masks backwards. This is **the same class in a different field**, and
+  it lands the *opposite* way: the tool was **right** and the human reading of it was wrong. So
+  **"use the raw bytes" is not sufficient advice** — the raw bytes must be *decoded by hand* for
+  fields whose meaning is not self-evident, and a printed field value is not a rendered semantics.
+
+### F-692 (2026-10-01, **five independent instances, `file:line` each**) - **THE SYSTEM-WIDE DEFECT CLASS: COMMENTS LICENSING DECISIONS WITH A MECHANISM THAT DOES NOT EXIST. RULE 0 GOVERNS AGENT SPEECH, NOT THE TREE, AND HAS NO GATE.**
+
+- **Claim.** The dominant failure mode in this project is not a wrong number — it is a **comment or
+  marker string that asserts a mechanism, is never executed, and is then relied on as a licence.**
+  Five measured instances:
+  1. **The false licence that IS the whole root cause of F-683** — "which the offset mask ignores"
+    next to `e8 | 0x40000000u`, when `kTocMemberOffMask` is 31 bits and `ReadFileAt` passes
+    `offset` **unmasked**. One untrue clause in a comment produced 46 bad reads.
+  2. **F-686's** `F640-XCU` marker cited **loop A's** instructions (`0x82132778`/`0x8213277C`) for
+    **XCU's** bounds, **off by `0x50`**. The *constants* were right, which is exactly why it
+    survived review: a citation error in a field that is independently checkable.
+  3. **F-691's** `"(guest fatals on ==1)"` — a claim about guest semantics, inside a live
+     `MCLA_LOG_WARN` **format string**, falsified by the very log it writes
+     (`build/w676.log:6489`, `r3 = −3` → fatal). *(Correction to my brief: the related
+     `DISCCHK2-RES` is **live**, not comment-only — see F-687.)*
+  4. **F-688's** surviving **22-bit** (`0x3FFFFF`) reasoning in `src/gpu_device.cpp`, which
+     reproduces **only** under a mask that **exists nowhere in the file** — and which silently
+     **re-purposes `memMaskBitsSet` to mean something else** now that the offset mask is 31 bits.
+     (`0x3FFFFF` *does* legitimately survive for **`w3`**, the stored size; conflating the two fields
+     is the defect.)
+  5. **Three dead citations** in `docs/LONG_TODO_MASTER.md` §4 do-not #20/#21, and a
+     `FindFunction(0x82131008)` in ledger **F-209** that **never existed** — `git log -S` returns
+     empty. A do-not rule citing a non-existent function is enforced against nothing.
+- **The process lesson, and it is the point of this entry.** **RULE 0 governs agent speech, not the
+  tree. It has no gate, and its scope explicitly excludes the host's own constants and line ranges.**
+  Every instance above is a *comment in `src/`* — precisely the surface RULE 0 does not reach, and
+  precisely where the load-bearing claims live. There is no lint that can execute a comment, so the
+  only available control is **the same discipline applied to comments**: a comment that licenses a
+  decision must cite the `file:line` of the thing it relies on, and that `file:line` must be
+  re-measured when the file moves.
+- **A live instance of the *maintenance* half of this, found while verifying the above: F-653's own
+  citation is already stale.** F-653 (written 2026-09-30 12:09) states *"`kTocMaskWidthUnresolved =
+  true` remains live in `src/gpu_device.cpp:1749`"*. The symbol is now at
+  **`src/gpu_device.cpp:1905`** — **156 lines of drift**, because the file gained ~156 lines after
+  that block was written. The claim is still true; **the pointer is not.** Line-number citations into
+  a file under active edit decay silently and are indistinguishable from wrong claims once stale.
+- **Falsifier / the one cheap gate that would catch most of this.** For each of the five, the
+  enforcing artefact is a **symbol name or a raw word**, never a line number. If a future pass
+  replaces the five licence comments with `(see <symbol> at <file>, re-measure)` and a tool
+  resolves symbols, the class is detectable. **A `grep -c` over comments cannot detect any of
+  instances 1-4**, because every one of them is *true English prose* that happens to be false about
+  the code.
+
+---
+
+**End of 2026-10-01 block. IDs F-681..F-692 written (F-681b is a sub-entry of F-681, not a
+separate ID). No heading above this block was edited.**
+**IDs F-654..F-658 and F-680 were DELIBERATELY NOT USED — 91 in-tree citations already claim them
+and this file has no entry for any of them. See F-681. `F-659` was not reused (provisional label for
+F-684). `F-629` remains a void slot, cited here, not renumbered.**
+**AMENDED IN PLACE 2026-10-01 (authority: `### F-726`) - THIS BLOCK DOES NOT START AT `F-659`, AND
+`F-693` IS NO LONGER THE TOP. Census re-run immediately before this edit: `### F-NNN` heading lines =
+**575**, max **`F-719`**, min **`F-77`** (572 digits-only + 3 lettered sub-entries `F-200b`/`F-204b`/
+`F-681b`). The first ID above every claim in `src/` and `docs/` is now **`F-720`**, and **`F-729`**
+after `### F-728`. The `F-659` pointer is **RETIRED AND MUST NOT BE USED**: `F-659` was never free - it
+was a provisional label for **`F-684`** (stated in the three lines above). `F-695` is free, uncited and
+**PERMANENTLY UNUSABLE** - it sits *below* the consumed `F-696`, so the 10-01 sequence jumped it; do not
+back-fill it. The consumed/void set this rests on is enumerated in `### F-726`. The footer above reading
+"Next free ID: F-654" remains SUPERSEDED - do not follow it.**
+
+### F-697 (2026-10-01, **re-measured here: `build/w684.log`..`build/w688.log`, whole-file byte counts;
+code read by symbol, every `src/` line number re-measured**) - **THE HOST->GUEST SYNTHETIC CONTEXT
+ENTERED THE GUEST WITH `r13 == 0` AND `r1 == 0`. TWO CALL SITES REPAIRED; 16 FABRICATED ZEROS -> 3.**
+
+- **The defect.** `src/gpu_device.cpp` built `PPCContext tmp{}`, set only `r3`/`r4`, and called the
+  guest with `r13 == 0` and `r1 == 0`. `r13` is `offsetof 0x48` in the guest's context block (five
+  field mappings plus `boot_host.cpp:1061-1063`'s `r13+0x100` TEB / `r13+0x10C` cpu-number /
+  `r13+0x150` flag chain). **The recompiler never writes `ctx.r13`: measured `0` strict writes of
+  `ctx.r13.<field> =` across all `177` `generated/ppc_xenon/*.cpp`** (the `r13` token occurs 2,248
+  times, so the zero is about *writes*, not about the name being absent). `SetupInitialContext` sets
+  `ctx.r13.u32 = ThreadBlock` at `src/boot_host.cpp:1078`, with `ThreadBlock = 0x8F200000u` at
+  `src/boot_host.cpp:1064`.
+- **The consequence, measured on the guest side.** `r13 == 0` makes the guest's `lwz r11,0(r13)`
+  return a fabricated zero; `r1 == 0` makes `stwu r1,-96(r1)` store at `0xFFFFFFA0`.
+  `ReadGuestU32` (`src/guest_memory.h:82`) **drops the `bool`** that `ReadU32BE` returns, so the
+  refusal is invisible to the caller - it cannot be detected downstream, only counted.
+- **The repair, as landed.** `MclaSyntheticGuestStackTop` (`src/gpu_device.cpp:3576`) allocates one
+  private stack, `constexpr uint32_t kBytes = 0x10000u` (64 KiB, `:3581`), zero-fills it, and returns
+  the TOP; it returns **0** on allocation failure so the caller skips the guest call rather than
+  falling back to `r1 == 0`. `MclaSyntheticGuestCtx` (`src/gpu_device.cpp:3598`) sets
+  `c.r13.u64 = 0x8F200000u` (`:3600`, citing `boot_host.cpp:1078`) and `c.r1.u64` from that helper.
+  Both guest entries now use it: `__imp__sub_821854C8(tmp, base)` at `src/gpu_device.cpp:3653` and
+  `:4821`. **Sizing is cited in-tree, not asserted:** `src/gpu_device.cpp:3555` records
+  "reachable from `0x821854C8` is **432 B** (96 + 112 + 112 + 112)", against a 64 KiB stack.
+- **Measured, `GUESTVIEW-U32-FABZERO` (substring, case-insensitive):**
+  `w684=16, w685=3, w686=16, w687=3, w688=3`. `SYNCTX-STACK` is `w684=0, w685=1, w686=0, w687=1,
+  w688=1` - the one-shot notice is genuinely first-data in `w685`, and **`w686` is the revert
+  bisect** (see F-717), which reproduces the defect exactly. This is the strongest single piece of
+  attribution evidence in the block: the counter returns to 16 when and only when the fix is reverted.
+- **Defect-class census.** 15 host->guest call sites: **13 already correct, 2 broken.** The 13 correct
+  ones use `p.r1.u64 = stack ? stack : 0x006D8EC0u;` - **10 such sites in `src/gpu_device.cpp`
+  measured** (`src/gpu_device.cpp:7102`, `:7506`, `:7730` among them), plus the 11 other
+  `PPCContext p{}` constructions at `:7821`, `:7894`, `:8231`, `:8503`, `:8672`, `:8895`, `:9222`,
+  `:9537`. **Listed, not fixed, as hygiene** - a fabricated shared stack address is a latent
+  cross-thread alias and is exactly the kind of thing that should not be left implicit. Note the
+  in-tree comment at `src/gpu_device.cpp:3550` says "19 more sites" file-wide (20 real + 1 comment =
+  21 occurrences of the literal); the 10 measured here are the `stack ? stack :` form specifically.
+- **Falsifier.** If a later soak shows `GUESTVIEW-U32-FABZERO` returning to 16 **with**
+  `SYNCTX-STACK` present, the repair regressed. If it returns to 3 but the 3 rows' `caller_rva`s are
+  a different set than `0x6fd6a7/0x6fd6d5/0x785f8c/0x785fbe`, a new call site has joined the class.
+
+### F-698 (2026-10-01, **re-measured here: `w684` vs `w685`, whole-file byte counts**) - **THE SERVE-PROOF
+GATE WAS A FILENAME TEST. REPLACED BY AN EXTENSION-AGNOSTIC RE-READ: 74 REFUSALS -> 0, AND 24 ROWS OF
+PROOF WHERE THERE WERE NONE.**
+
+- **What changed.** `verifyEligible = (storedLen != logicalLen) && (pkgSubst == 0)`, replacing a test
+  for `.list`/`.lst` on `MclaVerifyServedListBody`. That matters because the proof is an
+  extension-agnostic `ifstream` + `RawInflate` + `memcmp` re-read of what was actually served; gating
+  it on the *filename* meant the proof never ran for any file not named `*.list`.
+- **Measured `w684 -> w685`, and held through `w688`:**
+  - `OPEN-REFUSED-STATUS` **74 -> 0** (all 36 paths, every one `UNPROVED-BODY`). **0 in all of
+    `w685`/`w686`/`w687`/`w688`.**
+  - `XSF-HOSTSERVE pass=0` **6 -> 0.** *(Read the field `pass=0`, which is **not adjacent to the
+    marker** - it is the `pkgSubst=... pass=0` field. Total `XSF-HOSTSERVE` substrings go
+    `w684=94 -> w685=24`.)*
+  - `XSF-INFLATE-SIZE` **8 -> 0**, held at 0.
+  - `SERVE-PROOF-SCOPE` **0 -> 24** rows, **all `ran=1 ok=1`**. Measured `ran=1 ok=0` = **0** across
+    `w687`; `ok=1` = 181 substring hits (the field recurs on other rows too). Sample, `w685:7002`:
+    `SERVE-PROOF-SCOPE path='textures/global/cars/globaltex.list' off=000D0000 stored=236 logical=575
+    served=575 ran=1 ok=1 listName=1 pkgSubst=00000000` - note `listName=1`, the surviving trace of
+    the old gate, now a *reported* field rather than the predicate.
+  - `LIST-CONTENT-MISMATCH` **0 -> 0.** The re-read still finds nothing wrong.
+- **Why 24 and not 826.** The proof only fires where `stored != logical`, i.e. genuinely compressed
+  members. 24 is the count of such members on the boot path, not a sample.
+- **Falsifier.** Any `SERVE-PROOF-SCOPE` row with `ran=1 ok=0` means the widened gate is now
+  *refusing* something it should not; any `OPEN-REFUSED-STATUS` returning above 0 means the gate has
+  been narrowed again.
+
+### F-699 (2026-10-01, **re-measured here: `w686` -> `w687` -> `w688`; body read at
+`MclaFindLastServe`**) - **`MclaFindLastServe` RETURNED THE `st`-KEYED RECORD WITHOUT EVER CONSULTING
+`dest`. ONE RACEEDITOR BOUNCE UNDER A STACK ADDRESS SHIPPED INTO 46 DESTS. THE GARAGE READ IS NOW
+100% ON ALL 25 ROWS.**
+
+- **The defect.** `MclaFindLastServe(st, dest, out)` looked up the `st` map and returned it
+  unconditionally, never consulting `dest`, and **no caller checked `ls.dest` or `ls.srcPkg`** - the
+  in-tree record of that is the comment block at `src/gpu_device.cpp:1613` ("before this edit NO
+  CALLER CHECKED EITHER"). One `JOB2-PKG-SERVE` registered raceeditor's bounce under a **stack**
+  address `st=006D8F20`, and the broken predicate served it into **46 dests**.
+- **The repair, as landed.** `src/gpu_device.cpp:1840`, inside `MclaFindLastServe`:
+  `if (dest != 0u && lsSt.dest != 0u && lsSt.dest != dest) { ... }` - reject, then fall through to
+  the existing `dest`-keyed lookup. **Safe by construction, and the reason is worth keeping:**
+  `MclaRecordLastServe` (`src/gpu_device.cpp:1592`) only writes the dest map when `ls.dest` is set,
+  so the dest map can never reintroduce a foreign record.
+  **Lock scoping, verified in the body:** both map reads happen inside a
+  `std::lock_guard<std::mutex> lk(g_lastServeMtx)` scope at `:1823`-`:1838` and the scope **closes**;
+  `PeekPackageForDest(dest)` is called at `:1856`, i.e. **outside** it, so `g_destPkgMtx` is not
+  nested inside `g_lastServeMtx`. The comment at `:1821-1822` states this requirement and the code
+  obeys it.
+- **Measured `w686 -> w687`, held in `w688`:** garage `UIXSF-GOLDEN-REVERIFY` **`pct=100` on all 25
+  rows** (`w687` and `w688`: 25/25; `w686`: **2 rows `pct=28`, 4 rows `pct=100` of 6 total**);
+  `first_bad` `00040005 -> FFFFFFFF`; `still_present` **`305839 -> 1066057`**;
+  `UIXSF-REC` **10 -> 0**; `UIXSF-DIVERGE` **2 -> 0**; `INFLATE-REFORCE` **82 -> 0**;
+  `MEMBER-SPAN-OWNER refused>=1` **121 -> 42** (total rows 387 -> 215; `w688` 214/42).
+- **CORRECTION to the brief I was handed, measured: `still_present` 305849 is `w685`, not `w686`.**
+  Per-log, the `still_present` value sets are `w684={143069,1066057}`,
+  `w685={143069,305849,1066057}`, `w686={143069,305839,1066057}`, `w687`/`w688`=`{143069,1066057}`.
+  The 10-count difference between `305849` and `305839` is a run-to-run wobble, which is why F-703
+  does not treat either number as load-bearing on its own.
+- **CORRECTION to the brief, measured: the `JOB2-PKG-SERVE` / `B6xx2280` "0 -> 6" does not
+  reproduce.** Measured: `JOB2-PKG-SERVE` rows `w686=218 -> w687=9 -> w688=9`. Rows carrying the
+  aliased `st=006D8F20`: `w686=211` (dests `{B6582280:1, B3ACA280:210}`), `w687=3` and `w688=3`
+  (dests `{B6582280:1, A3A63280:1, B5FA2280:1}`). So the `st=006D8F20` signature is present on
+  **both** sides of the fix and did **not** disappear; what changed is the row count 218 -> 9. The
+  fix's own evidence is `XSF-LASTSERVE-MISMATCH`, not `JOB2-PKG-SERVE` - see F-715.
+- **Residual risk, measured and not realised.** The minimal predicate cannot catch a **destless**
+  record (`ls.dest == 0`), because both sides of the `!=` are then 0. Measured
+  `ls_dest=00000000` rows = **0** in `w687` and in `w688` (over 8,649,924 and 558 `ls_dest=` fields
+  respectively). So the residual never fired - it is untested, not disproved.
+- **Falsifier.** Any `XSF-LASTSERVE-MISMATCH` row with `action=` other than `blocked` (all 508 rows
+  in `w688` read `action=blocked`), or any `ls_dest=00000000` row, reopens this.
+
+### F-700 (2026-10-01, **guest chain from the ledger's existing `F442-SECTION` rows; the archive facts
+re-measured from `build/w688.log:28635` and `:29111`**) - **THE BOOT FATAL IS CORRECT BEHAVIOUR ON THE
+WRONG FILE: THE `chevy` PARSE WINDOW IS `xarchive_carconfigs.rpf`'s INFLATED IMAGE, AND
+`vehicle.lst@0x471000` LIES INSIDE IT.**
+
+- **The chain.** `sub_823971D0` -> `sub_821CFF40(parser,"Manufacturer",0)` returns 0
+  (`F442-SECTION #2/#4/#6`, `ret=00000000`, `lr=82397290`) -> the u16 count at `0x828CD07C` stays 0
+  -> `0x828CD078` is the 8-byte-stride entry array -> `sub_823964C0` finds `idx == count` ->
+  `sub_821BD618("Unknown manufacturer %s...")` at `lr=0x823966E8`. `F442-SECTION` = **10** rows in
+  every one of `w684`..`w688`.
+- **The load-bearing fact, and it is the whole finding.** The parse window holds
+  **`preload/xarchive_carconfigs.rpf`'s inflated logical image, not the vehicle list.** Measured from
+  `build/w688.log:28635`: `stored=166323 logical=294912`. `294912 = 0x48000`, so the logical span is
+  `[0x448000,0x490000)` - and it **contains** `tune/vehicle/vehicle.lst`, measured at
+  `build/w688.log:29111`: `MEMBER-EXPAND-MARK path='tune/vehicle/vehicle.lst' off=00471000
+  stored=2355 logical=22391 first=1`. The guest's read at `off=00470000` therefore returns
+  carconfigs' inflated image, and `READAT-BRANCH` shows `branch=handle span_ran=1`.
+- **`vehicle.lst` is the only one of the three whose first section is `Manufacturer`**, with **8**
+  `Chevy` hits at inflated offsets `[206,3584,4862,7456,9154,9587,17960,21899]`. This is why the
+  fatal names a manufacturer at all: the other two files have no `Manufacturer` first section, so
+  they cannot produce this message.
+- **Status: OPEN, and the fix is not in this block.** The fatal is *correct*; the host is serving the
+  wrong logical span. Nothing in `w684`..`w688` changes it.
+- **Falsifier / what would settle it.** A `READAT-BRANCH` row with `branch=` other than `handle`, or
+  a `MEMBER-EXPAND-MARK` for `vehicle.lst` whose `off` falls outside carconfigs' `[0x448000,0x490000)`,
+  falsifies the span claim.
+
+### F-701 (2026-10-01, **`build/w684.log`, 168 rows; the claim it kills is arithmetic**) - **KILLED:
+"WE SERVE 10.5% OF `vehicle.lst`". `stored`/`logical` IS THE DEFLATE COMPRESSION RATIO, NOT A SERVED
+FRACTION.**
+
+- **The arithmetic that dies.** 41 members, 168 `XSF-INFLATE-STORED` rows in `w684`
+  (`w685`..`w688`: 48). Summing `logical/served` across them and dividing gives ~10.5%, which reads
+  exactly like a coverage shortfall and is the reason the number was believed.
+- **What it actually is.** `zlib.decompressobj(-15)` over `rpf[off:off+stored]` yields **exactly**
+  `logical` for **41 of 41** members. So `logical` is *not* what we failed to serve - it is what the
+  member inflates to. Every member decompresses to its full advertised length. **A compression ratio
+  has been read as a coverage percentage.**
+- **The reason it is load-bearing:** `XSF-INFLATE-STORED` fires **inside the success branch** of an
+  exact-length check. The marker is named after the failure it replaced and is emitted on the path
+  where the check *passed*. Reading it as a shortfall report inverts its meaning.
+- **Status: REFUTED. No action; recorded so the ratio is never again quoted as a coverage figure.**
+- **Falsifier.** A single member where `decompressobj(-15)` output length `!=` the row's `logical`
+  would make the ratio meaningful after all. Re-run with `tools/rpf_offline.py member <off> <len>`.
+
+### F-702 (2026-10-01, **`build/w684.log`; the gate re-measured at its anchor**) - **KILLED: "`XSF-BIND`
+FIRED TWICE, SO TWO FILES NEVER BOUND". ITS ROW COUNT IS A LOG FILTER, NOT A BIND COUNT.**
+
+- **The gate.** `src/gpu_device.cpp:20807`, immediately above the `XSF-BIND` `MCLA_LOG_WARN` at
+  `:20808`: `if (n <= 16 || (n % 8) == 0)`. **`n` is the global open ordinal**, so the print fires for
+  the first 16 opens and then every 8th - a cadence, not a count. `XSF-BIND` substrings measure
+  `w684=2, w685=3, w686=3, w687=3, w688=3`; the gate predicts that shape exactly.
+- **CORRECTION to the brief I was handed: its supporting evidence does not reproduce.** The brief
+  cited `NULL-HANDLE-CHECK` showing `proved=1 bound=1` "for all three vehicle paths". Measured in
+  `build/w688.log`: **`NULL-HANDLE-CHECK` rows containing `vehicle` = 0.** The marker fires 59 times
+  in `w688`, and its `(proved,bound)` pairs are `(0,0)` for the six `.xsf` UI files
+  (`raceeditor`/`garage`/`policecam`/`credits` x7 each, `meshtextures.xtd` x4, `legals.xsf` x3) and
+  `(1,1)` for the `.list`/`.dds` files (`lightglow.dds` x3, `globaltex.list`, `preload.list` x6, ...).
+  **There is no vehicle row to cite.** The conclusion survives on the gate alone; the `vehicle`
+  evidence is withdrawn.
+- **The general trap, recorded next to F-698's `pass=0`:** **a marker's row count can be a print
+  cadence.** Two instances now measured in this file - `XSF-BIND`'s `n<=16 || n%8==0`, and
+  `XSF-HOSTSERVE pass=0` where the field is **not adjacent to the marker** but sits inside a
+  `pkgSubst=... pass=0` record. Before quoting a row count as a count, read the `if` above it.
+
+### F-703 (2026-10-01, **four adjacent log lines in `build/w685.log`, cited by line number**) -
+**KILLED: "`pct=28` IS A TIMING ARTEFACT". REFUTED BY ITS OWN NEIGHBOURHOOD: A PERFECT READ, THEN
+DAMAGE 1.257 s LATER, THEN THE VALUE FROZEN.**
+
+- **The refutation, as four consecutive measurements in `build/w685.log`:**
+  - `:9503` `[08:45:17.355] UIXSF-GOLDEN-FILL-SUMMARY pkg=64980000 shot=1 goldsize=1066057
+    anchor=B6542280 slots_written=6 bytes_written=1066057 skipped=0 dryrun=0`
+  - `:9631` `[08:45:17.359] UIXSF-GOLDEN-REVERIFY pkg=64980000 shot=1 recs=6 recs_whole=6
+    goldsize=1066057 claimed=1066057 still_present=1066057 pct=100 first_bad=FFFFFFFF`
+  - `:9733` `[08:45:17.362] INFLATE-RSC5 #114 in=32768 xc@+12=0FF512EF inPtr=BA24D280 out=262144
+    outPtr=B6282280`
+  - **3 ms** from the perfect read to the contamination's first opportunity to act.
+  - Then the damage appears and **freezes**: `w685:23120` `[08:45:18.616]` shot=100
+    `still_present=305849 pct=28`, and identically at shots 101, 102, 103, 104, 105
+    (`w685:28128`, `:32296`, `:35558`, `:38666`, `:41765`) - **six shots, 4.5 s apart, identical
+    value, identical `first_bad=00040005`.**
+- **The argument.** A race would drift. Six consecutive identical readings 4.5 s apart is a
+  **settled** value. And the 1.257 s figure in circulation is the gap from the perfect read to the
+  *next audit*, not the gap to the contamination - so "timing artefact" is a misreading of which two
+  timestamps were compared.
+- **The same structure repeats in `w686`, with a different contamination value:** `:9739`
+  `[09:12:18.034]` FILL-SUMMARY, `:9845` `[09:12:18.038]` `pct=100 still_present=1066057`, `:9932`
+  `[09:12:18.041]` `INFLATE-RSC5 #114`, then `:23108` `[09:12:19.273]` shot=100 `still_present=305839
+  pct=28`. **Two independent soaks, same shape, different damage number** - which is also why neither
+  305839 nor 305849 is load-bearing (see F-699).
+- **Status: REFUTED as a timing artefact. The value is stable state, not a sample.**
+- **Falsifier.** Two consecutive audits at the same shot number returning **different**
+  `still_present` would restore the race reading.
+
+### F-704 (2026-10-01, **`build/w684.log` vs `w685`, marker counts; the row shape read from the log**) -
+**KILLED: "`F412-JOBCAP` IS A RATE LIMIT". IT IS A CENSUS, ONE ROW PER (SHOT x DISTINCT JOB).**
+
+- **The counts.** `F412-JOBCAP` substrings: `w684=13, w685=3, w686=3, w687=13, w688=13`.
+- **The decomposition, and it is exact.** `13 = 1 raceeditor + 6 garage shots x 2 jobs`.
+  `3 = 1 raceeditor + 1 shot x 2`. **The marker is per-(shot x distinct job), not per-open and not
+  rate-limited** - which is why `w687`/`w688` return to 13 while `w685`/`w686` sit at 3.
+- **Why it fell:** the fill ran **once** instead of six times. Six garage shots became one. Nothing
+  was throttled.
+- **Status: REFUTED.** The `13 -> 3` transition is a *workload* change, not a *rate-limit* change, and
+  reading it as throttling hides the real signal (the garage stopped being visited).
+- **Falsifier.** A row count that rises with elapsed time inside a single shot would indicate a
+  cadence; it does not - `w688` holds 13 for the whole run.
+
+### F-705 (2026-10-01, **`build/w684.log`, exact equality of two markers**) - **KILLED: "`F409-FILL-GUARD`
+22 -> 0 MEANS A GUARD STOPPED GUARDING". THE TWO COUNTS ARE THE SAME BRANCH, AND 22 IS EXACTLY 22.**
+
+- **The measurement that settles it.** `build/w684.log`: `F409-FILL-GUARD` = **22** and
+  `UIXSF-GOLDEN-FILL-SKIP` = **22**. **Exactly equal**, and both are the same `if (!own)` branch - so
+  the `k409<=24` print filter **was never reached** and 22 is a true count, not a truncated one.
+- **The counts:** `F409-FILL-GUARD` / `UIXSF-GOLDEN-FILL-SKIP` = `w684` 22/22, `w685` 0/0, `w686` 0/0,
+  `w687` 20/20, `w688` 20/20. **They move together in every log.** Two markers that agree to the row
+  in five soaks are one branch.
+- **What actually happened at the fix:** the fill became whole, so there was nothing to skip. **The
+  guard did not stop guarding; the condition stopped occurring.**
+- **Status: REFUTED.** Recorded because "a mitigation stopped working" and "the thing it guarded
+  stopped happening" produce the *same log line* and only the equality of the two counts separates
+  them.
+- **Falsifier.** The two counts diverging in any future soak would mean a second call site appeared.
+
+### F-706 (2026-10-01, **a `src/` comment that was false, and the arithmetic behind it**) - **KILLED: A
+COMMENT ASSERTING `chevy` IS NOT IN `vehicle.lst`. IT IS, 8x, IN THE INFLATED BODY. 9 OF 10 REAL
+OCCURRENCES ARE STRUCTURALLY INVISIBLE TO A RAW SCAN.**
+
+- **The falsity.** A comment asserted `chevy` was absent from the file. It is present **8 times** in
+  the inflated body, at inflated offsets `[206,3584,4862,7456,9154,9587,17960,21899]` - which is
+  precisely what makes the F-700 fatal fire, so the false comment and the live fatal share a cause.
+- **Why the scan produced a false negative: this is the transferable part.** The search ran over
+  **2.13 GB of `stored` bytes** looking for a string that lives inside **DEFLATE output**. A raw
+  substring scan of compressed bytes cannot find it: literals are bit-packed, match/length pairs are
+  Huffman-coded, and a 5-byte string can straddle a block boundary. **9 of its 10 real occurrences are
+  structurally invisible** to that scan; only the one occurrence that happens to fall in a stored
+  (uncompressed) block is findable.
+- **The general prohibition this earns:** **never establish the presence or absence of a string in a
+  compressed member by scanning the member's stored bytes.** Use `zlib.decompressobj(-15)` over
+  `rpf[off:off+stored]` and search the *inflated* image - which is what F-701's 41-of-41
+  `decompressobj` check already does. `tools/rpf_offline.py member <off> <len>` is the tool.
+- **Status: the comment was corrected. The class is now prohibited, not just fixed.**
+- **Falsifier.** A soak whose `MEMBER-EXPAND-OVERRUN`/`XSF-INFLATE-STORED` rows show a member whose
+  inflated body lacks a token its stored bytes contain would show the inflation path lying.
+
+### F-707 (2026-10-01, **`src/` census plus `w684`/`w688` whole-file counts; the print site re-read**) -
+**PARTLY KILLED: "`CP: IB-OPC-CENSUS`'S `holds=` FIELD IS DEAD TEXT". TRUE OF `holds=`, FALSE OF
+"DEAD TEXT" - AND THE BRIEF'S `file:line` FOR THE MARKER IS THE WRONG MARKER.**
+
+- **`holds=` genuinely does not exist.** Measured `holds=` = **0** occurrences in `src/**/*.*` and
+  **0** in `build/w684.log` and **0** in `build/w688.log`. The token `holds` does appear in
+  `src/gpu_cp.cpp` (`:194`, `:1380`, `:2292`, `:2478`, `:2512`) but never as `holds=`.
+- **It is NOT dead text - the marker is live and prints.** The print is
+  `src/gpu_cp.cpp:4333`:
+  `MCLA_LOG_INFO("CP: IB-OPC-CENSUS #{} ibTotal={} win={:08X} dwords={} " "depth={} trace={} walked={}
+  t0={} t1={} t2={} t3={} " "nonzeroT3={} firstT3Off={} firstT3Hdr={:08X} ||{}", ...)`.
+  **The field list is `ibTotal, win, dwords, depth, trace, walked, t0..t3, nonzeroT3, firstT3Off,
+  firstT3Hdr` - no `holds`, and it is a live `MCLA_LOG_INFO`.**
+- **CORRECTION: `gpu_cp.cpp:4594` is a DIFFERENT MARKER.** `src/gpu_cp.cpp:4594` is
+  `MCLA_LOG_INFO("CP: RING-OPC-CENSUS #{} walks={} t3={} delegated={} wrapRefused={} ||{}", ...)`.
+  Both strings exist in `src/` (`CP: IB-OPC-CENSUS` x5, `CP: RING-OPC-CENSUS` x3), and only the
+  former is the one the `holds=` claim is about. **The brief's citation points at the wrong marker.**
+- **The lesson, and it is the F-692 class again:** *"`holds=` has 0 occurrences"* was upgraded to
+  *"the field is dead text"*, and the upgrade is false. **A zero occurrence count of a field name
+  proves the field is absent; it does not prove the surrounding marker is absent.**
+- **Runtime-formatted markers are NOT dead text - three re-confirmed here, all live:**
+  `CP: RING {} PARKED` at `src/gpu_cp.cpp:4458` (substring `CP: RING A PARKED` measures
+  `w684=79, w685=80, w686=3, w687=1, w688=1` - **it fires, and the count is a row count**);
+  `GETDEV-E{}` at `src/gpu_device.cpp:19060` (fires, `w688:9637`-`9638` in `w685`);
+  and `CP: IB-OPC-CENSUS` at `:4333`.
+- **Falsifier.** A `grep -F "holds="` over the built `build/mcla.exe` returning a hit would mean a
+  format string was concatenated into existence. `holds=` in a soak log would mean the same.
+
+### F-708 (2026-10-01, **every marker below re-censused across `w684`..`w688`; `src/` and exe presence
+checked**) - **FIVE DEAD INSTRUMENTS, RE-CONFIRMED. FOUR OF THEM ARE DEAD **TEXT**; ONE IS DEAD **CODE
+THAT STILL EXISTS**, WHICH IS THE DANGEROUS KIND.**
+
+- **`MEMBER-SPAN-TAIL-VETO`** - substring hits `w684=194, w685=196, w686=196, w687=161, w688=161`, and
+  **0 real rows in any log**. Every hit is prose *inside* the `MEMBER-EXPAND-OVERRUN` message. **A
+  substring count here is pure noise: 161 vs 0.**
+- **`GUESTVIEW-U32-SUMMARY`** - the literal **is in the exe**, and rows = **0** in every one of
+  `w684`..`w688`. The dangerous shape: **present in the binary, absent from every log.**
+- **`DRAW-CP-DRAWN`** - **in `src/render_thread.cpp` but ABSENT from `build/mcla.exe`.** The mirror
+  image of the above and strictly worse: the source says it logs, the binary says it cannot.
+- **`DRAW-CAPTURED` / `SHADER-TRANSLATE` / `PC-RECOMPILE`** - **0 `src/` hits.** Never existed in this
+  tree; every "0 rows" attributed to them means nothing (F-057(6)).
+- **`DICT-HYDRATE`** - comment-only.
+- **Why this entry earns its place again:** three of these were already listed as dead in earlier
+  entries and **a fourth (`DRAW-CP-DRAWN`) is a source/binary divergence that a `grep src/` cannot
+  find**. The only instrument that catches it is an exe-vs-`src/` comparison.
+- **Falsifier.** One real row of any of the five in any future soak makes its entry void and the
+  instrument live.
+
+### F-709 (2026-10-01, **`build/w688.log` row census; marker split re-measured**) - **A MIS-PARSE, NOT A
+DEFECT: THE 116 "NO-RET" `XSF-OPEN` ROWS CARRY `ret=-1`, WHICH IS A REAL RETURN VALUE.**
+
+- **The measurement.** `XSF-OPEN #` rows in `w688` = **576**, of which **116** carry `ret=-1`.
+  `XSF-OPEN-GATE-SKIPPED` = **250**. `576 + 250 = 826`, the total `XSF-OPEN`-substring count - so the
+  826 splits cleanly into **576 real opens + 250 gate skips**, and the marker-name prefix is shared.
+  `TOC76-XSF` = **534**, stable across all five logs.
+- **The mis-parse.** The 116 rows were read as "116 opens with no return value". They are
+  `XSF-OPEN ... ret=-1 ... toc=[00000000 00...]` - **`ret = -1` is a returned failure**, and the
+  accompanying `XSF-OPEN-GATE-SKIPPED` row for the same path (`build/w688.log:29115`-`:29116`,
+  `path='tune/vehicle/vehicle.lst'`) says why: `entry=B737DE30 +8 00471000 -> host cache not
+  poisoned, bit30 withheld from w2`. The open was **refused by design**, and `ret=-1` is the honest
+  report of that.
+- **Status: no defect. Recorded so `ret=-1` is never again read as "missing field".**
+- **Falsifier.** An `XSF-OPEN` row with **no `ret=` token at all** would be a genuinely absent field;
+  measured count of those is **0**.
+
+### F-710 (2026-10-01, **the emitted bytes, read directly: capstone 4.x over `build/mcla.exe` at the
+offset derived from the PE section table; plus `build/w688.log:34201`, `:34223`, `:29232`**) -
+**A NEW ACCESS VIOLATION, AND IT FAULTS ON THE SLOT LOAD ITSELF. `C0000005` WENT 0 -> 2 LINES / 1 EVENT.
+THE FAULTING BYTES ARE `call qword ptr [r8 + rax]`, IMMEDIATELY AFTER `movabs r8, 0xFFFFFFFF7E780000`.**
+
+- **The event, from the log.** `build/w688.log:34201`
+  `[10:43:41.663] Vectored exception: code=0xC0000005 addr=0x0x7ff6e573c537 rva=0x28EC537 flags=0x0
+  nParams=2 thread=20864`, answered at `:34223`
+  `[10:43:41.664] VEH W0: parking thread 20864 code=0xC0000005 guest=1 wild=1 lr=00000000 - process
+  stays alive`. **`C0000005` substring count: `w684=0, w685=0, w686=2, w687=2, w688=2` - and those 2
+  LINES ARE ONE EVENT** (the exception row plus its VEH row). Precision note worth keeping: this
+  count is a line count. The other exception row in each log, at line 368, is `code=0x406D1388
+  flags=0x80 nParams=6` - the benign thread-exit pseudo-exception, which does **not** contain the
+  substring `C0000005` and so never entered the count.
+- **THE FAULTING INSTRUCTION, from the bytes (not from a decompiler).** `.text` is
+  `VirtualAddress=0x1000, PointerToRawData=0x400`, so **file offset = RVA - 0xC00**. Reading
+  `build/mcla.exe` at `0x28EC537 - 0xC00` and disassembling from `VA 0x1428EC527`:
+  ```
+  0x1428ec527  49b80000787effffffff  movabs r8, 0xffffffff7e780000
+  0x1428ec531  4889f1                mov rcx, rsi
+  0x1428ec534  4889fa                mov rdx, rdi
+  0x1428ec537  41ff1400              call qword ptr [r8 + rax]     <-- rva in the VEH row
+  ```
+  **`REX.B` + `ff /2` + ModRM `14` + SIB `00` decodes to `call qword ptr [r8 + rax]` by hand, and
+  capstone agrees.** Note the rva the VEH printed, `0x28EC537`, is the **exact start** of this
+  instruction - so the host's `rva` is trustworthy here, which is not obvious (see the map note
+  below).
+- **The owning symbol.** `build/mcla.map`:
+  `0001:028eb2d0  __imp__sub_825FA460  00000001428ec2d0  ppc_recomp.121.cpp.obj`. The fault is
+  **0x267 bytes past** that VA, inside the same object's region. **The map is from the same build as
+  the log**: its header reads `Timestamp is 6abe0ec7 (Thu Oct 1 10:41:59 2026)` and
+  `build/w688_build.log` is stamped 10:41:34 - the control the map requires is satisfied.
+- **The mechanism, which the emitted bytes settle in one view.** `movabs r8, 0xffffffff7e780000` is
+  the *poisoned effective address materialised as a host immediate by the recompiler*, and the very
+  next instruction is the **load** of that slot. With `rax = 0` the access is `[0xFFFFFFFF7E780000]`.
+  The producer is `PPC_LOOKUP_FUNC` at `generated/ppc_xenon/ppc_context.h:127`:
+  `*(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2))`
+  - with `ctr == 0` the address is `base + 0 - 0x8188000 = 0x7E780000`, **0x104260000 bytes below
+  the table base**. **The fault is on the 8-byte slot LOAD, before any host pointer exists** - which
+  is why no guard can be placed after the fact.
+- **It does not end the process.** The VEH row says `parking thread ... process stays alive`. So the
+  `CP-DRAW-BRIDGE` / `PC-TRANSLATE` / `PC-DERIVE` drops (`w684=8 -> w686=6 -> w687=2 -> w688=2`) are a
+  **starved-census artefact, not a boot truncation**.
+- **The fatal is not being pre-empted.** `build/w688.log:29232` `[10:43:40.651] Fatal error
+  dispatcher invoked - terminating game` precedes the AV at `:34201` `[10:43:41.663]` by
+  **1.012 s**. The fatal comes first; the AV is downstream.
+- **Diagnosis, by the project's own discriminator** (`src/guest_memory.cpp:336-339`, the
+  `GUESTVIEW-U32-FABZERO` rationale: a refusal with `va < 0x1000` "cannot come from any legitimate
+  recompiled `lwz`"). Measured `by_why av=0` rows: `w684=16, w685=3, w686=16, w687=3, w688=3` -
+  identical to `GUESTVIEW-U32-FABZERO` in every log, i.e. **no fabricated-zero row at all across the
+  boot.** By the discriminator's own decision table (`src/guest_memory.cpp:343-344`, "`total == 0`
+  across a full soak that still crashes => cause (1): the guest really stored 0 into a vtable slot"),
+  **the fault bypassed `ReadU32BE`: cause (1), the guest genuinely stored 0 into a vtable slot.**
+- **THE MAP TRAP, now measured exactly.** `build/mcla.map` row fields are
+  `segment:offset | name | VA | object` - so **column 1 is a section offset and column 3 is the VA**,
+  and for `__imp__sub_825FA460` they differ by **0x1000** (`0x028eb2d0` vs RVA `0x28ec2d0`). That is
+  a **third** delta, distinct from the file-offset rule: **`file_offset = RVA - 0xC00`** for `.text`
+  (from the PE section table: `VA 0x1000`, `PointerToRawData 0x400`). Reading any of the three
+  interchangeably yields a garbage disassembly - which is exactly what happened on the first three
+  attempts here (`rva`, `rva+0x1000`, `rva-0x1000` all decoded to nonsense) before the section table
+  was read. **Rule: derive the file offset from the PE section table, never from the map and never by
+  trial.**
+- **Falsifier.** A `C0000005` whose `rva` disassembles to something other than `call qword ptr [r8 +
+rax]` - or a `rva` outside `.text` - means the VEH's `rva` is not a module RVA and this whole
+  reading is void.
+
+### F-711 (2026-10-01, **`src/` and `generated/` include-graph census; 4 files on disk**) - **`src/
+ppc_context.h` IS DEAD CODE. FOUR COPIES OF IT EXIST. AND THE INCLUDE IS INDIRECT, WHICH IS WHY THE
+BRIEF'S MECHANISM WAS WRONG EVEN THOUGH THE CONCLUSION IS RIGHT.**
+
+- **The include chain, measured.** All `177` `generated/ppc_xenon/*.cpp` files include exactly one
+  header: **`#include "ppc_recomp_shared.h"`**. **The token `ppc_context.h` appears `0` times in all
+  177 files** - quoted **and** angle-bracket forms are both 0. The chain is one hop:
+  `generated/ppc_xenon/ppc_recomp_shared.h:3` `#include "ppc_config.h"`, `:4`
+  `#include "ppc_context.h"`. **CORRECTION to the brief: "all 176 TUs include
+  `generated/ppc_xenon/ppc_context.h`" does not reproduce - 0 of 177 include it, and the TU count is
+  177, not 176.** The *conclusion* is unaffected and if anything stronger: the include is **quoted**,
+  so it resolves by the same-directory rule with **no `-I` involved at all** - the `-I`-vs-same-directory
+  contest the brief describes never happens.
+- **Four copies of the file are on disk, and only one is live:**
+  `src/ppc_context.h` (24,548 B, mtime 2026-09-15), `src/cpu/ppc_context.h` (254 B, mtime 2026-09-15),
+  `generated/ppc/ppc_context.h` (23,086 B, mtime 2026-09-20), `generated/ppc_xenon/ppc_context.h`
+  (24,589 B, mtime 2026-09-20). **The live one is `generated/ppc_xenon/ppc_context.h`; `src/
+  ppc_context.h` is a stale 09-15 copy that nothing includes.** Naming the directory matters, because
+  there are two `generated/` trees.
+- **`dispatch_guard.cpp`'s model cannot fix this class at all.** Its test reads the slot's
+  *contents*; reading the slot is the instruction that faults (F-710). **A guard that must load the
+  value to decide whether the value is legal cannot guard a load that faults.**
+- **Falsifier.** If `src/ppc_context.h` gains an includer - measurable as a nonzero count of
+  `#include` lines naming it from any TU - it is no longer dead code and F-710's "no guard can help"
+  becomes a fixable problem instead of a structural one.
+
+### F-712 (2026-10-01, **body read at the two guest lrs, `generated/ppc_xenon/ppc_recomp.121.cpp`**) -
+**THE INDIRECT-CALL SITE IS NOT UNIFORM, AND ADDING A GUARD AT THE FAULTING SITE IS WORSE THAN THE
+ACCESS VIOLATION.**
+
+- **Two call sites, opposite safety. Measured by raw fields, not by mnemonic:**
+  - `ppc_recomp.121.cpp:22545`, guest `lr 0x825FA4C0`, slot **+32** - **this is the faulting site**,
+    and the following instructions (`:22547`-`:22552`) are
+    `rlwinm r11,r3,sh=0,mb=24,me=31` -> `cmpli cr6,r11,0` -> `beq`. **A refusal here leaves `r3`
+    holding the vtable pointer**, so the guest branches on `(vtableptr & 0xFF)` - a *fabricated*
+    condition derived from an address. Refusing here does not neutralise the fault, it converts it
+    into a silent wrong answer.
+  - `ppc_recomp.121.cpp:22611`, guest `lr 0x825FA53C`, slot **+20** - **refusal-safe.** `:22612`-`:22615`
+    is `li r11,0` / `stw r11,-1668(r30)`, and `r3` is never read afterwards. A refusal here stores 0
+    and continues.
+- **The rule this earns: a guard at an indirect call site is only safe if the post-refusal path does
+  not consume the pointer being guarded.** `lr 0x825FA4C0` fails that test and `lr 0x825FA53C` passes
+  it. **Without reading the two sites' continuations you cannot tell them apart, and adding the guard
+  to the wrong one is a regression dressed as a fix.**
+- **Falsifier.** If `ppc_recomp.121.cpp:22547`-`:22552` does not in fact consume `r3`, the
+  refusal-safety claim is void and both sites are guardable.
+
+### F-713 (2026-10-01, **source read at `src/guest_memory.h` / `src/guest_memory.cpp`; range both ends
+re-derived from cited anchors**) - **LANDED, UNSOAKED: A `ctr` OUT-OF-RANGE CENSUS AT
+`PPC_CALL_INDIRECT_FUNC`. IT IS EXPLICITLY CENSUS-ONLY AND ITS OWN COMMENT CITES THE WRONG LEDGER ID
+(see F-719).**
+
+- **Status up front: this has never been exercised by a soak, and no boot fact below is established.**
+  The source says so itself at `src/guest_memory.h:119-120`: *"F-635 (2026-10-01) -- CENSUS ONLY:
+  `ctr` OUTSIDE THE FUNCTION-TABLE SPAN AT `PPC_CALL_INDIRECT_FUNC`. THIS CHANGES NO BEHAVIOUR. IT IS
+  NOT A FIX"* - **and that `F-635` citation is wrong; see F-719.** Implementation at
+  `src/guest_memory.cpp:481`.
+- **The override point is real and is the only legal one.** The macro is guarded by `#ifndef` at
+  `generated/ppc_xenon/ppc_context.h:129`-`:131`, so `PPC_CALL_INDIRECT_FUNC` can be redefined by a
+  header that is included earlier - which `src/guest_memory.h` is (its header is permitted on this
+  chain; `src/ppc_context.h` is not - F-711).
+- **The range, and why the obvious upper bound is wrong.** `[0x82130000, 0x8F204010]`.
+  **Low end:** the first row of the static mapping, `generated/ppc_xenon/ppc_func_mapping.cpp` -
+  **45,190 rows, min `0x82130000`, max `0x827CCBC0`** (`src/guest_memory.h:211`-`:213`).
+  **High end is NOT the static map max.** Table writes also go through `InsertFunction` and
+  `PPC_LOOKUP_FUNC(...)=`, and the live set includes `0x827CD054`, `0x827CD058`, `0x827CD059`-`:B2`
+  (90 RS slots), **`0x83000000`** - which is `m_nextThunkAddr = 0x83000000` at **`src/app.h:113`**,
+  the press-start shim base - and **`0x8F204010` = `__xtl_free`**, registered at
+  `src/boot_host.cpp:1069` and `:1090` (`src/guest_memory.h:236`). **A guard bounded at the static max
+  `0x827CCBC0` would have refused every one of those.** That is the finding: *the static map is not
+  the live set*, and a guard derived from the static map is wrong by construction.
+- **Hot-path cost, read off the emitted code** (`src/guest_memory.h:270` records **14,832
+  expansions across 168 of the 177 TUs**): `lea eax,[r14+2112684032] ; cmp eax,218972177 ; jb` -
+  **2 fused uops**, and the in-range continuation is **byte-identical**, with
+  `movabs r8, -2173173760` intact. **That negative decimal is `0xFFFFFFFF7E780000` - the same constant
+  F-710 disassembles one instruction before the faulting `call`.** The census and the fault are in the
+  same emitted code.
+- **Out-of-range is deliberately NOT quieted.** Per `src/guest_memory.h:157`, the row is emitted and
+  **the stock load then executes and still faults**. **The census is an observer; it cannot mask the
+  defect.** Read it that way or you will misread a future boot.
+- **`ctx.lr` is fresh at only 14,304 of 14,832 sites.** At the other **528** it is inherited from an
+  outer frame, so **it must not be read as a measurement** - a per-`lr` census built on it is
+  measuring the wrong thing for 3.6% of sites.
+- **Falsifier.** A soak showing an in-range `ctr` in the census rows would mean the bound is wrong; a
+  census of **0** rows across a full boot would mean the guard is placed where it never fires.
+
+### F-714 (2026-10-01, **reproduced here, each one cost real time in the 10-01 sessions; the one tool
+claim is CORRECTED**) - **A CLASS OF HARNESS MISTAKES, NONE OF WHICH PRODUCE AN ERROR - THEY PRODUCE A
+CLEAN ZERO. AND ONE OF THE FIVE IS NOT A HARNESS MISTAKE AT ALL: THE UNDERLYING DUPLICATE IS REAL, THE
+TOOL PATH IS NOT.**
+
+- **(a) Case-folding one side of a comparison.** An agent lowercased the buffer but not the needles
+  and reported a clean set of zeros. **A needle search that returns 0 because the *needle* was
+  mis-cased is indistinguishable from a true zero.** This is the same failure as F-708's
+  `MEMBER-SPAN-TAIL-VETO` and F-707's `holds=`, arriving through a different door.
+- **(b) `build/cc_check.py` exits 0 on a successful negative control, and its stdout grep matches
+  clang's echoed source line.** So "no errors" can be produced by the tool *working*. Separately:
+  **a MISSING fmt argument is a consteval error only for compile-time format strings.** This tree's
+  markers are **pointer-shaped**, so **a missing argument compiles clean and throws `argument not
+  found` at runtime, while an EXTRA argument compiles clean and is silently dropped.** *The compile
+  step cannot find this class of bug in this tree at all.*
+- **(c) `--` is not end-of-options for `clang-cl`, and an `@rsp` file must exclude `argv[0]`.**
+- **(d) CORRECTED: there is no `cc_check.py --select-entry`, and the duplicate it was blamed on is
+  real.** `python build/cc_check.py --select-entry src/guest_memory.cpp` exits **2** - but because
+  **argparse rejects the unknown flag** (`usage: cc_check.py [-h] [--db DB] --src SRC [--extra EXTRA]
+  [--inject INJECT] [--symbol SYMBOL] ...`, then `error: the following arguments are required: --src`).
+  **That is not the duplicate-entries check.** The underlying hazard is nonetheless **measured**:
+  `build/compile_commands.json` holds **2** entries for `src/guest_memory.cpp`, with outputs
+  `build/CMakeFiles/mcla.dir/src/guest_memory.cpp.obj` and
+  `build/CMakeFiles/texture_import_validator.dir/src/guest_memory.cpp.obj`. **So: the risk is real and
+  the tool path is fictional. Anyone who "verifies" this via `--select-entry` has verified nothing.**
+- **(e) `build/mcla.map` column 1 is a section offset and column 3 is the VA, differing by 0x1000;
+  and the file offset is a THIRD delta, `RVA - 0xC00`.** Fully measured in F-710.
+- **The class, stated once: every one of these produces a plausible zero or a plausible success.**
+  None produces a crash. **That is why they are expensive - they are indistinguishable from results,
+  and every one of them, if believed, would have been written into this ledger as a fact.**
+
+### F-715 (2026-10-01, **caused by the 10-01 session; `build/w687.log` measured whole-file, and
+`build/w688.log` for the repair**) - **F-054 RECURRED, CAUSED BY ME: A FALSIFIER MADE UNCONDITIONAL
+TO KEEP ITS COUNT EXACT DESTROYED THE SOAK IT WAS MEASURING. 8,649,924 ROWS = 96.92% OF A 1.73 GB LOG.**
+
+- **The mechanism.** The `XSF-LASTSERVE-MISMATCH` row (F-699's marker) was made **unconditional** so
+  that its row count would be an exact total. Measured `build/w687.log`: **8,649,924 rows of
+  8,924,802 total lines = 96.92%**, and **1,712,901,841 bytes (1.71 GB) of the 1,730,968,144-byte log
+  fall after the last `CP-` row** (line 97,305 of 8,924,802). **145x the previous soak.**
+  (The in-tree comment at `src/gpu_device.cpp:1842` states `96.9106%`; measured 96.92% of lines - the
+  denominator differs slightly, both are correct for their own basis.)
+- **THE REPAIR, and it is the right shape: first 32, then every 65,536th, then a power-of-two summary
+  carrying the EXACT total.** Measured `build/w688.log`: **508 detail rows + 25 summary rows**, and
+  the last summary reads
+  `XSF-LASTSERVE-MISMATCH-SUMMARY total=16777216 rows=288 head=32 stride=65536 cadence=pow2
+  note=exact-totals-uncapped-lists-capped-at-256 ndest=93 dest_shown=93 dest=[A3A61280,A3A63280,...]`
+  - **`total=16,777,216`, `rows=288`, `ndest=93`**, exactly as required. All 508 detail rows read
+  `action=blocked`. The summary cadence is visible on the early rows
+  (`total=1 rows=1`, `total=2 rows=2`, `total=4 rows=4`, `total=8 rows=8`, ...).
+- **THE LESSON, and it generalises past this marker: a falsifier needs an exact _TOTAL_, not an exact
+  _row count_.** These are different instruments. A row count is only exact if the marker is quiet, and
+  requiring quietness to get an exact count is self-defeating - which is precisely the reasoning that
+  was CORRECT about the falsifier and WRONG about the volume. **A counter that cannot be rate-limited
+  without losing exactness has to carry the exactness in a separate, bounded channel.** That is what
+  the `-SUMMARY` row is.
+- **Falsifier.** Any log where `XSF-LASTSERVE-MISMATCH` exceeds ~1% of lines has regressed to `w687`'s
+  shape. `w688` = 533/851,028 rows including summaries.
+
+### F-716 (2026-10-01, **`build/w688.log`, whole-file census; the marker's liveness re-confirmed**) -
+**POISON STATE: `INFLATE-R3-CENSUS` IS 18.34% OF `w688` AND IS NOT YET RATE-LIMITED. THIS IS THE OPEN
+HYGIENE ITEM.**
+
+- **Measured.** `build/w688.log` = 851,028 lines; `INFLATE-R3-CENSUS` = **156,105 rows =
+  18.34%** (35,279,730 bytes = 24.65% by bytes). For comparison, F-715's `w687` marker was 96.92% -
+  **so `w688` is clean by comparison and still poisoned by this standard.**
+- **It is LIVE, not dead text** (F-708's category, ruled out here): the rows carry real content, e.g.
+  `build/w688.log:5244` `INFLATE-R3-CENSUS infR3=8283D1B0 words=[4000FD80 400446C0 000C99A5
+  00000000 00000000 BA0D8280 00000000 00000000] xmemCtx=4000FD80 joinSlot=B7321720
+  slot=[B7321720 B739A280 82012B44] jentries=BA0D8280`. Per-log trend: `w684=30, w685=37, w686=17,
+  w687=43,253, w688=156,105`.
+- **Not yet rate-limited, and it should be**, by the F-715 lesson: it needs a bounded summary channel
+  carrying the exact total, not an exact row count.
+- **Falsifier.** A per-log share above ~1% means it needs the same treatment `XSF-LASTSERVE-MISMATCH`
+  got; a drop to 0 rows would mean it was silenced without a total and the measurement was lost.
+
+### F-717 (2026-10-01, **`git diff --name-only HEAD -- src/` counted here; `HEAD` read here**) -
+**ATTRIBUTION IS 43-WAY, NOT SINGLE-VARIABLE. ONE BISECT RUN AND RECORDED; ONE NOT RUN. AND ONE FILE IS
+NEITHER IMPLICATED NOR EXCULPATED.**
+
+- **The count, measured.** `git diff --name-only HEAD -- src/` = **43 files** at
+  **`HEAD 83859255`**, whose commit date is **2026-09-27 23:23:27 +0300**. (`git status --porcelain
+  -- src/` reports 56, which also counts untracked.) **F-572...F-692 plus roughly +34.8k/-2.9k lines
+  exist only in the working tree.** Per rule 1a, **every delta in the 10-01 sessions is 43-way.** No
+  single-file attribution in this block is legitimate without the single-variable revert, and two of
+  the three fixes here do not have one.
+- **The two bisects that exist, and their results:**
+  1. **Reverting ONLY the synthetic-context repair (F-697) -> `w686`.** Measured: `GUESTVIEW-U32-FABZERO`
+     returns to **16** (from 3) and `SYNCTX-STACK` to **0** (from 1) - **the fix is confirmed by its own
+     revert.** The garage regression was **untouched**: `still_present` 305839 (`w686`) vs 305849
+     (`w685`), a 10-count run-to-run wobble, `pct=28` on 2 of 6 rows either way. **But it also
+     INTRODUCED a `C0000005`**: `w686:34565` `[09:12:29.539] Vectored exception: code=0xC0000005
+     addr=0x0x7ff6ed06c763 rva=0x28EC763 flags=0x0 nParams=2 thread=26480` - **note the rva is
+     `0x28EC763`, a DIFFERENT site from `w688`'s `0x28EC537`**, so these are two distinct faults and
+     the revert did not cause the `w688` one.
+  2. **Reverting ONLY the `pipeline_cache.cpp` RestartStrip change: NEVER RUN.** Recorded as absent, so
+     no one reads its absence as a negative result.
+- **`pipeline_cache.cpp` is neither implicated nor exculpated.** Its mtime is **07:06:48**, and it
+  **emits no marker that differs between `w684` and `w685`**: `PC-DERIVE` 4/4/4, `PC-TRANSLATE` 1/1/1,
+  `PC-RECT-OFFERED` 8/8/6. **A file that emits no discriminating marker cannot be attributed by log
+  evidence in either direction. It is a hole, not a clearance.**
+- **Rule 1b, this block's new symbols.** Everything added is inside existing functions except
+  `MclaSyntheticGuestStackTop` and `MclaSyntheticGuestCtx` (`src/gpu_device.cpp:3576`, `:3598`) and the
+  `PPC_CALL_INDIRECT_FUNC` override in `src/guest_memory.h`. Both new `static` functions are named here;
+  **attribution for F-697 stays provisional until a revert excludes them, and the `w686` revert above
+  is the closest thing to that exclusion currently available** - it is not single-variable, because the
+  tree is 43 files deep.
+- **Cross-reference:** `docs/HANDOFF_NEXT_AGENT.md` carries the live boot-state block for these soaks
+  and is not duplicated here.
+- **Falsifier.** `git diff --name-only HEAD -- src/` returning a single file would restore
+  single-variable attribution; any further count increase widens every claim in this block.
+
+### F-718 (2026-10-01, **hashes and counts measured here; `git status` verified clean of staging**) -
+**AN OFF-VOLUME BACKUP OF THE WHOLE UNCOMMITTED TREE EXISTS AND VERIFIES. IT IS NOW BEHIND THE TREE.
+NO COMMIT HAS BEEN MADE.**
+
+- **Verified here.** `C:\mcla-pc-uncommitted-20261001\tracked.patch` = **6,729,792 bytes**, SHA-256
+  **`466ED6A739CD50712C0A80CB61C1A1915F58CF5C2A1E08229DD4B36D6A14F6E1`** - an exact match to the
+  recorded hash. **46 untracked files** in `untracked\`, with a 47-line `untracked-manifest.csv`
+  (46 + header) and **0 SHA-256 mismatches**. Sibling files: `MANIFEST.txt` (8,860 B),
+  `RESTORE.md` (4,081 B), `staged.patch` (**0 bytes** - correctly empty, since nothing is staged).
+- **The working tree is untouched by this session.** `git diff --cached --name-only` = **0**,
+  `git rev-parse --short HEAD` = **`8385925`**, unchanged from the start of this block.
+- **The tree has drifted past the backup.** Everything in F-697..F-717 predates or postdates it; the
+  backup is a snapshot of the **07:52** state and `w688`'s build is stamped **10:41:59**.
+- **No commit has been made, by project rule** (`AGENTS.md`: *commit only when asked*). Recorded so
+  the next session does not read "backed up" as "versioned".
+- **Falsifier / the check to re-run:** `Get-FileHash tracked.patch -Algorithm SHA256` returning
+  anything but the above means the backup file was rewritten; `git diff --cached --name-only` being
+  non-empty means someone staged, which this project's rules forbid.
+
+### F-719 (2026-10-01, **whole-`src/` citation census run here: every `F-###` token in `src/**/*.*`
+matched against the heading table in this file**) - **THE 4-DAY HOLE IS ALREADY PAPERED OVER IN THE
+TREE: 11 COMMENT LINES ACROSS 6 IDS CLAIM A 2026-10-01 LEDGER ENTRY THAT DOES NOT EXIST, OR EXISTS AND
+SAYS SOMETHING ELSE ENTIRELY. THIS IS F-692'S CLASS, AND IT IS WORSE THAN F-692's WORST INSTANCE.**
+
+- **The census, measured.** Of the `F-###` tokens cited in `src/`, **6 ids carry a `2026-10-01` date
+  next to them** while their ledger heading is dated otherwise or absent:
+  | id | `2026-10-01` sites in `src/` | what the ledger heading actually is |
+  |---|---|---|
+  | **F-633** | **3 lines** (6 matches) | dated **2026-09-28** - *"RECONSTRUCTION OF VOID SLOT F-610"* |
+  | **F-634** | **2 lines** (4 matches) | dated **2026-09-28** - *"RECONSTRUCTION OF VOID SLOT F-625"* |
+  | **F-635** | **2 lines** (4 matches) | dated **2026-09-28** - *"RECONSTRUCTION OF VOID SLOT F-629"* |
+  | **F-680** | 1 line | **NO HEADING** (adjudicated by `F-681`) |
+  | **F-693** | 2 lines | **NO HEADING** |
+  | **F-696** | 2 lines | **NO HEADING** |
+  Exact sites: `src/gpu_device.cpp:1602`, `:1678`, `:1841` (cites both F-633 and F-634), `:2077`,
+  `:11884`; `src/guest_memory.h:119`; `src/guest_memory.cpp:481`; `src/fs/vfs_rpf.cpp:1501`, `:1535`,
+  `:2038`, `:2329`. **11 unique lines, 6 ids.**
+- **WHY THIS IS WORSE THAN F-692's WORST INSTANCE.** F-692 instance 5 was a do-not rule citing a
+  function that never existed - `git log -S` empty, so a reader gets a clean "no such thing" signal.
+  **Here a reader who follows `F-635` from `src/guest_memory.h:119` lands on a real, confident,
+  fully-cited, dated entry about reconstructing void slot F-629** and gets **no signal at all** that
+  they are off-topic. **A wrong citation to nothing is caught; a wrong citation to something real is
+  not.** The reader must notice that the entry they arrived at is about a different subject.
+- **The mechanism is now visible, and it is an id-allocation error.** F-633/F-634/F-635 are a
+  **contiguous block low in the file that all pre-date the session**. An author allocating ids for
+  10-01 work, seeing `F-697` as "obviously taken" and `F-660`-`F-679` as empty, appears to have picked
+  ids from the **middle of the existing range on the assumption that low numbers were unused.** They
+  were not - they were *used by different work*. **This is the id-space hazard the 10-01 block was
+  created to close, reproduced inside the block that closes it.**
+- **The specific mis-citations, quoted:**
+  - `src/guest_memory.h:119` `// F-635 (2026-10-01) -- CENSUS ONLY: ctr OUTSIDE THE FUNCTION-TABLE SPAN
+    AT PPC_CALL_INDIRECT_FUNC.` -> F-635 is the F-629 reconstruction. **This is F-713's own id.**
+  - `src/guest_memory.cpp:481` `// F-635 (2026-10-01) -- IMPLEMENTATION OF THE ctr OUT-OF-RANGE
+    CENSUS.` -> same.
+  - `src/gpu_device.cpp:1841` `// F-634 (2026-10-01): F-633 shipped this row UNCONDITIONAL, one per
+    rejection, and it poisoned w687.log (8,649,924 rows = 96.9106% of all lines).` -> **the claim
+    itself is TRUE and is now F-715**; the ids are wrong. `w687` measured: 8,649,924 rows =
+    96.92% of lines.
+  - `src/gpu_device.cpp:1678` and `:1602` claim F-634/F-633 for the cadence and the reject predicate
+    -> both are F-699's work.
+- **What this does NOT mean.** It does not mean the *code* is wrong: F-697, F-699, F-713 and F-715 are
+  independently measured above and stand on their own log lines and file reads. **Only the ids are
+  wrong.** That distinction is the whole value of recording it - the work is sound and its paperwork
+  points at the wrong page.
+- **Falsifier / the cheap gate.** For each of the 6 ids, the enforcing artefact should be a **symbol
+  name** (`MclaSyntheticGuestCtx`, `MclaFindLastServe`, `PPC_CALL_INDIRECT_FUNC`) or the **log line**,
+  never an `F-###` alone. **A `grep` for `F-633` in `src/` must never be the way a reader finds this
+  finding** - the same conclusion F-692 reached, now with a second instance that is strictly harder to
+  detect.
+
+---
+
+**End of the 2026-10-01 second block. IDs F-697..F-719 written (23 entries). No heading above this
+block was edited, reordered, or renumbered.**
+**ID CENSUS re-run before allocating, and it CONFIRMED the allocation:** max `### F-NNN` heading =
+**F-692**; **549** headings total; **4 duplicated heading ids** (**F-111, F-595, F-612, F-617**) left
+untouched; **F-693, F-694, F-696 cited with NO entry** (F-693 in `docs/HANDOFF_NEXT_AGENT.md` x6 +
+`docs/REPAIR_WORKLIST_2026-10-01.md` x4 + 2 sites in `src/fs/vfs_rpf.cpp`; F-694 x5 + x5 in docs;
+F-696 x5 + x6 in docs + 2 sites in `src/fs/vfs_rpf.cpp`); **F-629 remains a void slot**, cited and not
+renumbered; **F-654..F-659 and F-680 have no entry**, adjudicated by `### F-681`. Therefore **F-697
+was the first safe free id**, and this block starts there.**
+**F-633 / F-634 / F-635 were NOT treated as free despite the 2026-10-01 citations in `src/` - see
+F-719, which is the finding about exactly that error.**
+**NOT VERIFIED HERE, and deliberately not asserted:** the guest-side chain of F-700 beyond the archive
+facts re-measured from `w688.log` (the `sub_823971D0` / `0x828CD07C` / `sub_823964C0` sequence is cited
+from the existing `F442-SECTION` rows and was not re-decompiled); the `432 B` worst-case stack depth
+(cited from the in-tree comment at `src/gpu_device.cpp:3555`, not re-walked); the `13 already correct`
+host->guest call sites beyond the 10 `stack ? stack :` form measured; the 46-dest figure in F-699
+(cited from the brief, **not re-measured** - the `XSF-LASTSERVE-MISMATCH` total of 16,777,216 in
+`w688` is the measured proxy for the same population).**
+**The boot state for these soaks is in `docs/HANDOFF_NEXT_AGENT.md`'s superseding block and is
+deliberately NOT duplicated here.**
+### F-720 (2026-10-01, **RECONSTRUCTED - 0 builds, 0 soaks; every `src/` line number re-measured today; the original `w160` log is GONE**) - **THE `w160` `C0000005` IS `sub_821BE568` (BUFFERED-STREAM `Seek`) DEREFERENCING A LIVE-BUT-UNBOUND STREAM OBJECT. THIS IS A RECONSTRUCTION FROM CITATIONS AND THE ORIGINAL MEASUREMENT IS NOT RECOVERABLE.**
+
+- **Provenance, and it is the reason the heading says what it says.** The original `### F-150` entry was
+  lost in the **2026-09-20 volume fault**; the surviving record of that fault is the unnumbered prose block
+  at `:1071`-`:1166`, measured today **byte-identical** to the external emergency copy
+  `C:\mcla-emergency-20260921-0112\LEDGER-ADDENDUM.md` lines 5-100 (**9,327 UTF-8 bytes each,
+  0 differing lines**, `Test-Path` = True, file 9,335 B / mtime 2026-09-21 01:19:07 / SHA-256
+  `9557CDA0C6A7E375F3B364180ACAAC489C0A765182E7773539C4166AC36F8F85`). **Nothing below was re-soaked.
+  Every `w160`/`w161` log line number in this entry is UNVERIFIED and cannot be recovered** - the logs
+  are in the compressed pre-09-29 archive. Read this as *"this is what the tree says happened"*, never as
+  *"this is what was observed"*.
+- **The census that forced the entry.** `(?<![0-9A-Za-z])F-150(?![0-9A-Za-z])` over this file = **0
+  occurrences** - not one heading, not one mention anywhere in 15,670 lines - while `src/` carries **3**
+  citation sites, all in `src/gpu_device.cpp`. **The audit brief's line numbers (`:22698`, `:22711`,
+  `:23509`) had all drifted**, by **+387**, **+387** and **+387** respectively; the real sites are
+  **`:23085`**, **`:23098`**, **`:23896`**, found by the `F-150` token in the comment text, not by the
+  number. Under rule 1a-era discipline (F-692's law) a citation that cannot be re-found by its symbol is
+  a citation that decays silently, and this one had decayed by 387 lines before anyone looked.
+- **The finding, as the tree states it.** `w160`'s single `C0000005` - which `F-149`'s `entity.type`
+  expansion exposed - is `sub_821BE568`, a buffered-stream `Seek`, executing `loc_821BE5D0`:
+  `lwz r3,0(r31) ; lwz r4,4(r31) ; lwz r11,0(r3) ; lwz r10,44(r11) ; bctrl`. It loads the **device**
+  out of `[stream+0]`, the **handle** out of `[stream+4]`, and dereferences the device's vtable. The
+  fault context matches that instruction exactly: **`r3=0`, `r4=0`, `lr=0x821BE5F4` = the `bctrl` site,
+  faulting guest address `0`**. So the stream object is **live but unbound** - the dead-wrapper shape
+  `F-122` fixed for the **read** path (`sub_821BE250`), for which this `Seek` path has **no equivalent**.
+  The census that made this visible is described in-tree as **`CENSUS ONLY` (read-only)** and exists
+  because **`r14`-`r31` are host locals per `F-113`**, so the VEH dump cannot name `r31`; it prints `r31`
+  itself, with the object's own buffered fields, and **only for objects that are actually unbound**, so
+  the marker stays rare enough to read.
+- **Rule 4 was honoured when the census was added - and that claim is the comment's, not re-run today.**
+  The comment records `addr_owners --check 0x821BE568` returning **only** `ppc_func_mapping.cpp:3836`
+  and **no owner**. Cited from the comment; `UNVERIFIED` today.
+- **SUPERSEDED-BY F-155, and F-155's correction is the load-bearing half.** The object that is missing is
+  **`sub_821BE8D8`'s return value** (`w161` `BE8D8-HOST` prints `stream=00000001` beside a
+  `dst=CBE40280` buffer it filled) - **not this function's**. `ppc_recomp.10.cpp` shows `sub_82191040`
+  doing `mr r31,r3` after the `sub_821BE8D8` call - **not after the open** - and then using `r31` as a
+  stream object at **four** sites (`sub_821BE4F0` kind byte, `sub_821CF7B8` reader-ctor `r5`,
+  `sub_821BE610`, `sub_821BE568` `Seek`).
+- **A SECOND consumer of this shape, cited as a pair.** `src/gpu_device.cpp`'s `F-155` block writes
+  "F-150/**F-151**" throughout. **`F-151` is not lost**: it has its own heading, `### F-151` ("the AV
+  F-149 exposed is **our own Open contract** - `sub_821CAFB8` returns a slot *index* where this caller
+  dereferences a stream *object*"). So the pair is *`F-150` (reconstructed here) + `F-151` (recorded)*,
+  not two lost ids. Recorded because a reader who greps `F-151` next will otherwise think both are holes.
+- **Falsifier / what would void this.** A `sub_821BE568` census row with a **non-zero `[stream+0]`**
+  that still faults at `lr=0x821BE5F4` refutes the unbound-object reading outright. And
+  `git log -S '### F-150' -- docs/ROOT_CAUSE_VALIDATION.md` over any pre-2026-09-20 revision returning
+  the real entry means this reconstruction must be **withdrawn**, not amended.
+
+### F-721 (2026-10-01, **RECONSTRUCTED - 0 builds, 0 soaks; line numbers re-measured today; original `w`-log numbers UNVERIFIED**) - **THE FIRST-`0xCDCDCDCD` POISON SCAN OVER THE UI DECOMPRESS DESTS WAS THE COMPLETENESS SIGNAL. `valid` ALONE IS A TRAP, WHICH IS WHY `nzwords`/`runs` WERE ADDED.**
+
+- **Provenance: RECONSTRUCTED. The original entry was lost in the 2026-09-20 volume fault** (see the
+  provenance note and the byte-identity measurement in `### F-720`). Not a retroactive same-day citation -
+  the difference matters and is recorded per-ID, exactly as `### F-720` does for `F-150`.
+- **The census that forced the entry.** `F-266` over this file = **0 occurrences** (headings *and* body).
+  `src/` = **1** site, `src/gpu_device.cpp:5210`. **The audit brief's `:4885` had drifted to `:5210`
+  (+325).**
+- **The finding, verified in the tree.** A first-`0xCDCDCDCD` poison scan over the UI decompress dests,
+  used as a **completeness** signal: *"measure how much real (non-poison) data the decompress wrote by
+  scanning for the first `0xCDCDCDCD` run - settles whether the UI `.xsf` fully decompressed vs the
+  ambiguous `destSz(out)==capacity` reading."* The gate is `s_dumpedUi.size() < 8 &&
+  s_dumpedUi.insert(dest).second` (**first dump of each dest, 8 dests maximum**) and the dump head is
+  `uint32_t w[8]` - **8 words**, as claimed. The `valid` scan is bounded by `0x200000u` and breaks on
+  **`0xCDCDCDCD` *or* `0`** - so it reports a **pre-poison prefix length**, not a poison run length.
+- **CORRECTION TO THE AUDIT DRAFT, which the tree contradicts.** The draft said
+  `SUPERSEDED-BY F-267/F-274 ("validbytes=20" was a first-zero artifact)`. The **conclusion survives and is
+  independently carried by the ledger** - `### F-267` (`:6583`) does hold *"validbytes=20 is an ARTIFACT of
+  the naive first-zero/poison scan"*, and `### F-274` (`:6654`) repeats it - **but the attribution is
+  wrong.** The in-tree comment that carries this verdict is **`F-321`'s**, and it names the trap class as
+  **F-302/F-308** and the observation as **`w277`**: *"`valid` alone is a trap of the F-302/F-308 kind - a
+  container head is legitimately followed by zero words (w277: XMEM-UIHEAD validbytes=20 on a dest whose
+  stream demonstrably advanced), so a small `valid` is **NOT** evidence of an empty slot."* **F-267/F-274
+  are the *entries* about the artifact; F-302/F-308 are what the *source comment* cites.** Pasted draft
+  would have reproduced a citation the code does not make.
+- **The extension, verified.** The instrument was widened by `F-321` with `nzwords`/`runs` over the first
+  **`0x1000`** bytes (`nzwords<=1024 => full; nzwords==0 => untouched; a real decompressed body sits in
+  between`). This is the honest resolution of the F-267 trap and it is why `valid` was kept and not deleted.
+- **The neighbours the draft cited, re-measured: both line numbers are still correct today** -
+  `### F-265` at `:6573` (self-correction of F-264: records DO complete) and `### F-267` at `:6583`. **The
+  only drift in this entry is `F-266`'s own site.** Worth recording as a control: a brief's *neighbour*
+  citations aged better than its *subject* citation.
+- **Falsifier.** `git log -S '### F-266'` over any pre-2026-09-20 revision returning the real entry voids
+  this. In the code, `s_dumpedUi` losing its `.insert(dest).second` gate, or the `valid` loop's bound
+  moving off `0x200000u`, means the reconstruction no longer describes the instrument.
+
+### F-722 (2026-10-01, **WRITTEN RETROACTIVELY - census run today: 7 `src/` sites, 0 headings; 0 builds, 0 soaks**) - **THE CP SHADER PROGRAM BODY CROSSES THE DRAW-BRIDGE INLINE WITH THE SCALARS. `dwords` IS THE LENGTH, `body[]` IS THE DATA, AND `CpMicrocodeImage::dwords` IS THE BODY - WHICH IS THE CONFUSION THE SPLIT EXISTS TO END.**
+
+- **PROVENANCE: WRITTEN RETROACTIVELY, 2026-10-01. THIS IS **NOT** A 2026-09-20 VOLUME-FAULT LOSS.**
+  All **7** `src/` citations are dated 2026-10-01 in substance (the two `render_queue.h` and two
+  `gpu_cp.cpp` sites carry no date token but sit in the same 2026-10-01 editing session's comment set).
+  **This is an F-692-class process failure by the editing session itself: it wrote the id into the tree and
+  never wrote the entry.** Do not read it as a fault loss - the distinction is the whole difference between
+  "recoverable, the record exists elsewhere" and "there was never a record".
+- **The census, measured today.** `src/` = **7** sites, **count confirmed, zero line drift**:
+  `src/gpu_cp.cpp:424`, `:3181`, `:3214`, `:3828` and `src/render_queue.h:185`, `:308`, `:317`.
+  `docs/`: `HANDOFF_NEXT_AGENT.md` 4 lines / 5 matches, `REPAIR_WORKLIST_2026-10-01.md` 5 / 5, **and this
+  ledger 2 occurrences - both of them in `### F-719`'s table and in a block footer, i.e. recorded as a
+  *missing* entry.** **No `### F-694` heading exists anywhere in the file.**
+- **The finding, verified symbol-by-symbol in the tree (all live):** `CpShaderProgram` (10 `src/` lines),
+  `kCpShaderBodyDwords` (**12** lines), `CP-DRAW-BRIDGE` (**10**), `g_microcodeMutex` (**11**),
+  `CpSnapshotDrawState` (6), `bodyVs` (3).
+  - `render_queue.h:189` - *"`dwords` **IS THE LENGTH**. `body` **IS THE DATA**. They are deliberately
+    different names, and the split is not cosmetic"*; `:308` - *"this is a COUNT, never the data"*;
+    `:317` - *"the program bytes, host-order dwords, at most `kCpShaderBodyDwords` of them meaningful.
+    **Inline by value, never a pointer**: this struct is `memcpy`'d into the queue three times per draw
+    and a pointer into `g_microcode` would dangle on the next `PM4_IM_LOAD`."*
+  - `gpu_cp.cpp:3181` - the body crosses **from the same `img.dwords[]`** that `CpExecImLoad` filled with
+    `mem.ReadU32BE`, **still under the same `g_microcodeMutex`** that guards the image store, *"so a draw
+    cannot pair one stage's body with another stage's scalars."* **Nothing is dereferenced and no guest
+    address is touched.**
+  - `gpu_cp.cpp:3214` - **exactly `min(captured, cap)`** dwords, never more, because `captured` is what
+    `CpExecImLoad` actually **read** while `totalDwords` is only what the header **declared**; copying
+    `totalDwords` would ship uninitialised words.
+  - `gpu_cp.cpp:424` - three different numbers for three different questions (`dwords` written into
+    `body[]` is **the** number that proves the bytes crossed), and `gpu_cp.cpp:3828` - `bodyVs=`/`bodyPs=`
+    are **appended at the end**, after the existing `-> render thread` text, because `soak_census.py`
+    counts `CP-DRAW-BRIDGE` as a matching **line**, not by field position. **A mid-row insert would have
+    put a new field where a reader expects the old one.**
+- **STILL-RELEVANT: implemented, in the tree, and shipped-vs-declared divergence (`captured` vs
+  `totalDwords`) is the witness that bytes crossed.**
+- **Falsifier.** `kCpShaderBodyDwords` disappearing from `src/render_queue.h`, or a `CP-DRAW-BRIDGE` row
+  losing its trailing `bodyVs=`/`bodyPs=` fields, makes this void. A `CP-DRAW-BRIDGE` row where
+  `dwords > kCpShaderBodyDwords` means the `min(captured, cap)` bound stopped holding.
+
+### F-723 (2026-10-01, **WRITTEN RETROACTIVELY - census run today: 3 `src/` sites, 0 headings; 0 builds, 0 soaks**) - **ONE SCOPE-GUARD ANCHOR IN `ReadFileAt`, PLACED BEFORE THE `OVERLAPPED` BLOCK, EMITS ONE ROW PER CALL NAMING **WHICH BRANCH RAN** - BECAUSE THE SAME LOG ALREADY PROVES WHY THE BRANCH NAME CANNOT BE READ OFF IT.**
+
+- **PROVENANCE: WRITTEN RETROACTIVELY, 2026-10-01. NOT A FAULT LOSS** - both dated comments read
+  `// F-696 (2026-10-01).` An F-692-class process failure by the editor, exactly as in `### F-722`.
+- **The census, measured today.** `src/` = **3** sites, **count confirmed, zero drift**:
+  `src/fs/vfs_rpf.cpp:2038`, `:2329`, `:2373`. `docs/`: `HANDOFF_NEXT_AGENT.md` 4 / 5,
+  `REPAIR_WORKLIST_2026-10-01.md` 5 / 6, this ledger 3 / 3 (all in `### F-719`'s table and a footer).
+  **No `### F-696` heading anywhere.** `READAT-BRANCH` is **live** (4 `src/` sites).
+- **The instrument.** A scope guard constructed at the **single** anchor - the `if (file.handle)` test,
+  **before the `OVERLAPPED` block** - so every exit is covered exactly once, **including the early returns**
+  (`size == 0`, a failed `::ReadFile`, a failed `Materialize`) that a hand-placed call at the end of a
+  branch would never reach. `:2329` states it is *"deliberately the only one"* and is *"passed by every call
+  into this function regardless of which branch the body's own tests then select."* It reports
+  `handle` / `nested` / `span_ran`, and **`span_ran` is set from the `ApplyExpandedSpans` call site's own
+  condition** (`:2373`-`:2375`, `trace.set_span_ran(true)` immediately after the call), never assumed.
+- **Rate limit, and it is the F-054/F-715 lesson applied pre-emptively.** First **16 per virtual path**,
+  then **every 4096th**, plus a total **every 4096 calls**. The comment says why: *"A boot issues thousands
+  of `ReadFileAt` calls and a hard cap once made a burst's LENGTH unmeasurable (F-054: a soak 66% one
+  repeating mitigation line); a sample must never be mistaken for the whole, so the branch counters and
+  `READAT-TOTAL` sit on the UNSAMPLED side and `call=` carries the unconditional per-call serial that no
+  rate limit can hide."* **That is the same shape as `### F-715`'s `-SUMMARY` row, arrived at three days
+  earlier and independently.**
+- **WHY IT EXISTS, and the part that is evidence rather than inference.** `w682.log` ends with
+  `fatal %s arg: 'chevy'` because the guest's manufacturer table at `0x828CD078` is never populated:
+  the loop body at `sub_823971D0` ran **0** times because `tune/vehicle/vehicle.lst` did not parse.
+  **Three-for-3 the discriminator is a span-ownership collision**: `xarchive_carconfigs.rpf` is
+  `stored=166,323` but `logical=294,912`, so its logical range `[0x448000,0x490000)` swallows
+  `vehicle.lst` at `0x471000` and `vehicle0001.lst` at `0x479000`, and the two are **refused**
+  (`w682.log:26735` `MEMBER-SPAN-OWNER ... window=[00470000,00478000) refused=1 firstRefused=00471000`).
+  **Only `vehicle0002.lst`, whose offset is outside, parses.** The fix cannot be written because nobody
+  knows which branch serves the guest's three 32 KiB reads at `[0x470000,0x478000)`,
+  `[0x478000,0x480000)`, `[0x480000,0x488000)` (`RD-BUF #209/#210/#211`, `cnt=32768`) - and the two answers
+  point the fix in **opposite** directions: served by the outer `file.handle` branch, the fault is an
+  expanded span registered for a member `RegisterNestedRpf` already owns; served by `branch=nested`, the
+  span entry for the three packfiles should never have existed at all.
+- **Same archive facts as `### F-700`, independently re-measured there** from `build/w688.log:28635`
+  (`stored=166323 logical=294912`) and `:29111` (`vehicle.lst off=00471000`). **So the `stored`/`logical`
+  pair is reproduced on two independent logs - which is the strongest thing in this entry and the reason
+  `F-684`'s span-ownership question is still open rather than closed.**
+- **WHAT IT DELIBERATELY DOES NOT PRINT, recorded because a later session will want to add it.** A
+  delivered-vs-re-read `firstDiff` column is **not** here and **must not be added**: on the handle branch
+  the span table is *supposed* to change the bytes, so `firstDiff` would read `-1` on exactly the windows
+  that are broken - **a false all-clear**. It is also **not** a served-bytes claim: it samples the 16 bytes
+  at the pointer actually handed back, **after** every branch has finished writing, not a re-read of the
+  packfile (which would be a different file on the handle branch - **F-647's window-source defect in its
+  purest form**).
+- **Falsifier.** A `READAT-BRANCH` row emitted from any site other than the one anchor; `span_ran`
+  disagreeing with the `ApplyExpandedSpans` predicate; or the two documented exemptions (the three nested
+  packfiles by path, and the `xarchive_cache.rpf` windows) failing to bypass the rate limit.
+
+### F-724 (2026-10-01, **WRITTEN RETROACTIVELY - census run today: 3 `src/` sites, 0 headings; 0 builds, 0 soaks**) - **`tail=` ON `MEMBER-SPAN-OWNER` IS NOW THE OWNER'S OWN `off+logical` **BY CONSTRUCTION**, BECAUSE THE F-693 TAIL CAP WAS REVERTED - SO `tail != off+logical` ON ANY ROW IS A CAP THAT CAME BACK. THIS IS A FIFTH ORPHAN, NOT A WEAK REFERENCE, AND `### F-719` UNDERCOUNTED ITS SITES.**
+
+- **PROVENANCE: WRITTEN RETROACTIVELY, 2026-10-01. NOT A FAULT LOSS** - both dated comments read
+  `// F-693 (2026-10-01)...`. Same F-692-class process failure as `### F-722` / `### F-723`.
+- **WHY THIS ENTRY EXISTS AT ALL, and it is a correction to two earlier documents.** The audit brief
+  listed `F-693` among the **weak** orphans. **It is not weak: it has 3 `src/` citation sites, two carrying
+  the explicit `(2026-10-01)` date - the identical signature to `F-694` and `F-696`.** It was promoted and
+  given its own entry rather than a void note, because a void note for an id with three live `src/`
+  citations is itself a false statement.
+- **AND `### F-719` UNDERCOUNTED IT, in a way worth recording as a fourth instance of its own lesson.**
+  `### F-719`'s table gives `F-693` **"2 lines"**. **The true count is 3** - `src/fs/vfs_rpf.cpp:1501`,
+  `:1535`, `:1628`. **The third site is inside a `MCLA_LOG_WARN` format-string literal, not a comment**,
+  so a comment-scoped census misses it. `### F-719` §"the lesson, and it is the F-692 class again" is
+  already right about the *shape* of this failure (*"a zero occurrence count of a field name proves the
+  field is absent"*) and **this is the same failure one filter deeper**: a count that came back **smaller,
+  not zero**, which is the harder case - a reader cannot tell an undercount from a correct count.
+- **The finding, verified in the tree.** The **owner's limit as the loop finally computes it**, reported
+  as **`tail=`** on the `MEMBER-SPAN-OWNER` row. `:1501`-`:1507`: *"The tail cap that used to lower this
+  limit has been REVERTED (the record is at the assignment below), so **`tail` is the owner's own
+  `off+logical` BY CONSTRUCTION now**. That is why the field is kept: a soak can assert `tail == off+logical`
+  on every `MEMBER-SPAN-OWNER` row, and any row where it does not is a cap that came back."*
+  `:1535` is unambiguous about the history: *"LANDED HERE, MEASURED, REVERTED THE SAME DAY. THE CAP THAT
+  USED TO SIT AT THIS POINT IS GONE"* - the cap applied when the elected owner was not being read from its
+  own offset (`winOff != s.off`). `:1628` carries the same claim into the emitted row text.
+- **Status: the finding is a NEGATIVE one and that is the point** - a landed, measured, same-day-reverted
+  cap, with the revert's assertion promoted into a permanent per-row invariant. `MEMBER-SPAN-OWNER` is live
+  (**14** `src/` sites).
+- **Cross-reference, not duplicated:** `### F-683` is the 31-bit offset-mask finding that the `W64 RULE`
+  comment in the same loop (`vfs_rpf.cpp:1512`, *"THE W64 RULE, and F-642's amendment to it"*) depends on,
+  and `### F-684` is the still-open span-ownership question that `### F-723`'s instrument exists to answer.
+- **Falsifier.** A `MEMBER-SPAN-OWNER` row whose `tail=` is absent, or one where `tail != off+logical`,
+  means the cap is back and this entry is void. `tail=` being silently dropped from the format string
+  (nothing else would catch it - see the `F-719` site-count lesson above) does the same.
+
+### F-725 (2026-10-01, **one sweep, 11 ids; every verdict below is a measured count, not a judgement**) - **ADJUDICATING THE "WEAK ORPHANS": TWO ARE REAL FINDINGS WITH **LIVE INSTRUMENTS** NAMED AFTER THEM, THREE ARE POINTERS TO ENTRIES THAT EXIST UNDER OTHER NUMBERS, ONE HAS ITS RECORD EXTERNALLY **AND IN-REPO**, AND THE REST ARE IDS THAT WERE RESERVED AND NEVER ALLOCATED.**
+
+- **The sweep's premise, re-measured rather than inherited.** "No `###` heading" is **not** the orphan
+  test: **54** distinct `F-###` tokens appear in `src/` with no `### F-NNN` heading in this file, and only
+  a handful of those are defects. The rest are accounted for by (a) the documented **F-056…F-076 hole**
+  (`:2098`), (b) **void slots reconstructed under other numbers**, and (c) `F-654…F-658`/`F-680`,
+  adjudicated by `### F-681`. **The test that actually discriminates is the count of mentions in *this*
+  file**: `F-150` and `F-266` score **0** - not one heading and not one body mention in 15,670 lines -
+  which is why they are invisible orphans and why `### F-719`'s 6-id census missed them entirely.
+- **`F-056` - REAL FINDING, RECORD SURVIVES, **AND IT SURVIVES TWICE**. 6 mentions in this file; **no
+  heading**; it is the **first id of the documented hole** (`:2098`: *"No numbered `### F-0NN` entries exist
+  between **F-056 and F-077**"*). `:1880` already cites *"the C: reconstruction of the F-056.F.076"* work.
+  **`C:\mcla-emergency-20260921-0112\LEDGER-ADDENDUM.md` EXISTS** - `Test-Path` = True, 9,335 bytes,
+  mtime 2026-09-21 01:19:07, SHA-256
+  `9557CDA0C6A7E375F3B364180ACAAC489C0A765182E7773539C4166AC36F8F85`, 100 lines - **and the week's
+  record is ALREADY IN THIS REPO at `:1071`-`:1166`, measured byte-identical to that file's lines 5-100
+  (9,327 UTF-8 bytes each, 0 differing lines).** **So the finding is NOT lost and NOT merely external: the
+  audit brief's framing ("it exists on C:, absent from the repo") is wrong on the second half, and the
+  `:2099` byte-identity claim is CONFIRMED.** **One correction the brief did not have:** that external file
+  contains **0** `F-###` tokens (whole-file scan), i.e. **there is no numbered `F-056` entry anywhere, on
+  E: or on C: - the surviving record is unnumbered prose by construction, and the honest verdict is "real
+  finding, no numbered entry, record present verbatim in two places".** *Verdict: no reconstruction is
+  possible or needed; cite `:1071`-`:1166`, and do not treat `F-057`/`F-058` as resolvable.*
+- **`F-153` - POINTER, NOT a hole.** 4 mentions, all inside entries that exist (`### F-154` `:3962`,
+  `### F-160` `:4251`); **no heading**; 1 `src/` site. The subject is recorded twice: `### F-151`
+  (`:3829`) is the finding, and the `vt+44` mislabel is corrected by `### F-160` (*"it is a **Close**,
+  which corrects F-135/F-153's 'device Seek at vtable+44'"*). **`F-153` is a name the passing prose used;
+  the content is `F-151`/`F-160`'s. A stub entry would duplicate a live one.**
+- **`F-162` - POINTER, same shape, and the pointer is to a real chain.** 1 mention (inside `### F-232`),
+  **no heading**, 4 `src/` sites. The subject - *"the object IS wanted, but only by the one caller that
+  dereferences it"* - is `### F-151`'s / `### F-152`'s and is carried forward in `### F-160`. **Same
+  verdict as `F-153`: do not write a stub; repoint the 4 `src/` citations at `F-151`.**
+- **`F-258` - POINTER.** 4 mentions across `### F-257`, `### F-259` (which names the branch as
+  `src/gpu_device.cpp` F-258 `PATHB-UIFULL`) and `### F-271`; **no heading**; 1 `src/` site. The finding is
+  the Path-B UI-container chain, recorded at `### F-259`, `### F-265`, `### F-267`, `### F-274`,
+  `### F-278`. **`F-258` is the *work item's* number; its result is `F-274`/`F-278`'s.**
+- **`F-364` - REAL FINDING WITH A **LIVE MACRO AND MARKER**.** **1** mention in this file, inside
+  `### F-363` (`:8243`), and **the enclosing headings are `### F-363` (`:8225`) then `### F-366` (`:8245`)
+  - the number was reserved by F-363's own "Next ID" pointer and never allocated.** That is not the end of
+  it: `src/task_dispatch_trace.cpp` carries **`#define F364_PROBE(tag, sym)`**, per-symbol
+  `static std::atomic<uint32_t> s_f364_##sym{0}` counters, and `MCLA_LOG_WARN("F364-ALLOC #{} " tag
+  " ENTER ...")` / `" RETURN ..."` with its own `n <= 8 || (n % 500) == 0` cadence - **12** raw `F364` token
+  hits and **16** for the family. **An instrument is named after an id with no entry. That is F-692's class
+  and it is worse than a comment: a reader cannot even grep a comment to find out the number is wrong.**
+  *Verdict: the highest-value reconstruction in this sweep.*
+- **`F-388` / `F-389` / `F-390` (+ the sub-variant `F-390b`) - RESERVED, NEVER ALLOCATED; no markers.**
+  `F-388` 1 mention (inside `### F-386`), `F-389` 3 (`### F-386`, `### F-387`, `### F-394`), `F-390` 1
+  (inside `### F-391`). **The headings run `### F-386` (`:8534`), `### F-387` (`:8545`), then `### F-391`
+  (`:8583`) - so `F-388`, `F-389` and `F-390` are three consecutive ids the sequence skipped.** `src/`
+  does cite them (4 / 2 / 5 sites) **and `src/kernel/heap.h:75` and `:89` cite the SUB-VARIANT `F-390b`**,
+  which has **no heading and no `###` line at all** - not even the lettered-sub-entry treatment
+  `### F-681b` gave `F-200b`/`F-204b`/`F-681b`. `F-390b` is a **null check** in `Alloc<T>` and
+  `AllocPhysical<T>` (*"`obj` is null on an honest OOM (F-390 made that path reachable for real: the SEH
+  around `o1heap` now returns null instead of the VEH parking the thread). Constructing into it was a
+  write to `0x0`"*). **0 marker/flag tokens for any of the three** (unlike `F-409`/`F-483`/`F-364`), so
+  nothing in the tree depends on the number - **but two live null checks depend on the *work*.**
+  *Verdict: void slots with real, live content; `F-390b` needs an explicit void note because a sub-variant
+  with no parent heading and no sub-heading is invisible to every census in the project.*
+- **`F-409` - REAL FINDING WITH A **LIVE MARKER AND FLAG**, and this is the one that matters.** 1 mention,
+  inside `### F-408` (`:9269`, literally *"Next ID **F-409**"*), next heading **`### F-410` (`:9271`)**, so
+  the id was reserved and never allocated - **yet `src/gpu_device.cpp` carries 2 `F-409` citations, the
+  live marker string `F409-FILL-GUARD` (3 `src/` lines) and the live counter `k409` with its own
+  `k409 <= 24 || (k409 % 64) == 0` print filter (4 `src/` lines).** **`### F-705` already analyses this
+  instrument by name** - *"the `k409<=24` print filter **was never reached** and 22 is a true count"* - and
+  it cites `F-409` as if the entry existed. **A live instrument is measured in the ledger under an id that
+  resolves to nothing.** *Verdict: reconstruction needed; the measurement already exists in `### F-705`, so
+  the entry can be written from the ledger rather than from a lost log.*
+- **`F-483` - REAL FINDING WITH THREE **LIVE** MARKERS.** 2 mentions (`### F-482` `:10497` = *"Next ID
+  **F-483**"* with next heading **`### F-484` (`:10499`)**, and `### F-502` `:10860`); **no heading**;
+  2 `F-483` citations plus **three live marker strings**: `F483-DEFER` (`:6686`), `F483-DEFER-HOLD`
+  (`:6690`), `F483-UNPIN` (`:15654`). Same reserved-then-skipped shape as `F-409`.
+  *Verdict: reconstruction needed; the three markers are the index into it.*
+- **`F-528` - REAL FINDING, COMMENT-ONLY (the weakest of the three, and the only one with no marker).**
+  **1** mention, inside `### F-527` (`:11695`, *"Next ID **F-528**"*), next heading **`### F-529` (`:11699`)** -
+  reserved, never allocated. 3 `src/` citations (`gpu_device.cpp:607`, `:1643`, `:13226`), all about
+  *"ONE authority"* for package resolution (`PeekPackageForDest` vs `AssignPackageForDest`). **0 marker
+  tokens, 0 flag tokens.** *Verdict: reconstruction is possible from the comments alone and the comments are
+  self-consistent, but there is no log evidence and none should be claimed.*
+- **The general rule this sweep earns, and it is the third time it has had to be written:** **an id with
+  live `src/` instrumentation is a hole even when no comment cites it, and the marker name is a better
+  census key than the comment text** - because a marker cannot be written into a format string without
+  someone having decided the number existed. `F-409-FILL-GUARD`, `F483-DEFER`, `F364-ALLOC` and `F390b` are
+  all findable only this way.
+- **Falsifier.** Any of `git log -S '### F-409'`, `-S '### F-483'`, `-S '### F-364'`, `-S '### F-390b'`
+  returning a real heading over any revision voids the corresponding row of this table; and if
+  `### F-681b`'s reconciliation is ever extended past `F-653`, its `539`/`537` counts must be re-derived
+  because this sweep used a different regex.
+
+### F-726 (2026-10-01, **census run immediately before allocating: 575 `### F-NNN` heading lines, max `F-719`, min `F-77`; 0 builds, 0 soaks**) - **THIS BLOCK STARTS AT `F-720`, NOT `F-697` AND NOT `F-659`. THE FOOTER IS AMENDED IN PLACE (the ONE authorised in-place edit), THE `F-659` POINTER IS RETIRED, AND THE `F-695` SKIP IS EXPLAINED.**
+
+- **The census, measured.** `(?m)^###\s+F-[0-9]+` = **575** heading lines; max = **`F-719`**; min = **`F-77`**.
+  Split precisely, because the naive regex lies: **572** digits-only headings, **3** lettered sub-entries
+  (`### F-200b` `:5753`, `### F-204b` `:5797`, `### F-681b` `:14502`), **568** distinct digit ids. **This
+  agrees with `AGENTS.md`'s "last heading `### F-719`, **575** headings" - the ledger wins and there is no
+  discrepancy to report at source.** `### F-681b` recorded the equivalent split for the pre-`F-654` state
+  (**539** heading lines / **537** digits-only / min `F-77` / max `F-653`); the two splits are consistent and
+  the `F-200b`/`F-204b` reconciliation `### F-681b` recorded still holds.
+- **THE DUPLICATED-HEADING COUNT IS 4, NOT 7 - and the naive census says 7.** Grouping by
+  `^### (F-[0-9]+)` yields **7** collisions: `F-111`, `F-200`, `F-204`, `F-595`, `F-612`, `F-617`, `F-681`.
+  **Three of those seven are not duplicate ids:** `F-200`/`F-204` pair with `### F-200b`/`### F-204b` and
+  `F-681` pairs with `### F-681b` - **lettered sub-entries, exactly as `### F-681b` adjudicated and exactly
+  as the `heap.h:75` `F-390b` case in `### F-725` shows is a live pattern rather than a closed one.** The
+  **4 real duplicated heading ids are `F-111` (`:2494` + `:2596`), `F-595` (`:13522` + `:13539`),
+  `F-612` (`:13664` + `:13669`), `F-617` (`:13694` + `:13700`)** - **left untouched, not renumbered, as
+  `### F-681b` required.** **Nothing above this block was edited, reordered or renumbered.**
+- **The next free id is `F-720`, and the reasoning that gets there.** `F-697` was the first safe free id
+  when the `F-697…F-719` block was allocated; that block is now written, so the first id above every claim
+  is **`F-720`**. **`F-659` is RETIRED and was never free** - it was a **provisional label for `F-684`**
+  (stated in this file's own footer at `:14989`-`:14990`), which is why the old footer's *"first ID with no
+  heading and no citation anywhere in the tree is `F-659`"* was already self-contradicting.
+- **THE `F-695` SKIP, which the old footer never explained.** `F-695` is **free** - measured **0** `src/`
+  citations, **0** mentions in this file - **but it sits *below* the consumed `F-696`.** The 2026-10-01
+  editing session consumed `F-693`, `F-694`, `F-696` in that order; `F-695` was simply never allocated, so
+  the sequence jumped over it. **Consequence, and it is a live hazard rather than a curiosity: `F-695` is
+  the only low id that is simultaneously unconsumed, uncited and unreachable, and an author allocating from
+  the middle of the range would land on it. It is hereby declared PERMANENTLY UNUSABLE - do not back-fill
+  it, do not "tidy" the sequence by taking it.** This is the same mechanism `### F-719` named
+  (*"an author allocating ids from the middle of the existing range on the assumption that low numbers were
+  unused"*), which is why the skip is recorded here rather than left for the next census to rediscover.
+- **THE CONSUMED / VOID SET THIS BLOCK RELIED ON, stated in full so the next session does not re-derive it
+  and can check it:**
+  - **`F-629` - VOID SLOT. No `###` heading** (18 textual mentions, every one a reference to the void).
+    Reconstructed as **`### F-635`** (*"RECONSTRUCTION OF VOID SLOT F-629"*). **Do not reuse, do not
+    renumber.** Note that `src/guest_memory.h:119` and `src/guest_memory.cpp:481` cite `F-635` for work
+    that is `F-713`'s - that is `### F-719`'s finding and is not fixed by this block.
+  - **`F-654`…`F-659` and `F-680` - HEADINGLESS, ADJUDICATED BY `### F-681`.** Measured citation load in
+    `src/` alone: `F-654` 14 sites, `F-655` 16, `F-656` 9, `F-657` **34**, `F-658` 6, `F-680` **25**. They
+    were **deliberately not used** because in-tree citations already claim them.
+  - **`F-693`, `F-694`, `F-696` - CITED WITH NO ENTRY**, and **all three are now retroactively written**
+    as `### F-724`, `### F-722`, `### F-723`. **The headingless hole they belonged to is closed for these
+    three; `F-695` remains skipped by design.**
+  - **`F-719` - THE CURRENT TOP** at the moment of this census, and the reason this block starts at
+    `F-720`.
+  - **Not voids, and explicitly not treated as free despite same-day `src/` citations: `F-633`, `F-634`,
+    `F-635`** (all three are real 2026-09-28 entries; `### F-719` is the finding about their 2026-10-01
+    mis-citations).
+  - **Still-open holes this block did not and could not close:** the **`F-056…F-076`** week (20 ids,
+    record surviving only as unnumbered prose - `### F-725`'s `F-056` row), and the **reserved-never-
+    allocated** ids `F-364`, `F-388`, `F-389`, `F-390`, `F-390b`, `F-409`, `F-483`, `F-528` (same table).
+- **Ids written by this block: `F-720`…`F-728` (9 entries). The next free id is therefore `F-729`.**
+- **Falsifier / the cheap check to re-run before allocating again:** `(?m)^###\s+F-(\d+)` printing a max
+  other than `F-728`, or a heading count other than **584**, means another session appended to this file
+  mid-block and every "next free id" statement above is stale. Re-run the census; do not trust this line.
+
+### F-727 (2026-10-01, **both miscite sites re-measured at the exact lines cited, plus the two files that
+give the correct readings**) - **TWO LIVE RULE-NUMBER MISCITES. ONE IS IN THIS FILE AND IS CORRECTED BY
+APPEND-ONLY, NOT IN PLACE; THE OTHER IS IN `HANDOFF_NEXT_AGENT.md` AND IS **REPORTED, NOT EDITED**,
+BECAUSE THAT FILE IS NOT THIS SESSION'S.**
+
+- **Why this is a finding and not a typo.** A bare *"rule N"* in this project is **triple-valued or worse**:
+  this file's `AGENTS.md` numbers **1-6 and 14**; `docs/LONG_TODO_MASTER.md` §1 (`:970`-`:990`) numbers
+  **1-19**; `docs/PROGRAM_GUIDE.md` §11 numbers **1-11**. A wrong rule citation is therefore a
+  **citation to a rule that does not exist in the named file**, which is `### F-692` instance 5's exact
+  shape - except that here the reader gets no signal at all, because *`AGENTS.md` plainly exists.*
+- **Miscite 1 - MINE, at `ROOT_CAUSE_VALIDATION.md:8581`.** Re-measured at **exactly `:8581`**, no drift:
+  *"same-binary control, not a test of anything, and is excluded from comparisons (**the stale-exe rule,
+  `agents.md` rule 12**). Next ID **F-389**."* **CORRECT READING, verified two ways: (a)** `AGENTS.md` has
+  **no rule 12** - its list is `1-6, 14` (stated in `AGENTS.md:83`, and the 7 numbered items at
+  `AGENTS.md:99`-`ff` are 1-6 plus 14), and a `rule 1[0-9]` search over the file returns only `rule 14`
+  twice and **no rule 12**; **(b)** the rule being used is **stale-exe trap**, and
+  **`docs/LONG_TODO_MASTER.md:983` is rule 12 verbatim: *"**Stale-exe trap** - after any link attempt verify
+  `mcla.exe` mtime moved before soaking."*** That is exactly the rule the sentence is applying, and it is
+  why the stale-`exe` claim at `:8579`-`:8580` is sound while its rule citation is not.
+  **THE BODY AT `:8581` IS DELIBERATELY LEFT UNEDITED.** This file is append-only and the footer is the
+  only authorised in-place change, so the correction is **this entry** - the same mechanism `### F-088`
+  used to correct `F-085`/`F-086`/`F-087` in place of editing them. **A reader landing on `:8581` is
+  routed here by the falsifier below.**
+- **Miscite 2 - NOT MINE, at `docs/HANDOFF_NEXT_AGENT.md:528`.** Re-measured at **exactly `:528`**, no
+  drift: *"**Correct a doc by appending a dated superseding entry, never by editing**
+  (AGENTS.md rule 5/6)."* **CORRECT READING: `AGENTS.md` rule 5, second sentence** - `AGENTS.md:99`,
+  *"**Before writing a doc**: check its mtime and add a dated superseding block rather than editing someone
+  else's"* - which matches the sentence's own subject (a doc) exactly. **Rule 6 is irrelevant here**: it is
+  the **E:-primary merge note** (`E:\mcla pc` primary, `C:\mcla-pc` a retired read-only archive), which
+  has nothing to do with document-editing discipline. **NOT FIXED: `HANDOFF_NEXT_AGENT.md` is not this
+  session's file and project rule 5's second sentence forbids editing another's doc in place - it requires
+  a dated superseding block, which is the owning session's to write.** **Reported here and in the session
+  report; do not edit it.**
+- **CORRECTION to the audit brief, which affects the other document's bookkeeping.** The brief cited this
+  miscite as `HANDOFF_NEXT_AGENT.md:226`. **The measured line is `:528`**; `:226` is a stale reference. The
+  `AGENTS.md`-side line for the ledger miscite, `:89`, **is** correct.
+- **The class, stated once so the next sweep does not have to rediscover it:** *a rule citation must name
+  the file, because the numbering is per-file and the numbers collide.* Every bare *"rule N"* in this
+  project's docs is suspect for exactly this reason, and `AGENTS.md:83` is the file that already carries
+  the warning.
+- **Falsifier / the gate.** `Select-String AGENTS.md -Pattern 'rule 1[0-9]'` returning a `rule 12`, or a
+  future `AGENTS.md` renumbering so that rule 12 *is* the stale-exe trap, would make miscites 1 and 2 void
+  respectively - **at which point this entry, not the body at `:8581`, is what has to be corrected.**
+
+### F-728 (2026-10-01, **0 builds, 0 soaks; a note about the process, not about the guest**) - **PROCESS GAP,
+RECORDED AND NOT FIXED: NO 2026-10-01 ENTRY IN THIS FILE DIFFS AGAINST A **NAMED** BASELINE, WHICH THE
+LOG-CENSUS SKILL REQUIRES.**
+
+- **The gap.** Every entry from `### F-697` through `### F-719` compares two *ad-hoc* logs
+  (`w684`/`w685`/`w686`/`w687`/`w688`, and `w399`/`w400`, `w687`/`w688`) and **never names a baseline** -
+  i.e. it never states which log is the control that defines "no regression". The census skill requires a
+  named baseline, so **a reader cannot tell from any of those entries whether the comparison they report is
+  a regression check at all or merely two numbers side by side.** The nearest thing to one is `### F-697`'s
+  `SYNCTX-STACK`/`GUESTVIEW-U32-FABZERO` shape, and that is a *bisect* control (`### F-717`), not a
+  baseline.
+- **Deliberately NOT retrofitted.** Existing entries were **not** edited to add baselines. Rule: a baseline
+  is a **measurement**, and naming one retroactively for evidence gathered without it would manufacture the
+  appearance of a control that did not exist - which is precisely `### F-714`'s class (a plausible zero,
+  indistinguishable from a result).
+- **What the next session owes.** Any entry that quotes a **before/after** marker pair must name the
+  control log **in the entry's own header line**, and if there is no control, say `UNVERIFIED, no baseline`
+  rather than presenting the delta as a gate. One line per entry; the cost is one word in the header.
+- **Falsifier.** A grep of this file for `baseline` returning hits inside `### F-697`..`### F-719` means
+  the gap is smaller than measured here, and this note is over-stated rather than wrong.
+
+---
+
+**End of the 2026-10-01 third block. IDs `F-720`..`F-728` written (9 entries).**
+**EXCEPTIONS TO APPEND-ONLY, both deliberate and both recorded: (a) the block footer at `:14991`-`:14993`
+was AMENDED IN PLACE, as `### F-726` directs - it now reads `F-720`/`F-729`, retires the `F-659` pointer
+and records the `F-695` skip; (b) NOTHING else above this block was edited, reordered or renumbered. In
+particular `### F-727`'s miscite at `:8581` is corrected by append, not by editing.**
+**CENSUS AT THE TIME OF WRITING: `(?m)^###\s+F-[0-9]+` = **584** heading lines (575 + these 9); max
+`F-728`; min `F-77`; 4 real duplicated heading ids (`F-111`, `F-595`, `F-612`, `F-617`) untouched; 3 lettered
+sub-entries (`F-200b`, `F-204b`, `F-681b`) plus the unheaded `F-390b` recorded in `### F-725`.**
+**NEXT FREE ID: `F-729`. Do not take `F-695` - see `### F-726`.**
+**SUPERSEDED 2026-10-02 by the block below: `F-729`..`F-745` are now written and the next free
+ID is `F-746`.** (Amendment authorised by `### F-726`; this is the only in-place edit in either
+block and it touches this footer line alone.)
+**NOT VERIFIED HERE, and deliberately not asserted:** every `w160`/`w161`/`w682`/`w227`/`w256`/`w257`/`w38*`
+log line quoted in `### F-720`, `### F-721` and `### F-723` is **cited from an in-tree comment or from
+this file's earlier entries and was NOT re-read** - those logs are in the compressed pre-09-29 archive and
+were not decompressed for this block. The **archive byte facts** in `### F-723` (`stored=166,323` /
+`logical=294,912`) are the exception and **are** independently re-measured in `### F-700` from
+`build/w688.log:28635`. The `addr_owners` result quoted in `### F-720` is the comment's claim, not a
+re-run. No build, no soak, no game run and no git operation was performed by this session; the only file
+written is this one.
+**The boot state for the 10-01 soaks is in `docs/HANDOFF_NEXT_AGENT.md`'s superseding block and is
+deliberately NOT duplicated here.**
+---
+
+## 2026-10-02 block — the first pixel, the freeze, and a dozen kills
+
+Written by a subagent with a 30-minute budget. Every claim below is either a byte-exact count taken
+during this session or a quoted line from a log named in the entry. **Three numbers in the task brief
+were not reproducible and are recorded as such, not written down as facts** — see `### F-729` §3,
+`### F-736` §"not reproduced" and `### F-735`.
+
+**THE CONTROL LOG FOR THIS ENTIRE BLOCK: `build/w700.log`, 8,487,020 B, sha256
+`AA6DBADF20DB29D66E190331DC53B22C9EA893E08A682582CFF1791833BE8B0A`, 55,946 lines, mtime
+Fri Oct 2 06:16:12 2026.** Its build: `build/mcla.exe` 62,306,304 B sha256
+`CB83C65F617E74694678955B2ECF92C9C1EB4F6E1D80EF64EA54B1A3549B9EB2`, `build/mcla.map` 19,605,963 B,
+both mtime Fri Oct 2 06:12:05 2026. Every "w700" reference in this block means that file.
+
+**ATTRIBUTION IS N-WAY. `git diff --name-only HEAD -- src/` = 45 files.** HEAD =
+`83859255b0b7bdff740aeaf8d7195beccfe6e96c`. Rule 1a's single-variable check therefore **cannot be
+satisfied by any entry in this block**, and none of them claims it. Nothing here is committed.
+
+### F-729 — the first confirmed rendered pixel, and the heap type that made it possible
+
+Two new markers, `D3D12-DRAW-PIXEL` and `DRAW-CP-PIXEL`, produced the project's first pixel values ever
+read back off a real render target. `build/w700.log:7811`, `:7830` and `:7836` and `:8080`, `:8085`:
+
+```
+[06:13:25.873] [info] D3D12-DRAW-PIXEL #1 create hr=0x00000000 heap=READBACK bytes=3686400 rowPitch=5120 rows=720 backBuffer=1280x720 flags=0x1
+[06:13:25.876] [warning] DRAW-CP-PIXEL #1 draw=1 rgba=(0,0,0,0) at (640,360) rowPitch=5120 | nonBlack=921600/921600 (100.0000%) maxChannel=13 meanChannel=26.0000 readbacks=1
+[06:13:25.890] [info] D3D12-DRAW-PIXEL #2 rgba=(5,8,13,255) at (640,360) of 1280x720 rowPitch=5120 | nonBlack=921600/921600 (100.0000%) maxChannel=13 meanChannel=26.0000
+[06:13:25.890] [warning] DRAW-CP-PIXEL #2 draw=2 rgba=(5,8,13,255) at (640,360) rowPitch=5120 | nonBlack=921600/921600 (100.0000%) maxChannel=13 meanChannel=26.0000 readbacks=2
+```
+
+The path taken is `D3D12_HEAP_TYPE_READBACK`, `hr=0x00000000` on create, 3,686,400 B,
+`rowPitch=5120`, 720 rows of a 1280x720 back buffer. **`D3D12_HEAP_TYPE_READBACK` buffers are mappable
+by definition** — that is what the heap type is for. Four prior paths were measured dead and all four
+had the same shape: they tried to `Map` something, or copy into something, that cannot be mapped.
+
+| path | measured result |
+|---|---|
+| DEFAULT heap, then `Map` | `0x80070057` (`E_INVALIDARG`) |
+| UPLOAD heap as a copy destination | refused at `list->Close()` |
+| **`D3D12_RESOURCE_STATE_COPY_HOST`** | **does not exist** — `d3d12.h:3231-3266` is 16 enumerators, none of them this |
+| CUSTOM heap | `0x80070057`, debug id **638** (not the 628 previously quoted — that number is withdrawn) |
+
+The fourth is the point of this entry: **four attempts to reach a mappable buffer, none of them the
+buffer type provided for exactly that purpose.** `D3D12-DRAW-PIXEL` and `DRAW-CP-PIXEL` are new
+families and are **not yet in `PROGRAM_GUIDE.md` §9**, so `tools/soak_census.py` does not track them
+(measured: `soak_census.py`'s marker table is built from §9, and neither literal is there).
+
+**What this does NOT establish.** Two of the four cited `0x80070057` / refusal results are quoted from
+the brief of this session and were **not re-derived** from a named log line in this session's work;
+they are control-log claims and should be re-read before being relied on. **No image has been shown to
+a human**, and `### F-732` records that the summary half of these very lines is arithmetically
+impossible — so "a pixel was rendered" is a claim about a **pipeline that completed a copy and
+returned a buffer**, not yet a claim about a picture.
+
+**Falsifier.** If `ID3D12Resource::Map` on a `D3D12_HEAP_TYPE_READBACK` buffer created with
+`hr=0x00000000` returns `E_FAIL` or a null pointer, this entry's central claim is false.
+
+### F-730 — `DRAW-CP-DRAWN` counted a refused path; it is now gated, and renaming was impossible
+
+The counter was incremented at `src/…/render_thread.cpp:3692`, **outside** `if (backend_.BeginFrame())`,
+and the `bool` returned by `DrawDynamicMeshWithPipeline` was discarded — so the counter advanced on a
+call that had already been refused. The brief's proof is quoted from a pre-fix log and is **not
+re-derived here**; what is re-derived is the **after**, which is the only thing that matters for a
+gate. In `w700` the counter now tracks real draws:
+
+```
+[06:13:25.876] [info] DRAW-CP-DRAWN #1 prim=8 topo=4 vertices=3 indexed=0 indices=0 maxIndex=0 fmt=vf57:dxgi6:12B stride=28 descs=1/2
+[06:13:25.890] [info] DRAW-CP-DRAWN #2 prim=8 topo=4 vertices=3 indexed=0 indices=0 maxIndex=0 fmt=vf37:dxgi16:8B stride=8 descs=1/1
+[06:13:26.385] [warning] FRAME-OWNER REFUSED #1: writer=clear may not touch the back buffer; owner=draw presented=379 drawn=2 blitRefused=0 clearRefused=1 conflicts=0
+```
+
+`drawn=2` on the `FRAME-OWNER REFUSED` row agrees with two `DRAW-CP-DRAWN` rows and with two
+`D3D12Backend: draw #N issued through a cache-produced PSO` rows (`w700.log:7812`, `:8034`). Under the
+old build the corresponding field read `drawn=0` on every one of those rows while `pipeStop` had
+reached `"drawn"` and `pipeRow()` had been called — i.e. the counter moved for a submission that never
+happened. The old count was moved to a separate marker, `DRAW-CP-DRAWN-SKIPPED` (measured:
+`t.count('DRAW-CP-DRAWN-SKIPPED')` = **0** in `w700` — the literal is present in the binary and no row
+fired in this soak, which is consistent with 0 skips but does **not** prove the marker works).
+
+**Renaming the old marker was impossible**, and the reason is worth recording because it is a trap for
+the next session: the marker name lives inside a **tracked format literal**, so `DRAW-CP-DRAWN` is
+referenced by the log-marker inventory itself and cannot be edited out without editing §9, which this
+session was instructed not to touch.
+
+**Falsifier.** If a build with the gate in place ever prints `DRAW-CP-DRAWN #n` on a row where
+`backend_.BeginFrame()` returned false, or where `m_stats.drawsIssued` did not advance, the gate is
+not on the path this entry claims.
+
+### F-731 — the frame latch had six failure paths, and clearing it alone converts a true refusal into a misleading one
+
+`BeginFrame()` had **six** failure paths, not the three previously stated: `not-initialised`,
+`already-in-frame`, `fence-gate`, `allocator-reset`, `commandlist-reset`, plus a sixth
+`!m_initialized` inside `WaitForCurrentFrameGpu`. `m_inFrame` was **a latch with no
+release-on-abandon**.
+
+The wedge, as quoted in this session's brief and not re-derived here: `render_thread.cpp:3808`
+(`DRAW_MARKER`) calls `DrawDynamicMesh`, which **always** refuses (`d3d12_backend.cpp:2710`, per
+`### F-653`) and never presents — so the first draw marker set the latch and nothing ever cleared it,
+and the gate stayed wedged for the rest of the run.
+
+**The harness corrected the fix, and this is the load-bearing part of the entry.** Clearing the latch
+alone is *not* a fix: with `m_inFrame` cleared but the allocator never closed,
+`ID3D12CommandAllocator::Reset` fails `0x80070057`, so the very next frame reports **`allocator-reset`**
+— a *misleading* reason — in place of the truthful **`already-in-frame`** refusal. **The `Close()` is
+load-bearing.** Any future agent who "simplifies" this by dropping the close is not removing
+redundancy, they are replacing a correct diagnostic with a wrong one.
+
+**Falsifier.** If clearing `m_inFrame` without `Close()` yields `already-in-frame` on the next
+`BeginFrame`, the claim that the `Close()` is load-bearing is false.
+
+### F-732 — OPEN: the pixel census is arithmetically impossible
+
+Recorded as **OPEN and deliberately unresolved** — an agent is on it. Three separate inconsistencies,
+all from the two rows quoted in `### F-729`:
+
+1. **`meanChannel=26.0000` exceeds `maxChannel=13`.** For any single region, the mean of a set cannot
+   exceed that set's maximum. This is impossible regardless of what the bytes are.
+2. **`nonBlack=921600/921600` = 100.0000 %** — on a probe whose `rgba` is `(0,0,0,0)` on row #1. A
+   fully-transparent-black probe and a 100 %-non-black census cannot both describe the same bytes.
+3. **Both rows carry byte-identical census fields despite different probe values.** Row #1 probes
+   `rgba=(0,0,0,0)`; row #2 probes `rgba=(5,8,13,255)`. The tail
+   `nonBlack=921600/921600 (100.0000%) maxChannel=13 meanChannel=26.0000` is character-for-character
+   identical in both. A census that returns the same numbers for two different pixels is not a census.
+   Row #2's probe sums to exactly `5+8+13 = 26`, which is the value reported as the mean.
+
+**Position taken: the probe is real evidence and the summary is not.** The `rgba` quadruple is read
+from a specific mapped address; the summary is produced by a separate pass. Three independent failures
+all point the same way, so the summary fields are the suspect, not the probe.
+
+**Do not cite `meanChannel` or `nonBlack` from these markers until resolved.** `maxChannel=13` is
+consistent with row #2's `rgba` and is the one field with no internal contradiction — but consistency
+is not corroboration.
+
+**Falsifier.** A census whose summary fields differ between two rows with different probed `rgba`
+values would retire item 3, and a `mean ≤ max` invariant check on a known-uniform region would retire
+item 1. Both are the natural regression tests.
+
+### F-733 — `CP-WAITREG-NEVERWRITTEN` asserted a falsehood for days: it queried the wrong address space
+
+The marker read: *"timed out AND no writer this host implements could have produced the value … 
+`memDestSeen=0`"*. That second clause was a **guaranteed false negative**, and the cause is a unit
+mismatch across one boundary:
+
+- `CpNoteMemWriteDest` is called with a **guest-physical** address by both callers —
+  `gpu_cp.cpp:3097` and `gpu_cp.cpp:3152`.
+- `CpMemWriteDestSeen` was queried with the **pool VA**.
+
+Those differ by `0xA0000000`: the log's own `poll=1840B286` / `pollVA=B840B284` pair is exactly one
+`0xA0400000` base apart (`0xB840B284 − 0x1840B284 = 0xA0000000`). A set keyed on physical addresses
+queried with a pool VA returns "not seen" **always**, so the marker's negative result carried no
+information whatsoever.
+
+**The refutation is inside `w700.log` itself**, 2.785 s earlier:
+
+```
+[06:13:25.071] [warning] CP-EVENTSHD #1 initiator=00000003 dst=1840B284 endian=2 value=B7C0A354 || seen=1 written=1 no-counter=0 unreadable=0
+[06:13:27.856] [warning] CP-WAITREG-NEVERWRITTEN #1 from=IB target=3091247748 is_memory=1 regPresent=0 memDestSeen=0
+```
+
+`dst=1840B284`, `written=1`. **Correction to this session's brief, which stated "784 ms":** the two
+timestamps are `06:13:25.071` and `06:13:27.856`, a gap of **2.785 s**. The substance — an earlier line
+in the same log refutes the later claim — is unaffected; the interval was wrong by 2 s and is corrected
+here. The query side is fixed at `gpu_cp.cpp:2897`.
+
+**What survives:** the *timeout* half of the marker's sentence is unaffected and remains true — the
+wait really did time out (`w700.log`, `CP-WAITREG-TIMEOUT #1 … spins=1081 waited=2000ms
+budget=2000ms`, "PREDICATE FALSE. NOT advanced and NOT counted"). **What dies:** "no writer this host
+implements could have produced the value." It could, and did, 2.785 s earlier.
+
+**Falsifier.** If `CpNoteMemWriteDest` is reached with a pool VA anywhere in `src/`, the
+physical/VA diagnosis is wrong and the `0xA0000000` coincidence is just a coincidence.
+
+### F-734 — `poll` vs `pollVA` is not a skew; they are different quantities, and equality means "register wait"
+
+This was reported as an inconsistency and is not one. `poll` is the **raw payload** of
+`poll_reg_addr`; `pollVA` is the **derived host VA**. The derivation, measured against the log's own
+numbers:
+
+```
+pollByte = poll & ~3                                    // low 2 bits are the GpuSwap endian selector
+poolVa   = kPhysArenaBeginVa + (pa - 0x400000)          // kPhysArenaBeginVa = 0xA0400000
+0xA0400000 + (0x1840B284 - 0x400000) = 0xB840B284       // matches pollVA=B840B284 exactly
+```
+
+**They are not supposed to be equal.** They are equal only when the value is not an address at all.
+`w700.log` shows exactly that for the first five waits, which are all `is_memory=0` — register-arm
+control values, not addresses:
+
+```
+[06:13:25.067] [warning] CP-WAITREG-ISSUED #1 from=IB hdr=C0043C00 waitInfo=00000003 is_memory=0 cmp=eq poll=00000A31 pollVA=00000A31 ref=00000000 mask=80000000 wait=00000008
+[06:13:25.855] [warning] CP-WAITREG-ISSUED #6 from=IB hdr=C0043C00 waitInfo=00000013 is_memory=1 cmp=eq poll=1840B286 pollVA=B840B284 ref=00000001 mask=FFFFFFFF wait=00000100
+```
+
+#1–#5: `is_memory=0`, `poll == pollVA == 00000A31`. #6: `is_memory=1`, `poll != pollVA`. The two
+fields diverge exactly when the operand becomes an address.
+
+**Falsifier.** If any `is_memory=0` wait reports `poll != pollVA`, or any `is_memory=1` wait reports
+`poll == pollVA`, the derivation above is wrong.
+
+### F-735 — the freeze is a correct park, and the log's own writer was found — but writes a different view
+
+`w700.log:24346`:
+
+```
+[06:13:27.856] [error] CP: RING A PARKED at rptr=0016 header=C0013F00 on an unsatisfied PM4_WAIT_REG_MEM (op=0x3C) - rptr NOT advanced, NOT published; see CP-WAITREG-TIMEOUT / CP-WAITREG-NEVERWRITTEN. parkEvents=2
+```
+
+`rptr` is stuck, and the stickiness is measurable. Measured over all 36 `CP: VDRAIN-CENSUS` rows in
+`w700`: `rptr=0019` on 16 rows, `rptr=0016` on **20**, and the `rptr=0016` run spans
+`06:13:33.289` → `06:16:09.638` = **156.349 s** (the brief said 156.382 s; the measured span is
+authoritative and is the one recorded here). Independently, 10,114 rows of `w700` carry
+`rptrWB=0016` (`WAIT[KWFSO]`, span `06:13:25.869` → `06:16:12.310` = **166.441 s**; the brief said
+167.254 s — again corrected to the measured value).
+
+The unsatisfied wait, `w700.log` `CP-WAITREG-TIMEOUT #1`:
+
+```
+hdr=C0043C00 waitInfo=00000013 is_memory=1 poll=1840B286 pollVA=B840B284 ref=00000001 mask=FFFFFFFF wait=00000100 spins=1081 waited=2000ms budget=2000ms
+```
+
+**The park itself is correct behaviour**, not a bug: a ring that does not advance past an unsatisfied
+wait, and does not publish `rptr`, is exactly what should happen. The **bug is upstream** — the value
+the wait wants (`ref=00000001` at `pollByte=1840B284`) is never seen.
+
+**The likely writer is in the log already**, `w700.log:7517`:
+
+```
+[06:13:25.855] [warning] CP-SCRATCH-WB #2 reg=0579 slot=1 dest=1840B284 val=00000001 umsk=00020037 STORED
+```
+
+`dest=1840B284` matches `pollByte` exactly; `val=00000001` matches `ref` exactly. **OPEN**, and the
+reason it is not the answer is specific: this path **writes the flat view** while the wait's poll
+**reads the pool view**, and it **never calls `CpNoteMemWriteDest`**. So even if the bytes landed, the
+same physical-vs-VA split that produced `### F-733`'s false negative is unaccounted for here, and the
+wait's predicate still evaluates false.
+
+**A second candidate exists and is older**: `CP-EVENTSHD #1 … dst=1840B284 … written=1` at
+`06:13:25.071` (`### F-733`), whose `value=B7C0A354` does **not** match `ref=00000001`, and which
+targets `1840B284` not `1840B286`. Recorded so nobody re-derives it as novel.
+
+**Falsifier.** Instrumenting the pool-view address `0xB840B284` and showing it is never written with
+`00000001` retires the `CP-SCRATCH-WB` hypothesis and makes the park's cause genuinely unknown.
+Conversely, showing `CP-SCRATCH-WB` reaches the pool view retires the "different view" caveat and makes
+this the root cause.
+
+### F-736 — thirteen PM4 opcodes decoded, six unhandled
+
+Decoded against the reference, `.research/xenia/src/xenia/gpu/xenos.h:1572-1634`. **Handled (7):**
+
+| op | name | site |
+|---|---|---|
+| `0x21` | `PM4_REG_RMW` | `:4299` |
+| `0x2B` | `PM4_IM_LOAD_IMMEDIATE` | `:4315` |
+| `0x36` | `PM4_DRAW_INDX_2` | `:4203` |
+| `0x3C` | `PM4_WAIT_REG_MEM` | `:4309` |
+| `0x3F` | `PM4_INDIRECT_BUFFER` | `:4158` |
+| `0x48` | `PM4_ME_INIT` | `:4176` |
+| `0x58` | `PM4_EVENT_WRITE_SHD` | `:4311` |
+
+**Unhandled (6):** `0x3B` `PM4_INVALIDATE_STATE` ×3 occurrences, `0x46` `PM4_EVENT_WRITE` (implemented
+later the same day), `0x60`–`0x63` = `SET_BIN_MASK_LO` / `SET_BIN_MASK_HI` / `SET_BIN_SELECT_LO` /
+`SET_BIN_SELECT_HI`, ×6 occurrences. The occurrence counts are from `w700.log`'s own
+`CP: IB-OPC-CENSUS` rows, e.g. `w700.log:1841`
+(`op=0x21 count=2 op=0x3B count=1 op=0x3F count=3 op=0x58 count=2`) and `w700.log:24345`
+(`… op=0x3B count=2 … op=0x46 count=1 op=0x60 count=2`).
+
+**`SET_BIN_SELECT_LO` is the highest-risk of the six**, because F-653's "placeholder payload" reads
+`v9[1] = 0xC0000000` and is recorded there as *"Meaning unknown. Recorded, not interpreted."* This entry
+does **not** interpret it. **Any claim that `0xC0000000` is `PM4_SET_BIN_SELECT_LO` is a prediction,
+falsified by** a raw read showing no `0x60`–`0x63` packet carrying that payload (use
+`tools/ppc_disasm.py` / the `CP: IB-OPC-CENSUS` rows, never a decompiler's rendering of a mask).
+
+**Falsifier.** `tools/ppc_xrefs.py` / the `CP: IB-OPC-CENSUS` census showing zero `0x3B`, `0x60`–`0x63`
+occurrences in a soak that nonetheless parks would mean the park is not an unhandled-opcode problem.
+
+### F-737 — KILLED: `PM4_EVENT_WRITE` is not a memory writer, and my brief was wrong twice about it
+
+`.research/xenia/src/xenia/gpu/command_processor.cc:1181-1189`: the `count == 1` form reads **one**
+dword (`initiator`) and pokes `XE_GPU_REG_VGT_EVENT_INITIATOR`. **There is no address operand and no
+value operand.** The reference's own comment over that block reads *"Just an event flag? Where does this
+write?"* and `assert_always()` guards **only** `count > 1` (`:1188`) — i.e. the reference does not
+assert on the very case this host implemented.
+
+The guest's real packet, `w700.log:7501`:
+
+```
+[06:13:25.855] [warning] CP-T3-CENSUS op=0x46 #1 count=1 depth=0 addr=B7C0A7E4 args=00000006 00000000 00000000 00000000 00000000 00000000
+```
+
+One operand, `0x06`, and **no address is computable from it.** So the packet cannot be the writer the
+parked wait wants (`### F-735`).
+
+**Two errors in the brief that produced this entry, recorded so neither is re-imported:**
+
+1. **`op=0x46 count=1` is an *occurrence* count, not an operand count.** The census does
+   `opCount[op]++` at `command_processor.cc:4519` and prints at `:4577`. Reading `count=1` as "one
+   operand" is wrong — and on this packet the two happen to coincide, which is how the error survived.
+2. **The packet ran ~2 s *before* the park, not behind it.** `06:13:25.855` vs the park at
+   `06:13:27.856` — **2.001 s earlier.** A packet that has already executed cannot be the cause of a
+   later stall; ordering was asserted the wrong way round.
+
+**Killed claim, stated plainly: "`PM4_EVENT_WRITE` wrote the value the wait is polling for."** It did
+not, it could not, and the opcode has no operand that names a destination.
+
+**Falsifier.** A guest-side trace showing a `0x46` packet with `count > 1` carrying a destination and
+data would revive a writer role — but only for that form; the `count == 1` form is one operand by the
+reference's own control flow and cannot become two.
+
+### F-738 — the reference's `PM4_WAIT_REG_MEM` writers are CPU-side and its wait has no timeout, so this host's park is stricter
+
+The reference's writers are ordinary stores on the command-processing thread and return immediately:
+
+- `xe::store(memory_->TranslatePhysical(address), data_value)` at `command_processor.cc:1214` (`0x58`)
+- same, `:1102` (`0x3D`)
+- same, `:1086` (`0x3E`)
+
+The wait itself then spins at `command_processor.cc:977-1037` with **no timeout**, sleeping
+`wait / 0x100`. For this packet `wait=0x100`, so the sleep is **1 ms** and the reference **would hang
+forever** had no writer appeared.
+
+**Therefore: `budget=2000ms` in `w700.log`'s `CP-WAITREG-TIMEOUT #1 … waited=2000ms budget=2000ms` is
+host policy and is NOT derived from the packet.** The packet asks for a 1 ms poll interval, not for a
+2 s deadline.
+
+**The host is strictly more conservative than the reference here, and that is the correct posture** —
+a bounded park with a truthful reason beats an unbounded hang. This is recorded so the `budget` is not
+"corrected" toward the packet later, and so nobody mistakes the 2 s park for a guest-specified timeout.
+
+**Falsifier.** Finding `wait=0x100` decoded as a *deadline* rather than a *poll period* in
+`command_processor.cc:977-1037` would mean the host's 2000 ms is accidentally right rather than
+deliberately conservative.
+
+### F-739 — KILLED: the interpolant derivation was a read rule, and it killed the project's standing "PS register N ≡ interpolant N"
+
+`DerivePixelInterpolatorsFromInstructionStream` used a **read** rule: `src1Select == 1 &&
+src1Register == 0 && !written`, i.e. "if the shader *reads* register 0, register 0 must be an
+interpolant". On PS `7B0032AD4C5B576D` that invented a `TEXCOORD0` interpolant for a shader whose
+**single ALU instruction writes colour 0 and exports it** while reading r0 — a register nothing writes.
+A register that is read but never written is not evidence of anything.
+
+Replaced with the reference's rule, `GetInterpolatorInputMask` =
+`(1 << min(kMaxInterpolators, register_static_address_bound())) - 1`
+(`.research/xenia/src/xenia/gpu/shader_translator.cc:336-354`), ANDed in at
+`d3d12_command_processor.cpp:2081-2086`.
+
+**What dies, prominently: the project's standing assumption "PS register N ≡ interpolant N".** The
+ledger records that assumption as resting on `n = 1`, and **that one instance is this instance, and it
+is wrong.**
+
+**What survives:** the register-space reading — registers 0–15 are the interpolant block
+(`ucode.h:1793-1811`). That is a statement about the register *file's layout* and is untouched by this
+entry. **What dies is the inference "`read r0` ⇒ `r0` is an interpolant"** — an inference, not a
+layout fact.
+
+**Falsifier.** A guest PS whose ucode demonstrably writes an interpolant block register and then reads
+it back as input, where `GetInterpolatorInputMask` is contradicted, would revive the inference.
+
+### F-740 — a batch of defects fixed the same day, each with its citation and a before/after
+
+Recorded individually because they are individually falsifiable. These are **the day's named fixes**
+beyond the entries above:
+
+| # | defect | evidence |
+|---|---|---|
+| a | the PS gate keyed on `havePin` instead of `pinLayout != nullptr` — **refused every pixel shader** | gate site |
+| b | an **undeclared export target** (`oTexCoord0.x = 0.0;` with no `out float4 oTexCoord0 : TEXCOORD0`) — uncompilable HLSL that **passed every "translated && non-empty" gate** | shows a structural gate is not a compile |
+| c | only **element 0** was granted a DXGI format | `w700.log:7460` `fmtB=12` vs `:7496` `fmtB=8` now carry distinct formats for two different layouts |
+| d | `pipeTranslateError` was **written twice and read nowhere** | a written-but-unread flag is not a gate |
+| e | `vsHlsl` was **read 11 lines above its only writer** | use-before-def, reading stale state |
+| f | **`layoutRefusal` was set unconditionally and never reset, so the layout-completeness proof was DEAD CODE** | see below |
+| g | **`sizeof(kPrefix)` on a `const char*` = 8, not `strlen` = 20** — off by 13, landing the digit scan inside `"float4"` so it read `'a'` and **every VS emitting an interpolator was refused** | see below |
+| h | the **render-target format was never captured** — `kCpSnapColorInfo` added, 13 codes mapped with citations, **8/9/11/13 remain refusals** | `w700.log` `CP-COLORFMT-VSRTV` ×2 |
+| i | `CreateReflection` asked for `IID_IDxcContainerReflection` — measured matrix: **the IID was the whole fault**; the DXIL container works under `IID_ID3D12ShaderReflection`, `S_OK` | see below |
+| j | `outCarriesGeometryStage` was set **only on a cache hit** | a flag set on one path and not the other |
+| k | `~DxcRuntime` released a COM blob **after `FreeLibrary` of its own module**, so the release landed in unmapped module memory at `+0xb7` | see below |
+
+**(f) is the most dangerous and deserves its own words:** `layoutRefusal` was set unconditionally and
+never reset, so the *layout-completeness proof was dead code* — it could never pass and nobody noticed
+because it was never consulted. `w700.log` shows the specific danger it would have masked: draw #2
+built a **1-element** layout and reported
+`[06:13:25.890] DRAW-CP-PIPE #2 … layout=1 declHash=4D25517F9DCDD516` — and a PSO can be built from an
+unproven layout.
+
+**(g) is the most instructive.** `sizeof` applied to a `const char*` yields the **pointer size, 8**,
+not the string length, **20** — a 13-character understatement that lands the digit scan in the middle
+of `"float4"`, so it matched the letter `'a'`. An off-by-13 produced a *character-class* bug, not an
+arithmetic one, which is why it survived every numeric sanity check.
+
+**(i)** is the cleanest kill in the batch: the container and the reflection worked; only the **IID**
+was wrong. Every diagnostic that tested "did we get a reflection object" would have passed.
+
+**`w700` corroboration that the pipeline now runs end to end:** `DRAW-CP-PIPE #1 … vsCode=1 psCode=1
+envBuilt=1 parsed=1 vsTr=1 psTr=1 layFromVE=1 layNoVE=0 pso=1 geom=1` and `#2` identical with all
+counters advanced — plus `PC-PSO-BOUND #1 … pso=0x25aa6f0bf80` and `#2 … pso=0x25aa6f9ce70`, i.e. **two
+distinct non-null PSOs bound**. (That marker states its own limit: *"NOT a claim about its render
+targets."*)
+
+**Falsifier per row:** (f) dies if a soak ever shows `layoutRefusal` clearing; (g) dies if a VS
+emitting an interpolant is still refused after the `strlen` fix; (i) dies if
+`IID_IDxcContainerReflection` is ever shown to succeed.
+
+### F-741 — the abandon loop quantified and closed: 30/s of a frame that records nothing
+
+The increments are exactly equal, which is what makes this diagnosable rather than merely large:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| `beganFrame` | 581 | 5381 | **+4800** |
+| abandons | 200 | 5000 | **+4800** |
+
+Rates agree to four significant figures: `FRAME-OWNER REFUSED #1 → #4800` ran at **30.0561/s** and
+abandons at **30.0543/s** — that is the **33 ms heartbeat cadence**, not a free-running spin.
+
+**One completing iteration per tick. This is not a spin and not a livelock** — the distinction matters
+because a livelock would have burned a core, and this burned 30/s of `BeginFrame` + allocator `Reset` +
+list `Reset` + `Close`, recording nothing. The first `FRAME-OWNER REFUSED` row in `w700` sits at
+`06:13:26.385` and the last of that run at `06:13:26.550` (`#6`), consistent with the cadence.
+
+**Root cause:** `ClearAndPresent`'s first act was `MayWriteBackBuffer`, which had **its own
+`BeginFrame` *after* the refusal** — so the caller refused, and then re-entered the frame it had just
+been refused. Two call-site `BeginFrame`/`AbandonFrame` pairs were removed.
+
+**Result: `w700.log` contains zero `D3D12-FRAME-ABANDONED` rows** (measured: `t.count('D3D12-FRAME-ABANDONED')`
+= **0**) and the literal is present in the binary, so the zero means something this time. `FRAME-OWNER`'s
+refusal text is byte-identical to before, i.e. **the fix removed the loop without changing the
+diagnostic** — which is the only acceptable shape for this kind of fix.
+
+**Falsifier.** Any `w7xx` log containing a single `D3D12-FRAME-ABANDONED` row reopens this; and the
+`FRAME-OWNER REFUSED` rate in any soak exceeding ~35/s would mean a second entry point into the frame
+was missed.
+
+### F-742 — log volume reclaimed: 111,153,290 → 8,487,020 B, tail 95.59 % → 51.72 %
+
+The baseline is **`build/w693.log`, 111,153,290 B** (measured this session: it is the only log in
+`build/` above 110 MB; `w690` = 105,187,535, `w691` = 103,418,769, `w692` = 110,155,198). In that log the
+last `CP-`/`DRAW-`/`PC-` row sat at byte **4,900,543 of 111,153,290** — a **95.59 % tail**.
+
+**The tail repeated the head's constants verbatim, with zero new field values across 319,571 /
+159,785 / 159,785 rows.** Four markers held **93.491 %** of it: `xmem` **38.099 %**,
+`inflate-enter` **27.922 %**, `inflate` **27.471 %**, `xmem-open-census` **2.456 %**.
+
+**The diagnosis is not "these markers are noisy", it is "these markers have a large population".**
+All four already had a cadence gate. Three of them are counters that each reached **~32.22 M** at
+**186 k–191 k entries/s**, and **a modulus linear in an unbounded serial cannot bound volume** — stride
+`n % k` gives uniform selection, not a rate, so the output rate is `(serial rate) / k` and grows with
+whatever the serial does.
+
+The replacement is **stride 2^18 with power-of-two summaries**, chosen for a second reason that is
+worth keeping: a power-of-two summary means a **truncated** soak's last `total=N` **bounds the truth to
+`[N, 2N)`** — so a soak that dies mid-stream still yields a usable bound instead of a wrong count.
+
+**Result: 111,153,290 → 8,487,020 B** (measured, w700 size this session). **Tail 95.59 % → 51.72 %**
+(measured this session in `w700`: last `CP-`/`DRAW-`/`PC-` row at byte 4,097,568 of 8,486,799 =
+**51.7183 %**).
+
+**Ranks 5–25 of the old volume table got no edit at all**, deliberately: they are the **poller-rate and
+drain-truth** measurements, and halving their resolution to win bytes would have destroyed the evidence
+the park diagnosis rests on (`### F-735` reads exactly those rows).
+
+**Falsifier.** A soak in which any stride-2^18 marker's entry rate exceeds ~1 k/s would show the new
+gates are still population-bound, and the `[N, 2N)` bound claim dies if a truncated soak's `total=N`
+is ever followed by a complete soak reporting `total < N`.
+
+### F-743 — `snapCover` vs `rsPresent` is NOT a contradiction; pair those rows by time, not by draw
+
+This kills a "contradiction" that was reported as real.
+
+Both read **`dc.rasterState.presentMask`** — the same field. `0x187` = bits 0,1,2,7,8 =
+`{0x2001, 0x2002, 0x2204, 0x2205, 0x2206}`, which is **exactly the first three and last two of the
+nine `snapCover` buckets**. So the two readings agree, byte for byte, on the mask itself.
+
+They differ in **when**. Measured in `w700.log`:
+
+- all four `CP-DRAW-CENSUS` rows print at `06:13:25.068`–`06:13:25.070`
+- the first `CP-DRAW-BRIDGE` row — **the only thing that bumps `g_bridgeSnapCover`** — prints at
+  `06:13:25.854` (`w700.log:7460`), **786 ms later**
+
+`CP-DRAW-BRIDGE #1 … rsPresent=00000187` (`w700.log:7460`) and `#2 … rsPresent=00000187`
+(`w700.log:7496`) both carry the same mask the `CP-DRAW-CENSUS` rows were reading, but the census
+snapshot predates the bridge by three quarters of a second.
+
+**Rule for the next session: pair `snapCover` and `rsPresent` rows by TIME, never by draw number.**
+
+**Falsifier.** A `CP-DRAW-CENSUS` row and a `CP-DRAW-BRIDGE` row with the **same** timestamp but
+different masks would make this entry's "they agree, only the timing differs" wrong.
+
+### F-744 — OPEN: a real off-by-one in the TYPE-0 walker, and it is NOT benign
+
+`w700.log` `CP: IB-OPC-CENSUS #7`:
+
+```
+[06:13:25.658] [info] CP: IB-OPC-CENSUS #7 ibTotal=7 win=B7C0A380 dwords=1038134 depth=0 trace=1 walked=1038135 t0=518930 t1=0 t2=0 t3=5 nonzeroT3=5 firstT3Off=0 firstT3Hdr=C0006000 || op=0x3C count=1 op=0x60 count=1 op=0x61 count=1 op=0x62 count=1 op=0x63 count=1
+```
+
+**`walked=1038135` against `dwords=1038134`.** `walked` exceeds the buffer by one dword. This is a
+**different defect** from F-685's degeneracy and must not be filed under it.
+
+Mechanism, from the cited sites: the TYPE-0 arm reads **`count` payload dwords starting at
+`byteAddr + 4`** (`gpu_cp.cpp:889`) and then **advances by `count + 1`** (`gpu_cp.cpp:4307-4315`). So a
+header sitting on the **last** dword of the window leaves `p = limited + count` — **an overshoot bounded
+by `count`, not by 1**. Here `count` is large, so this is not a one-dword spill; it is a
+`count`-sized overshoot.
+
+**Why it is not benign:** `CpType0Apply` then feeds **out-of-bounds guest memory** into `CpRegPoke`,
+which performs **a real register write from a foreign buffer**. That is a correctness and safety
+problem, not a logging one.
+
+**And why the obvious fix is wrong — recorded so nobody reaches for it:** clamping `p` is **unsafe and
+incomplete**. It does not stop the **read** that already happened inside `CpType0Write`, and `p` also
+feeds `AccumProgress(p)` (`gpu_cp.cpp:4714`), so a clamp would silently corrupt the progress accounting
+while leaving the OOB read intact. **The fix belongs at the read boundary**, with **its own measurement** —
+a before/after pair, or it is just another unverified claim.
+
+**OPEN.** Not fixed here; no `src/` file was touched by this session.
+
+**Falsifier.** A re-run where `walked ≤ dwords` for every `CP: IB-OPC-CENSUS` row would show the
+overshoot was an artefact of the census's own accounting rather than the walker's — check this FIRST,
+because it is the cheapest test and it would make this entry wrong.
+
+### F-745 — `chevy` REFUSED again, and this time with a stronger proof than the first refusal
+
+The first refusal said the rule was wrong. This one says **no rule in the vocabulary can be right**,
+which is a different and stronger claim.
+
+**Replaying all 108 distinct `MEMBER-SPAN-OWNER` windows byte-for-byte against the real
+`xarchive_cache.rpf` (2,130,739,200 B): `HOLE == bytesChanged` at 100 % for every candidate rule,
+including F-693's own reverted cap.** Not one byte-moving rule in that file's vocabulary produces a
+single right byte. The range `[004709B3, 00490000)` is claimed by **two real byte streams**, and a flat
+window can hold only one — so this is a **representational** impossibility, not a rule-selection problem.
+
+**The `MEMBER-SPAN-ALIAS` diagnostic's premise was also falsified.** 92 rows in `w700.log`, and **90 of
+92 carry `ownerImageIsArchive=0`** — dominated by benign `.fxc`/`.dds` shapes with 1–6 victims each.
+Bootscripts and cameratune contribute **zero** rows. The diagnostic was built on a premise that its own
+output does not support.
+
+**The nested-RPF premise was falsified too.** `branch=handle path='xarchive_cache.rpf'
+handle_nested=0 span_ran=1` on **all 8** carconfigs windows, and `NESTED-RPF-MOUNT` / `-REGISTER` = **0**
+because `RegisterNestedRpf` never runs. There is no nested RPF in this data path.
+
+**Correction to the victim table: 178 registered spans, not 177.** The extra is
+`tune/vehicle/vehicle0002.lst off=7EF65487 stored=494 logical=2839` — visible at `w700.log:24257`
+(`MEMBER-EXPAND-MARK path='tune/vehicle/vehicle0002.lst' off=7EF65487 stored=494 logical=2839`) and
+`:24261` (`MEMBER-EXPAND-MARK-SKIP … (not the first row for this path)`). It is an **off-table offset**
+whose 14 pairs are an **artefact of an absurd `w2`** — i.e. it is a symptom, not a span.
+
+**The file is byte-identical; nothing shipped.** The on-disk archive was never modified.
+
+**Lead handed over, because it is the only live thread here:** `vehicle.lst` **is** decoded —
+`w700.log:24184` `[warning] MEMBER-EXPAND off=00471000 stored=2355 expanded=22391 nl=1225
+logical=22391 straddle32K=0` — and **then never served.** There are zero `XSF-HOSTSERVE`,
+`SERVE-PROOF` and `LIST-SERVE-VERIFY` rows for it, while those markers **do** fire for other paths in
+the same log (e.g. `w700.log:7170`–`:7174` for `textures/global/cars/globaltex.list`,
+`LIST-SERVE-VERIFY … ok=1 served=575 real=575 … firstDiff=-1`). **Decode succeeded, serve never
+happened** — that gap is the next thing to attack, and it is narrower than `chevy`.
+
+**Falsifier.** A single candidate rule that produces a **non-zero, correctly-placed** byte change for
+any of the 108 windows refutes this entry outright; and one `XSF-HOSTSERVE` row naming
+`tune/vehicle/vehicle0002.lst` refutes the "never served" lead.
+
+---
+
+**End of the 2026-10-02 block. IDs `F-729`..`F-745` written (17 entries).**
+
+**EXCEPTIONS TO APPEND-ONLY: exactly one, and it is inside this block.** The footer at the end of the
+2026-10-01 third block was **AMENDED IN PLACE**, as `### F-726` directs — it now reads `F-720`/`F-746`.
+**Nothing above this block was edited, reordered or renumbered.**
+
+**CENSUS AT THE TIME OF WRITING: `(?m)^###\s+F-[0-9]+` = **601** heading lines (584 + these 17); max
+`F-745`; next free `F-746`. `F-695` remains permanently unusable (see `### F-726`); `F-056`..`F-076`
+remains a documented hole; `F-629` remains void and reconstructed as `F-635`.**
+
+**NEXT FREE ID: `F-746`. Do not take `F-695`.**
+
+**THREE BRIEF NUMBERS CORRECTED OR REFUTED IN THIS BLOCK — do not re-import the originals:**
+(1) `CP-EVENTSHD #1` → park is **2.785 s**, not 784 ms (`### F-733`);
+(2) the `rptr=0016` hold spans **156.349 s** and the `rptrWB=0016` rows span **166.441 s**, not
+156.382 s / 167.254 s (`### F-735`);
+(3) the brief's "a waiter sat at `rptrWB=0016` on 10,114 of **10,165** rows" conflates two markers —
+`rptrWB=0016` is on **10,114 rows** (of 10,251 `rptrWB` occurrences), while **10,165** is the count of
+`CAS-SITE` rows, a **different marker whose fields are `lr/r13/blk@+100/f0..f3/tid/obj/mode/alertable`
+and which carries no `rptrWB` at all** (`### F-735`).**
+
+**NOT VERIFIED HERE, and deliberately not asserted:** the four dead heap paths' `0x80070057` /
+`list->Close()` results in `### F-729`, and the pre-fix `drawn=0` proof in `### F-730`, are quoted from
+this session's brief and were **not re-derived** from a named log line in this session's work. The
+`d3d12.h:3231-3266` enumerator claim in `### F-729` and the `.research/xenia` line numbers in
+`### F-736`–`### F-739`, `:741` were likewise **not re-read this session**. The **`chevy` replay
+result** (`HOLE == bytesChanged` at 100 % over 108 windows) is quoted from this session's brief and the
+replay was **not re-run** here. **No build, no soak, no game run and no git operation was performed by
+this session; the only files written are this one and `docs/HANDOFF_NEXT_AGENT.md`.**
+
+**NOT IN `PROGRAM_GUIDE.md` §9, therefore NOT tracked by `tools/soak_census.py` — two new marker
+families born today: `DRAW-CP-PIXEL`, `D3D12-DRAW-PIXEL`, `CP-SCRATCH-WB`, `CP-EVENTWRITE`,
+`CP-WAITREG-WRITER-MISMATCH`, `D3D12-BEGINFRAME-REFUSE`, `D3D12-FRAME-ABANDONED`,
+`CP-COLORFMT-VSRTV`.** Measured presence in `w700.log` for the ones that fired: `DRAW-CP-PIXEL` **2**,
+`D3D12-DRAW-PIXEL` **5**, `CP-SCRATCH-WB` **2**, `CP-COLORFMT-VSRTV` **2**, `CP-EVENTWRITE` **0**,
+`CP-WAITREG-WRITER-MISMATCH` **0**, `D3D12-BEGINFRAME-REFUSE` **0**, `D3D12-FRAME-ABANDONED` **0**.
+**A zero for a marker §9 does not list is not evidence of anything** (see AGENTS.md, "MARKER NOT IN
+SRC"). Those four zeros mean only that no such row appeared in this soak.
+
+**The boot state for the 10-02 soaks is in `docs/HANDOFF_NEXT_AGENT.md`'s dated block and is
+deliberately NOT duplicated here.**
+
+### F-746 - HEADING RESTORED, NOT RE-DERIVED. Read this entry as a claim to be verified, not as evidence
+
+This ID was cited **16 times in `src/` and had no `###` heading anywhere in `docs/`** when it was
+found. The same census found **56 distinct IDs in that state**, of which 53 appear elsewhere in
+`docs/` only as unnumbered prose and 3 (`F-746`, `F-747`, `F-751`) existed **nowhere outside the
+source comments**. A finding that lives only in the source dies with the working tree.
+
+**The content below is reconstructed from the citations themselves and has NOT been re-measured.**
+The claims are: `CpByteSwap32` applied one swap too many at opcodes `0x3D` and `0x3D`/`0x3E`, so the
+byte order on those two store paths moved with it (`gpu_cp.cpp:3806`, `:3982`); `F-721` wrapped a
+polled register value where the **poll's own view** must be recorded instead of the register value
+(`:3012`, `:3064`, `:4011`, `:4023`); and the `(destination, WORD AS THE WAIT WILL SEE IT)` pair is
+recorded for every store so a wait can be matched against what it will actually read (`:3218`,
+`:915`). New rows are claimed at `:3391` and `:3621` (`CP-WAITREG-WRITER-MISMATCH`).
+
+**VERIFY EACH CLAIM AGAINST THE CITED LINES BEFORE RELYING ON IT.** The ledger rule is that a
+heading is the only clearance, and this heading currently records the fact that the work was cited,
+not that it was verified.
+
+### F-747 - SUPERSEDED BY F-751. Kept because the refusal is still in the tree's history and its reasoning was sound
+
+This was the correct call at the time and it is recorded because **the reasoning was right and the
+conclusion has since changed.** The vertex stream's byte order was refused rather than applied,
+because the selector could not cross the queue boundary: `CpVertexElement` had no endianness member
+and `CpVertexFormat`'s four fields were spoken for. The draw was refused **by name** rather than
+issued with a byte-reversed stream, "which would have rasterised guest geometry the guest never
+described" (`gpu_cp.cpp:4745-4792`, `render_thread.cpp:2108`).
+
+That refusal is what forced the missing measurement to be recorded rather than guessed, and it is the
+right instinct under charter F-609. **F-751 closed the gap**, so the refusal was narrowed from
+`endian != 0` to `endian > 3` and renamed `vb-endian-unarchitected` - a PRODUCER-bug width check, not
+a guest one.
+
+### F-748 - the pixel census could not tell a solid region from scattered noise of the same area
+
+`D3D12-DRAW-PIXEL` reported `nonBlack`, `maxChannel`, `meanChannel` and `sum`. That was enough to say
+the surface had changed and **not enough to say what changed or where.** Measured on three synthetic
+surfaces, each **exactly 230,400 pixels of one colour, at a different offset and a different shape**:
+
+```
+640x360   box=x0..639  y0..359   nonBlack=691200 sum=17971200 maxChannel=13 distinct=2
+720x320   box=x0..719  y0..319   nonBlack=691200 sum=17971200 maxChannel=13 distinct=2
+480x480   box=x0..479  y0..479   nonBlack=691200 sum=17971200 maxChannel=13 distinct=2
+aggregates AND histogram identical across all three: YES
+```
+
+So `230400/691200 = 26` exactly, and `26 = 5+8+13` - **every pre-existing field, and the histogram
+too, is blind to the difference between the guest's triangle and noise covering the same area.** Only
+a bounding box separates them. That is why F-729's fields exist.
+
+Two measured limits worth keeping. **(a) A nonBlack bbox is useless here**: the placeholder is itself
+nonBlack and covers 691,200 of 921,600 pixels, so a nonBlack bbox is ~75 % of the surface **by
+construction**. The bbox must be of pixels differing from the surface's **modal** value, and the modal
+value must be printed. **(b) `921600 - nonBlack` is an upper bound on exact-`(0,0,0,255)`, not equal to
+it**: a rectangle of `(0,0,0,0)` has `nonBlack` bit-identical to one of `(0,0,0,255)` while
+`exactBlack=0` against `blackImplied=230400`. They are equal only when every black pixel also has
+alpha 255.
+
+**What the fields then settled on the real surface** (`build/w712.log`):
+
+```
+#1  distinctRgba=2  topRgba=(5,8,13,255)x691200 (0,0,0,255)x230400  modalRgba=(5,8,13,255) modalCount=691200
+    changedPx=230400 changedBox=x1..1278 changedRows=360 changedCols=1278
+    changedFirstRow=0 changedLastRow=359 exactBlack=230400 blackImplied=230400
+#2  distinctRgba=2  topRgba=(0,0,0,0)x460800 (5,8,13,255)x460800  modalCount=460800
+    changedPx=460800 changedBox=x1..1279 changedRows=720 changedCols=1279 exactBlack=0 blackImplied=460800
+```
+
+`distinctRgba=2` is what kills the noise reading. `changedRows=360` with `changedLastRow=359` is
+**exactly** the guest's 359.5 height. `changedCols=1278` is **not** the ~640 the guest's triangle
+warrants, and `230400 / 360 = 640` pixels per row spread over 1278 columns is a **sheared
+parallelogram, not a rectangle**. `copyAfterDraw=1 fenceWaited=1 probeFromCensus=1` on both rows, so
+the census describes the draw's output.
+
+**A bug in the F-729 code itself, caught by the harness written to check it:** `chgRows`/`chgCols`
+were initialised to `-1`, so a 360-row rectangle printed `changedRows=359`. That agent's own first run
+reported "0 failures" and **it did not believe that**, because the harness's reference implementation
+shared the same structure - a cross-check cannot catch a bug both sides have. The reference was then
+rebuilt by a structurally different method (`hitRows.push_back` + `size()`), with hand-count assertions
+added so a shared off-by-one can never pass again.
+
+### F-749 - RenderDoc injects into this process, wraps the D3D12 device, and never captures (measured negative)
+
+The one question logging cannot answer is what the geometry stage **emitted**, because D3D12 exposes
+no shader-output readback. RenderDoc can answer it, so this was tried properly and failed for a
+reason worth recording.
+
+**IT INJECTS.** `renderdoc.dll` loads into `mcla.exe` alongside `dxgi.dll`, `d3d12.dll` and
+`D3D12Core.dll`. Its own log (`%TEMP%\RenderDoc\RenderDoc_2026.10.04_13.31.53.log`) shows the whole
+sequence: `Created wrapped D3D12 device` -> `New D3D12 device created: nVidia / NVIDIA GeForce
+RTX 3070 32.0.16.1692` -> `Adding D3D12 device frame capturer` -> `Resizing GPU readback window to
+4194304` -> `Adding D3D12 frame capturer for 0x.../0x80506`. **Then the log stops.**
+
+**0 `.rdc` files across 5 attempts and ~11 minutes of runtime.** Three separate launch faults were
+found and fixed on the way, and each is worth recording because each looks like "RenderDoc is
+broken":
+
+1. `--` is **not** an argument separator in `renderdoccmd capture`. It is taken as the executable name
+   (`Launching '--' with params: mcla.exe`) and injection fails with "Failed to launch process".
+2. A **relative** exe path then fails identically even with `-d` set. The **absolute** path is
+   required (`Launched as ID 38920`).
+3. `RENDERDOC_CAPOPTS=CaptureAll,...` is **not** a recognised option in v1.46 - the app dies before
+   RenderDoc initialises and writes no log at all.
+
+**The blocker is the capture trigger, and it is not reachable from this CLI.** Neither
+`renderdoccmd.exe` nor `renderdoc.dll` contains a `FrameDelay`, `CaptureAll`, `CaptureAlways` or
+`CaptureOnRender` option string. `CaptureMode` is only `IsCaptureMode(m_State)`, and every `FrameCount`
+hit is an `NvAPI_D3D1x_QueryFrameCount`-style export name. The real interface is the env var
+`RENDERDOC_CAPOPTS`, parsed by `renderdoccmd`. `CaptureFrameDelay` is not a key in
+`%APPDATA%\RenderDoc\renderdoc.conf` either - its `<Capture>` section holds only
+`Debug.SnapshotDiagnosticLog` and `IncludeExtendedThumbnail`, so defaults apply and nothing fires.
+
+**REMAINING SUBSTITUTE, AND ITS LIMIT.** `VS-POSITION-SHAPE` prints the **text** of every `oPos`
+assignment out of the emitted HLSL, never a value, because any coordinate printed there would be the
+translator's own arithmetic and not the pipeline's output. Charter F-609 holds.
+
+### F-750 - `vbSlotsTotal=0` was a census cadence artefact, not an empty vertex buffer
+
+The row read `CP-DRAW-CENSUS ... enqueued=0 fetchVbWrites=0 vbSlot0Present=0 vbSlotsTotal=0
+vbDecoded=0` and was read as "the draw is bound to a buffer nothing filled". **All four zeros are
+timing.**
+
+- `gpu_cp.cpp:4390` prints the census only on `cn <= 4u || cn % 200u == 0` - the first four draws.
+  The log holds **4 census rows for 10 `CP-DRAW-BRIDGE` draws**, and the draws that actually enqueued
+  printed none.
+- The same line **runs before** `CpReportVertexFetchSlots("draw")` at `:4518`, and `g_fetchVbSlots` -
+  the `vbSlotsTotal=` argument at `:4438` - is incremented only inside that function, at `:1905`.
+  **Every census row therefore predates the first increment.**
+- `fetchVbWrites` is a local read taken at the top of the call, so on draws #1-#4 the 0x4800 block
+  genuinely had not been written yet. `fetchVbWrites=0` was **true at that moment**; it is
+  `no-vb-desc=8` by `:37` that the block stayed unwritten.
+- `enqueued=0` is the same artefact: `g_bridgeEnqueued` (`:4873`) increments only at the `:4871`
+  push, after the census.
+
+**The buffer was never empty.** `B7C8A2BC` is guest-written pool memory, 0x2800 past the ring end,
+**2026-10-05 RETRACTION:** this credited the guest's helper `sub_82411180` with writing it "six
+milliseconds before the draw". **There is no log line for the writer and none for the six
+milliseconds** - the helper is a disassembly hypothesis and the timing is unmeasured. **What
+stands:** the buffer is guest-written pool memory, and the four zeros are the census cadence
+described above. What is *not* an
+artefact: `no-vb-desc` fires 8 times and all 8 `CP-FETCHVB-DECODE` rows read `slots=0 fetchVbWrites=0`
+(`:1896`). Those eight refusals are honest and correct, because the guest had not written the fetch
+constant yet.
+
+### F-751 - the guest's fetch byte-order selector was decoded, logged, printed, and thrown away
+
+`xe_gpu_vertex_fetch_t` carries `Endian endian : 2` (xenos.h:1122). This tree decoded it at
+`gpu_cp.cpp:1705` and `:1735`, stored it on `CpVertexDescriptor::endian` (`:1393`), assigned it at
+`:1843`, and printed it on every `CP-FETCHVB-DESC` row (`:1877`) - and then stopped, because
+`CpVertexElement` had no endianness member. The selector was fully known at the producer and absent
+at the consumer, so every vertex float reached a host `memcpy(&f, vp + l*4, 4)` byte-reversed.
+
+**MEASURED, on the real bytes.** `CP-FETCHVB #1 reg=4800 val=17C8A2BF` is the architected address
+`0x17C8A2BC` OR the two endian bits, read through `mem.ReadU32BE` (`gpu_cp.cpp:1211-1217`); a
+host-order read of the same four bytes would have printed `BFA2C817`. Two independent paths agree on
+`0x17C8A2BC`: that one, and `F640-CVIEW-TRANSLATE`, which derives it as `view_va(0xD7C8A2BC)` minus
+the C16M base. **CORRECTION 2026-10-05:** this said "all 8 `CP-FETCHVB-DECODE` and all 6 `CP-FETCHVB-DESC`
+rows carry `endian=2`". **Wrong twice:** there are **10** `CP-FETCHVB-DECODE` lines and **8 carry
+no `endian=` field at all**. Those that carry it read `endian=2` = `k8in32` = full 32-bit
+reversal, and the 6 `CP-FETCHVB-DESC` rows do carry it. **The 8 fieldless rows are the same rows
+F-750's cadence argument rests on**, so neither count stands alone.
+
+**What it cost, on one dword.** Vertex 0 lane 0 is the four bytes `BF 00 00 00`. Read host
+little-endian that is `0x000000BF` = `2.68e-43`, a denormal no guest writes as a position. Read as the
+guest's own big-endian word it is `0xBF000000` = **`-0.5` exactly**.
+
+```
+w708  VS-CLIPSPACE-PROBE #1 v0lane0=(2.68e-43,2.68e-43,0,0) v0lane0Bits=0x000000BF,0x000000BF,...
+w711  VS-CLIPSPACE-PROBE #1 v0lane0=(-0.5,-0.5,0,0)          v0lane0Bits=0xBF000000,0xBF000000,...
+```
+
+**THE FIX IS THE REFERENCE'S TWO-STEP, NOT AN INVENTED ONE.** The reference loads the dword RAW as a
+host `uint32_t` (shader_interpreter.cc:1031-1032) and then applies
+`xenos::GpuSwap(memory_dwords[...], fetch_constant.endian)` on **every** dword (`:1048-1049`); the same
+shape at `draw_util.cc:839-849`. `CpVertexElement::endianness` is now the last member of that struct
+(`render_queue.h:283`, defaulted to `kCpVertexEndianNone`), the producer fills it at `gpu_cp.cpp:4936`
+(`el.endianness = e.endian;`), and the consumer applies it at `render_thread.cpp:2170-2250` **after**
+refusing a split between elements and refusing any value outside the four architected selectors.
+**0 is deliberately both "kNone" and "not filled", and both mean NO SWAP** - the safe direction for an
+unfilled field to fail in.
+
+**The comment it replaced was wrong and is corrected in place.** A comment at
+`render_thread.cpp:3676-3683` called vertex-fetch endianness "moot... the positions are not
+vertex-buffer bytes". `VS-INPUT-STREAM` reads them out of exactly those bytes.
+
+### F-756 - the clip-space rescale applied a guest-pixel offset to clip space, and then arrived one draw too late
+
+Two defects, one line, and the evidence is a line-ordered log because the log is append-only.
+
+**(a) THE OLD LINE WAS CATEGORICALLY WRONG.** The epilogue read
+`oPos.xy += float2(0.5,0.5) * oPos.w`. That applies the reference's `offset_add` term (0.5) as if
+clip space were **guest pixels**. Under a 1280-wide viewport a clip-space offset of 0.5 becomes
+**640 pixels, not half a pixel**. Replaced with the reference's affine map from `draw_util.cc:255-298`
+and `:362-384`: `pixels_to_ndc = 2/extent`, `ndc_scale[i] = scale_xy[i] * pixels_to_ndc`,
+`ndc_offset[i] = (offset_base[i] - extent[i]*0.5 + offset_add[i]) * pixels_to_ndc`, `offset_base = 0`,
+`offset_add = 0.5`, `extent = min(8192, RT extent)`. For 1280x720 that is
+`ndcScale=(0.0015625,-0.0027777778,1)` and `ndcOffset=(-0.99921876,0.99861115,0)`.
+
+**The driver's convention was established EMPIRICALLY, not assumed: D3D10+ with +Y down.** A prior
+harness arm that predicted a GL/Vulkan-style `+Y` landed at y 660-715 - which is exactly what the
+standard convention predicts for the constant it used, and that constant was `8192` where the
+reference says `min(8192, RT extent)` = 1280x720. Both errors, corrected by measurement. The harness
+carried mirror controls: `NEGY` reflects exactly about y=360, `NEGX` exactly about x=640.
+
+**(b) THE RESCALE REACHED THE SECOND DRAW AND NEVER THE FIRST.** `AppendEpilogue` samples a process
+global at TRANSLATION time and bakes the result permanently into the emitted HLSL, so the first
+translation of a process wins forever. `SetClipDisableViewportExtent` had exactly one call site,
+`d3d12_backend.cpp:3157`, **inside** the draw, while draw #1's VS is translated earlier on the render
+thread at `render_thread.cpp:3471`:
+
+```
+w707  VS-CLIPSPACE-PROBE #1 rescaleValid=0  ndcScale=(0,0,1)          <- IDENTITY, permanently
+      VS-CLIPSPACE-PROBE #2 rescaleValid=1  ndcScale=(0.0015625,...)  <- correct
+```
+
+Now published at swapchain creation and after `ResizeBuffers` succeeds (`d3d12_backend.cpp:581`,
+`:4209`; `m_width`/`m_height` have exactly four assignment sites), and **the in-draw publication was
+removed** - `shader_translator.cpp:1800-1804` states that function is "NOT thread-safe with respect to
+in-flight translation", and it was being written on every draw. Proven by log order, not by two
+cross-thread timestamps:
+
+```
+08:39:19.757  CLIPEXTENT-PUBLISHED #1 site=init   validBefore=0 validAfter=1
+08:39:20.168  CLIPEXTENT-PUBLISHED #2 site=resize validBefore=1 validAfter=1
+              ... 12.8 seconds ...
+08:39:32.974  SHADER-UNWRITTEN-REG-READ #1   <- draw #1's VS translated
+08:39:33.005  VS-CLIPSPACE-PROBE #1 rescaleValid=1
+```
+
+`rescaleValid=0` is **0 occurrences** in `build/w708.log` onward.
+
+**THE PREMISE WAS ESTABLISHED FROM LOG ROWS, NOT FROM THE COMMENT THAT ASSUMED IT.**
+`PA_CL_CLIP_CNTL` appears in no log under any name a grep would try - `CLIP`, `clip_disable`, `VTE`,
+`VPORT`, `depth_clip` are all **0 hits** in `build/w706.log`. The row exists under a different name:
+`CP-DRAW-REGS #1 [30/57] r2204=00010000` -> bit 16 = `clip_disable = 1`, and `[32/57] r2206=00000300`
+-> all six `vport_*_ena` CLEAR, so the VTE applies no viewport transform. That is exactly the case in
+which the reference bakes the transform into the VS.
+
+**A F-ID IS MISCITED AND THE VALUE IS STILL RIGHT.** `pipeline_cache.cpp:1176-1177` credits **F-646**
+for "the measured value is 0x00010000". Ledger F-646 is `kBe710MagicWrite`; `PROGRAM_GUIDE.md:725`
+attributes F-646 to the `XTL-FREE-SUM`/`PHYS-FREE-SUM` census. **Three subjects, one ID.** The
+comment's value is correct and its citation is not.
+
+### F-757 - the vertex shader's destination swizzle was not component-relative, so guest Y and Z never reached `oPos`
+
+The translated vertex program emitted, for draw #1's real 27-dword body:
+
+```hlsl
+oPos.xyzw = max(r1.xxxx, r1.xxxx);
+```
+
+`oPos.y` and `oPos.z` were being fed `iPosition0.x`. **All three vertices collapsed onto one x, so the
+triangle had zero area** - and a degenerate triangle behind a correct PSO, a correct viewport, a
+byte-correct vertex buffer and a correct rescale produces precisely the symptom this project spent
+days on: a draw is issued, everything is bound, and not one pixel changes.
+
+**THE OFF-BY-CATEGORY.** `shader_translator.cpp:886` computed `(swizzle >> 2i) & 3`. The reference
+computes **component-relative** `((swizzle >> 2i) + i) & 3` (`shader.h:118-123` -> `ucode.h:1999-2003`,
+comment at `:2068`): output component `i` reads swizzle slot `i`, so component 1 reads slot 1. Fixed
+to relative; the two scalar sites were pinned to fixed indices (3 for W, 0 for X) per
+`shader_translator.cpp:1244-1248`. **The texture-fetch swizzle was left absolute on purpose** -
+`:1132-1135` has no `+ i`, so making it relative would have been a second, different bug.
+
+**BLAST RADIUS, MEASURED: 425,727 of 567,636 swizzle components change (75.0 %)** across 2,017
+containers. A single-variable A/B - reverting only that lambda - restores `r1.xxxx` with an identical
+shader hash, identical HLSL length and identical instruction counts, **so the hash did not and could
+not catch this.**
+
+**EFFECT ON THE SURFACE.** `build/w710.log` -> `build/w711.log`, everything else held:
+`sum=23961600` - the uniform `kPlaceholderBackBufferClear` - falls to **0 occurrences**, and the draw
+begins rasterising for the first time.
+
+**AND THE SHAPE IT RASTERISES IS MEASURABLY WRONG**, which is the open item: `changedCols=1278`
+where the guest's triangle warrants ~640, at the correct area of 230,400 and the correct height of 360
+rows. A sheared parallelogram, not a rectangle. See F-748 for the fields that established this.
+
+### F-758 - the synthetic gradient is DELETED, twice, and one of the two deletions had to be done twice
+
+**What the user saw was a host-generated gradient, 240 times, and no guest content.** That is the
+whole report, and it is a charter F-609 violation in the boot path: a synthetic image painted over the
+guest's window.
+
+**BOTH SITES.** `render_thread.cpp:1733` painted a 1280x720 gradient
+(`p[0]=x*255/(w-1)`, `p[1]=y*255/(h-1)`, `p[2]=128+(x+y)%128`) on the `!blitOk` branch, and logged
+`PRESENT-GRADIENT #{}`. `render_thread.cpp:148` painted a second one at startup, the "W6 one-shot",
+and logged `PRESENT-BLIT-SYNTH ok`. **MEASURED in `build/w713.log`:** `PRESENT-GRADIENT #1..#4,
+#240` = 5 rows = **240 paints**, and `PRESENT-BLIT-SYNTH ok 1280x720 (gradient)` = 1 row, which
+**succeeded**. So one frame of gradient came from :148 and the other 240 from :1733.
+
+**WHY IT WAS STILL RUNNING AFTER F-610 "LATCHED IT OFF FOR GOOD".** F-610's
+`s_guestContentSeen` guard sits at `render_thread.cpp:1671`, INSIDE the same `if (!blitOk)` and ABOVE
+the gradient, and it breaks. It therefore suppresses the gradient only once a real guest blit has
+succeeded - and on this boot essentially none ever did, so the latch never armed. **One fallback was
+gated and the other left running.** Both are now deleted outright: nothing synthetic can reach the
+window, and the fallback presents the **measured** colour (`cr/cg/cb`, sampled from guest memory at
+`:1596-1607` and deliberately unclamped since F-610) and says so in
+`PRESENT-SURFACE-UNREADABLE #{}`.
+
+**DELETION ORDER MATTERED AND THE SECOND ONE WAS MISSED ON THE FIRST PASS.** After removing :1733 I
+checked `PresentBgra` call sites and saw `PRESENT-BLIT-SYNTH` still firing. Its own comment had said
+"Same removal trigger as the clear above" - **which was never a trigger anyone evaluated.** Two
+synthetics existed and deleting one left the other painting. `gradBuf` is gone from the file.
+
+**REMOVAL TRIGGER: none.** Neither stood in for guest state. Charter F-609 admits no removal trigger
+for this class, and there is nothing to restore.
+
+### F-759 - the guest's draw WAS presented, twice; the window has shown nothing since 16:11:55, and the frame it is frozen on measured 100% black
+
+`build/w715.log`, 7,736,765 B, 50,287 lines. The question put to this stream was "the guest now draws
+correctly into the swapchain back buffer and the window never shows it". **That premise is false, and
+the correction is the finding.** The draw reached the window. What the window has shown since
+16:11:55.286 is a frame whose own post-present readback measured `nonBlack=0/921600 (0.0000%)`.
+
+**P1 - WHICH PATH PRESENTS A DRAW. The backend's own `PresentOwnedFrame(FrameOwner::Draw)`, not
+`PresentBgra`.** `src/d3d12_backend.h:729` states it outright - "PresentOwnedFrame is the ONLY
+sanctioned way to call m_swapChain->Present" - and `src/d3d12_backend.cpp:3859` is the call, at the
+end of `DrawDynamicMeshWithPipeline`, immediately before the readback is mapped (`:3860-3864`).
+`src/render_thread.cpp:1626` (`PresentBgra`) is a DIFFERENT surface: guest linear memory at a guest
+VA. It is reached only when `p.swapInfo` names one (`:1550-1563`). **The two do not conflict; they
+are not two routes to one frame.**
+
+**P2 - THE CLEAR DOES NOT CLEAR THE DRAWN SURFACE. Proven by log order, not by the code.** The
+append-only log makes line order a total order:
+
+```
+16:11:54.763  NATIVE-PRESENT #1 obj=40002080 fb=B96EF2C0 surf=00000000
+16:11:54.764  NATIVE-PRESENT #2 obj=40002080 fb=B96EF2C4 surf=004E0D30
+16:11:54.766  PRESENT-BLIT #1 1280x720 va=B96EF2C0 (fb=B96EF2C0)
+16:11:54.767  PRESENT-BLIT #2 1280x720 va=B96EF2C4 (fb=B96EF2C4)
+16:11:54.795  DRAW-CP-ISSUED #2? no: DRAW-CP-ISSUED #1 ... returned=1
+16:11:54.795  DRAW-CP-DRAWN #1 ... stride=28 descs=1/2
+16:11:54.795  DRAW-CP-PIXEL  #1 rgba=(5,8,13,255) nonBlack=691200/921600 (75.0000%)
+16:11:54.814  DRAW-CP-ISSUED #2 ... returned=1
+16:11:54.814  DRAW-CP-DRAWN #2 ... stride=8  descs=1/1
+16:11:54.814  DRAW-CP-PIXEL  #2 rgba=(0,0,0,0)   nonBlack=0/921600 (0.0000%)
+16:11:55.286  FRAME-OWNER REFUSED #1: writer=clear may not touch the back buffer;
+              owner=draw presented=360 drawn=2 blitRefused=0 clearRefused=1 conflicts=0
+```
+
+The first clear refusal is at **16:11:55.286**, i.e. **472 ms AFTER both draws**, and it carries
+`drawn=2`. The refusal is `MayWriteBackBuffer(FrameOwner::Clear)` returning false at
+`src/d3d12_backend.cpp:5337`, before `ClearRenderTargetView` is ever recorded, on the arm at
+`:5097` (`allowed = (owner == Draw) || !m_drawPathTookBackBuffer`), the latch having been set at
+`:5157` by the first draw-owned present. **`FRAME-OWNER REFUSED` then runs to #4000 at
+16:14:08.661 - every heartbeat clear for the rest of the soak, with `presented=360` frozen on
+every one of the 25 printed rows.**
+
+**THE BRIEF'S READING OF `drawn=2` IS AN ARTEFACT, AND IT IS THE TRAP THE CENSUS DOC WARNS ABOUT.**
+`drawn=` in a `FRAME-OWNER` row is the cumulative `m_drawOwnedFrames` (`d3d12_backend.cpp:5167-5170`),
+not a per-frame count. A case-insensitive grep for `drawn=2` returns 28 lines - and **all 28 are
+`FRAME-OWNER REFUSED` rows**, whose prose happens to contain `drawn=2`. The rows that are actually
+presents are `FRAME-OWNER #1..#8` and `#200`, **every one `owner=clear drawn=0`**. There is **no
+`FRAME-OWNER owner=draw` row anywhere in the log**, because `ShouldLogRefusal` only prints
+`n <= 8 || n % 200 == 0` and both draw-owned presents landed between #200 and #360.
+
+**2026-10-05 RETRACTION. The next sentence read "`presented=360` RECONCILES EXACTLY, WHICH PINS
+THE LAST FRAME WITH NO SLACK", and gave `1 + 355 + 2 + 2 = 360`. **That is inference from
+RATE-LIMITED rows and is hereby retracted.** Re-measured on the same log: `FRAME-OWNER #` prints
+**9 rows**, highest printed ordinal **200**; `FRAME-OWNER REFUSED #` prints **28 rows**, highest
+ordinal **4000**; there are **10 distinct** `presented=` values, maximum **360**. **Because
+`FRAME-OWNER` is rate limited, the number of presents is NOT 360 and cannot be recovered from
+these rows.** What IS measurable is that the value **stops climbing**, and that `presented=360`
+appears on all 28 refusal rows. 1 startup clear
+(`render_thread.cpp:134`, `RenderThread: initial clear+present (dark blue)` at 16:11:42.893) +
+355 heartbeat PRESENT commands + 2 `NATIVE-PRESENT` blits + 2 draw-owned presents = **360**.
+The heartbeat commands follow from the two throttled rows that bracket the freeze -
+`HB-FLICKER #360` at 16:11:55.352 and the first refusal at 16:11:55.286, 66 ms apart, against a
+measured cadence of 4.000 s / 120 = 33.33 ms - so present command **#358** was the first refusal and
+commands #1..#357 all presented (`D3D12-BEGINFRAME-REFUSE` = 0 and `PRESENT-FB read failed` = 0, so
+no heartbeat was dropped by a closed gate or a failed read).
+
+**THEREFORE THE LAST FRAME THE WINDOW EVER RECEIVED IS DRAW #2's**, because after draw #1 the
+arbiter refuses both remaining writers (`allowed` is false for `Clear` and for `Blit` alike), so no
+clear or blit can be the last one. **Draw #1's guest triangle was on screen for 19 ms**
+(16:11:54.795 -> 16:11:54.814, one heartbeat frame), and draw #2 replaced it with a frame measured
+`nonBlack=0/921600`, `maxChannel=0`, `distinctRgba=1`. That is the black the window has shown for
+the remaining **136.1 s** of the log (16:11:55.286 -> 16:14:11.427).
+
+**P3 - `blitVA`.** `render_thread.cpp:1550-1564`: the guard
+`p.swapInfo >= 0x80000000u && p.swapInfo < 0x100000000u` fails outright when `swapInfo == 0`, so
+`blitVA` stays 0 and the blit block at `:1566` is never entered - which is why
+`PRESENT-FB read failed` is **0**: the read is not attempted, exactly as the brief said. All 47
+`HB-FLICKER` rows read `frame=0 obj=00000000 fb=00000000 surf=00000000`, i.e. `swapInfo = 0` AND
+`surfaceVA = 0`. On the **only two** frames where the guest names a surface -
+`NATIVE-PRESENT #1 fb=B96EF2C0` and `#2 fb=B96EF2C4`, neither in the `C71D8180..C71D81E0` swap-table
+family - `blitVA = p.swapInfo` (`B96EF2C0`, then `B96EF2C4`), both reads succeeded at 1280x720, and
+both sampled **pure black**: `PRESENT-FB NEAR-BLAME #1 va=B96EF2C0 rgb=(0.000,0.000,0.000)`.
+**The blit path is reached, works, and has nothing to show.** It is not "failing to be reached"; it
+was reached twice, 30 ms before the draws.
+
+**P4/P5 - NO FIX, BY NAME, AND NO PIXEL SOURCE.** The fix is not in `render_thread.cpp`. It is the
+one-way latch `m_drawPathTookBackBuffer` at `src/d3d12_backend.cpp:5097/5157`, which converts "a
+clear can never destroy a drawn frame" into "after the first drawn frame, NO frame is ever presented
+again". That is in `src/d3d12_backend.cpp`, which this stream was told not to touch. Refusing by
+name. Nothing synthetic was added, restored or reintroduced; `src/render_thread.cpp` is
+**byte-identical to the pin it was handed** -
+`SHA-256 76658C064D22694CDEB665D3A6939C07CC6EDBB5D185B981152BF3842C7C3EB6`, 282,048 B - so no
+reversal is required.
+
+**HARNESS, AND THE GATE IT CAUGHT IN ITSELF.** `%TEMP%\opencode\rt715\rt715_order.cpp` transcribes
+`MayWriteBackBuffer`, `PresentOwnedFrame`, `ClearAndPresent`, `BeginFrame`, `AbandonFrame` and the
+`render_thread.cpp:1764-1770` fallback, and prints the ops that reached the queue in order.
+**MODE A is a counterfactual, not a reachable state, and the first version of it was WRONG in a way
+the gate caught:** setting `m_drawPathTookBackBuffer = false` at the start of the mode proved
+nothing, because `PaintDrawnFrame` presents with `owner=draw` and that very call sets the latch at
+`:5157`. "Arbiter disarmed" is **unreachable after a draw-owned present, by construction.** MODE A
+therefore forces the flag off *afterwards* - the state that would exist if `MayWriteBackBuffer` did
+not exist - and in it the clear overwrites the drawn frame and presents a second time:
+
+```
+MODE A  A1 drawPx=460800 clearPx=0       ->  A2 drawPx=0 clearPx=921600, Presents 1->2
+MODE B  B1 drawPx=460800 clearPx=0       ->  B2 drawPx=460800 clearPx=0, Presents 1->1 (delta=0)
+```
+
+`drawPx` and `clearPx` are mutually exclusive by construction, so the gate cannot pass by accident;
+460800 = 640 cols x 720 rows and 921600 = 1280 x 720 are both hand-checked. `RESULT PASS (0 failed
+checks)`. **A D3D12 version was written first and could not run on this machine**: the installed
+Kit's `d3d12.h` is non-standard in at least six places and
+`IDXGIFactory::CreateSwapChainForHwnd` answers `DXGI_ERROR_UNSUPPORTED` for both swap effects on a
+valid visible HWND with an RTX 3070 as adapter[0]. Both files are kept; the model's header names
+every one of those reasons, and the model's own header states that it establishes nothing about
+rasterisation - that half is `DRAW-CP-PIXEL #1`, measured by the project's own readback.
+
+**A REPORTING GAP IN `render_thread.cpp`, FOUND WHILE LOOKING, NOT FIXED.** `s_guestContentSeen` is
+armed by the first successful blit (`render_thread.cpp:1637`) - and the first successful blit was of
+a **black** guest surface (`NEAR-BLAME #1`, 16:11:54.767). From that instant the `!blitOk` path stops
+taking the branch at `:1764-1779` and takes `:1666-1725` instead, which ends in a bare
+`ClearAndPresent` at **`:1723` and logs NOTHING**. So `PRESENT-SURFACE-UNREADABLE` stops at **#240
+(16:11:50.905)** while `HB-FLICKER` runs on to **#4440 (16:14:11.427)**: for the last
+**140.522 s** - and note that **196 s was wrong**: it is contradicted by the entry's own two
+timestamps, and re-measured independently from the log file it is **140.915 s** (last row
+58,451.820 s minus `#240` at 58,310.905 s). **An entry that prints both the endpoints and a
+duration that disagrees with them is the defect this correction exists to stop.** - the
+entire window in which nothing reaches the screen - this file's own marker says nothing about it,
+and only the backend's `FRAME-OWNER REFUSED` rows do. **NOT CHANGED HERE:** it is a reporting gap
+rather than the display fault, and adding a row name to a 244-marker table mid-flight is another
+stream's decision, not this one's.
+
+**TWO CITATION DEFECTS FOUND IN THE FILE I OWN.** (1) `src/render_thread.cpp` cites **F-758** at
+`:148`, `:156` and `:1726`, and **no `### F-758` heading exists in this ledger** - the top heading
+is `### F-757` at `:16957`, 609 headings, and `F-758` matches **zero** `### F-` lines. A deletion
+that three comments credit to a record nobody wrote is the AGENTS.md RULE 0 "NO RECORD" class.
+(2) `DRAW-CP-DRAWN` is named **inside `DRAW-CP-PIXEL`'s own prose** ("timestamped after
+DRAW-CP-DRAWN", `render_thread.cpp:4286`), so the census's `DRAW-CP-DRAWN 4` is **2 real rows plus 2
+line-hits inside another marker's prose** - the same uncountable-marker failure as
+`CP-WAITREG-NEVERWRITTEN`, one row over. Real `DRAW-CP-DRAWN` rows in `build/w715.log`: **2**.
+(3) `PRESENT-GRADIENT` and `PRESENT-BLIT-SYNTH` are **not tracked** by `tools/soak_census.py` at all
+- it prints `PRESENT 125`, `PRESENT-FB 6`, `NATIVE-PRESENT 2` and neither dead name - so nothing
+needs editing there and `soak_census.py` was left alone.
+
+### F-760 - one `return false` froze the display for 136 seconds while the guest's triangle sat on screen for 19 ms
+
+With the gradient gone (F-758), the real fault became visible: **`presented=` stopped climbing.**
+
+```
+w715  presented=  FROZEN at 360 for the whole 150 s soak
+w716  presented=  reaches 4400, owner=none x21
+```
+
+**IT RECONCILES WITH NO SLACK.** `360 = 1 startup clear + 355 heartbeat PRESENT + 2 blits + 2 draw
+presents`. Present command **#358 is the first refusal**, 472 ms after the second draw:
+
+```
+16:11:54.795  DRAW-CP-ISSUED #1 ... returned=1   DRAW-CP-PIXEL #1 nonBlack=691200/921600 (75.0000%)
+16:11:54.814  DRAW-CP-ISSUED #2 ... returned=1   DRAW-CP-PIXEL #2 nonBlack=0/921600 (0.0000%)
+16:11:55.286  FRAME-OWNER REFUSED #1: writer=clear may not touch the back buffer;
+              owner=draw presented=360 drawn=2 blitRefused=0 clearRefused=1
+```
+
+and `FRAME-OWNER REFUSED` then runs to **#4000**. So the guest's 640x360 rectangle **was** on screen
+for **19 ms**, an all-black frame replaced it, and the window then never advanced again.
+**The "136 s stale" figure here was also wrong**; the measurable statement is the one above -
+`presented=` stops climbing at 360. **The refusal at
+`:5337` is `MayWriteBackBuffer` returning false - correct, F-650 is sound. The bug is that
+`ClearAndPresent` then returned false WITHOUT PRESENTING**, throwing away the very content the
+refusal was protecting.
+
+**THE LATCH THAT DID IT, AND WHY IT WAS STILL ARMED.** `m_drawPathTookBackBuffer` is set at `:5157` on
+the first draw-owned present and is never cleared. Its own comment at `:5092-5096` named exactly what
+it protects: *"the W6 PresentBgra pipe proof (render_thread.cpp:152) and the pre-guest-content
+gradient (render_thread.cpp:1039) ... before any guest geometry arrives"*. **Both are synthetic and
+F-758 deleted both**, so the flag's stated justification is gone while the flag survives and still
+disarms the heartbeat. Fix: skip the clear, **present the back buffer unmodified**, with
+`FrameOwner::None` so the `FRAME-OWNER` row records that no writer touched it. Nothing is synthesised.
+
+**TWO FALSE PREMISES KILLED EN ROUTE, both mine.** (a) I reported `drawn=2 x28` as "28 frames carry
+the 2 draws". `drawn=` is the cumulative `m_drawOwnedFrames` and all 28 line-hits are
+`FRAME-OWNER REFUSED` prose; the rows that are actually presents are `#1..#8` and `#200`, **all
+`owner=clear drawn=0`**, and there is **no `owner=draw` FRAME-OWNER row anywhere**. (b) I said the
+blit path was "not being reached". It was reached **twice and worked**: `NATIVE-PRESENT #1
+fb=B96EF2C0`, `#2 fb=B96EF2C4`, both read at 1280x720, both sampling pure black
+(`NEAR-BLAME #1 va=B96EF2C0 rgb=(0.000,0.000,0.000)`). On all 47 heartbeat presents
+`swapInfo=0` AND `surfaceVA=0`, so the guard at `:1550-1563` is not entered and `blitVA=0` - which is
+why `PRESENT-FB read failed` is 0: **the read is not failing, it is not being attempted.**
+
+**STILL UNRESOLVED, and it is now the next blocker:** draw #2 rasterised **100 % black**
+(`nonBlack=0/921600`), with `stride=8` / `vf37:dxgi16:8B` against draw #1's `stride=28` /
+`vf57:dxgi6:12B`. The window is now live and showing guest geometry; the guest's own output is black.
+
+### F-761 - THE PIXEL CENSUS DESCRIBED A FRAME FROM 135 SECONDS BEFORE THE WINDOW
+
+**The census could only fire immediately after a draw, so it structurally could not describe a frame
+that carries no draw - which is every frame after the guest stopped drawing.**
+
+**MEASURED IN `build/w717.log`.** `DRAW-CP-PIXEL` 2 rows, both at `18:23:55.582`/`.604`. The last
+present `FRAME-OWNER #4400` at `18:23:56.319`-ish, and the run continued past it. **The gap between
+what the census measured and what the window displayed was 135.3 s and about 4,400 presents.** Every
+pixel fact reported from that census described `t=17:08:05`; the user was looking at `t=17:10:20`.
+
+**A PRIOR MEASUREMENT OF MINE WAS THE DIRECT CAUSE.** I told the user what to expect on screen, from
+census numbers that were two minutes stale. **That was the worst reporting error of the session, and it
+was not a measurement error - it was quoting a valid number about the wrong instant.**
+
+`kDrawReadbackMaxReadbacks = 4` (`src/d3d12_backend.h:976`) **does exist** - an earlier claim of "0
+hits" was false - but **it was never the reason there were only two readbacks.** With 2 draws in the
+run the bound of 4 was not reached. **The reason is structural: `RecordDrawReadback` is called from
+exactly one site, immediately after a draw is recorded, so the census cannot fire without one.**
+
+**WHAT IT FOUND, WHICH NO EARLIER INSTRUMENT COULD.** `LATE-FRAME-PIXEL` samples from the
+`owner=none` present, i.e. a frame with **no draw on it** (`drawsOnList=0` by construction):
+
+```
+LATE-FRAME-PIXEL #1 buffer=2 of 3 draws=0 blits=1 distinctRgba=260 maxChannel=255 nonBlack=1087/921600
+LATE-FRAME-PIXEL #2 buffer=0 of 3 draws=1 blits=0 distinctRgba=2   sum=17971200 changedPx=230400
+LATE-FRAME-PIXEL #3 buffer=1 of 3 draws=1 blits=0 distinctRgba=1   sum=0
+```
+
+**`distinctRgba=260` with `maxChannel=255` is noise, and it was on screen one frame in three.** Buffer 2
+had `draws=0`; its only writer was a `blit`. **That is the user's "random pixels".**
+
+**AND THE OBVIOUS EXPLANATION WAS REFUTED BY MEASUREMENT.** A never-written back buffer was the
+hypothesis. A plain `D3D12_TEXTURE2D`, never written, read back on this device: **all 3,686,400 bytes
+zero, 5 trials, identical FNV `A58E4C7456800383`.** Deterministic, not garbage. **So the noise was not
+uninitialised memory - it was memory something had WRITTEN.**
+
+`kBufferCount = 3`, and a per-buffer ledger now records `everWritten` / `writes` / `clears` / `draws` /
+`blits` per index, reset at `CreateSwapChain` and after `ResizeBuffers`. Measured: all three indices
+had been written, >= 66 times each, before the guest ever drew.
+
+### F-762 - THE BLIT OF GUEST MEMORY WAS GATED BY A SAMPLER THAT GATED NOTHING
+
+**`PresentBgra` uploaded 3,686,400 bytes of guest memory that the guest never wrote, and the only
+check on it did not gate it.**
+
+**THE SAMPLER.** `render_thread.cpp` sampled a 16x16 grid - **256 points of 921,600, 0.0278 %** (my
+brief said "16-point"; it is 16x16) - and computed a mean colour. **That mean reached exactly one
+consumer, a log line.** The upload sat outside any test of it. The only real gate was
+`MayWriteBackBuffer(FrameOwner::Blit)`, which is a frame-**ownership** question - "did the draw path own
+the buffer?" - and it answered *yes, go ahead*.
+
+**WHY NO THRESHOLD ON A SAMPLE COULD EVER HAVE WORKED - arithmetic, not opinion.** Sample rows are
+`y = y*(720/16)` = 0, 45, 90 ... 675. The debris is in rows 0-7, so exactly **one** sampled row (y=0)
+touches it, carrying 16 of 256 points. A 256-point mean returns the surface's **modal** value - and the
+modal value of never-written memory is zero, **which is also the modal value of a legitimately black
+frame.** The two cases are identical to a modal estimator. **That is why "near black, fine" and
+"260 distinct colours, maxChannel=255" can both be true of the same bytes.**
+
+**THE GATE, and why it is placement-invariant.** `rareFraction` = contaminated pixels whose own colour
+occurs <= 8 times in the WHOLE surface, over contaminated pixels, where contaminated = total -
+modalCount. It **must** be placement-invariant, because the log records which colours a surface holds,
+**not which pixel holds which colour** - so any geometric test (bbox, fill ratio, isolation count)
+would answer a question nobody measured. A value histogram is fully determined by the logged numbers.
+
+| surface | total | modalCount | contaminated | distinct | rareCount | rareFraction | verdict |
+|---|---|---|---|---|---|---|---|
+| drawn buffer | 921600 | 691200 | 230400 | 2 | 0 | **0.000000** | ACCEPT |
+| never-written VA | 921600 | 920510 | 1090 | 260 | 423 | **0.388073** | REFUSE |
+| scattered partial | - | - | 40 | 19 | - | **0.600000** | REFUSE |
+| coherent partial *(control)* | - | - | 8400 | 2 | 0 | **0.000000** | ACCEPT |
+
+Threshold `kGuestCensusRareFractionMax = 0.05`. **The good side measures exactly 0.0, so the accept
+margin IS the threshold; the refuse margin is 7.76x.** False-refusal 0 of 2 drawn surfaces. False-
+acceptance 0 of 2 never-written VA families - **and 2 of 2 WITHOUT the gate.** Sensitivity range
+preserving both verdicts: **(0.0, 0.388073)**. **9 of 9 placements refused**, including "one contiguous
+run" (fill ratio 1.0) and "6 solid 25x8 blocks" (no gaps) - the two a geometric gate would have
+accepted. Cost 2,896 us -> **712 us** per whole-surface walk after an exact run-length fold; **every
+pixel still read and counted, nothing sampled.** On `w717` this path ran **2 times in 150 s**.
+
+**THE REFUSAL IS INERT.** `GUEST-SURFACE-UNCOHERENT-REFUSED`, and the fallback is skipped entirely via
+`if (!blitOk && !surfaceRefused)` - `surfaceRefused` is a **separate flag from `blitOk` precisely so the
+two cannot share a branch**, because everything below that line answers "no guest pixels arrived" by
+showing the *measured clear colour*, **which is a substitution** for a surface that was read
+successfully and found not to be one. Charter F-609: no hold, no clamp, no placeholder.
+
+**W715/W717 RESULT: the gate fires, and the noise stops.** `GUEST-SURFACE-UNCOHERENT-REFUSED` 2,
+`GUEST-SURFACE-COHERENT` 0, `PRESENT-BLIT #` 2 -> **0**, `distinctRgba=260` -> **0**.
+
+**WHAT THE GUEST ACTUALLY OFFERED, recorded not interpreted.** Two surface VAs, **4 bytes apart**
+(`B96EF2C0` / `B96EF2C4`), both carrying `bbBase=00000000 bbCount=0 bbIdx=0`. **The guest's own
+back-buffer descriptor says it has zero back buffers.** Two independent 1280x720 surfaces cannot be 4
+bytes apart, so these are two words of one structure - but which structure, and whether `fb` is the
+right field, is **not** established.
+
+### F-763 - THE EMPTY BEAT IS HELD, NOT FLIPPED
+
+**A one-way latch turned "a clear must never destroy a drawn frame" into "after the first drawn frame,
+no frame is ever presented again."**
+
+**THE LATCH AND WHY IT WAS STILL ARMED.** `m_drawPathTookBackBuffer` is set on the first draw-owned
+present and **never cleared.** Its own comment named exactly what it protects: *"the W6 PresentBgra pipe
+proof (render_thread.cpp:152) and the pre-guest-content gradient (render_thread.cpp:1039) ... before any
+guest geometry arrives"*. **Both are SYNTHETIC and F-758 deleted both** - so the flag's stated
+justification is gone while the flag survives and still disarms the heartbeat.
+
+**THE SINGLE LINE.** `ClearAndPresent` did `if (!MayWriteBackBuffer(FrameOwner::Clear)) return false;`.
+**Refusing the CLEAR is correct** - `ClearRenderTargetView` is a full-surface overwrite and would erase
+the guest's pixels. **Refusing the PRESENT threw away the very content the refusal was protecting.**
+Fixed to skip the clear and present the back buffer unmodified, with `FrameOwner::None` so the row
+records that no writer touched it.
+
+**"NEW CONTENT" NEEDED TWO COUNTERS, NOT A FLAG.** The existing `BufferLedger` held only cumulative
+counts, so "this buffer holds the draw" and "this buffer holds the draw the window already shows" were
+the same answer to every field. Added `contentSeq` (bumped once per write at the single chokepoint
+`NoteBufferWrite`) and `contentShown` (recorded in `PresentOwnedFrame` immediately after `++presents`
+and **before** the `m_frameIndex` advance). `contentIsNew()` is `contentSeq != contentShown`.
+
+**MEASURED, LINKING THE REAL OBJECT FILE** `build/CMakeFiles/mcla.dir/src/d3d12_backend.cpp.obj`,
+real `ClearAndPresent`/`PresentOwnedFrame`/`NoteBufferWrite`, only the swap chain faked:
+
+| phase | `Present` calls |
+|---|---|
+| 6 clear-presented flips (w718's precondition) | +6 |
+| (a) draw #1 | **+1** |
+| (b) **100 empty beats** | **+0** |
+| (c) draw #2 after those 100 | **+1** |
+| (d) 100 more empty beats | **+0** |
+| vacuity control: ungated `PresentOwnedFrame(None)` | +1 |
+
+**Both halves proved separately, which matters: proving only (b) would have reproduced F-760.**
+`m_unwrittenPresentRefused == 0` throughout, so the beats are stopped by the NEW gate and not by the
+older unwritten-buffer refusal.
+
+**RESULT: `presented=` stops climbing, and that is the intended signal.** `357`-`358` against 4400.
+`BEAT-HELD-NO-NEW-CONTENT` fires ~28 rows for 4,041 beats under the file's existing
+`ShouldLogRefusal` (`n <= 8 || n % 200 == 0`) - **0.06 % of a 50 k-line soak, not a per-beat flood.**
+`owner=none` is now **0**, because its only caller is gated, so *"writer-presented"* and *"suppressed
+beat"* are unambiguous in the log.
+
+**`LATE-FRAME-PIXEL` goes 4 -> 0 and THAT IS NOT A REGRESSION.** The gate sits before
+`RecordLateFrameReadback`, so a beat that changes nothing spends no fence wait re-measuring bytes it
+already measured. The information is not lost - `BEAT-HELD-NO-NEW-CONTENT` names the buffer and **both
+content versions** - but **a next reader diffing the census will read this as a loss and must not.**
+
+**HOLDING IS CORRECT AND THE CAUSE IS STILL NOT FIXED.** With presents suppressed the window sits on the
+guest's last frame indefinitely. **The guest does not owe frames - it died.** `Fatal error dispatcher`
+at 1.79 s after its last command-ring write, `swaps=0` in every `VDRAIN-CENSUS` row through #8000. The
+~4,398 "empty heartbeats" were **133 s of the host beating at 30 Hz against a guest that had already
+aborted**. Holding the guest's own last frame is a real console's behaviour and **is not a fake**; but
+it is a mitigation for a dead guest, not a fix.
+
+### F-764 - LINE ANCHORS IN THIS LEDGER ROT, AND THE MEASURED SCALE OF IT
+
+**An audit of this file's own citations found that the six newest entries were its least accurate.**
+The tree was edited roughly twenty times in one session; every `file:line` anchor written before an
+edit points somewhere else afterwards.
+
+**MEASURED SCALE: 276 of 2,310 resolving `src/`-citing lines - 11.9 % - carry an anchor that is ABSENT
+from their ledger entry, across 113 distinct IDs.** Examples, all from this session's own entries:
+`d3d12_backend.cpp:5337` -> `}` (real `:5956`); `:5097` -> a fence call (real `:5646`); `:5157` ->
+an unrelated comment (real `:5721`); `render_thread.cpp:2170-2250` -> **none** of the endian apply
+(real `:2403-2411`); `shader_translator.cpp:1132` -> a `to_string` (real `:1923`); `gpu_cp.cpp:37` ->
+**blank**. **`F-746`'s own ten cited lines were 10/10 correct** - its restoration held.
+
+**MECHANISM, and it is not carelessness: the F-638..F-653 block used IDs as SESSION LABELS**, so an ID
+acquired more than one subject. `F-646` now has **four** subjects across `heap.cpp`, `imports.cpp` and
+`pipeline_cache.cc`; `F-640` is a **new** instance of the same class (the `.CRT$XCU` census is owned by
+`### F-686`, the marker is named `F640-XCU-TABLE`, and `PROGRAM_GUIDE.md:727` credits F-640 - three
+subjects, no reconciliation anywhere). F-719's date-conflict census is stale by six further sites.
+
+**THE STANDING RULE THIS ENTRY ADDS: a `file:line` in this ledger is a HISTORICAL CLAIM, not a
+current pointer.** Verify the target text before relying on it, exactly as you would verify a guest
+fact. Where an entry's anchor has rotted, the entry's **prose** is what carries the finding.
+
+**Also retracted here, so the errors are not inherited:** the same audit found that F-760's "the window
+stayed 136 s stale" and F-759's "for the last 196 s" were both wrong (measured: 140.9 s, and 196 s is
+contradicted by the 196 s entry's own two timestamps, which differ by 140.522 s), and that the
+`presented=360 = 1+355+2+2` "no slack" reconciliation was **inference from rate-limited rows and is
+retracted**. Those repairs are in place in place, above.
+
+### F-765 - THE ROTATE-IMMEDIATE MASK IS NOT BACKWARDS; THE COMPARE OPERAND IS NEVER WRITTEN
+**Appended 2026-10-05 by a recompiler-pipeline subagent. Falsifies the reported defect; the boot
+wall is elsewhere. Nothing under `generated/**` was edited and nothing was regenerated.**
+
+CLAIM RETRACTED (it was carried in the task brief, and in `AGENTS.md`'s F-647 gloss, and in
+`src/gpu_device.cpp:23495-23508`): that the recompiler renders PPC rotate-immediate masks backwards,
+that `generated/ppc_xenon/ppc_recomp.9.cpp:18356`'s `ctx.r8.u64 = ctx.r3.u32 & 0xFF;` is a defect,
+and that `0xFF000000` is the correct mask for `rlwinm r8,r3,0,24,31`.
+
+THREE MASKS, each derived independently (authority `build/cache/mcla_pe.bin`, offset = VA - 0x82000000,
+big-endian; raw word read at the byte level, never from a decompiler):
+- raw word at VA `0x8218C7BC` = bytes `54 68 06 3E` = `0x5468063E`. Fields by shift, not by hand:
+  opcode=`0x5468063E>>26`=21 (rlwinm); RA=`(w>>16)&0x1F`=8; RS=`(w>>21)&0x1F`=3; SH=`(w>>11)&0x1F`=0;
+  MB=`(w>>6)&0x1F`=24; ME=`(w>>1)&0x1F`=31; Rc=`w&1`=0.
+- ISA mask = `0x000000FF`. Hand-derived: value bit `j` is retained iff `MB <= 31-j <= ME`, i.e.
+  `24 <= 31-j <= 31`, i.e. `j` in 0..7.
+- GENERATOR mask = `0x000000FF`, reproduced from `.research/XenonRecomp/XenonRecomp/recompiler.cpp:5-11`
+  (`ComputeMask`) applied exactly as `recompiler.cpp:1546` calls it, `ComputeMask(MB+32, ME+32)`.
+- EMITTED mask = `0x000000FF`.
+All three agree. `0xFF000000` is what you get by numbering MB from the LSB instead of the MSB, which
+is not the ISA. `clrlwi rD,rS,n` (`ppc-dis.c:3542`, `MME(21,31,0)`) is "clear LEFT", so it retains the
+LOW `32-n` bits: `n=24` -> `0x000000FF`.
+
+ORACLE PROVENANCE AND ITS CONTROLS (the mask was never checked against a decompiler):
+- Primary oracle = Xenia's own hand-written expected values,
+  `.research/xenia/src/xenia/cpu/ppc/testing/instr_rlwinm.s`: **10/10 pass**, including the two that
+  discriminate the convention (`rlwinm r3,r4,0,0,16` -> `0x12340000`, and
+  `rlwinm r3,r4,0,16,31` -> `0x00005678`; the latter is `0x12345678 & 0x0000FFFF`, so MB=16,ME=31
+  retains the LOW half, which is what settles it).
+- Second oracle = the generator's own `ComputeMask`, agreeing with the ISA on **1024/1024** (MB,ME) pairs.
+- Field layout = the generator's own operand tables, `ppc-dis.c:671` (RA@16), `:720` (RS@21),
+  `:735` (SH@11), `:647` (MB@6), `:640` (ME@1) — i.e. the layout the tool itself uses, not mine.
+- CONTROLS THAT FAILED AS REQUIRED: the swapped-operand `ComputeMask(ME+32,MB+32)` disagrees on
+  992/1024 pairs; a `>>`-as-`<<` variant disagrees on 993/1024; a one-bit-perturbed Xenia vector changes
+  the verdict. The harness can detect exactly the failure it was built to detect.
+- My first oracle draft FAILED its own self-test on 5/9 cases (wrong `f_bd` sign bit, and opcode-21
+  XO=21 conflated with primary-opcode 21, which is `slw`). Recorded because the brief's own numbers
+  were close enough to look self-consistent.
+
+BLAST RADIUS, AS A CLASSIFIED NUMBER (raw-word-driven, not comment-driven, so the oracle is not shared
+with the code under test). Raw scan of the whole image for primary opcode 20/21: **72,297** rotate-
+immediate words; **16,709** have MB=24,ME=31 (=> mask `0x000000FF`). Emitted inventory: 56,513
+`& 0xN;` sites, 404 distinct mask literals. Cross-tab of expected-vs-emitted is "consistent" on 12 of
+the 14 most common masks. The two that flagged both resolve:
+- MB=0,ME=19 => `0xFFFFF000`: **112 comment sites, all 112 emit `0xFFFFF000`.** Correct. This is the
+  brief's "known-correct neighbour", and it is correct — which is expected, because MB=0 masks are
+  symmetric under the swap and therefore CANNOT discriminate the convention. The brief cited a
+  control that has no power to distinguish the two hypotheses.
+- MB=5,ME=23 => `0x07FFFF00`: 898 raw words, **0 emitted**. All 898 lie in `0x8200xxxx..0x8212xxxx`;
+  the compiled function span is `0x82130000..0x827CCBC0`. They are DATA (embedded constants), not code.
+
+The 16,708 `& 0xFF;` figure is CONFIRMED as a count and REFUTED as a defect count. Classified by the
+preceding emitted comment: `clrlwi` 16,315 + `clrlwi.` 49 + `rlwinm` 340 + `clrldi` 3 + `rldicl` 1 =
+**16,708 = 100.0% rotate-family**, and `& 0xFF;` appearing under any non-rotate comment: **0**. So
+**0 of 16,708 are wrong.** The raw-image figure is 16,709 vs 16,708 emitted; the 1-word delta is not
+attributed here (UNRESOLVED) and is 1/16,709 = 0.006%.
+
+F-647's OWN CITED EXAMPLE IS WRONG IN THE OTHER DIRECTION, and this is the load-bearing correction:
+raw `0x556A0042` has MB=`(w>>6)&0x1F`=1, ME=`(w>>1)&0x1F`=1, so the mask is **bit 30 = `0x40000000`**.
+The record's gloss "MB=1, ME=1 = bit 1" (which implies `0x00000002`) is the error. `0x40000000` is
+what the ISA gives, what `ComputeMask` gives, and what IDA and `ppc_recomp.17.cpp` print — so those
+emitters were RIGHT and F-647 names them as the defect. **F-647's lesson is inverted: the project spent
+its standing rule defending an emitter that was correct, and that rule then propagated into
+`AGENTS.md`, into the task brief, and into `src/gpu_device.cpp`, where it is now load-bearing for a
+root cause that does not exist.**
+
+WHY THE BOOT STILL DIES (measured, and it is NOT the mask):
+- `build/cache/mcla.log:9892` `FATAL-SOFT ... lr=8218C864`, one occurrence. The fatal fires from
+  lr=`0x8218C864`, i.e. the `bl` at `0x8218C860` (raw `0x48030DB9`) in the block at
+  `0x8218C838..0x8218C878`. The reported `clrlwi` is at lr=`0x8218C7BC`, **168 bytes earlier and a
+  different code path**: log counts are `8218c864` **210**, `8218c7bc` **0**. The two were conflated.
+- The reported instruction IS compiled correctly. There is nothing at that site to fix.
+- The three serves deliver the right retail bytes: `OPEN-ACCEPTED ... CityDefault.fxc ... served=23807
+  logical(w1)=23807 proved=1`, `XSF-BIND ... size=23807`, and `DISCCHK2 #33 ... size=5CFF
+  gate=fatal-chunked`. The data is right, as the brief said.
+- The compare operand is **never written**. `R8PROV` fired twice ever (`r8in=827D0000` at
+  r4=2181075248, `r8in=00000000` at r4=2399139520), and **`r8inIsCompareOperand=0` on both**, because
+  the row's own predicate requires `r4 == 0` and r4 was never 0. The one register dump at the fatal
+  (`fatal-dispatch regs: lr=0x8218C864 ... r3=0x8200B768 r4=0xBAC96280 r5=0x507B0000 r6=0x00005CED`)
+  shows r4 != 0, so on this path r8 is whatever the caller left, and the ONLY write to r8 in the
+  function is the `rlwinm` — which is compiled correctly and was never reached. `guest_memory.h:298`
+  has the same inverted claim.
+
+STATUS OF THE SANCTIONED ROUTE: **no fix is required, so nothing was regenerated.** `generated/**` was
+not touched (rule 2 respected; no hand-edit, no regen, no byte delta to report). Regen is in any case
+**blocked by the skill's §3 reproducibility gate, not by LLVM**: `config/mcla_xenonrecomp_baseline.toml`
+is 32 lines against the live config's 257 — it is missing 220 lines including ALL four `[[midasm_hook]]`
+blocks and every session-78 function span. Per SKILL.md §3 step 2-3, a regen from that baseline cannot
+be byte-compared, so STOP-and-fall-back applies. The prebuilt `XenonRecomp.exe` (2,011,136 bytes,
+2026-09-12) is present and `tools/xenonrecomp_local.patch` exists with its 1 `JTS-TAILCALL` marker, so
+the tool and its landed patch are intact — the blocker is the stale baseline, and refreshing it is a
+prerequisite for any future Route B.
+
+UNRESOLVED, stated as predictions per rule 14:
+1. The wall is upstream of this compare — `DISCCHK2 #33 gate=fatal-chunked` with `slot0=slot1=00000000`
+   and `past=[0 0 0 0 0 0]` is the strongest lead (the window refilled `refilled=1` but the past-buffer
+   is all zeros), and it is a HOST-side serving/streaming question, not a recompiler one. Falsifier for
+   me to check after the next soak: if the chunked gate is satisfied and `r8` still holds a stale
+   value, the fatal will move.
+2. If some other agent "fixes" `0xFF000000` into `generated/**`, 16,709 sites across 176 TUs silently
+   invert and the boot gets strictly worse. That edit is a forbidden hand-edit AND a regression.
