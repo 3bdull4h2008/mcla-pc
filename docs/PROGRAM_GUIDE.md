@@ -32,8 +32,11 @@ live block is the only current status.
   One hook owner per guest address.
 - `src/hooks/` — PPC_FUNC bodies (`alloc_census.cpp`, `config_dispatch.cpp`)
 - `src/cpu/` — `vmx128_pack.cpp`, `guest_thread.h`, `ppc_context.h`
-- `src/fs/` — `vfs_rpf.cpp/h` (RPF3 packfile VFS) · `src/rage/` — asset pipeline
-- `src/kernel`, `src/apu`, `src/user` — kernel framework + guest runtime
+- `src/fs/` — `vfs_rpf.cpp/h` (RPF3 packfile VFS), `rpf3_nested.cpp/h` (measured nested-RPF3 reader;
+  contrasts the synthesized layout at `vfs_rpf.cpp:84`) · `src/rage/` — asset pipeline
+- `src/kernel`, `src/apu`, `src/user` — kernel framework + guest runtime (10-01 additions: XAM/port
+  layer `port_kobj`/`port_net`/`port_xam_user`/`port_voice_input`, `heap_arena.h`; APU:
+  `xma_decoder.h`, `audlo_extract.h` — all in CMakeLists, uncommitted as of 10-01)
   (`imports.cpp` = Nt*/Ke*/Xam*; `heap.cpp`/`o1heap.c` = physical allocator + SEH)
 - `src/renderer` — xenos decode, shader IR→DXIL, texture/vertex decode, caches
 - `tools/validators/` — phase-gate exes · `generated/ppc_xenon/` — 176 TUs, input only
@@ -108,11 +111,35 @@ launch `tools/ida-bridge.py` while it is listening: it `taskkill`s `idalib-mcp.e
   config/mcla_xenonrecomp.toml .` first); `config/…` fails SILENTLY (exit 127,
   `recompiler_config.cpp:5`). 2nd arg: `src/ppc_context.h` (`tail -n +4
   generated/…/ppc_context.h`, `cmp`-clean). Config emits **176 TUs** — re-check
-  vs CMakeLists.
+  vs CMakeLists (INVARIANT 1 below).
 - **Gate:** regen unmodified tool to scratch, `diff -r` vs `generated/`; not
   identical (minus known deltas) = do NOT regen, never into the tree. Then:
   per-function diff, stub census, soak (TSLAB-ALLOC ~2125, PARAM-STORE 401,
   EVENT-CREATE 256).
+- **INVARIANT 1 — the generated tree stays at exactly 176 translation units**
+  (`ppc_recomp.0..175.cpp` + `ppc_func_mapping.cpp`). The list is a
+  hand-maintained enumeration in `add_executable(mcla …)` at
+  `CMakeLists.txt:309-485` (`ppc_func_mapping.cpp:309`, `ppc_recomp.0.cpp:310`,
+  `ppc_recomp.175.cpp:485` — 176 `ppc_recomp` lines), and it is now checked at
+  **configure time** by `MCLA_EXPECTED_TU_COUNT 176` (`CMakeLists.txt:38`),
+  which fails on BOTH directions: a stray extra TU on disk is never referenced,
+  so it compiles and links fine and the emulator silently loses whatever
+  function landed in it, while a missing TU fails much later with an opaque
+  "cannot open source file" (`CMakeLists.txt:16-23`). A regen that legitimately
+  changes the count is an intentional migration: bump the count, regenerate the
+  source-list block from it, and re-run `check_regen_repro` — do not just append
+  a line (`CMakeLists.txt:33-36`). A `ppc_recomp.176.cpp` on disk is exactly
+  that failure mode (`CMakeLists.txt:20`).
+- **INVARIANT 2 — a regen must reproduce the tree byte-for-byte** against
+  `config/mcla_xenonrecomp_baseline.toml` (identical to the live config except
+  `out_directory_path`), with **two known deltas and no others**: (1) a
+  trailing-newline difference in `ppc_context.h`; (2) a **hand safety patch**
+  inside `sub_8218CC70` in `ppc_recomp.10.cpp` (indirect-branch
+  `targetFn`/`basePtr` validation) that the tool cannot emit. Session 75 measured
+  181/183 identical. Any third delta = **STOP**, fall back to Route A/C. Never
+  full-replace `ppc_recomp.10.cpp`, and never the session-38 null-dispatch AV
+  returns (`.qoder/skills/mcla-recompiler-regen/SKILL.md` §3). Header round-trip
+  is `tail -n +4 generated/ppc_xenon/ppc_context.h > src/ppc_context.h` (`cmp`-clean).
 - Dispatch guard = `src/dispatch_guard.cpp` + `[[midasm_hook]]` @ `0x8218CC94`
   (`sub_8218CC70` ends `bctr` via fn-ptr table; NULL slot = crash).
 - Stub census (both forms — old recipe missed 162):
@@ -120,9 +147,13 @@ launch `tools/ida-bridge.py` while it is listening: it `taskkill`s `idalib-mcp.e
   **0 broken** (was 1719); 44,707 mappings link-safe; 33% `.long 0x0` =
   never-executed, not a defect (F-022).
 - `.research/` + `generated/` gitignored → tool patches committed as `.patch`.
-  Helpers: `fix_stubs_{iter,self}.py` **at the repo root** (verified 19:25 — not `tools/`; they are
-  untracked junk per `LONG_TODO_MASTER` T37.1, so re-check before relying on them),
-  span fixed-point loops.
+  Helpers: `tools/fix_stubs_iter.py`, `tools/fix_stubs_self.py` — span fixed-point
+  loops, **in `tools/` and git-tracked** (verified 2026-09-28: `git ls-files` returns both).
+  They were **relocated from the repo root by commit `bc4b489`** ("drop 0-byte root
+  junk and relocate the stub-fix scripts to `tools/`"); any doc or command still
+  saying `fix_stubs_*.py` at the root is pre-`bc4b489`. `fix_stubs_iter.py:20` reads
+  the live regen config `mcla_jts_regen.toml` (repo root, deliberately kept) as
+  `BASE_CONFIG`.
 
 ## 6. Host runtime architecture
 
@@ -166,9 +197,12 @@ launch `tools/ida-bridge.py` while it is listening: it `taskkill`s `idalib-mcp.e
 
 ## §7-ADDENDUM (2026-09-23, F-091 §7) — guest-affecting mitigations registered NOWHERE (read first)
 
-The table below still lists 13 entries; `src/` currently carries **80** mitigation-shaped labels, and
-**135 guest-affecting lines per 120 s soak** belong to mitigations that are in neither this section nor
-`tools/soak_census.py`'s tracked list. Fire counts are from `build/w43a.log`.
+The table below lists 13 entries; `python tools/mitigation_audit.py` measured 2026-09-28: **§7
+registers 92 labels; `src/` carries 99 mitigation-shaped + 80 census-shaped labels, and 79 of the
+mitigation-shaped ones are still undocumented** (a further set is registered only as prose). Fire
+counts are from `build/w43a.log`; all three counts move every time a mitigation lands, so re-run the
+tool rather than quoting these numbers. See §7 for the 3 label-drift repointings and the F-609
+retirements that changed them.
 
 | label | site | effect on the guest | fires |
 |---|---|---|---|
@@ -183,7 +217,7 @@ The table below still lists 13 entries; `src/` currently carries **80** mitigati
 | `kF393NoHijackNonUi` | `src/gpu_device.cpp:1072` (flag), `:11174-11188` (gate body) | **EXPERIMENT SWITCH, currently `false` — measured and REJECTED (F-393).** When true it returns from the `inLeft == 0` leg, before any retry bookkeeping, for every dest whose `AssignPackageForDest` package is not a UI .xsf container: no record write at all, so the title takes its own async read (`ppc_recomp.14.cpp:19047` -> `loc_821BC2F0`/`loc_821BC310`). It did break the 6,747,400-entry spin in `sub_821BC140` (down to 231,518 entries, `READWRAP` 1,742 -> 463,018) and it cost the garage 917,504 -> 143,069 durable bytes, because `inLeft == 0` is a property of the ONE shared record `st=006D8F20` and cannot be decided per destination. Census marker `F393-SERVE-SKIP`. | 484 (`w407`, flag on), 0 (`w408`, flag off) |
 | `F370-SEMA` | `src/gpu_device.cpp` (`F370SemaRow`, called from the `sub_82135DC0`/`sub_82135DB8` wait hooks and the `sub_821C9108` release hook), registry in `src/boot_host.cpp` (F-370 block) fed by `imports.cpp::NtCreateSemaphore` | **READ-ONLY census.** One row per `WAIT`/`RETURNED`/`RELEASE` on any semaphore created with a non-zero initial count (i.e. a permit pool / job limiter), with `init=`, `x=` (timeout arg, or the returned status), `tid=` and the caller `lr=`. **Budget is per handle** (24 then every 200) because the first version shared one cap of 80 and the busiest handle took 83 of 84 rows, leaving the handle under investigation at zero | 33 in `w376` |
 | `F369-SHGRP-SOFT` | `src/gpu_device.cpp:17121-17138` (inside the F-142 binder hook, which opens at `:17059`) | **MITIGATION (F-369, user-directed).** Clears `sub_82193AF8(group,name,required)`'s `required` argument, so a shader-group variable that the group does not declare returns through the guest's own non-fatal exit `loc_82193BAC` (`r3=0`) instead of calling the fatal dispatcher `sub_821BD618`, whose host override parks the calling thread forever (`src/kernel/imports.cpp:3028`). Narrow by construction: `r5` is written once and read once in that body (`ppc_recomp.10.cpp:17741`/`:17804`) and that read only gates the fatal, and a *present* name reaches the same success work either way, so no successful binding is masked. Every application is logged by name — in `w373` there are exactly **2**: `skinningData` and `effectFade` | 2 |
-| `kF368HostDispatchGate` | `src/gpu_device.cpp:2047` | **EXPERIMENT SWITCH, currently `false`.** When true, the alive path of `PPC_FUNC(sub_821873E8)` calls `dispatchBootGateOnce()` (`:2254`), i.e. the host forces `sub_82131008` (the UI-load gate) itself on a detached thread, seed-free. User-approved 2026-09-26 and **still un-run**: it is held off because with it ON, a non-zero `W35-BOOT-GATE` would be our own dispatch rather than proof the guest reached `0x821315F4`. Flip it only for a dedicated soak | 0 |
+| ~~`kF368HostDispatchGate`~~ | **RETIRED 2026-09-28 (F-609)** — the flag, `dispatchBootGateOnce()` and its `src/gpu_device.cpp:2047`/`:2254` sites **no longer exist**; only the deletion note at `src/gpu_device.cpp:2459-2469` remains. It was an experiment switch that forced `sub_82131008` (the UI-load gate) itself on a detached thread, seed-free; it was held off because with it ON a non-zero `W35-BOOT-GATE` would be our own dispatch rather than proof the guest reached `0x821315F4`, and F-436/F-438 then measured the forced dispatch null twice. The native charter removed the mechanism rather than the flag. **Do not re-add it, and do not read a missing `dispatchBootGateOnce` as a regression** | n/a (gone) |
 | `BE710-SLOT` | `src/gpu_device.cpp:11484` | answers a device Read from the host slot table, `ctx.r3=served/4; return` — `__imp__sub_821BE710` never runs | 49 |
 | `kInflateIntervene` (`src/gpu_device.cpp:7085`) | **EXPERIMENT SWITCH, currently `true` = current behaviour.** Set to `false` and `PPC_FUNC(sub_821D5E10)` performs **no** state rewrite at all: it chains straight to the guest's own `zlibInflater::InflateBegin`. Measured (F-182, `w189`): `INFLATE-ENTER 149→1`, `XMEM 40→1`, the guest's own `not in XCompress format` assert becomes visible - but `Fatal error 0→2`, `FATAL-SOFT 0→2`, `GFx 5→1`, so the re-point is load-bearing and the switch stays on. Use it as the removal test whenever the inflate hook is suspected |
 | `kServeFromXCompressHead` (`src/gpu_device.cpp:315`) | **MITIGATION-candidate switch, currently `false`.** When true, an RSC5-framed member is served from `pkg+0x0C` instead of `pkg+0x00`, so the stream begins with the XCompress magic `0x0FF512EF` that `InflateBegin` tests. Measured (F-183, `w190`): **zero effect** - identical to `w189` on all 18 markers, so the stream the guest checks is not the XSF-served body. Kept as a switch because it is the only handle on that framing |
@@ -222,10 +256,18 @@ The table below still lists 13 entries; `src/` currently carries **80** mitigati
 | `INFLATE-J2-WIN-CONT-SKIP` | `:7354` | abandons the guest's continuation walk | 1 |
 | `kHostLzxDecode` / `MclaHostXcDecodePackage` | `src/gpu_device.cpp:323` / `:4114` (use `:804-810`) | **MITIGATION, Path A (F-188; F-189/F-190).** Host libmspack LZX of an RSC5+XCompress UI package inside `HostServeUiBody` so UI `.xsf` serve expanded without guest inflate/`0x82461530`. Path B (`sub_821E5E58` descriptors) dropped after F-187. Refuses partial (w199 32KB/143069 → `XSF-LZX-FAIL`); concats multi-frame XC before one `lzxd`. Lists stay DEFLATE/`RawInflate`. Pass = `XSF-LZX >= 4` + `W34-NOGFX` falling | `XSF-LZX` 4 UI / `XSF-LZX-FAIL` in `w199` |
 
-Registered-but-dead (§7 names them, they fire 0×): `INFLATE-SKIP`, `INFLATE-EMPTY`, `TEXCREATE-SC`,
-`SLOT-READY`, `BLIT-OOB-GUARD`. §7 entries that are prose rather than labels (so no tool can verify them):
-`SEH o1heap`, `pow2 align`, `NtReleaseSemaphore` "Wait-like resolve". `DICT-HYDRATE` is registered without
-its second printer at `:2087`. Full measurement: ledger **F-091 §7**.
+**CORRECTION 2026-09-28 — the "registered-but-dead" list above was wrong.** It
+claimed `INFLATE-SKIP`, `INFLATE-EMPTY`, `TEXCREATE-SC`, `SLOT-READY` and
+`BLIT-OOB-GUARD` fire 0×. All five are **live printers in `src/` today**
+(re-verified with `python tools/mitigation_audit.py --label <name>`, which
+distinguishes code hits from comment hits): `INFLATE-SKIP`
+`src/gpu_device.cpp:13082`, `INFLATE-EMPTY` `:12753`, `SLOT-READY` `:16575`,
+`BLIT-OOB-GUARD` `:4294`, `TEXCREATE-SC` `src/hooks/config_dispatch.cpp:125`.
+A low *count* for these is a finding about the run, not a dead probe. §7 entries
+that are prose rather than labels (so no tool can verify them): `SEH o1heap`,
+`pow2 align`, `NtReleaseSemaphore` "Wait-like resolve". `DICT-HYDRATE` is
+registered without its second printer. Full measurement: ledger **F-091 §7**;
+the authoritative re-measurement is `python tools/mitigation_audit.py`.
 
 ## 7. Short-circuits in tree (life-support — do not stack more without root cause)
 
@@ -238,12 +280,12 @@ overrun blit — closed s74 AV storm) · SLOT-READY (`sub_821CBE18` 1→2) ·
 DISCCHK bit31 pre-ack (F-112: = "pretend the record's bytes are already
 resident", skipping the guest's own disc read for every cache-packfile record; load-
 bearing — w100/w101 without it die at 4,528 lines vs 17,868) · DICT-HYDRATE (hash `0x82839F70` after 10 factory hits,
-`3c8744e` — stays till INSERT clean) · **`kF432SkipZeroCountGrow` / F432-SC** (`src/gpu_device.cpp:17469` flag,
-`:17519-17525` gate: returns from `sub_82397060` without running its body when `r4 == 0`, because that
+`3c8744e` — stays till INSERT clean) · **`kF432SkipZeroCountGrow` / F432-SC** (`src/gpu_device.cpp:23564` flag,
+`:23614` gate — re-measured 2026-10-01, prefer the symbol over these numbers: returns from `sub_82397060` without running its body when `r4 == 0`, because that
 degenerate count makes its free-list link loop run 2^32-1 times writing `[X+12]=X+16` across all 4 GB —
 F-432; measured `w431`: `C0000005` 4→0, `F379-HEAPSTORE-BT` 19→0, garage durable −65,536, `nGfx` unchanged at 0,
 so it is life-support for the heap, NOT a route to GFx) · **`kF434BreakNoProgressSpin` / F434-SC**
-(`src/gpu_device.cpp:1088-1097` flag, `:11007-11042` gate: after 64 consecutive no-progress sightings
+(`src/gpu_device.cpp:1508` flag, `:13468` gate — re-measured 2026-10-01, prefer the symbol: after 64 consecutive no-progress sightings
 of the *same* `(st, consumed)` with `0 < inLeft < 256`, `outLeft > 0`, `produced == 0`, write the
 caller loop's own stream-complete key `[st+0]=0 / [st+16]=0` — the same drain `INFLATE-UNSTUCK` already
 performs, which is gated on `produced > 0` and therefore unreachable for a non-UI stream. `w432`:
@@ -255,6 +297,57 @@ runs.** Trades a spin for a short container: the drained dest keeps whatever was
 Poison values: `0xCDCDCDCD` = guest fill-on-alloc (uninitialized, NOT
 corruption) · `0xDD` = free-fill · `0xFF00FF00`/`0xFFFF00FF` = missing-texture
 texels, NOT poison.
+
+**Label drift in this section (verified 2026-09-28, every `file:line` re-read this
+session).** Three names above were renamed in `src/` and the registry kept the old
+spelling, so `python tools/mitigation_audit.py` reports them STALE. All three are
+**live mitigations** — the registry is repointed, nothing is retired. The line
+numbers in the prose above (`:17469`, `:17519-17525`, `:1088-1097`,
+`:11007-11042`) have **drifted**; use this table.
+
+| registered here as | the real label / flag in `src/` | site (verified) | what guest behavior it replaces | removal gate |
+|---|---|---|---|---|
+| `DISCCHK` bit31 pre-ack | `kDiscChkForcedAck` (a `constexpr bool = true`); the printer is `DISCCHK2` / `DISCCHK2-RES` | `src/gpu_device.cpp:16635-16637` (the write), `:16620` (printer) | the guest's own disc-read completion: forcing `[rec+12]` bit31 tells the guest the record's bytes are already resident, so its read submission (`bctrl` at `0x821CC2B8`) and its wait (`bl 0x821DEE40`) never run | make the real completion path deliver — `sub_821DEE40(io,2)` must return 0 instead of -3. Load-bearing: w100 (off) dies at 4,528 lines vs w101 (on) 17,868 |
+| `F432-SC` | `F432-GROW-SKIP`; flag `kF432SkipZeroCountGrow` | `src/gpu_device.cpp:19646` (printer), `:19645` (gate), `:19595` (flag) | the body of `sub_82397060` when `r4 == 0` — that degenerate count makes its free-list link loop run 2^32-1 times writing `[X+12]=X+16` across all 4 GB (F-432) | a real `want` reaching the call site. `w431`: `C0000005` 4→0, `F379-HEAPSTORE-BT` 19→0, garage durable −65,536, `nGfx` unchanged at 0 — life-support for the heap, **not** a route to GFx |
+| `F434-SC` | `F434-SPIN-BREAK`; flag `kF434BreakNoProgressSpin` | `src/gpu_device.cpp:11777` (printer), `:11765` (gate), `:1410` (flag) | the guest's own no-progress inflate spin: after 64 consecutive no-progress sightings of the *same* `(st, consumed)` with `0 < inLeft < 256`, `outLeft > 0`, `produced == 0`, it writes the caller loop's stream-complete key `[st+0]=0 / [st+16]=0` — the same drain `INFLATE-UNSTUCK` already performs, which is gated on `produced > 0` and therefore unreachable for a non-UI stream | the stream making `produced > 0`. `w432`: `INFLATE-ENTER` 117,229 → 2,378, `BC140-REC` 5 → 7, garage durable back to 872,032. **Trades a spin for a short container** — the drained dest keeps whatever was already in it |
+
+**RETIRED 2026-09-28 (F-609 native charter — "no bypasses, no fakes").** The
+host-forced boot-gate branch was **deleted** from `src/gpu_device.cpp`:
+`kF368HostDispatchGate`, the whole `dispatchBootGateOnce` body (own thread +
+stack + fence/GFx-object construction + gate dispatch), and with it the literals
+`GFX-ALLOC`, `GFX-BLOCK`, `BOOT-GATE started`, `BOOT-GATE-ENTER`,
+`BOOT-GATE-RETURN`, `FIX-821873E8 dispatching`, plus the `GATE-STACK`/`GATE-WAIT`
+census. Verified: `GFX-BLOCK`, `BOOT-GATE started`, `GATE-STACK` and
+`dispatchBootGateOnce` occur **nowhere** in `src/` or `generated/`; `GFX-ALLOC`,
+`BOOT-GATE-ENTER`, `BOOT-GATE-RETURN` and `kF368HostDispatchGate` survive only as
+**historical comment text** in the deletion note at `src/gpu_device.cpp:2459-2469`
+— no live printer, no flag, nothing compiled. **Do not restore them**: F-436/F-438
+measured the forced dispatch null twice, and the negative it bought stands
+(dispatching the UILOAD callback is not what initialises GFx). `W35-BOOT-GATE` is a
+*different, still-live* marker — the guest-reached census in
+`src/task_dispatch_trace.cpp:1615` (§9). A session that finds no
+`dispatchBootGateOnce` in the tree is looking at a correct tree, not a regression.
+
+**Registered 2026-09-28 (in `src/`, absent from this section before; found by
+`python tools/mitigation_audit.py`).** House format: label · site · what guest
+behavior it replaces · the gate that would license removing it.
+
+| label | site (verified) | what guest behavior it replaces | removal gate |
+|---|---|---|---|
+| `F98-SKIP` | `src/gpu_device.cpp:15004` (printer), `:15017` (`ctx.r3.u64 = 0`) | the guest's fence wait `sub_8212F98`: it force-returns **0 = "fence satisfied, proceed"** instead of waiting for `need=[frame+8]` to be matched by `pub=[subctx+0]` (disasm `0x82412FE4-82412FF8`, `subctx=[devctx+10896]`). **Pre-menu load-bearing** — it is what gets the boot past a fence the CP never publishes | the fence actually publishing, i.e. `pub` reaching `need` in the F-603 equation this marker prints per hit. Until then a non-blocking return is the only choice that cannot deadlock the worker |
+| `INFLATE-J2-GUARD` | `src/gpu_device.cpp:13098` (printer), `:13094` (predicate), `:13101` (`return`) | `__imp__sub_821D5E10` itself, for a job-2 UI dest with `magic != 0x0FF512EF && produced == 0`: it returns without inflating, so the dest is left unwritten. Stops the `FATAL-SOFT` at `821D5E5C` "not in XCompress format" that a job-2 fresh dest raised (`w22`) because the previous job's magic was still in the state | the dest's input actually starting with XCompress. Narrow by construction: mid-stream continuations (`produced > 0`) still pass through — the proven path |
+| `INFLATE-J2-WIN-CONT-SKIP` | `src/gpu_device.cpp:11950` (printer) | the walk-continuation window for a job-2 dest whose served head is **not RSC5/XCompress**: it abandons the continuation and falls back to the package-head / drain path. **Not a bare `return`** — the fallback still runs (the same block's `INFLATE-J2-WIN-CONT` at `:11943` is the bounce leg that *does* return), so this is a serve-shape substitution | the walk head being RSC5/XCompress, i.e. `MclaLoadPkgWindow` serving a real continuation window for that dest |
+
+**Why `python tools/mitigation_audit.py` will STILL report 5 STALE labels after
+this edit, and why that is correct.** The tool cannot tell "registered in §7" from
+"named in a retirement note" — it only sees a label-shaped token in §7's text. So
+it lists: `DISCCHK`, `F432-SC`, `F434-SC` (the three registry names whose code
+labels differ — **permanently STALE by design**, the tables above are the
+repointing) plus `GFX-BLOCK` and `GATE-STACK` (the F-609 literals, which appear
+here *only* inside the retirement prose). **Do not "fix" a STALE verdict by
+re-adding code.** To check any one of them: `python tools/mitigation_audit.py
+--label <name>`, which prints code hits separately from comment hits and always
+exits 0.
 
 `kPathBHostFullDecode` (F-297, **ON by default**, `src/gpu_device.cpp:440`;
 labels `PATHB-HOSTDECODE`, `PATHB-HOSTDECODE-TOP`, `PATHB-HOSTDECODE-TOP-SKIP`,
@@ -417,6 +510,80 @@ boundary + inflation + blits + dict), `patches.cpp` (allocation + misc),
 (watches/crash filter), `imports.cpp` (kernel calls), `heap.cpp` (physical
 allocs). The log line `mcla_patch_groups = 'all'` confirms censuses armed.
 
+**FOOD-NOT-PROGRESS (added 2026-09-28).** These measure spin / per-read volume,
+not units of guest progress. A change in their count with every structural marker
+flat is a **timing artefact**, never evidence. Never use them in a neutrality
+claim, and never let a logging change move them.
+
+**HOW `soak_census.py` READS THIS SECTION (added 2026-10-01, measured on
+`w680.log`/`w679.log`; re-derive with `markers_from_guide()` before trusting it
+again).** `markers_from_guide()` (`tools/soak_census.py:609-633`) is the *only*
+thing that makes a marker here tracked, and it is picky. Verified rules:
+
+1. It finds the section by the **literal heading** `## 9. Census / marker
+   inventory` and ends at the next `\n## `. Retitle it and the tracked battery
+   drops to nothing, silently.
+2. Only lines **starting with `|`** count, and of those only the **first cell**
+   (`line.split("|")[1]`). A marker named in column 2, 3 or in a bullet is
+   **invisible to the tool** however loudly the prose says it is the gate.
+3. It keeps a cell's **backticked** tokens only, and drops a token that starts
+   with `-` or `/`, or fails `^[A-Za-z]`. So a `|`-separated first cell is
+   fine, but `**bold**` or bare unbackticked names are not tracked.
+4. **A first cell containing a `file:line` path tracks the path as a marker.**
+   `src/gpu_device.cpp:10993` becomes a tracked token (guide lines 517-520), it
+   counts 0 forever, and it is *not* reported by `MARKER NOT IN SRC` because
+   the path is a substring of nothing in `src/`... except it grades LIVE,
+   vacuously, via `marker_tokens()` splitting on `/` and matching the token
+   `src`. **Keep `file:line` out of the first cell of a tracked row** — put the
+   citation in the *second* cell, as most rows here already do.
+5. Counts are **matching lines, case-insensitive** (`grep -ic`), and rows are
+   **substring** matches, so `INFLATE` also counts `INFLATE-SKIP` and
+   `BE710-MAGIC` also counts `BE710-MAGIC-CENSUS`/`-OFF`. Prefix families
+   cannot be separated by the count alone; the row's own text must say so.
+
+**THE TWO NUMBERS (2026-10-01, re-measure, do not carry forward).** These are
+different quantities and conflating them is how the count rotted:
+`markers_from_guide()` returned **204** before this edit and **218** after (210
+unique — 8 of the 218 are repeat entries of tokens tracked elsewhere, which is
+why the list length and the unique count differ); the tool's own header line
+printed **230** before and **244** after. The header is the **union** of the
+hand battery (54: `FRONTIER` 25 + `VEH_PATHS` 2 + `SHORT_CIRCUITS_TRACKED` 18 +
+`FLOOD_MARKERS` 9) with the §9 parse, de-duplicated: 54 + 196 − 20 overlap =
+230. **`AGENTS.md:116` says "230 markers", which was correct for the union and
+is now stale at 244** — the *union* is what that row describes, and it is
+`AGENTS.md` (not this file) that must be updated. **This section states no
+count of its own, deliberately: a count here would be a second number to rot.
+Re-derive both from the tool instead of reading either.**
+
+**THE 14 ROWS ADDED 2026-10-01** (`XTL-FREE-SUM`, `PHYS-FREE-SUM`,
+`F640-XCU-TABLE`, `XSF-GATE-BIT30-WITHHELD`, `XSF-OPEN-GATE-SKIPPED`,
+`CP: IB-OPC-CENSUS`, `DRAW-GATE`, `BE710-SLOT-MISS`, `MEMBER-EXPAND-SIZE`,
+`SERVE-PROOF`, `PC-TRANSLATE`, `CP-WAITREG-ISSUED`, `TOC76-LAYOUT`,
+`BE710-MAGIC`): all 14 were **absent from this section** while being live
+`MCLA_LOG_*` prints in `src/`, so the frontier's held wins and gates were
+uncountable and every one of them had to be asserted by hand. Each row cites its
+own `file:line`, and each was graded with the tool's own `dead_tracked()` /
+`comment_only()` predicates before being written: **all 14 are LIVE, none DEAD,
+none COMMENT-ONLY** — so their counts are measurements, not the F-057(6)
+tautology. `src/boot_host.cpp:1455` carries the contemporaneous note that
+`F640-XCU-TABLE is not one of the 204 markers`; that comment is now **wrong** and
+is left alone only because `src/` is not this file's to edit.
+
+| marker | why it is flood, not progress |
+|---|---|
+| `INFLATE-ENTER` (`src/gpu_device.cpp:10993`) | one row per `sub_821D5E10` *entry*, so a re-arming spin produces one per iteration. Documented at **4.9k–109k rows per boot**, and one run reached **6,747,400 rows in 50 s**. F-434 (`F434-SPIN-BREAK`) exists only to cut that number, and it trades a spin for a short container — so a *falling* count can mean a truncated container, not a fix. Read it beside `UIXSF-GOLDEN-REVERIFY`/`F409-FILL-GUARD`, never alone |
+| `READWRAP` / `READWRAP-SERVE` (`src/gpu_device.cpp:16286`/`:16304`, `:16271`) | one row per packfile-device `Read` call. The streamer's retry loop re-reads the same window, so the count is iteration volume. F-393 measured it moving 1,742 → 463,018 with the guest's behaviour untouched |
+| `READWRAP-R7Z` (`src/gpu_device.cpp:16255`) | the same wrapper's `r7 == 0` arm, i.e. the F-172 zero-read case, printed **per occurrence**. It is a census of how often the zero read recurs, not of anything delivered |
+| `WAIT` (the hot poller, `WAIT[NTWFSO]`, printer `src/kernel/imports.cpp:612`) | the row is **flooded by a bypass in the print predicate itself**: `src/kernel/imports.cpp:610-611` treats any `lr` in `[0x82410000, 0x82430000)` as `hot` and prints it **unconditionally** (`hot \|\| n <= 120 \|\| n % 300 == 0`), tagging the line with a `!`. That band is a spin region, so the poller it serves can emit a line per iteration for the whole soak. The `!` is the tell: **a `WAIT` row carrying `!` is a loop census, not a wait completing.** Count the untagged rows for "waits that got a response". **`:610-612` was re-verified at 18:42 and is above the concurrently-edited region of the file, so it held; see the `Fatal` row for why the rest of `imports.cpp` is cited by literal only** |
+
+**KNOWN-BROKEN MARKERS (added 2026-09-28) — do not gate on these again.**
+
+| marker | the defect |
+|---|---|
+| `nGfx` (and any count derived from `W34-GFX-CENSUS` / `W34-NOGFX` rows) | **a broken counter, not a zero (F-302/F-437).** Two independent faults: (1) F-437 — `sub_824C6F08` writes `[obj+0]=0x820736DC` and `sub_82482008` then overwrites it with `0x8206DFAC` before the ctor returns, so the predicate misses a *finished* loader; (2) F-302 — the scan reads only 4 bands and every live object observed sat outside them. **`nGfx=0` must never be quoted as a count, and a `W34-GFX-CENSUS`/`W34-NOGFX` row is the scanner reporting its own bands, not a census of GFx.** Use `W35-MOVIE-CTOR` (§9 row) or `F438-GFXCTOR` instead — both are hooks on the ctor, with no blind spot and a positive control |
+| `UILOAD` / `82131008` greps | **substring false positives (F-550).** `grep -c UILOAD` returns only `W34-NOGFX` rows, whose message text names UILOAD while reporting its absence (`src/gpu_device.cpp:7765-7766`); `grep -c 82131008` returns only `F361-BOOTOBJ` rows printing `want+92=82131008` as the *expected* value (`src/gpu_device.cpp:15425`), while the hook at `0x82131008` itself fired 0 times. Both "UILOAD 6 / boot-gate 4" style readings are actually **0 / 0**. Grep `UILOAD-census` and `W35-BOOT-GATE` by their own literals |
+| `Fatal` (substring) | **not a crash count.** `soak_census` counts case-insensitively, so one `Fatal` grep merges five distinct printers: the real fatal dispatcher `Fatal error dispatcher invoked` (in the `sub_821BD618` host override, `src/kernel/imports.cpp` — which **parks the thread and never exits**, so it does not terminate the game), `FATAL-SOFT:` (same function), `FATAL-SOFT-RESOURCE-PARK` (the soft-return branch of the same function), `DISCCHK2-RES … (guest fatals on ==1)` (`src/task_dispatch_trace.cpp:977`), and **`P5-GATE`** (`src/task_dispatch_trace.cpp:642`, whose message ends "no Resource fatal"). The last is the volume term: it fires once per skipped bad pointer in the place-pass walk, so a `Fatal` count that scales with pointer volume is the **`P5-GATE` spin**, not crashes. Count `Fatal error` (the dispatcher line) for fatals and `P5-GATE` separately. **No line numbers are given for the three `imports.cpp` printers on purpose:** that file was being edited by another session throughout 2026-09-28 18:37-18:42 and its line numbers moved three times (3067 → 3855 → 4077 for the same literal). The literals are stable; the line numbers are not. Grep the literal |
+
 | Marker | Hook / meaning |
 |---|---|
 | `GETDEV` (+`-E0`/`-E1`) | fiDevice::GetDevice (`sub_821CB488`); dumps handler table `0x82860844`, entries, devices, lockFlag |
@@ -470,6 +637,11 @@ to bound the noise of any throughput marker quoted (`INFLATE`, `PUT=`, `rptrWB`,
 | `FDBF8-BUILD` / `RSC-PLACE-ARR-GATE` / `REBASE-TABLE` | **container-descriptor census — and a cautionary tale: `[arr]!=0` is NOT a frontier metric** (`sub_825FDBF8` hook at `src/task_dispatch_trace.cpp:1108`, gate at `src/gpu_device.cpp:10072`, publisher at `:4074-4102`). `FDBF8-BUILD` prints the swfC container object's fields: `[obj+12]` is an entry-array **cursor** FDBF8 advances by a length, `[obj+16]` a `u16` count. **F-307 proposed "lines where `[arr]` dereferences non-zero" as the honest signal and F-308 refuted it**: in `w193`/`w248` the value was written by our own mitigation `W30-ARR-FIX` (`gpu_device.cpp:5408`) onto a `CDCDCDCD` buffer, and where it resolved 7 times `UILOAD-census`/`MOVIE-CTOR`/`nGfx` were all still **0** — exactly as in the boots where it resolved 0. **A hook on a guest function still reports host-written bytes, so before trusting any counter, grep its field names against the `Write*` calls that target the same guest offset** (and note `W30-ARR-FIX` is one of the 64 mitigation labels `tools/mitigation_audit.py` finds unregistered in §7 — F-047). `REBASE-TABLE @… n=7 (D828-form vbase/pbase/size)` proves the region table is published and correct: header `nmap<<16` → the two summed `lhz` at `8217D838`, 12-byte entries at `+4` = `8217D878`, `Invalid fixup`=0 (F-307 §1). |
 | `PATHB-HOSTVERIFY` | **F-299 full-buffer residency proof for a host-decoded UI `.xsf`** (`UiDecVerifyReadback`, `src/gpu_device.cpp:4028`, called once per dest from the `D2308-buf` census site `:9681`). `want=` is the FNV-1a digest of the decoded body taken at write time (`UiDecRecordExpect`, `:365`), `got=` is the digest of `unc` bytes re-read from guest memory later in the same boot; `match=true` means the **whole** container is still byte-identical in guest memory, which `BUF-HEAD`'s 16 bytes cannot show. Log-only, one-shot per dest, and it changes no behaviour — proven zero frontier delta (`w273` vs `w271`: every structural marker +0). `read=FAIL` means the guest-memory read failed, not that the content differs. |
 | `SLOT-READY` | page-cache slot wait (`sub_821CBE18`) state flip |
+| `GATE-STACK` / `GATE-WAIT` | **RETIRED 2026-09-28 (F-609).** These belonged to the host-forced boot-gate thread, which is deleted (see §7). `GATE-STACK` occurs **nowhere** in `src/` or `generated/`; `GATE-WAIT` survives only as prose in a comment. Do not gate on either. |
+| `W35-MOVIE-CTOR` / `W35-MOVIE-POST` | **F-302: the project's real graphics gate — use this instead of `nGfx`.** `PPC_FUNC(sub_82482F78)`, the Scaleform **movie-ctor wrapper** (`src/task_dispatch_trace.cpp:1570` for `W35-MOVIE-CTOR`, `:1579`/`:1584` for the two `W35-MOVIE-POST` rows), printing `r3(obj)/r4(flags)/vt/lr` on entry and the object's `vt`→`vt+672` readback after. Why it replaced `nGfx`: F-437 showed `nGfx` is not a working loader-object counter at all, and F-302 then showed even a fixed scan is wrong **by construction** — `sub_82482008` re-types `[obj+0]` to `0x8206DFAC`, so a *finished* loader fails the `0x82073xxx` predicate. A hook on the ctor has no such blind spot. Siblings: `W35-MOVIE-LIFE` (`:1603`, the lifecycle step at `+28`). Cap `n <= 32 \|\| n%50`. **A zero here is the honest "the movie/GFx init chain was never entered" statement** |
+| `F438-GFXCTOR` | F-438: one row per **construction** of a GFx loader object (`sub_824C6F08`, the only routine that installs the loader vtable pair), printer `src/gpu_device.cpp:19570`, reading `obj/vt0/vt672/movie` + the caller `lr` captured before the call. Cap `k <= 16 \|\| k % 64 == 0`. It exists because `nGfx` never counted them (F-437): **a zero here is a falsifiable statement, which `nGfx=0` is not.** The load-bearing control is the **1 row in `w436` with the host gate on** — that is what makes the normal-boot zero mean something |
+| `W35-BOOT-GATE` / `W35-BOOT-GATE-POST` | the **UI-load gate callback itself**, `PPC_FUNC(sub_82131008)` (`src/task_dispatch_trace.cpp:1615` / `:1621`), printing `r3/r4/r5/lr` on entry and `ret r3=` after. Caps `n <= 32 \|\| n%100` and `n <= 8 \|\| n%100`. **This is a live guest-reached census, NOT the deleted host dispatch** — do not confuse the two (§7 RETIRED block). Its reading rule is unchanged and strict: while the host-forced dispatch existed, a non-zero `W35-BOOT-GATE` could have been *our own* line, which is why F-055 could never be licensed; now that the mechanism is gone (F-609), **any** row is proof the guest reached the gate itself. Pair with `W35-BOOT-GATE-POST` (which in the F-371 run printed 0 — the gate never returned) and `F360-REGCB`/`F361-BOOTOBJ` |
+| `UILOAD-census` (**not** `UILOAD`) | the UI-load body `sub_822012E8` reached through `sub_82131008` → `sub_822C0980` → `sub_821FD640` (printer `src/gpu_device.cpp:3850`, `UILOAD-census sub_822012E8 #n r3= r4= lr=`). **Grep trap (F-550): `grep -c UILOAD` counts `W34-NOGFX` rows, not this marker.** Every `W34-NOGFX` line carries the message text "UILOAD/EF220 never armed after inflate" (`src/gpu_device.cpp:7765-7766`), so the marker reporting the *absence* is the only thing producing the hits — in `w560`, `grep -ic UILOAD` = 6 and the real printer printed **0**. Always grep `-c UILOAD-census`. `tools/soak_census.py` tracks **none** of `UILOAD`, `W35-MOVIE-CTOR` or `F438-GFXCTOR`, so its `MARKER NOT IN SRC` guard (F-057(6)) cannot catch this class of false positive — only a hand grep by printer literal can |
 | `DISCCHK` / `DISCCHK2` | disc-error check (`sub_821CC1E0`): `DISCCHK2` dumps `strm/fobj/len/rec/size/offs/flags/route=` (route = the executed bit30×bit31 decision, F-112) — `n <= 40 \|\| (n % 200) == 0` |
 | `DISCCHK2-WAIT` / `-RES` | the guest's own completion call inside the disc-read block (`sub_821DEE40(io, 2)`) and its return value; **only observable with `kDiscChkForcedAck = false`**, so their zero in a normal soak means the mitigation is firing, not that the path is dead |
 | `PARK-STACK` | the boot worker's guest frame chain at each `PARK-SAMPLE` heartbeat (`f0..f7` = return addresses, resolved offline against `ppc_func_mapping.cpp`). Reads `g_bootWorkerCtx`, NOT `g_faultCtx` — that one is `thread_local` and null on the sampler thread (F-119) |
@@ -484,7 +656,6 @@ to bound the noise of any throughput marker quoted (`INFLATE`, `PUT=`, `rptrWB`,
 | `CP-T3-CENSUS` | unhandled PM4 Type-3 opcode, first 3 per opcode with argument dwords, then a running total (`src/gpu_cp.cpp:351-367`). Replaced a logger that collapsed every opcode `>= 0x20` — the whole draw range — into one line (F-059). Names: `xenos.h` PM4 enum. |
 | `CP-DRAW` | decoded `PM4_DRAW_INDX` (0x22) / `PM4_DRAW_INDX_2` (0x36): `VGT_DRAW_INITIATOR` split into `src`/`prim`/`numIdx`/`idxSize` plus `dmaBase`/`dmaSize` for kDMA (`src/gpu_cp.cpp:496-531`, fields per `registers.h:311-326`). **Census only — it does not render**; `DRAW_INDEXED` is a different, still-starved path. |
 | `MSGCHAIN` / `MSGBISECT` | The F-060/F-061/F-063 boot-init chain census (`src/gpu_device.cpp:9450-9560`): every hook **chains** to `__imp__` (log-only), prints its `r3`, `lr`, a guest stack back-chain and `[0x8287E26C]`/`[0x82839F68]`/`[0x8287E064]`. `MSGBISECT 5-822FBAF8 RETURN` is the line that says the `star_glow` effect init completed. Numbers are matched-LINE counts like everything here — one `RETURN` missing is the whole finding. |
-| `GATE-STACK` / `GATE-WAIT` | The forced boot gate's own host thread (`src/gpu_device.cpp:1097+`): the guest stack it runs on (from `g_userHeap`, never the phys o1heap — that caused 3 bogus `AllocPhysical` nulls) and the value of `[0x8287E26C]` after it waited up to 500 ms for the guest to publish its singleton. |
 | `D3070-SKIP` / `D3070-RUN` | `sub_821D3070` buffer guard (`src/gpu_device.cpp:11516+`). SKIP = object/block unusable; RUN = the call was passed to the guest. Since F-063 the `r4 & 0x8000` flag test no longer forces a SKIP, so a SKIP now genuinely means a dead object. |
 | `TICK-PROBE` | VSYNC semaphore release into the tick object |
 | `NFS-CENSUS` | file reads served by VFS |
@@ -494,7 +665,8 @@ to bound the noise of any throughput marker quoted (`INFLATE`, `PUT=`, `rptrWB`,
 | `PHYS-OVERRUN` / `FFBT` | physical overrun (with nearest-alloc + gap) / one-shot host callstack on poison stores (`gpu_cp.cpp`) |
 | `GEN76-ALLOC/FREE` / `BUDDY76-*` / `HEAP76` / `WIN76-*` | allocator censuses (general/buddy/arena/ownership) |
 | `TEXCREATE-SC` / `MISSING-BODY` | legacy-RT short-circuit / recompiler-gap stub census |
-| `GLOBTEX-BOOT` / `TEXINIT` / `GFXINIT` / `TEXINSERT(2)` / `DICTREQ` / `STREAMTEX` / `UILOAD` | texture-path censuses |
+| `GLOBTEX-BOOT` / `TEXINIT` / `GFXINIT` / `TEXINSERT(2)` / `DICTREQ` / `STREAMTEX` | texture-path censuses. (`UILOAD` was listed here with no literal and has been given its own row below — the real marker is `UILOAD-census`, and a bare `UILOAD` grep is a known false positive.) |
+| `PRESENT` | **read this row before quoting any present count (F-054 / F-610).** The real printer is the guest-present line at `src/render_thread.cpp:551`, which emits `HB-FLICKER` for a heartbeat frame and `PRESENT` for a real one from the same counter — so `PRESENT` is already one step removed from "the guest presented". **The substring is worse:** `grep -c PRESENT` also matches `still_present=` inside every `UIXSF-GOLDEN-REVERIFY` row (`src/gpu_device.cpp:10357`), plus the `PRESENT-FB`/`PRESENT-BLIT`/`PRESENT-GRADIENT`/`PRESENT-BLIT-SYNTH` lines below, and `soak_census` counts matching **lines** case-insensitively. **Sub-markers that must be counted separately:** `HB-FLICKER` (heartbeat, `:551` — a liveness watchdog, cleared-only frames, not guest work), `PRESENT-FB` (`:660`, framebuffer readback), `PRESENT-BLIT` (`:678` success / `:667` fail — the guest's own frame reaching a real blit; the positive signal is a **non-zero `va=`**), ~~`PRESENT-BLIT-SYNTH`~~ and ~~`PRESENT-GRADIENT`~~ **BOTH DELETED 2026-10-05 (F-758); their printer sites no longer exist.** Both were host-synthesised images painted into the swapchain over the guest's window -- 240 gradient paints in a 150 s soak, measured -- which charter F-609 forbids in the boot path. Verified comment-stripped at 0 live occurrences in `render_thread.cpp`; the literals survive only inside comments documenting the deletion, so **a grep for either name is now a false positive and must not be read as a live marker.** The honest display for a beat that carries no guest surface is `PRESENT-SURFACE-UNREADABLE` (`:1679`), which presents the measured clear and says so. **A reader diffing an older log against a current one must expect these two to go from non-zero to zero and read that as the fix, not a regression.** `NATIVE-PRESENT` remains the guest's real swap. **A `PRESENT` count that moved without one of these moving is not a finding.** Line numbers here were re-verified 2026-09-28 18:42 and `render_thread.cpp` was being edited minutes earlier — if a number misses, grep the literal, it is stable |
 | `DRAWDISP` / `SETSTREAMS` / `DRAWWRAP` / `SUBMIT` / `LOADGATE` / `DRAW-SEAM` | draw-path censuses |
 | `FRAME-END` / `NATIVE-PRESENT` / `VSYNC-ISR` / `SWAP-COMP` / `SWAP-STATUS` / `SWAP-FILL` | present-path counters + swap-table handshake |
 | `GATE-PROBE` / `DICTSLOT-ALLOC` | IO-credit gate probe (`0x827D74E0`) / slot allocator |
@@ -518,7 +690,7 @@ to bound the noise of any throughput marker quoted (`INFLATE`, `PUT=`, `rptrWB`,
 | `XSF-INFLATE` | the host expansion of an RSC5/Xcompress body (`src/gpu_device.cpp:682`-ff), keyed on the path so per-file success is visible. **0 in every soak through `w181`** while whole, ID-verified packages are being handed over - that is the current menu blocker (F-170/F-171): the payload behind `RSC5+0x0C == 0x0FF512EF` is not raw deflate in any framing tried over `+0x14..+0x2F`. `swfCMD` staying 0 is downstream of this, not independent evidence |
 | `XSF-LZX` / `XSF-LZX-FAIL` | F-188 Path A: host libmspack LZX expand of an RSC5+XCompress UI package inside `HostServeUiBody` (`MclaHostXcDecodePackage`). Success emits `XSF-LZX pkgSz=… wantOut=… produced=… frames=…`; total failure emits `XSF-LZX-FAIL`. **`XSF-LZX >= 4` with `W34-NOGFX` falling is the Path A pass signal.** Lists never take this path (they stay DEFLATE/`RawInflate`) |
 | `REQFILL sub_821867A0` | F-173, corrected by F-174: one line per call to a guest 28-byte streamer-request **builder** (`src/gpu_device.cpp:8418`-ff, registers-only, cap `n <= 24 || n % 2000`). It fires **twice per boot**, returns slot ids 3 and 4, has exactly ONE caller (`sub_82187150+0x1A8`), and its only non-pointer argument (`r5`) is 0 both times. **It is NOT the writer of the pool `sub_821BC140` reads** - its destination array is the caller's own `r1+224 + idx*28` - so do not cite it as the origin of the zero inflate length. Keep this hook register-only: a census in this subsystem once AV'd its consumer by reading guest memory (`ENQ sub_821BCB10` note)|
-| `INFLATE-ENTER` / `READWRAP` | the two lines that together diagnose the inflate door: `INFLATE-ENTER st= in= inPtr= consumed= outPtr= lr=` (our `sub_821D5E10` hook, `src/gpu_device.cpp:7067`-ff) and `READWRAP sub_821CC6F0 r3= r4=[4 words] r5= r6= r7= ret= r1in= lr=` (`:10276`-ff, the packfile device's Read wrapper). `lr=821BC334` on a READWRAP line means the read came from the streamer's inflate loop; **`r7=0` there is the F-172 finding**. `st+0 = 0xFFFFFFF4` with `st+4 = stack+12` is what a zero-byte read produces after the guest's own priming arithmetic - do not read those as real sizes
+| `INFLATE-ENTER` / `READWRAP` | the two lines that together diagnose the inflate door: `INFLATE-ENTER st= in= inPtr= consumed= outPtr= lr=` (our `sub_821D5E10` hook, printer **`src/gpu_device.cpp:10993`** — the `:7067` in this row's old text has drifted) and `READWRAP sub_821CC6F0 r3= r4=[4 words] r5= r6= r7= ret= r1in= lr=` (the packfile device's Read wrapper, printers **`src/gpu_device.cpp:16286`** and `:16304`; the `:10276` in this row's old text has drifted and now holds unrelated code). `lr=821BC334` on a READWRAP line means the read came from the streamer's inflate loop; **`r7=0` there is the F-172 finding**. `st+0 = 0xFFFFFFF4` with `st+4 = stack+12` is what a zero-byte read produces after the guest's own priming arithmetic - do not read those as real sizes. Sibling markers on the same wrapper, count them apart: `READWRAP-R7Z` (`:16255`, the `r7 == 0` arm) and `READWRAP-SERVE` (`:16271`, a host-served read) |
 | `STREAM-OPEN sub_821BCE68` | F-177: one line per `pgStreamer::Open` (registers-only, cap `n <= 24 || n % 500`). **7 firings per boot**, returning handle ids `0,1,2,3,4,0x8004,0x10004`; `r5` is the value read from `RSC5+0x04` (27/9/5442), and Open stores `dev->vtable[+84](dev)` into `record+4` - the length `sub_821BC140` later reads. Pair it with `REQDUMP d[0]` / `ENQ a0` to see which three requests actually execute. The `memory:` device's `+84` is the shared `li r3,0` stub (`0x821A5CC0`, which we force to 0 at `src/gpu_device.cpp:12642`-ff), so a zero length there is ours, not the archive's |
 | `STUB-SLOT` / `STUB-SLOT-TALLY` | per-`lr` tally inside the shared no-op vtable stub `sub_821A5CC0` (`li r3,0; blr`, thirteen slots of `0x82012918` point at it; we override it at `src/gpu_device.cpp:12642`-ff). One line per newly-seen `lr` (max 16) + the first 12 calls. w186: **four** callers per boot - `8217784C`, `8218C82C` (the device+88 case the override exists for), `821BE67C`, and the hot `82177EF8`. Any vtable slot you implement must be checked against this list, because those thirteen slots are indistinguishable by address (F-178) |
 | **Hazard: `INFLATE-ENTER` and `READWRAP` count a timed spin** | their totals depend on how many iterations fit in the soak timeout, so a logging footprint moves them without any change in guest progress (`w185`→`w186`: 149→82 and 278→138 with all 17 structural counters identical). They are not admissibility evidence and not progress evidence - use `LISTLINE`/`TYPINIT`/`GETDEV`/`CP-DRAW`/`PRESENT`/`DRAW_INDEXED`/`C0000005`/`SEEK-DEAD`/`Fatal error`/`FATAL-SOFT`/`DICTLOOKUP`/`[error]` instead (F-178) |
@@ -544,15 +716,33 @@ to bound the noise of any throughput marker quoted (`INFLATE`, `PUT=`, `rptrWB`,
 | `F469-RECSNAP` | F-469: one row per streamer queue push, printed read-only from `PPC_FUNC(sub_821BC868)` (`src/gpu_device.cpp:13853-13878`) just before the `PUSH` line, dumping records 0..5 of the array at `[0x8283D190+52]` as `[idx id/+4 length/+24 pkgoff]`. It is the instrument that settled the F-186 enqueue question: `[slot+0]` (printed as `tag`) is a **handle = `(gen << 15) | record_index`**, every push stamps both index `tag&0x7FFF` and index `tag&0x7FFF − 1`, and re-stamping happens 22-30 ms after creation — before most jobs dispatch. 7 rows/boot, uncapped, no guest write | 7 (`w475`) |
 | `F441-QUEUE-STORE` | F-441: store-watch on the title boot-worker queue `0x40004B40..0x40004DC0` (`src/gpu_cp.cpp:2169-2188`, armed `src/boot_host.cpp:1850-1853`). `w441` = 45 rows, **all value 0, all lr=8241356C** = the return after `bl 0x823d9890` (a memset), i.e. object construction only — no post ever happens. Cap `n <= 32 || n % 500 == 0` | 45 (`w441`) |
 | `F440-REGREAD` | F-440: read-watch on the whole `{handler, msgid}` registry `0x82102AA0..0x82118000` (`src/gpu_cp.cpp:2180-2198`, armed `src/boot_host.cpp:1841-1848`); prints `@addr -> value lr`. **`w440`: 0 rows**, while the same path logged 8 guest-attributed `PAGEWATCH R` rows from other ranges — that pairing is the control that makes the zero mean "never read", not "probe dead". Cap `n <= 24 || n % 500 == 0` | 0 (`w440`) |
-| `F438-GFXCTOR` | F-438: one row per **construction** of a GFx loader object (`sub_824C6F08`, the only routine that installs the loader vtable pair). It exists because `nGfx` never counted them (F-437): read `obj/vt0/vt672/movie` + the caller `lr` captured before the call. Cap `k <= 16 || k % 64 == 0`. **A zero here is the first falsifiable statement the project has had about GFx objects existing** — the old scan could not have found one even if it did | 0 (`w435`, normal boot), **1 (`w436`, control with the host gate on)** — the control is what makes the zero mean something |
+| `F438-GFXCTOR` | *(row moved up, next to `W35-MOVIE-CTOR`, and given its verified site `src/gpu_device.cpp:19570`. Its old line here had no `file:line` at all.)* F-438: one row per **construction** of a GFx loader object (`sub_824C6F08`, the only routine that installs the loader vtable pair). It exists because `nGfx` never counted them (F-437): read `obj/vt0/vt672/movie` + the caller `lr` captured before the call. Cap `k <= 16 || k % 64 == 0`. **A zero here is the first falsifiable statement the project has had about GFx objects existing** — the old scan could not have found one even if it did | 0 (`w435`, normal boot), **1 (`w436`, control with the host gate on)** — the control is what makes the zero mean something |
 | `F434-SPIN-BREAK` | F-434: one row per guest no-progress inflate spin it drains (`st/outPtr/inLeft/outLeft/consumed/magic`). **Uncapped, and the count is the quantity: `w432` = 1 row.** A rising count means a *new* stream is starving, which is a different bug than the one this fixed | 1 (`w432`) |
 | `F432-GROW-SKIP` | F-433: one row per `sub_82397060` entry with `r4 == 0` that is returned from without executing (gate `src/gpu_device.cpp:17519-17525`). **Uncapped on purpose** — the whole boot produced 3 rows in `w431`, and the count IS the quantity: it says how many degenerate grow calls the boot worker reached, which is the clearest available signal that the worker got further than the store storm used to let it | 3 (`w431`), 0 (`w430`, flag off) |
 | `F393-SERVE-SKIP` | F-393: fires once per `inLeft == 0` entry on a dest whose assigned package is not a UI .xsf container, **only while `kF393NoHijackNonUi` is true** (it is false now, so a zero is the expected reading, not a broken probe — print cap is `k <= 32 || k % 512 == 0`). Its purpose was to prove the host serve, not the guest, was holding `sub_821BC140`: with it on, `INFLATE-ENTER`'s max serial fell 6,747,400 -> 231,518 and `READWRAP` rose 1,742 -> 463,018, while `INFLATE-HOSTSERVE-PEND` went 25 -> 0 | 484 (`w407`), 0 (`w408`) |
 | `F382-MEMCPY` / `F379-HEAPSTORE-BT` | F-379..F-383: the two lines that named our own Path A driver as the writer of the host heap header. `F382-MEMCPY` prints the *real* `dst/src/len/lr/sp` of any guest copy whose span crosses `0x20000..0x20240`, read off the context in play (the hook's own `ctx`, not `GetPPCContext()`, which is a different context whenever the guest is driven from host code). `F379-HEAPSTORE-BT` prints the host return-address chain as RVAs; name them with `python tools/host_rva_resolve.py build/mcla.map <rva>...`. Always pair with `F382-MEMCPY-LIVE` before believing a zero (`w392` printed 0 rows because the filter tested the base, not the span) |
 | `VECTORED exception code=0x406D1388` | benign Windows SetThreadName exception from host code — not guest |
+| `XTL-FREE-SUM` | **F-646, added 2026-10-01.** The running census of the `XtlFree` host shim, printed from `XtlFreeSummary` (`src/kernel/imports.cpp:401-408`, `MCLA_LOG_WARN`) on a cadence of `kXtlFreeEvery` = every 64th attempt (`:334`). Fields: `attempted/honoured/refused/unaccounted/honoured_pct` plus the per-reason split `rej[below-4KiB]/[no-translate]/[probe]`, the `rej_why[...]` buckets and `descmismatch=`, ending `detail_rows=/last_ptr=/last_desc=/last_glr=`. **`detail_rows` is the sample size — read the rate against it, never as a per-boot total.** `honoured_pct` is the host-shim success ratio, NOT a guest-progress count. |
+| `PHYS-FREE-SUM` | **F-646, added 2026-10-01.** The same three-field shape for `PhysicalFree` (every 16th row), printed at `src/kernel/heap.cpp:3366-3369` (`MCLA_LOG_WARN`) from the `O1HeapDiagnostics` of the physical heap (`:3365`). Fields: `attempted/honoured/refused/unaccounted/honoured_pct` + `rej[non-exact]/[non-live]`, then the O1 heap state `o1_allocated/o1_capacity/o1_free/phys_freed_bytes` and `caller_rva=/glr=`. **A `rej[non-exact]` rise is a size-mismatch rejection, not a leak** — `honoured+refused` should equal `attempted`; `unaccounted` is the assertion that it does not. |
+| `F640-XCU-TABLE` | **F-640, added 2026-10-01.** The CRT XCU (exception-handler) table census: is the guest's unwinder table actually populated, or is the walker walking zeros? Built by `snprintf` into `lbuf` at `src/boot_host.cpp:1524-1527` and emitted by `BootReportInfo(lbuf)` at `src/boot_host.cpp:1576` (that helper is `MCLA_LOG_INFO("{}", line)`, `src/boot_log.cpp:9-12`) — **so it is a `#[info]` line, not a `#[warn]` one, and it is assembled across TWO `snprintf` calls (`:1524` and the continuation at `:1565`).** Fields: `begin/end/slots/nonNull/first/last/unmapped/truncated/walker/callSite/verify=`, then `beginReadOk/endReadOk/beginWord/endWord/beginInText/endSentinel/regionWords/entries/entriesInText/ffffffff/outOfText/firstEntry/adjacentPairs/orderBreaks/regionReadFail/textRange=`. **`nonNull` vs `slots` is the question the row exists to answer**, and `regionReadFail` != 0 means pass 2 stopped early so every count after it is partial. **ONE row per boot by construction** (it is inside the pre-boot init, not a hook), so a 0 in a soak means the boot never reached pre-boot init, not that the table is empty. |
+| `XSF-GATE-BIT30-WITHHELD` | **added 2026-10-01.** One row per withheld XSF serve-window poisoning, at `src/gpu_device.cpp:19912-19918` (`MCLA_LOG_WARN`). Prints `path/entry/+8` (the `off` that would have been poisoned) and the `w2Stays=` value actually used, plus `bit30=` and `wouldBe=`. **The 1:1 cross-check with `XSF-OPEN-GATE-SKIPPED`: equal counts are the invariant** (one withheld poisoning per skipped arm), and every `w2Stays=` must show `bit30=0` — that is the falsifier for "no XSF row shows an off= with bit 30 set", because W68's `0x40000000u` never enters the cached TOC and the offset stays `w2 & 0x7FFFFFFFu`. |
+| `XSF-OPEN-GATE-SKIPPED` | **added 2026-10-01.** The other half of that pair, `src/gpu_device.cpp:19903` (`MCLA_LOG_WARN`): one row per archive path whose `sub_821CFE80` open is refused, printing `path/entry/+8 ->` and the cleared value. **One row per path, so the count is a property of the archive, not a rate** — measured 250 in both `w679` and `w680`, and any change to it is a TOC/catalog change, never boot noise. The `+8 00471000 -> 40471000` shape in a row is the poison this arm exists to withhold. |
+| `CP: IB-OPC-CENSUS` | **added 2026-10-01.** The IB (instruction-buffer) op-count census, `src/gpu_cp.cpp:4146-4152` (`MCLA_LOG_INFO`). Fields: `ibTotal/win/dwords/depth/trace/walked/t0/t1/t2/t3/nonzeroT3/firstT3Off/firstT3Hdr` and a trailing double-pipe character then the verbatim op dump. **READ `walked` BEFORE believing the type counts, and read them as a function of `t3`, not as absolute work.** A zero header word scores TYPE-0 (`hdr>>30==0`), so on an all-zero buffer `walked == 2*t0` on every row — that identity is the signature of an empty buffer, not of work found. F-637's 437 "real register writes" were exactly this: 3040/3040 rows satisfying `walked == 2*t0`. **`nonzeroT3` is the only field here that can falsify the empty-buffer reading.** |
+| `DRAW-GATE` | **added 2026-10-01.** The draw-path split, two mutually exclusive arms at `src/gpu_device.cpp:4084` (`DRAW-GATE plausible`) and `:4091` (`DRAW-GATE dummy`), both `MCLA_LOG_INFO`. `plausible` = the fetched `vb/ib/cnt` pass the host-side sanity test at `:4078-4080` (`vb>=0x10000 && vbSize && vbStride && ib>=0x10000 && ibSize && indexCount`); everything else is `dummy`. **Capped on both arms (`n<=8` or `n%200==0`; `n<=8` or `n%500==0`), so a small count is the CAP, not the volume** — the underlying counters are `g_submitPlausible` / `g_submitDummy`. **MEASURED on the boot path: 12 `DRAW-GATE` lines, every one of them `dummy`, `vb=00000000`.** A `plausible` row is the first thing that makes a draw count mean anything, so read the arms separately, never the sum. |
+| `BE710-SLOT-MISS` | **added 2026-10-01.** `src/gpu_device.cpp:23416` (`MCLA_LOG_WARN`): a `sub_821BE710` slot/stream handle that resolved to nothing usable, printing `#/obj/h/words`. **0 in both `w679` and `w680` while the sibling `BE710-SLOT` fires 1,138 — a real measured zero, not a dead row**: the literal is live in comment-stripped `src/`, so the path simply was not taken. Do NOT "fix" it by deleting the row on a 0 (F-057(6) is about a literal that CANNOT print; this one can). |
+| `MEMBER-EXPAND-SIZE` | **added 2026-10-01.** The RPF member length-disagreement census, two arms at `src/fs/vfs_rpf.cpp:1166` (a stored-vs-logical mismatch: "guest w1 not reproduced; served as stored") and `:1177` (legacy registration, no guest `w1` to check against, so only an exact match is accepted and the member is refused in place). Prints `off=/stored=/expanded=/logical=`. **These are REFUSALS — the member is not served wrong, it is served as stored or not at all**, so the count is a correctness ledger, never a progress count. **0 in both `w679` and `w680` while `MEMBER-EXPAND` fires 950** — same measured-zero reasoning as `BE710-SLOT-MISS`; note `MEMBER-EXPAND-SIZE` is a strict refinement, so the 950 do not imply 950 of these. |
+| `SERVE-PROOF` | **added 2026-10-01.** The host-serve acceptance proof, `src/gpu_device.cpp:2843-2845` (`MCLA_LOG_WARN`): one row per member the host served, giving `path/off/serveOff/stored=/logical=/served=/head=/declared=/listProved=/proved=/cls=/decoded=/w1delta=/w1disagrees=`. **`served == logical` is the acceptance test**, and `w1disagrees` is the falsifier for it — `cls=rsc5` together with `decoded=1` says the guest's own header was honoured, and a non-zero `w1delta` is the case where it was not (see the W68-era note at `:2681`). **`listProved=0` means no `.lst` member has been proved**, so a `.list`-driven archive is not yet validated by this row. |
+| `PC-TRANSLATE` | **added 2026-10-01.** The shader-translation gate, `src/renderer/dxc_runtime.cpp:131` (`stage= ok# submitted= failed=0`, `MCLA_LOG_INFO`) and `:138` (`stage= FAILED reason= failed# submitted= detail=`, `MCLA_LOG_ERROR`), with the first-failure context at `:147` (`PC-TRANSLATE-FIRST-FAILURE`, `MCLA_LOG_ERROR`). **READ `failed=0` AS A CONSTANT FIRST**: the ok-arm format string hardcodes `failed=0`, so a nonzero `failed=` can only come from the `:138` error arm. **The two arms are NOT distinguished by this substring** — `PC-TRANSLATE` counts both, so a delta here means "something was submitted or something failed", and the `stage=`/`reason=` field is what separates them. **A single `submitted=1` here is the whole shader frontier, and it is NOT evidence that a shader compiles**: an offline validator result is not a boot fact, and this row is the only boot-path evidence. |
+| `CP-WAITREG-ISSUED` | **added 2026-10-01.** The CP wait-register issuance census, `src/gpu_cp.cpp:2576` (short body), `:2589` (body dword dump), `:2632` (normal, with `hdr=`/`waitInfo=`) and `:2692` (poll VA unreadable) — all `MCLA_LOG_WARN`, and all four behind the `r <= 8` or `r % 200` cap, so **a low count is the cap, not the volume** (the free-running counter is `g_waitRegMemUnreadable` and its siblings). The short-body arm is the load-bearing one: the five body dwords (`command_processor.cc:962-966`) are consumed but **NOT counted satisfied**. Siblings `CP-WAITREG-SATISFIED` / `-TIMEOUT` exist in the same block (`:2474`). **0 in both `w679` and `w680` for the whole `CP-WAITREG` family** — a measured zero, and the honest reading is that the CP never issued a wait register on this boot path, not that the census is broken. |
+| `TOC76-LAYOUT` | **added 2026-10-01.** The four-entry TOC76 window layout, `src/gpu_device.cpp:19778-19779` (`MCLA_LOG_WARN`): one row per window, printing `#/path/entry`, the eight big-endian words at `entry+4` and `entry+14` as `+4=[...]` / `+14=[...]`, and the `xsf=`/`list=` classification. **This is the row that decides whether a member is served at the right SIZE**, so it is the evidence behind `SERVE-PROOF`'s `logical=` and behind `MEMBER-EXPAND-SIZE`; the same four entries are re-read on every pass, so **an identical `(143,089)` / `(143,069)` pair across rows is a stable layout, and a CHANGE in it is a catalog change.** 534 rows per boot in both `w679` and `w680`. |
+| `BE710-MAGIC` | **added 2026-10-01.** The `sub_821BE710` magic-header write, `src/gpu_device.cpp:23480` (`MCLA_LOG_WARN`, "wrote 61786772"), gated on the compile-time `kBe710MagicWrite` at `:23477` — **`false` there is the T41.9b control (the `w130` arm) and it prints `BE710-MAGIC-OFF` at `:23482` instead, so the OFF row is the control, not a failure.** The companion header census is `BE710-MAGIC-CENSUS` at `:23443` (57 rows/boot). **`BE710-MAGIC` is a substring of both, so this row's count is the sum of the write rows and the CENSUS rows and can never be split by the census alone** — read `BE710-MAGIC-OFF` (0 in both soaks, so the control arm is off) and the `wrote 61786772` suffix separately. |
 
 ## 10. RE tooling
 
+- **One-shot / bulk exports:** `tools/ida_dump.py <dir> <addrs…>` (decompile via the bridge on
+  :8745) and `tools/ida_bulk_export.py <dir>` (whole image as files **with raw bytes** — the RULE 0
+  authority for mask claims). **x64dbg** MCP server is configured in both `.qoder/settings.json`
+  and `opencode.json` (added 09-28) for live debugger checks.
 - **IDA MCP** on `127.0.0.1:8745`. **Two ways in, and the safe one is usually not the configured one.**
   **F-350 SUPERSEDES the rest of this bullet — three facts, now all implemented in
   `tools/ida_rpc.py`.** (a) Analyze **`build/cache/mcla_pe.bin`**, *not*

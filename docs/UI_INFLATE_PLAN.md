@@ -686,3 +686,159 @@ host and guest writing the same buffers. (2) #90 is PROMOTED and sharpened: comp
 produces at the moment its decompress call returns against the reference, then census the InflateBegin
 parse exits for the two silent containers. (3) #89 stands unchanged (the verifier still iterates the
 fill log, so policecam and credits have no over-time verdict).
+
+## 11. Frontier after F-515..F-518 (2026-09-27 11:5x) — the decode works, the binding does not
+
+**Settled since §10.4, with the citation:**
+
+| Claim | Evidence |
+|---|---|
+| `*destSz(out)` = bytes WRITTEN (and `*srcSz(out)` = bytes consumed); a failed call leaves both untouched | F-517 §1 (the `kUiXsfFillDryRun` control) **and** F-517 §1b (single store site `0x824612F0`/`0x824612F8`, remainders kept in `r29`/`r28`) |
+| **The title's own `XMemDecompress` produces byte-exact container output** | `build/w525.log:3701` — raceeditor, dest `B7F01000`, 196,608 written, head == external golden@0, with *all* host placement disabled. F-509 §1's circularity objection no longer applies to this container |
+| Why that one worked | `src/gpu_device.cpp:11341-11350` `stackPkgHead && !IsJob2UiDest` → `MclaForceServePkgForDest` (`:8801`) → guest bounce `CA0F8180` holding the real `RSC5` window → decoder ran on `bounce+0x14`. The only `W28-STACKHEAD-SERVE` row in the boot |
+| Why the other three do not | F-517 §4: `PATHB-PKGFIX` binds `B7EC1000`/`B7841000`/`B78E1000`, and **0 of 6,594 uncapped `INFLATE-ENTER` rows** name any of them. 0 of 3,890 `JOB2-PKG-SERVE` rows carry `64980000`/`64CA3000`/`6496F000` |
+| Address-containment binding is the wrong repair | F-518: `w527` fired 15 `F518-RANGEBIND` rows and lost 3 of 7 dispatches, `JOB2-PKG-SERVE` 3,890→1, zero new containers. Reverted in `w528` |
+| `Fatal error` is not a 0/1 marker on the shipped tree | F-518 §4: the reverted build (`w528`, same-size exe as `w524`) printed **1**, so 0-vs-1 is boot-to-boot noise. State the baseline whenever this marker gates a claim |
+
+**The objective's two clauses, restated honestly here.** Clause (a) — "UI .xsf containers decompressed" —
+is now *mechanically demonstrated* for one of four containers by the guest itself, and the blocking defect
+is named precisely: the dest→package binding that chooses what to serve is keyed on the single dest
+observed at archive-open, while the guest inflates along its job's whole read-list. That is a binding bug,
+not a codec bug, and not a "containers never enqueued" bug (F-469 already killed F-186/F-187's premise).
+Clause (b) — GFx initialising — is unchanged: `F438-GFXCTOR` is 0 in `w524`, `w525`, `w527` and `w528`
+alike, so §10.2 P4 still stands.
+
+**Queue, in order:**
+1. **NEW #91 (replaces #90 step 2): per-JOB dest→package ownership.** Build `(job, slot-index) -> pkg` from
+   the `REQDUMP`/`PSTREAM` data already printed, keyed on the job the walk is running *right now*, and
+   consult it from `AssignPackageForDest` before the `rscTab` guess. It must be *unable* to evict another
+   job's dest — that is the whole difference from F-518. *Cite:* `src/gpu_device.cpp:373-392`, `:411-441`,
+   `:10062-10079` (the reverted F-518 code, kept `false` as the shape to copy), F-518 §3/§6.
+2. **#89** unchanged — the re-verify still iterates the fill log.
+3. **#87** still demoted.
+4. Cheap and independent: fix `tools/ppc_disasm.py`'s swapped `mr` operands (F-517 §1b) — it silently
+   misleads on every register move.
+
+### 11.1 F-519 ran (#91) — clean, shipped OFF, and it promoted a better suspect
+
+`kF519BindJobOwned` bound each dest by the **dispatching job's own** read-list
+(`slot+8+12i`/`slot+12+12i`, count `slot+1540`) paired with its `record+24` package. Measured `w529`
+against `w527` (F-518) and `w528` (both off): **all of F-518's damage disappears** — `POST-EXEC-START`
+7, `F507-INITEXP` 7, `GFx` 13, `LISTLINE` 171, `C0000005` 0, `Fatal error` 0, and `JOB2-PKG-SERVE`
+3,890→218 instead of →1. So job-keying is the right *shape* and the range machinery was never the
+problem. But it verified **no** additional container (`F517-GUESTOUT` OWN-CONTAINER still only
+raceeditor) and thinned the probe 67→30, so it is kept as a probe with the flag `false`.
+
+**What replaces #91 as the front suspect (new, from the same rows):** for job `8284A140` the title's own
+record says `pkg=64CA3000` (**policecam**) while `PATHB-PKGFIX #2` binds that job's slot[0] `B7EC1000`
+to `garage`/`64980000` by archive path name. The same dest therefore resolves to two different
+containers depending on which attribution is trusted (`w527`: `B7D21000 -> 64980000`; `w529`:
+`B7D21000 -> 64CA3000`). Only 4 of 7 dispatches registered, and `64980000` never appears as a
+`record+24` at all. That is F-467's two-index-space problem seen from the package side, and it must be
+resolved — which attribution is correct — before any further serve change, because every serve currently
+issued for those dests is keyed on one of them.
+
+**Also corrected here:** the argument that motivated #91 was wrong even though the build was sound.
+`REQDUMP` prints a *bounded window* of a 52-entry list, so its omission of `B7D21000`/`B7401000` proved
+nothing about ownership (F-519 §3). Read `rlc`/`slot+1540`, not the truncated dump.
+
+**Queue after F-519:** (1) NEW #92 — adjudicate `PATHB-PKGFIX` path-binding vs `record+24` for job
+`8284A140`, one soak, no serve change; (2) then re-run #91's arm behind the winner; (3) #89 unchanged;
+(4) #87 still demoted; (5) GFx/P4 unchanged, and `F438-GFXCTOR` is still 0 in `w524`/`w525`/`w527`/
+`w528`/`w529`.
+
+
+## 12. Clause (b) adjudicated as a separate problem — F-548 (2026-09-27 14:4x, 0 builds, read-only on `w560.log`)
+
+The GFx movie ctor chain is now pinned end to end and it does **not** run through anything this plan
+touches:
+
+- `sub_824C6F08` (loader ctor, `generated/ppc_xenon/ppc_recomp.94.cpp:3538`) has exactly one in-image
+  call site: `generated/ppc_xenon/ppc_recomp.87.cpp:16297`, inside wrapper `sub_82482F78`.
+- `tools/ppc_xrefs.py xref 82482F78` → **0 sites materialise `0x82482f78`**: the wrapper is reached only
+  by indirect dispatch (`src/task_dispatch_trace.cpp:1517-1518`), so no new hook on a `bl` exists to add.
+- Both counters print 0 in `w560.log` (`W35-MOVIE-CTOR`, `F438-GFXCTOR`), and the control fired: **20 of
+  the 53** markers declared in `src/task_dispatch_trace.cpp` print in that same log, so these are true
+  guest negatives, not dead hooks.
+
+Read with F-440 (registry never read) and F-441 (queue stores 45/45 all zero, all from a memset at
+`lr=8241356C`), the conclusion is that **clause (b) has no remaining decompression route**: after F-547
+proved 4/4 containers byte-exact in guest memory, "GFx initializes" is gated on the title's message-poster
+/ an indirect call target, nothing else.
+
+**Queue, rewritten after F-548.** (1) ~~serve/decompress work~~ closed for clause (a) — F-547.
+(2) Clause (b) needs a user decision, not a build: either authorize the `F-055` host-forced boot path, or
+authorize a runtime indirect-target census of `0x82482F00..0x82483000` (F-509 §5) to find who was supposed
+to call the wrapper. (3) Walk termination (#93/F-541) is retained as correctness hygiene for Path B but is
+no longer a candidate for clause (b). (4) #89 follow-ons (key `s_audited` by `(pkg, shot)`; extend
+`F547-RANGEAUDIT` to unreadable ranges) remain open, measurement-only.
+
+
+## 13. Clause (b) narrowed to one unfed callback slot - F-550 (2026-09-27 14:5x, 0 builds)
+
+F-548/F-549 narrowed GFx to one registry row; F-550 narrows it to one **empty descriptor word**, and
+retracts two of my own counts on the way (`UILOAD` 6 and `82131008` 4 in `w560.log` are substring hits on
+`W34-NOGFX` / `F361-BOOTOBJ` message text - the real printers read **0 / 0**).
+
+**The chain, every link cited and measured on the shipped binary (`w560`):**
+
+| # | link | evidence |
+|---|---|---|
+| 1 | boot worker never reaches the registration at `0x821315F4` | F-361, F-363, F-369 |
+| 2 | so `desc+92` reads `00000000` at the four `F361-BOOTOBJ` samples — **corrected by F-551: the title's copier installs `0x821FC008` there 105 ms later, so link 2 is a handler-identity mismatch, not an empty slot** | `F361-BOOTOBJ` x4 - `w560.log:3727,4122,4604,5240` |
+| 3 | so the callback `sub_82131008` is never entered | its hook: 0 rows; body `generated/ppc_xenon/ppc_recomp.0.cpp:2673` |
+| 4 | so UILOAD `sub_822012E8` never runs | `src/gpu_device.cpp:3968`: 0 rows |
+| 5 | so the GFx `{handler, kernelHandle}` registry is never read, incl. the movie-ctor row `0x82115F78 -> 0x82482F78` | F-440 (0 rows over `0x82102AA0..0x82118000`), F-549 |
+| 6 | so `sub_82482F78` is never called and `sub_824C6F08` never constructs | `W35-MOVIE-CTOR` 0, `F438-GFXCTOR` 0, control fired (20 of 53 markers in the same TU print) |
+
+**
+
+
+
+F-551 CORRECTION TO STEP 1 (2026-09-27 15:0x, 0 builds). The slot is not empty: the title's own copier writes 0x821FC008 into C65C5800+92 at w560.log 14:33:52.557 (F365-COPIER #1 AFTER obj+92=821FC008 obj+104=00000001), 105 ms after the four F361-BOOTOBJ samples. So the new P0 is one build, not a static read: a 4-byte load-watch on C65C5800+92 (F-549 step-4 recipe, aimed at the right word) plus a print of the first instruction words at 0x821FC008 at install time, to discriminate (i) thunk-to-UILOAD vs (ii) wrong-descriptor install vs (iii) two objects sharing the slot layout. Steps 2 and 3 below are unchanged and remain gated on that result.**F-552 UPDATE TO THE P0 ABOVE (2026-09-27 15:0x, 0 builds).** The load-watch is demoted: the slot IS
+written (F-551), and the reason the second write at `0x821315F4` never happens is that its enclosing call
+`sub_822C2EA8` (entered 51.595, `ret=0x82131554`, uncapped printers, **no RETURN row in the whole 93 s of
+log**) never returns - the boot worker's last frames are `sub_821BC868` and the mount gate. New P0, one
+build: uncapped enter/return on `sub_822C2EA8` + per-tid last-callee tracker (pattern at
+`src/gpu_device.cpp:15844-15866`), gate = it must name a single callee held at the end of the soak. If that
+callee is in the inflate-walk family, the GFx clause is inherited from F-541 §3a (drain `st+16` by keeping
+`written > 0`) and the walk-termination line is re-promoted from "hygiene" to the critical path.
+
+**F-553 (0 builds, 310 s soak `w561_longsoak.log`): the non-return is permanent, not a short-soak
+artifact** - `F363-C2EA8 #1 ENTER` @14:57:59.084, no RETURN through @15:02:50 (291 s), `F370-SEMA` exactly 61
+rows in both the 120 s and the 310 s boot (handle-filtered printer, not a row cap), so the worker is not
+spinning in tracked waits. Clause (a) also re-verified at 310 s (`F547-RANGEAUDIT` 4 rows, `LISTLINE` 171,
+`C0000005` 0). The remaining cheap unknown is only WHERE `sub_822C2EA8` blocks; the P0 build above is now
+the instrument that names it.
+
+**F-555 (2 builds, `w563`/`w564`): the blocker is named - `sub_822C54D8`.** Eleven consecutive call targets
+of `sub_822C2EA8` given ENTER/RET pairs: all return except `sub_822C54D8` (ENTER 1 / RET 0 at `lr=822C30B8`,
+`r3=D40A0880 r4=0`), and that routine is six instructions ending in **two `bctrl` virtual calls with the
+target loaded from `[r3]`**. The UILOAD registration is therefore hostage to a runtime indirect dispatch
+inside the boot worker - the live instance of the dispatch shape F-313 declared missing. Next build:
+ENTER/RET on `sub_821BD618` + `sub_822C51B0`, plus print `[r3]`/`[r3+4]`/`[r3+8]` at `0x822C552C` and
+`0x822C5540` to name the target.
+
+- F-561 CLOSED the host-mitigation question: `EF100-CNT-GATE` = 0 rows in w560/w561/w567, so our cap-to-1 never acted; the PLACE pass `sub_825EF100` instead runs on `B7921000`/`B7B41000` with `vt=CDCDCDCD arr=CDCDCDCD cnt=0xCDCD`. New P0 for clause (b): name who must fill those two objects before place runs (start at `lr=82720638`), then serve/trigger it in one build and gate on `F438-GFXCTOR` != 0. The `F-055` route is NOT needed for this experiment.
+
+Concrete implementation plan for clause (b), in cost order.** All of it targets link 1; every route that
+skips to links 2-6 is host forgery, which is the user-closed `F-055`.
+
+1. **P0, static, 0 builds - enumerate link 1's early exits.** Read `sub_82131508`'s path from entry to
+   `0x821315F4` in `generated/ppc_xenon/` and list every branch that can leave without registering; for each
+   callee on those paths, check whether an existing hook already names it (tasks #36/#37 concluded
+   `sub_822C2EA8`'s wait loop and `sub_82193AF8`'s failed lookups, both mitigations behind flags). Then run
+   `python tools/mitigation_audit.py --tiers` and read `PROGRAM_GUIDE` §7 to establish which of those arms
+   is actually enabled in the shipped configuration - not from memory.
+2. **P1, 1 build - instrument the exit, not the entry.** Add `F551-BOOTOBJ-EXIT` beside the existing
+   `F361-BOOTOBJ` printer: one row per `sub_82131508` return, printing `lr`, the last callee entered, and
+   `desc+88..+104` post-call. Usefulness gate: it must fire >=1x **and** its rows must disagree with the
+   `W34-NOGFX` scan-band claim, else it adds nothing and gets reverted.
+3. **P2, user-gated - `F-055`.** Only if (1)+(2) show the guest cannot reach `0x821315F4` in this prototype
+   does writing `desc+92 = 0x82131008` from the host become the last option, and F-436 already measured that
+   a forced ctor installs the wrong vtable (`0x820736DC` vs the `0x8206DF60` table of F-549 §3), so such a
+   route must verify `obj+0` against F-549's two tables, not assume either.
+
+**Do not spend turns on:** serve/window tuning as a route to clause (b) (F-538 closed that family), the
+neighbouring registry rows as separate mysteries (F-549 §2 - they share one unread table), or any counter
+read by substring grep (F-550 §4).
