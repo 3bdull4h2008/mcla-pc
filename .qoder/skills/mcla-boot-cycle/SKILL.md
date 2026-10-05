@@ -68,6 +68,15 @@ cd "E:/mcla pc/build" && timeout 120 ./mcla.exe > w43a.log 2> w43a_err.log; echo
 `BOOT_RC=124` means the timeout fired = **the process survived**, which is the normal good result.
 Never reuse or overwrite an existing soak log; they are the evidence base and are gitignored, so
 a lost log is a lost claim.
+> **SHELL GOTCHA (2026-09-28, cost two soaks):** that recipe assumes Git Bash. Under
+> PowerShell (this agent's shell) `>` writes **UTF-16LE** (`w623.log` = 128 MB of UTF-16,
+> `soak_census.py` reads all-zero until decoded), and `cmd.exe` has no `timeout` that runs a
+> program (`cmd /c "timeout 300 mcla.exe ..."` is a syntax error and the game never runs -
+> `w624` is void). The bounded run must be done in Python: `subprocess.Popen(['mcla.exe'])`
+> with stdout/stderr to raw-byte files, `wait(300)`, kill on `TimeoutExpired`. Decode a
+> UTF-16 log once with
+> `python -c "open('build/w623_utf8.log','w',encoding='utf-8').write(open('build/w623.log',encoding='utf-16-le').read())"`
+> and census the decoded copy, keeping the original as evidence.
 
 ## 5. Regenerate the guest image if it is missing (rule 3)
 

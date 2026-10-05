@@ -104,9 +104,10 @@ not, whatever its `C0000005` says.
 and 0 in `w38g.log`: the paths were deleted in T38.3(a) and the list was never regenerated, so "all
 zero" from it is vacuous, not reassuring. The live VEH signals to count instead are
 `VEH-NEUTRAL` (the handler declined — honest) and `VEH W0: parking thread`
-(`src/boot_host.cpp:1064`, the generic park). `tools/soak_census.py` has the same rot: 8 of its 9
-`VEH_PATHS` entries are gone from `src/` and it omits `parking thread` — fix it (T40.4) before
-trusting its recovery column, and re-derive the list from the source rather than from this file.
+(`src/boot_host.cpp`, generic park — re-measure the line). **[T40.4 DONE:] `tools/soak_census.py`
+has carried both live signals since its VEH repair (`soak_census.py` "DEAD TRACKER" prints
+`VEH-NEUTRAL` + `VEH W0: parking thread` rows; re-verified 2026-10-01) — the "fix it" note below is
+historical.** Re-derive any marker list from the source rather than from this file.
 
 ## Reading discipline
 

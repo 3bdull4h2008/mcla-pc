@@ -21,6 +21,17 @@
         "RENDERDOC_MODULE_PATH": "C:\\Program Files\\RenderDoc",
         "RENDERDOC_QRENDERDOC_PATH": "C:\\Program Files\\RenderDoc\\qrenderdoc.exe"
       }
+    },
+    "x64dbg": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "python",
+        "E:\\mcla pc\\tools\\x64dbg_mcp.py"
+      ]
     }
-  }
+  },
+  "plugin": [
+    "opencode-autogoal"
+  ]
 }

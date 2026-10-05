@@ -10,6 +10,135 @@ endif()
 
 project(mcla VERSION 0.1.0 LANGUAGES C CXX)
 
+# ===========================================================================
+# GATE 1 - generated/ppc_xenon must hold EXACTLY 176 recomp translation units.
+#
+# This invariant used to live only in prose, so a recompiler regen that
+# changed the TU count was silent in the dangerous direction.  The source
+# list in the add_executable(mcla ...) block below is a hand-maintained
+# ppc_recomp.0..175.cpp enumeration: a *stray extra* TU on disk (e.g.
+# ppc_recomp.176.cpp) is never referenced, so it compiles and links fine and
+# the emulator just silently loses whatever function landed in it.  A
+# *missing* TU fails much later with an opaque "cannot open source file".
+# Both directions now fail here, at configure time, with the reason.
+#
+# Invariant source of truth:
+#   .qoder/skills/mcla-recompiler-regen/SKILL.md:57-58
+#     "**TU count must stay 176** - `CMakeLists.txt` hardcodes
+#      `ppc_recomp.0..175.cpp`.  A regen that changes the count breaks the
+#      build."
+#   plus the do-not list (LONG_TODO_MASTER.md section 4) and
+#   SKILL.md:49 ("If a fresh regen is not byte-for-byte clean -> STOP").
+#
+# If a regen legitimately changes the count, that is an intentional
+# migration: bump MCLA_EXPECTED_TU_COUNT, regenerate the source-list block
+# from it, and re-run the reproducibility check (target check_regen_repro,
+# at the bottom of this file).  Do not just append a line to the list.
+# ===========================================================================
+set(MCLA_EXPECTED_TU_COUNT 176)
+set(MCLA_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated/ppc_xenon")
+
+# Expected TU names, derived from the count so the two can never drift.
+set(MCLA_EXPECTED_RECOMP_TUS "")
+math(EXPR _mcla_tu_last "${MCLA_EXPECTED_TU_COUNT} - 1")
+foreach(_mcla_i RANGE 0 ${_mcla_tu_last})
+    list(APPEND MCLA_EXPECTED_RECOMP_TUS "${MCLA_RECOMP_DIR}/ppc_recomp.${_mcla_i}.cpp")
+endforeach()
+
+# --- (a) every expected ppc_recomp.N.cpp exists ----------------------------
+set(_mcla_missing_tus "")
+foreach(_mcla_tu IN LISTS MCLA_EXPECTED_RECOMP_TUS)
+    if(NOT EXISTS "${_mcla_tu}")
+        list(APPEND _mcla_missing_tus "${_mcla_tu}")
+    endif()
+endforeach()
+if(_mcla_missing_tus)
+    list(LENGTH _mcla_missing_tus _mcla_missing_n)
+    string(REPLACE ";" "\n    " _mcla_missing_list "${_mcla_missing_tus}")
+    message(FATAL_ERROR
+        "MCLA INVARIANT VIOLATED [generated TU count, missing]:\n"
+        "  ${_mcla_missing_n} of ${MCLA_EXPECTED_TU_COUNT} expected ppc_recomp.N.cpp files are absent from\n"
+        "  ${MCLA_RECOMP_DIR}\n"
+        "    ${_mcla_missing_list}\n"
+        "  A recompiler regen changed the translation-unit count. The count is an\n"
+        "  invariant, not a stale number to be patched: .qoder/skills/mcla-recompiler-regen/SKILL.md:57-58\n"
+        "  (\"TU count must stay 176 ... A regen that changes the count breaks the build\")\n"
+        "  and SKILL.md:49 - a regen that is not byte-for-byte clean means STOP, fall back to Route A/C.\n"
+        "  Do NOT fix this by deleting entries from the mcla source list.")
+endif()
+
+# --- (b) NO unexpected ppc_recomp.*.cpp on disk (the silent direction) -----
+# This is the check that matters: the hand-written source list would ignore
+# an extra TU, so this is the only thing standing between a regen and a
+# silently-dropped guest function.
+file(GLOB _mcla_actual_recomp_tus "${MCLA_RECOMP_DIR}/ppc_recomp.*.cpp")
+set(_mcla_unexpected_tus "")
+foreach(_mcla_tu IN LISTS _mcla_actual_recomp_tus)
+    list(FIND MCLA_EXPECTED_RECOMP_TUS "${_mcla_tu}" _mcla_tu_idx)
+    if(_mcla_tu_idx EQUAL -1)
+        list(APPEND _mcla_unexpected_tus "${_mcla_tu}")
+    endif()
+endforeach()
+if(_mcla_unexpected_tus)
+    list(LENGTH _mcla_unexpected_tus _mcla_unexpected_n)
+    list(LENGTH _mcla_actual_recomp_tus _mcla_actual_n)
+    string(REPLACE ";" "\n    " _mcla_unexpected_list "${_mcla_unexpected_tus}")
+    get_filename_component(_mcla_unexpected_names "${_mcla_unexpected_tus}" NAME)
+    string(REPLACE ";" ", " _mcla_unexpected_names_csv "${_mcla_unexpected_names}")
+    message(FATAL_ERROR
+        "MCLA INVARIANT VIOLATED [generated TU count, UNEXPECTED EXTRA FILE]:\n"
+        "  found ${_mcla_actual_n} ppc_recomp.*.cpp in ${MCLA_RECOMP_DIR} but only\n"
+        "  ${MCLA_EXPECTED_TU_COUNT} are known; ${_mcla_unexpected_n} would be SILENTLY IGNORED:\n"
+        "    ${_mcla_unexpected_list}\n"
+        "  (${_mcla_unexpected_names_csv})\n"
+        "  The mcla source list below enumerates ppc_recomp.0.cpp..ppc_recomp.${_mcla_tu_last}.cpp by hand,\n"
+        "  so an extra file would compile, link and then never be called - the guest function it\n"
+        "  holds would be silently dropped, with no build error at all.\n"
+        "  Invariant: .qoder/skills/mcla-recompiler-regen/SKILL.md:57-58\n"
+        "  (\"TU count must stay 176\"; the full skill is SKILL.md, the TU-count bullet is line 57).\n"
+        "  Either delete the stray file (regen was pointed at the wrong out_directory_path, or a\n"
+        "  partial regen left debris) or, if the count genuinely moved, bump MCLA_EXPECTED_TU_COUNT\n"
+        "  and regenerate the source-list block to match - never just append to the list.")
+endif()
+
+# --- (c) the hand-written source list must still enumerate the same count --
+# The add_executable(mcla ...) entries are the only 4-space-indented lines of
+# this exact shape in the file, so this counts that block without parsing it.
+# Catches the reverse drift the (a)/(b) pair cannot see: a TU dropped from
+# the list while its file is still on disk compiles fine and is simply not
+# linked into mcla.
+# NOTE: CMAKE_CURRENT_LISTFILE is EMPTY on the cmake 4.4.0-rc3 this tree
+# configures with (file(READ) then tries to open the working directory), so
+# resolve this file's own path from CMAKE_CURRENT_LIST_DIR and fall back to the
+# source dir - this gate lives in the top-level CMakeLists.txt by construction.
+if(DEFINED CMAKE_CURRENT_LIST_DIR AND NOT CMAKE_CURRENT_LIST_DIR STREQUAL "")
+    set(_mcla_this_file "${CMAKE_CURRENT_LIST_DIR}/CMakeLists.txt")
+else()
+    set(_mcla_this_file "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
+endif()
+if(NOT EXISTS "${_mcla_this_file}")
+    message(FATAL_ERROR
+        "MCLA GATE [source-list drift]: cannot re-read '${_mcla_this_file}' to cross-check the\n"
+        "  generated source list. Refusing to skip the check - this file must be the top-level\n"
+        "  CMakeLists.txt for the check to mean anything.")
+endif()
+file(READ "${_mcla_this_file}" _mcla_cml_text)
+string(REPLACE "\r\n" "\n" _mcla_cml_text "${_mcla_cml_text}")
+string(REGEX MATCHALL "\n    generated/ppc_xenon/ppc_recomp\\.[0-9]+\\.cpp" _mcla_listed_tus "${_mcla_cml_text}")
+list(LENGTH _mcla_listed_tus _mcla_listed_n)
+if(NOT _mcla_listed_n EQUAL MCLA_EXPECTED_TU_COUNT)
+    message(FATAL_ERROR
+        "MCLA INVARIANT VIOLATED [source-list drift]:\n"
+        "  the mcla source list enumerates ${_mcla_listed_n} generated/ppc_xenon/ppc_recomp.N.cpp\n"
+        "  entries but MCLA_EXPECTED_TU_COUNT is ${MCLA_EXPECTED_TU_COUNT}.\n"
+        "  The generated tree on disk passed checks (a) and (b), so the two have drifted apart and\n"
+        "  some TU is either not compiled or not linked into mcla.exe.\n"
+        "  Invariant: .qoder/skills/mcla-recompiler-regen/SKILL.md:57-58 (\"TU count must stay 176\").\n"
+        "  Fix by regenerating the whole ppc_recomp.N.cpp block from MCLA_EXPECTED_TU_COUNT (entries\n"
+        "  are counted only when indented with exactly 4 spaces, so keep that shape) - and if the\n"
+        "  count really changed, update MCLA_EXPECTED_TU_COUNT at the same time.")
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -38,7 +167,29 @@ target_include_directories(smol-v PUBLIC
 )
 target_compile_definitions(smol-v PRIVATE _CRT_SECURE_NO_WARNINGS)
 
-add_executable(XenosRecomp
+# EXCLUDE_FROM_ALL is load-bearing, not cosmetic. The XenosRecomp tool cannot
+# be built with the toolchain this project pins: clang here is 19.1.7 and the
+# MSVC STL that clang-cl actually resolves demands Clang >= 20, so every TU
+# dies with `yvals_core.h(917): STL1000` (the `include_directories(AFTER
+# SYSTEM ...)` block below pins the 14.44 toolset's own include dir *behind*
+# the driver's default, and 14.44's copy of that same check only requires
+# Clang >= 19). Documented at .qoder/skills/mcla-recompiler-regen/SKILL.md:11-19
+# ("Current blocker (verified 2026-09-20) ... yvals_core.h(917): STL1000. Do
+# not delete anything under .research/XenonRecomp/build-clang/ - the existing
+# XenosRecomp.exe predates the VS upgrade and is the *only* binary carrying the
+# landed JTS-TAILCALL patch").
+#
+# Before this flag a bare `ninja` built this target and failed, so "never run
+# bare ninja" was tribal knowledge in the skill file. Now bare `ninja` is safe.
+# CONSEQUENCE: the target no longer appears in `ninja` / `ninja all`. Anything
+# that genuinely wants it must name it explicitly:
+#     cmake --build build --target XenosRecomp
+#     ninja -C build XenosRecomp
+# and on this toolchain that command is EXPECTED TO FAIL with STL1000 - it is
+# not a regression in mcla. Route A (a [[midasm_hook]] in the tracked
+# config/mcla_xenonrecomp.toml, SKILL.md:21-26) is the supported path, and
+# Route B is off the critical path as of 2026-09-20 (SKILL.md:18-19).
+add_executable(XenosRecomp EXCLUDE_FROM_ALL
     ${XENOS_RECOMP_SOURCE_DIR}/main.cpp
     ${XENOS_RECOMP_SOURCE_DIR}/shader_recompiler.cpp
     ${XENOS_RECOMP_SOURCE_DIR}/dxc_compiler.cpp
@@ -127,6 +278,8 @@ add_executable(mcla
     src/renderer/trace_types.h
     src/fs/vfs_rpf.cpp
     src/fs/vfs_rpf.h
+    src/fs/rpf3_nested.cpp
+    src/fs/rpf3_nested.h
     src/d3d12_backend.cpp
     src/d3d12_backend.h
     src/compat.cpp
@@ -142,6 +295,20 @@ add_executable(mcla
     src/kernel/imports.cpp
     src/kernel/xam.cpp
     src/kernel/xam.h
+    # F-609 port batch. Hand-written ports of console kernel exports that used to
+    # be empty GUEST_FUNCTION_STUB bodies in src/kernel/imports.cpp. These are
+    # NOT generated recompiler output, so they are deliberately NOT of the form
+    # "\n    generated/ppc_xenon/ppc_recomp.N.cpp" that the MCLA_EXPECTED_TU_COUNT
+    # gate (c) counts -- adding them cannot move the 176-TU invariant, and
+    # deliberately adding them in another shape would break it.
+    src/kernel/port_net.cpp
+    src/kernel/port_net.h
+    src/kernel/port_xam_user.cpp
+    src/kernel/port_xam_user.h
+    src/kernel/port_kobj.cpp
+    src/kernel/port_kobj.h
+    src/kernel/port_voice_input.cpp
+    src/kernel/port_voice_input.h
     .research/XenonRecomp/thirdparty/xxHash/xxhash.c
     src/boot_host.cpp
     src/boot_host.h
@@ -492,6 +659,395 @@ add_custom_target(check_xmem_lzx DEPENDS xmem_lzx_test
     COMMAND $<TARGET_FILE:xmem_lzx_test>
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Path A host LZX byte-exactness vs build/xmem_golden")
+
+# ===========================================================================
+# GATE 2 - a recompiler regen must be byte-reproducible.
+#
+# .qoder/skills/mcla-recompiler-regen/SKILL.md:41-49 ("Reproducibility gate
+# (hard, run before touching the tool)") was prose only, so the second
+# invariant could be violated by a regen with nothing in the build to notice.
+# It is now a target.  Same shape as check_xmem_lzx above: an add_custom_target
+# that runs a checker and fails the build.
+#
+# This is a VERIFIER, not a regen driver: it never runs XenosRecomp, which
+# cannot be built with the pinned toolchain (SKILL.md:11-19, STL1000).  You
+# run the regen yourself into a scratch dir, then point this at the result.
+# Default scratch dir matches config/mcla_xenonrecomp_baseline.toml:3
+# (out_directory_path = "build/xr_baseline").
+#
+# Invoke EITHER way:
+#   via ninja, after -DMCLA_REGEN_OUTPUT_DIR=<your regen dir> at configure time:
+#       cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMCLA_REGEN_OUTPUT_DIR=E:/tmp/xr_check
+#       ninja -C build check_regen_repro
+#   or standalone, no reconfigure, no build of anything (copy-pasteable):
+#       cmake -DMCLA_REGEN_NEW_DIR="E:/mcla pc/build/xr_baseline" -DMCLA_REGEN_REF_DIR="E:/mcla pc/generated/ppc_xenon" -P build/check_regen_repro.cmake
+#
+# Allowed to differ, and nothing else (SKILL.md:45-48):
+#   1. ppc_context.h  - a trailing newline (the regen does not emit the one
+#      the round-tripped src/ppc_context.h header has).
+#   2. the one TU that defines sub_8218CC70 - a HAND safety patch
+#      (indirect-branch targetFn/basePtr validation via
+#      mcla_DispatchGuard_8218CC94) that the tool cannot emit. SKILL.md:48:
+#      "Never full-replace ppc_recomp.10.cpp or the session-38 null-dispatch
+#      AV returns."  The TU is located BY SYMBOL, not by name: as of
+#      2026-09-28 the hand patch actually lives in ppc_recomp.9.cpp
+#      (lines 19138-19171), not ppc_recomp.10.cpp as SKILL.md:46-48 says, and
+#      SKILL.md is not ours to edit here - the verifier reports which TU it
+#      used so the stale doc line stays visible. The diff must stay INSIDE
+#      that function body; a full-replace or a second edit fails.
+# ===========================================================================
+set(mcla_regen_script_tmpl [==[cmake_minimum_required(VERSION 3.25)
+
+# ===========================================================================
+# check_regen_repro.cmake - GENERATED BY CMakeLists.txt, DO NOT EDIT.
+#
+# Verifies that a XenonRecomp regen is byte-reproducible against
+# generated/ppc_xenon, allowing exactly the two known deltas documented in
+# .qoder/skills/mcla-recompiler-regen/SKILL.md:41-49.
+#
+# This never runs the recompiler. Run the regen yourself into a scratch dir
+# (config/mcla_xenonrecomp_baseline.toml, SKILL.md:43-44), then:
+#   cmake -DMCLA_REGEN_NEW_DIR=<regen dir> -P build/check_regen_repro.cmake
+# ===========================================================================
+
+set(_guard_fn "sub_8218CC70")
+set(_guard_hook "mcla_DispatchGuard_8218CC94")
+set(_expected_tu_count @MCLA_EXPECTED_TU_COUNT@)
+
+# --- 0. arguments ----------------------------------------------------------
+if(NOT DEFINED MCLA_REGEN_NEW_DIR OR MCLA_REGEN_NEW_DIR STREQUAL "")
+    message(FATAL_ERROR
+        "check_regen_repro: MCLA_REGEN_NEW_DIR is not set.\n"
+        "  Pass the directory a regen wrote to, e.g.\n"
+        "    cmake -DMCLA_REGEN_NEW_DIR=\"E:/mcla pc/build/xr_baseline\" -DMCLA_REGEN_REF_DIR=\"E:/mcla pc/generated/ppc_xenon\" -P build/check_regen_repro.cmake\n"
+        "  or, via ninja: cmake -S . -B build -DMCLA_REGEN_OUTPUT_DIR=<dir> ... then ninja -C build check_regen_repro\n"
+        "  (This target deliberately does not run the recompiler - it cannot be built with the\n"
+        "   pinned toolchain; see .qoder/skills/mcla-recompiler-regen/SKILL.md:11-19.)")
+endif()
+if(NOT DEFINED MCLA_REGEN_REF_DIR OR MCLA_REGEN_REF_DIR STREQUAL "")
+    set(MCLA_REGEN_REF_DIR "@MCLA_RECOMP_DIR@")
+endif()
+set(_ref "${MCLA_REGEN_REF_DIR}")
+set(_new "${MCLA_REGEN_NEW_DIR}")
+foreach(_d IN ITEMS _ref _new)
+    if(NOT IS_DIRECTORY "${${_d}}")
+        message(FATAL_ERROR "check_regen_repro: ${_d} = '${${_d}}' is not a directory")
+    endif()
+endforeach()
+message(STATUS "check_regen_repro: REF (hand-patched, committed state) = ${_ref}")
+message(STATUS "check_regen_repro: NEW (regen output)                  = ${_new}")
+
+# --- helpers ---------------------------------------------------------------
+# Byte span of the PPC_FUNC_IMPL(__imp__<fn>) "unit" inside a file held in the
+# variable named <txtvar>: from the fn's alias line (extended back over the hand
+# patch's "extern ... <hook>" declaration and blank lines) to just before the
+# next top-level __attribute__ line.  Sets <prefix>_s / <prefix>_e.
+#
+# This works on raw text offsets rather than line indices on purpose.  Two
+# reasons, both measured on the real ppc_recomp.9.cpp (1.4 MB):
+#   * file(STRINGS) does not escape ';' inside a line, so a C++ statement ending
+#     in ';' occupies two list elements and the ref/new index spaces are NOT
+#     comparable - a line-index containment test FAILS on a genuine clean regen
+#     (the hand patch inserts its extern line, shifting every later index by 1).
+#   * splitting a 1.4 MB TU into ~40k list elements in CMake script mode took
+#     149 s.  Native string ops on the raw text take about a second.
+function(mcla_unit_span txtvar fn hook prefix)
+    set(_t "${${txtvar}}")
+    string(FIND "${_t}" "PPC_FUNC_IMPL(__imp__${fn})" _p)
+    if(_p LESS 0)
+        set(${prefix}_s -1)
+        set(${prefix}_e -1)
+        return()
+    endif()
+    # start of the unit: the alias line, extended back over the hook declaration
+    set(_s ${_p})
+    string(FIND "${_t}" "__attribute__((alias(\"__imp__${fn}\"" _a)
+    if(NOT _a LESS 0 AND _a LESS _p)
+        set(_s ${_a})
+    endif()
+    string(FIND "${_t}" "extern bool ${hook}" _x)
+    if(NOT _x LESS 0 AND _x LESS _p AND _x LESS _s)
+        set(_s ${_x})
+    endif()
+    # end of the unit: the next top-level __attribute__ after the impl line
+    # (string(FIND) has no start-offset option, so search the tail and rebase).
+    # If there is no later __attribute__ the function is last in the file and
+    # the unit runs to EOF; that is the permissive direction, so the start
+    # bound above is what pins the delta.
+    string(SUBSTRING "${_t}" ${_p} -1 _rest)
+    string(FIND "${_rest}" "\n__attribute__" _n)
+    if(_n LESS 0)
+        math(EXPR _e 1000000000)
+    else()
+        math(EXPR _e "${_p} + ${_n}")
+    endif()
+    set(${prefix}_s "${_s}" PARENT_SCOPE)
+    set(${prefix}_e "${_e}" PARENT_SCOPE)
+endfunction()
+
+# Allowed delta 2: prove the difference is confined to the <fn> body.
+# Method: strip each side's <fn> unit and require the remainders to be
+# byte-identical.  That single statement is exactly the invariant, and it
+# catches an edit anywhere else in the TU, not just near the function.
+function(mcla_check_guard_delta ref new tu fn hook out_ok out_why)
+    set(_ok FALSE)
+    set(_why "")
+    file(READ "${ref}/${tu}" _rt)
+    file(READ "${new}/${tu}" _nt)
+    mcla_unit_span(_rt "${fn}" "${hook}" r)
+    mcla_unit_span(_nt "${fn}" "${hook}" n)
+    if(r_s LESS 0 OR n_s LESS 0 OR r_e LESS 0 OR n_e LESS 0)
+        set(_why "the ${fn} body was not locatable on one side, so the delta cannot be bounded")
+    elseif(r_s GREATER r_e OR n_s GREATER n_e)
+        set(_why "the ${fn} unit span is inverted on one side - refusing to guess")
+    else()
+        string(SUBSTRING "${_rt}" 0 ${r_s} _rpre)
+        string(SUBSTRING "${_rt}" ${r_e} -1 _rpost)
+        string(SUBSTRING "${_nt}" 0 ${n_s} _npre)
+        string(SUBSTRING "${_nt}" ${n_e} -1 _npost)
+        set(_rout "${_rpre}${_rpost}")
+        set(_nout "${_npre}${_npost}")
+        if(NOT "${_rout}" STREQUAL "${_nout}")
+            set(_why "the two files differ OUTSIDE the ${fn} body - this TU carries more than the hand patch (a full-replace, or a second edit somewhere else in the file)")
+        else()
+            math(EXPR _rlen "${r_e} - ${r_s}")
+            math(EXPR _nlen "${n_e} - ${n_s}")
+            string(SUBSTRING "${_rt}" ${r_s} ${_rlen} _ru)
+            string(SUBSTRING "${_nt}" ${n_s} ${_nlen} _nu)
+            string(FIND "${_ru}" "${hook}" _hk_r)
+            string(FIND "${_nu}" "${hook}" _hk_n)
+            string(REGEX MATCHALL "\n" _rn "${_ru}")
+            string(REGEX MATCHALL "\n" _nn "${_nu}")
+            list(LENGTH _rn _rn)
+            list(LENGTH _nn _nn)
+            math(EXPR _d "${_rn} - ${_nn}")
+            if(_hk_r LESS 0)
+                set(_why "the ${fn} body in the reference tree does not contain ${hook} - the hand patch is gone")
+            elseif(NOT _hk_n LESS 0)
+                set(_why "the ${fn} body in the regen output also contains ${hook} - that is not the unpatched tool output, so this delta is not the known one")
+            elseif("${_ru}" STREQUAL "${_nu}")
+                set(_why "the ${fn} bodies are byte-identical - the hand patch is missing from the reference tree")
+            else()
+                set(_ok TRUE)
+                set(_why "confined to the ${fn} body: ${_rlen} B / ${_rn} lines in the reference tree vs ${_nlen} B / ${_nn} lines in the regen output (${_d} lines)")
+            endif()
+        endif()
+    endif()
+    set(${out_ok} "${_ok}" PARENT_SCOPE)
+    set(${out_why} "${_why}" PARENT_SCOPE)
+endfunction()
+
+# --- 1. TU count (invariant 1, checked here too) ---------------------------
+# Deliberately BEFORE the file-set comparison, so a changed count gets the
+# specific "TU count" diagnosis instead of the vaguer "file set mismatch".
+file(GLOB _ref_all RELATIVE "${_ref}" "${_ref}/*")
+file(GLOB _new_all RELATIVE "${_new}" "${_new}/*")
+list(SORT _ref_all)
+list(SORT _new_all)
+set(_ref_tus "")
+set(_new_tus "")
+foreach(_f IN LISTS _ref_all)
+    if(_f MATCHES "^ppc_recomp\\.[0-9]+\\.cpp$")
+        list(APPEND _ref_tus "${_f}")
+    endif()
+endforeach()
+foreach(_f IN LISTS _new_all)
+    if(_f MATCHES "^ppc_recomp\\.[0-9]+\\.cpp$")
+        list(APPEND _new_tus "${_f}")
+    endif()
+endforeach()
+list(LENGTH _new_tus _new_tu_n)
+if(NOT _new_tu_n EQUAL _expected_tu_count)
+    message(FATAL_ERROR
+        "check_regen_repro: the regen produced ${_new_tu_n} ppc_recomp.N.cpp files; the invariant is ${_expected_tu_count}\n"
+        "  (.qoder/skills/mcla-recompiler-regen/SKILL.md:57-58, \"TU count must stay 176\"). The CMake\n"
+        "  configure-time gate would reject the same tree. Per SKILL.md:49 a regen that is not clean\n"
+        "  means STOP and fall back to Route A/C.")
+endif()
+
+# --- 2. identical file-name sets -------------------------------------------
+set(_only_ref "")
+set(_only_new "")
+foreach(_f IN LISTS _ref_all)
+    list(FIND _new_all "${_f}" _i)
+    if(_i EQUAL -1)
+        list(APPEND _only_ref "${_f}")
+    endif()
+endforeach()
+foreach(_f IN LISTS _new_all)
+    list(FIND _ref_all "${_f}" _i)
+    if(_i EQUAL -1)
+        list(APPEND _only_new "${_f}")
+    endif()
+endforeach()
+if(_only_ref OR _only_new)
+    set(_m "")
+    if(_only_ref)
+        list(JOIN _only_ref ", " _jr)
+        string(APPEND _m "    only in REF: ${_jr}\n")
+    endif()
+    if(_only_new)
+        list(JOIN _only_new ", " _jn)
+        string(APPEND _m "    only in NEW: ${_jn}\n")
+    endif()
+    message(FATAL_ERROR
+        "check_regen_repro: FILE SET MISMATCH - the regen did not reproduce the tree.\n"
+        "${_m}"
+        "  A regen is expected to differ in bytes only, never in file names\n"
+        "  (.qoder/skills/mcla-recompiler-regen/SKILL.md:41-49).")
+endif()
+
+# --- 3. locate the hand-patched TU BY SYMBOL, not by name ------------------
+# file(READ)+string(FIND) rather than file(STRINGS ... REGEX): the latter splits
+# a 1.4 MB TU into ~40k list elements in script mode and took 149 s per file.
+# The scan stops at the first hit, so the real tree costs 10 file reads.
+set(_guard_needle "PPC_FUNC_IMPL(__imp__${_guard_fn})")
+set(_guard_tu "")
+foreach(_f IN LISTS _ref_tus)
+    file(READ "${_ref}/${_f}" _blob)
+    string(FIND "${_blob}" "${_guard_needle}" _hit)
+    unset(_blob)
+    if(NOT _hit LESS 0)
+        set(_guard_tu "${_f}")
+        break()
+    endif()
+endforeach()
+if(_guard_tu STREQUAL "")
+    message(FATAL_ERROR
+        "check_regen_repro: no ppc_recomp.N.cpp in the reference tree defines PPC_FUNC_IMPL(__imp__${_guard_fn}),\n"
+        "  which is the function the one allowed code delta is pinned to. Refusing to guess.")
+endif()
+message(STATUS "check_regen_repro: hand-patch TU located by symbol ${_guard_fn} -> ${_guard_tu}")
+if(NOT _guard_tu STREQUAL "ppc_recomp.10.cpp")
+    message(STATUS "check_regen_repro: NOTE SKILL.md:46-48 names ppc_recomp.10.cpp as the hand-patched TU, but the")
+    message(STATUS "check_regen_repro:      tree actually carries it in ${_guard_tu}. Verifier follows the tree; the doc line is stale.")
+endif()
+
+# --- 4. the reference tree must still carry the hand patch -----------------
+file(READ "${_ref}/${_guard_tu}" _ref_blob)
+string(FIND "${_ref_blob}" "${_guard_hook}" _hook_at)
+unset(_ref_blob)
+if(_hook_at LESS 0)
+    message(FATAL_ERROR
+        "check_regen_repro: ${_guard_tu} in the reference tree (${_ref}) no longer contains the hand safety\n"
+        "  patch symbol ${_guard_hook}: the hand-patched translation unit has been full-replaced.\n"
+        "  .qoder/skills/mcla-recompiler-regen/SKILL.md:48: \"Never full-replace ppc_recomp.10.cpp or the\n"
+        "  session-38 null-dispatch AV returns.\" Restore the patch; never accept a regen over it.")
+endif()
+
+# --- 5. byte-compare every file --------------------------------------------
+# cmake -E compare_files rather than file(READ): generated/ppc_xenon is ~127 MB
+# and CMake script-mode strings would have to hold all of it.
+set(_identical 0)
+set(_differing "")
+foreach(_f IN LISTS _ref_all)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E compare_files "${_ref}/${_f}" "${_new}/${_f}"
+        RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
+    if(_rc EQUAL 0)
+        math(EXPR _identical "${_identical} + 1")
+    else()
+        list(APPEND _differing "${_f}")
+    endif()
+endforeach()
+list(LENGTH _ref_all _total)
+message(STATUS "check_regen_repro: ${_identical}/${_total} files byte-identical (SKILL.md:45-48 expected 181/183)")
+
+# --- 6. classify the differences: only the two known deltas are allowed ----
+set(_unexpected "")
+set(_accepted "")
+foreach(_f IN LISTS _differing)
+    if(_f STREQUAL "ppc_context.h")
+        # allowed delta 1: a trailing newline and nothing else
+        file(READ "${_ref}/${_f}" _hr HEX)
+        file(READ "${_new}/${_f}" _hn HEX)
+        string(LENGTH "${_hr}" _lr)
+        string(LENGTH "${_hn}" _ln)
+        set(_why "")
+        if(_lr EQUAL _ln)
+            set(_why "same length (${_lr} bytes) but not byte-identical, so a trailing newline cannot explain it")
+        else()
+            if(_lr GREATER _ln)
+                set(_tail "${_hr}")
+                set(_lead "${_hn}")
+                set(_shortlen ${_ln})
+            else()
+                set(_tail "${_hn}")
+                set(_lead "${_hr}")
+                set(_shortlen ${_lr})
+            endif()
+            string(SUBSTRING "${_tail}" 0 ${_shortlen} _pre_tail)
+            string(SUBSTRING "${_lead}" 0 ${_shortlen} _pre_lead)
+            string(SUBSTRING "${_tail}" ${_shortlen} -1 _extra)
+            if(NOT _pre_tail STREQUAL _pre_lead)
+                set(_why "the two files differ BEFORE the final byte(s), so this is not a trailing-newline delta")
+            elseif(NOT _extra STREQUAL "0a" AND NOT _extra STREQUAL "0d0a")
+                set(_why "the only differing bytes are '${_extra}', which is not a newline (expected 0a or 0d0a)")
+            endif()
+        endif()
+        if(_why STREQUAL "")
+            list(APPEND _accepted "${_f} (trailing newline)")
+        else()
+            list(APPEND _unexpected "${_f}: ${_why}")
+        endif()
+    elseif(_f STREQUAL "${_guard_tu}")
+        mcla_check_guard_delta("${_ref}" "${_new}" "${_guard_tu}" "${_guard_fn}" "${_guard_hook}" _gok _gwhy)
+        if(_gok)
+            list(APPEND _accepted "${_f} (hand safety patch in ${_guard_fn}: ${_gwhy})")
+        else()
+            list(APPEND _unexpected "${_f}: ${_gwhy}")
+        endif()
+    else()
+        list(APPEND _unexpected "${_f}: not one of the two known deltas")
+    endif()
+endforeach()
+
+# --- 7. verdict ------------------------------------------------------------
+if(_unexpected)
+    list(LENGTH _unexpected _un)
+    list(JOIN _unexpected "\n    " _un_txt)
+    message(FATAL_ERROR
+        "check_regen_repro: REPRODUCIBILITY GATE FAILED - ${_un} unexpected difference(s):\n"
+        "    ${_un_txt}\n"
+        "  Only two deltas are allowed: (1) a ppc_context.h trailing newline, and (2) the hand safety\n"
+        "  patch inside ${_guard_fn} in ${_guard_tu}.\n"
+        "  .qoder/skills/mcla-recompiler-regen/SKILL.md:49: \"If a fresh regen is not byte-for-byte clean ->\n"
+        "  STOP, fall back to Route A/C.\" Do not copy the regen output over generated/ppc_xenon, and do not\n"
+        "  full-replace ${_guard_tu} (SKILL.md:48).")
+endif()
+list(LENGTH _accepted _acc)
+list(JOIN _accepted "; " _acc_txt)
+message(STATUS "check_regen_repro: accepted deltas: ${_acc_txt}")
+message(STATUS "check_regen_repro: OK - regen is byte-reproducible (SKILL.md:41-49 satisfied)")
+]==])
+
+set(MCLA_REGEN_OUTPUT_DIR "${CMAKE_BINARY_DIR}/xr_baseline" CACHE PATH
+    "Regen output directory compared against generated/ppc_xenon by the check_regen_repro target")
+
+# The checker itself is emitted at configure time (kept inline here so the
+# gate travels with the one file that owns it; it lands in the build dir and
+# is disposable).  Only the two configure-time values are interpolated, by
+# explicit REPLACE rather than string(CONFIGURE)/@ONLY: string(CONFIGURE)
+# returns an EMPTY STRING on the cmake 4.4.0-rc3 this tree configures with, and
+# an empty verifier would make `ninja check_regen_repro` pass vacuously.
+string(REPLACE "@MCLA_RECOMP_DIR@" "${MCLA_RECOMP_DIR}" _mcla_regen_script "${mcla_regen_script_tmpl}")
+string(REPLACE "@MCLA_EXPECTED_TU_COUNT@" "${MCLA_EXPECTED_TU_COUNT}" _mcla_regen_script "${_mcla_regen_script}")
+if(_mcla_regen_script STREQUAL "")
+    message(FATAL_ERROR "check_regen_repro: the verifier template expanded to nothing - refusing to install a check that cannot fail.")
+endif()
+string(FIND "${_mcla_regen_script}" "@MCLA_EXPECTED_TU_COUNT@" _mcla_unexpanded)
+if(NOT _mcla_unexpanded EQUAL -1)
+    message(FATAL_ERROR "check_regen_repro: the verifier template still contains an uninterpolated placeholder - refusing to install a half-written check.")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/check_regen_repro.cmake" "${_mcla_regen_script}")
+
+add_custom_target(check_regen_repro
+    COMMAND ${CMAKE_COMMAND}
+            "-DMCLA_REGEN_NEW_DIR=${MCLA_REGEN_OUTPUT_DIR}"
+            "-DMCLA_REGEN_REF_DIR=${MCLA_RECOMP_DIR}"
+            -P "${CMAKE_CURRENT_BINARY_DIR}/check_regen_repro.cmake"
+    VERBATIM
+    COMMENT "regen byte-reproducibility vs generated/ppc_xenon (2 known deltas allowed)")
 
 add_executable(backend_validator
     tools/validators/backend_validator.cpp

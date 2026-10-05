@@ -92,3 +92,7 @@ Thumbs.db
 __pycache__/
 *.pyc
 
+
+# MSVC link byproducts (regenerable in build/; root copies are strays) — added 2026-10-01 audit
+*.pdb
+*.ilk
