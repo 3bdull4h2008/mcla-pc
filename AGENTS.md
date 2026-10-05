@@ -42,9 +42,45 @@ anecdotes — a constitution citing a measurement that does not exist teaches re
 
 **The authority for a guest fact is `build/cache/mcla_pe.bin` (offset = VA − `0x82000000`), then IDA
 decompilation. Never inference. Never a doc. Never a remembered number from an earlier session.**
-Decompiler output is still a model: **all three decompilers render PPC rotate-immediate masks backwards**
-(raw `55 6A 00 42` = MB=1, ME=1 = bit 1; IDA *and* `generated/ppc_xenon/ppc_recomp.17.cpp` print
-`0x40000000`) — **F-647**. **Any mask claim is invalid until the raw word is read.**
+Decompiler output is still a model. **Any mask claim is invalid until the raw word is read** — that part
+was always right and it is the whole lesson. **But F-647's gloss is INVERTED and must not be followed.**
+
+> **F-647 as previously recorded was WRONG, and acting on it corrupts the build.** It claimed "all three
+> decompilers render PPC rotate-immediate masks backwards", citing raw `55 6A 00 42` = MB=1, ME=1 =
+> "bit 1". **MB=1, ME=1 gives bit 30 → `0x40000000`** — which is exactly what the ISA gives, what
+> `ComputeMask` (`recompiler.cpp:5-11`, called as `:1546`) gives, and what IDA *and*
+> `generated/ppc_xenon/ppc_recomp.17.cpp` print. **The emitters were right; the record's gloss numbered
+> MB from the LSB.** "bit 1" is MB=30, ME=30 — **never (1,1)**.
+>
+> **Settled 2026-10-05 by three independent implementations against the Xenia oracle: ISA 28/31,
+> `ComputeMask` 28/31 — identical 28, identical 3 (all `MB>ME` wrap cases a 32-bit harness cannot
+> model).** Both historically disputed words now agree: `MB=1,ME=1 → 0x40000000`;
+> `MB=24,ME=31 → 0x000000FF` (`clrlwi` = *clear left*, retaining the low `32−n` bits).
+> **The correct record is F-765, not F-647.** Populations reproduce exactly: 72,297 rotate-immediate
+> words, 16,709 with MB=24/ME=31, 16,708 `& 0xFF;` sites, **0 non-rotate** — 100% rotate-family.
+>
+> ⚠️ **"Fixing" `generated/**` to `0xFF000000` inverts 16,709 sites across 176 translation units and
+> makes the boot strictly worse.** Do not. `generated/**` is forbidden anyway (rule 2).
+
+**Field notes, all measured, so you do not rediscover them the hard way:**
+- **`ori`'s destination is `b20:16`; `b25:21` is the other operand.** This is true for `ori`/`or` *and*
+  for `add`/`subf` alike — the claim that `add`/`subf` differ is itself wrong. **Extract nibble by
+  nibble; shift-and-mask arithmetic has produced three wrong answers in this project.**
+- **`ori rA,r0,imm` round-trips as a no-op store to `r0` in Capstone 5.0.7** — a real defect in its
+  or-immediate arm. Do not use it to settle operand order.
+- **An `op18` branch target read as signed lands outside the image; `ppc_disasm.py` reads it unsigned
+  and also lands outside.** Not resolvable under either convention — use `bc` (16-bit BD) targets.
+- **`tools/ppc_xrefs.py calls` misleads.** It reported 20 "callers" of `0x821BE250` where a raw scan
+  finds **0** direct call sites (vtable dispatch), and its `->` column names the *enclosing* function.
+- **`tools/ppc_disasm.py` prints `mr` with RA/RT inverted** (F-112) and **cannot decode opcode-30
+  `rldicl`/`rldicr` at all** — it falls back to a generic `rldic-family`. Use `generated/ppc_xenon/*.cpp`
+  as the tiebreaker for those.
+- **Do not trust operand ordering in `generated/ppc_recomp.*.cpp` comments** — four sources disagreed
+  and the emitted code was the tiebreaker, not the comment.
+- **A control with `MB=0` is symmetric under the MB↔ME swap and therefore has *some* power but not
+  none** — measured: it discriminates five candidate wrong-models; only `ME=0` and `ME=31` are blind.
+  A widely-circulated claim that it is *powerless* was itself false. **Establish the discriminating
+  power of any control you rely on.**
 
 **How to stop guessing — use these, not your memory:**
 | need | tool |
