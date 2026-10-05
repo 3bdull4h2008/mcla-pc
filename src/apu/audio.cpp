@@ -27,13 +27,35 @@
 // M6: host worker thread periodically invokes the guest XAudio render
 // callback (UnleashedRecomp sdl2_driver pattern) so the guest fills a
 // 6ch BE float32 x 256 frame and calls XAudioSubmitRenderDriverFrame.
-// STATUS (2026-09-29, census of build/*.log): only M5 ever runs. Every soak
-// reaches "AUDIO-OPEN ok" (e.g. build/w580.log), but no soak contains
-// "apu::RegisterClient", "AUDIO-WORKER" or "AUDIO-FRAME". The guest call
-// sites exist (generated/ppc_xenon/ppc_recomp.73.cpp:12392 register, :12717
-// submit) and are simply never reached before the boot stalls, so the worker
-// and the downmix below are currently unreachable. Getting a client registered
-// is the open task docs/LONG_TODO_MASTER.md:1202-1204 (T41.11, Wave E audio).
+// STATUS -- CORRECTED 2026-10-06 (audio tier-1 pass). The status block this
+// replaces said: "only M5 ever runs ... no soak contains apu::RegisterClient,
+// AUDIO-WORKER or AUDIO-FRAME. The guest call sites exist
+// (generated/ppc_xenon/ppc_recomp.73.cpp:12392 register, :12717 submit) and are
+// simply never reached BEFORE THE BOOT STALLS." Both halves of that were
+// wrong, and the correction matters more than the original:
+//
+//  1. The boot does not stall. build/w734.log runs 149.811 s with FATAL-SOFT = 0
+//     (it was 1) and DRAW-CP-DRAWN = 4 (was 2). So "not reached before the
+//     stall" was no longer available as an explanation.
+//  2. The call site is NOT simply unreached. A raw-word scan of
+//     build/cache/mcla_pe.bin (NOT tools/ppc_xrefs.py, whose `calls` mode is
+//     known to invent callers on vtable dispatch) finds exactly ONE direct
+//     `bl` to __imp__XAudioRegisterRenderDriverClient, at 0x823F3774, inside
+//     guest function sub_823F3718. That guest function has ZERO direct callers
+//     anywhere in the image and appears only as a dword in two vtables, at
+//     0x8205F0E4 and 0x82112AB8 -- and NEITHER vtable has any code reference.
+//     No address in 0x823F3000..0x823F7000 appears in the guest's own .CRT$XCU
+//     static-initialiser table (0x827D0010..0x827D13E0, 1267 pointers,
+//     structurally verified: NULL prefix and NUL one word past the last slot).
+//     So the audio object is never constructed, and the guest therefore never
+//     asks for audio at all.
+//
+// CONSEQUENCE: nothing in THIS FILE can make audio reachable, and nothing in
+// this file should try. Emitting a frame the guest did not ask for, or
+// decoding a stream that was never handed over, is exactly the fabrication
+// F-609 forbids. The worker and the downmix below stay unreachable until the
+// guest constructs its XAudio object -- a guest-reachability problem, not an
+// apu problem. The next link is named in the handoff, not guessed at here.
 //
 // F-609 changes in this file (all in src/apu/, nothing else touched):
 //  1. The 440 Hz blip is GONE. Underrun plays true silence (a one-line
@@ -247,9 +269,29 @@ void SDLCALL AudioCallback(void* /*userdata*/, SDL_AudioStream* stream,
             // The first underrun is worth one line: "you are hearing nothing"
             // must be attributable to "the guest submitted nothing", not to a
             // silent device. Counted, not repeated.
+            //
+            // APPENDED 2026-10-06 (audio tier-1 pass), at the END of the
+            // existing row only, so the tracked format is unchanged and the
+            // row still leads with its own marker. `clientRegistered` and
+            // `workerTicks` are what separate the two hypotheses this row
+            // cannot otherwise distinguish:
+            //   clientRegistered=0 workerTicks=0 -> the guest never asked for
+            //       audio at all (the measured state: build/w734.log has
+            //       apu::RegisterClient = 0 rows and AUDIO-WORKER = 0 rows).
+            //   clientRegistered=1 workerTicks>0 -> the worker IS driving the
+            //       guest callback and the guest is submitting nothing, which
+            //       is a different bug entirely.
+            // Both are read from the same atomics the worker writes, so this
+            // is a measurement, not an inference.
             MCLA_LOG_WARN("AUDIO-UNDERRUN: guest queue empty, playing true "
                           "silence (no synthesised tone) - see AUDIO-FRAME "
-                          "count for whether the guest ever submitted");
+                          "count for whether the guest ever submitted; "
+                          "clientRegistered={} workerTicks={}",
+                          g_clientCallback.load(std::memory_order_relaxed)
+                                  != 0
+                              ? 1
+                              : 0,
+                          g_workerTick.load(std::memory_order_relaxed));
         }
     }
 
@@ -291,11 +333,26 @@ void AudioReturnTrampoline(PPCContext& ctx, uint8_t* base) {
 // start -- straight into live guest memory -- and InsertFunction there would
 // scribble a host pointer over guest data. So the only safe choice is a PC
 // inside [PPC_CODE_BASE, last registered function] whose slot is currently
-// null. Slots there are dense, so a null slot is by construction a VA the
+// null.
+//
+// CORRECTION 2026-10-06 (audio tier-1 pass): the sentence this replaces --
+// "Slots there are dense, so a null slot is by construction a VA the
 // recompiler never registered: no real function can live at it, and no guest
-// `blr` can already target it. This is rule 4 (one owner per guest address)
-// enforced by the table itself rather than by a grep, and it re-checks at
-// claim time so a slot another agent registered meanwhile is left alone.
+// `blr` can already target it" -- is FALSE, and asserting it was a trap. The
+// table is indexed every 4 bytes of code (see the stride note at the loop
+// below) while the recompiler registers only function STARTS, so a null slot
+// can and does sit INSIDE a registered function's body. Measured: the first
+// free 8-byte slot is 0x8213000C, which is 4 bytes into sub_82130008.
+//
+// What actually makes the claim safe, and is what the loop now relies on:
+//   * the slot is null AT CLAIM TIME, so rule 4 (one owner per guest address)
+//     holds against the table itself rather than against a grep, and a slot
+//     another agent registered meanwhile is left alone; and
+//   * for the address this scan actually picks, nothing dispatches through it:
+//     0 direct `bl` sites, 0 `b` sites, and 0 dword occurrences anywhere in
+//     guest data (raw scan of build/cache/mcla_pe.bin). An address no branch
+//     targets and no data word holds cannot be an existing dispatch target,
+//     which is the property the deleted sentence was reaching for.
 uint32_t ClaimReturnPc() {
     uint32_t lastGuest = 0;
     for (size_t i = 0; PPCFuncMappings[i].guest != 0; ++i) {
@@ -304,8 +361,33 @@ uint32_t ClaimReturnPc() {
         }
     }
     if (lastGuest <= PPC_CODE_BASE) return 0;
+    // Step by 4, not by 1 (fixed 2026-10-06, audio tier-1 pass).
+    //
+    // PPC_LOOKUP_FUNC is `*(PPCFunc**)(base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE
+    // + (pc - PPC_CODE_BASE) * 2)` (src/ppc_context.h:124), so consecutive
+    // `pc` values are TWO BYTES apart in the table while a PPCFunc* is EIGHT
+    // bytes wide on x64. Probing s += 1 therefore reads a misaligned 8-byte
+    // window that overlaps its neighbours and is not a function pointer at all.
+    // Stepping by 4 walks only real instruction boundaries, where 4 * 2 = 8
+    // bytes is exactly one pointer slot.
+    //
+    // Measured consequence of the old s += 1: it stopped at s = 1, i.e.
+    // va = 0x82130001 -- NOT 4-byte aligned, so not an instruction address, and
+    // the 8-byte window at byte offset 2 spans two registered slots. Replaying
+    // the scan over the real registration table with the byte model gives the
+    // first genuinely free 8-byte slot at s = 12, va = 0x8213000C. That VA is
+    // still 4 bytes INTO sub_82130008 (whose body is the `blr` at 0x8213000C,
+    // word 4E800020), so the old comment's claim that a free slot is
+    // "by construction a VA the recompiler never registered: no real function
+    // can live at it" is FALSE -- the table is indexed per 4 bytes of code
+    // while the recompiler only registers function STARTS, so a free slot can
+    // sit inside a registered function's body. What makes the claim safe is
+    // different and is checked below instead: no branch in the image targets
+    // the address, and it is not a dword in guest data, so nothing dispatches
+    // through that slot. Both are measured (0 `bl` sites, 0 `b` sites, 0
+    // data dword refs for 0x8213000C).
     const uint64_t slots = static_cast<uint64_t>(lastGuest - PPC_CODE_BASE) + 1u;
-    for (uint64_t s = 0; s < slots; ++s) {
+    for (uint64_t s = 0; s + 4 <= slots; s += 4) {
         const uint32_t va = PPC_CODE_BASE + static_cast<uint32_t>(s);
         if (mcla::kernel::g_memory.FindFunction(va) == nullptr) {
             mcla::kernel::g_memory.InsertFunction(
@@ -674,11 +756,23 @@ void Init() {
         }
 
         g_opened = true;
+        // ARG ORDER FIXED 2026-10-06 (audio tier-1 pass). The two trailing
+        // arguments were swapped, so this row printed the stream POINTER under
+        // the label `framePeriodNs` and the frame period under `stream`.
+        // Measured in build/w734.log, the only boot that ever reached here:
+        //   AUDIO-OPEN ok: 48000Hz ch=2 format=s16 underrun=silence
+        //                   framePeriodNs=0x2574d3bf6b0 stream=5333333
+        // `0x2574d3bf6b0` is the SDL stream handle and `5333333` is
+        // kFramePeriodNs, i.e. exactly the two values with their labels
+        // exchanged. A row that misreports its own numbers is a census
+        // hazard: the next reader greps `framePeriodNs=` and concludes the
+        // period is a pointer. Same marker, same placeholders, same count --
+        // only the two arguments now match the two fields they fill.
         MCLA_LOG_INFO(
             "AUDIO-OPEN ok: {}Hz ch={} format=s16 underrun=silence "
             "framePeriodNs={} stream={}",
-            kHostHz, kHostChannels, static_cast<const void*>(g_stream),
-            kFramePeriodNs);
+            kHostHz, kHostChannels, kFramePeriodNs,
+            static_cast<const void*>(g_stream));
     }
 
     // Worker may already be running if RegisterClient raced ahead of Init
