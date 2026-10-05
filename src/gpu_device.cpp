@@ -19650,6 +19650,151 @@ PPC_FUNC(sub_821CBE18) {
 // F-657 handoff, not run. Do-not #1/#9 applies -- do not add a second
 // short-circuit on top of this one to cover the new path.
 // The honest measurement of the missing step is DISCCHK2-RES below.
+// ===========================================================================
+// AP 2026-10-05. MclaArcWindowDeliver -- the ARC-WINDOW delivery, EXTRACTED
+// VERBATIM so that a harness links and EXECUTES this function rather than a
+// transcription of it. It is not a reimplementation: the body below is the body
+// that was inline in PPC_FUNC(sub_821CC1E0), moved out whole, clause for clause
+// and comment for comment. NOTHING is added, relaxed or reordered. The only new
+// things are (a) the result is RETURNED instead of logged here, and (b) `pos`
+// and `rec` are PARAMETERS, because the defect this fixes is that the caller
+// was reading them from guest memory AFTER the callee had returned.
+//
+// WHY THE PARAMETERS EXIST -- MEASURED, NOT INFERRED.
+// `pos` is dword 1 of the reader object the caller passes as r4. Raw words in
+// build/cache/mcla_pe.bin (offset = VA - 0x82000000, big endian):
+//   0x821CD388  1D7E0044  mulli r11,r30,68      ; the slot stride is 68
+//   0x821CD38C  7D6BFA14  add  r11,r11,r31      ; r11 = base + handle*68
+//   0x821CD390  388B0028  addi r4,r11,40        ; r4 = &slot[40]  <- ctx.r4
+//   0x821CD3AC  4BFFEE35  bl   0x821CC1E0       ; r3=base r5=dst r6=count
+// so ctx.r4 = the reader, dword 0 = the TOC record, dword 1 = `pos`.
+//
+// BOTH OPENS WRITE 0 TO IT, so a reader's position starts at 0:
+//   0x821CCF0C  3BA00000  li   r29,0
+//   0x821CCFF8  93BF0004  stw  r29,4(r31)       ; pos = 0        (open #1)
+//   0x821CD174  39200000  li   r9,0
+//   0x821CD184  912B002C  stw  r9,44(r11)       ; pos = 0        (open #2)
+//
+// AND THE CALL ADVANCES IT, on the far side of the call:
+//   0x821CC31C  815F001C  lwz  r10,28(r31)      ; the count this call stored
+//   0x821CC320  814B0004  lwz  r11,4(r31)       ; pos
+//   0x821CC328  7C6AD850  subf r3,r10,r27       ; r27 - that count
+//   0x821CC330  7CEB1A14  add  r7,r11,r3        ; pos + (that difference)
+//   0x821CC340  90FF0004  stw  r7,4(r31)        ; pos <- r7
+// (7C6AD850 is opcode 31 with rA=31, i.e. `rsubf`: r27 - r10.)
+//
+// THE MEASUREMENT THAT PROVES IT IS A POST-CALL READ. build/w733.log carries 18
+// ARC-WINDOW rows over 18 DIFFERENT members with six different archive offsets
+// (000D0000..001F5000) and `pos=4096` on EVERY ONE of them, and never 8192. A
+// position that accumulates 4096 per read cannot read 4096 on 18 independent
+// first pages; a position that is 0 at entry and advanced by the request at exit
+// reads exactly that, every time.
+//
+// AND THE ORACLE, WHICH IS NOT PROJECT CODE. python `zlib` straight over
+// build/game_data/xarchive_cache.rpf (SHA256
+// F46F9A39E797CC0A2F21730014E18E5762FDC0910595F440031E004CCE2DD420, hashed,
+// not trusted from the file attribute), raw-DEFLATE from the member's own
+// archive offset 0x1F5000:
+//   inflated length            23807  == w1=00005CFF == bodySize=23807
+//   inflated[0:8]              726778610BFF0711
+//   inflated[4096:4100]        2A110100
+// and 2A110100 is byte-for-byte the `head=2A110100` ARC-WINDOW #18 printed and
+// the `winW0=2A110100` STREAM-WINDOW #25 printed. So the delivered window[0..4]
+// is inflated[4096..4100] -- the source offset really is into the INFLATED
+// body, and the guest wants inflated[0..].
+//
+// WHY `pos` IS THE MEMBER'S LOGICAL POSITION AND NOTHING ELSE. Raw, in
+// sub_821CC1E0's UNCOMPRESSED path, where every term is unambiguous:
+//   0x821CC35C  812B0004  lwz  r9,4(r11)        ; r9  = rec[1]  = logical size
+//   0x821CC364  815F0004  lwz  r10,4(r31)      ; r10 = pos
+//   0x821CC368  7D2A4850  subf r9,r10,r9       ; remaining = size - pos
+//   0x821CC36C  7F1B4840  cmplw cr6,r27,r9     ; clamp the request to it
+//   0x821CC380  816B0008  lwz  r11,8(r11)      ; r11 = rec[2] = archive offset
+//   0x821CC3A4  7CAB5214  add  r5,r11,r10      ; source = off + pos
+//   0x821CC3C4  817F0004  lwz  r11,4(r31)      ; pos again
+//   0x821CC3CC  917F0004  stw  r11,4(r31)      ; pos += bytes returned
+// So `pos` is a byte offset INTO THE MEMBER'S OWN BYTES. It is NOT derived from
+// o8 (all 18 rows share one pos across six distinct offsets), NOT a destination
+// window offset (the destination is r5, stored at raw 0x821CC234 and reported
+// as `win=82862DF8`), and NOT a ring index -- see the ring answer below.
+//
+// THE WINDOW IS NOT A RING, AND THIS IS THE FALSIFIER ANSWERED.
+//  * The oracle shows the window holds a CONTIGUOUS 8-byte slice of ONE member
+//    starting at member position 4096. A ring holding two positions at once
+//    cannot produce a contiguous slice of a single member at any index.
+//  * STREAM-WINDOW reports `cur`(+24) and `end`(+28) MONOTONE, with
+//    endBefore=0 -> endAfter=4096 and gran=4096: one linear refill, not a wrap.
+//  * The fill length is bounded by `uncompressedSize - cursor` (raw 0x821CC260
+//    li r7,4096 / 0x821CC268-0x821CC274 lwz+rlwinm+subf+cmpli / 0x821CC27C
+//    mr r7,r9). A ring has no end; a stream clamped to the member's size has
+//    exactly this shape.
+//  * Two DISTINCT windows exist and are used in turn, 0x82861DF8 and
+//    0x82862DF8, one page apart, and STREAM-WINDOW's own `wrapIdx` column
+//    separates them (1 and 2). Double-buffering is not a ring.
+//
+// WHAT THIS FIX IS NOT. It does not write 0x61786772 anywhere, does not write
+// 0x72677861 by hand, does not invent a length, and does not fabricate the
+// offset 0: the 0 it uses is the value the guest itself wrote at open and the
+// value the guest's own raw read at 0x821CC364 consumes. It moves a READ from
+// one side of the call to the other. Charter F-609 holds: the bytes written are
+// the bytes the guest asked for -- the member at the position it was at when it
+// asked -- and the copy is still clamped to the served body, so no length is
+// ever invented.
+// ===========================================================================
+struct MclaArcWindowResult {
+  uint32_t rec;
+  uint32_t pos;
+  uint32_t w1;
+  uint32_t want;
+  uint32_t done;
+  uint32_t head;
+  uint32_t posInside;
+  uint32_t delivered;
+  uint8_t headBytes[8];
+};
+static MclaArcWindowResult MclaArcWindowDeliver(uint32_t rec, uint32_t pos,
+                                                 uint32_t dst, uint32_t count,
+                                                 const MclaServedBody &body) {
+  MclaArcWindowResult r{};
+  r.rec = rec;
+  r.pos = pos;
+  auto &memA = mcla::kernel::GuestMemoryHeap::Instance();
+  if (rec == 0u || rec == 0xCDCDCDCDu || dst == 0u || dst == 0xCDCDCDCDu)
+    return r;
+  (void)memA.ReadU32BE(rec + 4u, &r.w1);
+  // Every clause is a REFUSAL. The copy runs only when all of them pass.
+  const bool arExact = body.buf != 0u && body.size != 0u;
+  const bool arW1Agrees = r.w1 != 0u && r.w1 == body.size;
+  const bool arPosInside = pos < body.size;
+  r.posInside = arPosInside ? 1u : 0u;
+  uint32_t arWant = count;
+  if (arWant > body.size - pos)
+    arWant = body.size - pos;
+  r.want = arWant;
+  if (!(arExact && arW1Agrees && arPosInside && arWant != 0u))
+    return r;
+  bool arOk = true;
+  while (r.done < arWant) {
+    const uint32_t arChunk =
+        (arWant - r.done > 512u) ? 512u : (arWant - r.done);
+    uint8_t arTmp[512];
+    if (!memA.ReadBytes(body.buf + pos + r.done, arTmp, arChunk) ||
+        !memA.WriteBytes(dst + r.done, arTmp, arChunk)) {
+      arOk = false;
+      break;
+    }
+    r.done += arChunk;
+  }
+  if (!arOk) {
+    r.done = 0;
+    return r;
+  }
+  (void)memA.ReadU32BE(dst, &r.head);
+  (void)memA.ReadBytes(dst, r.headBytes, sizeof(r.headBytes));
+  r.delivered = 1u;
+  return r;
+}
+
 PPC_FUNC_IMPL(__imp__sub_821CC1E0);
 static std::atomic<uint32_t> s_hCC1E0{0};
 PPC_FUNC(sub_821CC1E0) {
@@ -19738,6 +19883,24 @@ PPC_FUNC(sub_821CC1E0) {
   const uint32_t amIn5 = ctx.r5.u32;  // BEFORE the call: the window
   const uint32_t amIn4 = ctx.r4.u32;  // BEFORE the call: the TOC record ptr
   const uint32_t amIn6 = ctx.r6.u32;  // BEFORE the call: the count
+  // ------------------------------------------------------------------------
+  // AP 2026-10-05. THE SAME FIX, APPLIED TO THE TWO GUEST DWORDS. The block
+  // above snapshots the three REGISTERS because r4/r5/r6 are caller-saved and
+  // the recompiled body rewrites them. `rec` and `pos` live in guest MEMORY at
+  // ctx.r4 and ctx.r4+4, and the guest's OWN code advances `pos` on the far side
+  // of the call (raw 0x821CC340 `90FF0004 stw r7,4(r31)`, with r7 built by raw
+  // 0x821CC330 `7CEB1A14 add r7,r11,r3` over raw 0x821CC328 `7C6AD850 subf
+  // r3,r10,r27` = r27 - [r31+28]). Reading them after the call therefore reads
+  // the NEXT position, not the one this read was issued at. Every derivation,
+  // the oracle and the falsifier answer are on MclaArcWindowDeliver above.
+  // Read-only; two ReadU32BEs on an address the block was already reading.
+  uint32_t amPreRec = 0u;
+  uint32_t amPrePos = 0u;
+  if (amIn4 != 0u && amIn4 != 0xCDCDCDCDu) {
+    auto &memPre = mcla::kernel::GuestMemoryHeap::Instance();
+    (void)memPre.ReadU32BE(amIn4, &amPreRec);
+    (void)memPre.ReadU32BE(amIn4 + 4u, &amPrePos);
+  }
   __imp__sub_821CC1E0(ctx, base);
   // ---------------------------------------------------------------------------
   // WINWR-REC (AK census 2026-10-05). READ-ONLY, and the record's fields are
@@ -19975,6 +20138,9 @@ PPC_FUNC(sub_821CC1E0) {
   //   * `pos` (dword 1 of the same caller object, raw 0x821CC364) must be inside
   //     the body, and the copy is clamped to the body -- never past it, so no
   //     length is ever invented (F-609);
+  //   * `pos` is READ BEFORE THE CALL, from amPrePos, for the reason measured on
+  //     MclaArcWindowDeliver: the guest advances it on the far side. The copy
+  //     itself is unchanged, and so is every clause.
   //   * the original body must have returned exactly `count`, so a short read or
   //     an error is left exactly as the guest's own code produced it;
   //   * it is a byte-for-byte OVERWRITE of a window the original just filled
@@ -19991,17 +20157,13 @@ PPC_FUNC(sub_821CC1E0) {
   // consumer, on the one call that is measured to have failed.
   // ===========================================================================
   {
-    auto &memA = mcla::kernel::GuestMemoryHeap::Instance();
     const uint32_t origRet = ctx.r3.u32;
-    uint32_t arRec = 0;
-    if (amIn4 != 0u && amIn4 != 0xCDCDCDCDu)
-      (void)memA.ReadU32BE(amIn4, &arRec);
+    // `arRec` and `arPos` are the PRE-CALL snapshot (amPreRec/amPrePos), not a
+    // read of amIn4 on this side of the call. See MclaArcWindowDeliver.
+    const uint32_t arRec = amPreRec;
     if (arRec != 0u && arRec != 0xCDCDCDCDu && amIn6 != 0u &&
         origRet == amIn6 && amIn5 != 0u && amIn5 != 0xCDCDCDCDu) {
-      uint32_t arPos = 0;
-      (void)memA.ReadU32BE(amIn4 + 4u, &arPos);
-      uint32_t arW1 = 0;
-      (void)memA.ReadU32BE(arRec + 4u, &arW1);
+      const uint32_t arPos = amPrePos;
       MclaServedBody arBody{};
       {
         std::lock_guard<std::mutex> lk(g_servedMtx);
@@ -20009,44 +20171,23 @@ PPC_FUNC(sub_821CC1E0) {
         if (it != g_servedByEntry.end())
           arBody = it->second;
       }
-      // Every clause is a REFUSAL. The copy runs only when all of them pass.
-      const bool arExact = arBody.buf != 0u && arBody.size != 0u;
-      const bool arW1Agrees = arW1 != 0u && arW1 == arBody.size;
-      const bool arPosInside = arPos < arBody.size;
-      uint32_t arWant = amIn6;
-      if (arWant > arBody.size - arPos)
-        arWant = arBody.size - arPos;
-      if (arExact && arW1Agrees && arPosInside && arWant != 0u) {
-        uint32_t arDone = 0;
-        bool arOk = true;
-        while (arDone < arWant) {
-          const uint32_t arChunk =
-              (arWant - arDone > 512u) ? 512u : (arWant - arDone);
-          uint8_t arTmp[512];
-          if (!memA.ReadBytes(arBody.buf + arPos + arDone, arTmp, arChunk) ||
-              !memA.WriteBytes(amIn5 + arDone, arTmp, arChunk)) {
-            arOk = false;
-            break;
-          }
-          arDone += arChunk;
-        }
-        if (arOk) {
-          uint8_t arGot[8] = {0};
-          uint32_t arHead = 0;
-          (void)memA.ReadU32BE(amIn5, &arHead);
-          (void)memA.ReadBytes(amIn5, arGot, sizeof(arGot));
-          static std::atomic<uint32_t> s_arDeliver{0};
-          const uint64_t arN = s_arDeliver.fetch_add(1) + 1;
-          const uint32_t arWantHead = 0x72677861u;
-          MCLA_LOG_WARN(
-              "ARC-WINDOW #{} rec={:08X} path='{}' win={:08X} pos={} req={} "
-              "want={} done={} body={:08X} bodySize={} w1={:08X} posOk={} "
-              "head={:08X} wantHead={:08X} headIs={}",
-              arN, arRec, arBody.path.c_str(), amIn5, arPos, amIn6, arWant,
-              arDone, arBody.buf, arBody.size, arW1, arPosInside ? 1 : 0,
-              arHead, arWantHead, arHead == arWantHead ? 1 : 0);
-          ctx.r3.u32 = arWant;
-        }
+      const MclaArcWindowResult ar =
+          MclaArcWindowDeliver(arRec, arPos, amIn5, amIn6, arBody);
+      if (ar.delivered != 0u) {
+        static std::atomic<uint32_t> s_arDeliver{0};
+        const uint64_t arN = s_arDeliver.fetch_add(1) + 1;
+        // FORMAT UNCHANGED. Same 14 placeholders, same 14 arguments, same order,
+        // same literals. `pos` is the only thing whose VALUE changes, and it
+        // changes because it is now read on the correct side of the call.
+        const uint32_t arWantHead = 0x72677861u;
+        MCLA_LOG_WARN(
+            "ARC-WINDOW #{} rec={:08X} path='{}' win={:08X} pos={} req={} "
+            "want={} done={} body={:08X} bodySize={} w1={:08X} posOk={} "
+            "head={:08X} wantHead={:08X} headIs={}",
+            arN, arRec, arBody.path.c_str(), amIn5, arPos, amIn6, ar.want,
+            ar.done, arBody.buf, arBody.size, ar.w1, ar.posInside,
+            ar.head, arWantHead, ar.head == arWantHead ? 1 : 0);
+        ctx.r3.u32 = ar.want;
       }
     }
   }
