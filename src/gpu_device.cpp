@@ -125,13 +125,36 @@ static constexpr uint32_t kBdf20WindowStride = 4096u;
 //   0x821CCB7C  7F1E5000  cmpw  cr6,r30,r10
 //   0x821CCB80  409A0048  bne   cr6 -> 0x821CCBC8   <-- SKIPS the call
 //   0x821CCB94  4BFFF285  bl    0x821CBE18
-// So sub_821CBE18 is reached ONLY when [reader+296] == 0x8000. It is not an
-// unconditional writer. If a soak shows [reader+296] != 0x8000 at the fatal's
-// read, this function is NOT the writer on that path, the branch goes to
-// 0x821CCBC8, and the WINWR-WATCH row firing zero times is evidence about the
-// CALL SITE rather than about the bytes. WINWR-WATCH cannot see that word from
-// inside the callee -- [reader+296] belongs to the caller's frame -- so it is
-// recorded here rather than guessed at from the row.
+// AM 2026-10-05, MEASURED AGAINST THE RECOMPILED BODY -- TWO CORRECTIONS, both
+// of which change what a WINWR-WATCH row is evidence ABOUT.
+//
+// (1) "r30 = 0x8000" IS FALSE, and with it the "reached ONLY when
+// [reader+296] == 0x8000" conclusion. r30 is derived from the CALLER'S r5, not
+// from the constant. generated/ppc_xenon/ppc_recomp.17.cpp:4681-4688, the
+// production recompiler body for the very same raw word 0x78AB8BC2, is
+//     4681  // rldicl r11,r5,49,15
+//     4682  r11.u64 = __builtin_rotateleft64(ctx.r5.u64, 49) & 0x1FFFFFFFFFFFF;
+//     4687  // rotlwi r30,r11,0
+//     4688  r30.u64 = __builtin_rotateleft32(r11.u32, 0);
+// and the shift 49 and the mask width (64-49bit result => MB=15) both agree
+// with the raw word, so this is not a rotate-width artefact. r30 is a SEGMENT
+// TAG the caller supplies. The constant 0x8000 lives only in r11, used by the
+// two compares above it (as the <= bound, and as the base for the fill count
+// `subf r29,r28,r11` at 0x821CCB68). Consequence: "[reader+296] == r30" tests a
+// MOVING value, so a WINWR-WATCH row cannot be read as evidence that one field
+// was or was not taken, and "the gate never matched" is not a distinguishable
+// answer from "the tag was something else this time".
+//
+// (2) 0x821CCBC8 IS NOT AN ALTERNATIVE WRITER. Read from raw words at the four
+// cascade addresses 0x821CCB70 / 0x821CCBC8 / 0x821CCC1C / 0x821CCC70, this is a
+// search over FOUR candidate slot records -- reader fields +296, +316, +336,
+// +356, a 20-byte stride -- and each of the four re-issues the SAME
+// `mr r4,r25` (0x7C992378) before its `bl 0x821CBE18`. So all four funnel into
+// the same window with the same argument shape; none of them writes the
+// destination by another route. This is corroborated in the soak rather than
+// only on paper: build/w730.log carries WINWR-WATCH rows for FIVE distinct
+// return addresses of this cascade -- lr=821CCB98, 821CCBEC, 821CCC40,
+// 821CCC94, 821CCD4C -- and every one of them names the same window.
 //
 // So the entry registers of sub_821CBE18 are r3=slot, r4=destination,
 // r5=offset-into-the-member, r6=count, and the SOURCE of the copy is
@@ -19481,8 +19504,42 @@ PPC_FUNC(sub_821CBE18) {
     const uint64_t wwHitTot = wwHit ? (s_winwrHit.fetch_add(1) + 1) : 0u;
     // Sparse on BOTH counters: the first 6 of each and every 50th of each, so
     // the last row printed before the fatal carries the running count with it.
+    // AM 2026-10-05, APPENDED TO THE PREDICATE (no field added, renamed, moved
+    // or removed; the row still fires on every arm that fired before). The old
+    // predicate is kept verbatim above; this is one more OR term.
+    //
+    // WHY off==0 IS NOW UNGATED, MEASURED. The old rule printed only the first
+    // 6 hits and then every 50th, and w730.log is what that cost:
+    //   * s_winwrHit reached 6 and the 6th row was the LAST row printed
+    //     (`WINWR-WATCH #6 ... tot=47`); the boot's final tot was 74, so 27
+    //     further entries to sub_821CBE18 went unlogged.
+    //   * build/w730.log STREAM-WINDOW #42 is the FATAL'S OWN refill -- it is
+    //     `path='shaders/city/fxl_final/CityDefault.fxc'`, `lr=821BE72C`, which
+    //     is the instruction immediately after `bl 0x821BE250` at 0x821BE728
+    //     (raw 0x4BFFFB29), and it reports
+    //       winW0=ED5C7B50 winHex=ED5C7B505CD779FF
+    //         refilled=1 endBefore=0 curAfter=4 endAfter=4096
+    //     i.e. the window's offset 0 WAS overwritten, with this member's own
+    //     bytes, at the fatal's own read, 0 ms before the fatal.
+    //   * So the claim that reached me -- "the last write to the window was 941 ms
+    //     before the fatal read, at off=8320, NOT off=0; offset 0 was last
+    //     touched at .928 and held a DDS header from another file; the falsifier
+    //     fired" -- is an ARTEFACT OF THIS SAMPLING RULE, not a property of the
+    //     bytes. Every one of the six printed hit=1 rows pairs 1:1 with a
+    //     STREAM-WINDOW row's winHex for a different path (post8=5F5F6E6F69736520
+    //     = globaltex.list, 947D655C96C917F6 = 2dnoise3.dds, 8042579075453575 =
+    //     2dnoise4.dds, 748DA0FF7E736AFF = cf_bump2.dds, 444453207C000000 =
+    //     a real "DDS " + dwSize 124 header, 00E0A0D0AB020202 = anisodir.dds),
+    //     which is what a window shared by many files looks like when it is
+    //     being refilled correctly, one member at a time.
+    // A refill always includes offset 0 by construction -- it writes a whole
+    // `gran` (4096) granule, `endBefore=0 -> endAfter=4096` on the row -- so
+    // off==0 is exactly the "a refill just wrote the head of the window" event
+    // and is bounded (one per refill, not per copy). Ungating it costs ~2 rows
+    // per refill on a boot that has 6 of them.
     const bool wwPrint = (wwTot <= 6u) || ((wwTot % 50u) == 0u) ||
-                         (wwHitTot <= 6u) || ((wwHitTot % 50u) == 0u);
+                         (wwHitTot <= 6u) || ((wwHitTot % 50u) == 0u) ||
+                         (wwHit && wwOff == 0u);
     uint8_t wwPreB[8] = {0};
     uint8_t wwSrcB[8] = {0};
     const bool wwPreOk =
@@ -19645,58 +19702,92 @@ PPC_FUNC(sub_821CC1E0) {
       }
     }
   }
+  // ---------------------------------------------------------------------------
+  // AM 2026-10-05. THE BLOCK BELOW HAD AN ARM-BREAKING MEASUREMENT BUG AND IT
+  // IS FIXED HERE. It is the fix I am able to make; it changes NO behaviour.
+  //
+  // WHAT WAS WRONG, MEASURED, AND IT IS WHY `WINWR-REC` FIRED ZERO TIMES.
+  // The block read `ctx.r5` and `ctx.r4` AFTER `__imp__sub_821CC1E0` returned and
+  // gated on the result. r4 and r5 are caller-SAVED in the PPC ABI and the
+  // recompiled body rewrites both before it returns. The caller's own raw words
+  // show what it hands down (tools/ppc_disasm.py, offset = VA - 0x82000000; the
+  // `mr` operands are printed RA-RT inverted, F-112, which is harmless for a
+  // move but is why the register names below are given from the ENCODING):
+  //   0x821CD35C  7CBD2B78  or r5,r29,r29    ; r29 = this frame's entry r5 (the window)
+  //   0x821CD360  7CDC3378  or r28,r28,...   ; r28 = entry r6 (the count)
+  //   0x821CD390  388B0028  addi r4,r11,40   ; r4 = TOC RECORD ptr, not a stream
+  //   0x821CD3A0  7F86E378  or r6,r28,r28    ; r6 = count
+  //   0x821CD3A4  7FA5EB78  or r5,r29,r29    ; r5 = r29 = THE WINDOW
+  //   0x821CD3AC  4BFFEE35  bl  0x821CC1E0
+  // and inside the callee's own next hop, generated/ppc_xenon/ppc_recomp.17.cpp
+  // :4660-4703, the ONLY thing the chain ever leaves in r5 is an OFFSET:
+  //   4663  r28 = ctx.r5.u32 & 0x7FFF      ; the window becomes a 15-bit offset
+  //   4696  ctx.r5.u64 = r28.u64           ; and r5 = that offset at the copy
+  // So a post-call `ctx.r5` on this path is a value in [0, 0x7FFF] by
+  // construction, and MclaWinwrIsWindowBase needs a value congruent to
+  // 0x82860DF8 mod 4096. The predicate could never be true. The zero was the
+  // census's own register-clobber bug, NOT a statement about the guest -- which
+  // is why `rec[4]`/`rec[8]` never reached the log and why the guest's
+  // archive-offset arithmetic stayed unverified at runtime.
+  //
+  // THE FIX: snapshot r4/r5/r6 on ENTRY, next to the existing r31 snapshot,
+  // exactly as WINWR-WATCH already does for `ctx.lr` (its own comment: "BEFORE
+  // the call (F-382)"). Read-only. No state change, no D3D12 call, no early
+  // return, nothing written to guest memory, and the DISCCHK2 block above is
+  // untouched and still owns the kDiscChkForcedAck write.
+  const uint32_t amIn5 = ctx.r5.u32;  // BEFORE the call: the window
+  const uint32_t amIn4 = ctx.r4.u32;  // BEFORE the call: the TOC record ptr
+  const uint32_t amIn6 = ctx.r6.u32;  // BEFORE the call: the count
   __imp__sub_821CC1E0(ctx, base);
   // ---------------------------------------------------------------------------
-  // WINWR-REC (AK census 2026-10-05). READ-ONLY, and placed AFTER the call so
-  // the record's fields are read in the same state the guest resumes in. No
-  // state change, no D3D12 call, no early return, nothing written to guest
-  // memory. The existing DISCCHK2 block above is untouched and still owns the
-  // kDiscChkForcedAck write; this block only reads.
+  // WINWR-REC (AK census 2026-10-05). READ-ONLY, and the record's fields are
+  // still read on the far side of the call so they are in the state the guest
+  // resumes in. The ARMING ARGUMENT is now the pre-call snapshot above.
   //
-  // ARMED ON ctx.r5, which is the window. MEASURED, from raw words in
+  // ARMED ON the pre-call r5, which is the window. MEASURED, from raw words in
   // build/cache/mcla_pe.bin at VA - 0x82000000 (big endian, tools/ppc_disasm.py):
-  //   0x821CD35C  7CBD2B78  mr  r29,r5      r29 = this frame's entry r5
-  //   0x821CD3A4  7FA5EB78  mr  r5,r29      r5 = r29, handed to the callee
-  //   0x821CD3A8  7FE3FB78  mr  r3,r31
+  //   0x821CD35C  7CBD2B78  or r5,r29,r29  r29 = this frame's entry r5
+  //   0x821CD3A4  7FA5EB78  or r29,r5,r5  r5 = r29, handed to the callee
+  //   0x821CD3A8  7FE3FB78  or r3,r31,r31
   //   0x821CD3AC  4BFFEE35  bl  0x821CC1E0  <- THIS function
-  // so ctx.r5 on entry is the same window address that later arrives as r4 (the
-  // destination) at 0x821CCB8C and is copied into by raw 0x821CBE90. The gate
-  // is therefore the same 3-compare window-base test WINWR-WATCH uses on its
-  // destination, applied here to r5.
+  // so the window arrives as r5 and later as r4 (the destination) at 0x821CCB8C,
+  // and is copied into by raw 0x821CBE90. The gate is therefore the same
+  // 3-compare window-base test WINWR-WATCH uses, applied to the PRE-CALL r5.
   //
   // WHY rec[+0..+24]. rec[4] and rec[8] are the two numbers the offset-basis
   // question turns on -- the record's LOGICAL size and the member's ARCHIVE
   // offset -- and neither is printed densely enough by the existing row to be on
   // the record for the fatal's own member. The whole 7-dword span is dumped so
   // the two are comparable against any later reading of the same record rather
-  // than quoted from memory. `rec` is resolved the same way the block above
-  // resolves it (the guest's own r31 == this function's entry r4, then [r31+0]),
-  // so these values line up with that row's size= / offs= fields.
+  // than quoted from memory.
   {
-    const uint32_t rrWin = ctx.r5.u32;
+    const uint32_t rrWin = amIn5;
     if (MclaWinwrIsWindowBase(rrWin)) {
       const uint64_t rrTot = s_winwrRec.fetch_add(1) + 1;
       if (rrTot <= 6u || (rrTot % 50u) == 0u) {
-        // The DISCCHK2 block's own `memD` is scoped inside its braces, so this
-        // block takes its own handle on the same singleton. Read-only.
         auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-        const uint32_t rrStrm = ctx.r4.u32;
-        uint32_t rrRec = 0;
-        if (rrStrm != 0u && rrStrm != 0xCDCDCDCDu)
-          (void)memR.ReadU32BE(rrStrm + 0, &rrRec);
+        // amIn4 is the caller's own r4 = the TOC RECORD pointer (raw
+        // 0x821CD390 addi r4,r11,40), so it is read directly rather than
+        // chased through a stream. 0 means "unresolved" and says so.
+        const uint32_t rrRec = amIn4;
         uint32_t w[7] = {0, 0, 0, 0, 0, 0, 0};
         if (rrRec != 0u && rrRec != 0xCDCDCDCDu)
           for (int k = 0; k < 7; ++k)
             (void)memR.ReadU32BE(rrRec + static_cast<uint32_t>(k * 4), &w[k]);
         const uint32_t rrLr = static_cast<uint32_t>(ctx.lr);
-        // 15 placeholders, 15 arguments (counted by tools/ak_fmt_arity.py).
+        // APPENDED at the END of the row only (AM 2026-10-05): `in4`/`in6`
+        // carry the two pre-call entry registers this block used to read on
+        // the far side of the call. No existing field was reordered, renamed
+        // or removed, so every existing matcher still matches.
+        // 17 placeholders, 17 arguments.
         // This format string's literal text names no other tracked marker.
         MCLA_LOG_WARN(
             "WINWR-REC #{} win={:08X} strm={:08X} rec={:08X} rec0={:08X} "
             "rec4={:08X} rec8={:08X} rec12={:08X} rec16={:08X} "
-            "rec20={:08X} rec24={:08X} r5={:08X} lr={:08X} tid={} tot={}",
-            rrTot, rrWin, rrStrm, rrRec, w[0], w[1], w[2], w[3], w[4], w[5],
-            w[6], rrWin, rrLr, GetCurrentThreadId(), rrTot);
+            "rec20={:08X} rec24={:08X} r5={:08X} lr={:08X} tid={} tot={} "
+            "in4={:08X} in6={}",
+            rrTot, rrWin, rrRec, rrRec, w[0], w[1], w[2], w[3], w[4], w[5],
+            w[6], rrWin, rrLr, GetCurrentThreadId(), rrTot, amIn4, amIn6);
       }
     }
   }
