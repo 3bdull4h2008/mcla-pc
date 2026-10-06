@@ -425,3 +425,169 @@ telling us the data is missing. **Do not delete the 09-28 block — it is supers
 
 ---
 **[2026-10-01] Session trail relocated to [docs/archive/trail-handoff-2026-10.md](docs/archive/trail-handoff-2026-10.md)** (blocks 2026-09-30 backward; nothing deleted).
+
+---
+
+# 2026-10-06 — HANDOFF: the boot blocker is SOLVED. Read this first.
+
+`HEAD = 3606e30`. Working tree clean under `src/`, 0 staged. **Do not redo anything below.**
+
+---
+
+## 1. THE BLOCKER IS FIXED. THE EVIDENCE, AND THE MEASURES THAT PROVE IT
+
+`a9bd027` — **`gpu_device`: snapshot the reader cursor before the device read.**
+
+**Cause, in one sentence.** `pos` is dword 1 of the reader object the caller passes as `r4` — the
+guest's own byte cursor into the member's logical bytes. The file already snapshotted `r4`/`r5`/`r6`
+around `__imp__sub_821CC1E0` but **never extended the snapshot to the two dwords it then read out of
+guest memory**, so every read observed the *previous* read's end position. The callee's tail advances
+it: raw `0x821CC3CC stw r11,4(r31)`.
+
+**The falsifier that killed the alternative reading** — do not re-derive it:
+> 18 rows, 18 different members, six different archive offsets, `pos=4096` on every one and
+> **never 8192**. An accumulating cursor cannot read 4096 on eighteen independent first pages.
+
+**Measured, `build/w734.log` and `build/w736.log`:**
+```
+                             w733 (had a fatal)   w734/w736 (no fatal)
+Fatal error dispatcher / FATAL-SOFT     1                 0
+dstAfter=507B5CED   (DEFLATE head)     1                 0
+dstAfter=61786772   (shader magic)     0                 1
+ARC-WINDOW headIs=1 (byte-exact)       0                 1
+WINWR-CMP beqTaken                     0                 1    r7 = r8 = 0x61786772
+boot duration              ~14 s to a fatal    149.8 s, no fatal
+DRAW-CP-DRAWN                            -                 4    (was 2)
+golden pct=100                          25                30
+```
+**The plateau is over.** 27 soaks died at 14.494–16.184 s. These do not die.
+
+**The window is NOT a ring** — settled, do not re-open: the fill is clamped by
+`uncompressedSize - cursor` (raw `0x821CC260`–`0x821CC27C`), `cur`/`end` are monotone, and two
+windows exist one page apart (`0x82861DF8`, `0x82862DF8`). Double-buffering, not a ring.
+
+---
+
+## 2. THE CURRENT WALL — narrow, measured, and NOT a fix you can guess
+
+```
+VEH[3] code=0xC0000005  lr=8218B458  read of host addr 0x7e780000
+     slot_guest_va=0xFFFFFFFF7E780000
+preceded by: BE710-DEAD … outcome=REFUSE-NO-BODY
+             XTL-ALLOC-REFUSED size=413 -> returned 0
+             o1heap invariants FAIL
+```
+
+**The arithmetic is solved.** `slot_guest_va = 0xFFFFFFFF7E780000` becomes host `0x7E780000` via
+the **same expression `src/ppc_context.h:127` evaluates.** An agent predicted `would_read_host =
+0x7E780000` analytically, before running anything, and a soak reproduced it to the digit.
+
+**The gate is not solved.** A guard on `sub_8218B0C8` was written, soaked, **and reverted** because:
+
+```
+AVGUARD-CTR-OOR #8  vt_read_ok=0  vt=00000000  slot_read_ok=0  passthru=0
+```
+**`passthru=0`** — the host could not read `ctx.r3` at all, so the guard refused **every** call,
+including legitimate ones. `FATAL-SOFT` went 0 → 1, `dstAfter=61786772` 1 → 0, `DRAW-CP-PIXEL`
+2 → 0. Reverted with `git checkout 3606e30 -- src/gpu_device.cpp`; the good state is restored and
+re-verified in `w736.log`.
+
+**THE QUESTION TO ANSWER: why is `ctx.r3` unreadable at `sub_8218B0C8`?** That is a guest-object
+resolution problem, not a fault to guard against. `IsKernelObject(handle)` is only
+`Translate(handle) != nullptr` (`src/kernel/xdm.cpp:32-39`) and `Translate` returns `m_base +
+guestAddr` for **every** `guestAddr < kSize` (`src/kernel/memory.cpp:476-481`, `kSize = 0x100000000`).
+**Establish whether that predicate should admit `0xFFFFFFFF7E780000`, and what the real object is.**
+
+⚠️ **A guard that removes the crash while destroying the boot is a net loss.** The crash is a
+symptom; reaching the shader check is progress.
+
+---
+
+## 3. A REGRESSION THAT IS NOT ONE — and why it matters more than it looks
+
+```
+TOCWALK-SLICE   w685..w722 = 1863 (34 logs, perfectly constant)
+                w723..w736 = 0     (14 logs)
+AFB8-IN         35 -> 1     BE710-MAGIC 114 -> 0
+```
+**The TOC walk never ran legitimately.** It ran 1863 times *only because the `kBe710MagicWrite`
+fabrication kept the guest limping past 57 dead bodies* long enough to miss `EmbeddedListLookup`
+35 times. Remove the lie → 1 open → 0 walks. **This was attributed by content plus a measured
+single-variable revert**, because a commit-date bisect is structurally impossible: **all 13
+commits have committer-date ≥ 10-05 16:28, i.e. 14 h after w723. The good state was uncommitted.**
+
+**The serve gate is NOT the cause.** Reverting `ret >= 0` at `gpu_device.cpp:22297`:
+```
+AUtoc_head_control   TOCWALK-SLICE=0  fatal=False
+AUtoc_revert_gate    TOCWALK-SLICE=0  fatal=True    <- the fatal RETURNS
+```
+**So the gate widening is load-bearing for the no-fatal property. Do not revert it.**
+
+**`REFUSE-NO-VERDICT` = 0 in ALL 45 real soaks including healthy ones — it carries ZERO
+information.** Its only literal (`gpu_device.cpp:21738`) is inside `if (verdict == nullptr)`, which
+is unreachable once `TOCWALK-SUMMARY` has stored a verdict. **Do not use it as evidence.**
+
+---
+
+## 4. CORRECTIONS TO THE RECORD — do not re-import these
+
+| the record said | the truth |
+|---|---|
+| `F-647`: all three decompilers render rotate-masks backwards | **INVERTED.** MB=1,ME=1 ⇒ bit 30 ⇒ `0x40000000`, which is what the ISA, `ComputeMask`, IDA and `ppc_recomp.17.cpp` all print. Corrected in `AGENTS.md`. |
+| `ori`'s destination is `b20:16` | **`b25:21`.** Correct for `ori`/`addi`/`addis`/`lwz`/`stw`; `b20:16` is correct for `or`/`and`/`xor`/`mr`/`cmp`. **Both right, different opcodes.** |
+| `rec[8]` is zero | **wrong address** — `[rec+8]` is the caller's state object; the archive offset is `[[rec+0]+8]`, and it is **non-zero**, 4 KiB-aligned. |
+| `o8` is page-quantised | **exact archive offsets** (`0xE4000/0x10000 = 14.25`). |
+| `o8=0x000F5000` is "one hex digit" from `0x001F5000` | **1 MiB apart, different member** (`cf_bump2.dds`). Coincidence. |
+| `TOCWALK-SUMMARY` at `vfs_rpf.cpp:21174` | **`gpu_device.cpp:21665`**. `REFUSE-NO-VERDICT` is `:21738`, not `:21247`. |
+| "24 soaks, median 14.903 s" | **45 real soaks exist, not 43 or 123** — 42 are 0-byte sidecars. The literal `'Unexpected EOF…'` is in **2 of 45**. |
+| `AUDIO-FRAME`'s zero is prose | **the marker is compiled and leads its own row.** The zero is real. |
+| `M6_PAGE_SPLICED_AT_+0x5000` / `M6_PAGE_RAW_AT_+0x5000` | **do not exist anywhere in `src/`.** Phantom. |
+| `TIMEOUT_SURVIVED` = a pass | **= 0 across 232 logs.** Not one log ever ended because the guest was running; every soak dies of a fatal then thrashes to the cap. **`process survived` is NOT a pass condition.** |
+
+---
+
+## 5. A NEW ENCODING FINDING THAT MAKES 123,273 TARGETS RESOLVABLE
+
+**opcode-18 branches use a 26-bit LI at word bits 2..27, AA at bit 1, LK at bit 0.**
+The textbook 32-bit I-form (bits 6..31) puts **0 of 147,363** opcode-18 words inside the image;
+this reading puts **144,170** inside and lands **123,273** on functions that exist in
+`ppc_func_mapping.cpp`.
+
+**`AGENTS.md` currently says op18 targets are "unresolvable both ways". That is now wrong, and it
+was propagated into briefs that told three agents to give up.** ⚠️ **Verify on a second sample before
+correcting `AGENTS.md` — I have already put one wrong rule in that file tonight.**
+
+---
+
+## 6. THE STANDING RULES THAT COST THE NIGHT — read these before touching anything
+
+- **Extract instruction fields nibble by nibble.** Shift-and-mask produced **four** wrong answers.
+- **`ppc_disasm.py` is a PowerPC disassembler and CANNOT decode Xenos GPU microcode.** It also inverts `mr` (F-112) and cannot decode `rldicl`. Use `generated/ppc_xenon/*.cpp` as the tiebreaker.
+- **`ppc_xrefs.py calls` invents callers on vtable dispatch** — it reported 20 "callers" of `0x821BE250` where a raw scan finds **0**. Its `->` column names the *enclosing* function.
+- **`CALLERS (none)` is an IDA carving artefact, not evidence.**
+- **Never put a constant in a census field.** `WINWR-CMP` printed `kAoCmpR8`, a hardcoded literal, and that "measurement" was believed for an hour. Deleted.
+- **Establish the discriminating power of any control.** One believed *powerless* discriminates five wrong-models; one believed *sufficient* was symmetric and could never have found its bug.
+- **A marker's prose can contain other markers' literals.** `READAT-BRANCH`'s prose contains `raw_positional=1`. **25 of 39 miscounts were this.**
+- **A marker absent from `src/` has a zero that means nothing.** `AUDIO-FRAME` is live; `MEMBER-SPAN-ALIAS` is not tracked; `MEMBER-SPAN-TAIL-VETO` has 0 real rows and 33 prose mentions.
+- **Never accept a fix on a marker count.** Nine fixes moved markers and not the boot. The measures that count: `headIs=1` byte-for-byte against a python-`zlib` oracle, `dstAfter=61786772`, `FATAL-SOFT=0`.
+- **`git checkout <commit> -- <file>` does NOT restore a byte-exact pin** — `core.autocrlf=true`, files are bare-LF, checkout converts. **Verify reverts by content.**
+- **Six+ harnesses passed while blind.** One served a body out of a **zero page** and reported fabricated bytes while passing. One reported **90.5%** because it harvested English prose as data. One reported a confident **0** because `re.match` anchored at line start and every line begins with a tab.
+- **E: FAILED MID-SESSION.** 158 `.obj` files and `mcla.exe` became unreadable *and undeletable*; `src/gpu_device.cpp` lost its content. A reboot cleared it. **Verify `build/mcla.exe` begins `4D 5A` before every build** — a corrupt exe reports `BUILD_RC=0 error=0`.
+
+---
+
+## 7. THE QUEUE
+
+`docs/LONG_TODO_MASTER.md`, dated block "2026-10-06 — QUEUE AFTER THE BOOT BLOCKER WAS SOLVED",
+39 items in three tiers. **Tier 1 is everything behind the blocker that has never once been
+exercised:** audio (the guest never constructs the XAudio object — `sub_823F3640` has no caller
+and is not in `.CRT$XCU`), input (implemented, hooked, polled every frame, **0 non-NULL polls
+ever**), and **the menu, which has 0 evidence in 261 logs.**
+
+⚠️ **71 `LOG_UTILITY` sites in `src/kernel/imports.cpp` compile to nothing under `NDEBUG`, with no
+log line at all.** Parts of this project are invisible to every log we have; their zeros are
+tautologies.
+
+**The charter win stands and must not be undone:** `kBe710MagicWrite` wrote the exact value the
+guest was about to check for, suppressing **57** fatals. Deleted. Verify absent at all times:
+`kBe710MagicWrite` = 0, `WriteU32BE(ctx.r4` = 0 across `src/`.
