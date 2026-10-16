@@ -2,6 +2,8 @@
 #include "heap.h"
 #include "memory.h"
 #include "function.h"
+#include "ppc_config.h"  // T43.1c (F-791): PPC_IMAGE_BASE/PPC_IMAGE_SIZE for the PHYS-LIVE region
+                         // table below. Read-only use; the header itself is rule-2 do-not-edit.
 #include "logging.h"
 #include <boot_host.h>  // F-374: header guard arm/disarm around each operation
 #include <atomic>
@@ -9,7 +11,15 @@
 #include <windows.h>
 #include <intrin.h>  // F-370: _ReturnAddress() for the heap caller census
 #include <cstdio>    // F-373: snprintf for the raw header dump
+#include <cstdlib>   // T43.1: std::getenv for the forced-invariant-gate control
 #include <dbghelp.h>
+
+// F-784 phase 3: the T44 wipe-watch COVERAGE line, defined in gpu_cp.cpp beside
+// T44WipeSelfTest. NotePhysBinProbe prints it once per probe so a run whose card pages produced
+// no T44-WIPE-STORE row reports its counts instead of leaving the reader to argue from absence --
+// w747's "0 rows in the card window" was uninterpretable precisely because no such count existed
+// (LT rule 19: a zero is not a result until the instrument is shown firing).
+namespace mcla::gpu { void T44WipeTotalsLine(uint32_t probeN); }
 
 // F-412: dead -- zero code references in src/; the same value lives on as kUserHeapArenaEnd
 // (heap_arena.h:24). Kept only because heap_arena.h:25 still names it in prose.
@@ -377,6 +387,31 @@ namespace
         f.op = kO1Idle;
         return ptr;
     }
+    // T43.2: THE SAME NET FOR THE PROBE, for the reason F-641 gives above -- `o1heapProbeGranular`
+    // walks `next_free`, which is the one dereference a corrupt free list makes unsafe, so the
+    // instrument that exists to find the corruption must not become a second fault on the same path.
+    // On a catch the result is marked `probe_av`, and that is an ANSWER rather than a lost row: it
+    // says the list the allocator was walking holds a pointer that is not readable, which is a
+    // stronger statement than any size word in the census could make. Deliberately not routed through
+    // `SehO1Filter`: that filter prints an AV row attributed to an ALLOCATION IN FLIGHT via
+    // `t_o1InFlight`, and no allocation is in flight here -- the request already failed and returned.
+    // Attributing a probe fault to it would name the wrong operation, which is exactly the error
+    // F-641's `gran=` field was added to prevent.
+    void SehO1ProbeGranular(const O1HeapInstance* heap, size_t amount, size_t granularity,
+                            O1HeapProbeResult* out)
+    {
+        if (out == nullptr)
+            return;
+        __try
+        {
+            o1heapProbeGranular(heap, amount, granularity, out);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            out->probe_av = 1u;
+            out->found_bin = -1;
+        }
+    }
     void SehO1Free(O1HeapInstance* heap, void* ptr)
     {
         // Same publication for the free half, so an AV inside o1heapFree names the block being
@@ -683,8 +718,39 @@ namespace
     // threshold back has a name to put it in. `capacity` is deliberately NOT a parameter: under this
     // policy no capacity comparison decides anything, which is what makes the routing independent of
     // which arena is bound.
-    inline bool O1UsesGranularPolicy(size_t /*amount*/, size_t /*capacity*/)
+    //
+    // T43.19 (2026-10-13): the SUB-PAGE LEVER, cvar-gated, DEFAULT OFF, one purpose.
+    // w769 measured 46,992 served requests at 634.5 MiB charged for 459.1 MiB of payload, of which
+    // >= 33,217 requests were a single 4 KiB page each with a 6-112 byte payload (F-642's own bound
+    // was 6,691 requests = 26.1 MiB; this run exceeds it 7x, so the term is now the pool's dominant
+    // consumer). The smallest refused request needed a 256 KiB run against 68 KiB free -- a 4.3x
+    // shortfall that the provable single-page population alone covers ~125x.
+    // `mcla_phys_subpage=1` routes ONLY amounts whose full page charge has a sub-page remainder
+    // (amount + alignment + 32 <= page; larger requests keep the console-faithful page charge), to
+    // the power-of-two class O1RoundUpPow2(amount + alignment + 32) (<= 2,048 B) -- the same class
+    // the reference's binned path uses (memory.cc:924: `round_up(alignment, page_size)` then
+    // o1heapAllocate) and the same `pow2_would_be` this file already prints on every PHYS-ACCT row.
+    // FAITHFULNESS, STATED: xboxkrnl_memory.cc:364 charges the console a full page for sub-page
+    // MmAllocatePhysicalMemoryEx requests, so this lever gives the guest MORE memory than the
+    // console would have -- a divergence with downstream risk. It stays off until (a) the guest's
+    // OWN rounding is read from mcla_pe.bin (rule 0: the guest's bytes outrank Xenia's model) and
+    // (b) a soak shows it changes the wall. Every routed allocation is counted and printed
+    // (SUB-PAGE-ROUTED, first 8 then every 4096th) so a soak reads the take rate, not a guess.
+    inline bool O1SubPageRouting()
     {
+        static const bool kEnabled = [] {
+            const char* e = std::getenv("mcla_phys_subpage");
+            return e != nullptr && e[0] == '1';
+        }();
+        return kEnabled;
+    }
+    inline bool O1UsesGranularPolicy(size_t amount, size_t /*capacity*/)
+    {
+        // The lever only speaks for amounts the page rule OVERCHARGES by more than it saves:
+        // `amount` here is o1Amount (size + alignment + O1HEAP_ALIGNMENT), so a sub-page request
+        // is one whose amount still fits inside one page. Anything else takes the old path.
+        if (O1SubPageRouting() && amount <= kO1PageGranule)
+            return false;
         return true;
     }
 
@@ -904,6 +970,104 @@ namespace
                        CallerRva(callerRa), glr, GetCurrentThreadId());
     }
 
+    // ==========================================================================================
+    // T43.2: PHYS-BINPROBE -- THE SIZE WORDS THE SEARCH ACTUALLY COMPARED AGAINST.
+    //
+    // THE CONTRADICTION THIS EXISTS TO CLOSE, every term of it measured. `build/w743.log:30954`
+    // refuses a 413-byte guest request (`size=0x19d align=0x4000 o1_amount=0x41bd`) on a pool
+    // reporting `free=0x22f8000` = 34.97 MiB, and `:30955` reports `bin_mask=0x801c0`
+    // `suitable=0x80000 verdict=healthy why=suitable_class_present capped_walks=0`. Those readings
+    // cannot all be true of one refused allocation:
+    //   * the charge is 0x5000 (`pfrag=0x5000`, `gran=4096`), so the granular search starts at
+    //     log2Floor(0x5000/64) = bin 8;
+    //   * `o1heapDoInvariantsHold` had just passed on this same instance (`invariants FAIL` = 0 in
+    //     w743, and the gate is proven to fire -- `build/w742ctl.log:210-215`), and what it tests is
+    //     exactly `(mask bit i set) == (bins[i] != NULL)` for all 64 bins (`o1heap.c:812-819`), so
+    //     bit 19 set means `bins[19]` was non-NULL;
+    //   * a fragment linked into bin 19 was binned there by `log2Floor(header.size / 64)`
+    //     (`o1heap.c:236`), so its size is in [2^25, 2^26) = [32 MiB, 64 MiB), which satisfies a
+    //     20 KiB charge outright;
+    //   * `capped_walks=0` reads `d.granular_walk_capped` (`:1580`), the field the search's own
+    //     post-loop check bumps (`o1heap.c:675-676`), so the hop cap did not null a found fragment;
+    //   * and `free` is `d.capacity - d.allocated` (`:796`), 34.97 MiB against a 20 KiB charge.
+    // The search therefore had to reach bin 19 and serve the request, and `oom=1..4` proves instead
+    // that it ran to its own out-path and returned NULL (`oom_count` is bumped only there, and only
+    // by the allocator that was called -- which is also what proves these rows describe the SAME
+    // instance that refused, not a second healthier one).
+    //
+    // EVERY TERM ABOVE IS READ FROM SOURCE OR PRINTED BY THE HOST except one: the search decides on
+    // `fragment->header.size`, and nothing in this tree reports a fragment's size. `allocated` is a
+    // sum, `bin_mask` is a presence bitmap, and the invariant check never dereferences a fragment.
+    // So `verdict=healthy` is not a wrong answer -- it is an answer to a different question. The
+    // classifier models BIN PRESENCE and the granular allocator decides on SIZE WITHIN THE BIN, and
+    // the gap between those two is exactly where this refusal lives. This row reads the size words.
+    //
+    // THREE OUTCOMES, so the row is decidable by whoever reads it and not by whoever wrote it:
+    //   found_bin >= 0             -> the replay WOULD serve it from the state as it now stands, so
+    //                                 the state moved between the call and the reading. Look for a
+    //                                 second writer, not for a fragment defect.
+    //   found_bin < 0, head_null=1 -> the mask promises a bin the array does not hold, i.e. the
+    //                                 invariant gate is not running on this instance after all.
+    //   found_bin < 0, every max_size < charge -> a fragment sits in a bin its own size does not
+    //                                 belong to: a header that no longer matches the list it is
+    //                                 linked from. `head_used=1` on the same row names the stronger
+    //                                 form -- a LIVE fragment linked into a free list.
+    //   probe_av=1                 -> the walk itself faulted, so the list holds an unreadable
+    //                                 pointer. Stronger than any size word.
+    //
+    // COST AND CADENCE. Called only from the refusal printer's own `n <= 8 || (n % 100) == 0` gate
+    // and with its `n`, so the two rows always pair and the cadence is the refusal cadence that is
+    // already on disk -- 4 rows in w743's 300 s. The walk is bounded twice over: the replay by
+    // O1HEAP_GRANULAR_MAX_HOPS (4096 links total across all bins, `o1heap.c:130`) and each census
+    // bin by O1HEAP_PROBE_MAX_LINKS, so the worst case touches ~4096 fragment headers = 256 KiB.
+    // It runs under `physicalMutex` like everything else on this path, which is why the bound is
+    // stated rather than assumed. Allocates nothing, writes nothing to guest or arena memory, makes
+    // no D3D12 call and reads no RegisterFile.
+    void NotePhysBinProbe(O1HeapInstance* heap, size_t o1Amount, uint32_t n, void* callerRa,
+                          const void* arenaBase, uint32_t arenaGuestBase)
+    {
+        O1HeapProbeResult pr{};
+        pr.found_bin = -1;
+        SehO1ProbeGranular(heap, o1Amount, kO1PageGranule, &pr);
+        char bins[1536] = {};
+        size_t off = 0;
+        for (uint32_t i = 0; (i < pr.n_bins) && (i < O1HEAP_PROBE_MAX_BINS) && (off + 1 < sizeof(bins));
+             ++i)
+        {
+            const O1HeapProbeBin& b = pr.bins[i];
+            // `gva`/`aoff` are the fragment's guest VA and its offset from the arena base, which is
+            // the whole point of printing the address: w744 measured head_size == 0 in both set bins
+            // and a size cannot say where. F-778's guest memcpy zeroed [A0400000, A04004C0), so
+            // `aoff` inside that range names the writer without a guess.
+            const size_t aoff = (arenaBase != nullptr && b.head_addr >= (size_t)arenaBase)
+                                    ? (b.head_addr - (size_t)arenaBase)
+                                    : ~(size_t)0;
+            const uint32_t gva = (aoff == ~(size_t)0) ? 0u : (uint32_t)(arenaGuestBase + aoff);
+            const int w = snprintf(bins + off, sizeof(bins) - off,
+                                   " b%u=[bin=%u null=%u used=%u len=%u trunc=%u n_ge=%u head=%#llx "
+                                   "min=%#llx max=%#llx gva=%08X aoff=%#llx prev=%#llx next=%#llx]",
+                                   i, b.bin, b.head_null, b.head_used, b.list_len, b.truncated,
+                                   b.n_ge_charge, (unsigned long long)b.head_size,
+                                   (unsigned long long)b.min_size, (unsigned long long)b.max_size,
+                                   gva, (unsigned long long)aoff,
+                                   (unsigned long long)b.head_prev,
+                                   (unsigned long long)b.head_next);
+            if (w <= 0 || (size_t)w >= sizeof(bins) - off)
+                break;
+            off += (size_t)w;
+        }
+        // F-784 phase 3: state the watch's counts at the same instant the damage is read, so this
+        // row and the T44 arm can be checked against each other (a band that took 0 hits on a run
+        // whose selftest fired is a coverage statement, not a finding).
+        mcla::gpu::T44WipeTotalsLine(n);
+        MCLA_LOG_ERROR("PHYS-BINPROBE #{} charge={:#x} valid={} gran_ok={} charge_ok={} start_bin={} "
+                       "bits_ge_start={} hops={} cap_would_fire={} found_bin={} found_size={:#x} "
+                       "probe_av={} n_bins={}{} caller_rva={:#x}",
+                       n, pr.charge, pr.valid, pr.granularity_ok, pr.charge_ok, pr.start_bin,
+                       pr.bits_at_or_above_start, pr.hops, pr.cap_would_fire, pr.found_bin,
+                       pr.found_size, pr.probe_av, pr.n_bins, bins, CallerRva(callerRa));
+    }
+
     // F-638: the periodic PHYS-STATE row. The old period was 10,000 refusals, and w658 refused
     // ~7,500 times in 79 s (oom=1 at 19:42:35.040 -> 7,500 at the end of the run) and printed
     // EXACTLY ONE row -- a period longer than a run's total event count is a hope, not a period.
@@ -985,21 +1149,28 @@ namespace
     // as pool-internal and hold `guest_refs` at zero for the whole run.
     //
     // WHY IT IS A SWEEP AND NOT A LOOKUP. Nothing in this tree knows where the guest keeps its
-    // pointers -- that is the question -- so the whole 4 GiB window is searched, for the exact
-    // 32-bit value, 8 bytes at a time (low and high dword of each aligned 64-bit word, which finds
-    // every 4-byte-aligned word once instead of twice). The sweep is INCREMENTAL and lives on the
-    // PHYS-STATE cadence (`kPhysStateEvery` = 1,000 refusals, quoted by symbol above), because a
-    // 4 GiB synchronous pass on the first refusal would stall the guest for a third of a second
-    // while holding `physicalMutex` -- `EmitPhysState` is called from `Heap::AllocPhysical`, which
-    // holds it from its `std::lock_guard lock(physicalMutex)` to its return. `sweep_ppm` on the row
-    // is the fraction of the window covered so far and `complete=` says whether the answer is
-    // final; a partial row is explicitly not an answer and says so in its own field.
+    // pointers -- that is the question -- so a pass still covers the whole 4 GiB window, for the
+    // exact 32-bit value, 8 bytes at a time (low and high dword of each aligned 64-bit word, which
+    // finds every 4-byte-aligned word once instead of twice). T43.1c (F-791) REORDERED the visit so
+    // the regions where a holder can live are scanned first -- image, boot stack, pool, user heap,
+    // then the remaining gaps, table beside `kPhysLiveRegions` -- a pass's coverage unchanged, only
+    // its order; and corrected the word read to BIG-ENDIAN (`be` below: `memory.cpp:221-222` loads
+    // raw then Swap32's), without which the compare ran against the byte-REVERSED value -- 276 rows
+    // across 10 logs, every one zero, none of them a statement about the block. `sweep_ppm` on the
+    // row is the fraction of the window covered in the CURRENT pass and `complete=` says whether the
+    // answer is final; a partial row is explicitly not an answer and says so in its own field.
     //
-    // COST, STATED SO IT IS NOT DISCOVERED. 256 MiB per row = 16 rows for one full 4 GiB pass.
-    // A 64-bit-word compare loop over committed memory runs at memory-copy speed; at 10 GB/s that
-    // is ~25 ms per row, i.e. ~1.6 % of the wall clock at one row per 1.6 s of storm, and it stops
-    // the moment the pass completes. On the eight head rows (the burst at the first refusal) the
-    // budget is the same, so a reader gets 2 GiB of coverage inside the first eight refusals.
+    // COST, STATED SO IT IS NOT DISCOVERED (re-measured by T43.1c, F-791: the old numbers here
+    // described a cadence and a stop the code never had). The emission is PER REFUSAL -- the
+    // cadence gate in `EmitPhysState` guards `PhysStateRow` only; `NotePhysLive` is called
+    // unconditionally, so w755's 256 refusals produced 256 rows -- and it runs while
+    // `Heap::AllocPhysical` holds `std::lock_guard lock(physicalMutex)` to its return. Measured
+    // (F-783 §7): 256 MiB per emission = ~41 ms at ~6.2 GB/s = 166 ms injected across four refusals
+    // in w743, 10.9 s across w755's whole refusal era -- the instrument was perturbing the thing it
+    // measures. T43.1c drops the budget to 16 MiB (`kPhysLiveBudget`, quoted by symbol) = ~2.6 ms
+    // per emission, and 256 rows x 16 MiB = exactly one 4 GiB pass. The sweep does NOT stop when a
+    // pass completes (w755 ran 16 of them), and `ctl=` is the rule-19 positive control (dwords
+    // quoted beside `kPhysLiveCtlOri`): image memory that never yields one is an instrument fault.
     // Nothing here allocates, frees, writes to the guest, or changes a return value.
 
     // F-638: the verdict-change edge, on the refusal path AND the free path. This is the row
@@ -1623,9 +1794,65 @@ namespace
 
     constexpr uint32_t kPhysLiveHits = 8;
     constexpr uint64_t kPhysLiveChunk = 1ull << 20;    // 1 MiB scratch, one memcpy per step
-    constexpr uint64_t kPhysLiveBudget = 256ull << 20; // 256 MiB of window per PHYS-STATE row
+    // T43.1c (F-791): 16 MiB per row, was 256 MiB. F-783 §7 measured the 256 MiB emission at
+    // ~41 ms under `physicalMutex` (w743: four refusals = 166 ms of guest-blocked time; w755:
+    // 256 emissions = 10.9 s of its refusal era), i.e. the instrument was perturbing the thing it
+    // measures. 16 MiB at that same measured 6.2 GB/s is ~2.6 ms per emission, and 256 rows x
+    // 16 MiB = exactly one 4 GiB pass, so a w755-class refusal count still completes a pass.
+    constexpr uint64_t kPhysLiveBudget = 16ull << 20; // 16 MiB of window per PHYS-LIVE row
+    // T43.1c (F-791): POSITIVE CONTROL (LONG_TODO §1 rule 19 -- a zero is not a result until the
+    // instrument is shown firing on an event you know happened). Two dwords measured in
+    // `build/cache/mcla_pe.bin` (offset = VA - 0x82000000, rule 3): the DOS `MZ` word at image
+    // base, and `ori r9,r8,0x6772` = raw `61 28 67 72` at offset 0x18C848 = VA 0x8218C848 -- the
+    // raw bytes re-read for this change, and UNIQUE in the whole image file (one occurrence), so
+    // `ctl` counts exactly the controls plus chance (299 MiB/2^32 ~ 0.07 expected). Both sit in
+    // region 0 of the visit order, which fits inside emission #1's 16 MiB budget, so from row #1
+    // onward `ctl == 0` means the sweep cannot see image memory -- a property of the instrument,
+    // not of the block. Before this control existed the sweep had never once been seen positive.
+    constexpr uint32_t kPhysLiveCtlMz = 0x4D5A9000u;   // mcla_pe.bin[0x0:0x4] = 4D 5A 90 00
+    constexpr uint32_t kPhysLiveCtlOri = 0x61286772u;  // mcla_pe.bin[0x18C848] = 61 28 67 72
+    // F-782: THE SWEEP'S FIRST BYTE, and the reason this constant exists. Guest VA 0 is a
+    // deliberate PAGE_NOACCESS null guard (`kNullGuardBytes`, armed in memory.cpp), and this sweep
+    // reads the window with a raw `base + pos` instead of through `Translate`/`IsValid`, so a
+    // cursor starting at 0 faulted on the very first 1 MiB chunk -- in every boot, deterministically.
+    // Measured cost: `PHYS-LIVE` printed 0 rows in all 313 logs on disk, `NotePhysVerdict` and
+    // `NotePhysPoolFull` were unreachable on the alloc-refusal path because `EmitPhysState` threw
+    // inside `NotePhysLive` before returning, and one of the five C0000005s per boot was ours while
+    // the VEH labelled it `guest AV` off a sticky lr. Skipping the guard loses no signal: nothing
+    // can legitimately live at a guest VA the guard exists to make unreadable.
+    constexpr uint64_t kPhysLiveStart = mcla::kernel::kNullGuardBytes;
+    // T43.1c (F-791): THE VISIT ORDER. The nine regions are disjoint and their union is exactly
+    // [kPhysLiveStart, 4 GiB), so a pass still covers the whole window once -- only the ORDER
+    // changed: where a holder of the block's address can plausibly live is scanned first, the dead
+    // space after it. Region 0 is the image (globals + both control dwords, inside emission #1);
+    // region 1 is the boot worker's execution stack (boot_host.cpp:1041-1043: StackTop 0x8F000000,
+    // StackSize 0x200000 -> [0x8E000000, 0x8F000000), plus ThreadBlock 0x8F200000 at :1071 --
+    // restated here because those are function-local constants; w755's dominant sp cluster
+    // 0x8EFFFFxx proves this stack is live); region 2 is the pool itself -> `pool_refs`; region 3
+    // is the user heap -> guest thread stacks / PCR / TLS blocks (w755's second sp cluster
+    // 0x006Dxxxx sits in it; guest thread blocks are g_userHeap allocations, boot_host.cpp:1876);
+    // regions 4-8 are the remaining gaps in ascending order for completeness. The T43.1c row
+    // proposed scanning [0x80000000, 0xC0400000) first -- regions 0-2 plus gaps 5-7 cover it -- but
+    // that window alone would EXCLUDE the user heap the live thread stacks sit in, so the heap is
+    // added as region 3 rather than left to the gaps.
+    struct PhysLiveRegion
+    {
+        uint64_t lo, hi;
+    };
+    static constexpr PhysLiveRegion kPhysLiveRegions[] = {
+        { PPC_IMAGE_BASE, PPC_IMAGE_BASE + PPC_IMAGE_SIZE },                     // image: globals + ctl dwords
+        { 0x8E000000ull, 0x8F400000ull },                                       // boot stack + thread block
+        { mcla::kernel::kPhysArenaBeginVa, mcla::kernel::kPhysArenaEndVa },     // the pool -> pool_refs
+        { mcla::kernel::kUserHeapArenaVa, mcla::kernel::kUserHeapArenaEnd },    // guest stacks/PCR/TLS -> guest_refs
+        { kPhysLiveStart, mcla::kernel::kUserHeapArenaVa },                     // gap: guard .. user heap
+        { mcla::kernel::kUserHeapArenaEnd, PPC_IMAGE_BASE },                    // gap: user heap .. image
+        { PPC_IMAGE_BASE + PPC_IMAGE_SIZE, 0x8E000000ull },                     // gap: image .. boot stack (incl. func table)
+        { 0x8F400000ull, mcla::kernel::kPhysArenaBeginVa },                     // gap: boot statics .. pool
+        { mcla::kernel::kPhysArenaEndVa, 0x100000000ull },                      // gap: pool .. top of window
+    };
     std::atomic<uint64_t> g_physLiveRefs{0};
     std::atomic<uint64_t> g_physLivePoolRefs{0};
+    std::atomic<uint64_t> g_physLiveCtl{0};  // T43.1c (F-791): pass accumulator for the control dwords
     std::atomic<uint64_t> g_physLivePass{0};
     std::atomic<uint64_t> g_physLiveHits[kPhysLiveHits]{};
     std::atomic<uint32_t> g_physLiveNHits{0};
@@ -1654,13 +1881,25 @@ namespace
         for (const void *p : LivePhysAllocs())
         {
             regTotal++;
-            const uint64_t pv = (uint64_t)(uintptr_t)p;
+            // T43.1c (F-791): the set stores HOST pointers -- `aligned` in `Heap::AllocPhysical`
+            // (uintptr_t arithmetic on the o1heap return, inserted by `LivePhysAllocs().insert`)
+            // -- and the old code compared that raw 64-bit host address against the guest-VA
+            // target: a range check no in-window host pointer can enter unless the window's host
+            // base is pathologically low, so `reg_hit=0` was STRUCTURAL, not a reading (w755's
+            // `reg_hit=0 reg_total=4949` said nothing about release).
+            // `MapVirtual` is the bounds-checked host->guest inverse: memory.cpp:492-497 returns 0
+            // for anything outside the window, and 0 can never fall inside
+            // [target, target+frag).
+            const uint64_t pv = mcla::kernel::g_memory.MapVirtual(p);
             if (pv >= target && pv < (target + (frag != 0 ? frag : 1ull)))
                 regHit++;
         }
 
-        static std::atomic<uint64_t> cursor{0};
+        static std::atomic<uint64_t> cursor{kPhysLiveRegions[0].lo};  // position inside the CURRENT region
+        static std::atomic<uint32_t> cursorRgn{0};  // index into kPhysLiveRegions the cursor belongs to
         static std::atomic<uint64_t> sweptFor{0};  // which block the cursor's coverage belongs to
+        static std::atomic<uint64_t> passScanned{0};  // bytes covered in the CURRENT pass (sweep_ppm's numerator)
+        constexpr uint32_t kRgnN = (uint32_t)(sizeof(kPhysLiveRegions) / sizeof(kPhysLiveRegions[0]));
         if (sweptFor.load(std::memory_order_relaxed) != g)
         {
             // A NEW BIGGEST BLOCK. Coverage and tallies measured for the previous block are not
@@ -1668,73 +1907,144 @@ namespace
             // the wrong block presented as a partial sweep of the right one would make a leak look
             // like a block nobody had scanned yet, which is the failure this whole row exists to
             // avoid.
-            cursor.store(0, std::memory_order_relaxed);
+            cursorRgn.store(0, std::memory_order_relaxed);
+            cursor.store(kPhysLiveRegions[0].lo, std::memory_order_relaxed);
             sweptFor.store(g, std::memory_order_relaxed);
             g_physLiveRefs.store(0, std::memory_order_relaxed);
             g_physLivePoolRefs.store(0, std::memory_order_relaxed);
+            g_physLiveCtl.store(0, std::memory_order_relaxed);
             g_physLivePass.store(0, std::memory_order_relaxed);
             g_physLiveNHits.store(0, std::memory_order_relaxed);
+            passScanned.store(0, std::memory_order_relaxed);
         }
+        uint32_t rgn = cursorRgn.load(std::memory_order_relaxed);
         uint64_t pos = cursor.load(std::memory_order_relaxed);
-        uint64_t scanned = 0, refs = 0, poolRefs = 0;
+        uint64_t scanned = 0, refs = 0, poolRefs = 0, ctl = 0;
         uint64_t hits[kPhysLiveHits];
         uint32_t nHits = 0;
         static uint8_t chunk[kPhysLiveChunk];
         const uint64_t poolLo = mcla::kernel::kPhysArenaBeginVa;
         const uint64_t poolHi = mcla::kernel::kPhysArenaEndVa;
+        bool complete = false;
+        // T43.1c (F-791): BIG-ENDIAN, or the sweep sees nothing. Guest words in the window are
+        // stored big-endian -- `ReadU32BE` (memory.cpp:221-222) host-loads raw and Swap32's, same
+        // formula inlined here because `GuestMemoryHeap::Swap32` is private -- so the old raw host
+        // load compared against the byte-REVERSED numeric target and could never match a real
+        // pointer: 276 PHYS-LIVE rows across 10 logs, all zero, before this line existed.
+        const auto be = [](uint32_t v) {
+            return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+        };
 
-        while (scanned < kPhysLiveBudget && (pos + 8) <= winSz)
+        while (scanned < kPhysLiveBudget)
         {
-            const uint64_t n = ((winSz - pos) < kPhysLiveChunk) ? (winSz - pos) : kPhysLiveChunk;
+            const PhysLiveRegion &R = kPhysLiveRegions[rgn];
+            const uint64_t hi = (R.hi < winSz) ? R.hi : winSz;
+            if (pos < R.lo)
+                pos = R.lo;  // defensive snap; the cursor is initialised at a region base
+            if ((pos + 8) > hi)
+            {
+                // Region boundary: advance, exactly as the old code stepped from the window end
+                // back to kPhysLiveStart (F-782: never at 0 -- that is the null guard).
+                rgn++;
+                if (rgn == kRgnN)
+                {
+                    rgn = 0;
+                    pos = kPhysLiveRegions[0].lo;
+                    complete = true;
+                    break;
+                }
+                pos = kPhysLiveRegions[rgn].lo;
+                continue;
+            }
+            const uint64_t room = hi - pos;
+            const uint64_t n = (room < kPhysLiveChunk) ? room : kPhysLiveChunk;
             std::memcpy(chunk, base + pos, (size_t)n);
             for (uint64_t off = 0; (off + 8) <= n; off += 8)
             {
                 uint64_t w;
                 std::memcpy(&w, chunk + off, sizeof(w));
-                const uint32_t d[2] = {(uint32_t)w, (uint32_t)(w >> 32)};
+                const uint32_t d[2] = {be((uint32_t)w), be((uint32_t)(w >> 32))};
                 for (unsigned k = 0; k < 2; ++k)
                 {
-                    if (d[k] != target)
-                        continue;
-                    refs++;
-                    // CLASSIFIED BY WHERE THE REFERENCE WAS FOUND, not by what it points at. The
-                    // target is always inside the pool -- it is a physical address -- so testing the
-                    // target here would file every hit under `pool_refs` and leave `guest_refs`
-                    // permanently zero, which is exactly the "a counter that quietly stops counting
-                    // looks like a counter at zero" failure. A hit whose OWN address lies in the
-                    // pool is a physical-to-physical reference and is not evidence the guest owns
-                    // the block; a hit anywhere else is the guest's own structure naming it.
-                    const uint64_t at = pos + off + (uint64_t)k * 4u;
-                    if (at >= poolLo && at < poolHi)
-                        poolRefs++;
-                    if (nHits < kPhysLiveHits)
-                        hits[nHits++] = at;
+                    if (d[k] == target)
+                    {
+                        refs++;
+                        // CLASSIFIED BY WHERE THE REFERENCE WAS FOUND, not by what it points at. The
+                        // target is always inside the pool -- it is a physical address -- so testing the
+                        // target here would file every hit under `pool_refs` and leave `guest_refs`
+                        // permanently zero, which is exactly the "a counter that quietly stops counting
+                        // looks like a counter at zero" failure. A hit whose OWN address lies in the
+                        // pool is a physical-to-physical reference and is not evidence the guest owns
+                        // the block; a hit anywhere else is the guest's own structure naming it.
+                        const uint64_t at = pos + off + (uint64_t)k * 4u;
+                        if (at >= poolLo && at < poolHi)
+                            poolRefs++;
+                        if (nHits < kPhysLiveHits)
+                            hits[nHits++] = at;
+                    }
+                    else if (d[k] == kPhysLiveCtlMz || d[k] == kPhysLiveCtlOri)
+                        ctl++;  // T43.1c (F-791): the positive control, counted wherever scanned
                 }
             }
             pos += n;
             scanned += n;
         }
-        // WRAP, AND REPORT THE WRAP. A pass that reaches the end of the window starts again at 0
-        // and counts a new pass, so `sweep_ppm` below is always "coverage of the CURRENT pass" and
-        // a reader never mistakes pass 2's first 10 % for a completed answer.
-        const bool complete = (pos + 8) > winSz;
+        // A budget exhausted exactly on a region boundary advances now, so the wrap (and any
+        // region change) is reported on the ROW THAT CAUSED IT rather than one row late.
+        if (!complete)
+        {
+            const PhysLiveRegion &R = kPhysLiveRegions[rgn];
+            const uint64_t hi = (R.hi < winSz) ? R.hi : winSz;
+            if ((pos + 8) > hi)
+            {
+                rgn++;
+                if (rgn == kRgnN)
+                {
+                    rgn = 0;
+                    pos = kPhysLiveRegions[0].lo;
+                    complete = true;
+                }
+                else
+                    pos = kPhysLiveRegions[rgn].lo;
+            }
+        }
+        // WRAP, AND REPORT THE WRAP. A pass that reaches the end of the LAST region starts again
+        // at region 0 (F-782: never at 0 -- that is the null guard; region 0 is the image) and
+        // counts a new pass, so `sweep_ppm` below is always "coverage of the CURRENT pass" and
+        // a reader never mistakes pass 2's first 10 % for a completed answer. (`complete` itself
+        // was decided by the loop and the boundary advance above.)
         uint64_t pass = g_physLivePass.load(std::memory_order_relaxed);
+        uint64_t showRefs, showPoolRefs, showCtl;
         if (complete)
         {
-            pos = 0;
             pass++;
             g_physLivePass.store(pass, std::memory_order_relaxed);
-            // A completed pass is the ANSWER, so its tallies are the tallies that matter. Zero the
-            // running ones at the wrap: the next pass measures the same question again and a
-            // cumulative total across passes would double-count every word in the window.
-            g_physLiveRefs.store(refs, std::memory_order_relaxed);
-            g_physLivePoolRefs.store(poolRefs, std::memory_order_relaxed);
+            // A completed pass is the ANSWER, so its tallies are the tallies that matter. Publish
+            // the FINISHED pass (accumulated so far, plus this emission) on the wrap row, then
+            // zero the running ones: the next pass measures the same question again and a
+            // cumulative total across passes would double-count every word in the window. T43.1c
+            // (F-791): the old code stored THIS emission's `refs` alone here, silently discarding
+            // the pass -- invisible before F-791 only because every count was zero for the
+            // byte-order reason above.
+            showRefs = g_physLiveRefs.load(std::memory_order_relaxed) + refs;
+            showPoolRefs = g_physLivePoolRefs.load(std::memory_order_relaxed) + poolRefs;
+            showCtl = g_physLiveCtl.load(std::memory_order_relaxed) + ctl;
+            g_physLiveRefs.store(0, std::memory_order_relaxed);
+            g_physLivePoolRefs.store(0, std::memory_order_relaxed);
+            g_physLiveCtl.store(0, std::memory_order_relaxed);
+            passScanned.store(0, std::memory_order_relaxed);
         }
         else
         {
             g_physLiveRefs.fetch_add(refs, std::memory_order_relaxed);
             g_physLivePoolRefs.fetch_add(poolRefs, std::memory_order_relaxed);
+            g_physLiveCtl.fetch_add(ctl, std::memory_order_relaxed);
+            passScanned.fetch_add(scanned, std::memory_order_relaxed);
+            showRefs = g_physLiveRefs.load(std::memory_order_relaxed);
+            showPoolRefs = g_physLivePoolRefs.load(std::memory_order_relaxed);
+            showCtl = g_physLiveCtl.load(std::memory_order_relaxed);
         }
+        cursorRgn.store(rgn, std::memory_order_relaxed);
         cursor.store(pos, std::memory_order_relaxed);
 
         uint32_t n = g_physLiveNHits.load(std::memory_order_relaxed);
@@ -1744,7 +2054,7 @@ namespace
 
         MCLA_LOG_ERROR("PHYS-LIVE #{} state_seq={} block_guest={:08X} frag={:#x} size={:#x} "
                        "alloc_seq={} caller_rva={:#x} glr={:08X} freed={} reg_hit={} reg_total={} "
-                       "guest_refs={} pool_refs={} scanned={:.1f}MB sweep_ppm={} complete={} pass={} "
+                       "guest_refs={} pool_refs={} ctl={} scanned={:.1f}MB sweep_ppm={} complete={} pass={} "
                        "hits={} hit0={:08X} hit1={:08X} hit2={:08X}",
                        (unsigned long long)stateSeq, (unsigned long long)stateSeq, target, frag,
                        g_physPool.bigSize.load(std::memory_order_relaxed),
@@ -1753,10 +2063,14 @@ namespace
                        g_physPool.bigGlr.load(std::memory_order_relaxed),
                        g_physPool.bigFreed.load(std::memory_order_relaxed),
                        (unsigned long long)regHit, (unsigned long long)regTotal,
-                       (unsigned long long)g_physLiveRefs.load(std::memory_order_relaxed),
-                       (unsigned long long)g_physLivePoolRefs.load(std::memory_order_relaxed),
+                       (unsigned long long)showRefs,
+                       (unsigned long long)showPoolRefs,
+                       (unsigned long long)showCtl,
                        (double)scanned / 1048576.0,
-                       (winSz != 0) ? (unsigned long long)((pos * 1000000ull) / winSz) : 0ull,
+                       (winSz != 0)
+                           ? (unsigned long long)((passScanned.load(std::memory_order_relaxed) * 1000000ull) /
+                                                  winSz)
+                           : 0ull,
                        complete ? 1u : 0u, (unsigned long long)pass,
                        g_physLiveNHits.load(std::memory_order_relaxed),
                        g_physLiveHits[0].load(std::memory_order_relaxed),
@@ -2379,6 +2693,33 @@ namespace
 } // namespace
 
 
+// F-779: host memory for the two DETACHED o1heap instances. Deliberately process-lifetime and never
+// freed, exactly like the arenas themselves. VirtualAlloc rather than _aligned_malloc because
+// <windows.h> is already included here and its 64 KiB granularity trivially satisfies
+// O1HEAP_ALIGNMENT (32), so no alignment arithmetic is needed and no new include is added.
+//
+// WHY THEY MUST NOT BE IN THE GUEST WINDOW. o1heapInit places the instance AT the arena base, so the
+// first 0x240 bytes of a guest-addressable arena are our control blocks. F-778 measured what that
+// costs: the title handed 0xA0400000 -- the physical instance's own first byte -- to its memcpy as a
+// copy destination and zeroed 128 bytes there, i.e. bin heads 0..15. With the bin heads and
+// `nonempty_bin_mask` zeroed, o1heapAllocate computes `suitable_bins == 0` and returns NULL for EVERY
+// size including 1 byte, while o1heapDoInvariantsHold -- which never dereferences a fragment -- still
+// returns true. That is precisely the `w740` signature: `o1heap invariants fail` alongside
+// `xtl-alloc-refused`, a pool that looks healthy and refuses everything.
+//
+// Detaching makes the arena's first byte an ordinary allocatable fragment, so a guest write to a guest
+// physical address can only ever land on guest data. NOTHING ABOUT THE ARENA BASE CHANGES: the title is
+// still handed 0x20000 and 0xA0400000 (F-384's measurement stands, and relocating the base was already
+// tried in `w395` and reverted), we simply no longer keep our books there.
+static uint8_t *g_userInstMem = nullptr;
+static uint8_t *g_physInstMem = nullptr;
+
+static uint8_t *AllocDetachedInstanceMem()
+{
+    void *const p = VirtualAlloc(nullptr, o1heapInstanceSize(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    return static_cast<uint8_t *>(p);
+}
+
 void Heap::Init()
 {
     // F-384: this line used to hardcode 0x20000 (XenonRecomp's baseline); the address is unchanged but
@@ -2386,9 +2727,12 @@ void Heap::Init()
     // relocation to 0x20000000 was tried and measured in `w395` and REVERTED: the writer followed the
     // base (`guest=20000000 val=20000004` from the same `sub_82397060` chain), so the title is being
     // HANDED our arena base -- that hand-off is T41.67, not a relocation.
+    // F-779: the arena base is still that same guest address; only the INSTANCE moved out of it.
     heapArenaBase = (uint8_t*)mcla::kernel::g_memory.Translate(mcla::kernel::kUserHeapArenaVa);
     heapArenaSize = mcla::kernel::kUserHeapArenaEnd - mcla::kernel::kUserHeapArenaVa;
-    heap = o1heapInit(heapArenaBase, heapArenaSize);
+    g_userInstMem = AllocDetachedInstanceMem();
+    heap = g_userInstMem ? o1heapInitSeparate(g_userInstMem, heapArenaBase, heapArenaSize)
+                         : o1heapInit(heapArenaBase, heapArenaSize);
     g_hdrArena = heapArenaBase;
     if (heap != nullptr)
         g_hdrGoldenCap = o1heapGetDiagnostics(heap).capacity;  // F-370: constant from here on
@@ -2409,27 +2753,47 @@ void Heap::Init()
     // was a lie with a number attached, and why 512 MiB is the faithful value and not a budget.
     // `AttachPhysicalArena` can still rebind the size (it is not called anywhere in this tree); the
     // init row below is emitted from whichever binding is live, so the two cannot disagree.
+    // F-779: it still rebinds to an ATTACHED instance (`o1heapInit`), i.e. to the old layout. It is
+    // dead code in this tree; if it is ever wired up it must be detached too, or the collision F-778
+    // measured comes back with it.
     physArenaSize = mcla::kernel::PhysArenaSizeBytes();
-    physicalHeap = o1heapInit(physArenaBase, physArenaSize);
+    g_physInstMem = AllocDetachedInstanceMem();
+    physicalHeap = g_physInstMem ? o1heapInitSeparate(g_physInstMem, physArenaBase, physArenaSize)
+                                 : o1heapInit(physArenaBase, physArenaSize);
     const uint64_t o1Cap =
         physicalHeap ? (uint64_t)o1heapGetDiagnostics(physicalHeap).capacity : 0ull;
     // F-640: the model-in-force row. Emitted ONCE, at Init, on the same terms as every other row in
     // this file: the modelled capacity straight from the constant, the guest extent it implies, the
-    // value it replaces, and the o1heap capacity the allocator actually took (arenaSize - 0x240,
-    // o1heap's own header padding -- boot_host.cpp:1991-1992 measures the instance as 0x230 padded
-    // to 0x240). A census can therefore answer "is the console's pool in force?" from one line
-    // even in a run that never refuses anything, which is the case that used to be indistinguishable
-    // from a healthy over-provisioned pool. `cap_mb` is the field a gate should read: 512.0.
+    // value it replaces, and the o1heap capacity the allocator actually took.
+    // F-779 CORRECTS THE PARENTHETICAL THAT USED TO BE HERE: it said the allocator took
+    // "arenaSize - 0x240, o1heap's own header padding". That was true of `o1heapInit` and is FALSE of
+    // `o1heapInitSeparate` -- a detached instance is not in the arena, so capacity is the whole
+    // `arenaSize` (still clamped to FRAGMENT_SIZE_MAX and rounded down to FRAGMENT_SIZE_MIN, neither
+    // of which binds at 0x20000000). `o1_cap_delta` is that difference printed explicitly: it is
+    // +0x240 when the instance is detached and 0 when it is not, so a census can tell which layout
+    // the running exe actually used WITHOUT trusting this comment. `inst_detached`, `inst_host` and
+    // `frag0_guest` are the same fact from the other side: the instance lives at a host address that
+    // is not in the guest window, and the first allocatable fragment is now the arena's own first
+    // byte rather than base+0x240.
+    const uint64_t o1CapAttachedModel =
+        (physArenaSize > o1heapInstanceSize()) ? (uint64_t)(physArenaSize - o1heapInstanceSize()) : 0ull;
     MCLA_LOG_WARN("PHYS-POOL phase=init cap_bytes={:#x} cap_mb={:.1f} model=console-512MiB "
                   "replaced_mb=1532.0 ratio=2.992x guest=[{:08X}..{:08X}) o1_capacity={:#x} "
-                  "o1_capacity_mb={:.1f} hdr={:p}",
+                  "o1_capacity_mb={:.1f} hdr={:p} inst_detached={} inst_host={:p} "
+                  "frag0_guest={:08X} o1_cap_delta={:#x} user_inst_detached={} user_inst_host={:p}",
                   (uint64_t)physArenaSize,
                   static_cast<double>(physArenaSize) / (1024.0 * 1024.0),
                   mcla::kernel::kPhysArenaBeginVa,
                   mcla::kernel::kPhysArenaBeginVa + (uint32_t)physArenaSize,
                   (uint64_t)o1Cap,
                   physicalHeap ? static_cast<double>(o1Cap) / (1024.0 * 1024.0) : 0.0,
-                  (void*)physArenaBase);
+                  (void*)physArenaBase,
+                  (g_physInstMem != nullptr) ? 1 : 0,
+                  (void*)g_physInstMem,
+                  mcla::kernel::kPhysArenaBeginVa,
+                  (uint64_t)(o1Cap - o1CapAttachedModel),
+                  (g_userInstMem != nullptr) ? 1 : 0,
+                  (void*)g_userInstMem);
 }
 
 void Heap::AttachPhysicalArena(void* base, size_t size)
@@ -2859,10 +3223,82 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     //     therefore writes them over the payload. w661 is the empirical check on the 16 floor:
     //     19,958 allocations served at `align=0x10` before the first refusal, `capacity` constant
     //     on all 23 PHYS-STATE rows, 0 `F370-HEAP-HDR` rows.
-    //   * Nothing consumes a page-aligned physical pointer. `MapVirtual` is pure identity
-    //     arithmetic on the arena window (memory.cpp:300-309), so no host page, no aliasing and no
-    //     page-table step depends on an individual fragment's alignment, and 4 KB bought nothing.
-    alignment = std::max<size_t>(16, alignment);
+    //   * REFUTED, 2026-10-06, and the refutation is the reason for the 16 KB floor below. This
+    //     bullet used to read "Nothing consumes a page-aligned physical pointer. `MapVirtual` is
+    //     pure identity arithmetic on the arena window (memory.cpp:300-309), so no host page, no
+    //     aliasing and no page-table step depends on an individual fragment's alignment, and 4 KB
+    //     bought nothing." Every host-side half of that is still true and is irrelevant: the
+    //     consumer of a physical pointer's alignment is THE GUEST'S OWN SLAB ARITHMETIC, which no
+    //     host-side survey can see. `sub_821C2840` (the guest heap init) masks the pointer we hand
+    //     it down to a slab base and builds its header there:
+    //         821C2884  54880022  rlwinm r8,r4,0,0,17   ; r8 = r4 & 0xFFFFC000  (~0x3FFF, 16 KB)
+    //         821C2890  911F00F8  stw    r8,248(r31)    ; heap+248 = the masked base
+    //     Raw words read at VA-0x82000000 per F-023; the emitted C++ agrees
+    //     (`generated/ppc_xenon/ppc_recomp.15.cpp`, `ctx.r8.u64 = ... & 0xFFFFC000;`). Closure
+    //     against the log: `HEAP76 ... +4=A0400290 +248=A0400000` (build/w736.log:941) -- both
+    //     fields are satisfied by exactly r4 in [A0400261, A0400280], and A0400280 is the lowest VA
+    //     this function can return (`:3176-3178`; corroborated `w736.log:245 big_guest=A0400280`).
+    //     A0400280 & ~0x3FFF = A0400000 = OUR o1heap INSTANCE HEADER, which o1heapInit places at the
+    //     arena base and which spans [A0400000, A0400240) (`o1heap.c:166` INSTANCE_SIZE_PADDED =
+    //     0x240, `:312` first fragment at base+0x240, `heap.cpp:2413` init site). The guest then
+    //     zero-sweeps it: `HEAPHDR-STORE` (`gpu_cp.cpp:7434-7458`) fired its 200-row cap covering
+    //     183 distinct addresses in [A0400000, A04004C0), 164 of them storing 00000000, the
+    //     dominant run being 137 contiguous stride-4 zeros from A0400000 (a memcpy whose dst is
+    //     caller-supplied, `lr=821BE3BC` = `sub_821BE250+0x16c`, `821BE3B8 bl 0x823DA950`).
+    //     `diagnostics.capacity` lives at instance+0x208, inside that sweep, which is why it reads
+    //     0: `AllocPhysical: o1heap invariants FAIL #1 size=0x19d align=0x10 cap=0 peak=0`
+    //     (w736.log:33535) followed 1:1 in the same millisecond by `XTL-ALLOC-REFUSED #1 size=413
+    //     align=16 -> returned 0` (imports.cpp:184) x4 -- and the guest never tests r3 there, so the
+    //     null propagates into an unconstructed object and a zero vtable slot.
+    //   * WHY 16 KB AND NOT 4 KB -- a page floor is not a cheaper fix, it is a non-fix. The mask is
+    //     ~0x3FFF, so on a 4 KB-aligned pointer `ptr & ~0x3FFF` is still up to 0x3000 BELOW ptr and
+    //     still lands in the header. Only a granule >= the guest's own makes mask-down the identity,
+    //     so the slab base equals the pointer we returned and the guest writes only inside memory it
+    //     was given. In-tree precedent for the same mask, measured earlier and independently:
+    //     `alloc_census.cpp:346`, `slab = elem & ~0x3FFF` = A0400000 from elem = A0401020.
+    //   * COST, measured not estimated: `o1Amount` at `:3040` is `size + alignment + 32` and the
+    //     granular charge rounds that up to 4 KB, so the floor adds <= 16 KB per allocation. w736
+    //     served 3,776 physical allocations (~59 MB extra) with peak live 373.6 MB
+    //     (`used_ppm=729615`) and minimum free 138.4 MB, leaving ~79 MB. Larger requested
+    //     alignments survive (`XAllocMem`'s up to 0x8000, `MmAllocatePhysicalMemoryEx`'s forwarded
+    //     argument) because this is a floor, not an assignment. The w661 evidence the 16 floor used
+    //     to cite (19,958 allocations at align=0x10) predates the guest ever reaching its heap init
+    //     and does not bound this cost; if a future boot multiplies the allocation count enough to
+    //     exhaust the arena, `PHYS-POOL-FULL` / `returned null` will name it.
+    constexpr size_t kPhysSlabGranule = 0x4000;  // the guest's own slab mask, ~0x3FFF, measured above
+    // T43.16 (2026-10-12): SCOPE the slab floor to slab-scale requests.
+    // The floor has exactly ONE consumer: sub_821C2840 masks the pointer with
+    // ~0x3FFF and builds its header at the masked base (proof :3200-3236).
+    // A request smaller than the granule can never be a slab the guest
+    // heap-inits -- the guest heap-init runs on arena-scale regions -- so
+    // charging every 14-byte XTL string-dup 16 KB is pure overcharge
+    // (~125 MiB over 8,000 asks, F-792 S2, the T43.2 exhaustion driver).
+    // Slab-scale requests keep the EXACT old behavior (floor + pow2 below
+    // unchanged); small requests keep max(16, pow2) which the :3185-3194
+    // bookkeeping proof already shows sufficient. Explicit large alignments
+    // (XAllocMem up to 0x8000, MmAllocatePhysicalMemoryEx forwards) survive
+    // on both arms via max(). Falsifier: HEAP76 census (:3207) naming a
+    // slab-init on a sub-granule block -- revert this scope if it fires.
+    // Counters, throttled rows (first 8 + every 4096th): ~10 rows per boot,
+    // nowhere near F-054 scale.
+    static std::atomic<uint64_t> s_slabFloorKept{0};
+    static std::atomic<uint64_t> s_slabFloorRelaxed{0};
+    if (size >= kPhysSlabGranule) {
+        alignment = std::max<size_t>(kPhysSlabGranule, alignment);
+        const uint64_t n = s_slabFloorKept.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 4096u) == 0u) {
+            MCLA_LOG_WARN("SLAB-FLOOR kept #{} size={:#x} align={:#x} (slab-scale, old behavior)",
+                          n, size, alignment);
+        }
+    } else {
+        alignment = std::max<size_t>(16, alignment);
+        const uint64_t n = s_slabFloorRelaxed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 4096u) == 0u) {
+            MCLA_LOG_WARN("SLAB-FLOOR relaxed #{} size={:#x} align={:#x} kept={} (T43.16 scope)",
+                          n, size, alignment,
+                          s_slabFloorKept.load(std::memory_order_relaxed));
+        }
+    }
     // Session 72: guest can pass non-pow2 (observed 0x404). The
     // `& ~(alignment-1)` mask is only valid for pow2 â€” a non-pow2 alignment
     // produced a misaligned user pointer and the bookkeeping words written
@@ -3003,7 +3439,42 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     // 293,212 `o1heap AV fault-addr=` rows against 2,940 printed `AllocPhysical: o1heapAllocate
     // returned null` rows (that row is capped to the first 8 + every 100th, so the printed count
     // is not the refusal count) -- that refusal, not this one, is what keeps the process alive.
-    if (!o1heapDoInvariantsHold(physicalHeap))
+    //
+    // T43.1: `o1Amount` and the F-640 attempt counter are computed HERE, above this gate, because
+    // the gate's refusal path now emits the same three rows the allocation-refusal path below does.
+    // Both are pure functions of the two parameters and `alignment` was already finalised by the
+    // slab floor and the pow2 round-up above the lock, so the value is IDENTICAL to the one this
+    // line used to produce after the gate -- the hoist moves a declaration, it changes no number.
+    // Hoisting the attempt is what keeps `attempts == served + refused` true once an invariant
+    // refusal increments `refused` (F-640's own rationale is quoted at its former site below).
+    const size_t o1Amount = size + alignment + O1HEAP_ALIGNMENT;  // F-631: named so the rows report
+                                                                  // the size o1heap actually classified
+    NotePhysAttempt();
+
+    // T43.1 CONTROL -- A FAULT INJECTOR, NOT A MITIGATION, and the direction is the safe one.
+    // Setting MCLA_T43_FORCE_INV_GATE=1 makes this gate fire on a HEALTHY heap, so the three rows
+    // below can be SHOWN firing rather than argued about (LONG_TODO §1 rule 19: a zero is not a
+    // result until the instrument is seen on an event you know happened). It exists because
+    // post-F-779 the guest no longer zeroes our instance header, so `invariants FAIL` measures
+    // **4 rows in each of w736..w740 and 0 in both w741 and w741b** -- a normal soak of the fixed
+    // tree CANNOT reach this path, and without the control the fix would ship on a prediction.
+    // Read once into a function-local static, defaults off, and when on it refuses EVERY physical
+    // allocation so the boot fails loudly and immediately. That is the opposite of the failure mode
+    // this project keeps getting burned by (`kBe710MagicWrite` suppressed 57 fatals and made a
+    // broken boot look healthy for as long as it lived): an injector that makes things visibly
+    // worse cannot masquerade as a fix.
+    //
+    // IT STAYS (F-781 §7). The control run is on disk -- `build/w742ctl.log:210-215`, which is the
+    // only place in 313 logs where `PHYS-POOL-FULL` has ever printed -- but deleting the injector
+    // would make this path unfalsifiable again for exactly as long as F-779's fix holds, which is
+    // the situation that produced the defect in the first place. Default-off, one getenv read per
+    // process, and it is registered in PROGRAM_GUIDE §7/§9 so an unregistered control is never
+    // mistaken for a silent short-circuit (do-not #9).
+    static const bool kT43ForceInvGate = [] {
+        const char *e = std::getenv("MCLA_T43_FORCE_INV_GATE");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (kT43ForceInvGate || !o1heapDoInvariantsHold(physicalHeap))
     {
         static std::atomic<uint32_t> s_badHeap{0};
         const uint32_t n = s_badHeap.fetch_add(1) + 1;
@@ -3028,6 +3499,37 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
             MCLA_LOG_ERROR("o1heap arena[32..]: {:016X} {:016X} {:016X} {:016X}",
                            words[4], words[5], words[6], words[7]);
         }
+        // T43.1: THE ORDERING FIX. This `return nullptr` used to be the last word the pool got. It
+        // executed BEFORE `EmitPhysState` / `NotePhysVerdict` / `NotePhysPoolFull`, which all live in
+        // the `ptr == nullptr` block below that this path never reaches -- and `NotePhysAttempt()`
+        // sat below it too, so F-640's counters missed these refusals entirely. Measured cost, from
+        // the four logs where this gate actually fired: `w736` holds four
+        // `AllocPhysical: o1heap invariants FAIL #1..#4 size=0x19d align=0x10 cap=0 peak=0` rows at
+        // `:33535/:33540/:33543/:33546`, and its ONE `PHYS-VERDICT-CHANGE` row is `:910`
+        // (`none -> healthy why=suitable_class_present refusals=0 req_amt=0x0`, 14:50:17 -- from the
+        // FREE path, `req_amt=0x0`, 2 m 16 s earlier), with **`PHYS-STATE` 0 rows and
+        // `PHYS-POOL-FULL` 0 rows in the whole log**. So the last thing that run said about a pool
+        // that was refusing every request was "healthy". Same defect class as the stale
+        // `PARK-SAMPLE` mirror (F-627/F-628 Correction 2): the row mirrors the last time the code
+        // REACHED it, not the present state.
+        //
+        // These are the same three calls with the same arguments the block below makes, so one
+        // request cannot be classified differently by the two refusal paths, and `_ReturnAddress()`
+        // is this function's own return address from either site, so `caller_rva` is unchanged.
+        // NO NEW FIELD IS NEEDED to tell the paths apart: `ClassifyPhysPool` maps `d.capacity == 0`
+        // to `destroyed-header why=capacity_zero` (`:781-787`), and `cap=0` on this path is already
+        // measured in those same four logs, so the row names its own origin. The switch in
+        // `NotePhysPoolFull` has an explicit `default:` arm for `DestroyedHeader` that increments
+        // `destroyed` (`:1500-1502`), i.e. the bucket lands honestly rather than in `exhausted`.
+        // Cost: `EmitPhysState` also drives the incremental 4 GiB PHYS-LIVE sweep while
+        // `physicalMutex` is held -- ONE EMISSION PER REFUSAL (no cadence gate reaches
+        // `NotePhysLive`; w755 printed 256 rows for 256 refusals), 16 MiB each since T43.1c/F-791
+        // (~2.6 ms at the measured 6.2 GB/s; was 256 MiB ~41 ms). The old claim here -- 16 rows
+        // then a stop when the pass completes -- described neither: w755 completed 16 passes
+        // without stopping. Changes no decision and no return value.
+        EmitPhysState(o1Amount, alignment, _ReturnAddress());
+        NotePhysVerdict(o1Amount, _ReturnAddress());
+        NotePhysPoolFull(o1Amount, _ReturnAddress());
         return nullptr;
     }
 
@@ -3036,14 +3538,17 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     // bookkeeping words written below it can never overlap the o1heap
     // fragment header (next@-32, prev@-24, size@-16, used@-8). Overlapping it
     // destroyed the pow2-size/used invariants IsLiveAllocation checks.
+    // (That head-room is exactly what the `+ O1HEAP_ALIGNMENT` term in the HOISTED `o1Amount`
+    // above the invariant gate pays for; the declaration itself moved there for T43.1.)
     //
-    const size_t o1Amount = size + alignment + O1HEAP_ALIGNMENT;  // F-631: named so the row below reports
-                                                                 // the size o1heap actually classified
     // F-640: ATTEMPTS AND OUTCOMES, counted on the way in and on the way out, so the refusal tally
     // has a denominator that the refusal path's own sampling cadence cannot bias. One relaxed
     // increment on a path that already takes a lock and walks a buddy allocator's bins; it changes
-    // no decision and no return value.
-    NotePhysAttempt();
+    // no decision and no return value. **T43.1 moved the `NotePhysAttempt()` call itself above the
+    // invariant gate** so that an invariant refusal is counted as an attempt as well as a refusal,
+    // which is what keeps `attempts == served + refused` arithmetically true now that
+    // `NotePhysPoolFull` runs on that path too. The increment, its cost and its meaning are
+    // unchanged; only its position moved.
     // F-641/F-642: ROUTE, AND THE ROUTING IS THE FIX. `o1heapAllocate` charges
     // `roundUpToPowerOf2(amount + O1HEAP_ALIGNMENT)`. F-641 first used that as a defect only when the
     // class exceeded the whole arena (build/w665.log: o1_amount=0x12b80030 -> class 0x20000000 against
@@ -3071,6 +3576,20 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
     // is bound (`AttachPhysicalArena` can rebind it) or on how full the pool is.
     const size_t capBefore = HeapDiag(physicalHeap).capacity;
     const bool granular = O1UsesGranularPolicy(o1Amount, capBefore);
+    if (!granular)
+    {
+        // T43.19: the sub-page lever took this request. Counted and printed (throttled) so a soak
+        // measures the take rate; the accounting below is unchanged and still measures the header.
+        static std::atomic<uint64_t> s_subPageRouted{0};
+        const uint64_t n = s_subPageRouted.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 4096u) == 0u)
+            MCLA_LOG_WARN("SUB-PAGE-ROUTED #{} amount={:#x} pow2_would_be={:#x} "
+                          "page_saved={:#x} (T43.19: mcla_phys_subpage=1; divergence vs console "
+                          "page charging is DELIBERATE and cvar-gated)",
+                          n, o1Amount, O1RoundUpPow2(o1Amount + kO1HeapAlignment),
+                          O1GranularCharge(o1Amount) -
+                              O1RoundUpPow2(o1Amount + kO1HeapAlignment));
+    }
     void* ptr = granular ? MCLA_O1_ALLOC_GRANULAR(physicalHeap, o1Amount, kO1PageGranule)
                          : MCLA_O1_ALLOC(physicalHeap, o1Amount);
     if (ptr != nullptr)
@@ -3109,6 +3628,17 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
             // ceiling. The fields are unchanged too, so every reader of this row keeps its meaning;
             // `path=granular` is simply no longer a distinguishing value.
             NotePhysLarge(lr, _ReturnAddress());
+            // T43.2 POSITIVE CONTROL (LONG_TODO rule 19: a zero is not a result until the instrument
+            // is shown firing on an event you know happened). w744's four rows all read
+            // `head=0 min=0 max=0`, and an instrument that has never been seen printing a NONZERO
+            // cannot distinguish "the arena's headers are zeroed" from "the probe reads the wrong
+            // offset". One row is emitted on the FIRST served allocation, where the arena is
+            // demonstrably working because the allocation succeeded, so a nonzero head_size there
+            // proves the offset and makes the zeros at refusal the arena's state. `#0` is the row.
+            static std::atomic<uint32_t> s_physProbeOkOnce{0};
+            if (s_physProbeOkOnce.fetch_add(1u, std::memory_order_relaxed) == 0u)
+                NotePhysBinProbe(physicalHeap, o1Amount, 0, _ReturnAddress(), physArenaBase,
+                                 mcla::kernel::kPhysArenaBeginVa);
         }
     }
     if (ptr == nullptr && granular)
@@ -3153,6 +3683,14 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
                            (unsigned long long)d.oom_count,
                            CallerRva(_ReturnAddress()),
                            GetPPCContext() ? static_cast<uint32_t>(GetPPCContext()->lr) : 0u);
+            // T43.2: the row above reports BIN PRESENCE (`live`/`cap`) and the PHYS-STATE row below
+            // reports `bin_mask`; neither can answer why the granular scan returned NULL when a set
+            // mask bit promised a fragment big enough. This replays that scan read-only and prints
+            // the size words the allocator actually compared against the charge. `n` and
+            // `_ReturnAddress()` come from the CALL SITE so the row pairs with the refusal above and
+            // `caller_rva` stays AllocPhysical's caller, not AllocPhysical itself.
+            NotePhysBinProbe(physicalHeap, o1Amount, n, _ReturnAddress(), physArenaBase,
+                             mcla::kernel::kPhysArenaBeginVa);
         }
         // F-638: the periodic state row -- first 8 refusals, then every 1,000th, so the pool's
         // STATE HISTORY between two verdict transitions is on disk and not reconstructed from a
@@ -3369,9 +3907,14 @@ void Heap::Free(void* ptr)
                               "o1_free={:#x} phys_freed_bytes={} caller_rva={:#x} glr={:08X}",
                               (unsigned long long)fs, (unsigned long long)ok, (unsigned long long)rej,
                               (unsigned long long)(fs >= ok + rej ? fs - ok - rej : 0ull),
-                              (ok + rej) ? (static_cast<double>(ok) * 100.0 /
-                                             static_cast<double>(ok + rej))
-                                         : 0.0,
+                              // T43.17 (2026-10-13): pct is over ATTEMPTED, not
+                              // accounted. The old denominator (ok+rej) excluded
+                              // the 1 in-flight free, so every row printed
+                              // 100.0000 while attempted = honoured+1. Same
+                              // flaw class as XTL-FREE-SUM before its fix.
+                              fs ? (static_cast<double>(ok) * 100.0 /
+                                     static_cast<double>(fs))
+                                 : 0.0,
                               (unsigned long long)ne, (unsigned long long)nl,
                               (uint64_t)ds.allocated, (uint64_t)ds.capacity,
                               (uint64_t)(ds.capacity > ds.allocated ? ds.capacity - ds.allocated : 0),

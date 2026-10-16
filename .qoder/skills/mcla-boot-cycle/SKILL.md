@@ -36,8 +36,19 @@ as a UNC path.
 ## 2. Build (rule 7 — tree must always compile)
 
 ```bash
-cd "E:/mcla pc" && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build_on_e.bat build > build/<wave>_build.log 2>&1; echo "BUILD_RC=$?"
+cd "E:/mcla pc" && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build_on_e.bat build; echo "BUILD_RC=$?"; cat build_ninja.log
 ```
+
+🔴 **THE OUTER REDIRECT IN THIS RECIPE USED TO CAPTURE NOTHING, AND A 0-BYTE LOG LOOKS LIKE A CLEAN
+BUILD.** `build_on_e.bat` ends with `ninja -C build mcla.exe > build_ninja.log 2>&1` (`:11`), and its
+configure step does the same into `build_cfg.log` (`:8`). Both redirects are **inside** the script, so
+`… build_on_e.bat build > build/<wave>_build.log 2>&1` writes a **0-byte** file. Measured twice:
+`build/w742_build.log` and `build/w743_build.log` are both 0 B while `build_ninja.log` (repo root,
+NOT `build/`) held 37,566 B and the real `[25/25] Linking CXX executable mcla.exe`. **Read
+`build_ninja.log` and `build_cfg.log` at the repo root.** A warning count of 137 there is normal and
+pre-existing (`nodiscard` on `ReadU32BE`/`WriteU32BE` across `alloc_census.cpp`, `gpu_cp.cpp`,
+`boot_host.cpp`, `gpu_device.cpp`, `render_thread.cpp`) — what matters is **0 errors**, that your own
+changed TU appears in the `[n/N]` list, and that the final `Linking` line is present.
 
 `build_on_e.bat` is the only build script to use (E: has been the primary tree since the 2026-09-23
 merge; `build_on_c.bat` no longer exists — the name in older doc text is stale). Bare arg =
@@ -48,7 +59,9 @@ about the rc convention above and their output is not captured to a log, so pref
 STL 14.51) and reports a failure that has nothing to do with your change.
 
 Capture `rc=$?` **immediately** and in the same command. Piping ninja to `tail` reports `0` on a
-failed build — this has bitten the project three times.
+failed build — this has bitten the project three times. **And `rc=0` from a background wrapper proves
+nothing on its own** — confirm from the artifacts: the `[n/N] Linking` line in `build_ninja.log`, your
+changed TU's `.obj` mtime, and step 3's exe mtime.
 
 ## 3. Verify the exe actually moved (rule 12 — stale-exe trap)
 

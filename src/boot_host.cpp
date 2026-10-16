@@ -63,6 +63,13 @@ extern std::atomic<uint32_t> g_mainGuestThreadId;
 PPC_EXTERN_FUNC(__xtl_alloc);
 PPC_EXTERN_FUNC(__xtl_free);
 
+// F-784: the T44 wipe-watch positive control (LT rule 19), defined at the foot
+// of the T44 block in gpu_cp.cpp. Declared at GLOBAL scope, before namespace
+// mcla::boot opens -- a declaration written inside that namespace would name a
+// different function with different linkage, the F-637 trap F-640's own
+// declaration above had to be written around.
+namespace mcla::gpu { void T44WipeSelfTest(); }
+
 namespace mcla::boot {
 
 // F-640: the physical-view alias probe + the init row. Defined at the foot of this TU with
@@ -3296,6 +3303,14 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // the byte it borrows. It publishes which alias mechanism is in force -- read off the
     // probe, not asserted in source -- and the extents the two reporting sites below now use.
     F640PhysAliasInit();
+
+    // F-784: prove the T44 wipe-watch chain fires on THIS build before any
+    // silence in T44-WIPE-STORE can be read as a result (LT rule 19). It writes
+    // byte-identical values back through the checked accessors, so the arena's
+    // contents are unchanged; its own row says read=N/2 and rows=N (expect 6).
+    // After F640 so the physical pool exists; before the XEX is installed, so
+    // nothing else is writing while the control runs.
+    ::mcla::gpu::T44WipeSelfTest();
 
     {
         const auto mainDiag = o1heapGetDiagnostics(g_userHeap.heap);

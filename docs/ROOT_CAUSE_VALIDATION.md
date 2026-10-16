@@ -17498,3 +17498,2138 @@ UNRESOLVED, stated as predictions per rule 14:
    value, the fatal will move.
 2. If some other agent "fixes" `0xFF000000` into `generated/**`, 16,709 sites across 176 TUs silently
    invert and the boot gets strictly worse. That edit is a forbidden hand-edit AND a regression.
+
+
+
+---
+
+### F-766 - THE BOOT BLOCKER IS SOLVED AND THE PROPERTY IS DURABLE ACROSS TWO BUILDS (a9bd027)
+
+**Appended 2026-10-06 by the session-79 orchestrator, re-verified against `build/w736.log` and
+`build/w737.log` by direct count this session. This entry records the re-verification; the fix itself
+landed at `a9bd027` and is not re-derived here.**
+
+- Task:        session 79 ledger catch-up (wave logs `build/w734.log`, `build/w736.log`, `build/w737.log`)
+- Type:        FACT
+- Class:       E (filesystem/device)
+- Priority:    P0
+- Evidence:    `src/gpu_device.cpp` reader-cursor snapshot around `__imp__sub_821CC1E0`; raw
+               `0x821CC3CC stw r11,4(r31)` = the callee's cursor advance; marker counts below measured
+               by the orchestrator with printer literals, whole lines, case-insensitive.
+
+**THE CAUSE, in one sentence.** `pos` is dword 1 of the reader object the caller passes as `r4` - the
+guest's own byte cursor into the member's logical bytes. The file already snapshotted `r4`/`r5`/`r6`
+around `__imp__sub_821CC1E0` but never extended the snapshot to the two dwords then read out of guest
+memory, so every read observed the *previous* read's end position. The callee's tail advances it.
+
+**THE FALSIFIER that killed the ring-buffer reading - do not re-derive it.** 18 rows, 18 different
+members, six different archive offsets, `pos=4096` on every one and **never 8192**. An accumulating
+cursor cannot read 4096 on eighteen independent first pages. The window is double-buffered (two windows
+one page apart), not a ring; the fill is clamped by `uncompressedSize - cursor` (raw
+`0x821CC260`-`0x821CC27C`).
+
+**RE-VERIFIED, no-fatal property holds in a build 4 hours newer and one `src/` change removed:**
+
+| printer literal | w736 | w737 |
+|---|---|---|
+| `FATAL-SOFT:` (`imports.cpp:6393`) | 0 | 0 |
+| `Fatal error dispatcher` (`imports.cpp:6334`) | 0 | 0 |
+| `headIs=1` (`ARC-WINDOW`, `gpu_device.cpp:20183-20189`) | 1 | 1 |
+| `dstAfter=61786772` (`BESWAP-RET`, `gpu_device.cpp:26329`) | 1 | 1 |
+
+**THE PLATEAU IS OVER.** 27 prior soaks died at 14.494-16.184 s. w737 ran the full 300 s cap
+(`BOOT_RC=124`, 19:23:31.571 -> 19:28:31.008, 32,509 timestamped rows, 5,393,002 bytes). Per the
+project's own record `TIMEOUT_SURVIVED` is **not** a pass condition - it is 0 across 232 logs and every
+soak dies of a fatal then thrashes to the cap - so survival is reported here only as the absence of the
+old 14 s death, not as success.
+
+---
+
+### F-767 - THE HANDOFF'S WALL MODEL IS WRONG: `ctx.r3` IS READABLE, `ctr` IS ZERO
+
+**Appended 2026-10-06. Supersedes the framing in `docs/HANDOFF_NEXT_AGENT.md`'s 2026-10-06 block,
+which asks "why is `ctx.r3` unreadable at `sub_8218B0C8`?" That question has no answer because it is
+not the question the instrument asks.**
+
+- Task:        session 79. Wave logs `build/w736.log`, `build/w737.log` (7 `C0000005` rows each)
+- Type:        FACT (arithmetic reproduced) + INFERENCE (labelled) for the upstream cause
+- Class:       A (recompiler/codegen) on the symptom; D (kernel/runtime) on the cause
+- Priority:    P0
+- Evidence:    `src/ppc_context.h:122-127` (FORBIDDEN to edit, read only); `F635-CTR-OOR` printer
+               `src/guest_memory.cpp:619`; `build/w736.log` `ctr=00000000` rows; raw words at the three
+               fault sites.
+
+**`ppc_context.h:127` IS NOT A TRANSLATION HELPER.** The handoff says `slot_guest_va=0xFFFFFFFF7E780000`
+becomes host `0x7E780000` "via the same expression `src/ppc_context.h:127` evaluates". Line 127 is
+`#define PPC_CALL_INDIRECT_FUNC(x) (PPC_LOOKUP_FUNC(base, x))(ctx, base)` - the indirect-call dispatch.
+Line 124 is `PPC_LOOKUP_FUNC(x,y) = *(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE +
+(uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2))`.
+
+**THE FAULT IS A WRAP, AND THE ARITHMETIC REPRODUCES EXACTLY.** With `y = 0`:
+`uint32_t(0) - 0x82130000` wraps to `0x7DE30000`; `* 2` = `0xFBC60000`; plus
+`PPC_IMAGE_BASE + PPC_IMAGE_SIZE` = `0x82000000 + 0x9E0000` = `0x829E0000` gives slot offset
+`0xFFFFFFFEFBDA0000`. And `0xFFFFFFFF7E780000 - 0xFFFFFFFEFBDA0000 = 0x829E0000`, i.e. exactly
+`IMAGE_BASE + IMAGE_SIZE`. **So the host read at `0x7E780000` is the function-table slot for a guest
+function pointer of zero.**
+
+**`ctr=00000000` IS PRINTED BY THE INSTRUMENT ITSELF, AND IT SAYS IT IS NOT A REGISTER READ.** The
+`F635-CTR-OOR` row's own note is `CTRFROMFAULTADDR ... unique 32-bit y with PPC_LOOKUP_FUNC(base,y) ==
+Param[1]; NOT a register read`. So the vtable-slot read **succeeded and returned zero**. All three fault
+sites decode to the identical PPC virtual-call idiom `lwz r11,0(r3); lwz r10,N(r11); mtctr r10; bctrl`
+with N = 32 / 28 / 8.
+
+**CONSEQUENCE FOR THE NEXT SESSION.** Do not write a guard on `sub_8218B0C8`. One was written, soaked and
+reverted: it refused every call because the host could not read `ctx.r3` at all (`passthru=0`), took
+`FATAL-SOFT` 0 -> 1 and `DRAW-CP-PIXEL` 2 -> 0. **A guard that removes the crash while destroying the
+boot is a net loss.** The question is upstream: why is the object's vtable slot zero. F-769/F-770 answer
+that.
+
+---
+
+### F-768 - `IsKernelObject` IS TAUTOLOGICAL AND CANNOT BE THE GATE
+
+**Appended 2026-10-06. Recorded because the handoff names it as the thing to "establish", and
+establishing it takes thirty seconds and closes the question.**
+
+- Task:        session 79
+- Type:        FACT
+- Class:       D (kernel/runtime implementation)
+- Priority:    P2
+- Evidence:    `src/kernel/xdm.cpp:32-39`; `src/kernel/memory.cpp:476-481`
+
+**`IsKernelObject(handle)` is exactly `Translate(handle) != nullptr`** (`xdm.cpp:32-39`), and
+**`Translate` returns `m_base + guestAddr` for every `guestAddr < m_size`** with
+`m_size = kSize = 0x100000000` (`memory.cpp:476-481`). The predicate therefore cannot return false for
+any 32-bit handle, and in particular it admits `0xFFFFFFFF7E780000`'s low half. **It is not a gate and
+never was.** Any theory of the wall that depends on `IsKernelObject` rejecting something is dead on
+arrival.
+
+---
+
+### F-769 - FIX, NECESSARY BUT NOT SUFFICIENT: PHYSICAL ALIGNMENT FLOORED TO THE GUEST'S OWN 16 KB SLAB
+
+**Appended 2026-10-06. The fix is landed in the working tree at `src/kernel/heap.cpp:2865`, built
+(`BUILD_RC=0`, exe mtime 14:50 -> 19:23, magic `MZ`) and soaked as `build/w737.log`. It DID what it was
+designed to do and it DID NOT fix the boot. Recorded as a partial fix with its own refutation, per
+rule 13 - a commit-only claim would be UNVERIFIED and this one has been measured.**
+
+- Task:        session 79, wave `build/w737.log` vs baseline `build/w736.log`
+- Type:        FIX (partial) + FACT
+- Class:       C (guest ABI/pointer) and D (kernel/runtime implementation)
+- Priority:    P0
+- Evidence:    raw `0x821C2884 = 54880022` and `0x821C2890 = 911F00F8`; `HEAP76` rows
+               `w736.log` 14:50:17.035 and `w737.log` 19:23:33.303; `F396-ALLOC-EXIT #1` both logs;
+               `src/kernel/heap.cpp:2865`, `src/kernel/o1heap.c:166`,`:312`, `src/kernel/heap.cpp:2413`
+
+**THE GUEST'S SLAB MASK, DECODED FROM RAW BYTES AND CONFIRMED TWICE.** `sub_821C2840` is the guest heap
+init. At `0x821C2884` the raw word is `54880022` = `rlwinm r8,r4,0,0,17`, SH=0 MB=0 ME=17, which masks
+with **`0xFFFFC000` (~0x3FFF, a 16 KB granule)**; at `0x821C2890` the raw word `911F00F8` =
+`stw r8,248(r31)` stores it as the heap's base. Independent confirmations: (i)
+`generated/ppc_xenon/ppc_recomp.15.cpp` emits `ctx.r8.u64 = ... & 0xFFFFC000;` for that word; (ii)
+arithmetic closure against the log - `HEAP76 simple @82830CD8 ... +4=A0400290 +248=A0400000` is satisfied
+by exactly `r4 in [A0400261, A0400280]`, and `A0400280` was the lowest VA `Heap::AllocPhysical` could
+return. The orchestrator's first attempt to re-derive this mask applied the rotate twice and printed
+`0x0003FFFF`; the corrected decode is `0xFFFFC000`. **Fifth instance of the shift-and-mask error class
+this project keeps recording - the generated C++ and the log closure are the tiebreakers, not the
+hand decode.**
+
+**WHY THAT CORRUPTED US.** `o1heapInit` places the instance header at the arena base, spanning
+`[0xA0400000, 0xA0400240)` (`INSTANCE_SIZE_PADDED = 0x240`, `o1heap.c:166`, `static_assert` at `:181`;
+first fragment at `base+0x240`, `o1heap.c:312`; init site `heap.cpp:2413`). `diagnostics.capacity` is at
+**instance+0x208**, inside that range. `0xA0400280 & ~0x3FFF = 0xA0400000`, so the guest's slab base WAS
+our instance header.
+
+**THE FIX AND ITS MEASURED EFFECT.** `heap.cpp:2865` now floors physical alignment to
+`kPhysSlabGranule = 0x4000` instead of 16, making mask-down the identity. Measured, w736 -> w737:
+
+| printer | w736 | w737 |
+|---|---|---|
+| `F396-ALLOC-EXIT #1 ... ret=` | `A04002A0` | `A0404020` |
+| `HEAP76 simple ... +4= / +248=` | `A0400290` / **`A0400000`** | `A0404010` / **`A0404000`** |
+| `PHYS-ACCT big_guest=A0400280` | 2 | **0** |
+| `PHYS-POOL-FULL` / `returned null` (the granule's cost) | 0 / 0 | **0 / 0** |
+
+`A0404020 & ~0x3FFF = A0404000`. **The guest's slab base moved off our instance header exactly as
+intended, and the 16 KB granule costs nothing measurable** - no pool-full, no null return.
+
+**A PRIOR CLAIM IN THIS FILE IS REFUTED.** `heap.cpp` carried the bullet *"Nothing consumes a
+page-aligned physical pointer. `MapVirtual` is pure identity arithmetic on the arena window
+(memory.cpp:300-309), so no host page, no aliasing and no page-table step depends on an individual
+fragment's alignment, and 4 KB bought nothing."* Every host-side half is true and irrelevant: **the
+consumer of a physical pointer's alignment is the guest's own slab arithmetic**, which no host-side
+survey can see. The bullet has been replaced in-tree with the measurement above.
+
+**A 4 KB FLOOR IS NOT A CHEAPER FIX, IT IS A NON-FIX.** The mask is `~0x3FFF`, so on a 4 KB-aligned
+pointer `ptr & ~0x3FFF` is still up to `0x3000` below `ptr` and still lands in the header. In-tree
+precedent for the same mask, measured independently earlier: `src/alloc_census.cpp:346`,
+`slab = elem & ~0x3FFF` = `A0400000` from `elem = A0401020`.
+
+**WHY THE FIX IS KEPT EVEN THOUGH IT DID NOT FIX THE BOOT.** Reverting it puts the guest's slab base back
+*on* the instance header, which is strictly worse. It is necessary, not sufficient: see F-770 for the
+second writer that survives it.
+
+---
+
+### F-770 - THE REAL CORRUPTOR IS A SECOND WRITER: A CONTIGUOUS ZERO SWEEP OF >=796 B AT 0xA0400000 FROM A CALLER-SUPPLIED MEMCPY DESTINATION
+
+**Appended 2026-10-06. This is the live blocker. It is measured, narrow, and its source is UNRESOLVED -
+stated as such rather than guessed at, per rule 14.**
+
+- Task:        session 79, wave `build/w737.log`
+- Type:        FACT (the sweep) + open question (its destination's origin)
+- Class:       C (guest ABI/pointer) / E (filesystem/device)
+- Priority:    P0
+- Evidence:    `HEAPHDR-STORE` rows `w737.log` 19:23:55.679-19:23:55.683; printer
+               `src/gpu_cp.cpp:7434-7458`; raw `0x821BE3B8 = 4821C599`; `src/gpu_device.cpp:25245`
+
+**IN w737 THE SWEEP IS ONE WRITER, ALL ZEROS, CONTIGUOUS, AND STILL ON OUR HEADER.**
+
+| `HEAPHDR-STORE` | w736 | w737 |
+|---|---|---|
+| rows (printer cap = 200) | 200 | 200 |
+| distinct addresses | 183 | **200** |
+| address span | `A0400000..A04004C0` | `A0400000..A040031C` |
+| values equal to `00000000` | 164 | **200** |
+| distinct writer LRs | 10 | **1** (`821BE3BC`, 200/200) |
+| elapsed | 14:50:15.984 -> 14:50:38.847 | 19:23:55.679 -> .683 (**4 ms**) |
+
+200 contiguous stride-4 words = 800 bytes, all zero, in 4 ms, from one site. `A040031C` is the cap's
+truncation point, so the true sweep is **>= 796 bytes and the true row count is in [200, 4999]**
+(`if (hn <= 200 || (hn % 5000) == 0)`).
+
+**THE WRITER IS A MEMCPY AND THE MEMCPY IS INNOCENT.** `lr=821BE3BC` = `sub_821BE250+0x16c`. The call
+site raw word at `0x821BE3B8` is `4821C599` = `bl 0x823DA950`, i.e. memcpy(r3=dst=r29, r4=buf+pos,
+r5=count); per the comment at `src/gpu_device.cpp:25245` this is the stream READ. **The destination
+`0xA0400000` is caller-supplied.** In w736 the same LR produced 137 of 200 rows, so this writer predates
+the alignment floor and is not a consequence of it.
+
+**THE DESTINATION CANNOT HAVE COME FROM OUR ALLOCATOR IN w737.** The lowest VA returned anywhere in
+`w737.log` is `A0404020` (`F396-ALLOC-EXIT #1`), `big_guest=A0400280` is 0 rows, and the guest image
+contains **zero** `lis 0xA040` instructions and **zero** big-endian `0xA0400000` dwords, so the title
+cannot materialize the constant directly. All `0xA0400000` occurrences in `src/` are comments or host
+constants (`heap_arena.h:56`, `boot_host.cpp:496`, `gpu_cp.cpp:526`, `alloc_census.cpp:346`,
+`gpu_device.cpp:9872`, `native_renderer.cpp:195`, `port_kobj.cpp:303`).
+
+**IT IS ALSO NOT PART OF THE HEAP INIT - THE TIMING SEPARATES THEM.** Heap init ~19:23:33.303, sweep
+19:23:55.679: **22.4 s apart.** w736 shows the same separation (init 14:50:15.984, sweep running to
+14:50:38.847). Two mechanisms, two timescales.
+
+**THE DOWNSTREAM CHAIN IS FULLY MEASURED AND UNCHANGED BY THE FIX.**
+`capacity` (instance+0x208) zeroed -> `AllocPhysical: o1heap invariants FAIL #1 size=0x19d align=0x10
+cap=0 peak=0` x4 (`heap.cpp:3006`, early `return nullptr` at `:3031`) -> interleaved 1:1 in the same
+millisecond with `XTL-ALLOC-REFUSED #1 size=413 align=16 -> returned 0` x4 (`imports.cpp:184`) -> the
+guest never tests r3 there -> unconstructed object -> zero vtable slot -> `ctr=00000000` ->
+`PPC_LOOKUP_FUNC` wrap (F-767) -> host `C0000005` at `0x7E780000`, 7 rows.
+Counts identical w736/w737: invariants FAIL 4/4, XTL-ALLOC-REFUSED 4/4, `F635-CTR-OOR` 5/5,
+`C0000005` 7/7.
+
+**OPEN, STATED AS A PREDICTION WITH ITS FALSIFIER.** The leading hypothesis is the F-640 pool-view model
+(`src/boot_host.cpp:180-250`): three views of one pool at `0xA0000000` / `0xC0000000` / `0xE0000000` with
+`F640PoolPhysBase() = 0x400000`, and `0xA0000000 + 0x400000 = 0xA0400000`. **Falsifier:** if the guest
+is never handed `0xA0000000`, or if scanning the image for `lis 0xA000` plus an addend of `0x400000`
+finds nothing on the path to `sub_821BE250`, the hypothesis is dead. **The settling measurement is
+cheap and does not need a guess: log r29 (the memcpy dst) and the caller's r3/r4/r5 at `sub_821BE250`
+entry, and widen the `gpu_cp.cpp:7447` gate beyond `[base, base+0x800)` so a slab base at `A0404000`
+becomes observable** - the gate width is why the mask could not be determined from logs alone and had to
+be decoded from raw bytes.
+
+---
+
+### F-771 - REFUTED: THE "OPCODE-18 LI AT BITS 2..27" FINDING IS INVERTED, AND `AGENTS.md` WAS WRONG IN THE OPPOSITE DIRECTION
+
+**Appended 2026-10-06. The claim was published in `docs/HANDOFF_NEXT_AGENT.md`'s 2026-10-06 block with
+its own warning to verify on a second sample first. It was verified independently from raw bytes and it
+FAILS. `AGENTS.md:86-87` has been corrected in the same session; that bullet was also wrong.**
+
+- Task:        session 79
+- Type:        FACT (refutation)
+- Class:       A (recompiler/codegen) and H (instrumentation/analysis artifact)
+- Priority:    P1
+- Evidence:    `build/cache/mcla_pe.bin` scanned in full by the orchestrator; 13,548 recompiler-resolved
+               `bl` sites across 26 TUs of `generated/ppc_xenon/ppc_recomp.*.cpp`; `tools/ppc_disasm.py`
+               and Capstone 5.0.7 as second and third oracles
+
+**THE CLAIM.** "opcode-18 branches use a 26-bit LI at word bits 2..27, AA at bit 1, LK at bit 0. The
+textbook 32-bit I-form puts 0 of 147,363 opcode-18 words inside the image; this reading puts 144,170
+inside and lands 123,273 on functions that exist in `ppc_func_mapping.cpp`."
+
+**IT IS STRUCTURALLY IMPOSSIBLE, AND THE ORCHESTRATOR REPRODUCED THAT DIRECTLY.** Bits 0..5 of a PowerPC
+word *are* the primary opcode. Scanning all 147,363 opcode-18 words in the image: **bit 0 (MSB) is set in
+0 of them and bit 1 (MSB) is set in 147,363 of 147,363.** Reading "AA at bit 1, LK at bit 0" would make
+every opcode-18 branch absolute and non-linking. The real flags are LK = bit 31 (set in 107,153 words)
+and AA = bit 30 (set in 1,469 - matching `tools/ppc_xrefs.py`'s own docstring figure independently).
+
+**THE NUMBERS ARE REAL AND ATTACHED TO THE WRONG READING.** In-image target counts over all 147,363
+words: **textbook bits 6..29, mask `0x03FFFFFC`, sign-extended x4 = 144,170** (the orchestrator's own
+full-image rescan gives 144,453, the small delta being non-code-range words); **bits 2..27 = 0**
+(reproduced exactly); bits 2..25 = 9,704; bits 6..31 unsigned = 46,456. On known functions: textbook
+123,273, every alternative <= 1,230. **The "discovery" was the correct answer wearing the wrong label** -
+the shift-and-mask class of error this project has now recorded five times.
+
+**THE DECISIVE CONTROL.** 13,548 `bl` sites whose destination the recompiler itself already resolved:
+textbook signed matched **13,548 / 13,548 = 100.00%**; bits 2..27, bits 2..25 and bits 6..31-unsigned
+matched **0** each. Six hand-checked sites, e.g. `0x8218C83C` raw `48031ED5` -> `0x821BE710` (textbook,
+corroborated by `ppc_recomp.9.cpp`) vs `0x84198FF0` (the claim).
+
+**THE CORRECT RULE.** LI = MSB bits 6..29 = `word & 0x03FFFFFC`, sign-extended from 26 bits, already
+x4; AA = bit 30; LK = bit 31; target = `VA + sext(LI)`, or `sext(LI)` when AA=1. Inside the code range
+this resolves **143,827 / 143,827 = 100%**. The 2,910 out-of-image residual lie entirely outside the
+code range and are ASCII/data, not branches (`49440000` = "ID", `4B45524E` = "KERN").
+
+**`AGENTS.md` WAS WRONG TWICE, WHICH IS WHY THIS ENTRY EXISTS.** Its bullet said op18 is "not resolvable
+under either convention - use `bc` (16-bit BD) targets", and that `ppc_disasm.py` "reads it unsigned and
+also lands outside". Both false: op18 IS resolvable, and `ppc_disasm.py` agrees with the signed reading
+at every site tested. Its real, separate defects stand (inverts `mr`, F-112; cannot decode opcode-30
+`rldicl`/`rldicr`). **The `bc`-targets workaround was advice to give up on a solvable problem, and it was
+propagated into briefs that told three agents to stop.**
+
+---
+
+### F-772 - THREE PUBLISHED SOAK NUMBERS ARE WRONG, AND w735 IS A FATAL BUILD
+
+**Appended 2026-10-06, from a printer-literal recount of `build/w733.log`, `w734.log`, `w735.log`,
+`w736.log`. Every count below is a whole-log-line, case-insensitive match against the printer's own
+format string, with the printer located in `src/` first.**
+
+- Task:        session 79
+- Type:        FACT (correction of the record)
+- Class:       H (instrumentation artifact)
+- Priority:    P1
+- Evidence:    printer `file:line` per row below; all four logs confirmed real and non-zero
+               (w733 6,137,547 B 10-05 21:03; w734 5,151,070 B 10-05 22:34; w735 3,776,685 B 10-06 14:49;
+               w736 5,435,702 B 10-06 14:52)
+
+**WRONG 1 - `dstAfter=507B5CED` is 0 in w733, not 1.** The string `507B5CED` occurs **zero** times in
+`w733.log`. It belongs to **`w732.log`**: `src/gpu_device.cpp:26395-26396` records "the two values
+w732.log actually printed: r7=0x507B5CED". w733's own `WINWR-CMP` row reads `r7=0001112a`. The handoff
+table imported a value from the wrong wave.
+
+**WRONG 2 - `DRAW-CP-DRAWN` is 2 in ALL THREE logs; the published "4 (was 2)" is prose pollution.** The
+printer is `src/render_thread.cpp:4369`, capped `dn<=8 || %200` at `:4364`; it printed rows #1 and #2 and
+no #3, so the true total is **exactly 2**. The naive count of 4 includes two `DRAW-CP-PIXEL` rows whose
+*message text* contains the literal "...timestamped after DRAW-CP-DRAWN" (`render_thread.cpp:4444`).
+**This is the exact failure the project's own counting rule warns about.** Nothing moved between w733 and
+w736.
+
+**WRONG 3 - `golden pct=100` is 25 / 25 / 30 for w733 / w734 / w736, not "25 -> 30" for both later
+logs.** Printer `UIXSF-GOLDEN-REVERIFY`, `src/gpu_device.cpp:12894-12899`; caller-gated by
+`MclaUiXsfLateReverify` at `:13203` which fires only at n in [1000,9000] and n%1000==0, so **the count is
+a sampling cadence, not a total**. A naive `pct=100` substring count gives 44 / 60 / 12 / 65 / 65 for
+w733 / w734 / w735 / w736 / w737 because a **second, unrelated printer** emits the token: `PHYS-FREE-SUM`
+at `src/kernel/heap.cpp:3406-3409` prints `honoured_pct={:.4f}` (the literal is at **`:3407`**), capped to
+every 16th free (`kPhysFreeSumEvery = 16u` at `:3316`, gate `(fs % kPhysFreeSumEvery) == 0u` at `:3399`),
+counting `honoured_pct=100` 19 / 35 / 12 / 35 / 35. Those two printers are the ONLY `pct=` literals in
+`src/`; `generated/` has none.
+
+**ALSO WRONG BY OMISSION - w735 IS A FATAL BUILD.** `w735.log` has `Fatal error dispatcher` = 1 and
+`FATAL-SOFT` = 1. It must not be grouped with w734/w736 as a no-fatal wave, and any "the plateau is over"
+claim resting on a w734-w736 range must exclude it.
+
+**WHAT SURVIVES THE RECOUNT.** `FATAL-SOFT` / `Fatal error dispatcher` 1 -> 0, `dstAfter=61786772`
+0 -> 1, `ARC-WINDOW headIs=1` 0 -> 1, and `WINWR-CMP beqTaken` 0 -> 1 all check out. The
+`r7 = r8 = 0x61786772` claim is **measured, not hardcoded**: w734/w736 each carry
+`WINWR-CMP #1 lrIn=8218C840 ... r7=61786772 r8=61786772 r7IsR8=1 slotEqDst=1 dst=8EFFF260 beqTaken=1`,
+where `r7` is read from guest memory (`ReadU32BE(inR1 + kAoCmpSlotOff)`, `gpu_device.cpp:26427-26429`) and
+`r8` is computed `aoR7 | kAoCmpOriImm` (`:26435`). The deleted constant `kAoCmpR8` survives only in the
+comment at `:26061-26064` with no definition in code - the charter check holds.
+
+---
+
+### F-773 - `PHYS-VERDICT-CHANGE` IS BLIND EXACTLY WHEN THE HEAP DIES, AND F-412 DOES NOT EXIST
+
+**Appended 2026-10-06. Two record defects found while instrumenting the F-769/F-770 work; both cause a
+future session to read a healthy signal out of a dead heap.**
+
+- Task:        session 79
+- Type:        FACT
+- Class:       H (instrumentation artifact)
+- Priority:    P1
+- Evidence:    `src/kernel/heap.cpp:3006` (gate), `:3031` (`return nullptr`), `:3128` block with emits at
+               `:3162`/`:3165`, free-path emit `:3516`, `NotePhysAttempt` `:3046`, `NotePhysPoolFull`
+               `:3172`; `build/w736.log:910`; `docs/ROOT_CAUSE_VALIDATION.md:9702`
+
+**THE VERDICT ROW FREEZES AT "HEALTHY".** `Heap::AllocPhysical` checks `o1heapDoInvariantsHold` at
+`:3006` and returns `nullptr` at `:3031` **before** reaching `EmitPhysState` / `NotePhysVerdict` inside
+the `:3128` block. `w736.log:910` is the run's only verdict row (`none -> healthy`, `req_amt=0x0`, a
+free-path call) and 2 m 16 s later `:33535-33546` print four `invariants FAIL ... cap=0 peak=0` with
+**0** `PHYS-STATE`, **0** `returned null` and **0** `PHYS-POOL-FULL` in the entire log. So the pool's own
+status marker says "healthy" for the whole of its death. Same class as the stale PARK-SAMPLE mirror
+(F-627/F-628, `docs/ROOT_CAUSE_VALIDATION.md:13749`). **Do not read `PHYS-VERDICT-CHANGE` as a health
+signal; read `AllocPhysical: o1heap invariants FAIL`, which does print before the early return.** The
+reorder was requested this session and is **not** in the tree.
+
+**`HEAPHDR-STORE` HAS A STRUCTURAL SHADOW.** `RSC-REF-STORE` (`gpu_cp.cpp:7299-7312`) and
+`CDCD-FILL`/`PHYS-OVERRUN` (`:7321-7372`) both `return` **before** `:7446`, so a `0xCDCDCDCD` poison
+store into the heap-header window can never print `HEAPHDR-STORE` (w736: 24 `CDCD-FILL` rows, 0 inside
+the window). A `HEAPHDR-STORE` count is therefore a lower bound on guest stores to that window in two
+ways at once - the 200-row cap and this shadow.
+
+**F-412 DOES NOT EXIST.** `grep -a -n "^### F-412" docs/ROOT_CAUSE_VALIDATION.md` returns nothing.
+`:9702` (inside F-453 section 3) records that the ledger jumps **F-411 -> F-430** and that
+**F-412..F-429 were never allocated**. That entry is the only record of the dangling `F-412` citations in
+`src/gpu_cp.cpp` comments. **Add F-412..F-429 to the same known-hole list as F-056..F-076: a grep that
+finds nothing does NOT prove a citation was fabricated, and those IDs must never be reused.** The
+`w394..w405` / `w406..w420` history those comments describe lives at `src/gpu_cp.cpp:7438-7444` and is a
+comment citation, not a re-measurement - those soak logs no longer exist (`build/` holds `w685`..`w737`).
+
+**THE LEDGER GREPS AS BINARY - AND THIS IS NOT DOCUMENTED WHERE A NEW SESSION WOULD SEE IT.** There is
+exactly one NUL byte, inside a quoted guest string (`...opGamerTask`) at byte ~1,789,044. Plain
+`grep -oE "^### F-[0-9]+"` silently stops at `### F-543` - 74 of 617 headings - and prints
+"Binary file matches". **Always `grep -a`.** An agent this session read F-543 as the ledger top before
+catching it; the true top before this append was `### F-765` with 617 headings.
+
+### F-774 — The A0400000 zero-fill instrument was blind twice over: its `%5000` cap arm is dead code and its 1 MB window is unreachable, so 512 stores is the ARMED CAPACITY, not the sweep length; and `lr=821BE3BC`, while genuine, does not identify the writer.
+
+- Task:        T74 (wave logs `build/w737.log`, `build/w738.log`)
+- Type:        FACT
+- Class:       H
+- Priority:    P0
+- Evidence:    `build/w738.log:35` · `src/boot_host.cpp:3207-3208` · `src/gpu_cp.cpp:7446-7474` · `src/gpu_device.cpp:25447-25478` · `src/guest_memory.cpp:156,167-197,254-271` · raw words `4821C599`@`0x821BE3B8`, `7C9D2378`@`0x821BE264`, `54880022`@`0x821C2884`, `911F00F8`@`0x821C2890` · whole-image scans over `build/cache/mcla_pe.bin` (10,354,688 B)
+
+**1. The first blindness — a cap arm that can never execute.** The `HEAPHDR-STORE` probe
+(`src/gpu_cp.cpp:7462-7474`) gated on `hn <= 200 || (hn % 5000) == 0` over a window of
+`[kPhysArenaBeginVa, kPhysArenaBeginVa + 0x800)`. A 0x800 window holds **512** stride-4
+addresses, so `hn` cannot reach 5000 and the modulo arm is dead code. An agent this session read
+the absence of row `#05000` in `w737.log` as "the fill ends below ~A0404E00" and proposed a 32 KB
+arena offset on that strength. **That inference is unsound and is withdrawn**: the missing row is a
+property of the cap, not of the guest.
+
+**2. The second blindness — widening the window did not help, and `w738` proves it.** The window was
+widened to 1 MB and the modulo dropped to 256. It remained blind, because this branch only runs from
+`PageWatchOnWrite`, which only runs for addresses inside a range armed by
+`RegisterGuestWatchRange` — and `src/boot_host.cpp:3207-3208` arms
+`[kPhysArenaBeginVa, kPhysArenaBeginVa + 0x800)`, i.e. 2 KB. `guestAddr` can therefore never reach
+`base + 0x800` in this branch and the 1 MB bound is unreachable. Measured in `w738.log`: **202**
+rows — `#1..#200` then `#256` then `#512` — the last being `#000512 @ A04007FC`, the final dword of
+the *armed* range. The log carries its own positive control at `w738.log:35`:
+`WATCH: range armed [A0400000,A0400800)`. **What is actually established:** the fill is contiguous
+stride-4 and covers at least the whole armed 2 KB. Above `A0400800` this branch is blind by
+construction and no row count from it can bound anything. This is `LONG_TODO_MASTER` §1 rule 19
+twice in one probe: a zero (or a ceiling) from an instrument is not a result until the instrument is
+shown able to fire there.
+
+**3. `lr=821BE3BC` is GENUINE — but it names the read primitive, not the writer.** Raw word at
+`0x821BE3B8` is `4821C599`; decoding under the corrected op-18 rule (LI = `word & 0x03FFFFFC`,
+sign-extended, ×1 added to the PC; see F-771, which refutes the "bits 2..27" gloss) gives target
+**`0x823DA950`** with LK=1, AA=0 — i.e. `bl 0x823DA950`, the guest memcpy. So `0x821BE3BC` is a real
+return address, not a sticky `GetPPCContext()` read as an earlier draft of this session's code
+comment claimed. Its enclosing function is `sub_821BE250` (body at
+`generated/ppc_xenon/ppc_recomp.14.cpp:24080`), a **stream/ring-buffer read primitive**:
+`obj=r3, dst=r4, count=r5`; `obj+8` = data buffer, `obj+0x18` = read pos, `obj+0x1C` = write pos;
+count is clamped to `writepos - readpos` before the memcpy. Raw word `0x821BE264` = `7C9D2378` =
+`mr r29,r4`, so **dst is caller-supplied `r4` verbatim**. **But the lr does not attribute the
+caller:** a raw whole-image op-18 scan finds **80** direct `bl` sites to `sub_821BE250` and 0 tail
+calls, and `lr=821BE3BC` appears on **1115** `w737` rows spanning three unrelated destinations
+(`HEAPHDR-STORE @A0400xxx`, `PARAM-STORE @A0106xxx`, `RSC-REF-STORE @8F0ED354`). One shared read
+primitive serving many callers. Naming "the writer" from that lr alone is unattributed.
+
+**4. F-640's constant-materialisation hypothesis is REFUTED on the guest side.** F-770 left open
+whether the host materialises `0xA0400000` as `0xA0000000 + 0x400000` and the guest merely echoes
+it. Three independent measurements close it. (a) **0** dwords in the whole 10,354,688-byte image
+equal `0xA0400000`, big-endian *or* little-endian. (b) `lis rT,0xA000` = **0** sites,
+`lis rT,0xA040` = **0** sites, `addis rD,rA,0x40` = **1** site (`0x82990524`, off-path) — against a
+live control of **236** sites for `lis rT,0x8213`, so the scanner is proven able to fire (rule 19).
+(c) The five `pa | 0xC0000000` sites (`src/boot_host.cpp:148-154`, `src/native_renderer.cpp:246`)
+force bits 31:30 = `0b11` → `0xC0xxxxxx`; `0xA0400000` has bits 31:30 = `0b10`, so it is
+arithmetically impossible for them to produce it. **The host-side arithmetic is not excluded by (a)
+or (b)**, only by (c) for those five sites.
+
+**5. Best-supported model — INFERENCE, labelled, with its falsifier.** The guest derives
+`0xA0400000` itself by masking a physical pointer down to a 16 KB granule. Exactly **5** sites in
+the image encode `rlwinm rT,rS,0,0,17` (mask `0xFFFFC000` = `~0x3FFF`): `0x821C2884`, `0x821C2B2C`,
+`0x821C2BE0`, `0x821C2CC0`, `0x82418CF4` — an exhaustive whole-image field scan, not a grep. Raw
+words verified at the first: `0x821C2884` = `54880022`, followed by `0x821C2890` = `911F00F8` =
+`stw r8,0xF8(r31)`. The companion sweep's target `A0106000` is already ledgered as a guest XTL
+slab-bank free-list base (`docs/ROOT_CAUSE_VALIDATION.md:8796`, `:8814-8815`), 16 KB-aligned and
+outside our pool — so the shape is "one writer zeroes two slab-bank bases, and the one at
+`0xA0400000` happens to hit our o1heap instance header". **Counter-evidence, stated plainly:** that
+mask path yields `A0404000` in `w737` (`PHYS-ACCT #2 … big_guest=A0404000`,
+`HEAP76 simple +4=A0404010 +248=A0404000`), not `A0400000`, so **the specific caller is
+UNRESOLVED** and this model is not yet load-bearing. **Falsifier:** if the entry `r4` is not
+16 KB-aligned, or does not trace to one of the 5 `rlwinm` sites, the slab-base model dies.
+
+**6. FIX — the instrument moved to where it can answer.** `src/gpu_device.cpp:25447-25478` adds
+`F774-PHYS-MEMCPY` inside `PPC_FUNC(sub_823DA950)`, reusing the F-382 span test
+(`dst < hi && dst + len >= lo`, in `uint64_t` so a wrap cannot fake a hit) against
+`[kPhysArenaBeginVa, kPhysArenaBeginVa + 0x100000)`. It reports `dst`/`src`/`len`/`end`/`lr`/`sp`/
+`tid`, is gated by no armed range, and reads the real `PPCContext` rather than `GetPPCContext()`.
+`len` is the measurement that decides between offsetting the arena and moving it out of
+guest-addressable memory entirely; `sp` discriminates among the 80 callers where `lr` cannot.
+Log-only — no guest-visible behaviour changes. Build verified real, not merely rc-0: `BUILD_RC=0`,
+`build/mcla.exe` mtime 19:57:30 → 20:14:08, size 62,536,704 → 62,539,264 (+2,560), and the literal
+`F774-PHYS-MEMCPY` occurs **1×** in the linked binary with `HEAPHDR-STORE #{:05}` now **0×**.
+Result pending as the `w739` soak; **UNVERIFIED until that log is censused** (rule 13).
+
+**7. Also corrected in-tree, because a refuted claim must not survive in a comment.** The draft
+comment at `src/gpu_device.cpp:25452-25461` asserted `lr=821BE3BC` was "the signature of a sticky
+`GetPPCContext()` read" and that an agent had "built a whole attribution on it". §3 above refutes
+the first half. The comment at `src/gpu_cp.cpp:7446-7461` asserted the widening made the row count
+"itself the measurement"; §2 above refutes that. Both were rewritten in the same edit that added the
+probe, so neither refuted claim ships.
+
+### F-775 — `tools/ppc_xrefs.py calls` reported its own listing cap as the total, understating call-site counts by up to 10×; fixed, with a positive control.
+
+- Task:        T74 (no soak required — static tool)
+- Type:        FIX
+- Class:       H
+- Priority:    P2
+- Evidence:    `tools/ppc_xrefs.py:286-311` · `build/xr_821BE250.txt` · independent whole-image op-18 scan of `build/cache/mcla_pe.bin`
+
+**1. The defect.** The `calls` subcommand scanned every word for an op-16/op-18 branch resolving to
+the target, and on each hit did `n += 1; print(...); if n > 60: break`. The `break` left the loop
+before the summary line, which then printed `{n} call site(s)` — so the tool reported **the number
+of rows it had printed**, not the number of call sites that exist. Any function with more than 60
+callers was silently truncated to 61, and the truncation was invisible because the output looked
+like a complete enumeration ending in a total.
+
+**2. Why it mattered here.** `sub_823DA950` (the guest memcpy) has **597** direct call sites; the
+tool reported **61**. An agent sizing the blast radius of a memcpy hook from that number would have
+understated it by ~10×. This is the same defect class as F-774's dead cap arm and
+`LONG_TODO_MASTER` §1 rule 19: an instrument whose ceiling looks like a measurement.
+
+**3. The fix.** `n += 1` now happens first, printing is gated on `n <= 60`, and the scan continues to
+the end of the image. The summary line reports the true total and, when truncated, appends
+`-- only the first 60 listed above; {n - 60} more exist`. The listing stays bounded (no 597-row
+dump) while the count becomes honest.
+
+**4. Positive control, passed.** `calls 0x821BE250` now reports **80**, matching an independent
+whole-image op-18 scan of `build/cache/mcla_pe.bin` exactly (`build/xr_821BE250.txt`, 62 lines).
+Second control: `0x823DA950` = **597** against the old cap's **61**.
+
+**5. AGENTS.md corrected, because its field note was false on both of its numbers.** The note read
+"reported 20 'callers' of `0x821BE250` where a raw scan finds **0** direct call sites (vtable
+dispatch)". Re-measured: the raw scan finds **80** direct call sites, not 0, and the tool's defect
+was under-reporting, not inventing callers. The vtable-dispatch explanation was a story fitted to a
+wrong number. There are **0** false positives and **19** dropped sites (the highest addresses, i.e.
+exactly the tail the `break` cut). The note is rewritten to say so. **The surviving warning is still
+true and is kept:** the `->` column names the *enclosing* function of the call site, not the
+caller's caller, so it must not be read as a call chain.
+
+### F-776 — `tools/ppc_disasm.py` printed a bare family name for every opcode it could not decode, so "undecodable" was indistinguishable from "decoded"; marked `NOT-DECODED`. Three load-bearing claims in `AGENTS.md` were also wrong and are corrected here.
+
+- Task:        T-meta (no wave log; measurements are from `build/cache/mcla_pe.bin` and `build/mcla.map` of the 2026-10-06 20:28:33 build)
+- Type:        FIX + FACT
+- Class:       H
+- Priority:    P2
+- Evidence:    `tools/ppc_disasm.py:102` (`NOT_DECODED`), `:200`, `:301`, `:316`, `:368`, `:370` · `python tools/ppc_disasm.py --selftest` = **25/25 PASS** · `python tools/ppc_disasm.py 821BE390 14` · opcode census over all 2,588,672 words of `build/cache/mcla_pe.bin` · `build/mcla.map` publics rows for `__imp__sub_823DA950`
+
+**1. THE DEFECT.** Seven generic fallbacks in `decode()` returned a family name with no indication that
+the operands were not interpreted: `op19:{xo9}`, `op31:986`, `op31:{xo} d= a= b=`, `rldic-family`,
+`float/ps`, `op58sub`, `op62sub`. A reader who did not already know the gap saw `rldic-family 78A30004`
+and could reasonably treat it as a decode. Every one now appends the module constant
+`NOT_DECODED = "NOT-DECODED(use generated/ppc_xenon/*.cpp)"` (`:102`), which both says the answer is
+absent and names the tiebreaker the project already prescribes. Control: `decode(0x78A30004)` now prints
+`rldic-family 78A30004 NOT-DECODED(...)`, and `--selftest` is still **25/25 PASS** — the change touched
+only fallbacks, never a decoded path.
+
+**2. THE GAP IS OPCODE 30, AND IT IS SMALL.** Census over the whole identity-mapped image
+(10,354,688 B / 2,588,672 words): **op-30 = 5,884 words (0.23%)**. For scale, the top opcodes are
+op-0 = 441,377, op-32 = 291,012, op-14 = 278,286, op-31 = 271,675, op-18 = 147,363. So the fallback is
+not a large blind spot; it is a *silent* one, which is the part that mattered.
+
+**3. `AGENTS.md`'S LIVE "F-112: `mr` IS PRINTED WITH RA/RT INVERTED" CLAIM IS FALSE — RE-MEASURED.**
+This is the second wrong rule put into that file in one night (after F-771's opcode-18 LI inversion),
+and it is more dangerous than the first because acting on it would have *broken a correct decoder*.
+Decodes from the tool itself, cross-checked against independently extracted fields:
+
+| word | tool prints | correct reading |
+|---|---|---|
+| `7C9D2378` | `mr r29,r4` | XO 444 = `or`, rS=b6:10=4, rA=b11:15=29, rB=b16:20=4 → `or r29,r4,r4` = `mr r29,r4` ✓ |
+| `7FC8F378` | `mr r8,r30` | rS=30, rA=8, rB=30 → `or r8,r30,r30` = `mr r8,r30` ✓ |
+| `7C8B5214` | `add r4,r11,r10` | XO 266 = `add`, rD=b6:10=4, rA=b11:15=11, rB=b16:20=10 → `add r4,r11,r10` ✓ |
+
+Note that `AGENTS.md`'s own cited control, `0x7FC8F378 = or r8,r30,r30`, **is the same instruction as
+its `mr r8,r30` claim in long form** — the entry contradicted itself on one word. The real explanation
+for how the false claim arose is the field-role asymmetry, and it is now recorded correctly: **b11:15 is
+the destination for the logical family (`or`/`and`/`xor`, hence `mr`) and b6:10 is the destination for
+the arithmetic family (`add`/`subf`).** Both conventions are right for their own family; neither
+generalises. Do not "fix" either arm.
+
+**4. THE MAP'S THIRD COLUMN IS `Rva+Base`, AND A HAND SUBTRACTION LANDED ME IN THE WRONG SYMBOL.**
+`build/mcla.map` publics rows are `Address(section:offset) | Publics by Value | Rva+Base | Lib:Object`.
+Column 1 (`0001:016ff230`) and column 3 (`0x141700230`) differ by exactly `0x1000`, the section base.
+I resolved `caller_rva=0x170050f` to `__imp__sub_823DA950 +0x2df` and then computed the symbol's base
+by hand as `0x1700170`; the true base is `0x170050f − 0x2df = **0x1700230**`. `0x1700170` is not
+`__imp__sub_823DA950` at all — the map has **no symbol at sec:off `0001:016ff170`**, and RVA `0x1700170`
+falls inside `__imp__sub_823DA748` (base RVA `0x16ffbc0`) at `+0x5b0`. The wrong number was written into
+`AGENTS.md` as a worked example before being caught. **Correct values: `__imp__sub_823DA950` = sec:off
+`0001:016ff230` = `Rva+Base 0x141700230` ⇒ RVA `0x1700230`, next symbol at `0x1701160`, extent `0xF30`.**
+Two rules follow, both now in `AGENTS.md`: read column 3, never column 1; and after resolving an offset,
+**check it lands inside the symbol's extent** — `+0x2df`, `+0x324`, `+0x663`, `+0x67e`, `+0x699` are all
+`< 0xF30`, which is what makes the attribution in F-778 usable rather than merely plausible.
+
+**5. A SMALL TOOL DEFECT FOUND WHILE MEASURING THIS.** `ppc_disasm.py` takes `<va> <count>` positionally
+(`:502-503`) and, given `--help` or one argument, dies with a raw `IndexError`/`ValueError` traceback
+instead of a usage line. That cost two failed invocations here and will cost them again; it is a
+candidate for the "no harness/tool may fail without naming its contract" admission rule.
+
+### F-777 — The heap-instance instrument family watched only ONE of the two o1heap instances, so the physical instance had no extent attribution at all; extended to both with per-window counters and an `inst=` field. Two prefix/cap traps in the census are recorded with it.
+
+- Task:        T-meta + task #4 (wave logs `build/w739.log`, `build/w740.log`, 300 s each, both `TIMEOUT 300s` = process survived)
+- Type:        FIX
+- Class:       H
+- Priority:    P1
+- Evidence:    `src/guest_memory.cpp:63-118` (windows, index-returning predicates, per-window counters), `:120-160` (`ReportHeapInstanceStore`), `:162-179` (`ReportHeapWindowExtent`), `:848-849` / `:866-867` / `:904-905` (the three checked writers) · `src/gpu_device.cpp:25467-25478` (`F774-PHYS-MEMCPY`) · `src/gpu_cp.cpp:7446-7474` (`HEAPHDR-STORE` widening + correction) · label-anchored census of `w740.log` vs `w739.log`
+
+**1. THE DEFECT.** `F374-HEAPSTORE` / `F631-HEAPWIN` / `F631-HEAPEXT` sit in the three checked writers
+`WriteU32BE`, `WriteU64BE` and `WriteBytes` — the chokepoints *every* guest store must cross, which is
+why this family and not a `PPC_FUNC` hook. But their window constants were
+`kHeapInstanceLo/Hi = kUserHeapArenaVa .. +0x240` only. Both o1heap instances are destroyed in every
+soak (`o1heap invariants FAIL` ×4, `XTL-ALLOC-REFUSED` ×4, `F370-HEAP-HDR` reading `cap=0x0` against
+`want_cap=0x7fe7fdc0`), yet the physical instance at `kPhysArenaBeginVa` had **no extent instrument** —
+only the 2 KiB armed watch range, whose attribution is a *sticky* guest `lr` (do-not #14) and whose 512
+rows are the armed capacity, not the sweep length (F-774).
+
+**2. THE FIX.** `kHeapWindows[] = {{kUserHeapArenaVa, +0x240, "user"}, {kPhysArenaBeginVa, +0x240,
+"phys"}}` (`:81-85`). `HeapInstanceStoreHit` / `HeapWindowOverlaps` return a **window index or −1**
+(`:87-101`) — deliberately not a bool, because −1 is truthy and every call site must compare `>= 0`.
+The counters `s_storeN` / `s_extN` / `g_winStores` / `g_winLo` / `g_winHi` are **per window** (`:107-118`),
+so a chatty user heap cannot spend the physical window's print budget and leave it with zero rows —
+that starvation is exactly how F-774's instrument went blind. Every row gained `inst=user|phys`.
+
+**3. IT WORKS, AND THE DELTA IS EXACTLY THE HEAD CAP.** Label-anchored, `w740` vs `w739`:
+`F374-HEAPSTORE` **16 → 32**, `F631-HEAPWIN` **16 → 32**, split **16 `inst=phys` + 16 `inst=user`** in
+`w740` against 16 `inst=user` alone in `w739`. +16/+16 is precisely one head cap for the new window,
+which is the expected signature of adding a window and nothing else. Both printers cap at
+`n <= 16 || (n % 4096) == 0` (`:134`); no `%4096` row appeared, so the cap-agnostic bound is
+**[16, 4095]** — **16 is a cadence, not a total**, and this is the F-774 defect class one level up.
+**Tightened (2026-10-06 21:0x) from the two windows that actually bind.** `HeapInstanceStoreHit`
+(`:87-91`) gates the printer on the **0x240 instance window**, *not* on the armed guard range, so `n`
+cannot exceed `0x240 / 8 = 72` at the observed stride; and for the user instance the armed range is the
+smaller of the two — `[0x00020000, 0x00020100)` (`src/boot_host.cpp:3216-3217`) versus the printer's
+`window=[00020000,00020240)` — so a store above `0x00020100` is in-window yet never reaches the probe.
+Therefore **phys ∈ [16, 72]** (the printer window binds; `:3207-3208` arms 0x800, which contains 0x240)
+and **user ∈ [16, 32]** (the armed range binds). Both bounds are conditional on every in-window store
+being 8 bytes: all 32 rows print `op=U64` at stride 8, but no counter proves nothing else wrote there.
+Recorded rather than glossed.
+
+**4. TWO CENSUS TRAPS, BOTH OF WHICH PRODUCED A WRONG NUMBER BEFORE BEING CAUGHT.**
+(a) **Substring collision.** Every `F374-HEAPSTORE` row *ends with the literal text* "the whole event is
+`F631-HEAPEXT` or `F631-HEAPWIN`", so `grep -c F631-HEAPEXT` returns **32** in `w740` while the
+label-anchored count is **0**. `F631-HEAPEXT` genuinely never fired — the bulk writer `WriteBytes` never
+saw a range overlapping either window, because the copies arrive as individual 8-byte `WriteU64BE`
+stores. (b) **Prefix collision.** `F382-MEMCPY` is a prefix of `F382-MEMCPY-LIVE`, so a
+first-match-wins loop scored `F382-MEMCPY = 1`. Exact-token matching (marker followed by `' '` or `'#'`)
+gives **`F382-MEMCPY` = 0** and **`F382-MEMCPY-LIVE` = 1** in both `w739` and `w740`. The `-LIVE` row is
+the positive control (`ka == 1 || ka % 200000 == 0`), so **the guest-memcpy hook is live** and its user-
+arena span test has matched **zero** times — see F-778 §4 for why that is an open contradiction and not a
+clean negative. **Rule: anchor on `] [level] ` and match the token exactly; never `grep -c` a marker that
+is another marker's prefix or that appears in its own family's message text.**
+
+**5. THE `gpu_cp.cpp` WIDENING IS INERT AND IS KEPT ONLY WITH ITS CORRECTION ATTACHED.** The
+`HEAPHDR-STORE` window was widened `0x800 → 0x100000` and its cap `%5000 → %256`, format `{:05} →
+{:06}`. It cannot bound the sweep: `PageWatchOnWrite` runs only inside an *armed* range and
+`src/boot_host.cpp:3207-3208` arms `[0xA0400000, 0xA0400800)`. Measured `w738`: 202 rows, last
+`#000512 @ A04007FC` = the final dword of the armed range, with the log's own control
+`WATCH: range armed [A0400000,A0400800)`. **512 is the armed capacity.** `w740` reproduces
+`HEAPHDR-STORE` = **202** and `PARAM-STORE` = **400** unchanged from `w738`/`w739`, and
+`WATCH:` = 44, `watch: range armed` = 32 — the widening moved nothing, as predicted.
+
+### F-778 — ANSWERED (F-770): the physical o1heap instance at 0xA0400000 is zeroed by the guest's own memcpy, called from `sub_8218B0C8` — and 0xA0400000 is the FIRST BYTE of the guest's usable physical pool, so `heap_arena.h`'s "the instance here is still safe" is REFUTED. The same 16 store sites zero the user instance 48 s later.
+
+- Task:        task #4 (wave log `build/w740.log`, 300 s, `TIMEOUT 300s`, 5,170,727 B, 20:29:30→20:34:47; exe+map both 2026-10-06 **20:28:33**)
+- Type:        FACT
+- Class:       D
+- Priority:    P0
+- Evidence:    the one 20-frame `F379-HEAPSTORE-BT` at `w740.log` 20:30:11.380, every frame `inmod=1`, all 20 resolved with `tools/host_rva_resolve.py build/mcla.map` · 32 `F374-HEAPSTORE` + 32 `F631-HEAPWIN` rows · `F375-HEAPSTORE #1` · raw words at `0x821BE390..0x821BE3C4` and `0x823DA950..0x823DA99C` from `build/cache/mcla_pe.bin` · `src/boot_host.h:168-201`, `src/boot_host.cpp:181-196`, `:226`, `:495-509` · `src/kernel/heap_arena.h:39-56`, `:120-137`
+
+**1. THE WRITER, NAMED BY AN INDEPENDENT HOST BACKTRACE — NOT BY A GUEST `lr`.** All 20 frames,
+outermost last, resolved against the map from the same build:
+
+```
+19  sub_82131508 +0x1b8            9  __imp__sub_8218C760 +0x3f3
+18  __imp__sub_82131508 +0x115     8  __imp__sub_8218C1C0 +0x505
+17  sub_822C2EA8 +0x127         >> 7  __imp__sub_8218B0C8 +0x832   <-- THE OPEN WALL
+16  __imp__sub_822C2EA8 +0x373     6  sub_821BE250 +0xca5
+15  __imp__sub_823047D8 +0x270     5  __imp__sub_821BE250 +0x4c1
+14  sub_82187820 +0x267            4  sub_823DA950 +0x337          <-- guest memcpy (PPC_FUNC override)
+13  __imp__sub_82187820 +0x21a     3  __imp__sub_823DA950 +0x2df   <-- its GENERATED body
+12  sub_82188E50 +0x2b0            2  WriteU64BE(GuestMemoryView) +0x7e
+11  __imp__sub_82188E50 +0x74b     1  ReportHeapInstanceStore +0x18f
+10  sub_8218C760 +0x1ed            0  HeapInstanceStoreReport +0x628
+```
+
+**This is the first host-side sighting of `sub_8218B0C8`** — the function the previous handoff named as
+the remaining wall ("why is `ctx.r3` unreadable at `sub_8218B0C8`?"). It is not a dead end reached from
+nowhere: it is a link in the chain that destroys the physical allocator. Frames 5/6 (`sub_821BE250`)
+also **independently corroborate** `F375`'s `lr=821BE3BC`, so that particular `GetPPCContext()` read was
+live and not the sticky artifact do-not #14 warns about.
+
+**2. WHAT IT WRITES.** 16 `F374-HEAPSTORE inst=phys` rows, `op=U64`, `val=0x0`, guest addresses
+**`A0400000, A0400008, … A0400078`** — stride 8, contiguous from the instance's first byte — all inside
+one 1 ms burst at **20:30:11.380/.381**, `tid=21780`. 16 distinct `caller_rva` values,
+`0x170050f, 0x1700554, 0x1700599, 0x17005de, 0x1700623, 0x1700668, 0x17006ad, 0x17006f2, 0x1700737,
+0x170077c, 0x17007c1, 0x1700806, 0x170084b, 0x1700893, 0x17008ae, 0x17008c9` — all inside
+`__imp__sub_823DA950` (RVA `0x1700230`, extent `0xF30` ⇒ `[0x1700230, 0x1701160)`), at `+0x2df … +0x699`,
+i.e. an unrolled run of 16 doubleword store sites. Stride between sites is `0x45` for the first 13, then
+`0x48`, then `0x1b`, `0x1b` — a real change of path inside the body, recorded not interpreted.
+`F631-HEAPWIN` tracks it exactly: `win_stores` 0→15, `lo=A0400000` constant, `hi` walking
+`A0400000 → A0400070`, **`saturated=0`** throughout (the sweep had not reached the window's last byte
+when the head cap stopped printing).
+
+**3. THE SAME 16 SITES ZERO THE USER INSTANCE, 48 s LATER.** 16 `F374-HEAPSTORE inst=user` rows at
+**20:30:59.126/.127**, guest addresses `00020000 … 00020078`, and the `caller_rva` set is
+**byte-for-byte identical** to the phys set — all 16 values, same order. So one code path in the
+generated memcpy body destroys *both* allocator instances; this is not two coincidental corruptions.
+**Gap, stated plainly:** `F379-HEAPSTORE-BT` totals exactly 20 rows = **one** backtrace, and it is the
+phys one. The user event has no backtrace, so its entry path is *inferred* from the identical store
+sites, not proven. And `F375-HEAPSTORE` capped at 8 rows, all phys — the user event has no register
+dump either.
+
+**4. THE `dst` ARGUMENT IS EXACTLY `0xA0400000` — NOT 8 BYTES BELOW IT. (This section was written
+wrong twice — once on the argument, once on the instruction path — and corrected in place both times;
+the two wrong readings are quoted in §4b and §4c so nobody re-derives them.)**
+`F375-HEAPSTORE #1 guest=A0400000 val=00000000 lr=821BE3BC sp=8EFFECD0 r3=A03FFFF8 r4=93C63E40
+r5=FFFFFFAF r6=0 r7=0 r13=8F200000`. The call site decodes from raw bytes (`tools/ppc_disasm.py
+821BE390 14`) as an unambiguous `memcpy(dst=r3, src=r4, len=r5)`:
+`mr r5,r30` (len, clamped by `cmpw cr6,r30,r11` / `ble` / `mr r30,r11`), `mr r3,r29` (dst),
+`add r4,r11,r10` (src), `bl 823DA950` (`0x4821C599`, LI = `0x21C598`, `0x821BE3B8 + 0x21C598 =
+0x823DA950`, LK=1 so it is a `bl` and `0x821BE3BC` is the true return address).
+The body's first act is `rlwinm r6,r3,sh=0,mb=29,me=31,mask=0x7` = `dst & 7` (`823DA954`) with
+`beq -> 823DA9B4` (`823DA964`); `0xA0400000 & 7 == 0`, so the byte-alignment head is skipped. At
+`823DA9B4` the same test runs on the SOURCE (`rlwinm r6,r4,…,mask=0x7`) and `0x93C63E40 & 7 == 0`, so
+`bne cr1 -> 823DACC8` (`823DA9C8`) is not taken and control reaches `cmpli cr7,r5,0080` (`823DA9C0`) /
+`bge cr7 -> 823DAA6C` (`823DA9CC`). **`r5 = 0xFFFFFFAF >= 0x80`, so that branch IS taken, and the
+`ldu`/`stdu` doubleword loop at `823DA9F4..823DA9FC` is NOT the path executed.** The path actually
+taken, decoded from raw bytes with `tools/ppc_disasm.py 823DAA6C 44`:
+
+```
+823DAA6C  rlwinm r6,r3,sh=0,mb=25,me=31,mask=0x0000007F   ; r6 = dst & 0x7F = 0
+823DAA70  addi r3,r3,-8                                   ; dst -= 8   (ONCE, pre-loop)
+823DAA74  addi r4,r4,-8                                   ; src -= 8   (ONCE, pre-loop)
+823DAA78  cmpli cr0,r6,0000
+823DAA80  beq -> 823DAA9C                                 ; TAKEN (0xA0400000 & 0x7F == 0), so the
+                                                          ; ldu/stdu align loop at 823DAA90 is skipped
+823DAA9C  rlwinm r6,r5,sh=25,mb=7,me=31,mask=0x01FFFFFF   ; ctr = len >> 7 = 0x1FFFFFF
+823DAAA4  beq -> 823DA9DC                                 ; not taken (0x1FFFFFF != 0)
+823DAAE8  mtctr r6
+823DAAEC  ld  r6,8(r4)      823DAAF8  std r6,8(r3)        ; NON-updating stores: r3 is a FIXED base
+823DAAF0  ld  r7,16(r4)     823DAB00  std r7,16(r3)
+823DAAF4  ld  r8,24(r4)     823DAB08  std r8,24(r3)
+   ... twelve more interleaved ld rN,32..120(r4) / std rN,32..120(r3), cycling r6,r7,r8 ...
+823DAB5C  ldu r6,128(r4)    823DAB68  stdu r6,128(r3)     ; the ONLY updating store: r3 += 128
+823DAB78  bdnz -> 823DAAEC
+```
+
+The first store of the first iteration is `std r6,8(r3)` at `823DAAF8`, and it lands on **`r3 + 8` =
+`dst_arg`**. **`r3 = 0xA03FFFF8` with `guest = 0xA0400000` is that pre-decremented base register, so
+`dst_arg = r3 + 8 = 0xA0400000` exactly — the guest was handed our o1heap instance's first byte as a
+copy destination.**
+
+**The log proves the addressing mode, not merely the arithmetic.** All 8 printed `F375-HEAPSTORE` rows
+(`w740.log`, 20:30:11.380 to .381) carry `r3=A03FFFF8` **unchanged** while `guest` advances by 8 --
+`A0400000, A0400008, A0400010, A0400018, A0400020, A0400028, A0400030, A0400038` -- so `guest - r3` =
+`0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40`, which are precisely the displacement fields of
+`std r6,8(r3)`, `std r7,16(r3)`, `std r8,24(r3)`, `std r6,32(r3)`, `std r7,40(r3)`, `std r8,48(r3)`,
+`std r6,56(r3)`, `std r7,64(r3)` in that unrolled block. An updating `stdu` loop would have advanced
+`r3` alongside `guest` and the column would not be constant; the agreement is therefore **structural**
+(a fixed base plus a rising displacement), not a one-off numeric coincidence. Corroborating detail: the
+same rows print `r6=00000000 r7=00000000`, i.e. the loop's own load registers holding the source data,
+which is zero -- and host code inside `WriteU64BE` does not write the guest context, so those are live
+loop values rather than residue.
+
+**The 16 printed addresses are one complete loop iteration, not an arbitrary truncation.** Both
+instances' rows run `inst_off = 0x0 .. 0x78` at stride 8 -- 16 stores covering exactly `0x80` bytes,
+which is the unrolled block's own width (fifteen `std` at displacements 8..120 plus the closing
+`stdu r6,128(r3)`); row #16 is `guest=A0400078` / `caller_rva=0x17008c9` = `+0x699`, the `stdu`. Rows
+#15 and #16 carry the **same two `caller_rva` values in both instances** (`0x17008ae`, `0x17008c9`),
+which is the per-row form of §3's identical-16-sites result. The head cap of 16 and the block width of
+16 stores coincide, so the count alone cannot distinguish "one iteration then the copy stopped" from
+"the cap truncated a longer sweep" -- the bound in F-777 §3 is what limits it, and §4's own
+`ctr = len >> 7 = 0x1FFFFFF` is what makes a much longer sweep the likelier reading. Stated as
+a prediction, not a measurement: a copy that ran to completion would produce 72 in-window phys stores
+and 32 in-window user stores, and neither number is observable under the current cap.
+
+**4d. THE PROOF IS RE-BASED ON HOST-SIDE EVIDENCE, AND `ctx.r5 = 0xFFFFFFAF` IS *NOT* THE LENGTH —
+IT IS A STALE TRANSLATOR-LOCAL WRITEBACK (F-056 class).** Everything above this line that rests on a
+`ctx.rN` read is now provisional; the addressing conclusion is not, because it has an independent host-
+side proof. Three results, measured from `w740.log` and the raw image.
+
+**(i) `caller_rva` distinctness identifies the executed loop without trusting any guest register.**
+`phys: rows=16 distinct_rva=16 first=0x170050f last=0x17008c9`, `user: rows=16 distinct_rva=16
+first=0x170050f last=0x17008c9`, and the two ordered rva lists are **identical** (`True`). Offsets from
+the generated body's base `0x1700230`: `0x2df, 0x324, 0x369, 0x3ae, 0x3f3, 0x438, 0x47d, 0x4c2, 0x507,
+0x54c, 0x591, 0x5d6, 0x61b, 0x663, 0x67e, 0x699`. A `ldu`/`stdu` loop contains **one** store
+instruction and therefore yields **one** host return address for every row; 16 distinct return addresses
+can only come from the unrolled block at `823DAAEC..823DAB68`, whose fifteen non-updating `std rN,8..120(r3)`
+are fifteen separate host store sites closed by the sixteenth (`stdu`, `+0x699`). **The `r3` column in
+§4 is corroborative, not load-bearing**: `dst_arg = 0xA0400000` follows from the rva census alone. And
+because that block is reached only past the `len >= 0x80` dispatch, **live `r5 >= 0x80` is deduced from
+the path taken, not read from `ctx.r5`.**
+
+**(ii) `ctx.r5 = 0xFFFFFFAF` (−81) is arithmetically unreachable as a length at every call site.** The
+caller chain resolved from the 20-frame host backtrace (`build/mcla.map`, column 3, base `0x140000000`)
+is `sub_8218B0C8 +0x832` → `sub_821BE250` → `sub_823DA950` (the memcpy override). `sub_821BE250` is a
+buffered-stream `read(dst, len)` — prologue `mflr r12 / bl 823D91F0 / stwu r1,-144(r1) / mr r31,r3 /
+li r27,0 / mr r29,r4 / mr r30,r5` — and its two exits into the copying tail at `821BE394` are
+exhaustive:
+
+- **path A**, `821BE2B4 ble cr6 -> 821BE394`, taken when `arg3 <= W − R` (`821BE2A0 lwz r11,28(r31)` = W,
+  `821BE2A8 lwz r10,24(r31)` = R, `821BE2AC subf r5,r10,r11` = W − R; **`subf rD,rA,rB` = rB − rA**,
+  verified field-by-field on `7CAA5850`). The tail clamps with `821BE3A0 ble -> 821BE3A8` /
+  `821BE3A4 mr r30,r11`, so **`len = arg3`**.
+- **path B**, `821BE37C bge -> 821BE394`, reached only after the refill (`821BE360 lwz r5,8(r31)` …
+  `821BE368 bctrl` … `821BE370 stw r27,24(r31)` = R:=0, `821BE374 stw r11,28(r31)` = W:=retval) and only
+  when `retval >= 0`. Path B is entered only when `arg3 > W − R`, so the residual `r30 = arg3 − (W − R)`
+  is **strictly positive**.
+
+All four of `sub_8218B0C8`'s call sites into `sub_821BE250` (`8218B12C`, `8218B160`, `8218B2BC`,
+`8218B300`) take their length from `sub_821BE4F0`, which is **readByte**: `li r5,1 / addi r4,r1,80 /
+bl 821BE250 / cmpi cr6,r3,1 / lbz r3,80(r1) / beq -> 821BE518 / li r3,-1` — it returns only `0..255` or
+`0xFFFFFFFF`. **`−81` is in neither set and in neither path.** The F375 printer's field labels were
+re-verified against `src/gpu_cp.cpp:7130-7138` and are correct, so the staleness is in the recompiler's
+writeback of a translator-local `r5`, not in the instrument. The candidate source `subf r5,r10,r11`
+(W − R at `821BE2AC`) is itself **excluded**: W − R = −81 would fail `ble` and force path B, which fires
+the partial-copy memcpy at `821BE2CC` first and would leave `lr = 0x821BE2D0` — not the observed
+`0x821BE3BC`.
+
+**Consequence for §4's `ctr = len >> 7 = 0x1FFFFFF`:** that value was computed from the stale `r5`, so the
+"~4 GiB runaway" reading loses its only numeric support. What remains decidable is the *branch*: the live
+length is either a normal `[128,255]` (one block, copy ends, 16..32 in-window stores) or `0xFFFFFFFF`
+from a failed readByte (a runaway). **Both print exactly 16 rows under the head cap, so w740 cannot
+distinguish them** — and §4's prediction of 72/32 stores is now conditional on the runaway arm, not
+supported by it.
+
+**(iii) The pointer's provider is still UNNAMED, and the `LOWPOOL` zero does not help.** The dst argument
+arrives at site `8218B300` as `r4 = ` the return of the allocator thunk `sub_82130528` (called at
+`8218B2EC`; thunk shape `lwz r11,0(r13) / li r10,28 / mr r4,r3 / li r6,0 / li r5,16 / lwzx r3,r10,r11 /
+lwz r9,0(r3) / lwz r8,8(r9) / mtctr r8 / bctr`) and is stored to `[r29+4]`. But no allocator in the tree
+should be able to return `0xA0400000`: F-395/F-631 measured the title's XTL bank as
+`F389-BANK … vt=82011884 fn=821C29A0 head=[82011884 A0401010 A0401000 0 0 A042FFC0 0 0]`, i.e.
+`0xA0401000..0xA042FFC0`, which starts **0x1000 above** the arena base; and our own o1heap's minimum
+return is `base + 0x240 = 0xA0400240` (`INSTANCE_SIZE_PADDED`). The only host sites that touch `kPhysArenaBeginVa` for publication
+are the **log-only** `F640-*` lines at `src/boot_host.cpp:4175-4219`, so we never hand the base to the
+guest that way.
+
+⚠️ **A draft of this section claimed "`LOWPOOL` = 0 rows is a cap artifact (`n <= 60`)". That is wrong,
+and the truth is worse for the argument.** `LOWPOOL` is not a marker — it is a *suffix tag* on
+`BUDDY76-FREE` (`src/hooks/alloc_census.cpp:3524`), and its gate is a **disjunction**:
+`if (n <= 60 || ptr >= mcla::kernel::kPhysArenaBeginVa)` (`:3499`), so a physical-arena pointer would
+print at any `n`. The census is `BUDDY76-ALLOC` = **0**, `BUDDY76-FREE` = **0**, `LOWPOOL` = **0** in
+`w740.log`. Both printers being zero means **the hook on `sub_82130010` never fires in this boot** — an
+unreachable instrument, not a bounded one (project memory `feedback-zero-effect-means-unreachable`).
+It is evidence about nothing, and must not be cited either for or against a provider. **Naming the
+provider requires a new instrument on the `sub_82130528` return value at `8218B2EC`.**
+
+**4b. THE WRONG FIRST DRAFT, kept so it is not re-derived.** It read `r3=A03FFFF8` as the *argument* and
+concluded "the guest buffer starts 8 bytes below the arena base and spans our instance", then used
+`0xA03FFFF8 & 7 == 0` to justify an aligned start. Both steps are refuted by the `addi r3,r3,-8` /
+`std r6,8(r3)` pair above: the pre-decrement is what puts `r3` 8 below the store address, so the
+argument was never below the arena. **Rule re-learned: a register dumped mid-library-function is a
+running pointer, not a parameter. Read the loop's addressing mode before converting a register value
+into an argument** — the same discipline as the `lis` sign-extension and D-field traps in
+`.qoder/skills/mcla-guest-raw-decode`.
+
+**4c. THE FIRST *CORRECTED* DRAFT CITED THE RIGHT CONCLUSION FROM THE WRONG LOOP.** It reached
+`dst_arg = 0xA0400000` by decoding `823DA9B4..823DA9FC` and pointing at `stdu r7,8(r3)`, i.e. the
+`len < 0x80` doubleword loop. That loop is **not executed here**: `r5 = 0xFFFFFFAF` makes
+`bge cr7 -> 823DAA6C` at `823DA9CC` taken, and the `823DAA90` align loop inside the target is itself
+skipped because `0xA0400000 & 0x7F == 0`. The real stores are the fifteen non-updating
+`std rN,8..120(r3)` closed by one `stdu r6,128(r3)`. The conclusion survives; the citation did not, and
+a conclusion resting on an unexecuted instruction is worthless the moment anyone re-derives it. That
+block also carried a transcription slip -- it labelled `cmpli cr7,r5,0080` as `823DA9CC` when `823DA9CC`
+is the `bge` and the `cmpli` is `823DA9C0`. **Rule: decode the branch predicates and follow the one that
+is actually taken before quoting any instruction as "the store that fired"; an addressing-mode argument
+is only as good as the path selection in front of it.**
+
+`r5 = 0xFFFFFFAF`: with `cmpli cr7,r5,0x80` / `bge cr7 -> 823DAA6C`, a value that large selects the
+`len >= 0x80` path, so it is at least *consistent* with being a live length. Whether it is the true
+byte count or a residual is **not decidable from `w740`** — both window printers capped at 16 rows, so
+the copy's extent was never observed (`saturated=0` at the cap). Recorded, not interpreted (F-653).
+**Provenance of the `0xA0400000` pointer is also open:** `w740`'s `F389-BANK` row is all zeroes
+(`bank=00000000 alloc=[bank+4]=00000000 vt=00000000 fn=00000000 head=[0 x8]`), so it names no
+allocator, and F-631 measured the title's XTL slab region as `0xA0401000..0xA042FFC0` — i.e. *above*
+`0xA0400000`, which does not explain this destination either. Do not name a provider without a
+measurement.
+
+**5. WHY NO PROBE CAUGHT IT, AND WHY F-382 = 0 IS AN OPEN CONTRADICTION, NOT A CLEAN NEGATIVE.**
+`F774-PHYS-MEMCPY` printed 40 rows — its own `k <= 40` head cap — **all `len=2`, all `dst=A043Cxxx`,
+all inside 4 ms at 20:30:02.749→.753**, i.e. the budget was exhausted **9 s before** the phys event and
+**57 s before** the user event; its `% 4096` arm never fired, so total phys-spanning calls ∈ [40, 4095].
+**It excluded nothing and proved nothing about `0xA0400000`** — F-774's cap defect reproduced verbatim in
+the replacement instrument. Separately, `F382-MEMCPY` = **0** in both `w739` and `w740` while its positive
+control `F382-MEMCPY-LIVE` = **1** (hook live, `calls=1`). But the user instance *was* written by the
+same 16 sites inside `__imp__sub_823DA950`, and the phys event's backtrace has frame 4 =
+`sub_823DA950 +0x337` — the override — so the override is on the path at least for phys. **An override
+that is on the stack should have evaluated its own span test against the user window and matched.**
+It did not. Unresolved; the candidates are that `ctx.r3/r5` at override entry differ from what the body
+uses, or that the user write reaches the generated body without passing the override. **Do not report
+`F382-MEMCPY = 0` as "the guest never copies low."**
+
+**6. THE ARCHITECTURAL ROOT CAUSE — WE PLACED THE INSTANCE AT THE POOL'S FIRST ALLOCATABLE BYTE.**
+`src/boot_host.h:168-201` and `src/boot_host.cpp:181-183` declare the console's three physical views
+(`0xA0000000`/64 KiB "A64K", `0xC0000000`/16 MiB "C16M", `0xE0000000`/4 KiB "E4K") over one 512 MiB
+pool, matching `.research/xenia/src/xenia/memory.cc:171-180`. `boot_host.cpp:196` sets
+`F640PoolPhysBase() = kPhysArenaBeginVa − 0xA0000000 = **0x400000**`, and `:226` maps
+`poolVa(pa) = kPhysArenaBeginVa + (pa − 0x400000)`. `boot_host.h:188` states the boundary from the other
+side: `kNoPoolByte` = "physical **< 4 MiB**, or past the pool's window". So **`pa = 0x400000` ⇒
+`poolVa = 0xA0400000 = kPhysArenaBeginVa`** — our o1heap instance header sits at the first byte of the
+guest's own usable physical memory, inside a `static_assert`-pinned guest extent
+`[0xA0400000, 0xC0400000)` (`heap_arena.h:130-137`). **The guest writing there is correct guest
+behaviour; the address collision is ours.**
+
+**7. `heap_arena.h:52-55`'S SAFETY ARGUMENT IS REFUTED.** It reads: "F-631: `w654` re-measures the
+title-side pool over THIS arena as `head=[82011884 A0401010 A0401000 0 0 A042FFC0 0 0]` … **The instance
+here is still safe (0xA0400000 is 0x1000 below the first block o1heap returns)**." That argument only
+considered the title's XTL slab region **above** the base (`0xA0401000..0xA042FFC0`), and it is refuted
+from the *other* direction: `w740` shows a `memcpy` whose `dst` argument is **exactly `0xA0400000`**
+(§4), so something hands the guest the instance's own first byte as a copy destination and the copy runs
+upward through the header from there. Neither of F-631's two bounds describes it. F-391 had
+already moved this base once — `0xA0000000 → 0xA0400000` — for precisely this reason ("0xA0000000 … is
+inside the title's own XTL heap"), and it moved the collision rather than removing it. **A second small
+relocation is not a fix; two moves have now failed the same way.**
+
+**8. WHAT THIS MAKES DECIDABLE, AND WHAT IT DOES NOT.** Decidable: the corruption is not a stray write,
+a wild pointer or an emulator bug in the allocator — it is the guest initialising memory it legitimately
+owns, and the *fix* is to stop putting host allocator control blocks at guest-addressable addresses.
+Not decidable from `w740`: the sweep's true length (both printers capped at 16; F-777 §3 bounds it to
+**phys ∈ [16, 72]** and **user ∈ [16, 32]** from the printer's own `window_bytes=0x240` intersected with
+the armed ranges, not the `[16, 4095]` the cap alone implies), **which arm of §4d(ii)'s branch the live
+length took — `[128,255]` or `0xFFFFFFFF` — since both print exactly 16 rows**, the user instance's
+entry path (§3), the *provenance* of the `0xA0400000` destination pointer (**§4d(iii)** — the allocator
+thunk `sub_82130528` returned it at `8218B2EC`, and no allocator in the tree should be able to), and
+whether relocating only the 0x240-byte instance is sufficient given that
+o1heap places fragments **inline in the arena** — `o1heapInit(base, size)` puts the instance *at* `base`
+(`src/kernel/o1heap.c:282`, called at `heap.cpp:2391` and `:2413`), so separating the instance from the
+fragment region needs an o1heap API change (`src/kernel/o1heap.c` is not on the forbidden list, but
+`:481` and `:517` both assert "NOTHING ELSE HERE CHANGES", so this is a deliberate decision and not an
+edit to make silently). **No fix is landed by this entry.**
+
+**The fix does not depend on any of the undecidable items.** Under every branch — normal length or
+runaway, title allocator or ours, provenance named or not — the guest was handed `0xA0400000` as a
+destination and zeroed 128 bytes there, and `0xA0400000` is the first byte of the physical o1heap
+instance. Removing that address from the set of values any allocator can return closes the collision
+class regardless of which allocator returned it. That is why §7's conclusion stands while §4d(iii)'s
+question stays open.
+
+**9. FRONTIER UNCHANGED — THE GATE CONDITIONS ALL HELD.** `w740` vs `w739`: `draw_indexed` **0 = 0**,
+`o1heap invariants fail` **4 = 4**, `xtl-alloc-refused` **4 = 4**, `headis=1` **1 = 1**,
+`dstAfter=61786772` **1 = 1**, `veh-neutral` **1 = 1**, `f370-heap-hdr` **1 = 1**,
+`present-surface-unreadable` **41 = 41**, `watch: range armed` **32 = 32**, `code=0x80000003` **0 = 0**.
+Moved, and **NOT attributed** to a log-only change without a repeat: `code=0xC0000005` 3→5,
+`fatal-soft` 1→0, `fatal error` 1→0, `F388-PHYSGUARD-BT` 32→16, `xsf-lastserve-mismatch` 225→226.
+Across `w738→w739→w740` the first three read 5→3→5, 0→1→0, 0→1→0 — the bimodal pattern project memory
+already records, so a single-variable claim here would be unsupported (rule 1a).
+
+### F-779 — FIX LANDED AND VERIFIED: detaching both o1heap instances from their arenas takes `XTL-ALLOC-REFUSED` and `o1heap invariants FAIL` from 4 to **0** over a full 300 s soak that covers the baseline's failure moment, and the same guest caller (`glr=82137904`) that refused in `w740` now succeeds with an exact split in `w741b`. The double-ownership conflict behind it is **narrowed, not eliminated**.
+
+- Task:        T43.9 (build `build/w741_build.log` rc=0, soaks `build/w741.log` 99.0 s — void for the refusal claim only, see §4 and F-780 §6, `build/w741b.log` 300 s) · **census corrected by F-780**
+- Type:        FIX
+- Class:       D
+- Priority:    P0
+- Evidence:    `build/w741b.log:49` `PHYS-POOL phase=init cap_bytes=0x20000000 … o1_capacity=0x20000000 hdr=0x1a0400000 inst_detached=1 inst_host=0x22f3f3e0000 frag0_guest=A0400000 o1_cap_delta=0x240 user_inst_detached=1 user_inst_host=0x22f3f3d0000` vs `build/w740.log:49` `o1_capacity=0x1ffffdc0` (no detach fields) — **the discriminating pair is `hdr=0x1a0400000` ≠ `inst_host=0x22f3f3e0000`: the arena's host mapping and the instance are now different allocations, and `o1_cap_delta=0x240` is the arithmetic self-check that the fragment region no longer loses the instance header** · `build/w740.log:31065` `[20:32:08.253] [error] AllocPhysical: o1heap invariants FAIL #1 size=0x19d align=0x4000 cap=0 peak=0` and `build/w740.log:31068` `[20:32:08.253] [warning] XTL-ALLOC-REFUSED #1 size=413 align=16 -> returned 0 (console value) glr=82137904 … seen=3195 ok=3194 refused=1` vs `build/w741b.log:31871` `[22:02:40.825] [error] PHYS-STATE #1 size=0x41bd align=0x4000 o1_frag=0x8000 class_ok=1 opt_bin=9 … capacity=0x20000000 free=0x22f3000 free_ppm=68260 verdict=healthy why=suitable_class_present split=exact … oom=1 caller_rva=0x2b5b5a glr=82137904 tid=6148` · `tools/soak_census.py build/w741b.log build/w740.log` → `XTL-ALLOC-REFUSED 0 4 -4 >>`, `PHYS-STATE 1 0 +1 <<`, `DEPTH: 32,157 vs 31,381 lines = 1.02x -> COMPARABLE` · `grep -aic "o1heap invariants FAIL"` = **0** in `w741b.log`, 4 in `w740.log` (case-SENSITIVE `grep -ac` scores 0 in BOTH — the marker's real text is `FAIL`, uppercase) · src `src/kernel/o1heap.h:99,122`, `src/kernel/o1heap.c:334-421`, `src/kernel/heap.cpp:2400-2403,2419-2421,2446-2448,2466-2482` · `build/mcla.exe` mtime `10-06 21:35:49` (moved from `20:28:33`), magic `4d 5a`
+  - ⚠️ **SELF-AUDIT CORRECTION (2026-10-06 22:2x, same session that wrote this entry).** The Evidence line as first written cited `build/w741b.log:1` and quoted `inst_host=0x1b860690000 … user_inst_host=0x1b860680000`. **Both were wrong: `0x1b860690000` occurs 0 times in `w741b.log` and 1 time in `w741.log`** — the quoted init row was the VOID 85 s soak's, pasted under the surviving soak's filename, and `w741b.log:1` is `[info] [logging.h:72] SDL initialized`, not the init row (which is `:49`, the same line number it holds in `w740.log`). Caught by re-running every citation before propagating the numbers into `LONG_TODO_MASTER` §5 and `PROGRAM_GUIDE` §9. The host addresses are ASLR-different every run, so **never cite one as evidence of anything**; cite `inst_detached`, `o1_cap_delta` and the `hdr` vs `inst_host` inequality instead.
+  - ⚠️ **`inst_detached=1` IS A SUBSTRING OF `user_inst_detached=1`** (§9 rule 5, in a field this very change introduced). Measured on `w741b.log`: **2 occurrences, 1 line.** `grep -c` (lines) = 1 is the correct census; an occurrence count of "2" is one physical row double-counted, which is how the first draft of this entry came to say `inst_detached=1 0 → 2`.
+
+**1. THE CHANGE, AND WHY IT IS ADDITIVE.** Two new public functions in `src/kernel/o1heap.c`:
+`o1heapInstanceSize()` (`:363`, returns `INSTANCE_SIZE_PADDED`) and
+`o1heapInitSeparate(instanceMem, base, size)` (`:368`). **No statement of `o1heapInit`,
+`o1heapAllocate`, `o1heapFree`, `o1heapDoInvariantsHold` or `o1heapAllocateGranular` is modified**, so
+the "NOTHING ELSE HERE CHANGES" notes at `o1heap.c:569` and `:605` remain true of every function they
+name, and `INSTANCE_SIZE_PADDED` is still pinned to `0x240` by the `static_assert` at `:181` — so every
+hardcoded instance offset in the instrumentation (mask at `+0x200`, `diagnostics.capacity` at `+0x208`)
+keeps meaning what it says. There are exactly **three** differences from `o1heapInit`: `out` is
+`instanceMem` rather than `base`; the root fragment is at `base` rather than `base + 0x240`; capacity
+starts at `size` rather than `size - 0x240`. `heap.cpp` allocates the instance memory with
+`VirtualAlloc` (`:2403-2407`) — 64 KiB granularity trivially satisfies `O1HEAP_ALIGNMENT` = 32, and
+`<windows.h>` was already included, so no new include and no alignment arithmetic. Both heaps are
+detached (`:2419-2421` user, `:2446-2448` physical), with the attached `o1heapInit` kept as a fallback
+if `VirtualAlloc` returns NULL.
+
+**2. THE PRE-FLIGHT CHECK THAT MADE THIS SAFE, AND THE ONE THAT ALMOST DIDN'T.** `o1heapFree` derives
+the arena bounds **from the handle address** (`o1heap.c:748,750`:
+`O1HEAP_ASSERT(((size_t)frag) >= (((size_t)handle) + INSTANCE_SIZE_PADDED))` and the matching upper
+bound), which is meaningless once the handle leaves the arena. Both are `O1HEAP_ASSERT` == `assert()`,
+and the header's claim that they are compiled out was **measured rather than trusted**:
+`build/CMakeCache.txt` `CMAKE_BUILD_TYPE:STRING=RelWithDebInfo`, `CMakeLists.txt:569`
+`CMAKE_C_FLAGS_RELWITHDEBINFO "/MT /O2 /Ob1 /DNDEBUG"`, the belt-and-braces
+`target_compile_definitions(mcla PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)` at `:578`, and `o1heap.c`'s
+own `build.ninja` FLAGS line reading `/MT /O2 /Ob1 /DNDEBUG -MT -Zi`. **A Debug build of a detached
+instance would assert on the first free**; that is written into the header comment at `o1heap.h:118-121`
+so it cannot be rediscovered by accident. Separately, `heap.cpp:3329`'s comment records a *live*
+`ptr >= physicalHeap` arena test that F-631 had already replaced with the bounds-based
+`Heap::IsPhysicalArenaPtr` (`heap.h:63-67`, using `physArenaBase`/`physArenaSize`), and a full grep
+confirmed every remaining handle use is an identity comparison or an o1heap API argument — **no
+functional path derives the arena from the instance address.**
+
+**3. THE RESULT IS CONTROLLED ON THE SAME GUEST CALLER, NOT JUST ON A COUNT.** `w740`'s refusal and
+`w741b`'s success carry the **same `glr=82137904`**, so this is the same guest allocation site reaching
+the same host path with opposite outcomes: `cap=0` + `invariants FAIL` + `returned 0 (console value)`
+becomes `capacity=0x20000000` + `verdict=healthy why=suitable_class_present split=exact`. `w740`'s
+`cap=0` is precisely F-630/F-631's destroyed-header signature — the guest zeroed `diagnostics.capacity`
+at instance `+0x208`, `ClassifyPhysPool` (`heap.cpp:781-786`, `DestroyedHeader` at `:783`) returned
+`why=capacity_zero`, and every allocation refused. **`PHYS-STATE` 0 → 1 is a second, independent
+confirmation**: that row is emitted from the `EmitPhysState` call at `heap.cpp:3252`, *after* the
+invariant gate's early `return nullptr` at `:3121` (gate test at `:3096`, its FAIL row at `:3103`), so
+under `w740`'s layout it was structurally unreachable. It prints now
+because the gate no longer trips. (This is the `PHYS-VERDICT-CHANGE` instrumentation-order defect
+resolving itself by the gate no longer firing — the defect itself is still not fixed, and would hide a
+*future* regression the same way.)
+
+**4. THE SHORT SOAK WAS NOT EVIDENCE FOR *THAT* CLAIM, AND THE REASON IS A RULE.** The first run
+(`build/w741.log`) was killed externally (exit `0x40010004`) after **99.0 s** — span
+`21:36:30.494 → 21:38:09.487` by its own first and last timestamps. *(This paragraph and the Task line
+above originally said "85 s"; F-780 §6 re-measured it as 99.0 s. The span was already printed correctly
+beside the wrong number, so the entry contradicted itself. Nothing turns on the difference.)* It also read
+`XTL-ALLOC-REFUSED` **4 → 0** — but `w740`'s four refusals all fired at `20:32:08` = **+139.9 s** into a
+run that started `20:29:48`, and `w741` never got there. **The zero was a duration artifact that
+looked exactly like a fix.** `w741b` runs `22:00:14 → 22:05:13` = the full 300 s and therefore *covers*
++139.9 s. **Generalised: a zero is only a result if the new run's timestamps span the moment the baseline
+event occurred. Equal-or-longer duration is necessary; coverage of the specific event time is what is
+sufficient.** ⚠️ **F-780 §6 applies this rule in the opposite direction and gets a second result out of
+the same file: `w741` covers +14.9 s, so it *is* valid evidence for the `P5-PHYS` return. Voidness is
+per-event-time, not per-file.** The same discipline caught a second error in the first census:
+`o1heap invariants fail` scored **0** in `w740` under a case-sensitive pattern and **4**
+case-insensitively — the census skill's `-i` rule, re-broken and re-caught.
+
+**5. WHAT THIS DOES *NOT* FIX — THE CONFLICT IS NARROWED, NOT ELIMINATED.** `F374-HEAPSTORE` = **32**
+in both soaks, at the same relative times (`w741b`: +25 s and +75 s; `w740`: +23 s and +71 s), with the
+same 16 distinct `caller_rva`s per instance. **The guest still zeroes 128 bytes at `0xA0400000` and at
+`0x20000`.** What changed is only *what is there*: our control blocks are no longer at those addresses,
+so the write lands on arena memory instead of on our books. But the underlying fact F-631 measured is
+untouched — the title's XTL bank is `0xA0401000..0xA042FFC0`, i.e. **inside** the 512 MiB region our
+o1heap also allocates from, so two allocators still believe they own the same bytes. The fatal
+*consequence* (total allocation refusal, boot dead) is gone; a guest-visible double-ownership is still
+possible and is **not measured either way** by this soak. Naming the provider of `0xA0400000` remains
+open (F-778 §4d(iii)) and would need a probe on the `sub_82130528` return at guest `8218B2EC`.
+> ⚠️ **SUPERSEDED ON THE "NOT MEASURED EITHER WAY" CLAUSE BY F-780 §7.** It is measured, at one row:
+> the `P5-PHYS` short-circuit that fires only in the post-fix runs does so on `old=B6FB2F29`, with
+> `r3=BD40C000` and `desc=BD908000` — all three inside this same `[0xA0400000, 0xC0400000)` arena. The
+> guest asked its rebase table about an address in our pool, missed, and was about to fatal. **The
+> double-ownership is not merely possible; it reached a guest lookup and was absorbed by a host
+> short-circuit.** The provider of `0xA0400000` is still unnamed.
+
+**6. EXHAUSTION IS A SEPARATE PROBLEM AND IS NOW VISIBLE.** `PHYS-STATE #1` at +146 s reports
+`allocated=0x1dd0d000` (477 MiB) against `capacity=0x20000000` (512 MiB), `free=0x22f3000` (36 MiB,
+`free_ppm=68260`), `peak_req=0x12b84020` (**314 MiB in a single request**) and `oom=1`. Both soaks also
+show `allocated=0x17465000` (390 MiB) at **+1.4 s**. So the pool is genuinely nearly exhausted
+independent of the corruption — the refusal that F-779 removed was a *destroyed-header* refusal
+(`cap=0`), not an exhaustion one, and an exhaustion refusal may still arrive later or under a larger
+request. **Do not read `XTL-ALLOC-REFUSED = 0` as "the physical pool is sufficient".**
+
+**7. FRONTIER UNCHANGED, EVERY GATE CONDITION HELD.** `w741b` vs `w740`, all `+0`: `DRAW_INDEXED`
+**0 = 0**, `PRESENT` 49 = 49, `C0000005` 5 = 5, `Fatal error` 0 = 0, `fatal` 0 = 0, `assert` 0 = 0,
+`VEH` 4 = 4, `VEH-NEUTRAL` 1 = 1, `VEH W0: parking thread` 2 = 2, `PHYS-OVERRUN` 7 = 7,
+`F379-HEAPSTORE-BT` 20 = 20, `F631-HEAPWIN` 32 = 32, `F774-PHYS-MEMCPY` 40 = 40, `PHYS-FREE-SUM`
+35 = 35, `PHYS-VERDICT-CHANGE` 1 = 1, `GFx` 1 = 1, `W34-NOGFX` 4 = 4, `80000003` 0 = 0.
+`FATAL-SOFT` **0**, `headIs=1` **1**, `dstAfter=61786772` **1**. CP truth `drains=6 last_rptr=0016
+pub=9 put=9 (caught up)`. **No draw, no menu, no audio: the boot is healthier and exactly as far from
+a frame as before.**
+> ⚠️ **CORRECTED BY F-780 — this paragraph originally ended "Mitigation lines 2,047 vs 2,043, and
+> `skip fatal` **0 vs 2** (fewer short-circuits firing, not more)", which is wrong in both its numbers
+> and its direction.** Mitigation lines are **2,043 → 2,047 (+4), i.e. MORE**; `skip fatal` is graded
+> `field` with **0 own rows in both logs** and is not a mitigation counter at all. The three new rows are
+> a `P5-PHYS` short-circuit, silent for 18 consecutive soaks, firing on an address inside our own
+> physical arena. **The neutrality claim above holds for every marker in the tracked battery and fails
+> for one mitigation that the battery does not track.** Read **F-780** before quoting this paragraph.
+
+**8. RULE 1b NEW-SYMBOL TAINT.** Three new file-scope symbols in `src/kernel/heap.cpp`:
+`g_userInstMem` (`:2400`), `g_physInstMem` (`:2401`), `AllocDetachedInstanceMem()` (`:2403`), plus two
+new public symbols in `src/kernel/o1heap.c`: `o1heapInstanceSize` (`:363`), `o1heapInitSeparate`
+(`:368`). All five are listed here; the build differing from the `w740` tree is these three files only
+(`git diff --stat` = `heap.cpp` +116/−13, `o1heap.c` +88, `o1heap.h` +27), so attribution is
+single-variable. **Revert test not yet run**: the claim rests on the forward control (§3's same-`glr`
+pair plus §4's timestamp coverage), not on a revert-and-see-it-return.
+
+**9. INSTRUMENTATION THAT THIS FIX SILENTLY STALED — READ THEIR ROWS WITH CARE.** Five log-only sites
+read the instance *through a guest address*, or through `g_hdrArena`, and now read arena/fragment data
+instead. None is functional; all will print misleading values. *(Citations re-verified line by line for
+F-780; this paragraph originally mis-cited two of them — `:2755` is an unrelated comment about the
+HeapGuardWindow ordering rule, and the field at `:1794-1795` is `hdr_off=`, not `moved=`.)*
+- **`F373-HEAP-RAW`** — printer `heap.cpp:1824-1826`; its reads are `:1810-1815`
+  (`gm.Translate(kUserHeapArenaVa)`, `ReadBytes(kUserHeapArenaVa, raw, 40)`,
+  `ReadBytes(kPhysArenaBeginVa, phys, 40)`), i.e. 40 raw bytes at what used to be the two instance
+  headers and are now the two arenas' first fragments. Its **`moved=`** field (`:1826`) is
+  `re != (void*)g_hdrArena` and now compares a guest-arena translation against a host `VirtualAlloc`, so
+  it reads `moved=1` unconditionally.
+- **`F373-HEAP-GOLDEN`** — printer `heap.cpp:2809-2810`, read `:2805` (`kUserHeapArenaVa`). This is the
+  healthy-reference row F-100 required so `F373-HEAP-RAW` could distinguish "the header broke" from "my
+  reader is broken"; **its `cap=` still comes from the live handle and stays correct, while its `hex=`
+  now dumps arena bytes.** A golden reference that silently changed subject is worse than no reference:
+  it will make a future `F373-HEAP-RAW` diff look like corruption.
+- **`F370-HEAP-HDR`'s `hdr_off=`** — `heap.cpp:1791` (field) computed at `:1794-1795` as
+  `(uint8_t*)h - g_hdrArena`, with `g_hdrArena = heapArenaBase` (`:2422`). Now a huge host-address
+  difference instead of a small instance offset. Its `cap=`/`want_cap=` fields are unaffected.
+- **`boot_host.cpp:468`** — the F-640 needle comment "fragments start +0x240", no longer true for either
+  arena; the bucket logic above it (`:465-468`) classifies a trip by offset into the *instance*, and
+  there is no instance at that address any more.
+- **`guest_memory.cpp:60-61` and `:77-78`** — `kHeapInstanceLo/Hi = kUserHeapArenaVa .. +0x240` and
+  `kPhysInstanceLo/Hi = kPhysArenaBeginVa .. +0x240`, the two `kHeapWindows[]` entries (`:79-82`). These
+  are the windows `F631-HEAPWIN`/`F631-HEAPEXT`/`F374-HEAPSTORE` report against, so every `inst=user|phys`
+  row now describes a write into the first 0x240 bytes of an **arena**, not into an instance.
+
+**`F374-HEAPSTORE inst=phys`/`inst=user` rows firing after this fix are therefore NOT a
+failure** — they are the guest writing to what is now ordinary arena memory. The windows should be
+retired or re-aimed, but doing so in this build would have broken rule 1a, so they were left alone.
+`heap.cpp:2440-2444` records that `AttachPhysicalArena` (`:2485-2490`) still rebinds to an *attached*
+instance; it is dead code in this tree, and wiring it up without detaching it would reintroduce the
+collision.
+
+### F-780 — F-779's neutrality claim is WRONG on one marker and its direction is inverted: `skip fatal` did not go "0 vs 2, fewer" — mitigation lines went **2,043 → 2,047 (+4)**, and the three new rows are a `P5-PHYS` host short-circuit that had been silent for **18 consecutive soaks** (`w723`…`w740`) and now fires in **both** post-fix runs. It fires on `old=B6FB2F29`, an address **inside our own physical arena**, which is the first direct measurement of the double-ownership F-779 §5 called "unmeasured either way".
+
+- Task:        T43.9 (no new build or soak — this is a re-census of `build/w740.log`, `build/w741.log`, `build/w741b.log`, plus 177 real soaks for the dormancy curve)
+- Type:        FACT (correcting a FIX entry's census) + INFERENCE (§7)
+- Class:       D
+- Priority:    P1
+- Evidence:    `tools/soak_census.py build/w741b.log build/w740.log` → `host short-circuit lines (mitigations firing, NOT fixes): 2,047   (baseline 2,043)` and, in its COUNT SEMANTICS block, `skip fatal  0  2  2  field  ['inflate-skip:1', 'p5-phys:1']` → `FIELD, not a row: phrase fragment; mitigation-label tier` · the three new rows, all in `build/w741b.log` at `22:00:29.492` = **+14.9 s** (first timestamped line `22:00:14.603`): `[info] P5-LOOKUP #000001 r3=BD40C000 r4=B6FB2F29 -> FFFFFFFF lr=8260A878 PLACE-44495500` (printer `src/task_dispatch_trace.cpp:569`), `[warning] P5-MISSFIX #00001 desc=BD908000 a4=82009840 old=B6FB2F29 lr=8260A8B0 r13=006A0020` (`:590`), `[warning] P5-PHYS #00001 old=B6FB2F29 lr=8260A8B0 — already physical, skip fatal (caller takes delta-0 path)` (`:607`) · the identical `P5-PHYS #00001` row in `build/w741.log` (span `21:36:30.494`→`21:38:09.487`) · dormancy: `grep -aic P5-PHYS` = **14** in `w720.log`, **14** in `w722.log`, **0** in every one of `w723`…`w740` (18 soaks), **1** in `w741.log`, **1** in `w741b.log`; 39 of the 308 `build/*.log` on disk contain it at all (177 are >1 KiB, i.e. real soaks) · raw guest word at `0x8260A8AC` = `4BBC7ACD` → op18, LI = bits 6..29 = `0x3BC7ACC`, sext = −4,425,012, AA=0, LK=1 ⇒ target `0x821D2378`, so `lr=8260A8B0` is a *return address*, not a fault site · `tools/ppc_xrefs.py fn 0x8260A8B0` → `sub_8260A830 +0x80`; `tools/addr_owners.py --check 0x821D2378` → 2 sites, `src/task_dispatch_trace.cpp:577` (orig) and `:579` (override) · rule 1a: `find src tools -newermt "2026-10-06 20:28:33" ! -newermt "2026-10-06 21:35:49"` → `src/kernel/heap.cpp`, `src/kernel/o1heap.h`, `tools/ppc_disasm.py` (not compiled) and one `.pyc`, only · arena extent from `build/w741b.log:49` `PHYS-POOL phase=init … guest=[A0400000..C0400000)`, and `python -c "print(0xA0400000 <= 0xB6FB2F29 < 0xC0400000)"` → `True`
+
+**1. THE CORRECTION, AND WHY IT IS WORSE THAN A TYPO.** F-779 §7 ends: *"Mitigation lines 2,047 vs
+2,043, and `skip fatal` **0 vs 2** (fewer short-circuits firing, not more)."* Both numbers were in that
+sentence and the gloss contradicted them. Re-measured: mitigation lines are **2,043 (`w740`) → 2,047
+(`w741b`), i.e. +4 — MORE.** And `skip fatal` is not a counter at all: `soak_census.py` grades it
+**`field`**, own-rows **0 in both logs**, its two carrying lines owned by `inflate-skip:1` and
+`p5-phys:1`. So "0 vs 2" was a *matching-line* count of a phrase that also occurs in an unrelated inflate
+note, reported as if it were a mitigation total, then glossed in the direction opposite to the number
+printed beside it. `docs/HANDOFF_NEXT_AGENT.md:812` carried the same sentence and is corrected alongside
+this entry. **The census skill has warned about exactly this phrase since 2026-09-20** ("`P5-PHYS … skip
+fatal (caller takes delta-0 path)` matches any filter containing the word 'fatal'"). F-779 re-broke it in
+the *opposite* direction, which is a new failure mode worth registering: the trap is not only that the
+phrase over-counts, it is that **its own-row count is legitimately 0 and therefore reads as "nothing
+fired"** — a `field`-graded label can hide a mitigation in both directions.
+
+**2. WHAT THE THREE NEW ROWS ARE.** One guest event, three host rows, same millisecond. The place-pass in
+`sub_8260A830` asked the guest rebase table about `r4=B6FB2F29` (`P5-LOOKUP`, `lr=8260A878`) and got
+`FFFFFFFF` — a miss. Execution then reached the resource-group-miss→fatal tail, hooked as
+`PPC_FUNC(sub_821D2378)` (`src/task_dispatch_trace.cpp:579`), which logged `P5-MISSFIX` and took the
+`alreadyPhys` arm at **`:604-611`**: `ctx.r3.u32 = 0; return;` — **instead of invoking the guest fatal**
+(`b 821BD618`, per the hook's own comment at `:593-599`). That arm's predicate is `:600-603`, three
+ranges ORed; `0xB6FB2F29` matches the third, `a5 >= 0x80000000u`. **This is a real short-circuit,
+registered in `docs/PROGRAM_GUIDE.md` §7 (`:226`), w9/w24 vintage, and per the census skill it must be
+reported as a mitigation and never as a fix.** §7's citation `:606` is the cadence gate; the printer is
+`:607` and the arm is `:604-611`.
+
+**3. THE DORMANCY CURVE, WHICH IS WHY THIS IS P1 AND NOT NOISE.** `P5-PHYS` is neither new code nor a
+rare path: **14 rows in `w720`, 14 in `w722`, then 0 in all 18 soaks `w723`…`w740`, then 1 in `w741` and
+1 in `w741b`.** Two independent post-fix runs against eighteen consecutive pre-fix zeros. The silence
+begins at the **same `w722 → w723` boundary** `docs/LONG_TODO_MASTER.md` §2 item 2.1 names for the
+TOC-walk regression ("`w722` = 1863 slices / 1862 dirs; `w723`-`w734` = **0**").
+
+**4. BUT THE TWO DO NOT MOVE TOGETHER, WHICH NARROWS ITEM 2.1.** Re-measured on the same logs:
+
+| marker | `w722` | `w723` | `w740` | `w741b` |
+|---|---|---|---|---|
+| `TOCWALK` | 3,987 | **0** | 0 | **0** |
+| `SLICE`   | 3,727 | 1 | 1 | 1 |
+| `DIRS=`   | 2 | **0** | 0 | **0** |
+| `TOC76`   | 1,451 | 462 | 462 | 462 |
+| `P5-PHYS` | 14 | **0** | 0 | **1** |
+
+So F-779 restored **one** of the paths silenced at `w723` and not the others — the TOC walk is still
+dead. Item 2.1's "attribution is N-way and unresolved" is therefore **too coarse**: whatever happened at
+`w723` is at least two independent mechanisms, and the one feeding `sub_821D2378` sits downstream of the
+physical allocator, not of the TOC walk. This is a falsifiable narrowing, not a solution; the TOC walk
+remains unexplained.
+
+**5. RULE 1a IS SATISFIED, SO F-779 MAY BE NAMED.** `find src tools -newermt "2026-10-06 20:28:33"
+! -newermt "2026-10-06 21:35:49"` — everything edited between the `w740` exe and the `w741b` exe —
+returns **`src/kernel/heap.cpp`, `src/kernel/o1heap.h`, `tools/ppc_disasm.py`** and a `.pyc`. Only the
+first two are compiled, and together with `src/kernel/o1heap.c` they *are* F-779. `o1heap.c`'s later
+mtime (`22:10:56`, after the `21:35:49` exe) is **comment-only** — verified by reading `:334-337` and
+`:355-360`, both inside the F-779 comment block — so codegen is identical and the log still describes the
+tree. **No revert run was performed**, so the direction stays provisional in the strict sense; what is not
+provisional is that the build delta is single-variable, and 2 post-fix runs against 18 pre-fix zeros is
+not the bimodal-artifact pattern `docs/` warns about.
+
+**6. THE "`w741` IS VOID" LOG IS STILL EVIDENCE FOR THIS CLAIM — AND ITS DURATION WAS MIS-STATED.**
+F-779 §4 and `HANDOFF` §8.7 both call `build/w741.log` an "**85 s**" soak. Its own timestamps are
+`21:36:30.494` → `21:38:09.487` = **99.0 s**, and the span printed in the same sentence was already
+correct, so the entry contradicted itself. The conclusion survives (99.0 s < **+139.9 s**, the offset of
+`w740`'s first refusal at `20:32:08.253` from its first timestamped line `20:29:48.455`), so `w741` still
+cannot speak to the refusal. **But the timestamp-coverage rule cuts both ways:** `w741` covers +14.9 s, so
+it *is* valid evidence for the `P5-PHYS` return and supplies the second independent post-fix observation.
+**A log too short for claim A is not void for claim B; voidness is per-event-time, not per-file.** That is
+F-779 §4's own rule applied in the direction its author did not consider.
+
+**7. WHY THIS OUTRANKS THE "+1" IT LOOKS LIKE.** F-779 §5 and `HANDOFF` §8.7 both state that after the
+fix "two allocators still believe they own the same bytes", while "guest-visible double-ownership is
+**unmeasured either way**". It is now measured, at one row: `r3=BD40C000`, `desc=BD908000` and
+`old=B6FB2F29` all lie inside `[0xA0400000, 0xC0400000)`, the arena extent that the `PHYS-POOL
+phase=init` row at `w741b.log:49` prints for itself. **The guest asked its own rebase table about an
+address in our physical arena, the table had no entry, and the guest was about to fatal.** A host
+short-circuit written in w9 is the only reason the run continued. Before F-779 the allocator refused
+everything once the header was destroyed, so pointers of this kind never reached the place-pass; now they
+do. **The fix removed a fatal and exposed the next gate** — which is progress, but it makes the honest
+frontier statement "the allocator now serves, and what it serves collides", not "the collision is gone".
+
+**8. WHAT IS NOT DECIDED.** (a) Whether `0xB6FB2F29` *should* have been in the rebase table — i.e.
+whether our arena handing out that address is itself the defect, or the guest's table is legitimately
+empty for it and the guest is at fault for asking. (b) Why **1** row and not `w720`'s **14**: the hook's
+cadence gate is `n <= 32 || n % 500 == 0` (`:589`, `:606`), so both 14 and 1 are below the cap and both
+are exact — the difference is real call volume, not printing. (c) Whether `P5-LOOKUP -> FFFFFFFF` is the
+guest's miss or a miss in a host-maintained table. (d) The identity of the **4th** mitigation line in the
++4, three of which are the P5 rows above. (e) `F635-CTR-OOR` went **5 → 4** in the same pair,
+unexplained.
+
+**9. TWO CENSUS DEFECTS THIS EXPOSED — (i) IS NOW FIXED *AND VERIFIED BY THE TOOL*; (ii) IS A READING
+RULE.** (i) **`P5-PHYS`, `P5-MISSFIX` and `P5-LOOKUP` were not in the tracked battery.** `soak_census.py`
+tracked only `P5-GATE` from that family (**0** in both logs), so its marker table had **no row for any of
+the three** — *not* a `+0`, no row at all, because an untracked literal is never printed — while three
+mitigation rows appeared in the log; they surfaced **only** in the `field`-owner attribution under
+`skip fatal` (`['inflate-skip:1', 'p5-phys:1']`), i.e. the mitigation total moved 2,043 → 2,047 but its
+**source was unnamed**. *(This paragraph originally said "the marker table printed `+0` for everything",
+which is wrong twice over: the table did print deltas for other markers — §10's `CAS-SITE` +248 among
+them — and an untracked marker prints no row rather than a zero. Corrected 22:4x, same session.)* Cause:
+`markers_from_guide()` (`tools/soak_census.py:813-848`) reads only §9 table first cells, and these three
+are registered in §7 (short-circuits) but were never listed in §9; `SHORT_CIRCUITS_TRACKED` (`:306-311`,
+18 entries) does not name `P5-PHYS` either — the tool's only mention of it is the comment at `:254`. **A
+mitigation that exists in §7 and not in §9 is invisible to the one tool whose job is to catch mitigations
+firing.** (ii) The same asymmetry in the other direction is why `PHYS-STATE`'s `+1` *was* visible: it is
+in §9.
+
+**FIX (i) LANDED AND VERIFIED 2026-10-06 22:4x.** Eight literals in this family had **0 §9 first-cell
+rows** — measured against `markers_from_guide()`'s own rules, not remembered: `PHYS-POOL`,
+`PHYS-POOL-FULL`, `P5-LOOKUP`, `P5-MISSFIX`, `P5-PHYS`, `F373-HEAP-RAW`, `F373-HEAP-GOLDEN`,
+`F374-HEAPSTORE` all returned `tracked=False`, while `PHYS-STATE`, `HEAPHDR-STORE`, `F631-HEAPWIN` and
+`XTL-ALLOC-REFUSED` returned `True` (227 tokens / 219 unique before the edit). Three §9 rows were added,
+plus a `PHYS-STATE`/`PHYS-VERDICT-CHANGE` line-number supersede note (F-779 drifted every `heap.cpp`
+citation in that row: gate `:3006`→**`:3096`**, FAIL printer `:3013`→**`:3103`**, `return nullptr`
+`:3031`→**`:3121`**, `EmitPhysState` `:3162`→**`:3252`**, `NotePhysVerdict` `:3165`→**`:3255`**,
+`NotePhysAttempt` `:3046`→**`:3136`**, `NotePhysPoolFull` `:3172`→**`:3262`**, free-path
+`:3516`→**`:3606`** — the *ordering defect itself* is unchanged and T43.1 is still open) and a corrected
+§7 `P5-PHYS` citation (`:606` is the cadence gate; the printer is **`:607`**, the arm `:604-612`, the
+mitigation body `:610-611`). **THE VERIFICATION IS THE TOOL, NOT THE EDIT:** re-running
+`python tools/soak_census.py build/w741b.log build/w740.log` on the *same two logs* now prints
+`257 tracked` (was 249, **+8 exactly**) and the rows `P5-LOOKUP 1 0 +1 <<`, `P5-MISSFIX 1 0 +1 <<`,
+`P5-PHYS 1 0 +1 <<`, `PHYS-POOL 1 1 +0`, `PHYS-POOL-FULL 0 0 +0`, `F373-HEAP-GOLDEN 1 1 +0`,
+`F374-HEAPSTORE 32 32 +0` — plus **one delta that was structurally invisible before:
+`F373-HEAP-RAW 0 1 -1 >>`**, the stale instrument going silent in the post-fix run. That is consistent
+with F-779 §9's reading rule (its reader changed subject) and is **NOT** a new fact about the heap; it is
+recorded here only so the next reader does not read `-1` as a regression. §9 rule 4 re-checked after the
+edit: no new `file:line` token leaked into a first cell (the same 4 pre-existing ones). **The general
+rule this leaves behind: when a marker is added to `src/`, its literal goes into a §9 first cell in the
+same change — a §7-only registration is not tracked, and the gap is silent in both directions.**
+
+**10. FULL DELTA SET FROM THE SAME RUN, SO NOTHING IS CHERRY-PICKED.**
+`tools/soak_census.py build/w741b.log build/w740.log --unchanged` → non-zero deltas only: `CAS-SITE`
++248, `WAKE[KWFSO]` +248, `WAIT` +248, `WAKE` +248 (the KWFSO poller family — FOOD-NOT-PROGRESS class, a
+timing artifact and never evidence of progress), `NFS-CENSUS` +4, `F441-QUEUE-STORE` +1, **`PHYS-STATE`
++1**, **`F635-CTR-OOR` −1**, **`XTL-ALLOC-REFUSED` −4**. `DEPTH: 32,157 vs 31,381 lines = 1.02x ->
+COMPARABLE`; **no `POISONED` verdict** (`grep -aic POISONED` over the full output = 0), the top recurring
+shape owning 18% of lines being the KWFSO heartbeat, which the quality check excludes. `DRAW_INDEXED`
+**0 = 0**, `PRESENT` own-rows **49 = 49**, `C0000005` **5 = 5**, `NATIVE-PRESENT` **2 = 2**,
+`Fatal error` **0 = 0**, `FATAL-SOFT` **0 = 0**. **Note the own-row vs matching-line split, because a
+hand `grep -ic` disagrees with every one of those and both numbers are correct for their own question:**
+`PRESENT` 49 own rows vs 254/255 matching lines, `C0000005` 5 vs 7, `F631-HEAPWIN` 32 own rows vs 64
+matching lines — the tool names the owner of the difference as `f374-heapstore:32`, i.e. the
+`F631-HEAPWIN` literal also appears inside `F374-HEAPSTORE`'s rows, a prefix collision running the
+other way from the usual one.
+
+
+### F-781 — T43.1 LANDED AND PROVEN: `EmitPhysState` / `NotePhysVerdict` / `NotePhysPoolFull` now run on the o1heap invariant-gate refusal path ahead of its `return nullptr`, demonstrated by a FORCED-GATE CONTROL run and not predicted from a soak in which the gate never fires
+
+- Task:        T43.1 (`build/w742.log` = no-regression soak, injector OFF; `build/w742ctl.log` = forced-gate control, `MCLA_T43_FORCE_INV_GATE=1`; build log `build_ninja.log` — **not** `build/w742_build.log`, see §8)
+- Type:        FIX
+- Class:       H
+- Priority:    P1
+- Evidence:    `build/w742ctl.log:210`/`:213`/`:214`/`:215` (first refusal, `[23:16:52.198]`) and `:298`/`:299`/`:300` (second, `[23:16:55.197]`) · `build/w742.log:30798-30801` and `:802` · `src/kernel/heap.cpp:3105`/`:3107`/`:3121`/`:3125`/`:3175-3178` · `build_ninja.log` 214 B, **3/3, 0 errors, 0 warnings** · `build/mcla.exe` **62,541,312 B, mtime 10-06 23:09:51** (was 62,540,800 B / 21:35:49 — the exe moved, rule 12 satisfied)
+
+**1. THE DEFECT WAS A CALL-ORDER BUG, AND THE ORDER IS THE WHOLE FINDING.** In `Heap::AllocPhysical` the invariant gate `if (!o1heapDoInvariantsHold(physicalHeap))` logged `AllocPhysical: o1heap invariants FAIL` and then did `return nullptr` **before** any of the three pool-state instruments ran — their only alloc-path call sites were below the gate. Consequence, measured in `build/w736.log` and recorded in `PROGRAM_GUIDE` §9: while the allocator refused *every* request because the heap was structurally broken, the last thing the log said about the pool was `PHYS-VERDICT-CHANGE none -> healthy`, and the state history simply stopped. **The row is a mirror of the last time the code reached it, not of the present state** — the same instrument-order class as the stale `PARK-SAMPLE` mirror (F-627/F-628 Correction 2). **The fix moves the emissions above the early return, it does not change any allocation behaviour:** `o1Amount` and `NotePhysAttempt()` are now hoisted to `heap.cpp:3105`/`:3107` so the gate arm can report the size o1heap actually classified, and the gate arm ends `EmitPhysState(...)` → `NotePhysVerdict(...)` → `NotePhysPoolFull(...)` → `return nullptr` at `:3175-3178`.
+
+**2. THE GATE IS DORMANT POST-F-779, SO NO NORMAL SOAK CAN PROVE THIS FIX — AND THAT IS WHY THE CONTROL EXISTS.** `w742.log` (298 s, 31,097 lines) holds **`invariants FAIL` = 0 rows**, exactly as `w741b` did: F-779 detached both o1heap instances into `VirtualAlloc`'d host memory, so the guest can no longer reach `diagnostics.capacity` at instance `+0x208`, and the invariant gate no longer trips. **A fix on a path that does not execute is unfalsifiable by soaking** (rule 19: a zero is not a result until the instrument is shown firing on an event you know happened). So the fix shipped with a one-line fault injector, `kT43ForceInvGate` at `heap.cpp:3121`, reading `MCLA_T43_FORCE_INV_GATE`, ORed into the gate condition at `:3125`. Injector OFF ⇒ `w742` is a clean no-regression run of the same binary. Injector ON ⇒ `w742ctl` is a positive control for the reordered path.
+
+**3. THE CONTROL'S FOUR ROWS, VERBATIM AND IN ORDER — THIS IS THE PROOF.** `build/w742ctl.log:210`, `[23:16:52.198]`:
+`AllocPhysical: o1heap invariants FAIL #1 size=0x2e80000 align=0x4000 cap=536870912 peak=0`
+then `:213` `PHYS-STATE #1 size=0x2e84020 align=0x4000 o1_frag=0x4000000 class_ok=1 opt_bin=20 … verdict=healthy … caller_rva=0x2eb768 glr=821325D4 tid=25060`,
+then `:214` `PHYS-VERDICT-CHANGE none -> healthy why=suitable_class_present split=exact refusals=1 req_amt=0x2e84020 req_class=20 req_frag=0x4000000 … capacity=0x20000000 oom=0 caller_rva=0x2eb768`,
+then `:215` `PHYS-POOL-FULL #1 model=console-512MiB cap_model=0x20000000 cap_o1=0x20000000 attempts=1 served=0 refused=1 … destroyed=0 class_present=1 … verdict=healthy glr=821325D4`.
+**All three rows that used to be unreachable now print, on the gate path, in the same millisecond as the refusal.** The second refusal repeats the shape at `:298-300` (`[23:16:55.197]`, `invariants FAIL #2 size=0x28`, `PHYS-STATE #2`, `PHYS-POOL-FULL #2 attempts=2 served=0 refused=2 class_present=2`) with **no second `PHYS-VERDICT-CHANGE`** — correct by design, since that printer fires only on a change (`heap.cpp:1042-1044`) and the verdict stayed `healthy`.
+
+**4. THREE FIELDS THAT MAKE THE ROWS SELF-AUTHENTICATING, AND THE ONE THING THE CONTROL DOES *NOT* PROVE.**
+(a) **`req_amt=0x2e84020` is nonzero ⇒ this is provably the ALLOC path.** The free-path call to `NotePhysVerdict` (`heap.cpp:3666`) prints `req_amt=0x0`, which is exactly what `w742.log:802` and `w736.log:910` show. So the control's verdict row cannot be a free-path row misread as an alloc-path one.
+(b) **`attempts == served + refused` holds** (`1 == 0 + 1`, then `2 == 0 + 2`), i.e. the F-640 attempt counter and the refusal counter are now fed by the same event rather than by two disjoint ones.
+(c) **`cap=536870912` = `0x20000000` is the control's own signature, not a healthy-looking accident.** A *real* invariant failure reads `cap=0` (that is `w736`'s measured `cap=0x0` against `want_cap=0x7fe7fdc0`, and `ClassifyPhysPool`'s `why="capacity_zero"` arm at `heap.cpp:782-788`). **Under a forced gate the pool is genuinely healthy, so the control proves REACHABILITY AND EMISSION ONLY.** It does **not** prove the `capacity_zero` classification, and it must not be cited as if it did. That chain is separate and rests on `w736`'s measured `cap=0` plus the classifier's own source.
+
+**5. NO-REGRESSION RUN `w742` — EVERY GATE CONDITION FROM THE TASK BRIEF, ALL MET (new vs named baseline `w741b`).** `invariants FAIL` **0 = 0**; `headIs=1` **1 = 1**; `dstAfter=61786772` **1 = 1**; `DRAW_INDEXED` **0 = 0**; `FATAL-SOFT` **0 = 0**; `XTL-ALLOC-REFUSED` **0 = 0** (F-779's win holds); `o1_cap_delta=0x240` **1 = 1**; `o1_capacity=0x20000000` **44 = 44**; `C0000005` **5 = 5**; `PRESENT` own-rows **49 = 49**; `VEH-NEUTRAL` **1 = 1**; `PHYS-STATE` **1 = 1**; `PHYS-VERDICT-CHANGE` **1 = 1**; `PHYS-POOL-FULL` **0 = 0**; `F374-HEAPSTORE` **32 = 32**; `HEAPHDR-STORE` **202 = 202**; `F635-CTR-OOR` **4 = 4**. CP truth: `drains=6 last_rptr=0016 pub=9 put=9` (caught up). `DEPTH: 31,097 vs 32,157 lines = 1.03x -> COMPARABLE`, **no `POISONED` verdict**. Mitigation total **2,047 → 2,031 (−16)**, owned entirely by `PARK-SAMPLE` **335 → 319**. The KWFSO poller family moved −327 each (`CAS-SITE`/`WAKE[KWFSO]`/`WAIT`/`WAKE`) — a timing artifact of a 298 s vs 300 s run and **never evidence of anything** (F-780 §10 class).
+
+**6. RULE 1a AND RULE 1b, DISCHARGED EXPLICITLY.** *1a (single-file bisect):* `src/kernel/heap.cpp` is the **only file whose code differs** from the build that produced `w741b`. `src/kernel/o1heap.c` was touched at 22:10 but **comment-only** — one additive hunk, and `w741b.log:49` already reads `o1_cap_delta=0x240`, a field that can only print if F-779's `o1heapInstanceSize()`/`o1heapInitSeparate()` code was in the 21:35 binary. So no attribution here is N-way. *1b (new-symbol taint):* this change adds exactly two new symbols to the tree — **`static const bool kT43ForceInvGate`** (`heap.cpp:3121`, a function-local static initialised once from `std::getenv`) and **`#include <cstdlib>`**. No new global state, no new thread, no new D3D12 call, no `RegisterFile` dependency.
+
+**7. THE INJECTOR STAYS, AS A PERMANENT RULE-19 CONTROL — AND THE CODE COMMENT THAT SAID OTHERWISE IS BEING CORRECTED.** The comment above `kT43ForceInvGate` currently ends *"Remove it once T43.1's control run is on disk."* The control run is on disk (`w742ctl.log`), but removing the injector would make the gate path **unfalsifiable again the moment F-779's fix holds** — which is the exact situation that produced this finding. Precedent in `src/` for env-gated, default-off controls: `cp_deferred_consume_experiment`, `cp_wait_regmem_ms`, `cp_ib_trace`, `MCLA_DXC_DIR`. Decision: **keep**, default-off, and it must be registered in `PROGRAM_GUIDE` §7 (host short-circuits) and §9 (markers) so the next session can see it — an unregistered control is indistinguishable from a silent short-circuit, which is do-not #9. The comment is corrected in the same build as F-782's fix, not in a build of its own.
+
+**8. TWO TOOL DEFECTS THIS TASK EXPOSED, BOTH CHEAP, NEITHER BLOCKING.** (a) **`build_on_e.bat` swallows its own build log.** It ends with `ninja -C build mcla.exe > build_ninja.log 2>&1`, so the `mcla-boot-cycle` skill's step-2 recipe (`… build > build/<wave>_build.log 2>&1`) captures **nothing** — `build/w742_build.log` is **0 bytes** and the real log is `build_ninja.log` at the repo root. The build was therefore verified from four independent artifacts instead of the log: two `.obj` mtimes, `.ninja_log` timings, the exe growing **+512 B**, and `build_ninja.log` itself. The skill's step 2 needs correcting. (b) `build/w742_err.log` is 101 B and **byte-identical in content to `w741b_err.log`** (one benign DXC line); `w742ctl_err.log` is 0 B.
+
+**9. CITATION ROT, MEASURED — 56 DISTINCT `heap.cpp:NNNN` CITATIONS ACROSS FOUR DOCS, IN THREE VINTAGES, FOR ONE DEFECT.** The *same* call-order defect is cited three incompatible ways in the live docs: `:3006`/`:3031` (`ROOT_CAUSE_VALIDATION`, `PROGRAM_GUIDE:743`), `:3096`/`:3121`/`:3252`/`:3255` (`LONG_TODO_MASTER:1551`/`:1600`/`:1617`, `HANDOFF_NEXT_AGENT:808`/`:859`), and `:3162`/`:3165`/`:3128`/`:3172`/`:3516` (`PROGRAM_GUIDE:740`). **All three were true when written; none is true now.** Many of the 56 point at comments or blank lines. Independent confirmation that the drift predates this task: `PHYS-FREE-SUM`'s printer had already moved `:3366` → `:3516` (+150) *before* T43.1 touched the file. **The durable form is symbol + snapshot date, not a bare line number** — which `heap.cpp`'s own comments already practise (`:645`, `:861`, `:1201`, `:1304`). Every doc citation of this defect is re-pointed in the same pass as F-782's fix, and `ROOT_CAUSE_VALIDATION:18462` gets a **superseding note** rather than an edit, since Part 3 is append-only.
+
+### F-782 — One of the five `C0000005`s in EVERY boot is ours, not the guest's: `EmitPhysState` calls `NotePhysLive` unconditionally, and that sweep `memcpy`s the guest window from `pos = 0` straight into the deliberate 4 KB `PAGE_NOACCESS` null guard — so the sweep faults on guest VA 0 on its first 1 MiB chunk, `PHYS-LIVE` has printed **0 rows in all 313 logs on disk**, and `PHYS-VERDICT-CHANGE` / `PHYS-POOL-FULL` are unreachable on the alloc-refusal path
+
+- Task:        T43.1 fallout; **blocker for T43.2** (`build/w742.log:30798-30801`, pre-change twin `build/w741b.log:31870-31873`)
+- Type:        FACT
+- Class:       H (an instrument's own defect — the alternative reading, D, would blame the allocator, and the allocator is exonerated by §4)
+- Priority:    P0
+- Evidence:    `src/kernel/heap.cpp:941` (the unconditional call) · `:1634`/`:1637-1638`/`:1640-1641`/`:1672`/`:1690`/`:1746` · `src/kernel/memory.cpp:409` and `:507-512` (the guard and its own rationale) · `src/kernel/memory.h:18-19` (`kBaseAddress = kSize = 0x100000000ULL`) · `build/w742.log:30798-30801` · `build/w741b.log:31870-31873` · `python tools/host_rva_resolve.py build/mcla.map --base 0x7FF721D40000 0x7ff725290a1b` → **`memcpy_repmovs +0xb`** · `PHYS-LIVE` **0 of 313** logs · `PHYS-POOL-FULL` **1 of 313** logs (`w742ctl`, 2 rows) · `PHYS-LARGE` **w742 = 63, w741b = 63, w742ctl = 0** · `### F-122` (the precedent)
+
+**1. THE CHAIN, IN SOURCE ORDER — FOUR HOPS, EVERY ONE VERIFIED.** `EmitPhysState` (`heap.cpp:936-942`) prints `PhysStateRow` and then calls **`NotePhysLive(seq)` at `:941` with no condition on it.** `NotePhysLive` (`:1634`) takes `base = GuestMemoryHeap::Instance().Base()` and `winSz = …Size()` (`:1640-1641`), resets its sweep `cursor.store(0, …)` whenever the biggest served block changes (`:1672`), and then walks the window in 1 MiB chunks with **`std::memcpy(chunk, base + pos, (size_t)n)` at `:1690`** — `kPhysLiveChunk` = 1 MiB, `kPhysLiveBudget` = 256 MiB (`:1626-1627`). **`base` is `0x100000000`** (`memory.h:18`) and **`pos` starts at 0**, so the first chunk reads host `[0x100000000, 0x100100000)`. **The first 4 KB of that range is `PAGE_NOACCESS` by design** — `VirtualProtect(m_base, 4096, PAGE_NOACCESS, &oldProtect)` at `memory.cpp:409`, whose own rationale is written at `:507-512` (*"The first 4 KB of the heap is a deliberate PAGE_NOACCESS null guard"*). **The sweep therefore faults on its very first copy, every time, deterministically.** It is a raw `base + pos`, i.e. it bypasses the checked guest helper and its `if (guestAddr < 4096u)` clause entirely — which is the only reason the guard did not catch it first.
+
+**2. WHY THE FAULT ADDRESS IS `0x100000000` IN EVERY RUN WHILE `hostRip` MOVES.** The guest window is reserved at a **fixed, non-ASLR** base (`kBaseAddress = 0x100000000ULL`, `memory.h:18`; `GuestMemoryBase`, `boot_host.cpp:78`), so host `0x100000000` **is guest VA 0** on every run. The host code address does move (`0x7ff60a85086b` in `w741b`, `0x7ff725290a1b` in `w742`) because that is the ASLR'd module. **A reader who notices only the invariant address will conclude "a guest null-pointer dereference" — the exact gloss `mcla-guest-raw-decode` teaches for `Param[1] == 0x7E780000`. Here that gloss is wrong**, because the reader is us.
+
+**3. `hostRip` RESOLVES INTO OUR OWN CRT, AND THE `lr=` LABEL IS STICKY AND WRONG.** `python tools/host_rva_resolve.py build/mcla.map --base 0x7FF721D40000 0x7ff725290a1b` → **`memcpy_repmovs +0xb`**, with the base taken from the log's own printed field (`w742.log:187`, `PARK-SAMPLE base=7ff721d40000`) rather than derived. Extent check per `AGENTS.md`: `memcpy_repmovs` RVA `0x143550a10`, next public `0x143550a20`, extent **0x10**, so `+0xb` lands inside. **The handler nonetheless prints `VEH-NEUTRAL guest AV: lr=82137904`** — `82137904` is the instruction after the `bl 82130528` inside `sub_821378B8`, i.e. the guest LR the translator last wrote before the host call, left sticky. **This is F-056 / do-not #14 verbatim: a fault whose `lr` points at a guest call site is not necessarily inside that callee, and not even necessarily in guest code.** Any census that buckets the five `C0000005`s by `lr=` puts this one in the guest's account.
+
+**4. THE DISCRIMINATOR THAT CONFIRMS THE MODEL RATHER THAN MERELY FITTING IT: `PHYS-LARGE` = 63 vs 0.** `NotePhysLive`'s first act is an early return when nothing large has been served (`:1637-1638`, `g_physPool.bigGuest == 0`). **`w742ctl` has `PHYS-LARGE` = 0 rows, so `bigGuest == 0`, so the sweep never runs, so nothing faults — and all three pool rows print.** `w742` and `w741b` have `PHYS-LARGE` = 63 each, so the sweep runs and faults. **The control run is clean for a reason internal to the model, and that reason is measurable in the same logs.** A hypothesis that cannot explain why its own control behaves differently is not a hypothesis; this one can, and the explaining field is printed on a different row.
+
+**5. WHAT IT COSTS — THREE BLIND SPOTS, ALL MEASURED OVER ALL 313 LOGS ON DISK.** (a) **`PHYS-LIVE`: 0 rows in 0 of 313 logs.** The instrument has never completed a single window since it was written. Per rule 19 its zero is not "the biggest block is never held" — it is *the instrument has never run*. (b) **`PHYS-POOL-FULL`: 0 rows in 312 of 313 logs**, the sole exception being `w742ctl` (2 rows). It fired in `w675` — quoted in `heap.cpp:956`'s own comment — but that log is off disk, so on-disk evidence says it has effectively never fired. (c) **`NotePhysVerdict` (`heap.cpp:3315`) and `NotePhysPoolFull` (`:3322`) are never reached on the alloc-refusal path**, because `EmitPhysState` at `:3312` faults *inside* `NotePhysLive` before returning. Measured shape, `w742.log:30798-30801`, all four lines `[23:13:35.903]`, all `thread=24128`: `o1heapAllocate returned null #1 size=0x19d … oom=1` → `PHYS-STATE #1 … verdict=healthy` → `VEH[3] (capped) code=0xC0000005` → `VEH-NEUTRAL … recovery disabled, declining`. **So the pool exhausts, prints one state row, throws an access violation, and the thread is left with a DECLINED exception rather than being parked — at the exact moment an allocation was refused.** That is why T43.1's reordering, though correct and though proven on the gate path, does **not** by itself make the verdict row honest on the *exhaustion* path: the emission still dies one call later. **T43.2 cannot be started until this is fixed.**
+
+**6. NOT CAUSED BY T43.1 — THE PRE-CHANGE TWIN IS IDENTICAL.** `w741b.log:31870-31873` (`[22:02:40.825]`, `thread=6148`, built at 21:35, **before** this change existed) carries the same four-line shape with the same fault address `0x100000000`; only `hostRip` differs (`0x7ff60a85086b`, that run's ASLR base). Same millisecond, same `tid` on both the state row and the exception. **The reordering changed which refusal path emits, not whether the sweep faults** — attribution here is single-variable and points away from T43.1.
+
+**7. `### F-122` IS THE SAME MECHANISM, 660 FINDINGS EARLIER, AND IT IS ALREADY IN THE LEDGER.** F-122's own heading: *"The 50 access violations were ours, not the guest's: … its source address wraps into the deliberate null guard page, and IsValid waves the copy through anyway."* **Same guard page, same "ours not the guest's" inversion, same class of bypass.** The difference is that F-122's copy went through a validity check that waved it through, while `NotePhysLive`'s does not consult a check at all. **The guard's 4096 is a bare literal in six places across three sites (`memory.cpp:133`/`:148`, `:409`/`:423`, `:442`/`:445`) with no named constant**, so nothing in the tree can be grepped for "who must respect the guard". That is the structural reason the same collision recurred.
+
+**8. `PHYS-LIVE` IS REGISTERED IN NO DOC — THE F-780 §9 DEFECT CLASS, RECURRING WITHIN ONE DAY.** Measured: `PHYS-LIVE` and `NotePhysLive` have **0 mentions in `PROGRAM_GUIDE`, `LONG_TODO_MASTER` and `HANDOFF_NEXT_AGENT`** (and 0 in the ledger before this entry). F-780 §1 was written about exactly this: *"A mitigation that exists in §7 and not in §9 is invisible"* — `markers_from_guide()` reads only §9 table first cells (`tools/soak_census.py:813-848`), so an unregistered literal is never counted and never printed as `+0`. **Here the consequence is worse than invisibility: because the marker was untracked, its permanent zero was never even a candidate for suspicion, and the fault it caused was being charged to the guest's `C0000005` budget in every census ever taken.**
+
+**9. THE FIX (NOT LANDED AS OF THIS ENTRY), AND ITS ONE DESIGN QUESTION.** Start the sweep above the guard: clamp both the initial `pos` and the `cursor.store(0, …)` reset at `heap.cpp:1672` to a named constant for the guard size, and read the window through the checked helper rather than a raw `base + pos` so the `guestAddr < 4096u` clause at `memory.cpp:507-512` participates. **The design question is whether the first 4 KB should be SKIPPED or READ-BACK-SAFELY**: skipping means a live physical pointer stored at guest VA ∈ [0,4096) is never seen — but nothing can legitimately live there, since the guard exists precisely to make guest VA 0 unreadable, so skipping loses no real signal. **Named constant, not a seventh bare `4096`.** Verification gate for the fix: `PHYS-LIVE` prints ≥1 row (its first ever), `PHYS-POOL-FULL` prints on the exhaustion path in a normal soak, `C0000005` drops **5 → 4**, and `VEH-NEUTRAL` loses the `host addr 0x100000000` row. **A `C0000005` count that does not drop is a refutation of this entry, not of the fix.**
+
+**10. RULE 19 APPLIED TO MYSELF — I NEARLY LEDGERED A FALSE "NEVER FIRED" FROM A TRUNCATED SCAN.** The first whole-disk census was written `for f in $(ls -1 *.log | head -60)`, which silently excludes `w742ctl.log` (it sorts past 60) and printed nothing at all. **That empty output would have supported "PHYS-POOL-FULL has never fired in any log" while excluding the one log on disk where it did fire.** The scan was re-run unbounded (`grep -aic … *.log`, all 313) and given a positive control (`grep -c "PHYS-POOL-FULL" src/kernel/heap.cpp` → 8, proving the literal exists and the pattern can match). **The instrument that was wrong was my own shell loop.** This is the eighth justification on record for a harness/tool admission test — nothing may report *pass* or *zero* until it has been shown to fail on a known-positive fixture.
+
+**11. THE T43.2 LEAD THIS EXPOSES, STATED AS A CONTRADICTION AND NOT AS A CONCLUSION.** On the very row where the allocation failed, the classifier reports the pool healthy: `w742.log:30798` reads `returned null #1 size=0x19d align=0x4000 o1_amount=0x41bd live=0x1dd08000 cap=0x20000000 peak=0x1dd08000 oom=1` and `:30799` reads `free=0x22f8000 free_ppm=68298 verdict=healthy why=suitable_class_present split=exact suitable=0x80000 smallest=0x80000 bin_mask=0x801c0 cand_mask=0xfffffffffffffe00 peak_req=0x12b84020`. **So: 36.8 MiB free against a 0x41bd (16.8 KB) request, a class-9 candidate, `suitable=0x80000` present, `split=exact` — and o1heap still returned null, with `live` = 499.6 MiB of the 512 MiB cap and `peak_req` = 314 MiB.** Either `ClassifyPhysPool`'s notion of "suitable" does not match what `o1heapAllocate` will actually split, or the failure is fragmentation rather than exhaustion and the `healthy` verdict is a category error. **This is a hypothesis with two named arms, not a finding; discriminating it needs the refusal path to survive past `EmitPhysState`, i.e. it needs §9's fix first.** `w741b.log:31870` carries the identical contradiction at `live=0x1dd0d000 free=0x22f3000 free_ppm=68260`, so it is reproducible across builds.
+
+### F-783 — F-782's null-guard fix is LANDED and VERIFIED in `w743`: `PHYS-LIVE` prints its first four rows in the instrument's life, `PHYS-POOL-FULL` fires four times on the exhaustion path, and our `host addr 0x100000000` fault is gone — but **F-782 §9's `C0000005` 5 → 4 gate was the wrong metric**: the count is conserved at **5 = 5** by substitution, and the discriminator is the fault ADDRESS
+
+- Task:        T43.1b (spawned by F-782); **unblocks T43.2** (`build/w743.log`, 300 s, `23:39:15` → `23:44:15`, survived; baseline `build/w742.log`)
+- Type:        FIX, carrying one correction to F-782 and four new FACTs
+- Class:       H → D (the instrument defect H is fixed; what it unblocked is an allocator-model contradiction, class D)
+- Priority:    P0
+- Evidence:    `build/w743.log:30954-30984` (the whole refusal window, verbatim below) · `build/w742.log:30798-30801` (the pre-fix twin) · `src/kernel/memory.h:20` (`kNullGuardBytes`) · `src/kernel/heap.cpp:1637` (`kPhysLiveStart`), `:1673`, `:1682`, `:1700`, `:1736` · `src/kernel/memory.cpp:133`/`:148`/`:409`/`:423`/`:437`/`:442`/`:445`/`:516` · `python tools/soak_census.py build/w743.log build/w742.log --unchanged` → **DEPTH 31,280 vs 31,097 = 1.01x COMPARABLE**, no POISONED verdict, 14 markers moved · `python tools/host_rva_resolve.py build/mcla.map 0x2eb768 0x2b5b5a 0x2d1793 0x3119a7 0x64feaf 0x64fed2 0x64ff06` (map mtime `23:38:52` = `mcla.exe` mtime, so the SAME build) · `src/kernel/heap.cpp:1465-1504` (the `NotePhysPoolFull` switch) · `:994-995` (the lock-hold, already documented in source)
+
+**1. THE FIX, AND ITS TWO NEW SYMBOLS (rule 1b discharged in the claim, not in a footnote).** `constexpr uint64_t kNullGuardBytes = 4096u;` at `src/kernel/memory.h:20`, with the rationale comment at `:13-19`; it replaces **eight bare `4096` literals at eight sites in `src/kernel/memory.cpp`** (`:133`, `:148`, `:409`, `:423`, `:437`, `:442`, `:445`, `:516`), so "who must respect the guard" is now greppable — the structural reason F-122 and then F-782 both happened. `constexpr uint64_t kPhysLiveStart = mcla::kernel::kNullGuardBytes;` at `src/kernel/heap.cpp:1637` is applied at **all three cursor-zeroing sites**: the initialiser `static std::atomic<uint64_t> cursor{kPhysLiveStart};` (`:1673`), the reset `cursor.store(kPhysLiveStart, …)` (`:1682`), and the wrap `pos = kPhysLiveStart;` (`:1736`). **No clamp was added on `cursor.load()`, because it is provably dead code once those three sites are fixed**: the reset branch always runs on a block's first call (`sweptFor` starts 0 and `g != 0` is guaranteed by the early return at `:1646`), so no un-clamped value can ever be loaded. `kRefPrintEvery = 4096` at `memory.cpp:44` was **deliberately left alone** — it is an unrelated print cadence that happens to share the value, and folding it into the constant would have made the substitution non-identity.
+
+**2. RULE 1a DISCHARGE — THREE FILES, ONE VARIABLE.** `git diff --name-only w742-build..HEAD ∩ src/` = `kernel/memory.h`, `kernel/memory.cpp`, `kernel/heap.cpp`. The `memory.cpp` change is a **provably value-identical literal → named-constant substitution** (same `4096u`, same eight expressions), so the only behavioural variable in the build is `kPhysLiveStart` at the three `heap.cpp` sites. That is single-variable attribution: **any delta between `w742` and `w743` is the sweep no longer faulting, or a consequence of it.**
+
+**3. THE GATE TABLE — EVERY GATE F-782 §9 SET, PLUS THE ONES IT DID NOT.** All counts are matching **lines**, case-insensitive, `build/w743.log` vs `build/w742.log`:
+
+| Signal | w742 | w743 | Verdict |
+|---|---|---|---|
+| `PHYS-LIVE` | **0** | **4** | ✅ **first rows in the instrument's life** (0 in all 313 prior logs on disk) |
+| `PHYS-POOL-FULL` | **0** | **4** | ✅ **first rows on the exhaustion path** (0 in 312 of 313; the sole prior exception was the forced-gate control `w742ctl`) |
+| `PHYS-STATE` | 1 | **4** | ✅ one per refusal instead of one-then-fault |
+| `host addr 0x100000000` | **1** | **0** | ✅ **THE discriminator. Our fault is gone.** |
+| `host addr 0x7e780000` | 0 | **1** | the guest's own fault took the freed slot (§5) |
+| `code=0xC0000005` | **5** | **5** | ⚠️ **conserved — F-782 §9 predicted 5 → 4 and was WRONG (§4)** |
+| `XTL-ALLOC-REFUSED` | 0 | **4** | ✅ **unmasked, not new** (§6) |
+| `returned null` | 1 | **4** | same unmasking |
+| `F635-CTR-OOR` | 4 | **5** | +1 = the guest fault that now reaches the VEH (§5) |
+| `invariants FAIL` | 0 | 0 | ✅ no regression on the F-779 route |
+| `PHYS-LARGE` | 63 | 63 | ✅ **held at 63** — the discriminator F-782 §4 relied on is unchanged, so `bigGuest != 0` in both and the sweep ran in both |
+| `PHYS-VERDICT-CHANGE` | 1 | **1** | 🔴 **still one row, and it is the free path's** (§10) |
+| `headIs=1` / `dstAfter=61786772` | 1 / 1 | 1 / 1 | ✅ F-766's gates held |
+| `DRAW_INDEXED` / `FATAL-SOFT` / `Fatal error` / `80000003` | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | ✅ unchanged — **no menu, no draw, as before** |
+| `w743_err.log` vs `w742_err.log` | 101 B | 101 B | ✅ byte-identical |
+
+**4. F-782 §9 PREDICTED `C0000005` 5 → 4 AND SAID "A COUNT THAT DOES NOT DROP IS A REFUTATION OF THIS ENTRY". THE COUNT DID NOT DROP. THE PREDICTION WAS THE DEFECT, NOT THE FIX.** Measured: `grep -aic "code=0xC0000005"` = **5 in both logs** (a bare `C0000005` gives 7 in both, because two of the seven are the `VEH W0: parking thread …` echoes of the same three events — the census skill's `code=0x…`-context rule, applied). **The count is conserved by SUBSTITUTION.** In `w742` the third `C0000005` was ours; in `w743` the guest's own fault arrives 1 ms later and takes the same `VEH[3] (capped)` slot:
+
+```
+w742.log:30800 [23:13:35.903] VEH[3] (capped) code=0xC0000005 addr=0x0x7ff725290a1b nParams=2 thread=24128
+w742.log:30801 [23:13:35.903] VEH-NEUTRAL guest AV: lr=82137904 read of host addr 0x100000000 (hostRip=0x7ff725290a1b)
+w743.log:30983 [23:41:35.946] VEH[3] (capped) code=0xC0000005 addr=0x0x7ff67d01ff1f nParams=2 thread=8284
+w743.log:30984 [23:41:35.946] VEH-NEUTRAL guest AV: lr=8218B458  read of host addr 0x7e780000  (hostRip=0x7ff67d01ff1f)
+```
+
+**The lesson is general and it is rule 19 pointed at my own gate: a total that counts events from two different producers cannot be the acceptance test for removing one of them.** The `VEH[3] (capped)` printer caps at three rows, so removing our fault did not reduce the number of faults *recorded* — it changed *which* faults were recorded. The correct gate is the field that identifies the producer, `host addr`, and it moved **1 → 0** exactly as modelled. **Any future gate of the form "count X drops by one" must first establish that X's producer population is closed** — here it was not, because the guest faults in the same window and the printer is capped.
+
+**5. WHO TOOK THE FREED SLOT: THE GUEST'S OWN FAULT, INSIDE `sub_8218B0C8` — THE HANDOFF'S NAMED OPEN WALL.** This was not expected and it is the most useful thing `w743` produced. Four consecutive rows, all `[23:41:35.946]`, all `tid=8284` (`w743.log:30978-30984`):
+
+```
+GUESTVIEW-U32-FABZERO  #6 va=00000000 size=4 why=range … caller_rva=0x64feaf
+GUESTVIEW-U32-REFUSED  #6 va=00000000 … lo_va=00000000 hi_va=00000100 by_why=[range=6 nullout=0 av=0]
+GUESTVIEW-U32-FABZERO  #7 va=00000008 size=4 why=range … caller_rva=0x64fed2
+GUESTVIEW-U32-REFUSED  #7 va=00000008 … lo_va=00000000 hi_va=00000100 by_why=[range=7 nullout=0 av=0]
+F635-CTR-OOR           #3 ctr=00000000 slot_off=0xFFFFFFFEFBDA0000 slot_guest_va=0xFFFFFFFF7E780000 load_addr=0x7E780000 base=0x100000000 lr=8218B458 caller_rva=0x64ff06
+VEH[3] (capped) code=0xC0000005 … → VEH-NEUTRAL … lr=8218B458 read of host addr 0x7e780000
+```
+
+Resolved against `build/mcla.map` from the **same** build (`23:38:52` for both `.exe` and `.map`, base `7ff67c9d0000` from `w743.log:186`'s own printed field): `0x64feaf` → **`__imp__sub_8218B0C8 +0xcef`**, `0x64fed2` → **`+0xd12`**, `0x64ff06` → **`+0xd46`**, and the faulting `hostRip` `0x7ff67d01ff1f` → **`+0xd5f`**. **All four host addresses are inside the ONE recompiled body of `sub_8218B0C8`, within 0x70 bytes of each other**, and the guest `lr=8218B458` is `sub_8218B0C8 + 0x390`. **So the exception that F-782's sweep had been masking is the handoff's own named blocker — "*why is `ctx.r3` unreadable at `sub_8218B0C8`?*" — and it is now visible with its own instrumentation attached.** The mechanism the rows spell out: the body reads guest VA `0` and `8` through the *checked* helper, which fabricates zero and logs `why=range` (`va is BELOW the 0x1000 guard-page floor`); `ctr` is `00000000`; `slot_off` is a sign-extended garbage value `0xFFFFFFFEFBDA0000`; the resulting `load_addr=0x7E780000` (= guest VA 0 per `mcla-guest-raw-decode`'s `Param[1] == 0x7E780000` gloss) is then read **unchecked** and faults. **Two reads of the same null, one guarded and one not, 0x19 bytes apart in the host body.** That asymmetry — not the null itself — is what makes it an access violation rather than a `FABZERO`.
+
+**6. `XTL-ALLOC-REFUSED` 0 → 4 IS UNMASKING, NOT A REGRESSION — AND THE PROOF IS BYTE-IDENTITY ON TWO INDEPENDENT ROWS.** This nearly went in as a regression. It is not.
+
+*(i) The row that the fault cut short.* `w742.log:30798` and `w743.log:30954` are the **same row**, field for field, differing only in the timestamp:
+
+```
+[23:13:35.903] AllocPhysical: o1heapAllocate returned null #1 size=0x19d align=0x4000 o1_amount=0x41bd live=0x1dd08000 cap=0x20000000 peak=0x1dd08000 oom=1 caller_rva=0x2b5b5a glr=82137904
+[23:41:35.779] AllocPhysical: o1heapAllocate returned null #1 size=0x19d align=0x4000 o1_amount=0x41bd live=0x1dd08000 cap=0x20000000 peak=0x1dd08000 oom=1 caller_rva=0x2b5b5a glr=82137904
+```
+
+`live=0x1dd08000`, `cap`, `peak`, `size`, `align`, `o1_amount`, `caller_rva` and `glr` are **all identical**, so the pool was in the same state at the same request. In `w742` the thread took our `memcpy` fault two lines later (`:30800`) **before `__xtl_alloc`'s own `if (ctx.r3.u32 == 0)` check could run**, so the `XTL-ALLOC-REFUSED` printer was never reached — the refusal happened, and only its *report* was lost.
+
+*(ii) The success path, as an independent control.* `XTL-ALLOC` (the success printer) has **14 rows in both logs**, and its last row is identical down to the request index:
+
+```
+w742.log:13034 [23:11:31.574] XTL-ALLOC #3072 size=996 align=16 -> BDF8C000 glr=8218A1D4 seen=3072 refused=0
+w743.log       [23:39:30.429] XTL-ALLOC #3072 size=996 align=16 -> BDF90000 glr=8218A1D4 seen=3072 refused=0
+```
+
+**Same `#3072`, same `size=996 align=16`, same `glr=8218A1D4`, same `seen=3072`, same `refused=0` — only the returned pointer differs (`BDF8C000` vs `BDF90000`), which is ordinary run-to-run placement.** So the guest's allocation *behaviour* did not change; the four new rows are the same four events `w742` had already recorded one layer down and then lost. **(The two runs are NOT at the same total request count — `seen=3195…3198` on the refusal rows is a later instant than `#3072` — so an earlier draft of this section that claimed "the same 3,195 requests in both runs" was unsupported and is withdrawn; the identity that carries the argument is the `#3072` row and the 14-row count, not a total.)** **A marker rising because a *downstream* printer was unblocked is the mirror image of F-434/F-436 (a marker rising because my own new log lines contain the token); both are reasons to enumerate which tool emitted a row before reading its delta.**
+
+**7. THE SWEEP IS NOW A MEASURED PERTURBATION, NOT A HYPOTHESIS: ~41 ms PER EMISSION UNDER `physicalMutex`, ~166 ms TOTAL.** The refusal window's timestamps are `.779 → .821 → .861 → .903 → .945/.946`, and the interleaving (`w743.log:30954-30976`) is rigid:
+
+```
+.779  returned null #1 → PHYS-STATE #1                 ← EmitPhysState prints its row
+.821  PHYS-LIVE #1 → PHYS-POOL-FULL #1 → XTL-ALLOC-REFUSED #1 → BE710-DEAD #138
+.821  returned null #2 → PHYS-STATE #2                 ← SAME MILLISECOND as the row above
+.861  PHYS-LIVE #2 → PHYS-POOL-FULL #2 → XTL-ALLOC-REFUSED #2 → BE710-DEAD #139
+.861  returned null #3 → PHYS-STATE #3
+…
+```
+
+**The guest's next call lands in the SAME millisecond as the preceding refusal's last row, so the guest is not retrying slowly — the 40-42 ms gap is entirely ours**, and it is `NotePhysLive`'s 256 MiB `std::memcpy` at `heap.cpp:1700` (`kPhysLiveBudget`, `:1627`), i.e. ≈6.2 GB/s. It runs **inside the allocation lock**: `heap.cpp:2979` is `std::lock_guard lock(physicalMutex)` in `Heap::AllocPhysical`, `:3193`/`:3195` and `:3330`/`:3340` are the `EmitPhysState` / `NotePhysPoolFull` calls, and **the source already says so** at `:994-995` (*"while holding `physicalMutex` — `EmitPhysState` is called from `Heap::AllocPhysical`, which holds it from its `std::lock_guard lock(physicalMutex)` to its return"*). Total injected latency **166 ms across four refusals**, on the thread that is trying to allocate. My own T43.1 comment at `:3191` predicted this cost (*"bounded to 16 rows of 256 MiB overall, already paid by the path"*) and **that prediction was unverified when written, because the sweep had never actually run** — F-782 §5(a). It is verified now, and it is worse than "already paid": it is paid on the *refusal* path, four times in 166 ms, while the guest waits on the mutex. **Queued as T43.1c; NOT changed in this pass (§12).**
+
+**8. THE SWEEP IS AIMED AT THE WRONG TWO GIBIBYTES, SO `guest_refs=0` IS NOT EVIDENCE OF ANYTHING.** All four rows are identical except `state_seq` and `sweep_ppm`:
+
+```
+PHYS-LIVE #1 state_seq=1 block_guest=A3A8C000 frag=0x12b85000 size=0x12b80000 alloc_seq=3 caller_rva=0x2eb768
+          glr=821325D4 freed=0 reg_hit=0 reg_total=3236 guest_refs=0 pool_refs=0
+          scanned=256.0MB sweep_ppm=62500 complete=0 pass=0 hits=0
+```
+
+`sweep_ppm` = 62500 / 125000 / 187500 / 250000, i.e. **1/16 of the window per emission, 4/16 = 25% covered, `complete=0 pass=0`** — a full pass needs **16** emissions and none has ever finished one. The sweep starts at `kPhysLiveStart` and walks linearly, so its first 1 GiB of budget covers guest VA `[0x1000, 0x40001000)`, which contains **neither the guest image (`0x82000000+`) nor the physical arena**. **The block it is looking for references TO is itself at `0xA3A8C000` = 2.557 GiB into the 4 GiB window = 63.9% = emission #11 of 16.** So the sweep has not yet reached the region where the block lives, let alone scanned the image that would point at it. **`guest_refs=0` at 25% coverage is a statement about the sweep's aim, not about the block's liveness** — and per rule 19, an instrument whose positive result is unreachable in the run being read has not reported a negative. This is T43.1c's second arm: re-aim at `[0x80000000, 0xC0400000)` or scan the block's own neighbourhood first.
+
+**9. `max_refused=0x0` AND THE ALL-ZERO BUCKETS ARE CORRECT, NOT DEAD FIELDS — DO NOT "FIX" THEM.** The newly-unblocked row prints `refused=1…4 class_present=1…4 buckets=[le64K=0 le512K=0 le4M=0 le32M=0 gt32M=0] max_refused=0x0 max_refused_frag=0x0`, which looks exactly like the F-780 §9 / F-782 §8 defect class (a row whose fields are never fed). **It is not.** `NotePhysPoolFull`'s switch at `heap.cpp:1465-1504` puts the histogram (`:1471-1478`) and `PhysPoolBumpMax(maxReq/maxFrag, …)` (`:1479-1480`) **only in the `case PhysVerdict::Exhausted:` arm**, and our four refusals classify `Healthy`, taking `:1495-1497`, whose own comment says so at `:1493-1494`: *"It is deliberately NOT bucketed: these refusals are the granular scan's, and their size profile is the console's page rounding, not a property of the pool's exhaustion."* **That is F-643's arm working exactly as written** — and the fact that it is now the arm that fires is itself the finding (§10). Two further zeroes are also correct by arithmetic, not by omission: `over_cap=0` because `req.frag (0x8000) > capacity (0x20000000)` is false, so `roundedOverPool` (`:1441-1445`) cannot fire; `granfit_missed=0` because F-642's test at `:1459` needs `freeBytes < req.frag`, and `0x22f8000 < 0x8000` is false. **I checked these because a zero on a row I had just unblocked was exactly where a dead field would hide — and rule 19's corollary cuts both ways: before calling a zero an artifact, read the gate that produces it.**
+
+**10. T43.2 IS NO LONGER A HYPOTHESIS WAITING ON A FIX — IT IS A QUANTIFIED CONTRADICTION, REPRODUCIBLE FOUR TIMES PER BOOT.** F-782 §11 stated this as "two named arms, not a finding", because discriminating it needed the refusal path to survive past `EmitPhysState`. **It now survives, and all four rows say the same thing.** From `PHYS-STATE #1` (`w743.log:30955`): `size=0x41bd align=0x4000 o1_frag=0x8000 class_ok=1 opt_bin=9 suitable=0x80000 smallest=0x80000 bin_mask=0x801c0 cand_mask=0xfffffffffffffe00 allocated=0x1dd08000 capacity=0x20000000 free=0x22f8000 free_ppm=68298 verdict=healthy why=suitable_class_present split=exact pfrag=0x5000 page_fits=1 pow2_fits=1`. Computed, not eyeballed:
+
+- `free = 0x22f8000` = 36,667,392 B = **34.97 MiB**, and `free / o1_frag = 36,667,392 / 32,768` = **1,119× the fragment the request needs**.
+- `bin_mask = 0x801c0` = bits **{6, 7, 8, 19}**; `opt_bin = 9` is **NOT** in it; `suitable = 0x80000 = 2^19`, i.e. the classifier's plan is *take a bin-19 (512 KiB) fragment and split it down four halvings to bin 9 (32 KiB)*.
+- Every one of the model's own tests passes: `class_ok=1`, `page_fits=1`, `pow2_fits=1`, `split=exact`, `full=0`, `over_cap=0`, `over_frag=0`, `destroyed=0`.
+
+**And `o1heapAllocate` returned null.** So either `O1BinMask` misreads o1heap's internal bin state — bin 19 is reported non-empty but is not usable — or o1heap's split path has a guard the classifier does not model. **`PHYS-VERDICT-CHANGE` stayed at ONE row across all four refusals** (`w743.log:802`, `[23:39:18.072]`, `none -> healthy why=suitable_class_present split=collapsed refusals=0 req_amt=0x0 caller_rva=0x2d1793` → **`DestroyKernelObject +0x133`**, i.e. the *free* path, 2 min 17 s before the refusals). **The verdict therefore never changed on the refusal path — it reported `healthy` before and `healthy` during — which means T43.1's reordering, though proven on the gate path (F-781 §2-§3), still does not make the verdict row informative here, because the classifier genuinely does not consider this a state change.** That is a third arm for T43.2 and it is a *modelling* defect, not an ordering one.
+
+**11. THE `alloc_seq=3` LEAD, WITH NAMED HOST SYMBOLS.** `PHYS-LIVE`'s `caller_rva=0x2eb768` resolves to **`MmAllocatePhysicalMemoryEx +0x38`**, and `glr=821325D4` is the guest return address inside `sub_82132578`. So: **the third physical allocation of the entire boot** (`alloc_seq=3`) asked for `size=0x12b80000` = **314 MiB** (`frag=0x12b85000`), got it at `block_guest=0xA3A8C000`, and per the row **was never freed** (`freed=0`, `big_freed=0`) — while `pool_refs=0` and the host's own live-pointer registry holds **`reg_hit=0` of `reg_total=3236`** entries inside it. **`freed=0` and `reg_hit=0` are in direct tension**: a 314 MiB block that was never freed and that nothing in 3,236 registered live pointers references. Per §8 the guest-side half of that (`guest_refs=0`) is not yet evidence, but `reg_hit` is a host-side count and is not subject to the sweep's aim. The other `caller_rva` on the same window, `0x2b5b5a` → **`GuestMemoryHeap::Alloc +0x1a`**, is the refusing path; `0x3119a7` → **`Heap::AllocPhysical<Semaphore> +0x27`** shows the same instrumentation reachable from a kernel-object allocation. **T43.2 should start at `MmAllocatePhysicalMemoryEx +0x38` / `alloc_seq=3` / 314 MiB, and the first question is who still holds `0xA3A8C000`.** Separately noted, not interpreted: `BE710-DEAD #138…#141` fires once per refusal with `outcome=REFUSE-NO-BODY` and `r4` = `A042C600`, `3CDB24AF`, `3CDB24BB`, `3CDB24C7` — the first is inside the physical arena, the latter three advance by exactly **+12** each, i.e. a caller walking 12-byte records and getting a null body for each.
+
+**12. WHAT I DELIBERATELY DID NOT CHANGE, AND WHY.** `kPhysLiveBudget` (256 MiB) and the sweep's aim both stay as they were. Changing either here would make `w743` differ from `w742` by **two** variables and destroy the rule-1a attribution that makes §3-§6 mean anything; and the plan-discipline rule requires a *recorded refutation* plus re-approval before pivoting a task's scope. §7 and §8 are that recorded refutation, and **T43.1c is queued for the next pass** rather than folded into this one. **The one thing that did change beyond the fix is a comment**: `heap.cpp`'s injector block now cites `build/w742ctl.log:210-215` as the control's location (F-781 §7), replacing a sentence that had asserted the control did not exist.
+
+**13. TWO SMALL CORRECTIONS TO THE RECORD, BOTH MINE.** (a) **F-782 §11 called `free=0x22f8000` "36.8 MiB"; it is 34.97 MiB** — 36,667,392 B is 36.7 *decimal* megabytes wearing a MiB label. The ratio that matters is unaffected and is now stated in §10 as **1,119×**. (b) F-782 §5(b) said `PHYS-POOL-FULL` was "0 rows in 312 of 313 logs, the sole exception `w742ctl` (2 rows)". **`w743` is now the second exception, with 4 rows, and it is the first on a *natural* exhaustion path rather than a forced gate** — `w742ctl`'s rows carried `cap=536870912` (the injector's own signature, F-781 §4), while `w743`'s carry `cap_o1=0x20000000` = the real 512 MiB console model. **So `w743.log:30957` is the first honest `PHYS-POOL-FULL` row this project has ever produced.**
+
+
+### F-784 — T44 PHASE 3 NAMES THE WRITER: both o1heap free-fragment cards (`BDA1F000`, `BE12A000`) are zeroed by the guest's own memcpy (`sub_823DA950`, store PCs `__imp__sub_823DA950 +0x2df..+0x3f3`) called from `sub_821BE250+0x16c` (`lr=821BE3BC`), caught live with `pre` values that decode under `FragmentHeader`'s own layout to exactly the bin-8 / bin-19 sizes the refusal probe later reports unusable — the cards were LIVE LINKED FREE FRAGMENTS when destroyed, which resolves the T43.2 `PHYS-STATE healthy` vs refusal contradiction
+
+- Task:       T43.8 (LONG_TODO §6, "trace `lr=821BE3BC`") + T44 phase 3; answer run `build/w748.log`
+- Type:       FACT (attribution + measurement), with the instrument's own record
+- Class:      D (root-cause diagnosis of the allocator refusal)
+- Priority:   P0 — this is the writer of the destruction behind every physical-alloc refusal
+- Evidence:   `build/w748.log` (300 s soak, exe 10-07 07:17:50, 32,455 lines, 07:20:00.852–07:25:00.360);
+              `build/mcla.map` (same build); `tools/host_rva_resolve.py`, `tools/ppc_disasm.py`,
+              `tools/ppc_xrefs.py`; `src/gpu_cp.cpp:7512-7660` (T44 prio arm/selftest/totals printers),
+              `src/gpu_device.cpp:25422-25512` (T44-WIPE-MEMCPY extent rows), `src/kernel/o1heap.c`,
+              `src/kernel/o1heap.h`. Every line number below was re-read from the log this session
+              (RULE 0); none is quoted from memory.
+
+## 1. THE WRITER, ON ROWS
+
+Six printed `T44-WIPE-STORE kind=prio` rows show a nonzero destination going to zero with the
+`pre` snapshot intact — i.e. the instrument watched the store happen and read the old bytes first
+(printer semantics `src/gpu_cp.cpp:7551-7554`, format `:7582-7584`, wipe predicate `:7560`):
+
+| log line | time (07:) | addr | field | `pre` (raw) | op / val |
+|---|---|---|---|---|---|
+| `w748.log:19013` | 20:38.837 | `BDA1F000` | +0x00 next | `30A2BD01000000` | U64 / 0 |
+| `w748.log:19014` | 20:38.837 | `BDA1F000` | +0x08 prev | `A0A1BD01000000` | U64 / 0 |
+| `w748.log:19015` | 20:38.837 | `BDA1F000` | +0x10 size | `40000000000000` | U64 / 0 |
+| `w748.log:19017` | 20:38.837 | `BDA1F000` | +0x20 next_free | `93BD01000000` | U64 / 0 |
+| `w748.log:19359` | 20:39.062 | `BE12A000` | +0x08 prev | `5012BE01000000` | U64 / 0 |
+| `w748.log:19360` | 20:39.062 | `BE12A000` | +0x10 size | `602D0200000000` | U64 / 0 |
+
+(`:19016`, `BDA1F000+0x18`, had `pre=0` — already zero, not a wipe.) Every one of these rows
+carries `lr=821BE3BC sp=8EFFECD0` and one of five distinct host PCs
+`0x7ff79667533f / 5384 / 53c9 / 540e / 5453`.
+
+**Guest side.** `python tools/ppc_disasm.py 0x821BE3B0 6` prints `821BE3B8 4821C599 bl 823DA950`,
+so `lr=821BE3BC` is exactly `sub_821BE250+0x16c` — the instruction after a direct call to the
+guest memcpy `sub_823DA950`. `python tools/ppc_xrefs.py calls 0x821BE250` resolves
+`sub_8218B0C8`'s four call sites: `+0x64` (0x8218b12c), `+0x98` (0x8218b160), `+0x1f4`
+(0x8218b2bc) — all three pass stack buffers — and **`+0x238` (0x8218b300), whose destination is
+an allocation result from `sub_82130528` and whose length is `r22` sourced from the stream**.
+
+**Host side.** Base = `0x7ff794f70000`, anchored independently by `w748.log:25985`
+(`hostRIP=0x7FF79519E78D rva=0X22E78D` -> `WriteU64BE+0xdd` via `tools/host_rva_resolve.py`).
+The five store PCs resolve to rvas `0x170533f/5384/53c9/540e/5453` =
+`__imp__sub_823DA950 +0x2df/+0x324/+0x369/+0x3ae/+0x3f3`. Extent-checked against this build's
+map (AGENTS.md nearest-preceding-PUBLIC trap): `__imp__sub_823DA950` = RVA `0x1705060`, next
+public `__imp__sub_823DADD8` = `0x1705F90`, **extent `0xF30`** — all five offsets sit inside it,
+and the symbol lives in section 1 (code). The generated body itself is
+`generated/ppc_xenon/ppc_recomp.69.cpp:22055` (`r3=dst, r4=src, r5=len`; head/`stdu` loops at
+`:22234-22265`), reached through the `PPC_FUNC(sub_823DA950)` hook in `src/gpu_device.cpp:25430`
+whose own rows (`F382-MEMCPY-LIVE calls=1`, `w748.log:203`) prove the hook is on the live path.
+
+**Therefore: the stores that destroyed both cards are guest-recompiled memcpy store
+instructions, invoked from `sub_821BE250+0x16c`.** Not host o1heap code, not a raw host
+`memset`.
+
+## 2. THE `pre` VALUES ARE FRAGMENT HEADERS — AND THE SIZES PROVE IT (not just suggest it)
+
+Decode method (all measured):
+- Printer: `pre` = the 8 destination bytes read **big-endian as the guest sees them** (`src/gpu_cp.cpp:7551-7554`), printed with `{:X}`.
+- Struct: `FragmentHeader` = `next` (8) `prev` (8) `size` (8) `used` (1), then `Fragment.next_free`, `Fragment.prev_free` (`src/kernel/o1heap.c:138-153`). The o1heap instance is **host code on x86-64**, so its fields are little-endian in memory.
+- So: pad the printed `pre` to 16 hex digits -> that is the memory byte order -> read it little-endian -> the field value.
+
+Decodes (arithmetic, not intuition):
+
+| row | field | memory bytes | little-endian value |
+|---|---|---|---|
+| `BDA1F000` +0x00 | `next` | `00 30 A2 BD 01 00 00 00` | `0x00000001BDA23000` |
+| `BDA1F000` +0x08 | `prev` | `00 A0 A1 BD 01 00 00 00` | `0x00000001BDA1A000` |
+| `BDA1F000` +0x10 | `size` | `00 40 00 00 00 00 00 00` | **`0x4000`** |
+| `BDA1F000` +0x20 | `next_free` | `00 00 93 BD 01 00 00 00` | `0x00000001BD930000` |
+| `BE12A000` +0x08 | `prev` | `00 50 12 BE 01 00 00 00` | `0x00000001BE125000` |
+| `BE12A000` +0x10 | `size` | `00 60 2D 02 00 00 00 00` | **`0x22D6000`** |
+
+**The cross-check that makes this a measurement:** `rebin`/`unbin` place a fragment in
+`idx = log2Floor(header.size / FRAGMENT_SIZE_MIN)` (`src/kernel/o1heap.c:236` and `:257`), with
+`FRAGMENT_SIZE_MIN = O1HEAP_ALIGNMENT * 2` (`:111`) and `O1HEAP_ALIGNMENT = sizeof(void*)*4 = 32`
+(`src/kernel/o1heap.h:34`), so the divisor is 64. The two decoded sizes give:
+
+- `log2Floor(0x4000 / 64)` = `log2Floor(256)` = **8**
+- `log2Floor(0x22D6000 / 64)` = `log2Floor(570880)` = **19** (2^19 = 524288)
+
+and the refusal-time probe `PHYS-BINPROBE #1` (`w748.log:32075`, 07:22:20.926) reports those
+very cards in those very bins: `b0=[bin=8 ... gva=BDA1F000 aoff=0x1d61f000 prev=0 next=0]`,
+`b1=[bin=19 ... gva=BE12A000 aoff=0x1dd2a000 prev=0 next=0]`, `found_bin=-1`, `n_ge=0`,
+`head=0`. The wiped `size` fields decode to exactly the sizes whose o1heap bin indices are the
+bins the allocator itself says those cards occupy. Two independent computations (wipe-time bytes
+vs allocator's bin walk) agree to the bit.
+
+The pointer decodes are independently coherent: host pointers are `guest_va + 0x100000000`
+(F-782 measured `base = 0x100000000` for this mapping), so `prev = 0x1BDA1A000` points at
+`BDA1A000` = the card minus `0x5000` (the preceding fragment) and `next = 0x1BDA23000` points at
+`BDA23000` = **exactly card + size 0x4000**, the start of the following fragment. `used` at +0x18
+was 0 (free). This is a linked free-fragment header, whole, at the moment it was zeroed.
+
+## 3. TIMELINE (w748, thread tid 6328 wherever a row prints tid)
+
+| time | event | citation |
+|---|---|---|
+| 07:20:00.978 | T44-WIPE-SELFTEST: `read=4/4 hdr=[00000000,00000000]x4 ... hits=12 expect_hits=12` — cards zero at boot; **positive control** (rule 19) | `:64` |
+| 07:20:01.333 | probe #0: `prio_hits=[3,3,3,3] prio_wipes=0 ring_next=12` | `:225` |
+| 07:20:14.810–15.340 | 75 `T44-WIPE-MEMCPY` extent rows (see §8), all tiny `len=0x10` | `:10738`–`:12482` |
+| 07:20:15.536–540 | 40 `F774-PHYS-MEMCPY` rows, `len=2`, `lr=821BE3BC sp=8EFFEC20` | `:13476`+ |
+| 07:20:24.138–141 | the A0400000 instance burst: `F375-HEAPSTORE` ×8 (`r3=A03FFFF8 r4=93C63E40 r5=FFFFFFAF`, `lr=821BE3BC sp=8EFFECD0`) + `HEAPHDR-STORE` ×202, all inside 3 ms | `:15767`,`:15845-:15875`; `:15842`–`:16080` |
+| **07:20:38.837** | **`BDA1F000` header fields wiped** (4 rows, §1) | `:19013-:19017` |
+| **07:20:39.062** | **`BE12A000` header fields wiped** (2 rows, §1) | `:19359-:19360` |
+| 07:20:39.067 | last printed prio row — **no card-page store after this** (counters confirm, §4) | `:19611` |
+| 07:21:11.848 | F374 guard `trip=5` write-side, `guestLR=821BE3BC` | `:25985` |
+| 07:22:20.926–20.966 | refusal ×4: `o1heapAllocate returned null size=0x19d align=0x4000 o1_amount=0x41bd live=0x1dd03000 cap=0x20000000 oom=1 caller_rva=0x2b958a glr=82137904` | `:32057`,`:32081`,`:32105`,`:32129` |
+| 07:22:20.926–21.046 | `T44-TOTALS` probes #1–#4, **byte-identical counters** | `:32058`,`:32082`,`:32106`,`:32130` |
+| 07:22:20.926+ | `PHYS-POOL-FULL` ×4: `attempts=3811..3814 served=3810 refused=1..4` | `:32078`,`:32102`,`:32126`,`:32150` |
+| 07:22:21.087 | `VEH-NEUTRAL` read of `0x7e780000`, `lr=8218B458` (F-783 / §9.4 fault) | `:32159` |
+| 07:22:21.046 → log end | `PARK-MIRROR-STACK mirror=STALE` rows to `07:25:00.360`, `sp=8EFFED60 lr=8218B458` | `:32169`–`:32455` |
+
+Causal chain, one thread: cards zeroed (20:38/39) -> the only remaining fragment big enough for
+page-aligned physical allocs is gone -> refusals ×4 (22:20) -> stream reader faults on
+`0x7e780000` (22:21) -> thread parks permanently. Refusal row `live=0x1dd03000 cap=0x20000000`:
+3810 served allocations of 400-ish MiB still stand; the pool never emptied — **the allocator
+stopped being able to see usable fragments.**
+
+## 4. LINKED-BEFORE-WIPE IS PROVEN, AND THE EVIDENCE IS BUDGET-IMMUNE
+
+Printed rows are budget-capped (`src/gpu_cp.cpp:7580-7581`: first 128 rows per page, then every
+256th), so silence in the row stream is worthless. The counters are not capped:
+
+- `T44-TOTALS` probes #1–#4 (`:32058/:32082/:32106/:32130`) are **identical**:
+  `prio_hits=[515,515,515,515]`, `prio_wipes=8`, `ring_next=2060`, `hits=1752925 band0=1227865
+  band1=525060`. Probe #0 (`:225`) was `prio_hits=[3,3,3,3] prio_wipes=0`. So: 512 sweep stores
+  per page (one full 4 KB page of u64 stores: hits `#4..#515` = offsets `0x0..0xFF8`), **zero
+  stores to any watched page between 07:20:39.067 and the refusals at 07:22:20** — the
+  identical totals across all four refusal-time probes say so regardless of row printing.
+- The watch is known-good: selftest `hits=12 expect_hits=12` (`:64`) is its positive control
+  (rule 19 discharged in-run).
+- The `pre` values themselves (§1/§2) are direct, snapshot-at-store-time proof that the headers
+  were populated **at the instant of zeroing**. Population happened after boot (`:64` read all
+  four card header u64s as `00000000` at 07:20:00.978) and before 07:20:38.837. Since `rebin`
+  writes `header.size`/`next_free`/`prev_free` and links the node (`src/kernel/o1heap.c:236-246`)
+  and `unbin` re-links on removal (`:257-278`), a fragment carrying size + next + prev + a
+  `next_free` chain is a **node that bin lists point at**: `bins[8]`/`bins[19]` referenced these
+  cards before the wipe. Not zero-from-birth; live list membership destroyed in place.
+- The 8 wipes vs 6 rows: rows `:19013-:19015`, `:19017`, `:19359-:19360` are the 6 header-field
+  wipes (pre-images, §1). Header offsets `0x00..0x28` fall on hit indices `#4..#11` of each
+  page — all within the always-printed first 128 — so **any header wipe would have printed**.
+  The remaining 2 of `prio_wipes=8` are at hit indices `#129+` (offset `>=0x3E8`, i.e. beyond
+  the header region: stale body data), counter-only. The split is arithmetic, not assumption.
+
+## 5. PROXIMATE CAUSE OF *THIS* REFUSAL = THE BIN-19 CARD
+
+`PHYS-BINPROBE #1` (`:32075`): `b0`/`b1` still list the cards (`len=1`, `gva` correct) but
+`prev=0 next=0` (the §1 zeros), `head=0`, **`n_ge=0`, `found_bin=-1`** — no fragment in any bin
+carries a usable size. The request is `o1_amount=0x41bd` (= `size 0x19d` + `O1HEAP_ALIGNMENT`
+rounding, per the refusal row), and alignment `0x4000` forces physical allocs into bins `>= 8`
+(`o1heap.c:236` bin floor). Therefore:
+
+- `BDA1F000` (bin 8, size `0x4000` = 16 KB) could never have served a `0x41bd` charge anyway;
+- **`BE12A000` (bin 19, size `0x22D6000` ~ 34.8 MiB) was the only fragment in the pool that
+  could**, and it is the one wiped at 07:20:39.062 — 101 s before the refusal.
+
+After that wipe, *every* page-aligned physical allocation must fail: the verdict machinery
+stayed healthy (`PHYS-STATE suitable=0x80000` mask/class reads, `PHYS-POOL-FULL attempts/served`
+rows) because **it never looked at fragment sizes**. That is the resolution of the long-standing
+contradiction: `PHYS-STATE suitable=0x80000` (bin mask & size-class available) and
+`o1heapAllocate returned null` (no fragment of usable size) were both true simultaneously —
+one reports bins, the other reads fragment headers, and the headers were destroyed while the
+bins still listed the (now size-0) cards. See HANDOFF §9.4/§9.5 and LONG_TODO T43.2; F-773
+(`PHYS-VERDICT-CHANGE` blind when the heap dies) is the instrumentation side of the same gap.
+
+## 6. THE CALLER CHAIN (20-frame host backtrace, all frames resolved this session)
+
+`F379-HEAPSTORE-BT` at `w748.log:15770-15789`, each frame named by
+`python tools/host_rva_resolve.py build/mcla.map` (base `0x7ff794f70000`):
+
+```
+HeapInstanceStoreReport+0x628
+ <- ReportHeapInstanceStore+0x18f
+ <- WriteU64BE+0x7e
+ <- __imp__sub_823DA950+0x2df        <- the store site (memcpy body)
+ <- sub_823DA950+0x44f                <- the PPC_FUNC hook in gpu_device.cpp:25430
+ <- __imp__sub_821BE250+0x4c1
+ <- sub_821BE250+0xca5                <- the caller named by lr=821BE3BC
+ <- __imp__sub_8218B0C8+0x832
+ <- __imp__sub_8218C1C0+0x505
+ <- __imp__sub_8218C760+0x3f3
+ <- sub_8218C760+0x1ed
+ <- __imp__sub_82188E50+0x74b
+ <- sub_82188E50+0x2b0
+ <- __imp__sub_82187820+0x21a
+ <- sub_82187820+0x267                <- the loader (F-102 / F-107)
+ <- __imp__sub_823047D8+0x270
+ <- __imp__sub_822C2EA8+0x373
+ <- sub_822C2EA8+0x127
+ <- __imp__sub_82131508+0x115
+ <- sub_82131508+0x1b8
+```
+
+The refusal's own `caller_rva=0x2b958a` resolves to `GuestMemoryHeap::kernel::Alloc+0x1a`.
+This extends, not replaces: F-770 (a caller-supplied memcpy is the writer shape, memcpy itself
+innocent), F-774 (an `lr` names the read primitive, not the fault), F-778 (both instances zeroed
+through `sub_8218B0C8`), F-783 (the `0x7e780000` fault this refusal chain ends in).
+
+## 7. RULE 1a: WHAT DIFFERS FROM THE w745c BASELINE
+
+`git diff --stat` vs the w745c baseline (w745c.log 10-07 00:55:56) — **5 files, +990/-80**:
+
+| file | +/- | mtime | in build |
+|---|---|---|---|
+| `src/guest_memory.cpp` | +227 | 10-07 06:25 | w747 |
+| `src/boot_host.cpp` | +15 | 10-07 06:26 | w747 |
+| `src/gpu_device.cpp` | +65 | 10-07 06:43 | w747 |
+| `src/kernel/heap.cpp` | +363 | 10-07 07:15 | w748 |
+| `src/gpu_cp.cpp` | +400 | 10-07 07:17 | w748 |
+
+Two stages, measured separately: **w745c -> w747** (first three files) moved two gates —
+`code=0xC0000005` 3 -> 5 and `Fatal error` 1 -> 0 — that is N-way (three files, none excluded);
+**w747 -> w748** (last two files, both instrument-only: prio arm/totals/selftest + `NotePhysBinProbe`)
+changed **every gate marker to the digit** (table in §9 of this finding's companion numbers
+below). The phase-3 instrumentation is behaviourally silent on boot.
+
+## 8. THE EXTENT INSTRUMENT ALREADY EXISTED — AND ITS BUDGET DROPPED BOTH CRITICAL ROWS
+
+`src/gpu_device.cpp:25495-25509` prints `T44-WIPE-MEMCPY` (dst/src/len/end/lr/sp from the live
+context at memcpy **entry**, budget `k<=64 || k%4096==0`). Measured in w748: **75 rows**, first
+at `:10738`, last (`#45056`) at `:12482`, every one `len=0x10`, `dst` in `[BD800000, BDBEDFC0]`,
+`lr=82431D18/82431C5C`, `sp=8EFFEF40`, all between 07:20:14.810 and 07:20:15.340 — texture-sized
+copies, none from `lr=821BE3BC`, none overlapping a card, none huge. `F774-PHYS-MEMCPY` likewise
+exhausted its `k<=40` budget by 07:20:15.540 (40 rows `len=2`, first `:13476`).
+
+Consequence (recorded so the next reader does not misread silence): **neither the instance copy
+at 07:20:24 nor any card-time copy got an entry row** — the counters kept incrementing past the
+print budgets. `F382-MEMCPY-LIVE` printed only `calls=1` (`:203`); its `ka%200000` arm never
+fired again, so total guest memcpy calls in the run are **< 200,000** (printer literal verified
+at `:203`, and a second row would have printed had it been reached — rule-19-style bound).
+
+One anomaly to carry forward, flagged rather than interpreted: `F375-HEAPSTORE`'s 8 rows
+(`:15767`, `:15845-:15875`) read **byte-identical** `r3=A03FFFF8 r4=93C63E40 r5=FFFFFFAF` while
+the store addresses advance `+8` each row, even though the report path is synchronous (the
+F379 chain runs `memcpy store -> WriteU64BE -> report` in-thread). Whether store-time
+`r3/r4/r5` are live loop registers or a stale snapshot is **UNRESOLVED**; do not build the next
+falsifier on store-time registers alone — use memcpy **entry** rows, where `r3/r4/r5` are
+definitionally the arguments (`gpu_device.cpp:25437-25438` reads them there).
+
+## 9. BOOT UNCHANGED (exact marker counts, case-insensitive line counts)
+
+| marker | w745c | w747 | w748 |
+|---|---|---|---|
+| `o1heapAllocate returned null` | 4 | 4 | 4 |
+| `PHYS-POOL-FULL` | 4 | 4 | 4 |
+| `VEH-NEUTRAL` | 1 | 1 | 1 |
+| `XTL-ALLOC #` / `-REFUSED` | 14 / 4 | 14 / 4 | 14 / 4 |
+| `PHYS-LARGE` / `headIs=` / `PHYS-STATE` / `PHYS-LIVE` | 63 / 62 / 4 / 4 | 63 / 62 / 4 / 4 | 63 / 62 / 4 / 4 |
+| `code=0xC0000005` / `Fatal error` / `8000003` | 3 / 1 / 11 | 5 / 0 / 11 | 5 / 0 / 11 |
+| `invariants FAIL` / `host addr 0x100000000` | 0 / 0 | 0 / 0 | 0 / 0 |
+| `DRAW_INDEXED` (fatal gate) | 0 | 0 | 0 |
+| `T44-WIPE-SELFTEST` / `T44-TOTALS` | 0 / 0 | 1 / 0 | 1 / 5 |
+
+Still no menu (`PRESENT-SURFACE-UNREADABLE` continues to log end, `:32453`). w747 == w748 on
+every non-T44 marker.
+
+## 10. LABELED HYPOTHESES — NOT FACTS — AND THEIR FALSIFIERS
+
+**(a) ONE huge contiguous copy.** The F375 snapshot (`:15767`) reads `r3=dst=A03FFFF8`,
+`r4=src=93C63E40`, `r5=len=0xFFFFFFAF` (= 2^32 - 81, i.e. an underflowed length) at the instance
+burst, 07:20:24. If a single call with those entry parameters kept running, dst progresses
+`A0400000 -> BDA1F000` = 0x19A1F000 = 426.7 MB in 14.70 s = ~29 MB/s, and the observed card wipe
+times fit that pace. **Tension, measured:** at ~29 MB/s the copy would cross `0xFFFFFFFF`
+(~100 MB from start, +3.5 s, ~07:20:27.6) and start writing low guest VAs — including the
+deliberate `PAGE_NOACCESS` null guard — yet **no VEH row and no write-trip exists anywhere in
+07:20:24..07:20:38** (`VEH` count for the whole run = 1, at 07:22:21). Either the checked-store
+path (`WriteU64BE`/`PPC_STORE_U64`) handles the wrap/floor in a way not yet read, or (a) is
+wrong. *Falsifier:* a `T44-WIPE-MEMCPY`-style **card-spanning entry row** (`dst <= BDA1F000 <=
+dst+len`, rare — the 45k early band calls do not qualify) timestamped at ~07:20:38 with fresh
+parameters kills (a) and confirms (b).
+
+**(b) Corrupt length per call, originating upstream.** `sub_8218B0C8+0x238` passes dst = an
+allocation result and len = `r22` from the stream; a corrupt `r22` (or an underflow like
+`end - start` with `end < start`, which yields exactly the `0xFFFFFFAF` shape) would make each
+call its own bomb. *Falsifier:* exactly ONE card-spanning entry (or huge-`len` entry) row in the
+whole run, at 07:20:24, with none at card time -> (b) is dead and the question moves upstream of
+the memcpy: what computed that length.
+
+**Open question carried forward (pre-existing, still unattributed):** the instance at
+`A0400000` was zeroed at 07:20:24 (202 stores covering the whole 0x240 instance plus ~0x410
+beyond), yet at 07:22:20 `bins[8]` still resolves to `BDA1F000` and capacity/`suitable` read
+valid (`:32075`, `PHYS-STATE`). Restoration or a second metadata copy — neither is named.
+
+**Next instrument (spec, for w749):** in `src/gpu_device.cpp`'s `PPC_FUNC(sub_823DA950)` hook,
+add two log-only arms with their own counters: (1) `len >= 0x100000` -> print dst/src/len/lr/sp
+(entry values, budget k<=64 then every 4096th); (2) card-spanning test `dst <= 0xBDA1F000 &&
+(uint64_t)dst + len >= 0xBDA1F008` (and the `BE12A000` page likewise) -> print, budget k<=32.
+Both are rare-event shapes, so their silence is interpretable; a positive control for each arm
+must print (rule 19). Do **not** rely on store-time `r3/r4/r5` until §8's anomaly is resolved.
+
+## 11. WHAT THIS FINDING DOES NOT SAY, AND TOOLING NOTES
+
+- It does not say *why* `sub_821BE250` was called with a destructive length — only which
+  instruction stored the zeros. Upstream length provenance is §10's job.
+- It does not name who restores the A0400000 instance (open question, above).
+- IDA decompilation is unavailable on this machine (`idalib-mcp` fails to start; direct launch
+  `FATAL ERROR: Cannot continue without a valid license`) — do not retry; use
+  `tools/ppc_disasm.py`, `tools/ppc_xrefs.py`, `tools/addr_owners.py`,
+  `generated/ppc_xenon/ppc_recomp.69.cpp` (read-only), and `build/mcla.map`.
+- w748 is the phase-3 baseline for future soaks (build 10-07 07:17:50; `build_ninja.log`
+  ends `[2/2] Linking CXX executable mcla.exe`, 12 warnings, 0 errors).
+
+### F-785 — T43.10 falsifier run (w749): hypothesis **(a) CONFIRMED — exactly ONE destructive memcpy entry** (`dst=8EFFEFB0` stack, `src=82862DF8`, `len=0xFFFFFFFF`, `lr=821BE3BC`), (b) refuted; guest root cause decoded = `sub_8218B0C8` passes **`ReadByte`'s -1 (EOF) sentinel unchecked as the length** into `sub_821BE250`, whose **SIGNED** `cmpw/ble` guards read -1 as "fits in buffer" and never clamp
+
+**Run** `build/w749.log` — 36,173 lines / 5,943,450 bytes, `[2026-10-07 23:33:33.519 -> 23:38:30.858]`, 300 s soak killed by harness (normal). **Rule-1a build delta w748->w749 = `src/gpu_device.cpp` only** (the two T43.10 entry arms + fwd decls; `BUILD_RC=0`, `build/mcla.exe` mtime 23:28:46, `build/mcla.map` 23:28:50 — stale-exe trap cleared before the run).
+
+#### 1. The decision — (a) vs (b)
+
+| hypothesis | falsifier prediction | w749 measurement | verdict |
+|---|---|---|---|
+| **(a) ONE huge copy** entered once, card-time stores are its cursor | one `T4310-HUGE-MEMCPY` + one `T4310-CARD-MEMCPY` row at copy start; NO fresh entry at card time; all card stores carry the same `lr/sp` | **exactly one** of each, both at `23:33:50.480` (`w749:14978-14979`, k=1); every card-crossing store: `lr=821BE3BC sp=8EFFECD0 host=__imp__sub_823DA950+0x2df` (`w749:21080-21085`, `:21432-21435`) | **CONFIRMED** |
+| **(b) per-call corrupt `r22` len** from `sub_8218B0C8+0x238` | a FRESH entry row at card time (2nd+ destructive call), dst = the +0x238 alloc | no second entry — arm budgets k<=64 / k<=32 before %4096, so a second firing prints at k=2; and dst is a STACK buffer (= site **+0x1f4**, §3), not the +0x238 alloc | **REFUTED** |
+
+#### 2. Positive control (rule 19) — the arms are not blind
+
+`w749:204` `[23:33:34.073] T4310-ARM-SELFTEST prio=[0,0,-1,1] (expect [>=0,>=0,-1,>=0]) huge=[1,0] (expect [1,0])` — **all six expected answers correct** (cards1/2 hit, texture page miss = -1, cards4 hit; huge flags 1/0). Rule 19 discharged for both predicates, so the k=1 rows are a result, not a blind instrument.
+
+#### 3. The single entry (entry regs — authoritative)
+
+```
+w749:14978 [23:33:50.480] T4310-HUGE-MEMCPY #001 dst=8EFFEFB0 src=82862DF8 len=FFFFFFFF end=8EFFEFAF lr=821BE3BC sp=8EFFECD0 tid=23144
+w749:14979 [23:33:50.480] T4310-CARD-MEMCPY #001 prio=0   dst=8EFFEFB0 src=82862DF8 len=FFFFFFFF end=8EFFEFAF lr=821BE3BC sp=8EFFECD0 tid=23144
+```
+
+`end` = 32-bit `(dst+len)` = `8EFFEFAF` = the exclusive end one byte below `dst`: the call writes **4 GiB-1 = every guest address except the single byte `0x8EFFEFAF`**.
+
+#### 4. Guest root cause — measured with `tools/ppc_disasm.py` (raw words, offsets = VA-0x82000000)
+
+- **`sub_821BE250(ctx r3, dst r4, len r5)`** = buffered stream read: `r31=ctx, r29=dst, r30=len`; available `r5=end(r31+0x1C)-pos(r31+0x18)` at `0x821BE2AC`; the two guards are **SIGNED**: `cmpw cr6,r30,r5; ble 0x821BE394` (`:0x821BE2B0-B4`) and the clamp `cmpw cr6,r30,r11; ble +8; mr r30,r11` (`:0x821BE39C-A4`); the memcpy is `bl 823DA950` at `0x821BE3B8` (r3=r29, r4=base(r31+8)+pos, r5=r30) -> returns `lr=821BE3BC`. **A len of -1 (0xFFFFFFFF) passes both `<= available` signed tests and is never clamped** -> `memcpy(..., 0xFFFFFFFF)`.
+- **`sub_821BE4F0` = ReadByte**: `li r5,1; addi r4,r1,80; bl 821BE250; cmpi cr6,r3,1; lbz r3,80(r1); beq +8; li r3,-1` (`0x821BE4FC-0x821BE524`) — returns the byte, or **`-1` (0xFFFFFFFF) when the 1-byte read does not return 1** (EOF/error).
+- **`sub_8218B0C8` has FOUR sites that use that result as the length with NO -1 check** (`mr r5,r3` / `mr r5,r22`): `+0x64` (`0x8218B12C`, dst=`r1+336`), `+0x98` (`0x8218B160`, dst=`r1+80`), **`+0x1f4` (`0x8218B2BC`, dst=`r1+592`, r5=`bl 821BE4F0` at `0x8218B2AC`)**, `+0x238` (`0x8218B300`, r22=`bl 821BE4F0` at `0x8218B2E4`, dst=`sub_82130528` alloc).
+- **Site attribution by dst arithmetic**: the memcpy's `sp=8EFFECD0` is inside `sub_821BE250` (frame -144), so `sub_8218B0C8`'s `r1 = 8EFFECD0+144 = 8EFFED60`; `8EFFED60+0x250(592) = 8EFFEFB0` = the measured dst **exactly** — sites +0x64/+0x98 give `8EFFEEB0`/`8EFFEDB0`, +0x238 gives an alloc. Independent corroboration: the final park row `w749:36173` `sp=8EFFED60 lr=8218B458` (thread parked in this very frame).
+- **Healthy-ctx control**: the benign copy 0.7 s earlier shares the same src: `w749:12337` `T44-WIPE-MEMCPY #003 dst=BD890000 src=82862DF8 len=800 lr=821BE3BC` (also `:12327` `len=F80 lr=821BE2D0`, `:12329` `len=1080`) — the stream `base/pos/end` were fine; only the REQUESTED length differed, i.e. ReadByte returned -1 once.
+
+#### 5. Host chain at the instance crossing (F379 x20, `w749:17388+`, resolved against `build/mcla.map` fresh from this build; control: `WriteU64BE+0xdd`/`HeapInstanceStoreReport+0x628` reproduce w748's exact offsets)
+
+`HeapInstanceStoreReport+0x628 <- ReportHeapInstanceStore+0x18f <- WriteU64BE+0x7e <- __imp__sub_823DA950+0x2df <- sub_823DA950+0x78e <- __imp__sub_821BE250+0x4c1 <- sub_821BE250+0xca5 <- __imp__sub_8218B0C8+0x832 <- __imp__sub_8218C1C0+0x505 <- __imp__sub_8218C760+0x3f3 <- sub_8218C760+0x1ed <- __imp__sub_82188E50+0x74b <- sub_82188E50+0x2b0 <- __imp__sub_82187820+0x21a <- sub_82187820+0x267 <- __imp__sub_823047D8+0x270 <- __imp__sub_822C2EA8+0x373 <- sub_822C2EA8+0x127 <- __imp__sub_82131508+0x115 <- sub_82131508+0x1b8`
+
+Function sequence identical to F-784 §6 (loader chain `sub_82187820 <- sub_82188E50 <- sub_8218C760 <- sub_8218C1C0 <- sub_8218B0C8`); only the host RVAs shifted by the instrument build.
+
+#### 6. Cascade timeline (w749, every row measured)
+
+| time | line(s) | event |
+|---|---|---|
+| 23:33:33.636 | `:64` `:226` | T44 selftest (cards `hdr=0` at boot), probe#0 `prio_wipes=0` |
+| 23:33:34.074-.075 | `:226` `:239` `:244` | binprobe#0: pool = ONE fragment, `n_bins=1 b0=[bin=22 gva=A3285000 size=0x1d17b000 aoff=0x2e85000] charge=0x2e85000 found_bin=22`; HEAPGUARD trip=1 selftest (`selftests=1`) |
+| 23:33:49.784-.786 | `:12327-12337` | benign stream copies (`len=F80/1080/800`) |
+| **23:33:50.480** | **`:14978-14979`** | **THE entry — one call, `dst=8EFFEFB0 src=82862DF8 len=FFFFFFFF`** |
+| 23:33:51.749 | `:15318` | wild AV #1 (tid 25488, rip `__imp__sub_825FA460+0x2a7`) parked, +1.27 s after entry |
+| 23:34:00.288-.289 | `:17385-17463+` | cursor crosses instance `A0400000` — F375 x8, F379 x20, HEAPHDR-STORE x202 (275.0 MiB from dst in 9.81 s = **28.1 MiB/s**) |
+| 23:34:17.038 | `:21080-21085` | page0 `BDA1F000` crossing — **4 nonzero-pre header wipes**: `pre=30A2BD01000000` (next), `A0A1BD01000000` (prev), `40000000000000` (**size=0x4000 = bin8**), `E018BD01000000` (next_free; `+0x18/+0x28` pre=0) — raw bytes = w748's F-784 §5 decode |
+| 23:34:17.297 | `:21432-21435` | page1 `BE12A000` crossing — 2 nonzero: `5012BE01000000` (prev), `602D0200000000` (**size=0x22D6000 = bin19**) |
+| 23:34:17.301 | (last prio rows) | page3 `BE135000` — one crossing per page, `lr=821BE3BC sp=8EFFECD0` throughout |
+| **23:34:54.423** | **`:28872`** | **the WRAP**: `F374-HEAPGUARD trip=3 off=0X0 want=W guestLR=821BE3BC tid=23144 rva=0x22F77D=WriteU64BE+0xdd` — 63.94 s x 28.3 MiB/s = 0x71001050 = exactly `0x100000000-0x8EFFEFB0`; the null window is DECLINED by the guard (no null-guard VEH) — this answers F-784 §10's wrap/VEH tension: the wrap does not fault, `WriteU64BE` refuses `<4KiB` and the walk continues |
+| 23:34:55.596 | `:29156` | wild AV #2 (tid 26456, rip `__imp__sub_821BC140+0x9ff`) parked, +1.17 s after wrap |
+| ~23:36:09 | (derived) | second pass crosses guest code `0x82000000` (74.7 s after wrap at the measured pace) — DERIVED, not directly observed |
+| 23:36:12.931-.054 | `:35816/:35840/:35864/:35888` + `:35834+` | refusals x4 (`o1_amount=0x41bd live=0x1dd00000 cap=0x20000000 glr=82137904 caller_rva=0x2ba57a = GuestMemoryHeap::kernel::Alloc+0x1a` — same fn+off as w748's `0x2b958a`, RVA shifted by build) + binprobe x4: `b0=[bin=8 ... gva=BDA1F000 aoff=0x1d61f000 prev=0 next=0 head=0 min=0 max=0 n_ge=0] b1=[bin=19 ... gva=BE12A000 aoff=0x1dd2a000 ...] found_bin=-1 n_bins=2` — cards' headers destroyed, identical wiped state to F-784 §5 |
+| 23:36:12.931-13.054 | `:35817/:35841/:35865/:35889` | T44-TOTALS x4 **byte-identical**: `prio_hits=[515,515,515,515] prio_wipes=8 ring_next=2060` — SAME as w748. 515 = 3 selftest + 512 copy stores = **ONE crossing per page**; the second pass never reaches BD/BE (it stops at `0x8EFFEFAF`) |
+| 23:36:13.093 | `:35918` | VEH-NEUTRAL `lr=8218B458 read of 0x7e780000` tid 23144 (F-783's, same shape as w748) -> park to log end `:36173` `sp=8EFFED60 lr=8218B458` |
+| ~23:36:15 | (derived) | the copy exhausts `0xFFFFFFFF` bytes at cursor `0x8EFFEFAF` — DERIVED from the measured pace |
+
+#### 7. Rule-1a gate census (w749 vs w748, raw byte counts)
+
+15 of 16 cited markers **+0**: `C0000005 7/7`, `Fatal error 0/0`, `VEH-NEUTRAL 1/1`, `VEH W0: parking thread 2/2`, `XTL-ALLOC-REFUSED 4/4`, `PHYS-POOL-FULL 4/4`, `HEAPHDR-STORE 202/202`, `F374-HEAPSTORE 32/32`, `F774-PHYS-MEMCPY 40/40`, `F379-HEAPSTORE-BT 20/20`, `o1heapAllocate returned null 4/4`, `T44-TOTALS 5/5`, `PHYS-BINPROBE 5/5`, `PHYS-STATE 4/4`, `PHYS-LIVE 4/4`. The one delta: **`F374-HEAPGUARD 4 -> 3 (-1)`** — characterized, not hand-waved: w748 had ONE EXTRA pre-copy trip `:707` `trip=3 off=0X20 want=W guestLR=00000000 tid=11224` (07:20:02, another thread, 70 s before its wrap) which w749 never had; both runs' wrap trips are the same shape (`off=0X0 want=W guestLR=821BE3BC`). Wild AVs across runs: w745c 1, w747 2, w748 2, w749 2 — in w749 each lands ~1.2 s after a cursor event (entry/wrap) and none before copy start; **suggestive of copy-clobbered threads wild-jumping, NOT proven** (no direct evidence of what they executed).
+
+#### 8. Two instrument bugs found by direct read (rule 19's second lesson, recorded so they are not re-imported)
+
+A first-pass script reported **0 nonzero-pre prio wipes in w749** — that zero was FALSE twice over: (1) its regex matched `addr=` while the rows print `@ ADDR`, so it could never fire (an instrument that never fires looks exactly like a result); (2) its display capped at the first 8 nonzero rows, all `kind=wipe`. Corrected counts: **prio nonzero = 6, prio zero = 514**, wipe nonzero = 474 — i.e. w749 has the same 6 header-field wipes as w748. `grep`-style filters against these rows must match the printed field names verbatim.
+
+#### 9. What this does NOT say (open — carried to HANDOFF)
+
+1. **WHY the stream hit EOF at that iteration** — the record loop's bound (`lwz r11,3(r31)` / `lwz r10,0(r31)`, `0x8218B264-B2B0`) vs the bytes actually available is unmeasured; needs either a count-vs-stream probe at `sub_8218B0C8+0x1f4` or the file format's record table. Falsifier for a future probe: if the count field is larger than the stream's records, the -1 fires exactly at iteration `count-records`.
+2. **Who restores the A0400000 instance** (zeroed 23:34:00, yet `bins[8]->BDA1F000`/`bins[19]->BE12A000` are readable at 23:36:12) — F-784 §10.4's question stands, now with a second run's evidence.
+3. **F375's frozen regs reproduced byte-identically across a second run** — `r3=A03FFFF8 r4=93C63E40 r5=FFFFFFAF` for all 8 rows (`w749:17385+`), matching w748 exactly while the ENTRY is `8EFFEFB0/82862DF8/FFFFFFFF`. They are neither entry values nor live advancing regs. Recorded, not interpreted; **do not build on store-time r3/r4/r5** (F-784 §8 now has 2-run evidence).
+4. The wild-AV mechanism (§7) and the `0x7e780000` read fault (F-783's) are unchanged by this run.
+5. The guest binary is untouched (data, not code) — no fix is implied here; a host-side guard on the destructive length is a separate, registered task (T43.11, PROGRAM_GUIDE §7 discipline, rule 4 `addr_owners` before any hook).
+
+
+### F-786 — T43.11 ANSWERED: `ReadByte` returned −1 because `CityDefault.fxc`'s invocation header at member coord 0x5000 was parsed from RAW archive bytes (the deliver instrument shows the tail beyond pos 20480 is never overwritten with the proved body), so a garbage `count=170` walked the record table off the end at iteration 24; the registered log-only guard `T4311-LEN-GUARD` now fires on the resulting `count=FFFFFFFF` (4× in w750) with 16/16 cited census markers +0.
+
+- Task:       T43.11 — both parts: (1) EOF provenance, (2) log-only host guard on impossible `len`
+- Type:       FACT + LOG-ONLY INSTRUMENT (no behavior change; guest binary untouched)
+- Class:      E (archive-serve provenance) with a rule-19-verified instrument
+- Evidence:   `build/w749.log` (raw-serve rows), `build/w750.log` (guard run), `build/ap_oracle_body.bin` (23,807 B logical body), `build/game_data/xarchive_cache.rpf` (stored member), `src/gpu_device.cpp:25930-25938` (guard)
+
+#### 1. The bytes at H=0x5000 are not this member's body — they are raw archive content, and the deliver instrument proves the tail was never written
+
+- Provenance (measured this session): `inflate(rpf[0x1F5000:0x1F6D9A], 7578 B) == ap_oracle_body.bin` byte-identical (stored head dword `0xED5C7B50`); the correct invocation header sits at apo[0x5014] = `05 00 08 "ambYPos\0" 08 "ambYPos\0" ... count=0`.
+- `STREAM-WINDOW` (w750:13564) `winAbs=0x2000 winHex=0000000001080000` == apo[0x2000] — a mid-file window IS served from the proved body. `STREAM-WINDOW` (w750:13609, same row shape as w749:14957) `winAbs=0x5000 winHex=C2342C2A95ABAA0A` == `rpf[0x1FA000]` where 0x1FA000 = member base 0x1F5000 + 0x5000 = **12,902 B past the member's stored end (0x1F6D9A)** — unrelated archive content, not this member's bytes (correcting the earlier shorthand "the member's raw stored bytes": the offset is *derived* from the member base but lands beyond the member).
+- `ARC-WINDOW` is unconditional (gpu_device.cpp:20176-20191): exactly **5 rows** for CityDefault.fxc in both runs (w750:13508/13533/13559/13570/13573 = #58-62, pos 0/4096/8192/12288/16384, req=4096), **no pos=20480 row** — the tail beyond the body was never overwritten with proved bytes (zero is valid: 5-row positive control on the same path).
+- Raw header at H=0x5000 (measured from `rpf[0x1FA000]`): `b0=0xC2 b1=0x34 l1=44 l2=74`, `count@0x507A=0xAA=170` — garbage where the logical header's count is 0.
+
+#### 2. The record walk: BYTES, not count, ended the loop (falsifier satisfied)
+
+- Walk of the raw header: **23 records reach the value stage; 22/22 value dwords == the BESWAP `dstAfter` log rows** (vpos 0x508F..0x5C79, 23 values logged = rec0..rec22 with rec22's value read returning 0) — the parse is real, the bytes are wrong.
+- rec23: `P=0x5C7D nl=254 nameAvail=129` → name longer than the window to EOF → rec24 `nameLen ReadByte` → **−1**. Falsifier from the task — "the −1 fires exactly at count−records" — is satisfied in its measured form: the crash lands at record **24**, never at 170; bytes, not the count field, ended the loop.
+
+#### 3. The byte boundary at stream offset 20480 is exact (alternative parse refuted)
+
+- All bytes ≤0x4FFF are apo-served (window 16384..20479, ARC-WINDOW #62). Previous invocation tail: siColor2 header @0x4FC4 (`count@0x4FDA`, trailing@0x4FDB), tireMotionBlur header @0x4FDC (`l1=l2=15`, `count@0x4FFE`, trailing@0x4FFF) — `sub_8218B0C8` unconditionally reads one trailing byte after the record loop (`8218B328-8218B33C stb r31+2`) → first raw byte = our b0 @0x5000 = winHex ✓.
+- Alternative "count@0x4FFF" parse **REFUTED**: its trailing byte would land at 0x5000, pushing b0 to 0x5001 ≠ winHex.
+
+#### 4. Crash chain — identical field-for-field across runs, now with the caller pinned directly
+
+- w750:13625 `BESWAP-RET #88` (rec23's value read, 0 bytes) → :13626 `WINWR-REC #50` → :13627 **guard #1** → :13628 `T4310-HUGE-MEMCPY #001 dst=8EFFEFB0 src=82862DF8 len=FFFFFFFF end=8EFFEFAF lr=821BE3BC sp=8EFFECD0 tid=22064` — byte-identical to w749:14978 (k=1 on both runs, same as w749).
+- Guest path: rec24 nameLen −1 in r3 → `8218B2B0 mr r5,r3` → `8218B2BC bl 821BE250` → signed `cmpw/ble` reads −1 as "fits" (F-785) → `memcpy(...,0xFFFFFFFF)`.
+- `PARK-MIRROR-STACK ... f1=8218B2B0 lr=821BE3BC` (w750:13707, 218 rows; = w749:14981).
+
+#### 5. The guard (log-only) and its rule-19 positive control
+
+- Code: `src/gpu_device.cpp:25930-25938`, top of `PPC_FUNC(sub_821BE250)` immediately after `count = ctx.r5.u32`; fires iff `count >= 0x10000000u`; budget `k<=16 || k%4096==0`. **No control-flow change** (the copy still runs), `addr_owners --check 0x821BE250` = **2 sites, exit 0**.
+- Threshold: w749 `BE250-GUEST` max legitimate count = 262,144 (distinct [1,2,262144]); `BE710` words ≤16,384 → the gate is >400× the largest observed legitimate count.
+- `T4311-LEN-SELFTEST` (w750:1898): `fire=[1,1,0,0] (expect [1,1,0,0])` over `[FFFFFFFF,10000000,0FFFFFFF,40000]` — the predicate was shown firing AND not-firing correctly (rule 19).
+- `T4311-LEN-GUARD` 4× (w750:13627, :31131, :31156, :31181), all `count=FFFFFFFF lr=8218B2C0` — **lr=8218B2C0 = return address of `bl 821BE250` @8218B2BC inside sub_8218B0C8's record loop**, so the guard row pins the caller directly (not mirror-inferred).
+- Event #1 is followed on the next line by `T4310-HUGE #001` (copy still ran — log-only as designed). Events #2-#4 are each followed by `AllocPhysical: o1heapAllocate returned null #N` (w750:31132/:31157/:31182) and **no second huge copy** (T4310 k stays 1 = w749), each preceded by `XTL-ALLOC-REFUSED`/`BE710-DEAD REFUSE-NO-BODY` — characterized by rows only: after the first 4 GiB copy the read's refill alloc fails, so the copy never recurs even though the impossible len arrives 4× per run.
+
+#### 6. Gates (w750 vs w749) — census exit 0
+
+- **16 of 16 cited F-785 §7 markers +0**: census table — `C0000005 5/5`, `Fatal error 0/0`, `VEH-NEUTRAL 1/1`, `VEH W0: parking thread 2/2`, `XTL-ALLOC-REFUSED 4/4`, `PHYS-POOL-FULL 4/4`, `HEAPHDR-STORE 202/202`, `F374-HEAPSTORE 32/32`, `F774-PHYS-MEMCPY 40/40`, `F379-HEAPSTORE-BT 20/20`, `PHYS-STATE 4/4`, `PHYS-LIVE 4/4`; direct counts — `F374-HEAPGUARD 3/3`, `T44-TOTALS 5/5`, `PHYS-BINPROBE 5/5`, `o1heapAllocate returned null 4/4` (F-785's characterized 16th is +0 here too).
+- Function-path printers identical: `BE250-GUEST 5`, `BE250-OBJ 5`, `BESWAP-RET 88`, `BE710-DEAD 4`, `F396-ALLOC-EXIT 65`, `WINWR-REC 7`, `BE250-SLOT 25` (all +0) — the edited function's normal paths are unchanged.
+- New rows exactly as designed: `T4311-LEN-GUARD +4`, `T4311-LEN-SELFTEST +1`; the table's other 21 non-zero deltas are throughput/cadence with depth 31,523 vs 36,173 lines (1.15×, tool verdict COMPARABLE), none a cited marker.
+- Registration: §9 row tracked=True for both tokens (`markers_from_guide`, 234 total); `mitigation_audit` registered 106→118, UNDOCUMENTED 88 (was 89 — `BESWAP-RET` became documented as a side effect of the §7 citation), STALE 6 unchanged (pre-existing exit 1).
+- Build: `BUILD_RC=0`, `mcla.exe` mtime 10/8 07:46:46; build delta vs the w749 build = `src/gpu_device.cpp` + `docs/PROGRAM_GUIDE.md` only (rule 1a single-variable); rule 1b new static: `s_4311g`.
+
+#### 7. What this does NOT say (open — carried forward)
+
+1. **WHY the tail fill bypassed span/ARC-WINDOW delivery** — `kListMemberSpans` registers [0x1F5000, 0x1F6D9A) and no `ARC-WINDOW` pos=20480 row exists in either run; no `READAT-BRANCH` row with off=001FA000/req=3327 appears. The fill path that wrote raw bytes at pos≥20480 is UNNAMED — that is the fix work, out of T43.11's scope (log-only by task §1629).
+2. The guard **rejects nothing**: count=FFFFFFFF still reaches memcpy in event #1 (by design). Rejection needs a separate task with guest-observed semantics (do-not #1: no invented behavior).
+3. `T4310-*` markers remain absent from §9 (`tracked=False`) — pre-existing gap, unchanged by this task.
+4. Guards #2-#4 recur at 07:49:28 (~118 s after #1) during the refusal cascade — characterized by rows (BE710-DEAD REFUSE-NO-BODY + null-alloc), not root-caused.
+
+### F-787 — T43.12 ANSWERED: there is NO bypass — the tail read enters `sub_821CC1E0` like every granule and the deliver gate's `origRet == amIn6` clause refuses its logical-clamped (3327) original, leaving raw `rpf[0x1FA000]` bytes standing in window `82862DF8`
+
+- Task:       T43.12 — name the tail-fill branch (F-786 §7 open #1) BEFORE any fix; log-only probe first (census-before-fix, do-not #1)
+- Type:       FACT + LOG-ONLY INSTRUMENT (no behavior change; guest binary untouched; `MclaArcWindowDeliver` never re-issued)
+- Class:      E (archive-serve provenance), rule-19-verified instrument — positive control = 28 rows including the known tail event, twice
+- Evidence:   `build/w751.log:13748` = `build/w752.log:13764` (the answer rows, identical modulo tid/time); `build/w750.log` pre-probe baseline (`WINWR-WATCH #42` `:13568`, `ARC-WINDOW #62` `:13573`, `STREAM-WINDOW #1000` `:13609`); probe at `src/gpu_device.cpp:20159-20275`; gate clause `src/gpu_device.cpp:20174`; registrations `docs/PROGRAM_GUIDE.md` §7 (`:455`, `:457`) + §9 (`:758`), `markers_from_guide` 234→235 tracked=True
+
+#### 1. The probe, and why its zeros mean something (rule 19)
+
+- `T4312-UNDELIVERED` at `src/gpu_device.cpp:20249-20274` (printer `:20265-20272`, `MCLA_LOG_WARN`) fires iff the deliver block did NOT correct the read into a window base (`!a4312Ar.delivered && MclaWinwrIsWindowBase(amIn5)`); budget first-96-or-%256 (`:20252`); `static std::atomic<uint32_t> s_4312` (`:20250`) is the change's only new static (rule 1b); `a4312Ret/a4312Gate/a4312Ar` (`:20165-20167`) are non-static hoists before the deliver block so the probe sees its verdict; **falls through unchanged — `ctx.r3` untouched, no control flow, no D3D12, deliver never re-issued** (a retry after a partial copy would be a behavior change).
+- 28 rows in w751 (120 s) and 28 in w752 (300 s = w750's own length); 28 ≤ 96 ⇒ the population is complete (budget not reached); tail row #24 byte-identical across runs (tid/time apart) ⇒ reproducible.
+- Census closure: 28 probe + 22 `ARC-WINDOW` rows with `win=82862DF8` = **50 = `WINWR-REC`'s printed `tot=50`** — every window-base entry into `sub_821CC1E0` yields exactly one of the two rows (delivered → `ARC-WINDOW`, unconditional; undelivered → probe, within budget).
+- Gates: build `[2/2]` = `gpu_device.cpp.obj` + link only vs the w750 build (rule 1a); `soak_census w752 vs w750` exit 0 with **12** nonzero deltas all ≤ +213, on flood counters whose unchanged-run jitter is ±1,107 (control `w750 vs w749` = **29** nonzero deltas); `T4311-LEN-GUARD` 4=4 (w751's 4→1 was run-length, 120 s vs 300 s); function-path printers byte-equal (`ARC-WINDOW 62=62`, `WINWR-REC 7=7`, `WINWR-WATCH 141=141`, `STREAM-WINDOW 58=58`, `DISCCHK2 40=40`, `READWRAP 1656=1656`, `SERVE-PROOF 102=102`, `XSF-HOSTSERVE 51=51`, `MEMBER-EXPAND-OVERRUN 33=33`); `addr_owners --check 0x821CC1E0` = 2 sites exit 0 (rule 4); `mitigation_audit` exit 1 pre-existing (neither its stale nor its undocumented list contains this change's tokens; `T4312-UNDELIVERED` is census-shaped).
+
+#### 2. The answer: the working hypothesis "bypasses `sub_821CC1E0`" is REFUTED — the refusal is ONE gate clause
+
+- Row (w751:13748 = w752:13764): `T4312-UNDELIVERED #24 gate=0 ret=3327 req=4096 retEq=0 rec=B79150A0 win=82862DF8 pos=20480 w1=00005CFF bodySize=23807 posIn=1 want=0 done=0 tid=…` — the pos=20480 read enters `sub_821CC1E0` like every other granule; there is no fill path around this function.
+- `ret=3327 = 23807 − 20480` = the member's **logical** remaining ⇒ the original body clamps to logical size (rows #25-#28, `pos=23807 ret=0`, confirm the clamp at EOF). `retEq=0` (3327≠4096) fails exactly one deliver clause: **`origRet == amIn6`, `src/gpu_device.cpp:20174`** — `rec` valid, `req≠0`, `win` a window base, and the deliver would have computed `posIn=1`, `w1=00005CFF=bodySize=23807`, `want=3327`; all pass. `gate=0` ⇒ `want=0 done=0` mean "not computed", not measured zeros.
+- The clause is deliberate — banner `src/gpu_device.cpp:20144-20145`: a short read "is left exactly as the guest's own code produced it" — so the named branch is the seam where that design meets a raw-past-stored-end original.
+- The five earlier granules delivered **only** because each original returned exactly `req=4096`: `ARC-WINDOW` CityDefault rows w752 `:13670/:13695/:13721/:13732/:13735` (pos 0/4096/8192/12288/16384, `req=want=done=4096`). The deliver-over-raw pattern is directly visible at stream pos 0x3000: `WINWR-WATCH #42` (w750:13568) shows the raw fill `src8=8588FC19B565A9BC == rpf[0x1F8000:0x1F8008]` = member_base(0x1F5000)+0x3000 (granule-relative `off=0`, cnt=4096), and `ARC-WINDOW #61` (w750:13570) then overwrites it with the served body at `pos=12288`.
+
+#### 3. Filler and source: full-row elimination + byte provenance
+
+- Filler = the original body of the pos=20480 call itself. In w750 the interval `ARC-WINDOW #62` (`:13573`, last corrected granule) → `STREAM-WINDOW #1000` (`:13609`, `end=3327`, window already raw) contains only BE250-GUEST/OBJ rows writing `dst=8EFFED00/8EFFED50` (guest stack) and BESWAP-RET rows writing `dst=A0438xxx/A042Cxxx` (phys arena) — **no row writes `82862DF8`** (the w750 log shows no fill row because WINWR-WATCH is budgeted past #42). In w751/w752 the same interval contains the probe row (`w752:13758` BE250-GUEST #1200 → `:13764` probe → `:13772` STREAM-WINDOW #1000) — the probe sits exactly in the w750 gap.
+- Source = raw `rpf[member_base + stream_pos]`, byte-identical at two measured positions: stream 0x3000 (`WINWR-WATCH #42`, §2) and stream 0x5000 (`STREAM-WINDOW` w750:13609 `winHex=C2342C2A95ABAA0A == rpf[0x1FA000:8]`, re-verified byte-for-byte this session; = F-786 §1's provenance). Member base `0x1F5000` measured by `MEMBER-EXPAND-OVERRUN off=001F5000 stored=7578 expanded=23807 logical=23807` (w752:13603).
+- The addressing `abs = archive_offset + pos` is the guest's own: `generated/ppc_xenon/ppc_recomp.17.cpp:3220 lwz r9,8(r11)` (archive offset from `[[rec+0]+8]`), `:3238 add r5,r11,r10` (+pos), `:3239 bctrl` → vtable+28 → `sub_821CC6F0` — raw words recorded at `src/gpu_device.cpp:19956-19971`.
+
+#### 4. Residual, UNNAMED — candidate T43.13: which host function physically read `rpf[0x1FA000]`
+
+- w752's complete `READAT-BRANCH` histogram has **0 rows** at `off=001F8000 / 001F9000 / 001FA000` (region rows: `off=001F5000` ×6 only, `span_ran=1 head16=72677861`).
+- The zero is legitimate, not rate-limit blindness (rule 19, positive control AT THIS MEMBER): the limiter is first-16-per-path-then-every-4096th (`vfs_rpf.cpp:2561-2562` `kReadAtFirstN`/`kReadAtEveryN`, drop condition `:2716`) and the in-span exemption bypasses it entirely — the 6 `off=001F5000` rows print at #957+ / `call≥961` (w752:13606+), far past both budgets, which can only be that exemption firing.
+- The span covers the tail: `MarkMemberExpandedIn` (`vfs_rpf.cpp:2204-2235`) stores `off=0x1F5000 logicalLen=23807`; `WindowInsideRegisteredSpan` (`:2615-2624`) tests `off ≤ head < off+logicalLen` ⇒ `[0x1F5000, 0x1FACCF) ∋ 0x1FA000`; the entry is `resolved` and not `failed` because `MEMBER-EXPAND-OVERRUN` prints only past the success check (`vfs_rpf.cpp:1175-1195`, the `s.bytes.size()==logicalLen` gate).
+- ⇒ a read at `0x1FA000` entering `RpfVirtualFileSystem::ReadFileAt` **would** print; none did ⇒ the granule fill never reached that function. Which host function produced these bytes (and how it obtained archive content at 0x1F8000/0x1F9000/0x1FA000) is **UNNAMED** — open residual, probe at that layer = T43.13, required before any fix (do-not #1).
+
+#### 5. Premise corrected: `kListMemberSpans` never covered this member (supersedes F-786 §7 item 1's framing)
+
+- F-786 §7 item 1 (`:19324`) and LONG_TODO `:1630` said "`kListMemberSpans` registers [0x1F5000, 0x1F6D9A)". Measured: `kListMemberSpans` (`src/gpu_device.cpp:2635-2642`) holds exactly six entries — five `.list` members plus `textures/global/cars/globaltex.list` — **no `CityDefault.fxc`**; and `0x1F6D9A` is the member's *stored* end (`0x1F5000 + 7578`), not any registered span. CityDefault's registration is dynamic via `g_expSpans` (`MarkMemberExpandedIn`, `vfs_rpf.cpp:2204-2235`) with the **logical** length 23807 ⇒ span `[0x1F5000, 0x1FACCF)`.
+- So "the fill is outside the registered range" was a mis-framing: the read IS inside a registered span (§4's exemption proves it fires at this member). What let the raw bytes stand is not a bypass of anything but the deliver's `origRet == amIn6` refusal (§2). The queue rows that carried the old premise (LONG_TODO T43.12, HANDOFF §12.3 item 2) are marked superseded by this finding.
+
+#### 6. Docs / registration state
+
+- `docs/PROGRAM_GUIDE.md` §7 paragraph (`:455` probe, `:457` answer) + §9 first-cell row (`:758`) added in the same change; `markers_from_guide(GUIDE)` re-run after the edit: `T4312-UNDELIVERED` tracked=True, total 234→235.
+- `docs/LONG_TODO_MASTER.md` T43.12 row → ✅ ANSWERED (premise superseded); new queue row **T43.13** for §4's residual; `docs/HANDOFF_NEXT_AGENT.md` §13 appended.
+- Uncommitted (commit only when asked); stage named paths only.
+
+- **Correction (same session, before commit) to §1's final clause:** "`T4312-UNDELIVERED` is census-shaped" is WRONG — `classify_token('T4312-UNDELIVERED')` returns **`other`** (its suffix `-UNDELIVERED` is in neither `MITIGATION_SUFFIX` nor `CENSUS_SUFFIX`, `tools/mitigation_audit.py:73-84`), which is exactly why it appears in neither the stale nor the undocumented list. The correct statement: *classified `other`, registered in §7, in neither audit list*. Verified with the final run after the §7 reword: **STALE = 6** (`CITING`, `F432-SC`, `F434-SC`, `GATE-STACK`, `GFX-BLOCK`, `INVERTED-DIRECTION` — all pre-existing, none from this task) and **UNDOCUMENTED = 88** (pre-existing), exit 1 unchanged. The same reword also removed this task's two accidentally label-shaped §7 tokens (`UNDELIVERED-READ` from the heading, bare `BESWAP`) that had briefly pushed stale 6→9 — `BESWAP` became `BESWAP-RET` (the printer, in `src/`), the heading became "A LOG-ONLY PROBE", and `F-787` was made live by citing it in the probe's own comment (`src/gpu_device.cpp:20206`, mirroring the guard's `F-786` cite at `:25983`).
+
+### F-788 — T43.13 ANSWERED: the granule bytes are produced by `::ReadFile` (OVERLAPPED) inside `RpfVirtualFileSystem::ReadFileAt`'s handle branch, issued per 32K page by guest `sub_8244F4C0` via `NtReadFile`'s positional arm — and the `off=001F8000` histogram zero was a limiter-SUPPRESSED row, now printed directly by the new log-only `READAT-DROP` probe (w753/w754, 2026-10-08)
+
+**Task T43.13 (F-787 §4 / HANDOFF §13.2 residual): name the host function that physically produced `rpf[member_base+pos]` bytes for the `CityDefault.fxc` granule fills, and the call chain — log-only probe first, no fix without the named producer (do-not #1/#9). ANSWERED. Every link below is a directly printed row reread this session; probe runs are `build/w753.log` (first budget) and `build/w754.log` (fixed budget), the citations are w754 unless noted.**
+
+**1. The granule fill is a guest-side copy out of a resident 32K page buffer — no read is issued per granule.** `WINWR-WATCH #42` (`w754:14250`; printer `src/gpu_device.cpp:19593`, inside the `sub_821CBE18` wrapper): `dest=82862DF8 slot=B793C13C off=0 cnt=4096 srcBase=B795C000 src=B795C000 lr=821CCBEC src8=8588FC19B565A9BC` — `src8 == rpf[0x1F8000:8]` byte-exact against `build/game_data/xarchive_cache.rpf`. Same row modulo time at `w750:13568` and `w753:13735`.
+
+**2. The page buffer was filled by a 32768-byte read completing inside the host override of guest `sub_8244F4C0`.** `RD-BUF #112` (`w754:14017`; printer `src/gpu_device.cpp:19279`, `PPC_FUNC(sub_8244F4C0)` at `:19225`): `buf=B795C000 cnt=32768 read=1 out=00008000 head=[.....e..|..7E..?]` == `rpf[0x1F8000:16]` byte-exact; companion `RD-BUF #111` (`:14012`): ``buf=B794C000 head=[`T....x.fL......]`` == `rpf[0x1F0000:16]` (oracle `605496efb8f078bd664ccf89ca8d0883`; the head's first byte is ASCII 0x60). (w750 numbering: `#112/#113` at `:13336/:13338`.)
+
+**3. Both reads entered `RpfVirtualFileSystem::ReadFileAt` and were dropped by its per-path limiter — the historical `off=001F8000` zero is a suppressed row, not an absent read.** Direct rows from the new probe (drop site `vfs_rpf.cpp:2733-2759`): `READAT-DROP #681 call=949 seen=945 path='xarchive_cache.rpf' off=001F0000 req=32768 got=32768 raw_positional=0` (`w754:14010`) and `#682 call=950 seen=946 off=001F8000 req=32768 got=32768` (`:14016`), line-interleaved with exactly their completions (`:14012`, `:14017`) and bounded by printed `READAT-BRANCH #944 call=948` (`:13980`) → `#947 call=951` (`:14056`) — the two calls missing from the printed sequence ARE these two rows. Earlier reads of the same pages were dropped too: `#609-#611 call=720/721/722 off=001F0000/001F8000/00200000` (`:11020-:11024`).
+
+**4. The physical producer: `::ReadFile` + OVERLAPPED on the pack handle (handle branch).** `vfs_rpf.cpp:2835-2860`, call `:2842-2843`, `OVERLAPPED ov` `:2838-2840`; the span splice runs under `if (!file.raw_positional)` `:2852-2855` — the drop rows show `raw_positional=0`, i.e. the NtReadFile path, not gpu_device's two raw-positional sites (measured live: `gpu_device.cpp:3217` and `:23849` — w754's banner prose still prints the stale pre-shift `:2946`/`:22763`; that text rides in every `READAT-BRANCH` row, so it was left alone). Branch corroboration: every printed `READAT-BRANCH` row on `path='xarchive_cache.rpf'` in w754 says `branch=handle`; the only `branch=nested|fallback` rows in the whole boot are `w754:825`/`:838` (calls 1-2, `path='/Device/Harddisk0/partition0'`).
+
+**5. The caller: `NtReadFile`'s positional arm.** `src/kernel/imports.cpp:3460` (`vfs.ReadFileAt(fileObj->fileHandle, offset, hostPtr, length, ...)`), NFS-ARM printer `:3513`; every sampled NFS-ARM row with `lr=8244F548` (inside `sub_8244F4C0`) carries `pos=1` (36 rows across w750+w752, measured earlier this session; NFS-ARM total 21 = w750's 21). The nesting is closed by line order: the `READAT-*` row prints at the end of `ReadFileAt` (trace destructor `vfs_rpf.cpp:2834`) *before* the enclosing `RD-BUF` prints after orig returns (`gpu_device.cpp:19279`) — `:14010 → :14012` adjacent ⇒ call 949's `ReadFileAt` completed inside that `sub_8244F4C0` invocation.
+
+**Full chain:** guest streamer → `sub_8244F4C0` body → `NtReadFile` (positional) → `imports.cpp:3460` → `RpfVirtualFileSystem::ReadFileAt` handle branch → **`::ReadFile`+OVERLAPPED `vfs_rpf.cpp:2842` (the producer)** → raw page bytes into `B794C000`/`B795C000` (`RD-BUF`, heads byte-exact) → guest `sub_821CC1E0` body → `sub_821CBE18` window write (`WINWR-WATCH`) → window `82862DF8`.
+
+**The zeros, split into the two classes T43.13's premise conflated:**
+- `off=001F8000` (and `001F0000`): reads EXIST and reached `ReadFileAt` — 2 each per boot in w754 (`#609/#610`, `#681/#682`), all limiter-dropped. The pre-probe histograms (w750/w752 = 0 rows) were rate-limiter artefacts: the limiter's `return;` (`vfs_rpf.cpp:2758`) ran before the printer.
+- `off=001F9000`/`001FA000`: STRUCTURAL zeros — no read is ever issued at those offsets (page granularity 32768; granule fills are guest copies). 0 `READAT-DROP` rows there as well; those bytes arrive inside the `001F8000` page read and are addressed by window offset.
+- Therefore F-787 §13.2's "⇒ the granule fill never reached `ReadFileAt`" holds only in the narrow sense that granule fills issue no reads; it must NOT be read as "no read at `001F8000` entered `ReadFileAt`" — it did, twice per boot, and was suppressed.
+
+**REFUTED / corrected this session (do not re-import):**
+- **The inherited buffer-map note** "the dropped pair = `001F8000`→B795C000 + `00200000`→B794C000 / `B794C000` = page `rpf[0x200000]`": the direct rows say the pair is **`001F0000`→B794C000 + `001F8000`→B795C000** (heads byte-exact vs `rpf[0x1F0000]`/`rpf[0x1F8000]`) — the two pages that exactly cover the member `[0x1F5000,0x1FACCF)`. `0x200000` lands later (`READAT-DROP #685 call=967 :14254` + `RD-BUF #113 :14255 head=rpf[0x200000]`, after the granule fill `:14250`) into a recycled B794C000.
+- **The first probe budget was blind on its own target** (w753): `first-64-then-every-256th` printed 66 drops but spent 64 by `call=84` and 512 by `call=575` (total drops <768 — no `#768` row), so the target pair (dropN 513-767) fell in the unprinted gap while 66 unrelated drops printed. Budget is now `first-1024-then-every-4096th` (`vfs_rpf.cpp:2748`); w754 printed all 685 (dropN #1..#685, calls 21..967, every row `got==req`). Recorded at `vfs_rpf.cpp:2606-2613`: a budget spent before the target event is a blind instrument with a passing smoke test — do not shrink it back.
+
+**Positive controls (rule 19) / gates:**
+- Probe fires on a known event: 685 rows incl. all 6 target-offset rows; every row `got==req` (completed read).
+- It observes without perturbing: real `READAT-BRANCH` rows **282 = w750's 282** (gate leading-literal count `readat-branch:282`). Naive substring counting of `READAT-BRANCH` over w754 reads **967 = 282 + 685** because each drop row quotes the marker in its own prose — count a marker only where it leads the row (soak_census COUNT rule).
+- `soak_census w754 vs w750` exit 0: DEPTH 1.03x COMPARABLE; LOG QUALITY top shape 16%, no withholding (drop rows = 685/32,450 = 2.1% of lines); `rd-buf` 113 (114), `nfs-arm` 21=21, `winwr-watch` 141=141, `arc-window` 62=62, `rd-submit` 24=24, `member-expand-mark` 161=161. `soak_census w753 vs w750` also exit 0.
+- Builds: each of w753's and w754's build = `[1/2] vfs_rpf.cpp.obj + [2/2] link` = exactly one TU (rule 1a); `g_readAtDropped` (`vfs_rpf.cpp:2614`) is the change's only new file-scope symbol (rule 1b); soaks w753 (5,202,487 B) + w754 (5,403,408 B), 120 s each, new log per experiment, `mcla.exe` killed after each run; guest binary untouched; nothing committed.
+
+**Registration / residual:** `PROGRAM_GUIDE` §7 paragraph (inserted before `## 8.`, measured `markers_from_guide` 235 → 236) and §9 first-cell row (after the `T4312-UNDELIVERED` row). **Residual: none for T43.13** — the producer is named and every link prints. The tail fill stays UNDELIVERED by design (T43.12's `origRet == amIn6` clause, `gpu_device.cpp:20174` — behaviour unchanged by this probe); fixing it is a separate task that must start from this chain.
+
+**Post-registration gates (run after the docs landed, 2026-10-08):** `tools/addr_owners.py --check sub_8244F4C0` **exit 0** — 2 sites, the standard orig/override pair (`src/gpu_device.cpp:19211` orig, `:19225` override), one owner each (rule 4; this task added no hook). `tools/mitigation_audit.py` exit 1 = the tree's **pre-existing baseline, zero attributable to T43.13**: neither failure list contains a T43.13 label — the stale six (`CITING`, `F432-SC`, `F434-SC`, `GATE-STACK`, `GFX-BLOCK`, `INVERTED-DIRECTION`) are all pre-existing, and `READAT-DROP` is absent from the undocumented-mitigation list (it is registered in §7 and its literal is in `src/`). Counts moved vs the 2026-10-01 measurement (§7 registered 92→132, undocumented 86→88, stale 4→6) — **attribution NOT established** (N-way: the tree carries other sessions' uncommitted `src/` changes); what is established is only the two negatives above.
+
+### F-789 — T43.14 LANDED: the ARC-WINDOW deliver gate opens on the logical-clamped EOF granule (`arFull || arClamp`); the 22-per-boot refusal class is retired, the CityDefault tail fills byte-exact, and the measured park chain dies with it (2026-10-08, `build/w755.log`)
+
+**Task `LONG_TODO §6 T43.14` (row registered before the change). Do-not #1 satisfied BEFORE the fix: F-787 named the refusing clause (`origRet == amIn6`, old `src/gpu_device.cpp:20174`), F-788 named the raw-fill producer (`::ReadFile`+OVERLAPPED in `RpfVirtualFileSystem::ReadFileAt`), and the refusal census below is COMPLETE — the `T4312-UNDELIVERED` budget (`first 96 + every 256th`) covers every window-base entry, closed against `WINWR-REC`'s printed `tot=50` (28 probe + 22 window-base `ARC-WINDOW` = 50).**
+
+**The change (one TU; no new file-scope symbols).** `src/gpu_device.cpp` only: the served-body lookup moved before the gate (comment `:20191-20195`, lookup `:20196-20202` — the same lookup at the same point in the sequence; on a call failing both arms it is one map hit that previously happened inside `MclaArcWindowDeliver`), and the gate is now `arFull || arClamp` (`:20225-20230`, deliver call `:20234`). `arFull` = the original predicate byte-for-byte (`origRet == amIn6`); `arClamp` = `!arFull && origRet != 0u && origRet < amIn6 && arBody.buf != 0u && arBody.size != 0u && amPrePos < arBody.size && origRet == arBody.size - amPrePos` (`:20226-20229`) — an EOF-exact short read against a present served body. Banner bullet amended `:20146-20161` (bullet amended: `:20144-20145`). `MclaArcWindowDeliver` (`:19755`) is untouched: it already clamps `want = min(count, body.size - pos)` (`:19770-19773`) and refuses `ret=0` itself (`:19774`, `arWant != 0`), and the block sets `ctx.r3 = ar.want` (`:20250`) ⇒ **guest-visible return identical on every row; only the window fill changes** (raw pack bytes → the proved body; same 512-byte copy loop `:19777-19780`; same exact-key + `w1 == body.size` trust anchors, F-609). Error (`0xFFFFFFFF`), zero-length and truncated reads match no arm and stay refused, as the original clause intended. Rule 1a: build `[1/2] gpu_device.cpp.obj + [2/2] link`, 0 errors — the w755 exe differs from the w754 exe in this TU only. Rule 1b: the change's only new symbols are the two locals `arFull`/`arClamp` (`:20225/:20226`); the probe's `s_4312` predates it. Rule 4: `addr_owners --check 0x821CC1E0` = 2 sites exit 0 (orig `:19798`, override `:19800` — no new hook). Rule 12: `mcla.exe`+`mcla.map` mtime 14:47:14, w755 started 14:47:49.432; guest binary untouched; killed after; nothing committed.
+
+**The census basis (complete; classifier run this session).** `build/w754.log` = 28 `T4312-UNDELIVERED` rows = **22 clamp-refused + 6 zero-eof + 0 other** (`ret==0 && pos==bodySize` → zero-eof; `0<ret<req && pos<bodySize && ret==bodySize-pos` → clamp; printed `w754 classes: zero-eof=6 clamp-refused=22 other=0`). The 22 = **17 refused member tails** (incl. `rec=B79150A0 pos=20480 ret=3327 = 23807-20480`, the CityDefault tail, head of the F-785→F-786 chain) **+ 5 whole-body reads** (`ret=575/824/260/1246/109 < 4096` — entire window raw). Every member on this path is DEFLATE (`stored != logical` in every `SERVE-PROOF` row, e.g. `globaltex.list 236→575`), so every refused window held compressed-stream garbage, not a near-miss.
+
+**Soak w755 (new log per experiment).** 120 s survived (TIMEOUT_KILLED), **43,932 lines / 7,853,784 B**, span 14:47:49.432 → 14:49:48.845; mcla.exe post-killed (not found afterward).
+
+**Outcome 1 — byte-exact, on both clamp rows.** `ARC-WINDOW #153 rec=B79150A0 path='shaders/city/fxl_final/CityDefault.fxc' win=82862DF8 pos=20480 req=4096 want=3327 done=3327 bodySize=23807 head=05000861` (`w755:17422`): fresh `zlib.decompress(rpf[0x1F5000:0x1F6D9A], -15)` = 23,807 B and its `[0x5000:0x5004]` = `05000861` — **log head == oracle slice, True**; bytes `05 00 08 "ambYPos…"` are the correct invocation header F-786 recovered, replacing raw `rpf[0x1FA000]` = `C2342C2A`. Second clamp delivery in the same boot: `ARC-WINDOW #160 CityDefaultGrime.fxc pos=20480 want=2647 = 23127-20480` (`w755:17665`) — also exact.
+
+**Outcome 2 — the refusal class is gone, classified, not counted.** `w755 classes: zero-eof=3 clamp-refused=0 other=0` — the 3 survivors are all `gate=0 ret=0 pos==bodySize posIn=0` (`w755:13552/:17072/:21347`), the zero-EOF reads `MclaArcWindowDeliver` refuses itself; `T4312-UNDELIVERED 28 → 3` (census lead-count). The probe is retained as the complete-census + regression alarm it always was: any future nonzero clamp-refused class = the gate regressed.
+
+**Outcome 3 — every link of the F-785→F-786 park chain is 0** (w754 → w755; direct literal counts unless labeled census): `T4310-HUGE-MEMCPY 1→0`, `T4311-LEN-GUARD 1→0`, `count=FFFFFFFF 1→0`, `len=FFFFFFFF 2→0`; census lead-counts `HEAPHDR-STORE 202→0`, `F374-HEAPSTORE 32→0`, `F631-HEAPWIN 32→0`, `F379-HEAPSTORE-BT 20→0`. `T4311-LEN-SELFTEST fire=[1,1,0,0]` still passes — instrument alive on a known-positive (rule 19).
+
+**Outcome 4 — depth, and what the refusal was costing.** Direct counts: `ARC-WINDOW # 62→176`, `STREAM-WINDOW 58→99`, `XSF-HOSTSERVE 51→141`, `LISTLINE 1→81`, `GETDEV 268→620`. Census lead-counts: `SERVE-PROOF 102→282`, `TOC76 462→768`, `PARK-SAMPLE 208→84`, `C0000005 4→2`. **No presentation progress** (`NATIVE-PRESENT 2=2`, `HB-FLICKER 39=39`, `DRAW_INDEXED 0→0`) — a fix, not a completion. The ceiling is the strongest causal statement here and it is single-variable against w754: **w743/748/750/754 all stall at the identical `ARC-WINDOW#=62, GETDEV=268, LISTLINE=1, star_glow=0`** (measured across all four), the w755 exe differs in `gpu_device.cpp` only, and the gate change breaks the ceiling (62→176). A wall, not THE wall — the boot then dies at the next one (below).
+
+**Outcome 5 — regression check on the new fatal (it is not the delivered bytes).** `star_glow` appears **0 times in w743/748/750/754** — the boot never reached that code — and 27 times in w755. The fatal's own member content is served correctly on its other path: `TOCSERVE-DEFLATE leaf='star_glow.dcl' stored=83 tocW1=89 inflated=89 served=89` (`w755:25734`, inflated == w1 exactly). Further: `Unable to load shader` appears in **no other log of `build/w685..w754`** (0 in every one, measured this session), and the `FATAL-SOFT` rows that do exist in that range are different messages (`'Unknown manufacturer %s…'` w685/w700; `'Old version of rage effect…'` w733; 0 rows w734–w754).
+
+**The new head of queue (measured; cause UNATTRIBUTED — this is T43.15 material, not an answer).**
+- `FATAL-SOFT 'Unable to load shader '%s', it probably wasn't preloaded properly.' lr=82189270` (`w755:25836`, @14:48:14.569), dispatcher `w755:25821`, message `:25824`, **aux `:25825 = 'star_glow'`** — guest paused, host window stays.
+- Preceded by the embedded-entry gate, both forms: `AFB76-REFUSE #74 path='embedded:/dcl/star_glow.dcl' reason=NO-EMBEDDED-ENTRY content=NOT-CORROBORATED blocked=STEP6-ALLOC` (`w755:25744`) and `#75 path='embedded:/star_glow.dcl'` (`:25763`), each with `AFB76-MISS-HONEST (T41.3d/F-066)` (`:25745/:25764`). The mangled-archive hop of §8's documented cascade prints as `TOC76/TOC76-SG path='star_glow/dcl/star_glow/dcl/star_glow.dcl' ret=00000000 [all zero]` (`w755:25792-25805`), then `path='dcl/star_glow.dcl'` (`:25807-25812`) — then the fatal 9 ms later.
+- **Two labeled hypotheses, both falsifiable, neither measured:** (a) the host embedded-entry gate lacks a table this boot needs (T41.3d/F-066 territory) — falsified if supplying/patching the embedded entry kills the fatal without touching the pool; (b) `blocked=STEP6-ALLOC` means content corroboration is DENIED by the refusal burst that starts at 14:48:03.635 (`PHYS-POOL-FULL #1 … attempts=8400 served=8399 refused=1 over_frag=1`, `w755:18151`; `XTL-ALLOC-REFUSED #1`, `:18152`) — falsified if a boot with headroom passes STEP6 with no embedded table present. Do not quote either as a cause.
+- **T43.2's exhaustion reproduces for the first time in a full-boot log:** `PHYS-POOL-FULL 0→9`, `XTL-ALLOC-REFUSED 0→8`, `PHYS-LIVE 0→256` (0 in w743/748/750/754 — those stall at the ceiling before any burst). This is the phase `LONG_TODO §6 T43.1c/T43.2` were written for; it is now reachable.
+- Also in-run: `Vectored exception code=0xC0000005 rva=0x2980BA7 thread=7200` (`w755:18729`, @14:48:04.910) → `host_rva_resolve.py build/mcla.map 0x2980BA7` = **`__imp__sub_825FA460 +0x2a7`**, exit 0 (same-build map; control = a known symbol resolves at +0x0). Pre-existing class, not a regression (census `C0000005 4→2`).
+
+**Gates.** `soak_census build/w755.log build/w754.log` **exit 0**: `DEPTH: 43,932 vs 32,450 lines = 1.35x (bar 2.00x) -> COMPARABLE`, 262 tracked, LOG QUALITY top shapes = idle `CAS-SITE`/`WAIT[KWFSO]`/`WAKE[KWFSO]` at 15% each — **no withholding** (no WITHHOLD verdict row). `addr_owners --check 0x821CC1E0` exit 0 (2 sites). `mitigation_audit` exit 1 = **pre-existing baseline, zero T43.14 attribution**: `STALE (6)` = F432-SC, F434-SC, GATE-STACK, GFX-BLOCK, INVERTED-DIRECTION (+1), `UNDOCUMENTED (88)` — all predate this change; keyword counts in its output: `T43.14 = 0, arClamp = 0, arFull = 0, AMENDED = 0`. `host_rva_resolve` exit 0 (above).
+
+**Two instrument notes (rule 19), so neither is re-imported.** (1) `count=170` is **0 in BOTH** logs — it was never a log literal (F-786's manual STREAM-WINDOW hex parse); the chain's honest log markers are the four `…→0` rows above. (2) `F631-HEAPWIN` census lead-count is **32** while a direct literal count is **64** — quote the census number when quoting the census (half the lines mention it without leading the message).
+
+**Doc/queue actions of this append:** `PROGRAM_GUIDE` §7 gains a paragraph registering the gate change + an AMENDED note on the T43.12 paragraph (its line numbers drifted: probe comment `:20255-20298`, condition `:20299`, `s_4312` `:20300-20302`, printer `:20315-20322`, hoisted probe locals `:20181-20183`); §9 `T4312-UNDELIVERED` row amended (28 → 3, class split); `LONG_TODO` T43.14 → ✅; `HANDOFF` §15 written. **Next free ID F-790.**
+
+### F-790 — T43.15 ANSWERED: the `star_glow` fatal is pool exhaustion seen through a shader load — STEP6's `mem.Alloc(89,16)` returns 0 while the 512 MiB console pool has refused every allocation since 14:48:03.578; the embedded table is intact (15) and `content=NOT-CORROBORATED` is a vestigial constant (2026-10-08, `build/w755.log` + host code, NO BUILD)
+
+**Task `LONG_TODO §6 T43.15` (row registered with this append; F-789 seeded it as the new head of queue). Diagnosis only — no `src/` change, no build, no boot.** Every claim is a `file:line` of host code (read directly — RULE 0 governs the guest binary and logs; host source is readable) or a `build/w755.log` row number. Rule 19 honored before the zeros: the `o1heapAllocate returned null` sampler was shown printing `#1..#8/#100/#200` rows and its budget read at `heap.cpp:3455`, so the empty fatal window is a budget, not a pass.
+
+**The fatal chain, end to end (all rows `build/w755.log`).**
+1. `AFB8-IN #74` (:25731, @14:48:14.293, `path='embedded:/dcl/star_glow.dcl'`) enters `sub_821CAFB8` (`src/gpu_device.cpp:24090`). The seeded embedded list misses — **by design**: `listCount=15` and all fifteen names are the `rage_*`/`rmptfx_*` family, no `star_glow` (full list printed at :25385; the F-654/F-655 comment `gpu_device.cpp:24118-24124` records the list as a FIXED 15-entry table seeded at boot, with the guest-TOC fallback existing precisely for the rest).
+2. The F-655 fallback resolves the name against the guest's own enumerated TOC: `tocHashes=11836 tocLeaves=22068 candidates=1 tocVerdict='OK'` (:25744) — **the enumeration worked; exactly one record.**
+3. `MclaTocServeMember` (`gpu_device.cpp:23844`) runs its steps: STEP1 range passes, the read completes (89 B at `off=00305F0C`, :25733), STEP4 inflate passes — `TOCSERVE-DEFLATE leaf='star_glow.dcl' ... stored=83 tocW1=89 inflated=89 served=89 ... inflated length == w1 exactly` (:25734) — STEP5 magic/printable passes. The function returns on the first failed step and `why` is still `OK` until STEP6 writes it, so **reaching `STEP6-ALLOC` proves steps 1-5 all passed: the corroboration PASSED.**
+4. STEP6: `const uint32_t dst = mem.Alloc(served, 16); if (!dst) { *why = "STEP6-ALLOC"; return 0; }` (`gpu_device.cpp:24077-24080`) — **89 bytes, alignment 16 — refused.** The caller prints `AFB76-REFUSE #74 path='embedded:/dcl/star_glow.dcl' ... content=NOT-CORROBORATED blocked=STEP6-ALLOC` (:25744), then `AFB76-MISS-HONEST #74` (:25745) and `BDF20 #265 ... ret=0` (:25746).
+5. The bare form repeats identically: `AFB8-IN #75` (:25747, `path='embedded:/star_glow.dcl'`), inflate passes again (:25750), `AFB76-REFUSE #75 ... blocked=STEP6-ALLOC listCount=15` (:25763), `BDF20 #266 ... ret=0` (:25765).
+6. The guest falls back to its own archive lookups — first the mangled path `star_glow/dcl/star_glow/dcl/star_glow.dcl` (:25792, :25799-:25806), then `dcl/star_glow.dcl` (:25807-:25813): `TOC76 #502..#505` all `ret=00000000` with all-zero scatter, `BDF20 #268/#269 ret=0`.
+7. Fatal, @14:48:14.569: dispatcher (:25821) → `fatal message: 'Unable to load shader '%s', it probably wasn't preloaded properly.'` (:25824) → `fatal aux r4: 'star_glow'` (:25825) → `FATAL-SOFT ... lr=82189270 — guest paused, host window stays` (:25836).
+
+**Why `mem.Alloc(89,16)` is 0 — the pool, not the content.** `GuestMemoryHeap::Alloc` (`src/kernel/memory.cpp:529-539`) has exactly three return-0 arms: `!m_initialized` (false since boot — this heap served every earlier allocation of the run), `g_userHeap.AllocPhysical` returning null (`:534-536`), and `MapVirtual` (`:490-500`) which returns 0 only for a pointer outside `[m_base, m_base+m_size)` — impossible for a pointer just returned by that window (the pool is identity-mapped into it, `heap.cpp:1094`). The live arm is the null, and the log shows that null happening continuously:
+- `AllocPhysical: o1heapAllocate returned null #1..#8` @14:48:03.578→.979, `#100` @14:48:08.088, `#200` @14:48:12.120 (`:18124`, `:18161`, `:18207`, `:18243`, `:18273`, `:18319`, `:18355`, `:18391`, `:19845`, `:21088`) — **every row `live=0x1ffa8000 cap=0x20000000 peak=0x1ffa8000`** = 511.7 MiB of the 512 MiB console pool in use, `peak==live` (no headroom, never dropped between #1 and #200). All ten carry `caller_rva=0x2bc7aa`, and `tools/host_rva_resolve.py build/mcla.map 0x2bc7aa` resolves it to **`?Alloc@GuestMemoryHeap@kernel@mcla@@QEAAI_K0@Z +0x1a`** — the very function STEP6 calls.
+- `PHYS-STATE #1` (:18139, same millisecond, `oom=1`) classifies the same event: `size=0x40b0 align=0x4000 ... suitable=0x0 smallest=0x0 bin_mask=0x1c0 allocated=0x1ffa8000 peak_allocated=0x1ffa8000 capacity=0x20000000 free=0x58000 free_ppm=671 verdict=over-fragmented why=free_but_no_suitable_class` — 352 KiB nominally free, no usable class. Its `size` is the o1_amount form of the same request the sampler prints as payload `0x90`: `0x90 + 0x4000 + 0x20 = 0x40B0`, and the identity cross-checks exactly on sampler row #200's own triple (`size=0x70 align=0x4000 o1_amount=0x4090`).
+- `XTL-ALLOC-REFUSED #1..#8` run in the same window (`:18152`-`:18418`, @14:48:03.635→04.036, sizes 144, 640, 128, 112, 14, 9520, 52, 112, `align=16`) — **even 14 bytes was refused.**
+- The fatal window (14:48:14.29-14:48:14.38) contains **no** `oom` row — not evidence of success: the sampler prints only `n <= 8 || (n % 100) == 0` (`src/kernel/heap.cpp:3455`; cap rationale `:3450-3454`), so between `#200` and end-of-run the true count is invisible. For this event the direct evidence is `blocked=STEP6-ALLOC` itself. (Rule 19: a budgeted printer's numbers are a cadence, not a total — ≥200 refusals by 14:48:12.120, unknown after.)
+- The refusal era began **11 s before** the fatal, and the boot kept running on console-value-0 returns the guest mostly did not test, until the shader serve needed real memory.
+
+**Verdicts on F-789's two hypotheses (now measured, not predictions).**
+- **(a) "the embedded-entry gate lacks a table this boot needs" — REFUTED.** The table is intact and printed: `listCount=15` with all fifteen names (:25385, :25763), and the `star_glow` miss is the designed behaviour of a fixed `rage_*` seed (comment `gpu_device.cpp:24118-24124`). What the gate lacked was only 89 bytes of guest memory.
+- **(b) "content corroboration denied by the pool refusal burst" — CONFIRMED in its pool half, INVERTED in its corroboration half.** The pool refusal is exactly what killed the serve — but the denied step is the *body's guest-memory allocation* (STEP6), not the corroboration, which passed at STEP4 with `inflated length == w1 exactly`.
+- **`content=NOT-CORROBORATED` is a vestigial constant and carries zero information** (instrument trap, rule 19): the local is initialized at `gpu_device.cpp:24239` and printed at `:24328/:24334` — **no assignment exists anywhere between them** (a full-file token scan of `content` finds no other occurrence inside `sub_821CAFB8`; the remaining hits are other functions' comments). It printed `NOT-CORROBORATED` in **14 of 14** refusal rows in w755 — both classes alike (`NO-GUEST-TOC-RECORD` x12, `STEP6-ALLOC` x2) — while its own comment (`:24187`) claims the field names "the corroboration's verdict". The comment overpromises the field: never read a corroboration failure off `content=`. (w755 holds **15** lines containing the token `AFB76-REFUSE`; one is F640-XCU-SUMMARY prose at :134 — 14 are refusal rows, spanning AFB8 call numbers `#56` (first, :25385) to `#75` (last, :25763).)
+
+**The other refusal class in the same window — different gap, not fatal (recorded so it is not mistaken for the star_glow mechanism):** the 12 `rage_im` rows are `blocked=NO-GUEST-TOC-RECORD` with `candidates=0` (:25385, :25388, :25421, :25424, :25473, :25476, :25520, :25523, :25573, :25576, :25607, :25610) — the guest TOC genuinely has no `dcl/rage_im.dcl` leaf (the seed's name for it is `fxl_final/rage_im.fxc`, and the run's one `AFB76-HIT #1` at :1866, @14:48:01.440, is exactly that fxc form). The boot continued 1.2 s past them; only the `candidates=1` + `STEP6-ALLOC` pair preceded the fatal.
+
+**Residual / next (why this row is ANSWERED but the fatal is not "fixed").** With the pool refusing everything, the next guest allocation after `star_glow` would die the same way — the fatal has no fix of its own. The cure is the exhaustion, in the queue's registered order: **T43.1c → T43.2**. Three inputs measured here for T43.2: (i) the mechanism is already written in-tree — `src/kernel/heap.cpp:1976-1982`: `__xtl_free` "is a deliberate no-op that returns 1, so EVERY guest XTL allocation is un-reclaimable and the physical arena can only grow"; (ii) w755's classifier already says `verdict=over-fragmented why=free_but_no_suitable_class` where the T43.2 row's w743 premise said `verdict=healthy` — `free` fell 34.97 MiB → 352 KiB and `bin_mask` lost bit 19 (`0x801c0` → `0x1c0`); (iii) the 314 MiB `alloc_seq=3` block still sits at `block_guest=A3A8C000` on every `PHYS-LIVE` row (:25743 etc., `freed=0`).
+
+**Doc/queue actions of this append:** `LONG_TODO §6` gains the **T43.15** row (ANSWERED, residual pointer to T43.1c/T43.2); `HANDOFF` gains §16. **No printer added — `markers_from_guide` should remain 262** (the prediction F-789 §15.3 recorded; re-run `soak_census` on the next soak to check it). Ledger: next free ID **F-791**.
+
+
+### F-791 — T43.1c DONE: `NotePhysLive`'s cost, its aim, and three structural zeros fixed in ONE log-only change — refusal-era wall-time 10.934 s → 1.596 s for the same 254/256-refusal storm, the first positive `guest_refs` in the instrument's lifetime, and a `ctl=` positive control that fires from row #1
+
+**Task `LONG_TODO §6 T43.1c` (row closed by this append; authorised by F-783 §7-§8). One log-only change, `src/kernel/heap.cpp` only: one-TU build (`[1/2] heap.cpp.obj` → `[2/2] Linking`, 0 errors, `build_ninja.log` 145 B), `mcla.exe` 14:47:14 → 16:40:18 (rule 12 discharged), guest binary untouched, one new soak `build/w756.log` (78,367 lines / 12,667,325 B, span 16:41:21.193 → 16:46:20.304, 300 s bound, RC=124 survived the bound as w755 did; `w756_err.log` = 1 benign DXC line).** Every claim below is a tool-printed line or a `file:line`.
+
+**What changed (six defects, one pass, all `src/kernel/heap.cpp`).**
+- **(a) COST:** budget 256 → 16 MiB — `kPhysLiveBudget` (`heap.cpp:1771`): one emission covers 16 MiB of window, so 256 emissions = exactly one pass over the 4 GiB window, and the per-emission memcpy falls 16×.
+- **(b) AIM:** nine-region priority visit-order table `kPhysLiveRegions` (`heap.cpp:1793-1820`, struct `PhysLiveRegion` `:1807`): image `[0x82000000, 0x829E0000)` (`PPC_IMAGE_BASE` + `PPC_IMAGE_SIZE`, `ppc_config.h:12-13`, raw-confirmed: `mcla_pe.bin` = `0x9E0000` bytes) → boot stack → pool → user heap → gaps ascending; disjoint, union = `[0x1000, 4 GiB)`. Cursor statics `cursorRgn`/`passScanned` (`heap.cpp:1868`, `:1870`) reset only when the biggest block changes (`:1879-1887`), so the pass survives across refusals.
+- **(c) BYTE ORDER:** each window dword passes the `be()` bswap before compare (`heap.cpp:1903`): the window is guest-BE — `ReadU32BE` is a raw host load + `Swap32` (`memory.cpp:204-229`; `Swap32` private in `memory.h:135` → inlined) — while the old sweep compared raw LE loads against guest-VA bounds.
+- **(d) POSITIVE CONTROL:** `ctl=` counts `kPhysLiveCtlMz = 0x4D5A9000` = `mcla_pe.bin[0x0:0x4] = 4d 5a 90 00`, **exactly 1 occurrence in the image**, and `kPhysLiveCtlOri = 0x61286772` = `mcla_pe.bin[0x18C848] = 61 28 67 72`, **exactly 1 occurrence, inside region 0** (`heap.cpp:1781-1782`, pass accumulator `g_physLiveCtl` `:1824`, wrap add `:2010`) — both counts raw-measured in `build/cache/mcla_pe.bin` this session.
+- **(e) WRAP:** on pass completion the tally now publishes the finished pass's totals (`showRefs = load()+refs` `heap.cpp:1998`, ctl `:2010`) and zeroes (`:2012`, `:2004`) — the old code stored only the last emission's count at wrap, discarding the whole pass.
+- **(f) REGISTRY ARM:** `LivePhysAllocs()` holds HOST `aligned` pointers (o1heap `void*`), which the old code compared raw against a guest-VA target — a type error making `reg_hit` structurally 0. It now goes through the bounds-checked `g_memory.MapVirtual(p)` (`heap.cpp:1862`, `memory.cpp:490-497`).
+- Two stale comments corrected in the same pass (F-644 header `heap.cpp:1120-1143`, binned arm `:3462-3463`): the emission was never on a "PHYS-STATE cadence" (it fires once per refusal) and never "stopped when the pass completes" — measured in w755: `pass=0..16` = 16 completed passes in 256 rows.
+
+**New symbols of this change (rule 1b):** file-scope — `struct PhysLiveRegion` (`:1807`), `kPhysLiveRegions` (`:1811`), `kPhysLiveCtlMz`/`kPhysLiveCtlOri` (`:1781-1782`), `g_physLiveCtl` (`:1824`); function-local statics inside `NotePhysLive` — `cursorRgn`, `passScanned`. All names occur in `heap.cpp` only (grep this session); no hook, no owner (rule 4: the diff adds no `PPC_FUNC`/`GUEST_FUNCTION_HOOK`/`SetFunction` site). New include `ppc_config.h` — read-only; the header itself stays rule-2 do-not-edit. (The working tree's other uncommitted `+static` symbols — `s_t44*`, `s_4310/4311/4312`, `s_774`, `g_userInstMem` … — belong to earlier sessions and were named in their entries.)
+
+**(a) COST — re-timed exactly as the row demanded (a `PHYS-LIVE` row count is a latency count):**
+
+| | w755 (before) | w756 (after) |
+|---|---|---|
+| PHYS-LIVE rows | **256** (`w755:18149`–`:25820`) | **254** (`w756:18167`–`:24015`) |
+| refusal era | **10.934 s**, mean gap **42.9 ms** (14:48:03.635 → 14:48:14.569) | **1.596 s**, mean gap **6.3 ms**, median 6.0 ms (16:41:35.532 → 16:41:37.128) |
+| `scanned=` per row | `256.0MB` on every row | `16.0`–`16.9MB` on every row (budget + at most one chunk) |
+| `oom #n` rows | n∈{1..8,100,200} of 256 (F-790, `w755:18124`–`21088`) | **exactly** n∈{1..8,100,200} = 10 rows of 254 (`w756:18151`–`:19652`) |
+| terminus | `star_glow` fatal (`w755:25821`, +25.14 s after process start) | same `star_glow` fatal (`w756:24016` dispatcher, `:24019` message, `:24020` aux `star_glow`, +15.94 s) |
+
+Row count held (256 → 254, −2 = the refusal count on both boots), so no rows were added; injected sweep wall-time fell from ≈ 11.0 s (256 × 42.9 ms) to ≈ 1.6 s (254 × 6.3 ms) — **6.9× less latency for the same storm, same terminal fatal, 9.2 s earlier in boot-relative time** because the instrument no longer owns the clock. The census agrees the wall-time went back to the guest: `CAS-SITE 6,513 → 17,409 (+10,896)` and `WAKE[KWFSO] 6,511 → 17,407 (+10,896)` polls inside the same 300 s bound (`soak_census.py w756 w755`, exit 0).
+
+**(b)+(c) The first positive in the instrument's lifetime — byte order was the last blocker.** 276 rows across 10 prior logs were structurally all-zero (F-783 §8, re-confirmed this session). After the change, `PHYS-LIVE #1` (`w756:18167`) already carries **`guest_refs=1 … ctl=2 … hit0=82830B54`**, and all 254 rows agree (`guest_refs=1`, `pool_refs=0`, `hit0=82830B54`, `reg_hit=2`, `reg_total=4951`, `freed=0`): a word at **VA 0x82830B54** — past code end (`PPC_CODE_BASE + PPC_CODE_SIZE = 0x82130000 + 0x69D054 = 0x827CD054`, `ppc_config.h:14-15`, so image .data/.bss) — holds a value inside the block's span `[0xA3A8C000, 0xB6611000)` at runtime while `mcla_pe.bin[0x830B54] = 00 00 00 00` at rest: **a runtime-written image global naming the block's span**, found by region 0 in emission #1 (`sweep_ppm=4119`). It was reached only because aim (b) put the image first — the old linear cursor met it 2.04 GiB into the window.
+
+**(d) RULE-19 DISCHARGED — the instrument is shown firing on events known to exist.** `ctl=2` on row #1 and on **all 254 rows** (zero_rows=0): both control dwords — the MZ at image base and the unique `ori` at 0x8218C848 — are found by the first 16 MiB emission, against raw byte counts of exactly 1 each. The instrument's zeros (`pool_refs=0`, `freed=0`, any future `guest_refs=0`) can now be read as data instead of as unproven vacuity.
+
+**(e) REGISTRY ARM — type error confirmed and fixed.** w755: `reg_hit=0` on all 256 rows (structural). w756: **`reg_hit=2 reg_total=4951` on all 254 rows.** One of the two is the block's own `aligned`; the second's identity is open (candidates: an entry inside the `frag−size = 0x5000` tail, or a set entry `Heap::Free` never reached) — handed to T43.2.
+
+**(f) WRAP TALLY — changed, arm NOT exercised (rule 19 honesty).** The last row reads `sweep_ppm=992674 complete=0 pass=0` (`w756:24015`): the fatal ended the era 2 emissions short of the first completion (256 × 16 MiB = one full pass), so **w756 contains no `complete=1` row** and the publish-on-wrap path is compile-verified only. What it replaces is measured (w755's `pass=0..16` = 16 completed passes, totals discarded by the old store). Closing this gap needs a block era of ≥257 refusals — cite this sentence in the next log that reaches it.
+
+**Gates (this change).**
+- Build: exactly one TU — `[1/2] Building CXX object CMakeFiles/mcla.dir/src/kernel/heap.cpp.obj`, `[2/2] Linking CXX executable mcla.exe`, 0 errors (`build_ninja.log`).
+- `soak_census.py build/w756.log build/w755.log` **exit 0**: **`262 tracked` — F-790's prediction held (no printer added; `ctl=` is a field, not a marker)**; `DEPTH 78,367 vs 43,932 = 1.78x (bar 2.00x) → COMPARABLE`; `PHYS-LIVE 254 vs 256 delta −2`; `[error] 521 vs 522`; refusal structure unchanged — `PHYS-STATE 8/8`, `XTL-ALLOC-REFUSED 8/8`, `PHYS-POOL 10/10`, `PHYS-POOL-FULL 9/9`; no poisoned verdict (top line shapes 22.2% each, bar 33%).
+- `mitigation_audit.py` exit 1 = the pre-existing baseline (92 registered / 109 in `src/`), unchanged by this append.
+- Rule 4: no hook added — `addr_owners --check` has nothing new to resolve.
+
+**Doc/queue actions of this append:** `LONG_TODO §6` T43.1c → DONE (measurements inline); `HANDOFF` gains §17. Queue head is **T43.2 — name the exhaustion**, now holding F-791's four new inputs: `hit0=0x82830B54` (the first guest word ever to name the span), `guest_refs=1 / pool_refs=0`, `reg_hit=2 / reg_total=4951`, `ctl=2`.
+
+### F-792 — T43.2 DONE: the 314 MB asker is `sub_82131228`'s video-mode size helper (`(r7 − 1280×720)×16 & 0xFFFF8000`), the 512 MiB pool is the fixed `kConsolePhysicalBytes`, and the fill is 354.0 MiB of boot + 153.7 MiB of XTL micro-allocs each carrying the host's 16 KiB slab floor — the pool dies over-fragmented at `free=0x4e000` after charging +125.5 MiB over the console's own page model, then the boot fatals on `star_glow`
+
+**Task `LONG_TODO §6 T43.2`, row closed by this append. NO BUILD, NO BOOT, guest binary untouched.** Guest facts: `build/cache/mcla_pe.bin` (offset = VA − `0x82000000`) through `tools/ppc_disasm.py` / `tools/ppc_xrefs.py`; host symbols: `tools/host_rva_resolve.py build/mcla.map` (map of the same build as the log); the log census: inline python over `build/w756.log` (the F-791 baseline, 78,367 lines). Rule 0 / F-783 §13a: every quantity below is tool-printed this session or script arithmetic — no hand conversion anywhere in this entry.
+
+**§1 Q A — who asks `0x12B80000`, and why that exact number.**
+
+*The ask chain (raw-decoded).* `sub_827A7688` (0 static callers; post-bl TLS `lwz r11,0(r13)` → slot 28 → vtable slot at +8 `bctr`) → **`sub_82131228`**, a one-shot boot initializer guarded by a 5-bit flag dword at guest `0x828315DC`, frame base `r31=0x82830000`:
+- bit0: `-extraheapmem` probe (string `0x82000E18`) → `bl 821C2E60`, node `0x82830CD8`, `r4=0x2E80000` = **46.5 MiB = PHYS-ACCT #1** (`w756:224`);
+- bit3: 8 MiB block (node `0x82830C10`) = PHYS-ACCT #2 (`w756:252`);
+- bit4/0x10 step: probe cancels (`r27=r28=r30`, both branches test the same string) → `bl sub_82130EC0` (3 sites, all inside `sub_82131228`, `+0xe4/+0x1c0/+0x1d4`; the size comes from the `+0x1d4` site at `0x821313FC`) → `rlwinm r3,r7,sh=10,mask=0xFFFFFC00` at **`0x82131408`** (KiB→bytes) → **`bl 821BC0F0` at `0x8213140C`** → `sub_82132578` (`glr=821325D4`) → import `0x827BCF14` `__imp__MmAllocatePhysicalMemoryEx` → `imports.cpp:4938` → `g_userHeap.AllocPhysical` (`imports.cpp:4943`). `ppc_xrefs calls 0x821C0F80` = 2 sites, both in `sub_82131228` (`+0x14c`/`+0x1fc`) — the node-init helper has no other caller.
+
+*The helper `sub_82130EC0`, decoded from raw bytes this session* (`ppc_disasm 0x82130EC0 46` + tail): `bl 827BCD84` → `VdQueryVideoMode` fills a stack struct; struct[+16]≠0 → early `r31=0`; else `r8=min(w,1280)`, `r9=min(h,768)`, `op31:235` = **`mullw r10,r9,r8`** (Capstone-settled this session — the circulated "divwu = 0 for 1280×768" reading is dead), `subf r6,r10,r7`, `rlwinm r11,r6,sh=4,mask=0xFFFFFFF0` = `(r7 − pixels)×16`, clamp ≥0, the SD clamp (`w≤720 ∧ h≤576`) **skipped** (w=1280), `&= 0xFFFF8000` (`0x82130F58`), `srawi/addze → r31` in KiB; tail probes `-extrad3dmem` (`0x82000EA4`) → `r31 − 6144` KiB if present — absent this boot (the size is `0x12B80000`, not `0x12580000`).
+
+**w/h are measured, not assumed: `VdQueryVideoMode` hardcodes `DisplayWidth = 1280`, `DisplayHeight = 720` (`imports.cpp:4589-4590`)** → `pixels = 921,600`, and with the probe deltas cancelling the observed size pins the helper's `r7`:
+
+> **size = (r7 − 921,600)×16 & 0xFFFF8000 = `0x12B80000` ⟹ `r7 ∈ [20,549,632, 20,551,680) = [0x1399000, 0x1399800)`** (script arithmetic on measured inputs; `& 0xFFFF8000` makes the window exactly 0x800 wide).
+
+*r7 provenance — last def MEASURED, one link UNVERIFIED.* The last definition of r7 before the size path is `mr r7,r29` at **`0x82131370`**, and `r29 = lwz r29,3284(r28)` at `0x82131350` = **`*(0x82830CD4)`** (`ppc_xrefs xref 0x82830CD4`: exactly two accesses, **both reads**, both in `sub_82131228` — the storing `stw` materialises the address another way and was NOT found). Straight-line `0x82131370 → 0x821313FC` writes no r7 (window read); `sub_82130EC0` writes no r7 either (whole body `0x82130EC0-0x82130F94` read) and its callees preserve it — `VdQueryVideoMode`'s C++ body touches no `ctx.r7` (`imports.cpp:4587-4598`), `sub_82131C08` is a 3-instruction leaf (`lis/lwz/blr`), `sub_823D90B0` writes r3/r8-r11 only (measured in the Q A pass). **UNVERIFIED: r7 across the two big intervening calls** — `sub_821C0F80` (body `0x821C0F80-0x821C0FF4` has no r7 write; it stores r7 via `stw r7,8(r31)` at `0x821C0FA8`, but its four internal calls `823D91F4`/`821BD618`/`821DE388`/`821BBF50` are unaudited) and `sub_823D9A98` (whole body `0x823D9A98-0x823D9AC0` clean; its `bl 823D9990` unaudited). **Falsifiers: one runtime read of guest dword `0x82830CD4` at `0x821313E8`; or locate the storing `stw`. What the dword MEANS is likewise unknown (no writer found).**
+
+*Naming word, confirmed by decode.* The second node-init (`0x82131414-0x82131424`, node `r25=0x82830B50`) stores `r4` at `+4`, where `r4 = r3` from `0x82131410` = **the return of `bl 821BC0F0` = the allocated buffer pointer → `0x82830B54` is F-791's `hit0`, the 299.5 MiB block's guest pointer** (F-791 measured the word holds a value inside `[0xA3A8C000,0xB6611000)` — consistent). The first node-init (`0x82131374`, `lis r3,0080` at `0x82131354` = the 8 MiB request) stores its pointer the same way.
+
+*The arithmetic the row's INPUTS owed, paid by script:* `0x12B80000` = 314,048,512 B = **314.05 MB = 299.50 MiB** — the cell's earlier `313.75 MB / 299.2 MiB` was hand arithmetic, withdrawn here and corrected in the row (F-783 §13a class); `peak_req=0x12b84020` = 314,064,928 B = 314.06 MB = 299.52 MiB = `size + 0x4000 + 0x20`, exactly the `o1Amount` formula (`heap.cpp:3387`), arithmetic-confirmed.
+
+**§2 Q B — what fills the 512 MiB (w756).** *Field semantics first, so nobody re-misreads them:* PHYS-ACCT `req`/`charge`/`con_charge` are CUMULATIVE sums, `live = d.allocated` is occupancy, `freed_bytes` is cumulative freed; gate `seq > 4 && seq % 2000 → return` (`heap.cpp:1449`) = exactly the 8 rows seen; `con_charge = O1ConsoleCharge(guestSize)` = `round_up(size, 4096)` of the guest size alone (`heap.cpp:693-697`).
+
+| milestone | rows | live | free | note |
+|---|---|---|---|---|
+| #1-#3, 21.671→21.679 s | `w756:224/252/260` | 46.5 → 54.5 → **354.1 MiB** | 465.5 → **157.9** | boot: req deltas 46.5 + 8.0 + 299.5 = **354.0 MiB in 8 ms**; `caller_rva=0x2f36a8 glr=821325D4` = §1's chain; over-console **+0.017%** (`over_console_ppm=1000165`) |
+| #4, 21.848 s | `w756:274` | 354.1 | 157.9 | `caller_rva=0x2f79f4` = `CreateRegisteredKernelObject<Semaphore>+0x34`, `glr=8244ECC8` = `sub_8244EC78+0x50` |
+| #2000 → #8000, 33.189 → 35.504 s | `w756:1273/14338/16095/17913` | 402.5 → **507.8** | 109.5 → **4.2** | **every row `caller_rva=0x2bc7aa` = `GuestMemoryHeap::Alloc+0x1a`**, glr `821D4588`(=`sub_821D4500+0x88`) then `82137904`(=`sub_821378B8+0x4c`); gross charge 581.3 vs console 455.8 → **+125.5 MiB over the console model (`over_console_ppm=1275297`)** |
+
+**The tail's mechanism.** Every guest XTL allocation goes `__xtl_alloc` (`imports.cpp:158`; r5 clamped to ≥16 pow2, `:160-161`; thunk `0x82130528` hardcodes `li r5,16` at `0x82130538`) → `GuestMemoryHeap::Alloc` (`memory.cpp:529-539`, a straight pass-through) → `Heap::AllocPhysical` (`heap.cpp:3147`) — and AllocPhysical floors alignment to **`kPhysSlabGranule = 0x4000`** (`heap.cpp:3237-3238`, "the guest's own slab mask, ~0x3FFF") before `o1Amount = size + alignment + O1HEAP_ALIGNMENT` (`heap.cpp:3387`). **Measured: a 14-byte ask charges `0x402e`, a 128-byte ask `0x40a0`, a 9,520-byte ask `0x6550`** (`AllocPhysical: o1heapAllocate returned null` rows, `w756:18151+`) — ≥16.5 KiB each; `align_bytes = 131,072,000 = 8000 × 16,384` at #8000 shows **all 8,000 requests** paid the floor, and `resid=16384B` on the last row is that floor minus page rounding. The two `align=` fields describe one request at two points — `XTL-ALLOC-REFUSED align=16` (the guest's ask, `imports.cpp:184`) vs `PHYS-STATE align=0x4000` (the charged floor) — **not a contradiction**. Corollary: `heap.cpp:685-686`'s residual breakdown ("the caller's alignment term, which on every measured request is 16") is pre-floor and stale against w756.
+
+Counts (script): **7,447 XTL successes** (`XTL-ALLOC #7168` at 35.507 s, `seen=7168 refused=0`; `ok=7447` frozen at the first refusal because `served` never grows again — `PHYS-POOL-FULL #200` still reads `served=8401`), refusal era **35.527 → 37.128 s = 1.601 s, 254 refusals** (PHYS-LIVE 1:1, `w756:18167-24015`), attempts **8,401 + 254 = 8,655** (check: `PHYS-POOL-FULL #200` prints `attempts=8601 = 8401+200`). Non-XTL attempts at the first refusal = 8,402 − 7,448 = **954**, and 7,447 + 954 = 8,401 served exactly — the ledger closes iff all 254 refusals are XTL-path, and no sampled row contradicts it (**10 of 254 sampled: `returned null #1..#8/#100/#200`, every one `caller_rva=0x2bc7aa`**, guest glrs `821887B8`=`sub_821887A0+0x18`, `82188EC0`=`sub_82188E50+0x70`, `82137904`=`sub_821378B8+0x4c`, `821DEC40`=`sub_821DEBA8+0x98` via `bctrl` at `0x821DEC3C`).
+
+**The pool's own verdict at death.** First refusal at `free=0x4e000` (312 KiB), `allocated=0x1ffb2000` (511.70 of 512.00 MiB), `verdict=over-fragmented why=free_but_no_suitable_class`, `suitable=0x0`, `oom=1 → 254`; `PHYS-STATE` 8 rows (`w756:18166+`, first-8 gate), `PHYS-POOL-FULL` 9 (`:18169+`), `PHYS-VERDICT-CHANGE` gains only its second row ever: **healthy → over-fragmented `refusals=1`** (`:18168`) — F-783's third arm (the classifier does record the transition) now fires. Regime difference, recorded not explained: **w743's four `verdict=healthy` refusals at free=34.97 MiB (F-783's quantified contradiction) did NOT reproduce in w756** — w756 serves until genuinely exhausted; the bin-19/split-at-healthy question is unexercised in this baseline (falsifier: a w756-era refusal row with `verdict=healthy`).
+
+**Resolved: `MmAllocatePhysicalMemoryEx: FAILED` = 0 is routing, not blindness.** The literal exists (`imports.cpp:4950-4955`, gate `<50` so the first failure always prints; the same `MCLA_LOG_WARN` macro printed 22 `XTL-ALLOC` rows in this very log — rule 19 satisfied) and w756 counts **0**: the Mm import path never refused. Refusals arrive through `GuestMemoryHeap::Alloc` (`memory.cpp:534`), which prints `AllocPhysical: o1heapAllocate returned null` instead. PHYS-LIVE's `caller_rva=0x2f36a8` is **`bigRva` — the provenance of the *big block*, not the refusing caller** (printer `heap.cpp:2024-2047`, field `:2031`). Fresh `host_rva_resolve` (same map as the log): `0x2bc7aa = GuestMemoryHeap::Alloc+0x1a`, `0x2f36a8 = MmAllocatePhysicalMemoryEx+0x38`, `0x2f79f4 = CreateRegisteredKernelObject<Semaphore>+0x34`. Mm-import successes: `PHYS-CENSUS` prints exactly n=1..32 (gate `n≤32 || n%2000 || bytes>200MiB`, `imports.cpp:4968`) → ≥32, <2,000, and ≤954 from the non-XTL bound; zero failures.
+
+**Consequence — sequence MEASURED, causation LABELED.** `XTL-ALLOC-REFUSED #1..#8` in the same milliseconds ("caller does not test r3, sub_821378B8 memcpy follows", `w756:18170+`); guest `BDF20 #269 path='a:/archive/dcl/star_glow.dcl' ret=0` at 37.120 s (`:24014`); then **`Fatal error dispatcher … 'Unable to load shader '%s' … ' star_glow` at 37.128 s** (`:24016-24020`, `lr=0x82189270`). Identical terminus in w755 (script: both logs `dispatcher=1`, shader-fatal-msg=2, `star_glow`=43; w754=0) — the current end state. **The pool → fatal link is a hypothesis**: falsified by a boot that has pool headroom at +15.9 s and still fatals on `star_glow`, confirmed by a refusal row whose glr sits inside the shader-preload chain (none of the sampled 10 does).
+
+**§3 Q C — is 512 MiB the right pool for this title?**
+
+- The size is a fixed console-model constant: **`kConsolePhysicalBytes = 0x20000000u`** (`heap_arena.h:97`), no cvar or size parameter anywhere; arena extent `[0xA0400000, 0xC0400000)` (`:101`); `static_assert` ties (`:121/:132/:207`); the guest is told "physical < 0x20000000" by **five structural sites** (`heap_arena.h:176-181`), the live one being `PhysToKernelVA` = `gpu_cp.cpp:2572-2573` (`addr < 0x20000000u ? addr | 0xC0000000u : addr`). `MmAllocatePhysicalMemoryEx` receives `minAddress/maxAddress` and drops both (`imports.cpp:4938-4943` passes only `size, alignment`) — there is no range model to resize. (heap_arena.h's internal line cites — gpu_cp.cpp:1752-1757, imports.cpp:4412-4466 — are stale; actuals 2572 / 4938.)
+- Measured demand split: boot = **354.0 MiB the guest itself asks for** (§1's chain; +0.017% over console rounding) + tail gross 227.2 MiB host vs 101.8 MiB console — **125.4 of the 125.5 MiB total overcharge is the tail** (script, #8000/#4 fields).
+- **Bounded prediction (script; assumptions explicit):** console-fair net occupancy at #8000 (35.504 s, *before* the first refusal, so the request sequence is identical either way) = `455.8 − con_freed`, with `0 ≤ con_freed ≤ host_freed = 73.5` (per-request `host ≥ con`: `roundUp(size+0x4000+96,4096) ≥ roundUp(size,4096)` by the floor itself) → **net ∈ [382.3, 455.8] MiB → headroom ∈ [56.2, 129.7] MiB**, where the host had 4.2 MiB and began refusing at 312 KiB. **Under the console's own charging the pool would not have been exhausted at this point.** Labeled PREDICTION (it extrapolates the same request stream through different charges); falsifier: per-request `con`-shaped accounting, or a run with floor=16 — and the floor's own justification must survive that experiment (`heap.cpp:3222-3227`: the guest masks pointers with `~0x3FFF`, so a granule below 16 KiB makes mask-down land up to 0x3000 below the returned pointer, i.e. in the previous block's header). **This is the candidate root cause for the NEXT task — it is NOT a queue row yet; register it in `LONG_TODO §2` before working it (two-queue rule; do-not #1/#9: F-792 proposes no fix).**
+
+**§4 Residual unknowns, each with its falsifier.**
+
+1. r7's provenance/value: window MEASURED; `*(0x82830CD4)` writer NOT found; r7 preservation unaudited across `sub_821C0F80`'s four internal calls and `823D9990` (§1).
+2. What `0x82830CD4` *means* — and the neighbouring dword `0x82830CD0` (loaded at `0x821313E4`, becomes the second node-init's r7-arg at `0x82131420`).
+3. `reg_hit=2`'s second registry entry identity (carried from F-791(e)).
+4. Pool → `star_glow` causation (§2).
+5. The console-fair headroom prediction (§3) — unexercised.
+6. Mm-import success count bounded only to [32, 954] (§2).
+7. w743's healthy-verdict refusal regime absent from w756 (§2) — open.
+
+**§5 Gates (this append).** No build, no boot, no `src/` change — **rule 1b: no new symbols (docs only)**; rule 4: no hook. Cites re-read from disk this session: `imports.cpp:158-204/4587-4598/4938-4976`, `memory.cpp:529-539`, `heap.cpp:693-697/1449-1458/2024-2047/3147/3237-3238/3387/3467-3470`, `heap_arena.h:97/101/176`, `gpu_cp.cpp:2572-2573`, plus the fresh `host_rva_resolve`/`ppc_xrefs`/`ppc_disasm` outputs quoted above. Docs changed: this append (binary, LF, NUL 1 → 1 asserted), `LONG_TODO_MASTER.md` T43.2 → DONE + INPUTS arithmetic corrected, `HANDOFF_NEXT_AGENT.md` §18. Census baseline unchanged: **w756**; next free ledger ID **F-793**.
+
+### F-793 — T43.3 ANSWERED: the "guest rebase table" behind `P5-LOOKUP`'s `FFFFFFFF` is OUR host-published mirror (structurally empty for `0xB6FB2F29`), the arena never handed that address out (it is ARR-RESTORE-promoted payload), and 5.2's "double-ownership … is measured" is REFUTED on both operands
+
+**Task `LONG_TODO §6 T43.3`, row closed by this append. NO BUILD, NO BOOT, `src/` untouched, guest binary untouched.** Log rows cited from `build/w741b.log` (re-verified at write time), guest facts from `build/cache/mcla_pe.bin` (offset = VA − `0x82000000`) and `ppc_disasm.py`, host facts from `file:line`.
+
+**1. Verdict on T43.3's two arms — both dissolve, and both point at us.**
+
+- **Arm A — "is the guest's rebase table legitimately empty for `0xB6FB2F29`?" YES, structurally — and it is not the guest's table at all.** The table `sub_8217D828` walked (`P5-LOOKUP r3=BD40C000`, `w741b:11381`) is `s_gRebaseTable`: our printer `REBASE-TABLE @{:08X} n={} (D828-form vbase/pbase/size)` (`gpu_device.cpp:7418-7419`) prints **`@BD40C000 n=7`** (`w741b:11364`; 4 rows per log, all `@BD40C000` in `w741*`, `@BD16C000` in `w756`), and its argument is the `s_gRebaseTable` variable, assigned only by `mem.Alloc` (`:7400-7404`). `MclaArmRebaseCtx` installs it as `[rebaseCtx+0]` (`:7429-7430`; comment `:7422-7423`: "point [group+0] at the PSTREAM region table so D828 can resolve 0x50/0x60 virtuals instead of fataling"), called for the rebuild group at `:16833` with `pctx.r4 = s_rbCtx` (`:16839`) — and `P6-FIXWALK-CENSUS table=BD40C000 buildCtx=BD908000` (`w741b:11380`) shows group+0 = that table. Content: 7 `{vbase,pbase,size}` records filled from `g_mclaRebaseMap` (`:7410-7417`), all vbases 0x50/0x60-domain (`REQDUMP #6 w741b:11389`: `50000000→B5FAC000`, `50020000→B3A8C000`, `50040000→B3AAC000`, `50060000→B5F5C000`, `50070000→B3ACC000`; `w756` `PSTREAM :3612-3620`: `50000000…60080000`). D828 membership is `vbase <= addr < vbase+size` walking `table+4` (layout `:7381-7386`; `sub_8217D828` decompile returns index or −1). A `0xB6……` key satisfies no record ⇒ `FFFFFFFF` is **structurally guaranteed**, not an accident of emptiness.
+- **Arm B — "should our arena never have handed that address out?" It never did.** `B6FB2F29` ends in nibble `9`: not 16-byte-aligned (o1heap) and not `kPhysSlabGranule = 0x4000` (`heap.cpp:3237`), so no allocation API could ever return it as a base. Its provenance is **payload bytes**: `RSC-CHILD-DUMP obj=B7B41000[3] -> B7981000 [B813FA0A B6FB2F29 B389690F F53F7970 42AB345A 7622992E 6B64702B A40C5E78]` (`w741b:11366`; printer `gpu_device.cpp:11081`) — word[1] of a resource payload buffer, with words [4][5][6] gate-bad (`w741b:11367-11369`, incl. `6B64702B` = ASCII `kdp+`; `RSC-ARR-CENSUS … childGate=3` `:11370`). 5.2's span observation (`B6FB2F29 ∈ [A0400000, C0400000)`) is a property of the pool's range, not of any hand-out.
+- **⇒ Neither the guest's registry nor the arena is implicated: the row is our mitigation stack talking to itself.**
+
+**2. Root cause: `FDBF8-ARR-RESTORE` promoted payload into a pointer role.** `w741b:11362` = `FDBF8-ARR-RESTORE #5 obj=B7B41000 vt=82085364 arr=B7981000 [arr]=B813FA0A/B6FB2F29 cnt=1 (from dest cand B7981000)`. Source, read in full: poison gate `gpu_device.cpp:16783-16784`; **`kArrCand[]` `:16786-16789` = 6 hardcoded addresses** `{B7B6D9B4, B7B61000, B7B71000, B79C1000, B79A1000, B7981000}` (comment `:16785` "Known physical arr from w9 RSC-REBASE"); loop `:16790-16823` — `live` gate `:16794-16797`, **`looksPtr` `:16800-16801`** (`c0 ∈ [80000000,A0000000) ∪ [B0000000,C0000000)`), `looksTag` `:16802`, filter `:16803`, `arr = cand` `:16805-16806`, cnt restore + writes `arr→kUiCont+12`, `cnt→kUiCont+16` `:16807-16816`, printer `:16818-16821`, **`break` on first match `:16822`** — so the logged `B7981000` is the 6th entry and entries 1-5 must have failed `live`/`looksPtr`/`looksTag`. The gate's own comment (`:16798-16799` "not raw inflate residue") names exactly what it failed to exclude: word[0] `B813FA0A` merely *resembles* a pointer while word[1] `B6FB2F29` is payload. The rebuild re-runs the guest place-pass with the restored arr (`FindFunction(0x825EF100u)` `:16825-16827`, group armed `MclaArmRebaseCtx(s_rbCtx)` `:16833`, **`place(pctx, …)` `:16843` on a fresh `PPCContext pctx;` `:16834` that does NOT copy lr** `:16835-16839`), and the fixwalk took `head=[bucket+4]` → `P6-FIXWALK bucket=B7981000 [0]=B813FA0A head=B6FB2F29` (`w741b:11377-11378`), armed `WATCH: range armed [B6FB2F29,B6FB2F2D)` (`:11379`; printer `guest_memory.cpp:237`), and walked it as a node (`:11380`).
+
+**3. The miss and the suppressed fatal (`w741b:11381-11383`).**
+- `P5-LOOKUP #000001 r3=BD40C000 r4=B6FB2F29 -> FFFFFFFF lr=8260A878 PLACE-44495500` — printer `task_dispatch_trace.cpp:569-573`; the `PLACE` tag is `lrIn == 0x8260A878` (`:564-565`) = `sub_8260A830+0x44`.
+- `P5-MISSFIX … a4=82009840 … lr=8260A8B0` → `sub_821D2378`, **decoded this session**: `821D2378 mr r11,r4; 821D237C lwz r4,8(r3); 821D2380 lis r10,8201; 821D2384 mr r6,r5; 821D2388 addi r3,r10,12648; 821D238C mr r5,r11; 821D2390 b 821BD618` — an **unconditional tail into the fatal dispatcher, no return path**. Strings read from raw bytes this session: `r3 = 0x82013168` = `"Resource '%s': %s (ptr=%p)"`; `a4 = 0x82009840` = `"Invalid fixup, address is neither virtual nor physical"`.
+- `P5-PHYS … already physical, skip fatal` — `alreadyPhys` `task_dispatch_trace.cpp:600-611`: for `a5 >= 0x80000000u` ("image + all high phys → delta-0") it returns `ctx.r3.u32 = 0; return;`. **The arm's model has only two states (0x50/0x60 virtual ↔ already-physical, comment `:593-599`); payload garbage falls into "already physical" by exclusion — there is no "never an address" state.** This is the sole reason execution reached `8260A8B0`'s continuation instead of a loud fatal.
+
+**4. The consequence — a real guest constructor at a data address (writer NAMED).** `P9-B588 #00001 node=B6FB2F29 type=00 [0]=00000000` (`w741b:11384`) → `sub_8260B588` dispatches on the type byte at `[node+4]` (jump table at `8260B5B4`, data entries `8260B5C8/8260B5D0/8260B5D8/8260B5E8/8260B5F0`), type 00 → `8260B5C8: mr r4,r11; b 8260B310` → `PAGEWATCH W #064 @ B6FB2F29 = 82088784 lr=821BC53C` (`:11385`; printer `gpu_cp.cpp:7890-7891`, lr read from `GetPPCContext()` `:7887-7889`). **Storing instruction: `sub_8260B310+0x24`** — `8260B328 lis r11,8209; 8260B330 addi r10,r11,-30844; 8260B334 stw r10,0(r31)` with `r31 = r3 = node = B6FB2F29` ⇒ `0x82090000 − 30844 = 0x82088784`. **Exhaustive census** (raw scan of `mcla_pe.bin` for every `addi` with imm `0x8784`, any source register): exactly **3 sites** — `sub_8260A8F8+0x20`, `sub_8260B310+0x20`, `sub_8260B420+0x78` — and `grep src` for `82088784` finds **no host writer** (3 hits: comments + `RegisterGuestWatchValue` `task_dispatch_trace.cpp:92`, which only *watches* the value). Only the type-00 path ran. Meaning: the guest *correctly* constructed an object of class `0x82088784` — at an address that was never an object.
+
+**5. The `lr=821BC53C` residue — RESOLVED: the row's lr is a parked context, not the storing frame.**
+- `0x821BC538 = 48006C81 bl 821C31B8`, inside **`sub_821BC140 +0x3f8`** (func-mapping scan of `generated/ppc_xenon/ppc_func_mapping.cpp`, 45,190 entries), followed by the epilogue `821BC53C lwz r1,0(r1); 821BC540 b 823D9220` — so `821BC53C` is the return address of the transfer executor's **last guest-body call**.
+- `sub_821C31B8 = lis r11,8285; addi r3,r11,24084; b 821CE0D8` → `r3 = 0x82855E14`; `sub_821CE0D8` = `lwarx/stwcx` atomic increment leaf — that subtree can only store `old+1` to image BSS `0x82855E14`, so it **cannot** be the vtable write (both links decoded this session).
+- **Timeline (`w741b`)**: `COMPLETE sub_821C31B8 #5 … lr=821BC53C` at **`:11322` (.478)** — printed from `ctx.lr` by `PPC_FUNC(sub_821C31B8)` (`gpu_device.cpp:17733-17740`) — then ARR-RESTORE `:11362` (.486) … PAGEWATCH `:11385` (.492), then `POST-EXEC sub_821BC140 #5` **`:11386` (.492)**. The chain is **sandwiched between the guest body's last call and our hook's POST-EXEC log**, and the ARR-RESTORE/rebuild block sits inside `PPC_FUNC(sub_821BC140)` (`gpu_device.cpp:16207-17584`: `__imp__` call `:16572`, ARR-RESTORE `:16770-16823`, POST-EXEC log `:17581`) — i.e. it runs in our **post-body** phase, with the original context's lr parked at `821BC53C`.
+- **Two contexts coexist on one thread within the same millisecond**: the re-dispatch hooks print `pctx`'s lr (`FDBF8-BUILD lr=825EF118` `:11375`, `P6-FIXWALK-CENSUS lr=825FDC64` `:11380`, `P5-LOOKUP lr=8260A878` `:11381`, `P5-PHYS lr=8260A8B0` `:11383` — all set by bls inside `place(pctx,…)` `:16843`, whose fresh `pctx.lr` starts uncopied `:16834-16839`), while PAGEWATCH reads `g_ppcContext` (`thread_local`, `ppc_context.h:4-6`) still parked at `821BC53C`. The storing frame's own chain (`bl 8260B588 @8260A8C8` → `bctr` → `b 8260B310`, lr preserved = `8260A8CC`) is printed by no row. **Falsifier**: add a ctx-id / both lrs to the PAGEWATCH row, or break on `sub_8260B310` and read the running ctx's lr.
+
+**6. Dormancy — dormant in the current baseline.** Byte-count of `B6FB2F29` (case-insensitive) over **all 192 `build/w*.log`**: exactly **2 logs — `w741.log` (11) and `w741b.log` (11)**; zero everywhere else including baseline `w756`. Marker census over `w740/w741/w741b/w743/w756`: `FDBF8-ARR-RESTORE` / `P5-LOOKUP` / `P5-PHYS` / `RSC-CHILD-DUMP` each `1/1/…` in `w741+w741b` and `0` in `w740/w743/w756`; `REBASE-TABLE` (4 rows) and `PSTREAM` (75 rows) print in every log (ordinary printers; boot-specific table address `BD40C000` in `w741*`, `BD16C000` in `w756`). 5.2's `P5-PHYS` curve (`14/14/0…0/1/1`, `:1563-1564`) is consistent.
+
+**7. What this corrects.** `LONG_TODO §5.2` (`:1561-1563`): *"the guest asked its own table about one of our physical addresses, missed, and only a w9-vintage host short-circuit stopped a fatal. So the double-ownership that F-779 called 'not measured either way' is measured."* **Both operands are wrong**: (i) the table was **ours** (§1) — not "the guest's own"; (ii) `B6FB2F29` was **never handed out by the arena** (§1-2). The double-ownership question **dissolves** on this row: there was no ownership contest — a host heuristic promoted payload into a pointer role, the guest walked it, our `P5-PHYS` suppressed the guard that would have made the mistake loud, and the guest then constructed a legitimate object at a data address. The guest behaved correctly throughout: D828 miss → `sub_821D2378` → fatal *is* the designed response to a bogus pointer. Rule-19 reading of the miss: 5.2's conclusion was drawn from the row's labels ("guest rebase table") before the printer's producer was read — the instrument printed truthfully; the *reading* was wrong. A dated supersession note now sits under 5.2.
+
+**8. Defects named — nothing fixed here (two-queue rule: register `§2` rows first).**
+1. **Root: `FDBF8-ARR-RESTORE`** `gpu_device.cpp:16783-16822` — `looksPtr` accepts payload whose word[0] merely resembles a pointer; `kArrCand` are hardcoded w9 guesses; no alignment/ownership check (word[1] = `B6FB2F29` is not even 16-byte-aligned — one `& 0xF` test on the *head* candidate would have caught this class).
+2. **Silencer: `P5-PHYS`** `task_dispatch_trace.cpp:600-611` — delta-0 for any `a5 >= 0x80000000` with no third state for a key that is neither virtual-banded nor a known physical (§3). **Order matters: ARR-RESTORE must be fixed first — removing P5-PHYS alone converts silent corruption into a fatal.**
+
+**9. Residuals, each with a falsifier.**
+1. Who wrote `B6FB2F29` into `B7981000[1]` (the inflate payload's content) — untraced. *Falsifier*: arm a watch on `[B7981000+4)` before job #2 inflates.
+2. Rest of `sub_8260B310`'s body beyond the stamp (what else it mutates at the payload address) — not decoded. *Falsifier*: `tools/ida_dump.py` on `sub_8260B310`.
+3. Whether another `kArrCand` candidate is likewise payload (only `B7981000` was exercised) — not audited. *Falsifier*: dump all six candidates' first two words + rebase-map membership in one census row.
+4. `PAGEWATCH` `#055-058` (`:11201-11204`, `B7B41000` ctor stamps, `lr=821BC998` = dispatch #5's *entry* lr) — saved-entry-lr vs mid-body park not pinned. *Falsifier*: the §5 lr-provenance fix.
+5. `T43.4` (provenance probe `8218B2EC`) unchanged; the `kPhysSlabGranule` floor question still needs its `§2` row (F-792 §3).
+
+**10. Gates (this append).** No build, no boot, no `src/` change — docs only; rule 1b: no new symbols; rule 4: no hook added; no tool edited (`ppc_disasm.py` used, not touched). New measurements this session: full `w741b:11358-11390` chain read untruncated and re-verified at write time (16 rows); 192-log dormancy census; decodes of `sub_821D2378`, `sub_821C31B8`, `sub_821CE0D8`, `sub_8260A8F8`, `sub_8260B310`, `sub_8260B588`'s jump table, `821BC530…540`, `821BC990…9A0`; both fatal strings read from `mcla_pe.bin`; exhaustive 3-site vtable-stamper census over the raw image; func-mapping owner scan (45,190 entries); full ARR-RESTORE source block (`:16770-16855`).
+
+**Doc/queue actions of this append:** `LONG_TODO §6` T43.3 → **ANSWERED** + a dated supersession note under `§5.2`; `HANDOFF` gains §19. Queue head is **T43.4**. Next free ledger ID: **F-794** (verify: `grep -aoE "^### F-[0-9]+" docs/ROOT_CAUSE_VALIDATION.md | tail -1`, always `-a` — the file holds 1 NUL byte).
+### F-794 — T43.17 honesty campaign CLOSED by the w765 stamp; w766 parks on B73D8040 with the pool FULL; two claims withdrawn with cause
+
+- Task:        T43.16 (Attempt) / T43.17 (CLOSED) — `build/w759.log`, `build/w765.log`, `build/w766.log`, `build/w769.log`
+- Type:        FACT + FIX
+- Class:       D (kernel) / H (instrumentation) / G (guest behavior, frontier half)
+- Priority:    P1
+- Evidence:    log lines + `src/` lines re-read 2026-10-13 as cited; items NOT re-read are marked brief-supplied, per the trail-writer rule
+
+**1. The w765 stamp (all measured this session).** `w765.log` = **108,275 lines**, `Fatal error` **0 rows**, zero `] [FATAL` rows. The naive `POISONED` count (545) is a pure F-772 substring collision — every hit is `XSF-OPEN-GATE-SKIPPED ... host cache not poisoned` — counted only where the marker follows the `] [` level tag, per `AGENTS.md` rule 19. `REBASE-POISON` still prints **12 rows**, so no blanket "no POISONED" is adopted here. Falsifier: any recount on the same file.
+**2. Honesty fixes verified live in w765 (src re-read).** `PHYS-FREE-SUM` last row: `attempted=27744 honoured=27743 refused=0 unaccounted=1 honoured_pct=99.9964` — pct is now over ATTEMPTED (`src/kernel/heap.cpp:3859-3872`, T43.17 comment `:3865-3869`). `XTL-FREE-SUM`: `attempted=95744 honoured=27737 refused=68007 pct=28.9700` (`src/kernel/imports.cpp:406-413`). SEMA single shared gate (`src/kernel/kernel_objects.h:135-137`): **54 `SEMA-wait` + 24 `SEMA-release` = 78 probe rows** (`SEMA-CREATE` 36 is a separate marker, not the gate). `KEWAIT-RESOLVE` in-row counters: `hits=16383 misses=1 total=16384`; `SEMA-FALLBACK-SUM` 1 row, `SEMA-TYPE5-SUM` 0 rows. Shapes re-read: main-park `objptr/passes` (`imports.cpp:5290-5296`), REVERIFY cumulative counter (`src/gpu_device.cpp:12894-12900`), READAT per-path serial (`src/fs/vfs_rpf.cpp:2715-2719`). Brief-supplied, NOT re-read: decimal-ms + `:5370` unknown-type row, `:2749` DROP footer, main-park `passes=` denominators.
+**3. Withdrawn with cause.** (a) The "**~99.8% fallback**" claim: opposite measured — `hits=16383` vs 1 miss in the row re-read above. Dead. (b) The **`GLOBTEX-SERVE-BODY` phantom**: 0 hits in `src/` (measured); the real printer is `GLOBTEX-BODY` (`src/gpu_device.cpp:4011`, re-read). Dead; cite this heading.
+**4. T43.16 slab-floor = Attempt (not Landed).** Scope verified in src: floor applies only when `size >= kPhysSlabGranule`, else 16 (`src/kernel/heap.cpp:3253-3270`). `w759` prints 19 capped `SLAB-FLOOR relaxed` rows; the cap (first 8 + every 4096th, `:3265`) puts n at ~45k — consistent with the brief's "≈45k spared". Brief-supplied, not recounted: XTL refusals 8→1, POOL-FULL 9→6. Single-variable caveat stands (folder fix landed in the same era); needs a menu-gated follow-up soak.
+**5. Frontier: w766 (108,486 lines; tail measured).** `HB-FLICKER ... mainwait=B73D8040 mainwaitlr=82135DF8 mainwait_age_ms=286345` — main parked since ~12 s in. Race verdict UNDECIDED; falsifier: a per-iteration branch-taken row at `ppc_recomp.17.cpp:4422-4427` + an exit-trap at `loc_821CCA2C`. Brief-supplied, not re-verified: producer `sub_821CC970` exits-on-empty / consumer `sub_821CC800` single-shot attributions, pool-FULL numbers (free 60–68 KB, suitable=0, 314 MB block LIVE `guest_refs=1`), worker-death null-vtable chain (`0x82303220`, `822F96E0→822F8F20→82302FA0`).
+**6. Foundation (brief-supplied except as noted).** Toolchain versions as briefed (cmake/ninja not on this shell's PATH — not confirmed). VFS no-folder fix VERIFIED this session in `w769`: `Fatal error` 0 plus `VFS: extracted cache dir absent (not required) ... indexing game_data root only`. `tools/self_review.py` exists (verified); its gates and the no-hardcoded-addresses rule are brief-supplied.
+**Gates (this append).** Docs only: no build, no boot, no `src/` change; rule 1b: no new symbols; rule 4: no hook. Next free ledger ID after this entry: **F-795** (verify with `grep -a`, never from memory).

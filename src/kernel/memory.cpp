@@ -130,7 +130,7 @@ mcla::kernel::Memory::Memory()
         return;
 
     DWORD oldProtect;
-    VirtualProtect(base, 4096, PAGE_NOACCESS, &oldProtect);
+    VirtualProtect(base, mcla::kernel::kNullGuardBytes, PAGE_NOACCESS, &oldProtect);
 #else
     // MAP_FIXED_NOREPLACE below *is* the "already mapped there?" check: no
     // /proc/self/maps parse needed. The two fallbacks omit it and may relocate.
@@ -145,7 +145,7 @@ mcla::kernel::Memory::Memory()
     if (base == nullptr)
         return;
 
-    mprotect(base, 4096, PROT_NONE);
+    mprotect(base, mcla::kernel::kNullGuardBytes, PROT_NONE);
 #endif
 
     // Record the window size: IsInMemoryRange and boot_host's full-4GiB reuse
@@ -406,7 +406,7 @@ bool mcla::kernel::GuestMemoryHeap::Initialize()
         return false;
 
     DWORD oldProtect;
-    VirtualProtect(m_base, 4096, PAGE_NOACCESS, &oldProtect);
+    VirtualProtect(m_base, mcla::kernel::kNullGuardBytes, PAGE_NOACCESS, &oldProtect);
 #else
     // On Linux, check if memory is already mapped at the target address
     m_base = (uint8_t*)mmap((void*)kBaseAddress, kSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
@@ -420,7 +420,7 @@ bool mcla::kernel::GuestMemoryHeap::Initialize()
     if (m_base == nullptr)
         return false;
 
-    mprotect(m_base, 4096, PROT_NONE);
+    mprotect(m_base, mcla::kernel::kNullGuardBytes, PROT_NONE);
 #endif
 
     m_size = kSize;
@@ -434,15 +434,15 @@ bool mcla::kernel::GuestMemoryHeap::Adopt(uint8_t* base, uint64_t size)
     if (m_initialized)
         return true;
 
-    if (!base || size < 4096)
+    if (!base || size < mcla::kernel::kNullGuardBytes)
         return false;
 
 #ifdef _WIN32
     DWORD oldProtect;
-    if (!VirtualProtect(base, 4096, PAGE_NOACCESS, &oldProtect))
+    if (!VirtualProtect(base, mcla::kernel::kNullGuardBytes, PAGE_NOACCESS, &oldProtect))
         return false;
 #else
-    if (mprotect(base, 4096, PROT_NONE) != 0)
+    if (mprotect(base, mcla::kernel::kNullGuardBytes, PROT_NONE) != 0)
         return false;
 #endif
 
@@ -504,12 +504,16 @@ bool mcla::kernel::GuestMemoryHeap::IsValid(uint32_t guestAddr, size_t size) con
     if (!m_initialized || guestAddr == 0 || size == 0)
         return false;
 
-    // The first 4 KB of the heap is a deliberate PAGE_NOACCESS null guard (set at
-    // :218/:251), and the rest of the 4 GB is committed read/write. Without this
+    // The first `kNullGuardBytes` of the heap are a deliberate PAGE_NOACCESS null guard (armed in
+    // Initialize and Adopt, and in the free-function window setup above -- grep the constant, the
+    // line numbers rotate), and the rest of the 4 GB is committed read/write. Without this
     // clause a "checked" helper passes IsValid for a near-null guest pointer and
     // then faults inside memcpy - which is what F-122 measured: 50 AVs in
     // MemoryStreamServeRead's ReadBytes at wrapped src 0x00000C61 (#6: 0x0).
-    if (guestAddr < 4096u)
+    // F-782: the same collision recurred in code that bypassed this helper entirely -- heap.cpp's
+    // NotePhysLive swept the window with a raw `base + pos` from pos 0, and one of the five
+    // C0000005s in every boot was that sweep, not the guest.
+    if (guestAddr < mcla::kernel::kNullGuardBytes)
         return false;
 
     if (guestAddr >= m_size)

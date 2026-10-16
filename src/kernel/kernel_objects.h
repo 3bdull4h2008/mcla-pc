@@ -79,12 +79,28 @@ struct Event final : KernelObject, HostObject<XKEVENT>
             // form - blocking on it here skipped the deadline check whenever
             // no thread signaled inside the window (infinite park). Polling
             // honors the deadline; 1ms quantum is well under one frame.
+            //
+            // T43.24 (2026-10-16, audit finding #4): CONSUME the auto-reset
+            // signal on the success exit. The finite arm previously returned
+            // STATUS_SUCCESS without clearing `signaled`, so an auto-reset
+            // event stayed signaled after a finite wait — the NEXT waiter
+            // consumed the stale permit (spurious wake, doubled dispatch).
+            // The CAS below matches what the Wait(0) and Wait(INFINITE) arms
+            // already do for auto-reset events; manual-reset is a no-op.
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
             while (!signaled.load(std::memory_order_acquire))
             {
                 if (std::chrono::steady_clock::now() >= deadline)
                     return STATUS_TIMEOUT;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            // Auto-reset: consume the signal (same CAS as the other arms).
+            if (manualReset == false)
+            {
+                bool expected = true;
+                signaled.compare_exchange_strong(expected, false,
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire);
             }
         }
 
@@ -131,12 +147,15 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         // WAKE-LOSS PROBE (session 14): consumers park on C5218280 but never
         // cycle despite NtReleaseSemaphore firing on it. Compare wrapper
         // identity between wait and release paths.
-        {
-            static std::atomic<uint32_t> s_semaWaitLogs{0};
-            const uint32_t n = s_semaWaitLogs.fetch_add(1) + 1;
-            if (n <= 60 || (n % 2000) == 0)
-                SemaphoreProbeLog(this, "wait", count.load());
-        }
+        //
+        // T43.17 (2026-10-13): NO per-site gate here -- every call reaches
+        // SemaphoreProbeLog, whose single shared gate (first 60 + every
+        // 2000th across wait AND release) does the sampling. The old shape
+        // had a second gate here (first 60 + every 2000th of waits alone),
+        // so SEMA-wait rows were a doubly-censored sample: w764 showed 36
+        // wait rows against 16,384 resolve-hits, which read as "36 waits"
+        // when the truth was ~17k. One gate, stated here, no other.
+        SemaphoreProbeLog(this, "wait", count.load());
         if (timeout == 0)
         {
             uint32_t currentCount = count.load();

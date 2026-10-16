@@ -18,6 +18,7 @@
 #include <cstdio>  // F-647: std::snprintf into the CP-REGS-EXPORT fixed buffer
 #include <cstdlib>
 #include <cstring>  // F-632: std::strcmp on the refusal-reason literals
+#include <intrin.h>  // F-784: _ReturnAddress() for the T44 wipe-watch host attribution
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -7285,8 +7286,377 @@ void HeapInstanceStoreReport(uint32_t guestAddr, uint32_t value) {
   }
 }
 
+// ===========================================================================
+// F-784 T44 WIPE WATCH -- who zeroes the two o1heap free-fragment headers?
+// ===========================================================================
+// F-783 measured TWO free-fragment headers inside the physical arena reading
+// all-zero out of the read-only PHYS-BINPROBE walker in w745c: bin 8's card at
+// 0xBDA2A000 and bin 19's at 0xBE135000, both printing
+// `head=0 min=0 max=0 prev=0 next=0 len=1 used=0 found_bin=-1` while 34.97 MiB
+// of the arena was free and the 413-byte request was refused with oom=1.
+// F-783 also killed the three candidate explanations then on the table (the old
+// game write, a VirtualProtect-style reset, a wrong-length zero-on-allocate), so
+// the question is now purely empirical: which store writes those two addresses?
+//
+// THE INSTRUMENT. Every guest store that crosses the checked accessors in
+// guest_memory.cpp (WriteU8 / WriteU16BE / WriteU32BE / WriteU64BE /
+// WriteBytes -- the chokepoint both direct `stw` loops and bulk copies must
+// cross; see the F-777 note at guest_memory.cpp:72-75) asks
+// `T44WipeOverlaps(addr, len)` first and, on a hit, reports op, the value
+// written, a PRE-copy snapshot of what was there, the guest lr/sp and the host
+// return address. Phase 1 armed the two exact 4 KB pages from w745c; **w746
+// proved that too narrow**, and phase 2 armed bands (below) plus a copy-level
+// extent hook in gpu_device.cpp (T44-WIPE-MEMCPY).
+//
+// W746 -- WHAT PHASE 1 ACTUALLY MEASURED (all from build/w746.log):
+//   * Positive control PASSED: `T44-WIPE-SELFTEST pages=[BDA2A000,BE135000]
+//     read=2/2 ... rows=6 expect_rows=6`, and the six rows' `host=` fields
+//     resolve with tools/host_rva_resolve.py --base 0x7FF639EE0000 to
+//     `T44WipeSelfTest+0xc9` and neighbours. The chain fires, and the host
+//     attribution resolves (LT rule 19 satisfied on both axes).
+//   * The armed pages were the WRONG pages: this run's PHYS-BINPROBE #1..#4
+//     read the broken cards at `gva=BDA1F000` and `gva=BE12A000`, i.e. **both
+//     moved by exactly -0xB000** from w745c's BDA2A000/BE135000. Run-to-run
+//     address stability is therefore REFUTED, not merely unverified: a 4 KB
+//     arm watches two addresses nobody writes.
+//   * A 3,152-byte zero sweep DID land on the stale page: 394 `op=U64 val=0`
+//     stores, `BDA2A000..~BDA2AC50`, 06:28:39.778..40.002, `lr=821BE3BC`
+//     (= sub_821BE250+0x16c, the return address of `bl 0x823DA950` per the
+//     F-774 raw check at gpu_device.cpp:25455-25457) and 16 host lanes
+//     `__imp__sub_823DA950 +0x2df..+0x699` -- the identical 16-site signature
+//     F-778 recorded for the zeroed o1heap instances. `pre=0` on every row, so
+//     it destroyed nothing live where it was watched, and it started at/above
+//     BDA2A000 while this run's card sat 0xB000 lower: **not yet attributable
+//     to the wipe**, only recorded.
+//
+// WHAT SILENCE MEANS -- READ THIS BEFORE QUOTING A ZERO. These functions are
+// only reached by writes that go through the checked accessors. A raw
+// host-pointer write (our own allocator's free-list surgery, a host memset on a
+// host pointer) never gets here -- F-374 established exactly that limitation for
+// the registered watch ranges. So zero T44 rows excludes accessor-routed writes
+// to the armed BANDS and nothing else; it is NOT evidence the cards went
+// unwritten. The complementary instrument is the run's own read-only
+// PHYS-BINPROBE walker (src/kernel/heap.cpp NotePhysBinProbe), and the
+// copy-level T44-WIPE-MEMCPY rows report a sweep's whole dst/src/len even when
+// the per-store rows are capped.
+//
+// ROW POLICY (F-054 log quality; a 4 MB band is busy arena, so emitting every
+// hit would spend the budget on texture traffic). `seq` counts EVERY hit; a row
+// is attempted only for: the first hit of each band (band liveness + it makes
+// the selftest's rows the first thing printed, so printer health is on the
+// page), a WIPE hit (`val==0` with `preN>0` and `pre!=0` -- a zero store that
+// destroyed live data, which is the signature we are hunting), and every
+// 65536th hit as a cadence. Emitted rows are then capped at 400 + every 4096th.
+// PHASE 3 (w747): that cap printed 477 of >=315,392 candidates, so the cap itself
+// became the top hazard -- see kT44PrioPages below. Card-page hits take a separate
+// path with a per-page budget this cap does not reach, and every probe now prints
+// T44-TOTALS so silence arrives as a count rather than as an absence.
+
+// PHASE 2 BANDS. 4 MB around each measured card cluster -- 90x the observed
+// 0xB000 drift, and still only 1.6% of the 512 MiB arena. Index 0 = the bin-8
+// cluster (w746 card BDA1F000, w745c card BDA2A000); index 1 = the bin-19
+// cluster (w746 card BE12A000, w745c card BE135000).
+constexpr uint32_t kT44WipeBands[2][2] = {
+    {0xBD800000u, 0xBDC00000u},
+    {0xBE000000u, 0xBE400000u},
+};
+constexpr uint32_t kT44WipeNumBands = 2u;
+// PHASE 3 -- THE PRIORITY PAGES. w747 measured the CAP rather than the writer, and that is now
+// the load-bearing fact about this instrument: `T44WipeNote` only prints for n<=400 or n%4096==0,
+// `n` reached **315,392**, and 477 rows reached the log (= 400 + 77 multiples of 4096). So a hit
+// on a card address had a ~0.15% chance of printing, and w747's "0 rows in either card window"
+// is UNINTERPRETABLE rather than a zero -- exactly the LT-rule-19 shape, arriving as a cap instead
+// of a blind printer. These four pages are the union of every card address this run family's own
+// PHYS-BINPROBE has printed:
+//   BDA1F000 / BE12A000 -- w746 AND w747 (stable across both builds),
+//   BDA2A000 / BE135000 -- w745c, still in the family, still the boot-time control.
+// A hit overlapping one of them counts per page, is pushed into a 16-entry ring that the probe
+// dumps, and PRINTS under a per-page budget (first 128 rows of that page, then every 256th) that
+// the band cap cannot touch. `kind=prio` rows still carry val/pre/pre_n, so a wipe is read off the
+// row itself: val=0 with pre!=0 and pre_n>0.
+constexpr uint32_t kT44PrioPages[4] = {0xBDA1F000u, 0xBE12A000u, 0xBDA2A000u, 0xBE135000u};
+constexpr uint32_t kT44NumPrioPages = 4u;
+
+// Every hit, suppressed or not. The selftest reads it before/after to prove the
+// chain fired (LT rule 19): a zero with no selftest delta is blindness.
+static std::atomic<uint32_t> s_t44WipeHits{0};
+// Per-band hit counters; the first hit of each band always emits a row.
+static std::atomic<uint32_t> s_t44BandHits[kT44WipeNumBands]{};
+// PHASE 3 per-page counters (hit and emitted-row counts), so a probe row can STATE coverage.
+static std::atomic<uint32_t> s_t44PrioHits[kT44NumPrioPages]{};
+static std::atomic<uint32_t> s_t44PrioRows[kT44NumPrioPages]{};
+static std::atomic<uint32_t> s_t44PrioWipes{0};
+// Emitted rows for the band arm (was a function-local static in T44WipeNote; file scope now so
+// T44WipeTotalsLine can print it alongside the hit totals).
+static std::atomic<uint32_t> s_t44BandRows{0};
+
+// PHASE 3 RING. The row budget above is generous but finite; the ring is what makes the TAIL
+// observable -- the last 16 priority hits as they stood when PHYS-BINPROBE fired, cap or no cap.
+// Written under a seqlock (seq odd while a slot is being filled, even once published) so a dump
+// taken concurrently with a store cannot report a torn record as fact.
+struct T44PrioRec
+{
+    uint32_t seq;        // 0 = never written; odd = being written; even = published
+    const char* op;
+    uint32_t addr;
+    uint32_t len;
+    uint64_t val;
+    uint64_t pre;
+    uint32_t preN;
+    uint32_t lr;
+    uint32_t sp;
+    uint32_t band;
+    uint32_t prio;
+    uint32_t seqn;       // global hit counter at the time
+    uint32_t pad;
+    const void* host;
+};
+constexpr uint32_t kT44PrioRingN = 16u;
+static T44PrioRec s_t44PrioRing[kT44PrioRingN]{};
+static std::atomic<uint32_t> s_t44PrioRingNext{0};
+
+// Band index containing guestAddr, or -1. -1 IS truthy, so every caller must
+// compare `>= 0` rather than test the result (same trap as HeapInstanceStoreHit).
+int T44WipeBandOf(uint32_t guestAddr) {
+  for (uint32_t i = 0; i < kT44WipeNumBands; ++i)
+    if (guestAddr >= kT44WipeBands[i][0] && guestAddr < kT44WipeBands[i][1])
+      return (int)i;
+  return -1;
+}
+
+bool T44WipeOverlaps(uint32_t guestAddr, uint32_t len) {
+  if (len == 0) return false;
+  const uint64_t end = static_cast<uint64_t>(guestAddr) + len;
+  for (uint32_t i = 0; i < kT44WipeNumBands; ++i) {
+    const uint64_t lo = kT44WipeBands[i][0];
+    if (guestAddr < kT44WipeBands[i][1] && lo < end) return true;
+  }
+  return false;
+}
+
+// SPAN form: also reports where the overlap starts and how many bytes of it
+// there are, so a bulk copy can snapshot exactly the bytes it is about to
+// overwrite (start address alone cannot say which bytes those are).
+bool T44WipeSpan(uint32_t guestAddr, uint32_t len, uint32_t* outStart,
+                 uint32_t* outLen) {
+  if (len == 0) return false;
+  const uint64_t end = static_cast<uint64_t>(guestAddr) + len;
+  for (uint32_t i = 0; i < kT44WipeNumBands; ++i) {
+    const uint64_t lo = kT44WipeBands[i][0];
+    const uint64_t hi = kT44WipeBands[i][1];
+    if (guestAddr < hi && lo < end) {
+      const uint64_t s = guestAddr > lo ? guestAddr : lo;
+      const uint64_t e = end < hi ? end : hi;
+      if (outStart) *outStart = static_cast<uint32_t>(s);
+      if (outLen) *outLen = static_cast<uint32_t>(e - s);
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t T44WipeHits() { return s_t44WipeHits.load(std::memory_order_relaxed); }
+
+// PRIORITY ARM (phase 3). Page-granular overlap against kT44PrioPages; -1 when the address is
+// only in a band. Returns the page index so the caller can count per page.
+int T44WipePrioOf(uint32_t guestAddr, uint32_t len)
+{
+    if (len == 0u) return -1;
+    const uint64_t end = static_cast<uint64_t>(guestAddr) + len;
+    for (uint32_t i = 0; i < kT44NumPrioPages; ++i)
+    {
+        const uint64_t lo = kT44PrioPages[i];
+        if (guestAddr < (lo + 0x1000u) && lo < end) return (int)i;
+    }
+    return -1;
+}
+
+// Seqlock push: publish `seq` odd, fill, publish even. A reader that sees an odd value, a zero,
+// or a value that changed across its copy discards the record instead of quoting it.
+void T44WipePrioRingPush(const char* op, uint32_t addr, uint32_t len, uint64_t val, uint64_t pre,
+                         uint32_t preN, uint32_t seqn, uint32_t band, uint32_t prio,
+                         const void* host)
+{
+    const uint32_t slot =
+        s_t44PrioRingNext.fetch_add(1, std::memory_order_relaxed) % kT44PrioRingN;
+    T44PrioRec& r = s_t44PrioRing[slot];
+    // The marker is a plain field in a copyable struct; atomic_ref is what makes the seqlock a
+    // seqlock rather than a plain read-modify-write race (C++20, and every access below goes
+    // through a reference, so no plain access to `seq` exists anywhere).
+    std::atomic_ref<uint32_t> mark(r.seq);
+    uint32_t lr = 0, sp = 0;
+    if (const PPCContext* c = GetPPCContext())
+    {
+        lr = static_cast<uint32_t>(c->lr);
+        sp = c->r1.u32;
+    }
+    const uint32_t s0 = mark.load(std::memory_order_relaxed);
+    mark.store(s0 + 1u, std::memory_order_release);
+    r.op = op;
+    r.addr = addr;
+    r.len = len;
+    r.val = val;
+    r.pre = pre;
+    r.preN = preN;
+    r.lr = lr;
+    r.sp = sp;
+    r.band = band;
+    r.prio = prio;
+    r.seqn = seqn;
+    r.host = host;
+    mark.store(s0 + 2u, std::memory_order_release);
+}
+
+// The probe-time coverage line. Its whole purpose is to make a SILENT run interpretable: it pairs
+// every probe row with how many hits each armed band and each armed card page took, so
+// "no T44-WIPE-STORE row for this address" can be read as a count instead of argued from absence.
+// One row per PHYS-BINPROBE (4 per w747-shaped soak), so it costs nothing against F-054.
+void T44WipeTotalsLine(uint32_t probeN)
+{
+    MCLA_LOG_WARN(
+        "T44-TOTALS probe#{} hits={} band0={} band1={} band_rows={} "
+        "prio_pages=[{:08X},{:08X},{:08X},{:08X}] prio_hits=[{},{},{},{}] "
+        "prio_rows=[{},{},{},{}] prio_wipes={} ring_next={}",
+        probeN, T44WipeHits(), s_t44BandHits[0].load(std::memory_order_relaxed),
+        s_t44BandHits[1].load(std::memory_order_relaxed),
+        s_t44BandRows.load(std::memory_order_relaxed), kT44PrioPages[0], kT44PrioPages[1],
+        kT44PrioPages[2], kT44PrioPages[3], s_t44PrioHits[0].load(std::memory_order_relaxed),
+        s_t44PrioHits[1].load(std::memory_order_relaxed),
+        s_t44PrioHits[2].load(std::memory_order_relaxed),
+        s_t44PrioHits[3].load(std::memory_order_relaxed),
+        s_t44PrioRows[0].load(std::memory_order_relaxed),
+        s_t44PrioRows[1].load(std::memory_order_relaxed),
+        s_t44PrioRows[2].load(std::memory_order_relaxed),
+        s_t44PrioRows[3].load(std::memory_order_relaxed),
+        s_t44PrioWipes.load(std::memory_order_relaxed),
+        s_t44PrioRingNext.load(std::memory_order_relaxed));
+
+    // The ring tail, so the probe row and the last writes to those pages sit next to each other.
+    for (uint32_t i = 0; i < kT44PrioRingN; ++i)
+    {
+        T44PrioRec& r = s_t44PrioRing[i];
+        std::atomic_ref<uint32_t> mark(r.seq);
+        const uint32_t s1 = mark.load(std::memory_order_acquire);
+        if (s1 == 0u || (s1 & 1u) != 0u) continue; // never written, or mid-write
+        const T44PrioRec c = r;                    // copy, then re-check for a tear
+        if (mark.load(std::memory_order_acquire) != s1) continue;
+        MCLA_LOG_WARN(
+            "T44-PRIO-RING #{} slot={} kind={} op={} @ {:08X} len={} val={:X} pre={:X} "
+            "pre_n={} band={} prio={} lr={:08X} sp={:08X} host={} seq={}",
+            i, i, (c.preN > 0u && c.val == 0u && c.pre != 0u) ? "wipe" : "hit", c.op, c.addr,
+            c.len, c.val, c.pre, c.preN, c.band, c.prio, c.lr, c.sp, c.host, c.seqn);
+    }
+}
+
+// `pre` is the value read at the destination BEFORE the store (memory order,
+// big-endian as the guest sees it); `preN` is how many bytes of it were
+// captured -- 0 means this path did not snapshot (the PageWatchOnWrite arm),
+// so a `preN=0` row can never be read as "the destination was zero".
+void T44WipeNote(const char* op, uint32_t guestAddr, uint32_t len, uint64_t val,
+                 uint64_t pre, uint32_t preN, const void* hostPc) {
+  const uint32_t seq = s_t44WipeHits.fetch_add(1, std::memory_order_relaxed) + 1;
+  const int band = T44WipeBandOf(guestAddr);
+  // The signature being hunted: a zero store that overwrote nonzero data.
+  const bool wipe = (preN > 0u && val == 0u && pre != 0u);
+  bool first = false;
+  if (band >= 0)
+    first = (s_t44BandHits[band].fetch_add(1, std::memory_order_relaxed) == 0);
+  uint32_t lr = 0, sp = 0;
+  if (const PPCContext* c = GetPPCContext()) {
+    lr = static_cast<uint32_t>(c->lr);
+    sp = c->r1.u32;
+  }
+
+  // PHASE 3 PRIORITY ARM. Evaluated before the band arm so a card-page hit can never be
+  // swallowed by it: it is counted per page, always pushed to the ring, and printed under the
+  // page's OWN budget (first 128 rows of that page, then every 256th) -- `n > 400 && n % 4096`
+  // below does not apply to these. `first` was already consumed above, so band liveness still
+  // prints when a card page holds the band's very first hit.
+  if (const int prio = T44WipePrioOf(guestAddr, len); prio >= 0) {
+    s_t44PrioHits[prio].fetch_add(1, std::memory_order_relaxed);
+    if (wipe) s_t44PrioWipes.fetch_add(1, std::memory_order_relaxed);
+    T44WipePrioRingPush(op, guestAddr, len, val, pre, preN, seq,
+                        static_cast<uint32_t>(band), static_cast<uint32_t>(prio), hostPc);
+    const uint32_t r = s_t44PrioRows[prio].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (r > 128u && (r % 256u) != 0u) return;
+    MCLA_LOG_WARN("T44-WIPE-STORE #{:04} kind=prio band={} page={} op={} @ {:08X} len={} "
+                  "val={:X} pre={:X} pre_n={} lr={:08X} sp={:08X} host={} seq={}",
+                  r, band, prio, op, guestAddr, len, val, pre, preN, lr, sp, hostPc, seq);
+    return;
+  }
+
+  const bool cadence = (seq % 65536u) == 0u;
+  if (!(wipe || first || cadence)) return;
+  const uint32_t n = s_t44BandRows.fetch_add(1) + 1;
+  if (n > 400u && (n % 4096u) != 0u) return;
+  MCLA_LOG_WARN("T44-WIPE-STORE #{:04} kind={} band={} op={} @ {:08X} len={} "
+                "val={:X} pre={:X} pre_n={} lr={:08X} sp={:08X} host={} seq={}",
+                n, wipe ? "wipe" : (first ? "first" : "cadence"), band, op,
+                guestAddr, len, val, pre, preN, lr, sp, hostPc, seq);
+}
+
+// LT rule 19 POSITIVE CONTROL. A silent T44-WIPE-STORE only means something if
+// this run ALSO printed T44-WIPE-SELFTEST with a nonzero hits= delta: for each
+// of the four armed card pages it reads a dword, a byte and a 16-byte span and
+// writes the very same bytes back through the checked accessors, so the arena is
+// byte-identical afterwards while the accessor -> overlap -> note chain is
+// forced to fire 12 times. Those writes land on `kind=prio` rows, so the
+// PRIORITY PRINTER phase 3 depends on is proven on the page, and two of the four
+// are the very addresses w747's probe reported broken (BDA1F000 / BE12A000) --
+// the control covers the addresses under investigation rather than only a
+// convenient stand-in. The row also prints each page's first two dwords as they
+// stood at boot: the only baseline for "was this header always zero or did it get
+// zeroed" the run will ever have. If the addresses cannot be read this early in
+// boot the line says so (read=0/4, hits=0) and the run's silence stays
+// uninterpretable rather than looking like a result.
+void T44WipeSelfTest() {
+  mcla::native::GuestMemoryView& mem = mcla::native::GetActiveGuestMemoryView();
+  const uint32_t seq0 = T44WipeHits();
+  uint32_t readOk = 0, wrote32 = 0, wroteU8 = 0, wroteBulk = 0;
+  uint32_t hdr[kT44NumPrioPages][2] = {};
+  for (uint32_t i = 0; i < kT44NumPrioPages; ++i) {
+    const uint32_t page = kT44PrioPages[i];
+    uint32_t w0 = 0, w1 = 0;
+    const bool r0 = mem.ReadU32BE(page, &w0);
+    const bool r1 = mem.ReadU32BE(page + 4u, &w1);
+    hdr[i][0] = w0;
+    hdr[i][1] = w1;
+    if (r0 && r1) ++readOk;
+    if (r0 && mem.WriteU32BE(page, w0)) ++wrote32;      // byte-identical
+    uint8_t b = 0;
+    if (mem.ReadU8(page + 8u, &b) && mem.WriteU8(page + 8u, b)) ++wroteU8;
+    uint8_t buf[16] = {};
+    if (mem.ReadBytes(page + 0x10u, buf, sizeof(buf)) &&
+        mem.WriteBytes(page + 0x10u, buf, sizeof(buf)))
+      ++wroteBulk;
+  }
+  MCLA_LOG_WARN("T44-WIPE-SELFTEST bands=[{:08X},{:08X})+[{:08X},{:08X}) "
+                "prio=[{:08X},{:08X},{:08X},{:08X}] read={}/4 "
+                "hdr=[{:08X},{:08X}][{:08X},{:08X}][{:08X},{:08X}][{:08X},{:08X}] "
+                "w32={} wu8={} wbulk={} hits={} expect_hits=12",
+                kT44WipeBands[0][0], kT44WipeBands[0][1], kT44WipeBands[1][0],
+                kT44WipeBands[1][1], kT44PrioPages[0], kT44PrioPages[1],
+                kT44PrioPages[2], kT44PrioPages[3], readOk, hdr[0][0], hdr[0][1],
+                hdr[1][0], hdr[1][1], hdr[2][0], hdr[2][1], hdr[3][0], hdr[3][1],
+                wrote32, wroteU8, wroteBulk, T44WipeHits() - seq0);
+}
+
 void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   static std::atomic<uint32_t> s_watchWrites{0};
+
+  // F-784 T44 WIPE WATCH. Two o1heap free-fragment headers were measured
+  // zeroed inside the physical arena (F-783: w745c cards BDA2A000/BE135000;
+  // w746 cards BDA1F000/BE12A000 -- both moved -0xB000, so the arm is a 4 MB
+  // BAND pair now, see kT44WipeBands above, and the analysis still compares
+  // this run's own PHYS-BINPROBE `gva` against those bands before believing any
+  // silence). This arm is the FALLBACK path: it only runs when a range or value
+  // watch already fired, and it carries no `pre` (pre_n=0 below), so the
+  // accessor arms in guest_memory.cpp are the primary rows. Fall through so the
+  // existing CDCD-FILL / PHYS-OVERRUN / RSC-REF arms keep their rows.
+  if (T44WipeOverlaps(guestAddr, 4u))
+    T44WipeNote("PW", guestAddr, 4u, value, 0, 0, _ReturnAddress());
+  // (pre=0 pre_n=0 -- this path does not snapshot the prior value; the
+  // accessor arms in guest_memory.cpp do, and those are the primary rows.)
 
   // F-141 CENSUS ONLY (read-only; armed in boot_host.cpp for these two values).
   // The renderer's resource "pointers" at this frontier are non-addresses
@@ -7443,15 +7813,39 @@ void PageWatchOnWrite(uint32_t guestAddr, uint32_t value) {
   // 16 rows, which w418/w419/w420 show already spent on 0x828CD0xx. So after F-391 a guest store
   // of the shape `@ <phys base> = <base+4>` had no logging route at all. Follow the constant.
   // This branch returns before the 16-row PAGEWATCH cap, so it stays the uncapped channel.
+  // F-774: the window was [base, base+0x800) and the cap was `hn <= 200 || hn % 5000 == 0`.
+  // Those two constants made the probe STRUCTURALLY BLIND to the only question it exists to
+  // answer. A 0x800 window holds 512 stride-4 addresses, so a single ascending zero-fill pass
+  // can produce at most 512 in-window stores -- `hn` can never reach 5000, and the `% 5000` arm
+  // is dead code. w737 printed exactly rows #1..#200 (A0400000..A040031C, contiguous, all zero,
+  // all lr=821BE3BC) and then nothing, which reads as "the sweep stopped at 0x320 bytes" but is
+  // equally consistent with "the sweep ran on for megabytes and the cap ate it". An agent this
+  // session inferred the former and proposed a 32 KB arena offset on the strength of it; that
+  // inference is unsound and the offset would be a guess. This is LT rule 19 / F-412 again: a
+  // zero from an instrument is not a result until the instrument is shown able to fire.
+  //
+  // F-774 CORRECTION -- widening the window below did NOT make this probe able to answer, and
+  // w738 proves it. This branch only runs from PageWatchOnWrite, which only runs for addresses
+  // inside a range armed by RegisterGuestWatchRange; boot_host.cpp:3207-3208 arms
+  // [kPhysArenaBeginVa, kPhysArenaBeginVa + 0x800), i.e. 2 KB. So guestAddr can never reach
+  // base+0x800 here and the 1 MB bound is unreachable. Measured in w738: 202 rows, #1..#200 then
+  // #256 then #512, the last being `#000512 @ A04007FC` -- the final dword of the ARMED range,
+  // with the log's own positive control `WATCH: range armed [A0400000,A0400800)` at w738.log:35.
+  // 512 is therefore the armed capacity, not the sweep length. What is actually established:
+  // the fill is contiguous stride-4 and covers at least the whole 2 KB; above A0400800 this
+  // branch is blind by construction and no row count from it can bound anything.
+  // The instrument that can answer lives at the memcpy hook instead (gpu_device.cpp,
+  // F774-PHYS-MEMCPY in PPC_FUNC(sub_823DA950)): it sees dst/len directly, is not gated by any
+  // armed range, and reads the real PPCContext rather than GetPPCContext().
   if (guestAddr >= mcla::kernel::kPhysArenaBeginVa &&
-      guestAddr < mcla::kernel::kPhysArenaBeginVa + 0x800u) {
+      guestAddr < mcla::kernel::kPhysArenaBeginVa + 0x100000u) {
     static std::atomic<uint32_t> s_heapHdrStores{0};
     const uint32_t hn = s_heapHdrStores.fetch_add(1) + 1;
-    if (hn <= 200 || (hn % 5000) == 0) {
+    if (hn <= 200 || (hn % 256) == 0) {
       uint32_t lr = 0;
       if (const PPCContext *c = GetPPCContext())
         lr = static_cast<uint32_t>(c->lr);
-      MCLA_LOG_WARN("HEAPHDR-STORE #{:05} @ {:08X} = {:08X} lr={:08X}", hn,
+      MCLA_LOG_WARN("HEAPHDR-STORE #{:06} @ {:08X} = {:08X} lr={:08X}", hn,
                     guestAddr, value, lr);
     }
     return;

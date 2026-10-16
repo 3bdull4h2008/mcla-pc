@@ -2602,7 +2602,8 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::GetOrCompile(
     const std::string& psHlsl,
     const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout,
     const char* caller,
-    bool* outCarriesGeometryStage) {
+    bool* outCarriesGeometryStage,
+    bool isGuestDraw) {
 
     // The carried geometry-stage capability starts FALSE and is only ever set on
     // the one path that can justify it (the cache hit below). Every early return
@@ -2689,6 +2690,27 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::GetOrCompile(
         RefuseOnce(key, kRefuseNoRootSignature, caller,
                    "no root signature: the worker cannot know what the draw will bind");
         return nullptr;
+    }
+
+    // T43.24v2 (2026-10-16): REVERTED the nullptr refusal. The audit was
+    // right that the test-PSO substitution draws through a layout the
+    // guest never declared — but refusing the draw was WORSE: there is
+    // only ONE draw per unique pipeline key in this boot, so the first
+    // (and only) draw was refused, the async compile had nothing to serve,
+    // and ZERO draws happened (w784: PC-PSO-MISS=2, DRAW-CP-DRAWN=0,
+    // a strict regression from 2 draws to 0). The correct shape is to
+    // return the fallback (test PSO) as before — the draw works when the
+    // stride matches (as w783 proved), and the compile populates the cache
+    // for any future draw with the same key. The substitution is now
+    // COUNTED AND LOGGED (below) instead of silent.
+    if (isGuestDraw) {
+        static std::atomic<uint32_t> s_testPsoGuestDraws{0};
+        const uint32_t tp = s_testPsoGuestDraws.fetch_add(1) + 1;
+        if (tp <= 16 || (tp % 100) == 0) {
+            MCLA_LOG_WARN("PC-TESTPSO-GUEST #{} key={} (T43.24v2: guest draw "
+                          "through test PSO on cache miss; compile queued)",
+                          tp, key.vsHash);
+        }
     }
 
     // Cache miss: grab the fallback PSO up front (may be null before SetFallback)

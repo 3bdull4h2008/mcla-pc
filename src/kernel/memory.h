@@ -10,6 +10,15 @@
 
 namespace mcla::kernel {
 
+// F-782: the first `kNullGuardBytes` of the guest window are deliberately inaccessible, so a guest
+// null dereference faults instead of silently reading real memory. This was a bare `4096` literal
+// in eight places across four sites in memory.cpp, so nothing in the tree could be grepped for
+// "who must respect the guard" -- and a raw `base + pos` sweep in heap.cpp did not respect it,
+// which cost one access violation per boot and left `PHYS-LIVE` at 0 rows in all 313 logs on disk.
+// Any code that reads the window by pointer arithmetic rather than through `Translate`/`IsValid`
+// must start at this offset.
+constexpr uint64_t kNullGuardBytes = 4096u;
+
 // Guest memory heap: 4 GB VirtualAlloc at fixed base 0x100000000
 // Provides MapVirtual/Translate for guest↔host pointer translation
 

@@ -331,6 +331,94 @@ O1HeapInstance* o1heapInit(void* const base, const size_t size)
     return out;
 }
 
+// F-779 (2026-10-06). ADDITIVE: no statement above or below this block is modified, so the
+// "NOTHING ELSE HERE CHANGES" notes at :569 and :605 remain true of every function they name --
+// o1heapAllocate, o1heapFree, o1heapInit, o1heapDoInvariantsHold, O1HEAP_GRANULAR_MAX_HOPS and the
+// diagnostics layout are all untouched, and INSTANCE_SIZE_PADDED is still pinned to 0x240 by the
+// static_assert at :181 (so every hardcoded instance offset in the instrumentation -- mask at +0x200,
+// diagnostics.capacity at +0x208 -- keeps meaning what it says).
+//
+// WHAT THIS ADDS AND WHY. o1heapInit places the instance AT base, so the first 0x240 bytes of the
+// arena are host control blocks sitting at a GUEST-ADDRESSABLE address. F-778 measured the cost:
+// the title handed 0xA0400000 -- the physical instance's own first byte -- to its memcpy as a copy
+// destination and zeroed 128 bytes there, i.e. bin heads 0..15. With `nonempty_bin_mask` and the bin
+// heads zeroed, o1heapAllocate computes `suitable_bins == 0` and returns NULL for EVERY size including
+// 1 byte, while o1heapDoInvariantsHold -- which never dereferences a fragment -- still returns true.
+// That is the "allocator refuses everything but the pool looks healthy" signature.
+//
+// Detaching the instance makes the arena's first byte an ordinary allocatable fragment: a guest write
+// to a guest physical address can then only ever land on guest data, never on our control block.
+//
+// THE THREE DIFFERENCES FROM o1heapInit, ALL OF THEM: `out` is instanceMem rather than base; the root
+// fragment is at base rather than base + INSTANCE_SIZE_PADDED; capacity starts at size rather than
+// size - INSTANCE_SIZE_PADDED. The clamping, the alignment loop, the fragment initialization, the
+// rebin and the diagnostics block are line-for-line the same.
+//
+// ONE CONSEQUENCE TO KNOW: o1heapFree's two bounds asserts (:748, :750) derive the arena from the
+// handle address, so they are meaningless here. They are O1HEAP_ASSERT == assert(), compiled out
+// under -DNDEBUG, and this tree builds RelWithDebInfo with /DNDEBUG (CMakeLists.txt:569 and the
+// $<NOT:$<CONFIG:Debug>> guard at :578; measured on o1heap.c's own build.ninja FLAGS line). A Debug
+// build of a detached instance would assert on the first free -- do not enable one without rewriting
+// those two checks to take an explicit arena base.
+size_t o1heapInstanceSize(void)
+{
+    return INSTANCE_SIZE_PADDED;
+}
+
+O1HeapInstance* o1heapInitSeparate(void* const instanceMem, void* const base, const size_t size)
+{
+    O1HeapInstance* out = NULL;
+    if ((instanceMem != NULL) && (base != NULL) &&
+        ((((size_t)instanceMem) % O1HEAP_ALIGNMENT) == 0U) &&
+        ((((size_t)base) % O1HEAP_ALIGNMENT) == 0U) &&
+        (size >= FRAGMENT_SIZE_MIN))
+    {
+        O1HEAP_ASSERT(((size_t)instanceMem) % sizeof(O1HeapInstance*) == 0U);
+        out = (O1HeapInstance*)instanceMem;
+        out->nonempty_bin_mask = 0U;
+        for (size_t i = 0; i < NUM_BINS_MAX; i++)
+        {
+            out->bins[i] = NULL;
+        }
+
+        // Limit and align the capacity. No INSTANCE_SIZE_PADDED is subtracted: the instance is not in
+        // this arena, so the whole of `size` is allocatable.
+        size_t capacity = size;
+        if (capacity > FRAGMENT_SIZE_MAX)
+        {
+            capacity = FRAGMENT_SIZE_MAX;
+        }
+        while ((capacity % FRAGMENT_SIZE_MIN) != 0)
+        {
+            O1HEAP_ASSERT(capacity > 0U);
+            capacity--;
+        }
+        O1HEAP_ASSERT((capacity % FRAGMENT_SIZE_MIN) == 0);
+        O1HEAP_ASSERT((capacity >= FRAGMENT_SIZE_MIN) && (capacity <= FRAGMENT_SIZE_MAX));
+
+        // Initialize the root fragment AT base.
+        Fragment* const frag = (Fragment*)(void*)((char*)base);
+        O1HEAP_ASSERT((((size_t)frag) % O1HEAP_ALIGNMENT) == 0U);
+        frag->header.next = NULL;
+        frag->header.prev = NULL;
+        frag->header.size = capacity;
+        frag->header.used = false;
+        frag->next_free = NULL;
+        frag->prev_free = NULL;
+        rebin(out, frag);
+        O1HEAP_ASSERT(out->nonempty_bin_mask != 0U);
+
+        // Initialize the diagnostics.
+        out->diagnostics.capacity = capacity;
+        out->diagnostics.allocated = 0U;
+        out->diagnostics.peak_allocated = 0U;
+        out->diagnostics.peak_request_size = 0U;
+        out->diagnostics.oom_count = 0U;
+        out->diagnostics.granular_walk_capped = 0U;
+    }
+    return out;
+}
+
 void* o1heapAllocate(O1HeapInstance* const handle, const size_t amount)
 {
     O1HEAP_ASSERT(handle != NULL);
@@ -760,4 +848,146 @@ O1HeapDiagnostics o1heapGetDiagnostics(const O1HeapInstance* const handle)
     O1HEAP_ASSERT(handle != NULL);
     const O1HeapDiagnostics out = handle->diagnostics;
     return out;
+}
+
+void o1heapProbeGranular(const O1HeapInstance* const handle, const size_t amount, const size_t granularity,
+                         O1HeapProbeResult* const out)
+{
+    if (out == NULL)
+    {
+        return;
+    }
+    // Zero the whole result first, so a probe that stops early still reports honest zeros rather
+    // than the caller's stack. `found_bin` is the one field whose zero would be a lie -- 0 is a real
+    // bin index -- so -1 means "nothing found" and is set explicitly here.
+    uint8_t* const raw = (uint8_t*)(void*)out;
+    for (size_t i = 0; i < sizeof(*out); i++)
+    {
+        raw[i] = 0U;
+    }
+    out->found_bin = -1;
+
+    if ((handle == NULL) || (amount == 0U))
+    {
+        return;
+    }
+    out->valid = 1U;
+
+    // The same two shape guards o1heapAllocateGranular applies, in the same order, so a probe whose
+    // `granularity_ok` is 0 names a refusal that never reached the search at all.
+    const bool granularity_ok = (granularity >= FRAGMENT_SIZE_MIN) && (granularity <= (SIZE_MAX / 2U)) &&
+                                ((granularity & (granularity - 1U)) == 0U) &&
+                                ((granularity % FRAGMENT_SIZE_MIN) == 0U);
+    const bool amount_ok = (amount <= (SIZE_MAX - O1HEAP_ALIGNMENT));
+    out->granularity_ok = (granularity_ok && amount_ok) ? 1U : 0U;
+    if (!granularity_ok || !amount_ok)
+    {
+        return;
+    }
+
+    // The same charge expression, term for term, so `charge` here and the allocator's can never
+    // disagree about what was asked for.
+    const size_t charge = (((amount + O1HEAP_ALIGNMENT) + granularity - 1U) / granularity) * granularity;
+    out->charge = charge;
+    const bool charge_ok = (charge <= handle->diagnostics.capacity) && (charge >= FRAGMENT_SIZE_MIN) &&
+                           ((charge % FRAGMENT_SIZE_MIN) == 0U);
+    out->charge_ok = charge_ok ? 1U : 0U;
+    if (!charge_ok)
+    {
+        return;
+    }
+
+    const uint_fast8_t start = log2Floor(charge / FRAGMENT_SIZE_MIN);
+    out->start_bin = (uint32_t)start;
+
+    uint32_t bits = 0U;
+    for (uint_fast8_t i = start; i < NUM_BINS_MAX; i++)
+    {
+        if ((handle->nonempty_bin_mask & pow2(i)) != 0U)
+        {
+            bits++;
+        }
+    }
+    out->bits_at_or_above_start = bits;
+
+    // (1) THE FAITHFUL REPLAY. Same start bin, same loop condition, same per-link walk condition and
+    // the same cumulative `hops` that the original never resets between bins, so `cap_would_fire`
+    // here is the value o1heapAllocateGranular's own post-loop check would have seen. No extra bound
+    // is added and none is needed for fidelity: `hops` already caps the TOTAL walk across every bin
+    // at O1HEAP_GRANULAR_MAX_HOPS, and that is what makes a cyclic list terminate. Writes nothing.
+    const Fragment* found = NULL;
+    uint32_t        hops = 0U;
+    for (uint_fast8_t idx = start; (idx < NUM_BINS_MAX) && (found == NULL); idx++)
+    {
+        if ((handle->nonempty_bin_mask & pow2(idx)) == 0U)
+        {
+            continue;
+        }
+        const Fragment* f = handle->bins[idx];
+        while ((f != NULL) && (f->header.size < charge) && (hops < O1HEAP_GRANULAR_MAX_HOPS))
+        {
+            f = f->next_free;
+            hops++;
+        }
+        if ((f != NULL) && (f->header.size >= charge))
+        {
+            found = f;
+            out->found_bin = (int32_t)idx;
+            out->found_size = f->header.size;
+        }
+    }
+    out->hops = hops;
+    out->cap_would_fire = (hops >= O1HEAP_GRANULAR_MAX_HOPS) ? 1U : 0U;
+
+    // (2) THE PER-BIN CENSUS, over the first O1HEAP_PROBE_MAX_BINS bins the search would consider.
+    // This half is the one that answers the question, because it prints the size words the search
+    // compared against -- the only quantity the decision turns on and the only one no other reading
+    // in this library exposes. `head_used` is printed for the same reason: a fragment linked into a
+    // free list with `used == true` is corruption the mask cannot express either. Bounded per bin so
+    // a cyclic list reports `truncated` instead of hanging.
+    for (uint_fast8_t idx = start; (idx < NUM_BINS_MAX) && (out->n_bins < O1HEAP_PROBE_MAX_BINS); idx++)
+    {
+        if ((handle->nonempty_bin_mask & pow2(idx)) == 0U)
+        {
+            continue;
+        }
+        O1HeapProbeBin* const pb = &out->bins[out->n_bins];
+        out->n_bins++;
+        pb->bin = (uint32_t)idx;
+        const Fragment* f = handle->bins[idx];
+        if (f == NULL)
+        {
+            pb->head_null = 1U;  // Mask bit set, bin empty: an invariant violation, and a named one.
+            continue;
+        }
+        pb->head_size = f->header.size;
+        pb->head_used = f->header.used ? 1U : 0U;
+        // The full header, because w744 measured head_size == 0 in both set bins and a size on its
+        // own cannot say where the fragment is or whether the list was truncated by a zeroed link.
+        pb->head_addr = (size_t)f;
+        pb->head_prev = (size_t)f->header.prev;
+        pb->head_next = (size_t)f->next_free;
+        pb->min_size = f->header.size;
+        pb->max_size = f->header.size;
+        uint32_t len = 0U;
+        while ((f != NULL) && (len < O1HEAP_PROBE_MAX_LINKS))
+        {
+            if (f->header.size >= charge)
+            {
+                pb->n_ge_charge++;
+            }
+            if (f->header.size < pb->min_size)
+            {
+                pb->min_size = f->header.size;
+            }
+            if (f->header.size > pb->max_size)
+            {
+                pb->max_size = f->header.size;
+            }
+            f = f->next_free;
+            len++;
+        }
+        pb->list_len = len;
+        pb->truncated = (f != NULL) ? 1U : 0U;
+    }
 }

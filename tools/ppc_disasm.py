@@ -99,6 +99,16 @@ def rot_mask(mb, me):
     return m
 
 
+# F-776: every generic fallback in decode() used to print a bare family name -- `rldic-family
+# 78A30004`, `op31:3 d=5 a=4 b=0`, `?op7:18000000`. That reads like an answer and is not one.
+# Measured over build/cache/mcla_pe.bin (2,588,672 dwords): op-30 alone is 5,884 words, all of
+# which came back as `rldic-family <hex>` with zero operands. A window decode can therefore return
+# no real operands for hundreds of instructions while looking complete -- the same defect class as
+# a capped log printer (LT rule 19) and as F-774/F-775. The defect was documented in AGENTS.md
+# instead of here, and AGENTS.md is not open at decode time. Say it at the point of use.
+NOT_DECODED = "NOT-DECODED(use generated/ppc_xenon/*.cpp)"
+
+
 def decode(i, pc):
     op = i >> 26
     d = (i >> 21) & 31
@@ -187,7 +197,7 @@ def decode(i, pc):
             return f"mcrf cr{crd},cr{(i >> 18) & 7}"
         if xo9 in (257, 33, 449, 225, 193, 417, 289, 129, 353, 385, 421):
             return f"cr-op {xo9}"
-        return f"op19:{xo9}"
+        return f"op19:{xo9} {NOT_DECODED}"
     if op == 31:
         if xo == 0:
             return f"cmpw cr{crd},{r(a)},{r(b)}"
@@ -288,7 +298,7 @@ def decode(i, pc):
         if xo == 661:
             return f"stswi {r(d)},{r(a)},{b}"
         if xo == 986:  # XeCPU lvewx / vec: on integer decode = 'or with shift'? keep raw
-            return f"op31:986 {r(d)},{r(a)},{r(b)}"
+            return f"op31:986 {r(d)},{r(a)},{r(b)} {NOT_DECODED}"
         if xo == 725:
             return f"stswx {r(d)},{r(a)},{r(b)}"
         if xo == 922:
@@ -313,7 +323,7 @@ def decode(i, pc):
             return f"mfmsr {r(d)}"
         if xo == 616:
             return f"mtmsr {r(d)}"
-        return f"op31:{xo} d={d} a={a} b={b}{rc}"
+        return f"op31:{xo} d={d} a={a} b={b}{rc} {NOT_DECODED}"
     if op == 32:
         return f"lwz {r(d)},{simm}({r(a)})"
     if op == 33:
@@ -365,9 +375,9 @@ def decode(i, pc):
         return (f"rlwnm {r(a)},{r(d)},{r(b)},mb={mb},me={me}"
                 f",mask=0x{rot_mask(mb, me):08X}{rc}")
     if op == 30:
-        return f"rldic-family {i:08X}"
+        return f"rldic-family {i:08X} {NOT_DECODED}"
     if op == 4:
-        return f"float/ps {i:08X}"
+        return f"float/ps {i:08X} {NOT_DECODED}"
     if op == 58:  # 64-bit D-form: ds = bits 15:2, low 2 bits select opcode
         ds = (i & 0xFFFC)
         sub = i & 3
@@ -377,7 +387,7 @@ def decode(i, pc):
             return f"ldu {r(d)},{ds}({r(a)})"
         if sub == 2:
             return f"lwa {r(d)},{ds}({r(a)})"
-        return f"op58sub{sub} {i:08X}"
+        return f"op58sub{sub} {i:08X} {NOT_DECODED}"
     if op == 62:  # 64-bit D-form stores
         ds = (i & 0xFFFC)
         sub = i & 3
@@ -385,8 +395,8 @@ def decode(i, pc):
             return f"std {r(d)},{ds}({r(a)})"
         if sub == 1:
             return f"stdu {r(d)},{ds}({r(a)})"
-        return f"op62sub{sub} {i:08X}"
-    return f"?op{op}:{i:08X}"
+        return f"op62sub{sub} {i:08X} {NOT_DECODED}"
+    return f"?op{op}:{i:08X} {NOT_DECODED}"
 
 
 # ---------------------------------------------------------------------------

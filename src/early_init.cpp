@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <signal.h>
 #include <windows.h>
+#include <timeapi.h>  // T43.18: timeBeginPeriod, process-scope 1 ms granularity
 
 static LONG WINAPI EarlyVeh(EXCEPTION_POINTERS* ep) {
     FILE* f = nullptr;
@@ -35,5 +36,12 @@ struct EarlyCrashInit {
         _set_invalid_parameter_handler(EarlyInvalidParam);
         signal(SIGABRT, EarlyAbortSignal);
         AddVectoredExceptionHandler(1, EarlyVeh);
+        // T43.18 (2026-10-13, taken from LARecomp's pacing notes): process
+        // timer granularity to 1 ms for the life of the process. Windows
+        // defaults to ~15.6 ms, which turns every short host sleep (the 1 ms
+        // semaphore poll slices, vsync pacing) into a 15 ms stall. Host-only
+        // (winmm.lib, already linked); no guest behavior changes. Never
+        // paired with timeEndPeriod: the requirement outlives every scope.
+        timeBeginPeriod(1);
     }
 } g_earlyCrashInit;

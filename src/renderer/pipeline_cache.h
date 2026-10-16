@@ -936,7 +936,8 @@ public:
         const std::string& psHlsl,
         const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout,
         const char* caller = "pipeline_cache.h:undefined",
-        bool* outCarriesGeometryStage = nullptr);
+        bool* outCarriesGeometryStage = nullptr,
+        bool isGuestDraw = true);
 
     // Set the fallback PSO used for cache misses while async compilation runs.
     void SetFallbackPipeline(Microsoft::WRL::ComPtr<ID3D12PipelineState> fallback);

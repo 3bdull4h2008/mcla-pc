@@ -19,6 +19,16 @@ void PageWatchOnRead(uint32_t guestAddr, uint32_t value);
 // F-375: gpu_cp.cpp owns the PPCContext includes, so the guest-side argument dump for a store
 // that reached the host heap instance lives there (see ReportHeapInstanceStore below).
 void HeapInstanceStoreReport(uint32_t guestAddr, uint32_t value);
+// F-784: the T44 wipe watch (defined next to PageWatchOnWrite in gpu_cp.cpp, same linkage
+// reasoning as above). `T44WipeOverlaps` is the cheap address test against the two armed
+// pages; `T44WipeSpan` additionally returns the overlapping sub-range so a bulk copy can
+// snapshot the exact bytes it is about to overwrite; `T44WipeNote` prints the row. Callers
+// must test first -- these are report paths, not filters, and every one of them is called
+// on the hot write path.
+bool T44WipeOverlaps(uint32_t guestAddr, uint32_t len);
+bool T44WipeSpan(uint32_t guestAddr, uint32_t len, uint32_t* outStart, uint32_t* outLen);
+void T44WipeNote(const char* op, uint32_t guestAddr, uint32_t len, uint64_t val,
+                 uint64_t pre, uint32_t preN, const void* hostPc);
 } // namespace mcla::gpu
 
 static constexpr uint32_t kWatchPage = 0x50000000u;
@@ -54,44 +64,73 @@ static constexpr uint32_t kWatchPage = 0x50000000u;
 // they resolve with `tools/host_rva_resolve.py`, so they stay and gain an explicit `sample_of` note
 // rather than being replaced.
 namespace {
-// F-384: these two follow the arena; they are NOT a hardcoded address any more. Watching a stale
-// range after a relocated arena would read as "the corruption stopped" when it only moved out of
-// sight -- the values now come from the single definition in `src/kernel/heap.h`.
+// F-384: these follow the arena; they are NOT hardcoded addresses. Watching a stale range after a
+// relocated arena would read as "the corruption stopped" when it only moved out of sight -- the
+// values come from the single definition in `src/kernel/heap.h`.
 constexpr uint32_t kHeapInstanceLo = mcla::kernel::kUserHeapArenaVa;
 constexpr uint32_t kHeapInstanceHi = mcla::kernel::kUserHeapArenaVa + 0x240u;
 
-inline bool HeapInstanceStoreHit(uint32_t guestAddr) {
-    return guestAddr >= kHeapInstanceLo && guestAddr < kHeapInstanceHi;
+// F-777: the PHYSICAL instance was missing from this family entirely. BOTH o1heap instances are
+// destroyed in every soak (`o1heap invariants FAIL` x4, `XTL-ALLOC-REFUSED` x4, `F370-HEAP-HDR`
+// reading `cap=0x0` against `want_cap=0x7fe7fdc0`), yet the extent instrument -- the only one in
+// the tree that reports a real `dst`, a real `len` and a `caller_rva` that
+// `tools/host_rva_resolve.py` can name -- was pointed at kUserHeapArenaVa alone. The physical
+// instance at kPhysArenaBeginVa was covered only by the 2 KB armed watch range, whose attribution
+// is a guest `lr` read through GetPPCContext() and is therefore STICKY (do-not #14): 512 rows of
+// `lr=821BE3BC` were read as an attribution when the same lr also sits on 1115 unrelated rows and
+// on 40 genuine 2-byte memcpys 0x3C000 higher. These three functions are called from
+// WriteU32BE/WriteU64BE/WriteBytes, the chokepoint every guest store must cross, so neither a
+// direct `stw` loop nor a bulk copy can bypass them -- which is more than a PPC_FUNC hook can
+// claim: `F382-MEMCPY` has fired 0 times in every log ever written (w725..w739), so its zero is
+// blindness, not absence (LT rule 19).
+struct HeapInstanceWindow { uint32_t lo; uint32_t hi; const char *tag; };
+constexpr uint32_t kPhysInstanceLo = mcla::kernel::kPhysArenaBeginVa;
+constexpr uint32_t kPhysInstanceHi = mcla::kernel::kPhysArenaBeginVa + 0x240u;
+constexpr HeapInstanceWindow kHeapWindows[] = {
+    {kHeapInstanceLo, kHeapInstanceHi, "user"},
+    {kPhysInstanceLo, kPhysInstanceHi, "phys"},
+};
+constexpr size_t kNumHeapWindows = sizeof(kHeapWindows) / sizeof(kHeapWindows[0]);
+
+// Returns the matching window index, or -1. Deliberately NOT a bool: -1 is truthy, so every call
+// site must compare `>= 0` rather than test the result.
+inline int HeapInstanceStoreHit(uint32_t guestAddr) {
+    for (size_t i = 0; i < kNumHeapWindows; ++i)
+        if (guestAddr >= kHeapWindows[i].lo && guestAddr < kHeapWindows[i].hi) return (int)i;
+    return -1;
 }
 
 // F-631: SPAN overlap, not point containment. The write that matters starts at 0x20004 and runs for
 // megabytes; a test on the start address alone sees it, a test on the window alone does not. Mirrors
 // the range logic `RangeOverlapsWatch` already uses for the dynamic ranges (guest_memory.cpp:183).
-inline bool HeapWindowOverlaps(uint32_t guestAddr, uint32_t size) {
-    if (size == 0) return false;
+inline int HeapWindowOverlaps(uint32_t guestAddr, uint32_t size) {
+    if (size == 0) return -1;
     const uint64_t end = static_cast<uint64_t>(guestAddr) + size;
-    return guestAddr < kHeapInstanceHi && static_cast<uint64_t>(kHeapInstanceLo) < end;
+    for (size_t i = 0; i < kNumHeapWindows; ++i)
+        if (guestAddr < kHeapWindows[i].hi && kHeapWindows[i].lo < end) return (int)i;
+    return -1;
 }
 
-// Cumulative extent of the per-dword path. Monotonic and never reset: this measures the whole boot's
-// writing into the window, which is the quantity F-630 got wrong by treating 8 as the total. Widen
-// with a CAS-free exchange-max: a lost race can only under-report the low bound by one address, and
-// the rollup is a census, not a lock.
-std::atomic<uint64_t> g_winStores{0};
-std::atomic<uint32_t> g_winLo{0xFFFFFFFFu};
-std::atomic<uint32_t> g_winHi{0};
+// Cumulative extent of the per-dword path, per window. Monotonic and never reset: this measures the
+// whole boot's writing into the window, which is the quantity F-630 got wrong by treating 8 as the
+// total. Widened with a CAS-free exchange-max: a lost race can only under-report the low bound by
+// one address, and the rollup is a census, not a lock.
+std::atomic<uint64_t> g_winStores[kNumHeapWindows]{};
+std::atomic<uint32_t> g_winLo[kNumHeapWindows] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+std::atomic<uint32_t> g_winHi[kNumHeapWindows]{};
 
-void CountWindowStore(uint32_t guestAddr) {
-    g_winStores.fetch_add(1, std::memory_order_relaxed);
-    uint32_t cur = g_winLo.load(std::memory_order_relaxed);
-    while (guestAddr < cur && !g_winLo.compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
-    cur = g_winHi.load(std::memory_order_relaxed);
-    while (guestAddr > cur && !g_winHi.compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
+void CountWindowStore(size_t wi, uint32_t guestAddr) {
+    g_winStores[wi].fetch_add(1, std::memory_order_relaxed);
+    uint32_t cur = g_winLo[wi].load(std::memory_order_relaxed);
+    while (guestAddr < cur && !g_winLo[wi].compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
+    cur = g_winHi[wi].load(std::memory_order_relaxed);
+    while (guestAddr > cur && !g_winHi[wi].compare_exchange_weak(cur, guestAddr, std::memory_order_relaxed)) {}
 }
 
-void ReportHeapInstanceStore(const char *op, uint32_t guestAddr, uint64_t val, void *ra) {
-    static std::atomic<uint32_t> s_storeN{0};
-    const uint32_t n = s_storeN.fetch_add(1) + 1;
+void ReportHeapInstanceStore(const char *op, uint32_t guestAddr, uint64_t val, void *ra, size_t wi) {
+    static std::atomic<uint32_t> s_storeN[kNumHeapWindows]{};
+    const HeapInstanceWindow &w = kHeapWindows[wi];
+    const uint32_t n = s_storeN[wi].fetch_add(1) + 1;
     // F-379: the old hard cap (`n > 16`) made the burst length unmeasurable -- w387 and w388 both
     // printed exactly 16 rows regardless of how long the copy actually was, so "16 dwords" was the
     // cap, not a measurement. First 16 plus every 4096th row keeps a short burst complete (cap-shape
@@ -99,53 +138,55 @@ void ReportHeapInstanceStore(const char *op, uint32_t guestAddr, uint64_t val, v
     // F-631: `sample_of` and `win_stores` are what stop the next reader making F-630's mistake again.
     // `win_stores` is the number of stores the window has actually seen; a burst far larger than the
     // 16 rows below it is a sample of something bigger, and the row now says so in the same line.
+    // F-777: the counter is now PER WINDOW, so the two instances cannot spend each other's budget --
+    // a shared counter would let a chatty user heap starve the physical one to zero rows and read as
+    // "the physical instance was never written".
     if (n <= 16 || (n % 4096) == 0) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
         const uintptr_t abs = reinterpret_cast<uintptr_t>(ra);
-        const uint64_t total = g_winStores.load(std::memory_order_relaxed);
-        MCLA_LOG_ERROR("F374-HEAPSTORE #{} op={} guest={:08X} inst_off={:#x} val={:#x} "
+        const uint64_t total = g_winStores[wi].load(std::memory_order_relaxed);
+        MCLA_LOG_ERROR("F374-HEAPSTORE #{} inst={} op={} guest={:08X} inst_off={:#x} val={:#x} "
                        "caller_rva={:#x} tid={} sample_of={} (window is 0x240 bytes: these rows are "
                        "a SAMPLE, the whole event is F631-HEAPEXT or F631-HEAPWIN)",
-                       n, op, guestAddr, guestAddr - kHeapInstanceLo, val, base ? abs - base : abs,
+                       n, w.tag, op, guestAddr, guestAddr - w.lo, val, base ? abs - base : abs,
                        GetCurrentThreadId(), (unsigned long long)total);
         mcla::gpu::HeapInstanceStoreReport(guestAddr, static_cast<uint32_t>(val));
         // F-631: the rollup, on the same cadence as the rows it qualifies. `saturated` is the whole
         // point -- it is true once the window has seen its own last byte, which means the observed
         // range is bounded by the window and NOT by the writer.
-        if (n <= 16 || (n % 4096) == 0) {
-            const uint32_t lo = g_winLo.load(std::memory_order_relaxed);
-            const uint32_t hi = g_winHi.load(std::memory_order_relaxed);
-            MCLA_LOG_ERROR("F631-HEAPWIN #{} op={} win_stores={} lo={:08X} hi={:08X} "
-                           "saturated={} window=[{:08X},{:08X}) window_bytes=0x{:X} tid={}",
-                           n, op, (unsigned long long)total, lo, hi,
-                           (hi >= kHeapInstanceHi - 4u) ? 1 : 0, kHeapInstanceLo, kHeapInstanceHi,
-                           (unsigned)(kHeapInstanceHi - kHeapInstanceLo), GetCurrentThreadId());
-        }
+        const uint32_t lo = g_winLo[wi].load(std::memory_order_relaxed);
+        const uint32_t hi = g_winHi[wi].load(std::memory_order_relaxed);
+        MCLA_LOG_ERROR("F631-HEAPWIN #{} inst={} op={} win_stores={} lo={:08X} hi={:08X} "
+                       "saturated={} window=[{:08X},{:08X}) window_bytes=0x{:X} tid={}",
+                       n, w.tag, op, (unsigned long long)total, lo, hi,
+                       (hi >= w.hi - 4u) ? 1 : 0, w.lo, w.hi,
+                       (unsigned)(w.hi - w.lo), GetCurrentThreadId());
     }
-    CountWindowStore(guestAddr);
+    CountWindowStore(wi, guestAddr);
 }
 
 // F-631: the primary extent instrument. A bulk copy that overlaps the instance window is ONE event
 // with a real destination and a real length, which is the thing F-630 needed and the dword window
 // could not provide. `len` is the whole copy, not the part that landed in the window, and the row
 // says how much of it did -- so a 5.2 MB memset reads as a 5.2 MB memset.
-void ReportHeapWindowExtent(const char *op, uint32_t guestAddr, uint32_t size, void *ra) {
-    static std::atomic<uint64_t> s_extN{0};
-    const uint64_t n = s_extN.fetch_add(1, std::memory_order_relaxed) + 1;
+void ReportHeapWindowExtent(const char *op, uint32_t guestAddr, uint32_t size, void *ra, size_t wi) {
+    static std::atomic<uint64_t> s_extN[kNumHeapWindows]{};
+    const HeapInstanceWindow &w = kHeapWindows[wi];
+    const uint64_t n = s_extN[wi].fetch_add(1, std::memory_order_relaxed) + 1;
     // Cadence: the first 4, then every 64th. A guest that memsets its own allocator state once per
     // frame is not interesting; one that does it in a loop is, and 64 keeps a loop visible without
-    // letting it become the log.
+    // letting it become the log. F-777: per window, for the same reason as s_storeN above.
     if (n > 4 && (n % 64) != 0) return;
     const uint32_t hi = guestAddr + size;  // size is bounded by IsValidRange (<= 4 GiB window)
-    const uint32_t ovLo = guestAddr > kHeapInstanceLo ? guestAddr : kHeapInstanceLo;
-    const uint32_t ovHi = hi < kHeapInstanceHi ? hi : kHeapInstanceHi;
+    const uint32_t ovLo = guestAddr > w.lo ? guestAddr : w.lo;
+    const uint32_t ovHi = hi < w.hi ? hi : w.hi;
     const uintptr_t mbase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
     const uintptr_t abs = reinterpret_cast<uintptr_t>(ra);
-    MCLA_LOG_ERROR("F631-HEAPEXT #{} op={} dst={:08X} len={:#x} window_overlap=[{:08X},{:08X}) "
+    MCLA_LOG_ERROR("F631-HEAPEXT #{} inst={} op={} dst={:08X} len={:#x} window_overlap=[{:08X},{:08X}) "
                    "overlap_bytes={:#x} covers_window={} caller_rva={:#x} tid={}",
-                   (unsigned long long)n, op, guestAddr, size, ovLo, ovHi,
+                   (unsigned long long)n, w.tag, op, guestAddr, size, ovLo, ovHi,
                    (unsigned)(ovHi > ovLo ? ovHi - ovLo : 0u),
-                   (guestAddr <= kHeapInstanceLo && hi >= kHeapInstanceHi) ? 1 : 0,
+                   (guestAddr <= w.lo && hi >= w.hi) ? 1 : 0,
                    mbase ? abs - mbase : abs, GetCurrentThreadId());
 }
 }  // namespace
@@ -782,8 +823,23 @@ bool GuestMemoryView::ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t si
 bool GuestMemoryView::WriteU8(uint32_t guestAddr, uint8_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint8_t));
     if (!ptr) return false;
-    __try { *ptr = val; }
+    // F-784: T44 wipe watch. A byte store never reaches the value watch below
+    // (Session 73's own note), so the address test has to be explicit here.
+    // `pre` is captured inside the __try so it is only ever a value this
+    // function actually read.
+    const bool t44 = mcla::gpu::T44WipeOverlaps(guestAddr, sizeof(uint8_t));
+    uint32_t t44Pre = 0;
+    __try {
+        if (t44) {
+            uint8_t raw = 0;
+            std::memcpy(&raw, ptr, sizeof(raw));
+            t44Pre = raw;
+        }
+        *ptr = val;
+    }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (t44)
+        mcla::gpu::T44WipeNote("U8", guestAddr, 1, val, t44Pre, 1, _ReturnAddress());
     // Session 73: byte-wide 0xCD fills bypassed the value watch entirely.
     // Route them into the watch (synthetic word value) so registered ranges
     // get LR attribution for byte fill loops (memset alignment head etc.).
@@ -795,12 +851,22 @@ bool GuestMemoryView::WriteU8(uint32_t guestAddr, uint8_t val) const {
 bool GuestMemoryView::WriteU16BE(uint32_t guestAddr, uint16_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint16_t));
     if (!ptr) return false;
+    // F-784: T44 wipe watch, same shape as WriteU8 above.
+    const bool t44 = mcla::gpu::T44WipeOverlaps(guestAddr, sizeof(uint16_t));
+    uint32_t t44Pre = 0;
     __try
     {
+        if (t44) {
+            uint16_t raw = 0;
+            std::memcpy(&raw, ptr, sizeof(raw));
+            t44Pre = Swap16(raw);
+        }
         uint16_t be = Swap16(val);
         std::memcpy(ptr, &be, sizeof(be));
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (t44)
+        mcla::gpu::T44WipeNote("U16", guestAddr, 2, val, t44Pre, 2, _ReturnAddress());
     // Session 73: same as WriteU8 — halfword 0xCDCD stores were unwatched.
     if (val == 0xCDCDu && PageWatchHit(guestAddr))
         mcla::gpu::PageWatchOnWrite(guestAddr, 0xCDCDCDCDu);
@@ -814,14 +880,25 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
     }
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint32_t));
     if (!ptr) return false;
-    if (HeapInstanceStoreHit(guestAddr))
-        ReportHeapInstanceStore("U32", guestAddr, val, _ReturnAddress());
+    if (const int wi = HeapInstanceStoreHit(guestAddr); wi >= 0)
+        ReportHeapInstanceStore("U32", guestAddr, val, _ReturnAddress(), (size_t)wi);
+    // F-784: T44 wipe watch -- address test + pre-copy snapshot of the dword
+    // this store is about to replace, so the row can show header-was-live.
+    const bool t44 = mcla::gpu::T44WipeOverlaps(guestAddr, sizeof(uint32_t));
+    uint32_t t44Pre = 0;
     __try
     {
+        if (t44) {
+            uint32_t raw = 0;
+            std::memcpy(&raw, ptr, sizeof(raw));
+            t44Pre = Swap32(raw);
+        }
         uint32_t be = Swap32(val);
         std::memcpy(ptr, &be, sizeof(be));
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (t44)
+        mcla::gpu::T44WipeNote("U32", guestAddr, 4, val, t44Pre, 4, _ReturnAddress());
     if (PageWatchHit(guestAddr))
         mcla::gpu::PageWatchOnWrite(guestAddr, val);
     else if (WatchValueHit(val))
@@ -832,14 +909,24 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
 bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint64_t));
     if (!ptr) return false;
-    if (HeapInstanceStoreHit(guestAddr))
-        ReportHeapInstanceStore("U64", guestAddr, val, _ReturnAddress());
+    if (const int wi = HeapInstanceStoreHit(guestAddr); wi >= 0)
+        ReportHeapInstanceStore("U64", guestAddr, val, _ReturnAddress(), (size_t)wi);
+    // F-784: T44 wipe watch -- the 8 bytes this store replaces.
+    const bool t44 = mcla::gpu::T44WipeOverlaps(guestAddr, sizeof(uint64_t));
+    uint64_t t44Pre = 0;
     __try
     {
+        if (t44) {
+            uint64_t raw = 0;
+            std::memcpy(&raw, ptr, sizeof(raw));
+            t44Pre = Swap64(raw);
+        }
         uint64_t be = Swap64(val);
         std::memcpy(ptr, &be, sizeof(be));
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (t44)
+        mcla::gpu::T44WipeNote("U64", guestAddr, 8, val, t44Pre, 8, _ReturnAddress());
     if (PageWatchHit(guestAddr) || PageWatchHit(guestAddr + 4))
     {
         mcla::gpu::PageWatchOnWrite(guestAddr, static_cast<uint32_t>(val >> 32));
@@ -857,11 +944,43 @@ bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
 bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t size) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, size);
     if (!ptr || !src) return false;
+    // F-784: T44 wipe watch. The span test runs BEFORE the copy so `pre` is the
+    // true prior content of the first overlapped bytes, and this is the only
+    // entry point that knows how many bytes the copy actually moved -- the
+    // per-dword arms can report a sweep only store by store (F-631's lesson,
+    // guest_memory.cpp:40-50). `pre`/`post` hold up to 8 memory-order bytes,
+    // zero-padded on the right when the overlap is shorter; `pre_n` says how
+    // many of them were really read.
+    uint32_t t44Va = 0, t44Len = 0, t44Off = 0, t44Cap = 0;
+    uint64_t t44Pre = 0;
+    const bool t44 = mcla::gpu::T44WipeSpan(guestAddr, size, &t44Va, &t44Len);
+    if (t44) {
+        t44Off = t44Va - guestAddr;
+        const uint32_t rem = size - t44Off;
+        t44Cap = rem < 8u ? rem : 8u;
+    }
     __try
     {
+        if (t44) {
+            uint64_t raw = 0;
+            std::memcpy(&raw, ptr + t44Off, t44Cap);
+            t44Pre = _byteswap_uint64(raw);
+        }
         std::memcpy(ptr, src, size);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (t44) {
+        uint64_t t44Post = 0;
+        __try
+        {
+            uint64_t raw = 0;
+            std::memcpy(&raw, ptr + t44Off, t44Cap);
+            t44Post = _byteswap_uint64(raw);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { t44Post = 0; }
+        mcla::gpu::T44WipeNote("BULK", t44Va, t44Len, t44Post, t44Pre, t44Cap,
+                               _ReturnAddress());
+    }
     // F-631: the heap-window EXTENT census, and the only place in this file that knows how many
     // bytes a bulk copy actually moved. `WriteBytes` had no heap-window arm at all, so a guest
     // `memset` of megabytes across 0x20000 was visible only as the handful of dword stores that
@@ -870,8 +989,8 @@ bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t s
     // destination, length, and how much of the length overlapped the window. Placed after the
     // `__except` so it reports only copies that actually landed, and before the `size >= 4` block
     // so it does not depend on the copy being long enough to have endpoints.
-    if (HeapWindowOverlaps(guestAddr, size))
-        ReportHeapWindowExtent("bulk", guestAddr, size, _ReturnAddress());
+    if (const int wi = HeapWindowOverlaps(guestAddr, size); wi >= 0)
+        ReportHeapWindowExtent("bulk", guestAddr, size, _ReturnAddress(), (size_t)wi);
     if (size >= 4)
     {
         // Watch coverage for bulk copies of ANY size: check first + last
@@ -974,7 +1093,32 @@ uint64_t QueryGuestTimebase() {
     QueryPerformanceCounter(&counter);
     // Scale to ~800 MHz (Xenon timebase = CPU/4, 3.2 GHz / 4 = 800 MHz)
     // freq is in Hz, so multiply by 800e6 / freq.QuadPart
-    return (counter.QuadPart * 800000000ULL) / freq.QuadPart;
+    const uint64_t now =
+        (static_cast<uint64_t>(counter.QuadPart) * 800000000ULL) /
+        static_cast<uint64_t>(freq.QuadPart > 0 ? freq.QuadPart : 1);
+    // T43.18 (2026-10-13, taken from LARecomp's clock lesson): monotonic
+    // max-latch. QPC is monotonic on healthy HALs, but a backward step on
+    // VMs/buggy firmware would rewind guest time and spiral timer-driven
+    // guest code the way their vblank catch-up did. The latch is identity
+    // on a healthy clock; a clamp prints (throttled) so a silent rewind
+    // can never hide here. Log-only; no guest behavior changes while the
+    // clock behaves.
+    static std::atomic<uint64_t> s_maxTick{0};
+    static std::atomic<uint64_t> s_clamps{0};
+    uint64_t prev = s_maxTick.load(std::memory_order_relaxed);
+    while (prev < now &&
+           !s_maxTick.compare_exchange_weak(prev, now, std::memory_order_relaxed)) {
+    }
+    if (now < prev) {
+        const uint64_t n = s_clamps.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || (n % 1000u) == 0u) {
+            MCLA_LOG_WARN("TIMEBASE-CLAMP #{} now={} held={} (host clock "
+                          "stepped backward; holding last tick)",
+                          n, now, prev);
+        }
+        return prev;
+    }
+    return now;
 }
 
 } // namespace mcla::native

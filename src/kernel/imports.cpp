@@ -36,6 +36,11 @@
 // boot_host.cpp when the boot worker starts.
 std::atomic<uint32_t> g_mainGuestThreadId{0};
 
+// T43.18 (2026-10-13): latest-main-park publication, declared in xdm.h.
+std::atomic<uint32_t> g_mainParkHandle{0};
+std::atomic<uint32_t> g_mainParkLr{0};
+std::atomic<uint64_t> g_mainParkNs{0};
+
 // Forward declaration for VSync thread's scheduler tick signaling.
     // Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait.
     // This is the kernel-role duty that the real hardware GPU ISR/vblank path would
@@ -406,9 +411,13 @@ void XtlFreeSummary(uint64_t seen, uint32_t ptr, uint32_t desc) {
       "rej_why[bad-pointers]={} rej_why[unknown]={} descmismatch={} "
       "detail_rows={} last_ptr={:08X} last_desc={:08X} last_glr={:08X}",
       seen, ok, rej, seen >= accounted ? seen - accounted : 0ull,
-      accounted ? (static_cast<double>(ok) * 100.0 /
-                   static_cast<double>(accounted))
-                : 0.0,
+      // T43.17 (2026-10-13): pct is over ATTEMPTED (seen), not accounted.
+      // The old denominator (ok+rej) excluded unaccounted, overstating pct
+      // whenever an exit path lands outside the two buckets. Same flaw
+      // class as PHYS-FREE-SUM before its fix.
+      seen ? (static_cast<double>(ok) * 100.0 /
+              static_cast<double>(seen))
+           : 0.0,
       g_xtlFreeRejNullGuard.load(std::memory_order_relaxed),
       g_xtlFreeRejNoTranslate.load(std::memory_order_relaxed),
       g_xtlFreeRejProbe.load(std::memory_order_relaxed),
@@ -1735,13 +1744,28 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
   // MAIN-THREAD PARK PROBE
   {
     static std::atomic<uint32_t> s_parkLogs2{0};
+    // T43.17 (2026-10-13): passes counts EVERY pass through this probe;
+    // printed rows cap at 200, so row count is a lower bound -- passes= is
+    // the denominator showing cap coverage.
+    static std::atomic<uint64_t> s_parkPasses2{0};
+    const uint64_t t = s_parkPasses2.fetch_add(1, std::memory_order_relaxed) + 1;
     uint32_t mainId = g_mainGuestThreadId.load();
+    // T43.18 (2026-10-13): publish every main-thread park uncapped for the
+    // HB-FLICKER mainwait=* tail-light (see xdm.h). Relaxed store, no log.
+    if (mainId != 0 && GetCurrentThreadId() == mainId) {
+      g_mainParkHandle.store(Handle, std::memory_order_relaxed);
+      g_mainParkLr.store(g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u,
+                         std::memory_order_relaxed);
+      g_mainParkNs.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count()),
+                         std::memory_order_relaxed);
+    }
     if (mainId != 0 && GetCurrentThreadId() == mainId &&
         s_parkLogs2.fetch_add(1) < 200) {
       MCLA_LOG_INFO("[main-park] NtWaitForSingleObjectEx handle={:08X} "
-                    "alertable={} lr={:08X}",
+                    "alertable={} lr={:08X} passes={}",
                     Handle, Alertable,
-                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0), t);
     }
   }
   uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
@@ -5243,14 +5267,33 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   // MAIN-THREAD PARK PROBE
   {
     static std::atomic<uint32_t> s_parkLogs3{0};
+    // T43.17 (2026-10-13): passes counts EVERY pass through this probe
+    // (any thread); printed rows cap at 200, so the row count is a lower
+    // bound and passes= is the denominator showing cap coverage. A main-
+    // thread park count is <= passes, never more.
+    static std::atomic<uint64_t> s_parkPasses3{0};
+    const uint64_t t = s_parkPasses3.fetch_add(1, std::memory_order_relaxed) + 1;
     uint32_t mainId = g_mainGuestThreadId.load();
+    // T43.18 (2026-10-13): same publication as the NTW probe above. Handle
+    // here is the MapVirtual'd guest VA (this path has Object*, not a
+    // guest handle); 0 = unmapped at park time.
+    if (mainId != 0 && GetCurrentThreadId() == mainId) {
+      g_mainParkHandle.store(
+          mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object),
+          std::memory_order_relaxed);
+      g_mainParkLr.store(g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u,
+                         std::memory_order_relaxed);
+      g_mainParkNs.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count()),
+                         std::memory_order_relaxed);
+    }
     if (mainId != 0 && GetCurrentThreadId() == mainId &&
         s_parkLogs3.fetch_add(1) < 200) {
       MCLA_LOG_INFO(
-          "[main-park] KeWaitForSingleObject obj={:08X} reason={} lr={:08X}",
+          "[main-park] KeWaitForSingleObject objptr={:08X} reason={} lr={:08X} passes={}",
           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)),
           WaitReason,
-          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0), t);
     }
   }
   const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
@@ -5270,7 +5313,13 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     static std::atomic<uint32_t> s_typeLogs{0};
     const uint32_t n = s_typeLogs.fetch_add(1) + 1;
     if (n <= 60 || (n % 5000) == 0) {
-      MCLA_LOG_INFO("TYPE-CENSUS[KWFSO] #{:04} obj={:08X} type={:02X} timeout={:08X} lr={:08X}",
+      // T43.17 (2026-10-13): timeout prints DECIMAL ms, matching WAIT's
+      // `to=` (both are GuestTimeoutToMilliseconds; the old {:08X} read
+      // 0000001E for the same 30 WAIT prints decimal). objptr is the
+      // truncated HOST pointer, NOT the guest VA -- WAIT/CAS print the
+      // MapVirtual'd guest address under `obj@`; the two fields share no
+      // domain despite the old shared name.
+      MCLA_LOG_INFO("TYPE-CENSUS[KWFSO] #{:04} objptr={:08X} type={:02X} timeout_ms={} lr={:08X}",
                     n,
                     static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Object)),
                     type, timeout,
@@ -5293,10 +5342,48 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     // has a Semaphore for this address — if so, wait on that instead of
     // creating a mismatched Event wrapper.
     Semaphore *sem = TryQueryKernelObject<Semaphore>(*Object);
+    // T43.17 (2026-10-13): resolve census. w762/w763 showed 36 SEMA-wait
+    // probe rows + 1 fallback against ~17k WAKEs -- no branch model built
+    // from the visible cases closes that gap, so count the resolution
+    // itself: hits+misses MUST equal WAIT calls or the model is wrong.
+    // Log-only.
+    static std::atomic<uint64_t> s_resolveHit{0};
+    static std::atomic<uint64_t> s_resolveMiss{0};
+    if (sem) {
+      s_resolveHit.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      s_resolveMiss.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+      const uint64_t h = s_resolveHit.load(std::memory_order_relaxed);
+      const uint64_t m = s_resolveMiss.load(std::memory_order_relaxed);
+      const uint64_t t = h + m;
+      if (t <= 8 || (t % 4096u) == 0u) {
+        MCLA_LOG_INFO("KEWAIT-RESOLVE hits={} misses={} total={} (hits take "
+                      "sem->Wait, misses take fallback(event); total must "
+                      "equal WAIT calls or the dispatch model is wrong)",
+                      h, m, t);
+      }
+    }
     if (sem) {
       waitResolution = "map-hit(sem)";
       waitStatus = sem->Wait(timeout);
     } else {
+      // T43.17 (2026-10-13): count the fallback branch. w764 measured the
+      // real split -- resolve-hits ~16k, misses 1 -- so the fallback is
+      // RARE, not the ~99.8% an early reading claimed from the doubly-gated
+      // SEMA rows (that claim stood exactly one soak and is withdrawn
+      // here). KEWAIT-RESOLVE is the authoritative split; this counter is
+      // its miss half, printed redundantly so a reader without the SUM row
+      // still sees misses exist. Log-only.
+      static std::atomic<uint64_t> s_semaFallback{0};
+      const uint64_t fb =
+          s_semaFallback.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (fb <= 8 || (fb % 4096u) == 0u) {
+        MCLA_LOG_INFO("SEMA-FALLBACK-SUM fallback={} (map-miss event branch; "
+                      "SEMA-wait/release rows cover the map-hit branch only)",
+                      fb);
+      }
       waitResolution = "fallback(event)";
       Event *ev = QueryKernelObject<Event>(*Object);
       waitStatus = ev->Wait(timeout);
@@ -5305,6 +5392,21 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   }
 
   case 5: {
+    // T43.17 (2026-10-13): count the type-5 direct-semaphore branch. The
+    // SEMA-wait probe only fires inside case-0/1 map-hits and TYPE-CENSUS
+    // samples 63 of ~17k waits, so without this counter the branch split
+    // of the wait stream is unknowable -- w762 showed 36 sem-waits +
+    // 1 fallback against ~17k WAKEs, which no two-branch model closes.
+    // Log-only.
+    static std::atomic<uint64_t> s_semaType5{0};
+    const uint64_t t5 =
+        s_semaType5.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (t5 <= 8 || (t5 % 4096u) == 0u) {
+      MCLA_LOG_INFO("SEMA-TYPE5-SUM type5={} (direct-semaphore branch; "
+                    "with FALLBACK-SUM and SEMA-wait/release this partitions "
+                    "the wait stream)",
+                    t5);
+    }
     waitResolution = "map-hit(sem)";
     Semaphore *sem = QueryKernelObject<Semaphore>(*Object);
     waitStatus = sem->Wait(timeout);
@@ -5319,7 +5421,9 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
       uint32_t objAddr =
           mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
       MCLA_LOG_WARN("KWFSO unknown-type #{:04} obj={:08X} type={:02X} "
-                    "timeout={:08X} lr={:08X}",
+                    // T43.17: decimal ms like TYPE-CENSUS (was {:08X}; same
+                    // GuestTimeoutToMilliseconds domain). Never fired to date.
+                    "timeout_ms={} lr={:08X}",
                     n, objAddr, type, timeout,
                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }

@@ -102,11 +102,17 @@ bool App::Initialize() {
     // Initialize the RPF VFS: back-end for guest file IO (Nt*File hooks, RSC tab)
     mcla::vfs::RpfVirtualFileSystem& vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
     std::filesystem::path extractedRoot = m_gameDataRoot / "mcla extracted cache";
-    if (std::filesystem::exists(extractedRoot)) {
-        if (vfs.Initialize(extractedRoot.string())) {
-            vfs.Mount();
-            MCLA_LOG_INFO("VFS initialized and mounted");
-        }
+    // T43.18 (2026-10-13): init UNCONDITIONALLY. The extracted dir is our
+    // invention, not a game requirement: Initialize() no longer fails when
+    // it is absent (warns, indexes game_data only) and nothing here creates
+    // it. A missing dir must change nothing about the boot.
+    if (vfs.Initialize(extractedRoot.string())) {
+        vfs.Mount();
+        MCLA_LOG_INFO("VFS initialized and mounted");
+    } else {
+        MCLA_LOG_ERROR("VFS: Initialize FAILED for '{}' -- guest file IO "
+                       "will refuse every archive open (audlo fatal follows)",
+                       extractedRoot.string());
     }
 
 m_running = true;

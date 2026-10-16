@@ -5969,7 +5969,108 @@ PPC_FUNC(sub_821BDDE8) {
     MCLA_LOG_INFO("DICTSLOT-ALLOC sub_821BDDE8 #{} r4='{}' r5='{}' lr={:08X}",
                   n, a, b, static_cast<uint32_t>(ctx.lr));
   }
+  // T43.23v3 (2026-10-16): HANDLE TABLE RESCUE — PRE-CALL, not post-call.
+  // v1 and v2 failed because sub_821BDDE8 dispatches its OWN fatal handler
+  // (sub_821BD618 → infinite loop) when the table is full, so our post-call
+  // code NEVER EXECUTES. The rescue must run BEFORE the original call.
+  {
+    constexpr uint32_t kTblBase = 0x82860C18u;
+    constexpr uint32_t kTblStride = 40u;
+    constexpr uint32_t kTblSlots = 12u;
+    auto &mem3 = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t freeSlots = 0;
+    uint32_t bestSlot = 0xFFFFFFFF;
+    uint64_t bestPos = 0;
+    for (uint32_t s = 0; s < kTblSlots; ++s) {
+      const uint32_t slot = kTblBase + s * kTblStride;
+      uint32_t dev = 0;
+      if (!mem3.ReadU32BE(slot, &dev) || dev == 0) {
+        ++freeSlots;
+        continue;
+      }
+      uint32_t posLo = 0, posHi = 0;
+      (void)mem3.ReadU32BE(slot + 16, &posLo);
+      (void)mem3.ReadU32BE(slot + 20, &posHi);
+      const uint64_t pos = (static_cast<uint64_t>(posHi) << 32) | posLo;
+      if (pos >= bestPos && (bestSlot == 0xFFFFFFFF || pos > 0 || s < bestSlot)) {
+        bestPos = pos;
+        bestSlot = s;
+      }
+    }
+    if (freeSlots <= 2) {
+      // Debug: dump table state when close to full
+      MCLA_LOG_WARN("DICTSLOT-TABLE n={} free={} best={} bestPos={} "
+                    "[0]={:08X} [1]={:08X} [2]={:08X} [11]={:08X} lr={:08X}",
+                    n, freeSlots, bestSlot, bestPos,
+                    [&]{ uint32_t v=0; mem3.ReadU32BE(kTblBase,&v); return v; }(),
+                    [&]{ uint32_t v=0; mem3.ReadU32BE(kTblBase+40,&v); return v; }(),
+                    [&]{ uint32_t v=0; mem3.ReadU32BE(kTblBase+80,&v); return v; }(),
+                    [&]{ uint32_t v=0; mem3.ReadU32BE(kTblBase+440,&v); return v; }(),
+                    static_cast<uint32_t>(ctx.lr));
+    }
+    if (freeSlots == 0 && bestSlot != 0xFFFFFFFF) {
+      // Table full AND we found an occupied slot. Free the one with the
+      // highest pos (ties: lowest index). pos=0 is OK — the bodies were
+      // read via BE8D8-PACK, not through the slot's own read path.
+      const uint32_t slot = kTblBase + bestSlot * kTblStride;
+      mem3.WriteU32BE(slot + 0, 0);
+      mem3.WriteU32BE(slot + 4, 0xFFFFFFFF);
+      static std::atomic<uint32_t> s_rescued{0};
+      const uint32_t r = s_rescued.fetch_add(1) + 1;
+      MCLA_LOG_WARN("DICTSLOT-RESCUE #{} slot={} addr={:08X} pos={} free={} "
+                    "(T43.23v3: freed slot PRE-CALL to prevent fatal)",
+                    r, bestSlot, slot, bestPos, freeSlots);
+    }
+  }
   __imp__sub_821BDDE8(ctx, base);
+  // T43.22 (2026-10-13): identify slot-0 occupant — the persistent object
+  // that blocks the 12-file lighting preload. After the call, r3 = the
+  // returned slot address (base 0x82860C18, stride 40, capacity 12).
+  // Log UNTHROTTLED for slot 0, throttled for the rest. The r4/r5 dump
+  // above is pre-call; this is post-call (the slot we actually got).
+  {
+    const uint32_t slotAddr = ctx.r3.u32;
+    constexpr uint32_t kTableBase = 0x82860C18u;
+    constexpr uint32_t kSlotStride = 40u;
+    constexpr uint32_t kTableSlots = 12u;
+    if (slotAddr >= kTableBase &&
+        slotAddr < kTableBase + kTableSlots * kSlotStride) {
+      const uint32_t slotIdx = (slotAddr - kTableBase) / kSlotStride;
+      if (slotIdx == 0) {
+        // Unthrottled: slot-0 hits are the ones we need to trace.
+        auto &mem2 = mcla::kernel::GuestMemoryHeap::Instance();
+        char a2[48] = {0}, b2[48] = {0};
+        auto dumpstr2 = [&](uint32_t addr, char *out, size_t cap) {
+          if (addr < 0x82000000 || addr > 0x82AD3000) {
+            snprintf(out, cap, "%08X", addr);
+            return;
+          }
+          const char *p =
+              static_cast<const char *>(mcla::kernel::MmGetHostAddress(addr));
+          if (!p) {
+            snprintf(out, cap, "%08X?", addr);
+            return;
+          }
+          size_t i = 0;
+          for (; i < 40 && p[i]; ++i)
+            out[i] = (static_cast<unsigned char>(p[i]) >= 32 &&
+                      static_cast<unsigned char>(p[i]) < 127)
+                       ? p[i]
+                       : '.';
+          out[i] = 0;
+        };
+        dumpstr2(ctx.r4.u32, a2, sizeof(a2));
+        dumpstr2(ctx.r5.u32, b2, sizeof(b2));
+        MCLA_LOG_WARN(
+            "DICTSLOT-ZERO #{} slot=0 addr={:08X} r4='{}' r5='{}' lr={:08X} "
+            "(T43.22: slot-0 occupant trace)",
+            n, slotAddr, a2, b2, static_cast<uint32_t>(ctx.lr));
+      } else if (n <= 32 || (n % 100) == 0) {
+        MCLA_LOG_INFO("DICTSLOT-RET #{} slot={} addr={:08X} lr={:08X}",
+                      n, slotIdx, slotAddr, static_cast<uint32_t>(ctx.lr));
+      }
+    }
+  }
 }
 
 // Session 75j: insert linker called from texture ctor 82185648.
@@ -12891,12 +12992,19 @@ static void MclaUiXsfReverify(uint32_t pkg, const std::vector<uint8_t> &gold,
         ++nPresent;
     }
   }
+  // T43.17 (2026-10-13): verifies counts EVERY verify call this boot.
+  // The row below prints per shot/pkg; without the cumulative total a
+  // reader mistakes the printed-row count for the verification total.
+  static std::atomic<uint64_t> s_goldenReverifyTotal{0};
+  const uint64_t vtot =
+      s_goldenReverifyTotal.fetch_add(1, std::memory_order_relaxed) + 1;
   MCLA_LOG_WARN("UIXSF-GOLDEN-REVERIFY pkg={:08X} shot={} recs={} recs_whole={}"
                 " goldsize={} claimed={} still_present={} pct={} "
-                "first_bad={:08X}",
+                "first_bad={:08X} verifies={}",
                 pkg, shot, static_cast<uint32_t>(recs.size()), recsOk,
                 static_cast<uint32_t>(gold.size()), nClaimed, nPresent,
-                nClaimed ? (nPresent * 100u) / nClaimed : 0u, firstBadOff);
+                nClaimed ? (nPresent * 100u) / nClaimed : 0u, firstBadOff,
+                vtot);
 
   // F-330: classify the divergence instead of hypothesising about it. Everything
   // so far (F-326/327/329) left two candidate causes for the garage stopping at
@@ -16795,26 +16903,41 @@ PPC_FUNC(sub_821BC140) {
               c0 != 0xCDCDCDCDu && c0 != 0 && c0 != 0xFFFFFFFFu;
           if (!live)
             continue;
-          // Prefer a candidate whose first word looks like a guest pointer
-          // or a small tag — not raw inflate residue (0xFF.. / 0x0A0A..).
+          // Both entry words must look like a guest pointer or a small tag --
+          // never raw inflate residue (0xFF.. / 0x0A0A.. / RSC heads). There is
+          // deliberately NO exemption for any candidate: B7B6D9B4 holds
+          // post-inflate payload on real boots, and promoting payload to an
+          // entry array makes the place-pass below walk payload as pointers.
           const bool looksPtr = (c0 >= 0x80000000u && c0 < 0xA0000000u) ||
                                 (c0 >= 0xB0000000u && c0 < 0xC0000000u);
           const bool looksTag = (c0 < 0x10000u);
-          if (!looksPtr && !looksTag && cand != 0xB7B6D9B4u)
+          const bool looksPtr1 = (c1 >= 0x80000000u && c1 < 0xA0000000u) ||
+                                 (c1 >= 0xB0000000u && c1 < 0xC0000000u);
+          const bool looksTag1 = (c1 < 0x10000u);
+          if ((!looksPtr && !looksTag) || (!looksPtr1 && !looksTag1)) {
+            MCLA_LOG_WARN("FDBF8-ARR-RESTORE-SKIP #{} cand={:08X} "
+                          "[cand]={:08X}/{:08X} reason=PAYLOAD-NOT-POINTERS",
+                          n, cand, c0, c1);
             continue;
+          }
+          // cnt comes from the object's own +16 half-word and is never
+          // invented: a 0/CDCD probe means the guest published no count, and
+          // writing cnt=1 would let the place-pass walk one payload word.
+          uint16_t cntProbe = cnt;
+          if (cnt == 0 || cnt == 0xCDCDu) {
+            (void)mem.ReadU16BE(kUiCont + 16, &cntProbe);
+            if (cntProbe == 0 || cntProbe == 0xCDCDu) {
+              MCLA_LOG_WARN("FDBF8-ARR-RESTORE-SKIP #{} cand={:08X} "
+                            "[cand]={:08X}/{:08X} reason=NO-COUNT",
+                            n, cand, c0, c1);
+              continue;
+            }
+          }
           if (arr == 0 || arr == 0xCDCDCDCDu || arr == 0xFFFFFFFFu)
             arr = cand;
-          if (cnt == 0 || cnt == 0xCDCDu) {
-            // w9 RSC header +16 was 0001CDCD — low half often holds cnt=1
-            // when the container has a single clip entry.
-            uint16_t cntProbe = 0;
-            (void)mem.ReadU16BE(kUiCont + 16, &cntProbe);
-            if (cntProbe == 0 || cntProbe == 0xCDCDu)
-              cntProbe = 1;
-            cnt = cntProbe;
-            (void)mem.WriteU32BE(kUiCont + 12, arr);
-            (void)mem.WriteU16BE(kUiCont + 16, cnt);
-          }
+          cnt = cntProbe;
+          (void)mem.WriteU32BE(kUiCont + 12, arr);
+          (void)mem.WriteU16BE(kUiCont + 16, cnt);
           MCLA_LOG_WARN("FDBF8-ARR-RESTORE #{} obj=B7B41000 vt={:08X} "
                         "arr={:08X} [arr]={:08X}/{:08X} cnt={} "
                         "(from dest cand {:08X})",
@@ -19367,22 +19490,54 @@ PPC_FUNC(sub_821C5038) {
 
 PPC_FUNC_IMPL(__imp__sub_821CC970);
 PPC_FUNC(sub_821CC970) {
-  // T41.3n2 S4b hop 3: the XDK window pager (page-loop, [TLS+52]-gated).
-  // Its entry lr names the RAGE consumer that should branch to inflate.
+  // F-779 (2026-10-17): measured producer-loop exit. This function is the
+  // fiReadCache consumer loop. Every inst is the recomp layer's PPC-to-C++;
+  // our hook runs AROUND the loop. Capture manager ptr (r3) up front, run
+  // the original (returns when next ring slot's item[0]==0, i.e. poison/empty),
+  // then dump the ring scalars and the first 16 slot triples so we can tell
+  // WHICH state caused the exit (poison-pit, full ring, etc.).
   static std::atomic<uint32_t> s_pager{0};
   const uint32_t n = s_pager.fetch_add(1) + 1;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   uint32_t tls52 = 0;
+  const uint32_t mgr = ctx.r3.u32;
   {
     auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t tls = ctx.r13.u32;
     if (tls) (void)memP.ReadU32BE(tls + 52u, &tls52);
   }
-  if (n <= 24)
-    MCLA_LOG_WARN("T413N2-PAGER #{} r3={:08X} r4={:08X} r5={:08X} "
-                  "[TLS+52]={:08X} lr={:08X}",
-                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, tls52, lr);
+  MCLA_LOG_INFO("T413N2-PAGER #{} r3={:08X} lr={:08X} [TLS+52]={:08X}",
+                n, mgr, lr, tls52);
   __imp__sub_821CC970(ctx, base);
+  // --- POST-LOOP DUMP of the ring state -------------------------------
+  {
+    auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t c0,c1,c2,c3,c4,c5,c6; c0=c1=c2=c3=c4=c5=c6=0;
+    (void)memP.ReadU32BE(mgr + 220u, &c0);
+    (void)memP.ReadU32BE(mgr + 224u, &c1);
+    (void)memP.ReadU32BE(mgr + 228u, &c2);
+    (void)memP.ReadU32BE(mgr + 232u, &c3);
+    (void)memP.ReadU32BE(mgr + 236u, &c4);
+    (void)memP.ReadU32BE(mgr + 240u, &c5);
+    (void)memP.ReadU32BE(mgr + 244u, &c6);
+    MCLA_LOG_INFO("FI-PROD-EXIT mgr={:08X}: +220={:08X} +224={:08X} +228={:08X} "
+                  "+232={:08X} +236={:08X} +240={:08X} +244={:08X}",
+                  mgr, c0, c1, c2, c3, c4, c5, c6);
+    // ring base = mgr+52 (==r31). dump 16 slot triples (each 12 bytes)
+    char buf[512] = {0};
+    memP.ReadBytes(mgr + 52u, buf, 16*16);
+    for (int i = 0; i < 16; i++) {
+      uint32_t a=0,b=0,c=0;
+      int off = i*12;
+      a = (static_cast<uint8_t>(buf[off])<<24)   | (static_cast<uint8_t>(buf[off+1])<<16) |
+           (static_cast<uint8_t>(buf[off+2])<<8) | (static_cast<uint8_t>(buf[off+3]));
+      b = (static_cast<uint8_t>(buf[off+4])<<24) | (static_cast<uint8_t>(buf[off+5])<<16) |
+           (static_cast<uint8_t>(buf[off+6])<<8) | (static_cast<uint8_t>(buf[off+7]));
+      c = (static_cast<uint8_t>(buf[off+8])<<24) | (static_cast<uint8_t>(buf[off+9])<<16) |
+           (static_cast<uint8_t>(buf[off+10])<<8) | (static_cast<uint8_t>(buf[off+11]));
+      MCLA_LOG_INFO("   slot {} @mgr+{} : {:08X},{:08X},{:08X}", i, 52+off, a, b, c);
+    }
+  }
 }
 
 // B2b (F-096 follow-on): device-claim census. sub_821CB650-0x821CB68C is the
@@ -20143,6 +20298,22 @@ PPC_FUNC(sub_821CC1E0) {
   //     itself is unchanged, and so is every clause.
   //   * the original body must have returned exactly `count`, so a short read or
   //     an error is left exactly as the guest's own code produced it;
+  //     AMENDED T43.14 (2026-10-08, ledger F-789, LONG_TODO §6 T43.14): "exactly
+  //     count" now ALSO admits an EOF-exact clamp short -- the original returned
+  //     exactly `body.size - pos` with `0 < ret < count` and pos inside the body.
+  //     Measured on build/w754.log: ALL 22 short reads the old clause refused
+  //     (T4312-UNDELIVERED rows, `retEq=0`) satisfy that formula exactly, and
+  //     every member on this path is DEFLATE (`stored != logical` in each
+  //     SERVE-PROOF row), so the raw fill the refusal left behind was
+  //     compressed-stream garbage -- most consequentially at the CityDefault tail
+  //     pos=20480 ret=3327 = 23807-20480 (F-787), whose raw `rpf[0x1FA000]`
+  //     bytes parse as garbage count=170 -> record 24 ReadByte -1 -> len=FFFFFFFF
+  //     (F-785/F-786) -> header destruction -> refusal -> park. The deliver
+  //     already clamps `want` to the body, so `ctx.r3 = ar.want` equals `origRet`
+  //     on such a row: the guest-visible return is unchanged and only the window
+  //     bytes change (raw fill -> proved served body). An error return
+  //     (-1 = 0xFFFFFFFF), a zero-length read and a truncated read do not match
+  //     the formula and stay refused, exactly as the original clause intended;
   //   * it is a byte-for-byte OVERWRITE of a window the original just filled
   //     with the same `count` bytes, at the same address. It adds no region,
   //     registers no span and moves no member extent, so the byte-level overlap
@@ -20156,14 +20327,27 @@ PPC_FUNC(sub_821CC1E0) {
   // deliver. It is the completion of one existing table's one existing
   // consumer, on the one call that is measured to have failed.
   // ===========================================================================
+  // T43.12 (2026-10-06). PROBE STATE, declared before the deliver block because
+  // the probe below fires when that block did NOT deliver. Read-only capture:
+  // `a4312Ret` is the same value the block's own `origRet` reads one line later
+  // (nothing executes between), `a4312Gate` records whether the gate opened,
+  // and `a4312Ar` is the deliver result (default-delivered=0 when the gate did
+  // not open). No behavior of the block below is altered.
+  const uint32_t a4312Ret = ctx.r3.u32;
+  bool a4312Gate = false;
+  MclaArcWindowResult a4312Ar{};
   {
     const uint32_t origRet = ctx.r3.u32;
     // `arRec` and `arPos` are the PRE-CALL snapshot (amPreRec/amPrePos), not a
     // read of amIn4 on this side of the call. See MclaArcWindowDeliver.
     const uint32_t arRec = amPreRec;
     if (arRec != 0u && arRec != 0xCDCDCDCDu && amIn6 != 0u &&
-        origRet == amIn6 && amIn5 != 0u && amIn5 != 0xCDCDCDCDu) {
-      const uint32_t arPos = amPrePos;
+        amIn5 != 0u && amIn5 != 0xCDCDCDCDu) {
+      // T43.14 (2026-10-08, ledger F-789, LONG_TODO §6 T43.14). The served-body
+      // lookup MOVED UP from inside the gate so the clamp arm can see it; it is
+      // the same lookup at the same point in the sequence -- nothing ran between
+      // it and the deliver call before, nothing does now (the only new work on a
+      // call that fails both arms is this one map hit).
       MclaServedBody arBody{};
       {
         std::lock_guard<std::mutex> lk(g_servedMtx);
@@ -20171,9 +20355,40 @@ PPC_FUNC(sub_821CC1E0) {
         if (it != g_servedByEntry.end())
           arBody = it->second;
       }
-      const MclaArcWindowResult ar =
-          MclaArcWindowDeliver(arRec, arPos, amIn5, amIn6, arBody);
-      if (ar.delivered != 0u) {
+      // `arFull` is the ORIGINAL gate condition (`origRet == amIn6`), byte-for-
+      // byte the same predicate for a full read. `arClamp` is the T43.14 arm:
+      // an EOF-exact short read -- the original returned exactly the bytes that
+      // remain in the served body (`origRet == arBody.size - amPrePos`, with
+      // `0 < origRet < amIn6`, pos inside a present body). Measured population
+      // on build/w754.log (complete: the T4312 probe's budget covers all rows):
+      // 22 rows, every one matching the formula exactly -- 17 refused member
+      // tails (incl. CityDefault rec=B79150A0 pos=20480 ret=3327 = 23807-20480,
+      // the head of the F-785/F-786 park chain) + 5 whole-body reads
+      // (ret=575/824/260/1246/109). The other 6 probe rows are zero-length EOF
+      // reads (pos == body.size, ret=0) and stay closed -- `origRet != 0`.
+      // `MclaArcWindowDeliver` clamps `want` to the body itself, so on such a
+      // row `ctx.r3 = ar.want` == `origRet` (the same return the guest already
+      // saw) and only the WINDOW bytes change: the original body's raw pack
+      // fill (compressed-stream garbage for every member here -- SERVE-PROOF
+      // `stored != logical`) -> the proved served body, under the deliver's
+      // unchanged trust anchors (exact g_servedByEntry key, w1 == body.size,
+      // copy clamped to the body, F-609). An error return (0xFFFFFFFF), a
+      // zero-length read and a truncated read do not match the formula and stay
+      // refused, exactly as the original clause intended. A FIX, not a stacked
+      // short-circuit (do-not #1/#9): root cause named end-to-end by F-787/F-788,
+      // one existing consumer of one existing table completed.
+      const bool arFull = (origRet == amIn6);
+      const bool arClamp =
+          (!arFull && origRet != 0u && origRet < amIn6 &&
+           arBody.buf != 0u && arBody.size != 0u &&
+           amPrePos < arBody.size && origRet == arBody.size - amPrePos);
+      if (arFull || arClamp) {
+        a4312Gate = true;
+        const uint32_t arPos = amPrePos;
+        const MclaArcWindowResult ar =
+            MclaArcWindowDeliver(arRec, arPos, amIn5, amIn6, arBody);
+        a4312Ar = ar;
+        if (ar.delivered != 0u) {
         static std::atomic<uint32_t> s_arDeliver{0};
         const uint64_t arN = s_arDeliver.fetch_add(1) + 1;
         // FORMAT UNCHANGED. Same 14 placeholders, same 14 arguments, same order,
@@ -20188,7 +20403,78 @@ PPC_FUNC(sub_821CC1E0) {
             ar.done, arBody.buf, arBody.size, ar.w1, ar.posInside,
             ar.head, arWantHead, ar.head == arWantHead ? 1 : 0);
         ctx.r3.u32 = ar.want;
+        }
       }
+    }
+  }
+  // ===========================================================================
+  // T43.12 (2026-10-08) (LONG_TODO §6 T43.12 :1630; F-787). T4312-UNDELIVERED -- LOG-ONLY PROBE, NO BEHAVIOR
+  // CHANGE (do-not #1/#9: it reads, it prints, it writes nothing -- ctx.r3 is
+  // untouched, no D3D12 call, no guest state, and the deliver call is NEVER
+  // re-issued, because a retry after a partial copy would be a behavior change).
+  //
+  // WHAT IT MEASURES: every read into this function whose destination is one of
+  // the guest's own stream windows (MclaWinwrIsWindowBase, the exact predicate
+  // WINWR-REC arms on) and which the deliver block above did NOT deliver.
+  // ARC-WINDOW prints unconditionally for the delivered half, so probe +
+  // ARC-WINDOW together are a COMPLETE census of window-base entries -- which
+  // is what turns an absent row at a given `pos=` into a measured absence
+  // rather than a sampling artifact (LONG_TODO §1 rule 19).
+  //
+  // POPULATION BOUND, measured on build/w750.log (not predicted): WINWR-REC
+  // uses this same predicate and prints `tot=`; its rows are tot=1..6 plus
+  // tot=50 at line 13626, with no tot=100 row anywhere, so the whole boot makes
+  // 50..99 window-base calls. The budget below (first 96, then every 256th) is
+  // therefore a full census, not a sample. CLOSED ON w751/w752, where this
+  // probe exists: 28 rows + the 22 ARC-WINDOW rows whose win=82862DF8 = 50 =
+  // WINWR-REC's printed tot=50 exactly. (The other 40 ARC-WINDOW rows -- 62
+  // total -- carry NON-base destinations such as BCF90F80; deliver does not
+  // require a window base, so ARC-WINDOW is a SUPERSET of the delivered
+  // window-base entries, never a subset. Every window-base entry is covered by
+  // exactly one of the two rows: delivered -> ARC-WINDOW, undelivered -> here.)
+  //
+  // WHY THE POS= FIELD IS THE POINT (T43.12's falsifier): for the CityDefault
+  // tail event w750 has ARC-WINDOW pos 0..16384 (last row #62, line 13573)
+  // and NO deliver row at pos=20480, while the window still received raw
+  // archive bytes at stream pos >= 20480. Either this function was entered for
+  // that read and refused/gate-failed (this row then prints pos=20480 with
+  // gate/retEq/w1/bodySize/posIn naming the clause), or it was never entered
+  // (no row at pos=20480 anywhere, and ARC-WINDOW's own complete census says
+  // the same) -- which would confirm the bypass hypothesis and send the next
+  // probe to the fill site instead.
+  //
+  // VALUES ARE MEASURED, NOT INVENTED: gate/ret/req/rec/win/pos come from the
+  // pre-call snapshots this function already keeps; w1 is read from [rec+4]
+  // here; bodySize comes from the served-body table lookup done here; posIn is
+  // the deliver clause's own formula (pos < body.size, MclaArcWindowDeliver);
+  // want/done are the deliver result and are 0 exactly when gate=0, i.e. when
+  // the deliver never ran -- the gate field is printed first so that is read
+  // as "not computed", not as a measured zero. 14 placeholders, 14 arguments.
+  // This format string's literal text names no other tracked marker.
+  if (!a4312Ar.delivered && MclaWinwrIsWindowBase(amIn5)) {
+    static std::atomic<uint32_t> s_4312{0};
+    const uint64_t n4 = s_4312.fetch_add(1) + 1;
+    if (n4 <= 96u || (n4 % 256u) == 0u) {
+      uint32_t pW1 = 0u;
+      MclaServedBody pBody{};
+      if (amPreRec != 0u && amPreRec != 0xCDCDCDCDu) {
+        auto &memP = mcla::kernel::GuestMemoryHeap::Instance();
+        (void)memP.ReadU32BE(amPreRec + 4u, &pW1);
+        std::lock_guard<std::mutex> lk(g_servedMtx);
+        auto it = g_servedByEntry.find(amPreRec);
+        if (it != g_servedByEntry.end())
+          pBody = it->second;
+      }
+      const uint32_t pPosIn =
+          (pBody.size != 0u && amPrePos < pBody.size) ? 1u : 0u;
+      MCLA_LOG_WARN(
+          "T4312-UNDELIVERED #{} gate={} ret={} req={} retEq={} rec={:08X} "
+          "win={:08X} pos={} w1={:08X} bodySize={} posIn={} want={} done={} "
+          "tid={}",
+          n4, a4312Gate ? 1u : 0u, a4312Ret, amIn6,
+          (a4312Ret == amIn6) ? 1u : 0u, amPreRec, amIn5, amPrePos, pW1,
+          pBody.size, pPosIn, a4312Ar.want, a4312Ar.done,
+          GetCurrentThreadId());
     }
   }
 }
@@ -20546,17 +20832,29 @@ PPC_FUNC(sub_821CB488) {
     ctx.r3.u32 = kMemDeviceObj;
     return;
   }
+  // T43.24 (2026-10-16, audit finding #5): the empty-path return 0 was INSIDE
+  // the logging throttle — behavior changed with call count (call #200
+  // returned 0, call #201 with the SAME path fell through to the original).
+  // Now: empty path ALWAYS returns the memory-device object (same as the
+  // null-path arm above), never 0, never gated on throttle.
+  {
+    auto &memR5 = mcla::kernel::GuestMemoryHeap::Instance();
+    char path5[68] = {0};
+    memR5.ReadBytes(ctx.r3.u32, path5, 64);
+    MclaSanitizePath(path5, sizeof(path5));
+    if (path5[0] == 0) {
+      MCLA_LOG_WARN("GETDEV-EMPTY #{} lr={:08X} -> memory-dev",
+                    n, static_cast<uint32_t>(ctx.lr));
+      EnsureMemoryDeviceVtable();
+      ctx.r3.u32 = kMemDeviceObj;
+      return;
+    }
+  }
   if (n <= 200 || (n % 100) == 0) {
     auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
     char path[68] = {0};
     memR.ReadBytes(ctx.r3.u32, path, 64);
     MclaSanitizePath(path, sizeof(path));
-    if (path[0] == 0) {
-      MCLA_LOG_WARN("GETDEV-EMPTY #{} lr={:08X}", n,
-                    static_cast<uint32_t>(ctx.lr));
-      ctx.r3.u32 = 0;
-      return;
-    }
     uint32_t arr = 0;
     uint16_t cnt = 0, cap = 0;
     memR.ReadU32BE(0x82860844u, &arr);
@@ -22466,14 +22764,22 @@ PPC_FUNC(sub_821CCEA0) {
       // alloc+Read consumers get the body we actually hold.
       if (tocEntry && tocEntry != 0xCDCDCDCDu)
         (void)memR.WriteU32BE(tocEntry + 4, xsz);
-      // Bind the global BDF20 stream wrapper {dev, handle} so later
-      // BE8D8/BE610/BE250 on the array's first slot address this open file.
-      // kBdf20WrapArray is the base sub_821BDDE8 itself allocates from (raw
-      // `lis r11,8286` + `addi r10,r11,3096` at 821BDE5C/821BDE60); it was a
-      // second, private literal here, which is the shape F-655 had to undo.
-      constexpr uint32_t kBdf20Wrap = kBdf20WrapArray;
-      (void)memR.WriteU32BE(kBdf20Wrap + 0, dev);
-      (void)memR.WriteU32BE(kBdf20Wrap + 4, static_cast<uint32_t>(ret));
+      // T43.21 (2026-10-13): the two WRITES below are REMOVED. They stamped
+      // {dev, ret} into GUEST slot 0 (0x82860C18+0/+4) on every accepted
+      // open, regardless of which slot sub_821BDDE8 actually allocated.
+      // Effect: slot 0 became a ZOMBIE (marked occupied, never freed by
+      // sub_821BE610 because the guest holds the real slot's pointer), reducing
+      // the guest's 12-slot table to 11 and causing "Out of file handles"
+      // when the boot's transient 11-stream lighting peak coincided with the
+      // zombie. The guest's own allocator already writes {dev, handle} into
+      // the correct slot it picks (sub_821BDDE8 at ppc_recomp.14.cpp:23380).
+      // Our write was redundant AND destructive. Proof: w775.log:22628
+      // XSF-BIND rows show two live files stamped into the same slot 0
+      // 380ms apart, and DICTSLOT-ALLOC reaching #300 confirms the guest
+      // was recycling slots correctly until our write burned slot 0.
+      constexpr uint32_t kBdf20Wrap = kBdf20WrapArray;  // kept for the log row below
+      // (void)memR.WriteU32BE(kBdf20Wrap + 0, dev);       // REMOVED T43.21
+      // (void)memR.WriteU32BE(kBdf20Wrap + 4, static_cast<uint32_t>(ret)); // REMOVED T43.21
       // Packfile slot: Open already wrote tocEntry at dev+40+h*68.
       // Confirm + publish size on the TOC entry only (never invent a vtable).
       if (n <= 16 || (n % 8) == 0)
@@ -25418,6 +25724,20 @@ PPC_FUNC(sub_82397060) {
 // three boots running: it reads GetPPCContext(), not the context in play. A hook sees the real one.
 // Generated emits `sub_X` as a weak alias of `__imp__sub_X`, so a strong definition here takes the
 // slot without touching generated/ (same mechanism as sub_82193AF8). Log-only.
+//
+// F-784 phase 2: this is also where the T44 COPY-level extent row lives. The per-store watch in
+// guest_memory.cpp can only see the part of a sweep that lands inside an armed band, and its row
+// budget cannot express a sweep's extent -- w746 saw 394 stores covering ~3,152 bytes and could not
+// tell whether the copy started 44 KB lower (which is where that run's broken card actually was).
+// One row here gives the whole thing: dst/src/len/end from the REAL context, before the copy runs.
+namespace mcla::gpu {
+bool T44WipeOverlaps(uint32_t guestAddr, uint32_t len);
+// T43.10 (F-784 §10): the page-granular span test against kT44PrioPages (gpu_cp.cpp:7377,
+// 7462-7472) -- returns the prio-page index whose page intersects [guestAddr, guestAddr+len),
+// -1 otherwise. Used below as the CARD-SPAN entry arm.
+int T44WipePrioOf(uint32_t guestAddr, uint32_t len);
+} // namespace mcla::gpu
+
 PPC_FUNC_IMPL(__imp__sub_823DA950);
 PPC_FUNC(sub_823DA950) {
   // F-100 rule 1 (a probe must prove it fires): an unhooked memcpy chain would print zero F382 rows
@@ -25443,6 +25763,121 @@ PPC_FUNC(sub_823DA950) {
       MCLA_LOG_ERROR("F382-MEMCPY #{} dst={:08X} src={:08X} len={:X} lr={:08X} sp={:08X} tid={}", k,
                      dst, ctx.r4.u32, len, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
                      GetCurrentThreadId());
+  }
+  // F-774: the SAME span test for the PHYSICAL arena, whose o1heap instance sits at
+  // kPhysArenaBeginVa = 0xA0400000 and is zeroed in every soak (w736/w737/w738: 512 contiguous
+  // stride-4 zero stores, A0400000..A04007FC, then `o1heap invariants FAIL` x4 and
+  // XTL-ALLOC-REFUSED x4, after which the boot worker is permanently `mirror=STALE`).
+  //
+  // WHY HERE AND NOT IN THE WATCH PROBE -- two reasons, and the first one was wrong when this
+  // comment was drafted, so read it as corrected:
+  //
+  // (1) `lr=821BE3BC` is GENUINE, not a sticky GetPPCContext() read. Raw-verified: the word at
+  //     0x821BE3B8 is 4821C599 = `bl 0x823DA950`, so 0x821BE3BC is the real return address
+  //     inside sub_821BE250 (body at generated/ppc_xenon/ppc_recomp.14.cpp:24080). What that lr
+  //     does NOT identify is the caller: sub_821BE250(stream=r3, dst=r4, count=r5) has 80 direct
+  //     `bl` sites (raw op-18 scan; tools/ppc_xrefs.py agrees after its F-775 cap fix), and
+  //     lr=821BE3BC appears on 1115 w737 rows spanning three unrelated destinations
+  //     (HEAPHDR-STORE @A0400xxx, PARAM-STORE @A0106xxx, RSC-REF-STORE @8F0ED354). One shared
+  //     ring-buffer read primitive serving many callers -- so naming "the writer" from that lr
+  //     alone is unattributed. `sp` below discriminates callers where `lr` cannot.
+  // (2) The armed range is only [A0400000, A0400800) (src/boot_host.cpp:3207-3208, verified by
+  //     the positive control `WATCH: range armed [A0400000,A0400800)` at w738.log:35), so the
+  //     512 HEAPHDR-STORE rows are the ARMED CAPACITY, not the length of the sweep. `len` here is
+  //     the copy's real size and is gated by nothing. This is the measurement that decides
+  //     between offsetting the arena and moving it out of guest-addressable memory entirely.
+  //
+  // Also settled here: F-640's "host materialises 0xA0400000 as 0xA0000000+0x400000" is
+  // REFUTED on the guest side -- 0 dwords in the whole image equal 0xA0400000, `lis rT,0xA000`
+  // has 0 sites and `lis rT,0xA040` has 0, against a live control of 236 for `lis rT,0x8213`.
+  // Log-only.
+  constexpr uint32_t kPhysLo = mcla::kernel::kPhysArenaBeginVa;
+  constexpr uint32_t kPhysHi = mcla::kernel::kPhysArenaBeginVa + 0x100000u;
+  const bool spansPhys = dst < kPhysHi && static_cast<uint64_t>(dst) + len >= kPhysLo;
+  if (spansPhys) {
+    static std::atomic<uint32_t> s_774{0};
+    const uint32_t k = s_774.fetch_add(1) + 1;
+    if (k <= 40 || (k % 4096) == 0)
+      MCLA_LOG_ERROR("F774-PHYS-MEMCPY #{} dst={:08X} src={:08X} len={:X} end={:08X} "
+                     "lr={:08X} sp={:08X} tid={}", k, dst, ctx.r4.u32, len,
+                     (uint32_t)(static_cast<uint64_t>(dst) + len),
+                     static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId());
+  }
+  // F-784 phase 2 -- THE EXTENT INSTRUMENT. One row per copy whose span reaches
+  // a T44 band, carrying dst/src/len/end from the LIVE context (r3/r4/r5), so a
+  // sweep is described completely even when it starts below the band and even
+  // when the per-store rows are capped. w746's sweep (394 stores, ~3,152 bytes,
+  // `lr=821BE3BC`, 16 lanes `__imp__sub_823DA950 +0x2df..+0x699`) could be
+  // measured only from BDA2A000 upward because that was the whole armed page;
+  // this row would have printed its true dst and len directly. Bands:
+  // kT44WipeBands in gpu_cp.cpp. Log-only, own bounded budget.
+  if (mcla::gpu::T44WipeOverlaps(dst, len)) {
+    static std::atomic<uint32_t> s_t44copy{0};
+    const uint32_t k = s_t44copy.fetch_add(1) + 1;
+    if (k <= 64 || (k % 4096) == 0)
+      MCLA_LOG_ERROR("T44-WIPE-MEMCPY #{:03} dst={:08X} src={:08X} len={:X} "
+                     "end={:08X} lr={:08X} sp={:08X} tid={}", k, dst, ctx.r4.u32,
+                     len, (uint32_t)(static_cast<uint64_t>(dst) + len),
+                     static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                     GetCurrentThreadId());
+  }
+  // T43.10 (LONG_TODO §6; F-784 §10; HANDOFF §10.3) -- THE TWO ENTRY ARMS THAT DECIDE
+  // hypothesis (a) from (b): WHY was this copy's dst/len destructive?
+  //   (a) ONE huge copy entered ~07:20:24 with r3=A03FFFF8 r4=93C63E40 r5=FFFFFFAF
+  //       (w748.log:15767, 2^32-81 = an underflow shape) and kept running until it wiped
+  //       both cards at 07:20:38/39 -- then arm 1 fires ONCE (07:20:24) and arm 2 fires
+  //       once for the SAME call (its 64-bit span covers the cards from below).
+  //   (b) each destructive call is its own event (corrupt r22 len passed by
+  //       sub_8218B0C8+0x238) -- then arm 2 fires AGAIN at ~07:20:38 with that call's
+  //       own entry dst/len, or arm 1 with a fresh huge len.
+  // Existing entry rows cannot answer this: T44-WIPE-MEMCPY (75 rows) and F774-PHYS-MEMCPY
+  // (40 rows) both exhausted their budgets by 07:20:15.4 on texture-sized copies (len=0x10 /
+  // len=2), so both critical entries were counted and never printed -- w748's silence there
+  // is budget, not absence. These two arms are RARE-EVENT shapes with their own counters,
+  // so their silence is interpretable. ENTRY regs only (r3/r5 read at hook entry above are
+  // definitionally the arguments): F-784 §8 flagged store-time r3/r4/r5 as unresolved --
+  // F375's 8 rows read byte-identical values while store addresses advanced +8.
+  //
+  // Rule-19 positive control: evaluate BOTH predicates over synthetic pairs with known
+  // answers on the first memcpy call of the run (that call provably happens -- the F382
+  // row at ka==1 printed in every soak, e.g. w748.log:203). If this line's answers differ
+  // from the expectation printed next to them, the arms below are BROKEN, not silent.
+  if (ka == 1) {
+    const int c1 = mcla::gpu::T44WipePrioOf(0xBDA1F000u, 8u);          // exact card landing
+    const int c2 = mcla::gpu::T44WipePrioOf(0xA03FFFF8u, 0xFFFFFFAFu); // huge span from below
+    const int c3 = mcla::gpu::T44WipePrioOf(0xBD800000u, 0x10u);       // band0 texture: MISS
+    const int c4 = mcla::gpu::T44WipePrioOf(0xBE12A000u, 1u);          // second card: HIT
+    MCLA_LOG_WARN("T4310-ARM-SELFTEST prio=[{},{},{},{}] (expect [>=0,>=0,-1,>=0]) "
+                  "huge=[{},{}] (expect [1,0]) - entry-arm predicates, positive control",
+                  c1, c2, c3, c4, (0xFFFFFFAFu >= 0x1000000u) ? 1 : 0,
+                  (0x10u >= 0x1000000u) ? 1 : 0);
+  }
+  // ARM 1 -- ANOMALOUS LENGTH AT ENTRY. 16 MiB is a chosen threshold, not a measured game
+  // maximum: the destructive shape observed so far is 0xFFFFFFAF (~4 GiB), and the copies
+  // measured on rows so far are len=2 and len=0x10 (F774/T44-WIPE-MEMCPY). Any row this
+  // prints is worth reading; the budget keeps even a flood of legitimate large copies
+  // bounded (64 + every 4096th).
+  if (len >= 0x1000000u) {
+    static std::atomic<uint32_t> s_4310h{0};
+    const uint32_t k = s_4310h.fetch_add(1) + 1;
+    if (k <= 64 || (k % 4096) == 0)
+      MCLA_LOG_ERROR("T4310-HUGE-MEMCPY #{:03} dst={:08X} src={:08X} len={:X} end={:08X} "
+                     "lr={:08X} sp={:08X} tid={}", k, dst, ctx.r4.u32, len,
+                     (uint32_t)(static_cast<uint64_t>(dst) + len),
+                     static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId());
+  }
+  // ARM 2 -- SPAN REACHES A CARD PAGE (any length). The span test is 64-bit and non-wrapping
+  // (gpu_cp.cpp:7464-7469), which is deliberate: it OVER-matches a wrapped 4 GiB copy (that
+  // is the shape we are hunting) and cannot miss a copy that starts below a card and reaches
+  // it. A copy that starts above a page can never match (dst < page+0x1000 fails).
+  if (const int prio = mcla::gpu::T44WipePrioOf(dst, len); prio >= 0) {
+    static std::atomic<uint32_t> s_4310c{0};
+    const uint32_t k = s_4310c.fetch_add(1) + 1;
+    if (k <= 32 || (k % 4096) == 0)
+      MCLA_LOG_ERROR("T4310-CARD-MEMCPY #{:03} prio={} dst={:08X} src={:08X} len={:X} "
+                     "end={:08X} lr={:08X} sp={:08X} tid={}", k, prio, dst, ctx.r4.u32,
+                     len, (uint32_t)(static_cast<uint64_t>(dst) + len),
+                     static_cast<uint32_t>(ctx.lr), ctx.r1.u32, GetCurrentThreadId());
   }
   __imp__sub_823DA950(ctx, base);
 }
@@ -25770,6 +26205,43 @@ PPC_FUNC(sub_821BE250) {
   const uint32_t obj = ctx.r3.u32;
   const uint32_t dst = ctx.r4.u32;
   const uint32_t count = ctx.r5.u32;
+  // T43.11(2) (LONG_TODO §6 T43.11, :1629; F-786) -- THE LEN GUARD at the
+  // sub_8218B0C8 / sub_821BE250 boundary, and it is LOG-ONLY as the task's own
+  // bolded word demands: it prints and falls through, changing no control flow,
+  // no return value, no byte (do-not #1/#9 -- declining the read here would
+  // invent guest-observed semantics the task never specified). WHAT IT CATCHES:
+  // sub_8218B0C8 feeds ReadByte's return straight into r5 for this call -- raw
+  // disasm `8218B2B0 mr r5,r3` then `8218B2BC bl 821BE250` -- so ReadByte's EOF
+  // -1 arrives here as count=0xFFFFFFFF, this function's signed cmpw/ble reads
+  // -1 as "fits" (F-785), and the guest memcpy runs with len=0xFFFFFFFF
+  // (w749.log:14978 T4310-HUGE-MEMCPY #001 lr=821BE3BC; PARK-MIRROR-STACK
+  // f1=8218B2B0 at :14981 pins the caller to that record loop). Threshold
+  // 0x10000000 (256 MiB): the largest count measured on ANY legitimate read in
+  // w749 is 262144 (BE250-GUEST rows, distinct count= [1,2,262144]), and
+  // sub_821BE710 word counts top out at 16384 (BESWAP-RET inR5words) -- no real
+  // read can reach the threshold, the EOF shape always does. Rule-19 positive
+  // control: on the FIRST sub_821BE250 call of the run (that call provably
+  // happens) evaluate the predicate over four synthetic counts with known
+  // answers and print them beside the expectation; the GUARD arm's own positive
+  // control is a recurring EOF, which w749 proves reaches this boundary.
+  if (n == 1) {
+    MCLA_LOG_WARN("T4311-LEN-SELFTEST fire=[{},{},{},{}] (expect [1,1,0,0]) "
+                  "- count>=0x10000000 over [FFFFFFFF,10000000,0FFFFFFF,40000], "
+                  "predicate positive control",
+                  (0xFFFFFFFFu >= 0x10000000u) ? 1 : 0,
+                  (0x10000000u >= 0x10000000u) ? 1 : 0,
+                  (0x0FFFFFFFu >= 0x10000000u) ? 1 : 0,
+                  (0x00040000u >= 0x10000000u) ? 1 : 0);
+  }
+  if (count >= 0x10000000u) {
+    static std::atomic<uint32_t> s_4311g{0};
+    const uint32_t k = s_4311g.fetch_add(1) + 1;
+    if (k <= 16 || (k % 4096) == 0)
+      MCLA_LOG_ERROR("T4311-LEN-GUARD #{} obj={:08X} dst={:08X} count={:08X} "
+                     "lr={:08X} sp={:08X} tid={}", k, obj, dst, count,
+                     static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
+                     GetCurrentThreadId());
+  }
   uint32_t dev = 0, h = 0;
   if (obj && obj != 0xCDCDCDCDu) {
     (void)mem.ReadU32BE(obj + 0, &dev);
@@ -26975,4 +27447,73 @@ PPC_FUNC(sub_82130588) {
   // Original thunk: r4=r3 then TLS-slot-28 call with FuncBlock+12 (free).
   ctx.r4.u32 = ctx.r3.u32;
   __xtl_free(ctx, base);
+}
+
+// ===========================================================================
+// Device-close census (LOG-ONLY). Proven chain:
+//   sub_821CBEB0 = device close, guard [mgr+32]!=0 && [mgr+12]!=-1;
+//   it calls [mgr+32]->vtable+52 = sub_821CCDC8 (poison-pill enqueuer);
+//   sub_821CCE58 = device dtor body (calls close);
+//   sub_822C3588 = deleter (0 direct callers, delete[]-dispatch).
+// Goal: name WHO fires the close path during boot. [this+32] = cache ptr and
+// [this+12] = thread handle (or -1) are the two guard operands, so printing
+// them on every entry shows whether the guest reached close with the guard
+// armed. Rule 4 checked 2026-10-13: addr_owners --check 0x821CBEB0 resolved
+// via hex, 1 site = generated/ppc_xenon/ppc_func_mapping.cpp:4389 (the
+// function map itself), exit 0 -- no host-side owner, so this strong PPC_FUNC
+// is the only hook and the weak alias at ppc_recomp.17.cpp:2621 yields to it.
+// No behavior change: __imp__sub_821CBEB0 (the recompiled body) always runs
+// unchanged. Census note: grep the three message forms separately --
+// "DEVCLOSE enter", "DEVCLOSE exit", "DEVCLOSE-FIRST" -- because a bare
+// substring count of DEVCLOSE would fold the FIRST row into the total
+// (rule-19 corollary: a second printer can emit your token).
+// ===========================================================================
+
+PPC_FUNC_IMPL(__imp__sub_821CC800);
+static std::atomic<uint32_t> s_gfiEnq{0};
+PPC_FUNC(sub_821CC800) {
+  // F-780: enqueue-side visibility. r3=mgr, r4=item ptr.
+  const uint32_t en = s_gfiEnq.fetch_add(1) + 1;
+  const uint32_t mgr = ctx.r3.u32;
+  const uint32_t item = ctx.r4.u32;
+  uint32_t ih0=0,ih1=0,ih2=0, widx=0,cnt=0;
+  auto &m = mcla::kernel::GuestMemoryHeap::Instance();
+  (void)m.ReadU32BE(item, &ih0);
+  (void)m.ReadU32BE(item+4, &ih1);
+  (void)m.ReadU32BE(item+8, &ih2);
+  (void)m.ReadU32BE(mgr+224u, &widx);
+  (void)m.ReadU32BE(mgr+232u, &cnt);
+  MCLA_LOG_WARN("FI-ENQ #{} mgr={:08X} item={:08X} triple={{ {:08X},{:08X},{:08X} }} "
+                "widx224={} count232={}",
+                en, mgr, item, ih0, ih1, ih2, widx, cnt);
+  __imp__sub_821CC800(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821CBEB0);
+static std::atomic<uint32_t> s_devClose{0};
+static std::atomic<bool> s_devCloseFirst{false};
+PPC_FUNC(sub_821CBEB0) {
+  const uint32_t n = s_devClose.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  const uint32_t thisPtr = ctx.r3.u32;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t cache = 0, threadH = 0;
+  if (thisPtr != 0 && thisPtr != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(thisPtr + 32u, &cache);
+    (void)mem.ReadU32BE(thisPtr + 12u, &threadH);
+  }
+  if (!s_devCloseFirst.exchange(true))
+    MCLA_LOG_WARN("DEVCLOSE-FIRST #1 this={:08X} cache={:08X} threadH={:08X} "
+                  "lr={:08X}",
+                  thisPtr, cache, threadH, lr);
+  if (n <= 40 || (n % 200) == 0) {
+    MCLA_LOG_WARN("DEVCLOSE enter #{} this={:08X} cache={:08X} threadH={:08X} "
+                  "lr={:08X}",
+                  n, thisPtr, cache, threadH, lr);
+  }
+  __imp__sub_821CBEB0(ctx, base);
+  if (n <= 40 || (n % 200) == 0) {
+    MCLA_LOG_WARN("DEVCLOSE exit #{} ret={:08X} this={:08X} lr={:08X}", n,
+                  ctx.r3.u32, thisPtr, lr);
+  }
 }

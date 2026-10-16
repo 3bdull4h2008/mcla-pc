@@ -83,13 +83,52 @@ was always right and it is the whole lesson. **But F-647's gloss is INVERTED and
   generated code — do not "fix" it by hand; route it through `.qoder/skills/mcla-recompiler-regen`.**
 - **`ori rA,r0,imm` round-trips as a no-op store to `r0` in Capstone 5.0.7** — a real defect in its
   or-immediate arm. Do not use it to settle operand order.
-- **An `op18` branch target read as signed lands outside the image; `ppc_disasm.py` reads it unsigned
-  and also lands outside.** Not resolvable under either convention — use `bc` (16-bit BD) targets.
-- **`tools/ppc_xrefs.py calls` misleads.** It reported 20 "callers" of `0x821BE250` where a raw scan
-  finds **0** direct call sites (vtable dispatch), and its `->` column names the *enclosing* function.
-- **`tools/ppc_disasm.py` prints `mr` with RA/RT inverted** (F-112) and **cannot decode opcode-30
-  `rldicl`/`rldicr` at all** — it falls back to a generic `rldic-family`. Use `generated/ppc_xenon/*.cpp`
-  as the tiebreaker for those.
+- ⚠️ **`op18` (I-form branch) IS resolvable; a circulated "bits 2..27" encoding is REFUTED — do not
+  re-import it.** PPC bit numbers run from the MSB (bit *k* = `1<<(31-k)`): **LI = bits 6..29** =
+  `& 0x03FFFFFC`, sign-extended from 26 bits, already ×4; **AA = bit 30**; **LK = bit 31**; target =
+  `VA + sext(LI)`, else `sext(LI)` when AA=1. Over all 147,363 op18 words that gives **144,170
+  in-image targets, 123,273 on a function in `ppc_func_mapping.cpp`, and 143,827/143,827 = 100% of
+  code-range words**; the 2,910 residual are all outside the code range and are ASCII/data, not
+  branches (`49440000`=`"ID"`, `4B45524E`=`"KERN"`). Bits 2..27 is *structurally* impossible, not
+  merely unfit: bits 0..5 **are** the primary opcode, so bit 1 is set in **147,363 of 147,363** words
+  and bit 0 in **0** — that reading would make every op18 branch absolute *and* non-linking, when
+  really LK(bit 31) is set in **107,153** words and AA(bit 30) in **1,469** (`ppc_xrefs.py`'s own
+  docstring agrees). Control: **13,548** `bl` sites whose target the recompiler itself already
+  resolved (26 TUs of `generated/ppc_xenon/ppc_recomp.*.cpp`) — signed bits 6..29
+  **13,548/13,548**; bits 2..27, bits 2..25 and bits 6..31-unsigned **0** each. Both oracles
+  (`tools/ppc_disasm.py`, Capstone 5.0.7) print the textbook target at all six hand-checked sites,
+  e.g. `0x8218C83C` raw `48031ED5` → `0x821BE710` (bits 2..27 → `0x84198FF0`). **`ppc_disasm.py` does
+  NOT read op18 "unsigned-and-outside"** — the bullet this replaces was wrong about the tool as well
+  as the encoding; its real defects are two bullets below.
+- **`tools/ppc_xrefs.py calls` USED to under-report, and the note about it was itself wrong.** The
+  previous text here said it "reported 20 callers of `0x821BE250` where a raw scan finds **0** direct
+  call sites (vtable dispatch)". **Both numbers were false.** Measured 2026-10-06 against
+  `build/cache/mcla_pe.bin`: a raw whole-image op-18 scan finds **80** direct `bl` sites to
+  `0x821BE250` (0 tail `b`), and the tool listed **61** of them with **zero false positives** — the
+  defect was a silent output cap (`if n > 60: break` at `:299-300`, then `{n} call site(s)` at `:301`),
+  so the number it printed was the *listing cap*, not the count. The 19 it dropped were the highest
+  addresses, i.e. exactly the callers you are most likely looking for. **Fixed** (F-775): it now scans
+  everything, lists at most 60, and prints `80 call site(s) -- only the first 60 listed above; 20 more
+  exist`, which reproduces the raw scan exactly. Scale of what the cap was hiding: `0x823DA950` (the
+  guest memcpy) has **597** call sites, not 61. Its `->` column does name the *enclosing* function
+  (`sub_8218B0C8 +0x1f4` = an offset into it), and it still cannot see the **15,392** register-indirect
+  `bctrl`/`bctr` sites (op 19), which have no static target (`:284-286`).
+- 🔴 **`tools/ppc_disasm.py` does NOT invert `mr` — that claim (F-112) was re-measured FALSE on
+  2026-10-06 and acting on it would have broken a correct decoder.** `decode(0x7C9D2378)` →
+  `mr r29,r4` ✓; `decode(0x7FC8F378)` → `mr r8,r30` ✓ (rS==rB, so the alias is right — AGENTS.md's
+  own control `0x7FC8F378 = or r8,r30,r30` is the *same instruction* in long form);
+  `decode(0x7C8B5214)` → `add r4,r11,r10` ✓ matching Capstone. Both operand conventions in this file
+  are honoured correctly: X-form logical (`or`/`mr`, XO 444) prints `r(a),r(d),r(b)` because the
+  destination is the bits-11:15 field, while X-form arithmetic (`add`, XO 266) prints
+  `r(d),r(a),r(b)` because there the destination is bits-6:10. **Do not "fix" either arm.**
+- **`tools/ppc_disasm.py` still cannot decode opcode-30** (`rldicl`/`rldicr`) — and that gap is
+  bigger than the old note implied: **5,884** op-30 words in `mcla_pe.bin` (of 2,588,672 dwords;
+  for scale, op-31 = 271,675, op-18 = 147,363, op-16 = 146,177, op-21 = 64,033). It also bails on
+  op-4 (`float/ps`), op-19 unknown XOs, `op31:<XO>` and `op58sub`/`op62sub`. **Fixed (F-776):** every
+  fallback now appends `NOT-DECODED(use generated/ppc_xenon/*.cpp)`, so an undecoded word can no
+  longer pass for an answer — previously `rldic-family 78A30004` looked like output and carried zero
+  operands. Control: `--selftest` is still 25/25 after the change. Use `generated/ppc_xenon/*.cpp`
+  as the tiebreaker for those opcodes.
 - **Do not trust operand ordering in `generated/ppc_recomp.*.cpp` comments** — four sources disagreed
   and the emitted code was the tiebreaker, not the comment.
 - **A control with `MB=0` is symmetric under the MB↔ME swap and therefore has *some* power but not
@@ -102,7 +141,7 @@ was always right and it is the whole lesson. **But F-647's gloss is INVERTED and
 |---|---|
 | decompile guest functions | `python tools/ida_dump.py <dir> 0x821378B8 0x…` (bridge on :8745) |
 | whole image as files, with raw bytes | `python tools/ida_bulk_export.py <dir>` |
-| raw instruction truth | `tools/ppc_disasm.py` (offset = VA − `0x82000000`; prints raw fields, not mnemonics) |
+| raw instruction truth | `tools/ppc_disasm.py` (offset = VA − `0x82000000`; **prints mnemonics** — F-633 added them, so the old "prints raw fields, not mnemonics" note was stale — plus raw fields and the rotate mask. Undecodable opcodes now say `NOT-DECODED`, F-776. Run `--selftest` after touching it.) |
 | xrefs (use `calls`/`fn`, **not** `xref`) | `python tools/ppc_xrefs.py calls 0x824112C8` |
 | who owns a guest address | `python tools/addr_owners.py --check 0x…` — hex **or** `sub_<VA>` both work |
 | exact log counts | `open(f,'rb').read().lower().count(b'…')` — **not** `findstr` alone |
@@ -122,7 +161,7 @@ includes this orchestrator's briefs.
 1. `docs/LONG_TODO_MASTER.md` — §0 dated state, §1 rules, §2 task queue, §4 do-not list.
 2. `docs/HANDOFF_NEXT_AGENT.md` — live block + session ledger (what the last session actually saw).
 3. `docs/PROGRAM_GUIDE.md` on demand — §3 build/run gotchas, §4 guest image, §5 recompiler pipeline, §7 host short-circuit table, §9 log-marker inventory, §10 RE tooling, §11 forbidden paths.
-4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — the append-only evidence ledger. **Never trust an ID range quoted anywhere, including here**: the top moves hourly (last heading `### F-719`, 575 headings, on 2026-10-01). **F-056…F-076 is a documented hole** (`:2098`; that week survives only as unnumbered prose at `:1071-1166`), so **F-057/F-058 resolve to nothing** and a grep that finds nothing does *not* prove a citation was fabricated. **F-629 has no `###` heading** (17 textual mentions, all references to the void); it was reconstructed as **F-635** — do not renumber or reuse it.
+4. `docs/ROOT_CAUSE_VALIDATION.md` Part 3 — the append-only evidence ledger. **Never trust an ID range quoted anywhere, including here**: the top moves hourly (last heading `### F-773`, **625** headings, measured 2026-10-06). 🔴 **The file contains 1 NUL byte, so plain `grep` treats it as binary and silently returns 74 of 625 headings plus "Binary file matches"** — an agent this session read `F-543` as the ledger top from exactly that. **Always `grep -a`.** Two commands that never rot: next free ID = `grep -aoE "^### F-[0-9]+" docs/ROOT_CAUSE_VALIDATION.md | tail -1`; a duplicate check = `grep -ain "<address or marker>" docs/ROOT_CAUSE_VALIDATION.md`. Note a **backtick breaks a grep pattern**: searching `agents.md rule 12` returns 0 while the file holds `` `agents.md` rule 12 `` at `:8581`. **F-056…F-076 is a documented hole** (`:2098`; that week survives only as unnumbered prose at `:1071-1166`), so **F-057/F-058 resolve to nothing** and a grep that finds nothing does *not* prove a citation was fabricated. **F-412…F-429 were never allocated** (F-773). **F-629 has no `###` heading** (17 textual mentions, all references to the void); it was reconstructed as **F-635** — do not renumber or reuse it.
 
 Older status text anywhere else = trail, not truth. Pre-compression doc text: `git show 8f07a39:docs/<file>`.
 
@@ -131,25 +170,33 @@ Older status text anywhere else = trail, not truth. Pre-compression doc text: `g
 ## The 7 rules that keep costing sessions
 
 **Rule numbers are namespaced — never expand a bare "rule N" without naming the file.** This file:
-1–6, 14. `LONG_TODO_MASTER` §1 (`:970-990`, rules 1–19 — what a bare "rule 11/13" means): 5 = one new
-log per experiment (`:976`), 6 = timeout every boot + kill `mcla.exe`, 7 = tree must always compile,
-8 = retail content only, 9 = no framework rewrites while not booting, **10 = write the trail as you go**,
-**12 = the stale-exe trap**. `PROGRAM_GUIDE` §11 (`:785-818`, rules 1–11) — **6/7/8/9/10 collide with
-`LONG_TODO_MASTER` §1**, its 5 = do-not-stack-short-circuits (`:797`). So **"rule 5" is triple-valued**
-(this file's concurrency rule, `LONG_TODO_MASTER.md:976`, `PROGRAM_GUIDE.md:797`) — write the file. Two
-live miscites prove the cost: `ROOT_CAUSE_VALIDATION.md:8581` "agents.md rule 12" (that rule is
-`LONG_TODO_MASTER` §1's stale-exe trap) and `HANDOFF_NEXT_AGENT.md:528` "AGENTS.md rule 5/6" (only
-rule 5 is relevant there — this file's rule 6 is the E:-primary merge note).
+1–6, 14, 19. `LONG_TODO_MASTER` §1 ("Rules", `:552-573`, rules 1–19 — what a bare "rule 11/13" means):
+5 = one new log per experiment (`:558`), 6 = timeout every boot + kill `mcla.exe`, 7 = tree must always
+compile, 8 = retail content only, 9 = no framework rewrites while not booting, **10 = write the trail as
+you go**, 11 = two-session coordination (`:564`), **12 = the stale-exe trap** (`:565`), **19 = a zero from
+an instrument is not a result until that instrument is shown firing on a known event** (`:572`).
+`PROGRAM_GUIDE` §11 ("Rules that govern all work", `:796-830`, rules 1–11) — **6/7/8/9/10 collide with
+`LONG_TODO_MASTER` §1**, its 5 = do-not-stack-short-circuits (`:808`). So **"rule 5" is triple-valued**
+(this file's concurrency rule, `LONG_TODO_MASTER.md:558`, `PROGRAM_GUIDE.md:808`) — write the file.
+⚠️ **Prefer the section name to the line range: anchors in this project rot faster than the prose**
+(F-764 measured the scale). The five line numbers in this paragraph were all wrong before 2026-10-06 and
+are re-measured as of it — expect them to drift again, and re-run `grep -n "^## " <file>` rather than
+trusting any range, including these. One live miscite proves the cost: `ROOT_CAUSE_VALIDATION.md:8581`
+says "`agents.md` rule 12" — **this file has no rule 12**, its list is 1–6, 14, 19; that rule is
+`LONG_TODO_MASTER` §1's stale-exe trap. (A second miscite once cited here, `HANDOFF_NEXT_AGENT.md:528`
+"AGENTS.md rule 5/6", is **gone**: 0 hits in the live HANDOFF, 0 in `docs/archive/trail-handoff-2026-10.md`,
+0 in `HEAD`'s blob. It was corrected, and this sentence is the only trace.)
 
 1. **Census before fix.** No short-circuit without a root cause; never stack short-circuits (do-not #1/#9). A mitigation must be labelled and cited at its `file:line`.
    **1a (bisect attribution).** A `src/` change may not be named as a fault's cause unless the only build differing from the last known-good is that change, or a single-variable revert is shown; otherwise write "N-way" and name the other files still in the build. **A citation is not attribution.** *Check:* `git diff --name-only <last-good>..HEAD` ∩ `src/` = 1 file.
    **1b (new-symbol taint).** Any new `static`/`extern` host function or global in the working tree must be listed in the same claim; attribution stays provisional until a revert excludes or confirms it. *Check:* `git diff <last-good>..HEAD -- src/ | grep -E '^\+.*\b(static|extern)\b'`.
-2. **Never edit `generated/**`, `.research/**`, `config/mcla_xenonrecomp.toml`, `src/ppc_context.h`, `src/ppc_config.h`, `src/dispatch_guard.cpp`** — full forbidden + default-modifiable lists: PROGRAM_GUIDE §11 (`:802-806`). Tool changes go through `.qoder/skills/mcla-recompiler-regen`.
+2. **Never edit `generated/**`, `.research/**`, `config/mcla_xenonrecomp.toml`, `src/ppc_context.h`, `src/ppc_config.h`, `src/dispatch_guard.cpp`** — full forbidden + default-modifiable lists: PROGRAM_GUIDE §11 rule 7 (`:813-817`). Tool changes go through `.qoder/skills/mcla-recompiler-regen`.
 3. **Raw-byte rule (F-023).** `build/cache/mcla_pe.bin`, offset = VA − 0x82000000, words big-endian; the PE section table lies; IDA is a hypothesis until the bytes agree.
 4. **One owner per guest address.** `python tools/addr_owners.py --check <addr\|symbol>` before adding any hook (it reads `PPC_FUNC`/`GUEST_FUNCTION_HOOK`/`SetFunction`/`GetFunction`; **exit 1 = duplicate owners**, 2 = unresolvable symbol). grep is the fallback, not the check.
 5. **Concurrent sessions are normal.** Before building/booting: `tasklist | grep -iE "mcla|ninja"` and the newest `build/*.log` >2 min old (= `LONG_TODO_MASTER` §1 **rule 11**). Before writing a doc: check its mtime and add a dated superseding block rather than editing someone else's.
 6. **E: is primary again (merged 2026-09-23; pre-merge state = commit `35912f0`).** `C:\mcla-pc` is a retired **read-only** archive; provenance snapshot `E:\mcla-c-snapshot-20260923`. Verified then: the merged tree **built clean on E: (`build_on_e.bat`, 11/11, 0 errors) and `w46.log` reproduced `w45b`**. Do not start building on C: again; `diff -q` against the snapshot before trusting either side.
 14. **Premises must be cited.** Every factual assertion in a task brief or a finding carries a `file:line` or a log line. No citation means verify before acting, not after. A brief is not authority; a measurement is. Briefing from this project's own records is a defect, not a shortcut.
+19. **A zero is not a result until the instrument is shown firing on an event you know happened** (`LONG_TODO_MASTER` §1 rule 19, `:572`; F-100 voids F-095). Six harnesses in this project reported *pass* while blind — they never failed on anything. Before believing any 0: make it fail once on a known-positive fixture and show the line. Corollaries that each cost a session: **a marker absent from `src/` has a zero that means nothing** (prove the printer literal exists first — `tools/soak_census.py` prints `MARKER NOT IN SRC` for this); **a capped printer's count is a cadence, not a total** (`UIXSF-GOLDEN-REVERIFY` fires only at n∈[1000,9000] ∧ n%1000==0, so "25 rows" says nothing about how many verified); **and a second printer can emit your token** — naive `pct=100` counts 65 in `w737` where `UIXSF-GOLDEN-REVERIFY` accounts for 30 and `PHYS-FREE-SUM`'s `honoured_pct=100.0000` for 35 (F-772). **Count a marker only on lines where it follows the `] [` level tag, i.e. where it is the message's own label.**
 
 ## Project skills (`.qoder/skills/`) — use them, don't rediscover the gotchas
 
@@ -170,7 +217,7 @@ rule 5 is relevant there — this file's rule 6 is the E:-primary merge note).
 | `tools/mitigation_audit.py` | do-not #9 — diffs the PROGRAM_GUIDE §7 registry against the mitigation-shaped labels really in `src/`. Re-measured **2026-10-01**: **§7 = 92 registered, 4 stale; `src/` = 105 mitigation-shaped of 1,330 label tokens; 86 undocumented** (the old "13" was the F-047 reading). `--tiers`, `--label X`. | **1 = unregistered/stale** |
 | `tools/ppc_xrefs.py` | static xrefs without IDA: `find-str <text>`, `xref <hexVA>` (`lis`=`addis rT,0,imm`! sliding per-register state), `calls`, `fn`. One-site messages are load-bearing attributions (F-102 named the whole preload chain this way). | 0 |
 | `tools/rpf_offline.py` | archive forensics without a soak: `header` (RPF3 TOC length/endianness), `names <toc_dump>`, `find <path> [archive\|dump]`, `member <off> <len>`, `islands`. Raw-archive `find` returns 0 **by design** — the on-disk TOC is AES, the in-guest copy is a hash-sorted cleartext table (F-099). | 0 |
-| `tools/host_rva_resolve.py build/mcla.map [--base <runtime image base>] <rva\|absolute>…` | names a **host** address from the VEH/PARK dumps (`rip owner=host …`, `rawrip=…`, the host stack lines) using the `/MAP` every link already writes (`CMakeLists.txt:577`; the old `§410` pointed at the `ppc_recomp.82..85` list) — this turned F-370's `C0000005` from "some host thread" into `memset ← GuestThreadContext ctor`. Control: a known symbol must resolve at `+0x0`, using the map from the SAME build as the log. | 0 |
+| `tools/host_rva_resolve.py build/mcla.map [--base <runtime image base>] <rva\|absolute>…` | names a **host** address from the VEH/PARK dumps (`rip owner=host …`, `rawrip=…`, the host stack lines) using the `/MAP` every link already writes (`CMakeLists.txt:577`; the old `§410` pointed at the `ppc_recomp.82..85` list) — this turned F-370's `C0000005` from "some host thread" into `memset ← GuestThreadContext ctor`, and on 2026-10-06 named the writer of **both** zeroed o1heap instances from `F374-HEAPSTORE`'s `caller_rva` — 16 distinct sites `+0x2df … +0x699` inside `__imp__sub_823DA950`, an identical set for the user instance (`0x20000`) and the physical one (`0xA0400000`); see **F-778**, which also resolves a full 20-frame `F379-HEAPSTORE-BT` chain that reaches `sub_8218B0C8`. Control: a known symbol must resolve at `+0x0`, using the map from the SAME build as the log. ⚠️ **If you verify this tool by hand, read the map's THIRD column (`Rva+Base`), not the first, and subtract with a computer.** The publics table is `Address(section:offset) | Publics by Value | Rva+Base | Lib:Object`; the first column is section-relative, so a hand parse of it lands exactly **0x1000** off and will make a *correct* resolution look wrong (this happened, and nearly discarded a true result). Worked example, measured not remembered: `__imp__sub_823DA950` is sec:off **`0001:016ff230`**, `Rva+Base` **`0x141700230`** ⇒ RVA **`0x1700230`**, next symbol at `0x1701160`, extent **`0xF30`**. An earlier revision of this line gave `016ff170`/`0x1700170` — **both wrong**, produced by hand-computing `0x170050f − 0x2df`; the true answer is `0x1700230`, and **`sec:off 0001:016ff170` does not exist in the map at all** (RVA `0x1700170` is inside `__imp__sub_823DA748`, base RVA `0x16ffbc0`, at `+0x5b0`). A wrong base silently re-attributes every offset computed from it, so `python -c "print(hex(0x170050f-0x2df))"`, never mental arithmetic. Also check the offset lands *inside* the symbol's extent (next symbol minus this one) before believing it — `+0x2df` into a `0xF30`-byte function is fine; `+0x2df` past a 16-byte symbol is a nearest-preceding-symbol artifact. | 0 |
 | `build/soak_parallel.py` | **REFUSES to run more than one mcla** ("Single-instance bounded soak runner", docstring `:1`). The old N-affinity-pinned mode and its `time.sleep(5)` stagger (`:3-5`) were unsound: one window, one D3D12 device, one audio endpoint, one VFS cache, so a collision is a **synchronisation** bug pinning cannot fix (F-572). **Soaks run through `build/soak_run.py`** (`:41-43`). | 0 ran / **2 refused** |
 
 ## Project MCP servers — both `opencode.json` (gitignored, different schema) and the committed `.qoder/settings.json` declare the same **three** (first load shows a trust prompt; run `/mcp reload`)

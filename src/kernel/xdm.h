@@ -11,6 +11,17 @@
 // boot_host once the worker starts; imports use it to attribute waits.
 extern std::atomic<uint32_t> g_mainGuestThreadId;
 
+// T43.18 (2026-10-13): the main thread's LATEST wait, published uncapped by
+// the main-park probes (imports.cpp) for the render-thread heartbeat
+// (HB-FLICKER mainwait=* in render_thread.cpp). Handle/lr stampit: the
+// probe's 200-row cap blinds the TAIL of a soak, while the heartbeat prints
+// ~every 4 s all run, so the tail always shows the latest main park.
+// mainwait_age_ms on the HB row (now minus ns) says how stale the stamp
+// is; 0 handle = no main park yet observed.
+extern std::atomic<uint32_t> g_mainParkHandle;
+extern std::atomic<uint32_t> g_mainParkLr;
+extern std::atomic<uint64_t> g_mainParkNs;
+
 #define OBJECT_SIGNATURE           (uint32_t)'XBOX'
 #define GUEST_INVALID_HANDLE_VALUE 0xFFFFFFFF
 

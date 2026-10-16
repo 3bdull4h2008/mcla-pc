@@ -284,6 +284,15 @@ def cmd_calls(words, starts):
     # own field (see branch_target). Also note what this cannot see: 15,392
     # register-INDIRECT call sites (bctrl/bctr/bcctrl, op 19) in this image have
     # no static target and are therefore unreachable from here by construction.
+    #
+    # F-775: this loop used to `break` at `n > 60` and then print `{n} call site(s)`, so the
+    # number it reported was the LISTING CAP, not the count. For 0x821BE250 it printed
+    # "61 call site(s)" where a raw whole-image scan of build/cache/mcla_pe.bin finds **80**
+    # (all 61 it listed are genuine -- zero false positives -- and the 19 it dropped are simply
+    # the highest addresses, i.e. exactly the callers most likely to be missed). A truncated
+    # total that looks like a total is the same defect class as a capped log printer, and it is
+    # what made AGENTS.md assert the opposite error ("reports 20 callers where a raw scan finds
+    # 0"). So: scan everything, list at most 60, and say when the listing was cut.
     for i, w in enumerate(words):
         op = _hi(w)
         if op not in (16, 18):
@@ -292,13 +301,13 @@ def cmd_calls(words, starts):
             continue                                   # zero displacement: branches to itself
         pc = BASE + i * 4
         if branch_target(w, pc, op)[0] == target:
-            e = enclosing(starts, pc)
-            print(f"  {pc:#010x} bl -> " + (f"sub_{e[0]:08X} +{e[1]:#x}" if e else "?")
-                  + f"   [{branch_mnemonic(w, op)}]")
             n += 1
-            if n > 60:
-                break
-    print(f"  {n} call site(s)")
+            if n <= 60:
+                e = enclosing(starts, pc)
+                print(f"  {pc:#010x} bl -> " + (f"sub_{e[0]:08X} +{e[1]:#x}" if e else "?")
+                      + f"   [{branch_mnemonic(w, op)}]")
+    print(f"  {n} call site(s)"
+          + (f" -- only the first 60 listed above; {n - 60} more exist" if n > 60 else ""))
 
 
 # ---------------------------------------------------------------------------

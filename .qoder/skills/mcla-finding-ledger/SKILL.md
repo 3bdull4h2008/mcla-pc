@@ -10,10 +10,18 @@ is how the 2026-09-20 false handoff happened (three confident claims, all alread
 
 ## Before writing: check for duplicates
 
+🔴 **`docs/ROOT_CAUSE_VALIDATION.md` contains 1 NUL byte, so plain `grep` classifies it as binary and
+silently returns 74 of 625 headings plus "Binary file matches".** Every grep below therefore carries
+`-a`. Measured 2026-10-06: an agent ran the un-`-a` form, read `F-543` as the ledger top, and nearly
+allocated a duplicate ID. **A backtick also breaks a pattern**: searching `agents.md rule 12` returns 0
+while the file holds `` `agents.md` rule 12 `` at `:8581` — quote the words, not the markup.
+
 ```bash
 cd "E:/mcla pc"
-grep -n "F-04[0-9]" docs/ROOT_CAUSE_VALIDATION.md | tail -8
-grep -in "<your address or marker>" docs/*.md | head
+grep -an "F-04[0-9]" docs/ROOT_CAUSE_VALIDATION.md | tail -8
+grep -ain "<your address or marker>" docs/*.md | head
+# next free ID — never trust a number quoted in any doc, including this one:
+grep -aoE "^### F-[0-9]+" docs/ROOT_CAUSE_VALIDATION.md | tail -1
 ls -l --time-style=+%m-%d_%H:%M docs/            # another session may have moved it
 ```
 
@@ -23,10 +31,23 @@ superseding blocks, never rewrite another session's text (append-only), and neve
 
 ## Entry format (Part 3 of `docs/ROOT_CAUSE_VALIDATION.md`)
 
-The live format is an `###` heading plus five field lines (verified against
-`docs/ROOT_CAUSE_VALIDATION.md:1799`, `### F-089 — …`; ledger is at **F-089**, so the next ID is
-**F-090**). The old `**F-0NN — …** FACT | …` one-liner form is NOT what is in the file — grep
-`^### F-0` for real entries; the 56 `**F-0` hits are inline references inside other entries.
+🔴 **Never take the next ID from this file — it is a snapshot and it rots.** This paragraph used to say
+"ledger is at **F-089**, so the next ID is **F-090**", citing `:1799`; both the number and the anchor are
+long dead. **Run the command instead:**
+
+```bash
+grep -aoE "^### F-[0-9]+" docs/ROOT_CAUSE_VALIDATION.md | tail -1   # -a is mandatory, see above
+```
+
+Measured 2026-10-06: **625** headings, top **`### F-773`**. Both heading punctuations are live and
+neither is wrong — **425** entries use an em-dash (`### F-745 — …`), **206** use a plain hyphen
+(`### F-773 - …`). Match whichever the neighbouring entries use. The five field lines below are
+**optional in practice**: only **8 of the last 20** entries carry them. Use them for a FIX or anything
+that will be re-tested; a short FACT/REFUTED entry with a bold provenance line and a body is equally
+correct and is what the recent tail looks like. The old `**F-0NN — …** FACT | …` one-liner form is NOT
+what is in the file — grep `^### F-` for real entries; `**F-0` hits are inline references inside other
+entries. **Known ID voids, do not renumber or reuse:** F-056…F-076 (that week survives only as
+unnumbered prose), F-412…F-429 (never allocated — F-773), and F-629 (reconstructed as F-635).
 
 ```
 ### F-0NN — <the claim, as one sentence>

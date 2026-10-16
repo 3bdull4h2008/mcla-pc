@@ -5638,11 +5638,33 @@ bool D3D12Backend::RefuseUnchangedPresent(const char* ownerName) {
 }
 
 bool D3D12Backend::MayWriteBackBuffer(FrameOwner owner) {
-    // The draw path always owns the back buffer. The blit and the clear own it
-    // only until the first draw has presented: that window is what keeps the W6
-    // PresentBgra pipe proof (render_thread.cpp:152) and the pre-guest-content
-    // gradient (render_thread.cpp:1039) alive before any guest geometry arrives,
-    // and losing it would trade a black screen for a black screen.
+    // T43.24 (2026-10-16, audit finding #1): the draw-path latch was
+    // PERMANENT — m_drawPathTookBackBuffer was set on the first
+    // PresentOwnedFrame(Draw) and never cleared, killing the guest's
+    // blit-present path (PresentBgra) and ClearAndPresent FOREVER after
+    // 2 draws. The "W6 blit proof" that justified it was for two synthetic
+    // paths that are now deleted (the file's own comment at :5642-5645
+    // says "keeps the W6 PresentBgra pipe proof alive" — that proof
+    // served its purpose and is retired).
+    //
+    // FIX: reset the latch when a GUEST PRESENT command arrives — a new
+    // guest frame is by definition newer than the last draw, and the
+    // guest's PresentKick path (PRESENT cmd → PresentBgra) is the game's
+    // own mechanism for showing a frame. The draw path re-claims the
+    // buffer on its next PresentOwnedFrame(Draw) as before.
+    //
+    // The pre-draw window (gradient + blit before the first draw) is
+    // preserved: the latch is only set after a draw has ACTUALLY presented,
+    // and it is cleared on the next guest PRESENT, not on a timer.
+    if (owner == FrameOwner::Blit) {
+        // A guest PRESENT is arriving: release the draw-path latch so
+        // the blit can write. The draw path re-claims on its next present.
+        if (m_drawPathTookBackBuffer) {
+            m_drawPathTookBackBuffer = false;
+            MCLA_LOG_INFO("FRAME-OWNER latch released for guest PRESENT "
+                          "(draw had claimed the buffer; blit may write now)");
+        }
+    }
     const bool allowed = (owner == FrameOwner::Draw) || !m_drawPathTookBackBuffer;
     if (allowed) {
         if (m_frameWriter != FrameOwner::None && m_frameWriter != owner) {

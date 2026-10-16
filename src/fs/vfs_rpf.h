@@ -85,6 +85,11 @@ public:
         // for it. Feeds ClassifyTailClaim's kReadMemberHead; 0 means unknown,
         // and that case is then unreachable.
         uint64_t read_member_off = 0;
+
+        // T43.20 (2026-10-13): handle_id for proper cleanup in CloseFile.
+        // Without this, the m_open_files entry is never removed, causing a
+        // handle leak (observed as "Out of file handles" after ~957 opens).
+        uint64_t handle_id = 0;
     };
 
     RpfVirtualFileSystem();

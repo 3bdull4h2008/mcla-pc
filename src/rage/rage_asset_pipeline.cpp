@@ -1,7 +1,18 @@
 ﻿#include "rage_asset_pipeline.h"
 
+#include "rage_ideal_flow.h"  // frame-vs-parallel ownership policy (T43.17)
+
+// NOTE (2026-10-13, verified): this TU is NOT compiled into mcla.exe --
+// `rage` appears nowhere in CMakeLists.txt's add_executable, and no built
+// TU calls RageAssetManager (zero callers outside src/rage/). The bodies
+// below (honest refusal since T43.17) take effect only if this file is
+// ever wired into a target. RAGE-ASSET-REFUSE=0 in any soak therefore
+// means "not built", never "called and fine". Do not wire it into the
+// boot path to make the rows appear; park stands until menu (MENU-GATE).
+
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <sstream>
 
@@ -498,12 +509,20 @@ bool RageAssetManager::LoadModel(uint32_t hash) {
 bool RageAssetManager::GetTextureData(uint32_t hash, std::vector<uint8_t>& out_data, 
                                       uint32_t& out_width, uint32_t& out_height, 
                                       uint32_t& out_format) {
-    // Placeholder - return dummy data for now
-    out_width = 128;
-    out_height = 128;
-    out_format = 28; // DXGI_FORMAT_R8G8B8A8_UNORM
-    out_data.assign(128 * 128 * 4, 0xFF);
-    return true;
+    // ROCKSTAR SYSTEMS POLICY (2026-10-12): honest refusal, never placeholder.
+    // Was: 128x128 white + return true. A white texture that reports success
+    // renders a plausible frame that is not the guest's frame and hides the
+    // real producer (guest DrawPacket -> texture_decode -> D3D12 backend).
+    // The guest path owns rendering; this native path is offline forensics.
+    static std::atomic<uint64_t> s_refused{0};
+    const uint64_t n = s_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 500) == 0) {
+        MCLA_LOG_WARN("RAGE-ASSET-REFUSE GetTextureData hash=0x{:08X} #{}: "
+                      "native path has no resident (guest path owns textures)",
+                      hash, n);
+    }
+    (void)out_data; (void)out_width; (void)out_height; (void)out_format;
+    return false;
 }
 
 bool RageAssetManager::GetModelGeometry(uint32_t hash, std::vector<float>& out_positions,
@@ -527,13 +546,30 @@ bool RageAssetManager::GetModelGeometry(uint32_t hash, std::vector<float>& out_p
 }
 
 bool RageAssetManager::GetOrCreateTexture(uint32_t hash) {
-    // TODO: Create D3D12 texture resource
-    return true;
+    // ROCKSTAR SYSTEMS POLICY: native upload not on boot path. Refuse loudly
+    // so a soak counts it instead of believing a texture is resident.
+    static std::atomic<uint64_t> s_refused{0};
+    const uint64_t n = s_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 500) == 0) {
+        MCLA_LOG_WARN("RAGE-ASSET-REFUSE GetOrCreateTexture hash=0x{:08X} #{}: "
+                      "no D3D12 upload on native path (guest BindGuestTextures owns it)",
+                      hash, n);
+    }
+    (void)hash;
+    return false;
 }
 
 bool RageAssetManager::GetOrCreateModel(uint32_t hash) {
-    // TODO: Create D3D12 model buffers
-    return true;
+    // Same policy as above: no host-side model buffers on the boot path.
+    static std::atomic<uint64_t> s_refused{0};
+    const uint64_t n = s_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 500) == 0) {
+        MCLA_LOG_WARN("RAGE-ASSET-REFUSE GetOrCreateModel hash=0x{:08X} #{}: "
+                      "no host model buffers (guest vertex_decode owns it)",
+                      hash, n);
+    }
+    (void)hash;
+    return false;
 }
 
 } // namespace mcla::rage

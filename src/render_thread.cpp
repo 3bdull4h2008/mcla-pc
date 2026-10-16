@@ -2,6 +2,7 @@
 #include "logging.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
 #include "kernel/memory.h"
+#include "kernel/xdm.h"  // T43.18: g_mainParkHandle/Lr/Ns for the HB tail-light
 #include "renderer/shader_translator.h"
 #include "renderer/pipeline_cache.h"
 #include "renderer/xenos_shader_ir.h"
@@ -1521,12 +1522,32 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // render_queue.h, shared with the queue's shed policy so the two
             // cannot drift and disagree about which PRESENT is which.
             const bool heartbeat = IsHeartbeatPresent(cmd);
-            if (n <= 10 || (n % 120) == 0)
+            if (n <= 10 || (n % 120) == 0) {
+                // T43.18 (2026-10-13): mainwait=* is the TAIL-LIGHT for the
+                // main thread's latest park (published uncapped by the
+                // main-park probes; xdm.h). The probe rows cap at 200 early
+                // in the run, so without this the TAIL of a soak is dark.
+                // mainwait_age_ms = heartbeat-now minus stamp: large age =
+                // stale stamp (thread moved on or died), small age = parked
+                // there now. 0 handle = no main park observed yet.
+                const uint32_t mwH =
+                    g_mainParkHandle.load(std::memory_order_relaxed);
+                const uint32_t mwLr =
+                    g_mainParkLr.load(std::memory_order_relaxed);
+                const uint64_t mwNs =
+                    g_mainParkNs.load(std::memory_order_relaxed);
+                const uint64_t mwAge =
+                    (mwH != 0) ? static_cast<uint64_t>(NowNs() / 1000000) >= mwNs
+                                     ? static_cast<uint64_t>(NowNs() / 1000000) - mwNs
+                                     : 0u
+                               : 0u;
                 MCLA_LOG_INFO(
                     "RenderThread: {} #{} frame={} obj={:08X} fb={:08X} "
-                    "surf={:08X}",
+                    "surf={:08X} mainwait={:08X} mainwaitlr={:08X} "
+                    "mainwait_age_ms={}",
                     heartbeat ? "HB-FLICKER" : "PRESENT", n, p.frameNumber,
-                    p.obj, p.swapInfo, p.surfaceVA);
+                    p.obj, p.swapInfo, p.surfaceVA, mwH, mwLr, mwAge);
+            }
 
             // F-610: stamp a guest present for the heartbeat's suppression
             // window. Without this the 30 Hz beat competes with a guest that

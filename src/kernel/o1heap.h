@@ -94,6 +94,33 @@ extern "C" {
     /// The heap is not thread-safe; external synchronization may be required.
     O1HeapInstance* o1heapInit(void* const base, const size_t size);
 
+    /// The footprint an instance needs, in bytes, i.e. INSTANCE_SIZE_PADDED. Exposed so a caller can
+    /// size a buffer for o1heapInitSeparate without O1HeapInstance being a complete type here.
+    size_t o1heapInstanceSize(void);
+
+    /// Like o1heapInit, except the instance is placed in caller-supplied memory OUTSIDE the arena
+    /// instead of in its first INSTANCE_SIZE_PADDED bytes.
+    ///
+    /// Why this exists: o1heapInit puts host control blocks at `base`, and when `base` is a
+    /// guest-addressable physical-arena address the guest can be handed that address by a different
+    /// allocator and write through it -- which destroys every bin head and makes o1heapAllocate
+    /// return NULL for all sizes while o1heapDoInvariantsHold still reports the pool healthy. With the
+    /// instance detached, the arena's first byte is an ordinary allocatable fragment and no guest
+    /// write to a guest address can reach the control block.
+    ///
+    /// `instanceMem` must be aligned at O1HEAP_ALIGNMENT and hold at least o1heapInstanceSize() bytes;
+    /// it is never returned by o1heapAllocate and must outlive the instance. `base` must be aligned at
+    /// O1HEAP_ALIGNMENT and `size` must be at least FRAGMENT_SIZE_MIN. capacity is `size` (not
+    /// `size - INSTANCE_SIZE_PADDED`), clamped and aligned exactly as o1heapInit does.
+    ///
+    /// Returns NULL if either pointer is NULL, either is misaligned, or `size` is too small.
+    ///
+    /// NOTE: o1heapFree's two debug bounds checks derive the arena from the handle address and are
+    /// therefore meaningless for a detached instance. They are O1HEAP_ASSERT, compiled out under
+    /// -DNDEBUG, and this project builds RelWithDebInfo with /DNDEBUG (CMakeLists.txt:569, :578), so
+    /// they do not fire. A Debug build of a detached instance would assert on the first free.
+    O1HeapInstance* o1heapInitSeparate(void* const instanceMem, void* const base, const size_t size);
+
     /// The semantics follows malloc() with additional guarantees the full list of which is provided below.
     ///
     /// If the allocation request is served successfully, a pointer to the newly allocated memory fragment is returned.
@@ -169,6 +196,82 @@ extern "C" {
     /// This function merely copies the structure from an internal storage, so it is fast to return.
     /// If the handle pointer is NULL, the behavior is undefined.
     O1HeapDiagnostics o1heapGetDiagnostics(const O1HeapInstance* const handle);
+
+    /// 2026-10-07, ADDED (T43.2). READ-ONLY replay of o1heapAllocateGranular()'s search.
+    ///
+    /// WHY THE DIAGNOSTICS COPY CANNOT ANSWER THIS. build/w743.log:30954 refuses a 413-byte guest
+    /// request with `free=0x22f8000` (34.97 MiB), `bin_mask=0x801c0` and `capped_walks=0`, and
+    /// `o1heapDoInvariantsHold` had just passed on the same instance. Those four readings are
+    /// mutually fatal: the charge is 0x5000 so the search starts at bin 8; bit 19 is set; the
+    /// invariant check this library provides tests exactly `(mask bit i set) == (bins[i] != NULL)`
+    /// for all 64 bins, so `bins[19]` was non-NULL; and a fragment binned at 19 is at least
+    /// 2^19 * FRAGMENT_SIZE_MIN = 32 MiB, which satisfies a 20 KiB charge. The search therefore
+    /// had to succeed, and it returned NULL. Every word of that argument is either read out of this
+    /// file or printed by the host -- EXCEPT one: the search decides on `fragment->header.size`,
+    /// and no diagnostic in this library reports a fragment's size. `diagnostics.allocated` is a
+    /// sum, `nonempty_bin_mask` is a presence bitmap, and `o1heapDoInvariantsHold` never
+    /// dereferences a fragment at all. So the one quantity the decision turns on is the one
+    /// quantity that is unobservable, and this function exists to observe it.
+    ///
+    /// WHAT IT REPORTS, and the three outcomes that matter. `found_bin >= 0` means the replay WOULD
+    /// have served the request from the state as it now stands, so the allocator's NULL is not
+    /// reproducible from that state and the state moved between the call and the reading.
+    /// `found_bin < 0` with some `bins[i].head_null == 1` means the mask promises a bin that the
+    /// bin array does not hold, i.e. the invariant check did not actually run on this instance.
+    /// `found_bin < 0` with every listed bin's `max_size < charge` means a fragment is sitting in a
+    /// bin its own size does not belong to -- which is a fragment header that no longer matches the
+    /// bin it is linked from, and is the one shape neither the mask nor the invariants can see.
+    /// `probe_av` is set by the caller's exception net, not here: walking `next_free` is exactly the
+    /// dereference that a corrupt list makes unsafe, so a probe that faults is itself a result.
+    ///
+    /// This function allocates nothing, writes nothing and changes no diagnostic. It is bounded by
+    /// O1HEAP_GRANULAR_MAX_HOPS on the replay and O1HEAP_PROBE_MAX_LINKS per census bin, so a cyclic
+    /// list costs a bounded walk and reports `truncated` rather than hanging.
+#define O1HEAP_PROBE_MAX_BINS 4
+#define O1HEAP_PROBE_MAX_LINKS 4096U
+
+    /// One bin the search would have visited, censused read-only.
+    typedef struct
+    {
+        uint32_t bin;           ///< Bin index.
+        uint32_t head_null;     ///< 1 = the mask bit is set but bins[bin] is NULL.
+        uint32_t head_used;     ///< bins[bin]->header.used. MUST be 0 in a free list; 1 is corruption.
+        uint32_t list_len;      ///< Fragments walked, capped at O1HEAP_PROBE_MAX_LINKS.
+        uint32_t truncated;     ///< 1 = the walk stopped on the cap, so list_len is a floor.
+        uint32_t n_ge_charge;   ///< Fragments whose size satisfies the charge. 0 here IS the refusal.
+        size_t   head_size;     ///< bins[bin]->header.size, the word the search compares against.
+        size_t   min_size;      ///< Smallest header.size seen in this bin.
+        size_t   max_size;      ///< Largest header.size seen in this bin.
+        /// w744 measured `head_size == 0` in BOTH set bins at the refusal, which is structurally
+        /// impossible for a binned fragment (FRAGMENT_SIZE_MIN is 64, and `rebin` bins by
+        /// log2Floor(size/64)), i.e. the header was overwritten after binning. A size alone cannot
+        /// say WHERE, so the whole header is reported: the fragment's own address, which the caller
+        /// turns into a guest VA by offset from the arena base, plus `prev`/`next` because a zeroed
+        /// `next_free` is what makes `list_len` read 1 no matter how long the list really is.
+        size_t   head_addr;     ///< bins[bin] itself, as an integer.
+        size_t   head_prev;     ///< bins[bin]->header.prev.
+        size_t   head_next;     ///< bins[bin]->next_free, the link the census walk follows.
+    } O1HeapProbeBin;
+
+    typedef struct
+    {
+        size_t   charge;                 ///< The charge the search would use, computed identically.
+        uint32_t valid;                  ///< 1 = the probe ran at all; 0 = NULL handle or amount.
+        uint32_t granularity_ok;         ///< The shape guards o1heapAllocateGranular applies.
+        uint32_t charge_ok;              ///< The capacity/grid guards it applies.
+        uint32_t start_bin;              ///< log2Floor(charge / FRAGMENT_SIZE_MIN).
+        uint32_t bits_at_or_above_start; ///< Set mask bits the search would consider.
+        uint32_t hops;                   ///< Links the replay walked.
+        uint32_t cap_would_fire;         ///< 1 = hops reached O1HEAP_GRANULAR_MAX_HOPS.
+        int32_t  found_bin;              ///< Bin the replay would serve from; -1 = none.
+        size_t   found_size;             ///< That fragment's header.size.
+        uint32_t probe_av;               ///< Set by the caller's SEH net: the walk itself faulted.
+        uint32_t n_bins;                 ///< Entries in bins[], at most O1HEAP_PROBE_MAX_BINS.
+        O1HeapProbeBin bins[O1HEAP_PROBE_MAX_BINS];
+    } O1HeapProbeResult;
+
+    void o1heapProbeGranular(const O1HeapInstance* const handle, const size_t amount,
+                             const size_t granularity, O1HeapProbeResult* const out);
 
 #ifdef __cplusplus
 }

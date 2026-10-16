@@ -6,7 +6,7 @@ description: Count and compare boot-log markers in build/*.log case-insensitivel
 # Log census (rule 13's evidence machine)
 
 Every "it advanced / it didn't / zero occurrences" statement in this project must come from a
-counted log line. Four census mistakes are on record:
+counted log line. Six census mistakes are on record:
 
 - **Case-sensitivity false negative (2026-09-20):** `grep -c c0000005` = **0** while the log held
   **703** `code=0xC0000005` lines. Always use `-i`. This is still live in the frontier table below:
@@ -20,6 +20,26 @@ counted log line. Four census mistakes are on record:
 - **Mitigation lines are not fault lines (2026-09-20):** `P5-PHYS … skip fatal (caller takes
   delta-0 path)` matches any filter containing the word "fatal". Those 17 `lr=825EF1DC` events are a
   host short-circuit *absorbing* a guest failure. Including them invented a second fault cluster.
+- **A marker's own prose can contain another marker's literal (2026-10-06, F-772):** `DRAW-CP-DRAWN`
+  counted **4** in `w737.log` by substring and is really **exactly 2**. The extra two are
+  `DRAW-CP-PIXEL` rows whose *message text* says "…timestamped after DRAW-CP-DRAWN"
+  (`src/render_thread.cpp:4444`); the real printer is `:4369`. Same log, same night: naive `pct=100`
+  counts **65**, of which `UIXSF-GOLDEN-REVERIFY` owns 30 and `PHYS-FREE-SUM`'s `honoured_pct=100.0000`
+  owns 35 — two unrelated printers, one token. **Rule: count a marker only on lines where it is the
+  message's own label, i.e. where it immediately follows the `] [` level tag**
+  (`[19:23:55.679] [warning] HEAPHDR-STORE …`). In python:
+  `sum(1 for l in lines if re.match(r'^\[[^\]]+\] \[[a-z]+\] MARKER\b', l))`. Then reconcile against
+  `grep -ic` and *explain* any gap — the gap is the finding.
+- **A cap's modulo arm can be structurally unreachable, making the probe blind rather than quiet
+  (2026-10-06, F-774):** `HEAPHDR-STORE` gated on `[base, base+0x800)` = 512 stride-4 addresses and
+  capped at `hn <= 200 || hn % 5000 == 0`. **`hn` can never reach 5000**, so the second arm is dead
+  code and `w737` printing rows #1..#200 and then nothing was read as "the zero sweep stopped at
+  0x320 bytes" — when it is equally consistent with a multi-megabyte sweep the cap ate. An agent
+  proposed a 32 KB arena offset on that inference. **Before believing a capped probe's last row,
+  compute the maximum count its window can produce and check the cap is reachable.** If it is not, the
+  probe cannot answer the question it was built for: widen the window and lower the modulo (log-only,
+  single-variable) before drawing any conclusion. Same class as F-089 §6 (`TOC76` stopped at #80,
+  1 ms before the lookups that mattered).
 
 ## Marker battery
 

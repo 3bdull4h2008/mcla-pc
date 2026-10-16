@@ -197,19 +197,30 @@ bool RpfVirtualFileSystem::Initialize(const std::string& extracted_cache_root) {
 
     m_extracted_root = extracted_cache_root;
 
+    // T43.18 (2026-10-13): the extracted dir is OUR invention, not a game
+    // requirement -- a missing dir must neither fail init nor be created
+    // to satisfy it. Warn, skip its scan, and serve from the game_data
+    // root below (the real packfiles), which is what every boot actually
+    // reads. If game_data itself is missing, THAT fails below -- and the
+    // XEX load above already failed first, so that row can never be the
+    // first sign of trouble.
     std::filesystem::path root_path(extracted_cache_root);
-    if (!std::filesystem::exists(root_path)) {
-        MCLA_LOG_ERROR("VFS: Extracted cache root does not exist: {}", extracted_cache_root);
-        return false;
+    const bool haveExtracted = std::filesystem::exists(root_path);
+    if (!haveExtracted) {
+        MCLA_LOG_WARN("VFS: extracted cache dir absent (not required): {} -- "
+                      "indexing game_data root only", extracted_cache_root);
+    } else {
+        MCLA_LOG_INFO("VFS: Initializing with extracted cache root: {}",
+                      extracted_cache_root);
     }
-
-    MCLA_LOG_INFO("VFS: Initializing with extracted cache root: {}", extracted_cache_root);
 
     // Scan the extracted cache. In the committed tree that directory is EMPTY
     // by design (PROGRAM_GUIDE §3: "must exist (empty OK)"), which is why every
     // pre-F-628 soak logged `VFS: Indexed 1 files/directories` and
     // `xarchive* entries=0`.
-    BuildIndex(extracted_cache_root);
+    if (haveExtracted) {
+        BuildIndex(extracted_cache_root);
+    }
 
     // F-628: this pass used to be a no-op. BuildIndex ignored its argument
     // (cleared the index and walked m_extracted_root), so it re-walked the
@@ -568,6 +579,7 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
         out_file.handle = nullptr;
         out_file.virtual_rpf.reset();
         out_file.nested_rpf = std::move(nested);
+        out_file.handle_id = handle_id;
         m_open_files[handle_id] = std::make_unique<OpenFileHandle>(out_file);
         MCLA_LOG_INFO("VFS: opened NESTED packfile '{}' logical={}", norm,
                       out_file.size);
@@ -594,6 +606,7 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
                 out_file.handle = h;
                 out_file.virtual_rpf.reset();
                 out_file.nested_rpf.reset();
+                out_file.handle_id = handle_id;
                 m_open_files[handle_id] = std::make_unique<OpenFileHandle>(out_file);
                 MCLA_LOG_INFO("VFS: opened REAL packfile '{}' ({} MB)", norm,
                               static_cast<int>(real_size >> 20));
@@ -614,6 +627,7 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
             out_file.position = 0;
             out_file.handle = nullptr;
             out_file.virtual_rpf = rpf;
+            out_file.handle_id = handle_id;
             m_open_files[handle_id] = std::make_unique<OpenFileHandle>(out_file);
             return true;
         }
@@ -638,6 +652,7 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
     out_file.handle = handle;
     out_file.virtual_rpf.reset();
     out_file.nested_rpf.reset();
+    out_file.handle_id = handle_id;
 
     m_open_files[handle_id] = std::make_unique<OpenFileHandle>(out_file);
     return true;
@@ -2594,6 +2609,24 @@ std::atomic<uint64_t> g_readAtTotal{0};
 std::atomic<uint64_t> g_readAtHandle{0};
 std::atomic<uint64_t> g_readAtNested{0};
 std::atomic<uint64_t> g_readAtFallback{0};
+// F-788 / T43.13 (2026-10-08), census-only new symbol (rule 1b): rows the
+// per-path limiter SUPPRESSED. A missing READAT-BRANCH row used to be
+// indistinguishable from a read that never happened -- that is exactly how the
+// off=001F8000 histogram zero read as "this read never reached
+// RpfVirtualFileSystem::ReadFileAt" when the read had in fact entered this
+// function and been dropped by the limit below (the two 32K CityDefault.fxc page
+// reads). Counts EVERY suppressed row, unsampled; the printed subset is budgeted
+// first-1024-then-every-4096th at the drop site itself so a drop flood cannot
+// reproduce F-054. Never read by any other code path, never reset.
+//
+// Budget history, both measured, do not "simplify" it back: the first shape
+// (first-64-then-every-256th) was consumed entirely by the boot preamble -- on
+// w753 64 drops were spent by call=84 and 512 by call=575, total drops <768
+// (no #768 row printed), so the two drops this probe exists for (the
+// CityDefault.fxc page reads, dropN 513-767) fell in the unprinted gap and
+// READAT-DROP named every drop except its own target. A budget spent before the
+// interesting event is a blind instrument with a passing smoke test.
+std::atomic<uint64_t> g_readAtDropped{0};
 std::mutex g_readAtTraceMtx;
 std::map<std::string, uint64_t> g_readAtPerPath;
 
@@ -2697,7 +2730,11 @@ public:
 
         if ((call % kReadAtEveryN) == 0) {
             MCLA_LOG_WARN("READAT-TOTAL call={} handle={} nested={} fallback={} "
-                          "(every {}th call, UNSAMPLED: the READAT-BRANCH rows are "
+                          // T43.17 (2026-10-13): the essay below names the
+                          // branch-row family without printing its literal,
+                          // so naive substring counts don't double-count these
+                          // totals as branch rows. Same for READAT-DROP.
+                          "(every {}th call, UNSAMPLED: the branch rows are "
                           "rate-limited per path and a sample must not be read as "
                           "the whole -- F-054)",
                           call, g_readAtHandle.load(std::memory_order_relaxed),
@@ -2714,6 +2751,29 @@ public:
         // it is never paid on the rows that print.
         if (!always && seen > kReadAtFirstN && (seen % kReadAtEveryN) != 0 &&
             !WindowInsideRegisteredSpan(packKey_, offset_)) {
+            // F-788 / T43.13 probe (LOG-ONLY, zero behaviour change): print the
+            // row the limiter is about to suppress, budgeted so this line itself
+            // cannot become the F-054 shape. `got` is this call's real
+            // bytes_read -- the read COMPLETED; only the row is missing. Before
+            // this line existed, a zero in a READAT-BRANCH offset histogram could
+            // only be argued (by call/seen counter gaps) into "suppressed"; now
+            // the suppressed row names its own off/req, so a histogram zero and a
+            // read that never happened are finally distinguishable. Budget
+            // re-measured after w753 (see g_readAtDropped): first 1024, then
+            // every 4096th -- every drop of a normal boot (<768 on w753) prints,
+            // a flood still caps.
+            const uint64_t dropN =
+                g_readAtDropped.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (dropN <= 1024 || (dropN % 4096) == 0) {
+                MCLA_LOG_WARN(
+                    "READAT-DROP #{} call={} seen={} path='{}' off={:08X} req={} "
+                    "got={} raw_positional={} "
+                    "(row suppressed by the per-path limiter: seen>{} && seen%{}!=0"
+                    " && out-of-span. The read itself COMPLETED -- this line, not "
+                    "an absent branch row, is the evidence for its offset)",
+                    dropN, call, seen, vpath_, offset_, size_, bytes_read_,
+                    rawPositional_ ? 1 : 0, kReadAtFirstN, kReadAtEveryN);
+            }
             return;
         }
 
@@ -2865,6 +2925,12 @@ bool RpfVirtualFileSystem::CloseFile(OpenFileHandle& file) {
     if (file.handle) {
         CloseHandle(static_cast<HANDLE>(file.handle));
         file.handle = nullptr;
+    }
+    // T43.20 (2026-10-13): remove from m_open_files to fix handle leak.
+    // The handle_id was stored in the OpenFileHandle at OpenFile time.
+    if (file.handle_id != 0) {
+        m_open_files.erase(file.handle_id);
+        file.handle_id = 0;
     }
     file.virtual_rpf.reset();
     // F-628: the nested archive itself is shared and stays mounted (it is
