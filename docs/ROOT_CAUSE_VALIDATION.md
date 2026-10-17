@@ -19633,3 +19633,57 @@ Counts (script): **7,447 XTL successes** (`XTL-ALLOC #7168` at 35.507 s, `seen=7
 **5. Frontier: w766 (108,486 lines; tail measured).** `HB-FLICKER ... mainwait=B73D8040 mainwaitlr=82135DF8 mainwait_age_ms=286345` — main parked since ~12 s in. Race verdict UNDECIDED; falsifier: a per-iteration branch-taken row at `ppc_recomp.17.cpp:4422-4427` + an exit-trap at `loc_821CCA2C`. Brief-supplied, not re-verified: producer `sub_821CC970` exits-on-empty / consumer `sub_821CC800` single-shot attributions, pool-FULL numbers (free 60–68 KB, suitable=0, 314 MB block LIVE `guest_refs=1`), worker-death null-vtable chain (`0x82303220`, `822F96E0→822F8F20→82302FA0`).
 **6. Foundation (brief-supplied except as noted).** Toolchain versions as briefed (cmake/ninja not on this shell's PATH — not confirmed). VFS no-folder fix VERIFIED this session in `w769`: `Fatal error` 0 plus `VFS: extracted cache dir absent (not required) ... indexing game_data root only`. `tools/self_review.py` exists (verified); its gates and the no-hardcoded-addresses rule are brief-supplied.
 **Gates (this append).** Docs only: no build, no boot, no `src/` change; rule 1b: no new symbols; rule 4: no hook. Next free ledger ID after this entry: **F-795** (verify with `grep -a`, never from memory).
+
+### F-795 (2026-10-17) — kTocMemberStoredMask was 30 bits; the true length field is 22. Six UI packfiles got 339 MB "stored" lengths and were refused by the 16 MB sanity ceiling. Narrowed to 0x3FFFFF; 968/968 already-served members unaffected (measured).
+
+**The chain, measured on w787.log first, then fixed and re-measured on w788/w789:**
+
+`w3` of a TOC record carries FLAG BITS above bit 21 — for the UI packfiles, bits 28+26 (0x14000000):
+
+```
+raceeditor.xsf  w3=D4343015: & 0x3FFFFF =   3420181 (correct, served fine pre-F-657)
+                              & 0x3FFFFFFF = 338964501 (339 MB -> sanity gate refuses)
+garage.xsf      w3=D574B032, policecam.xsf w3=D41D2810, credits.xsf w3=D4082813,
+meshtextures.xtd w3=DC2C0810, legals.xsf w3=D454283D  -- same class
+```
+
+F-657 (commit 19f7c56) installed the 30-bit mask as "the guest's own read" (MB=2,ME=31). The mask itself is a correct encoding of that rotate immediate — but the guest reads a RAW FIELD, and the field's low 22 bits are the length while the bits above are flags. The F-632 .list comment already used the correct mask ("w3 & 0x3FFFFF is the on-disk length: 126/452/460/...").
+
+**Consequence before the fix:** XsfOffsetCandidates' `stored > 0x1000000` ceiling refused all six UI packfiles -> HostServeUiBody returned buf=0 size=0 -> no MclaRegisterServedBody -> no served bodies -> the guest's member reads through them got raw bytes -> the boot lost every UI resource.
+
+**The fix:** `kTocMemberStoredMask` 0x3FFFFFFF -> 0x3FFFFF (src/gpu_device.cpp, the constant and 13 use sites, comments updated).
+
+**Safety, measured on w787's own rows:** all 968 XSF-POSTOPEN-SERVE rows with buf!=0 have ZERO bits above 21 in w3 — the narrowing changes nothing for any member that served today. w788 re-measure: all six UI packfiles now serve with real buffers (raceeditor buf=B9874000 size=143069, etc.), XSF-HOSTSERVE 7/7/7/7/4/3 rows, MEMBER-EXPAND-MARK stored=3420181 (the correct value), ARC-WINDOW deliveries 0 -> 1048.
+
+The small `.dcl/.fxc` failures (w3=0x3D / w3=0x0) are a separate defect, NOT this one — their stored is already small; they fail later in the serve for a different reason.
+
+Next free finding ID after this entry: F-796 (verify with grep -a, never from memory).
+
+### F-796 (2026-10-17) — PoliceVoices.xml (rec=B7277250) was read through the guest stream window without ever being served expanded: the raw DEFLATE bytes (+ 618 bytes of the next member) landed in window 0x82860DF8, the tokenizer chewed garbage, and ~144,100 EOF retries parked the main thread. F-796: on-demand serve on a g_servedByEntry miss — read the record geometry, RawInflate the stored extent, admit only if the inflate reproduces w1 exactly. Storm dead (630 -> 0), park moved off B72A0EC0 for the first time.
+
+**Who found it:** the subagent forensics on w787 (T4312-UNDELIVERED trace) + the host-side reading of the ARC-WINDOW deliver gate. The record: `Tune/Audio/PoliceVoices.xml`, w1=947 (logical), w2=0x11BF9D9 (archive offset), w3=0xC0000149 (flags | stored=329). Offline zlib(-15) over xarchive_cache.rpf[0x11BF9D9:+329] inflates to exactly 947 bytes of well-formed `<VoiceList>` XML (subagent-measured, byte-exact).
+
+**Why no serve ever ran:** PathLooksLikeArchiveContent (gpu_device.cpp:482-499) is case-sensitive and has no `.xml` pattern — `Tune/Audio/PoliceVoices.xml` (capital T) does not match `tune/` (lowercase). The XSF-POSTOPEN-SERVE block never fired for this member, so MclaRegisterServedBody never ran, so g_servedByEntry had no body, so the ARC-WINDOW deliver gate could never open. Compounding: kDiscChkForcedAck forced bit31 on the record's first call, routing sub_821CC1E0 down the raw path — the window's first fill was `95 53 5D 4F C2 30 14 7D` (the DEFLATE stream head, byte-verified against the archive), and the XML head `3C566F69` `<Vo` appeared in ZERO rows of w787.
+
+**The fix (src/gpu_device.cpp, in the ARC-WINDOW deliver block, right after the g_servedByEntry lookup):** on a table miss with valid record geometry (off!=0, stored!=0, logical!=0, stored<logical, both under 16 MB), read `stored` bytes from the archive at `off`, RawInflate, and admit ONLY if the inflate reproduces `logical` EXACTLY — the same prove-or-refuse discipline SERVE-PROOF uses. Negative-cache permanent failures (bad geometry, proved-bad inflate); do NOT cache transient VFS failures (a momentary handle shortage must not permanently starve a member). New marker: ARC-ONDEMAND.
+
+**Measured on w789 (full 300 s soak, 123,294 lines):**
+```
+ARC-ONDEMAND #19 rec=B7277250 off=011BF9D9 stored=329 logical=947
+  buf=BE158340 head=3C566F69  (329 -> 947 exact inflate; body registered)
+ARC-WINDOW #1054 rec=B7277250 win=82860DF8 pos=0 req=4096 want=947 done=947
+  body=BE158340 bodySize=947 head=3C566F69  -- '<Vo' delivered into the window
+T4312-UNDELIVERED rec=B7277250: 0  (w787: 630, w788: 565)
+T4312-UNDELIVERED total:      28  (w787: 659, w788: 594)
+F447-REFILL eof counter: 0 -> 14 and stops (w787: climbed past 144,141, spinning)
+mainwait park: B7293E40 (SEMA #14 init=15) -- a DIFFERENT wait from every
+  previous soak's B72A0EC0 (SEMA #15 init=0). The main thread moved past the
+  PoliceVoices wall for the first time.
+Fatal: 0. Out of file handles: 0. (Both invariant across w787/w788/w789.)
+```
+
+The ARC-ONDEMAND refusal arm also works as designed: 8 REFUSED rows with stored==logical (the `.dcl` members, in==out — not DEFLATE, geometry check refuses, negative-cached) and 2 with geom=1 whose inflate did not reproduce w1 (cached, permanent).
+
+**The next wall (named, not solved):** the main thread now parks on B7293E40 (SEMA-CREATE #14, init=15) — all 15 initial permits were consumed and no one is posting more. That is a different chain (the producer's work-available side) and is the next frontier after this entry.
+
+Next free finding ID after this entry: **F-797** (verify with `grep -a`, never from memory).
