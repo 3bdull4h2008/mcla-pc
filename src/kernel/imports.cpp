@@ -6757,8 +6757,31 @@ uint32_t ExCreateThread(be<uint32_t> *handle, uint32_t stackSize,
 
   uint32_t hostThreadId;
 
-  uint32_t kernelHandle = GetKernelHandle(GuestThread::Start(
-      {startAddress, startContext, creationFlags}, &hostThreadId));
+  GuestThreadHandle *hThread = GuestThread::Start(
+      {startAddress, startContext, creationFlags}, &hostThreadId);
+  // F-799 (2026-10-17, w791): register the thread object in the identity
+  // map -- the same two steps NtCreateFile already performs for file
+  // objects (imports.cpp, the "Publish the object in the identity map"
+  // block). Without this EVERY thread handle is unresolvable:
+  // TryQueryKernelObject misses (the entry never existed), and the raw
+  // fallback in ResolveKernelObjectSafe reads handle+8 -- which for a
+  // host-allocated object is the upper half of the 8-byte vptr, NOT
+  // Flink -- so the OBJECT_SIGNATURE proof fails and
+  // ObReferenceObjectByHandle returns STATUS_INVALID_HANDLE for the
+  // title's own thread handles. Measured in w791: the streaming worker
+  // (THREAD-CREATE #17, start=821C91C8) references its own thread object
+  // BE108C40 three times at startup (lr=82131D64/82131DE4/82131E78), all
+  // three fail, and the main thread then parks on SEMA #39 (BE108BC0)
+  // forever because the worker never reaches the code that releases it.
+  // identityHdrAddr is what DestroyKernelObject (xdm.cpp:12-13) erases
+  // on, so a closed thread's entry cannot outlive it.
+  hThread->identityHdrAddr = GetKernelHandle(hThread);
+  {
+    std::lock_guard guard{g_kernelLock};
+    WrapperIdentityMap()[hThread->identityHdrAddr] = {hThread,
+                                                     hThread->header.Type};
+  }
+  uint32_t kernelHandle = hThread->identityHdrAddr;
   if (handle)
     handle->set(kernelHandle);
 

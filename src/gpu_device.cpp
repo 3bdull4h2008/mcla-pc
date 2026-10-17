@@ -13,6 +13,8 @@
 #include "generated/ppc_xenon/ppc_context.h"
 #include "kernel/memory.h"
 #include "kernel/heap.h"
+#include "kernel/xdm.h"          // F-797: LookupIdentityKernelObject for slot-sem count
+#include "kernel/kernel_objects.h" // F-797: Semaphore (count is a public atomic)
 #include "logging.h"
 #include <cpu/ppc_context.h>
 #include "fs/vfs_rpf.h"
@@ -479,23 +481,44 @@ static bool IsJob2UiDest(uint32_t outPtr) {
 // predicate widened, so the next soak's result is about the fix and not about
 // the ordering. `tune/` and `.lst` are last in the chain so the older, better
 // understood families are unaffected by their cost.
+// F-798 (2026-10-17, subagent case-audit): the guest's OWN TOC hash is
+// case-INSENSITIVE (MclaTocHash :21351 folds A-Z) and the whole src/fs layer
+// lowercases (NormalizePath/NormalizeNestedKey/LowerAscii) -- this predicate
+// was the ONLY case-sensitive layer between the guest and its bytes. One
+// lost member (PoliceVoices.xml, capital Tune/) cost 144,100 reads + a park
+// (F-796), and w789/w790 show a second (PoliceScript.xml, capital T) and a
+// third class (.fxc/.dcl with no pattern at all). Fix: fold the input to
+// lowercase ONCE into a bounded stack copy, run the same substring checks
+// on the folded copy, and add the .xml family the predicate never had.
+// The callers' semantics are unchanged for every path that already matched
+// (lowercase patterns still match lowercase paths bit-for-bit); the change
+// is strictly ADDITIVE: paths that differ only in case now match too.
 static bool PathLooksLikeArchiveContent(const char *path) {
   if (!path || !path[0])
     return false;
-  return std::strstr(path, ".xsf") != nullptr ||
-         std::strstr(path, ".xtd") != nullptr ||
-         std::strstr(path, ".list") != nullptr ||
-         std::strstr(path, "globaltex") != nullptr ||
-         std::strstr(path, "preload") != nullptr ||
-         std::strstr(path, "shaders/") != nullptr ||
-         std::strstr(path, "textures/") != nullptr ||
-         std::strstr(path, "resources/") != nullptr ||
+  char folded[300];
+  size_t i = 0;
+  for (; path[i] && i < sizeof(folded) - 1; ++i)
+    folded[i] = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(path[i])));
+  folded[i] = '\0';
+  return std::strstr(folded, ".xsf") != nullptr ||
+         std::strstr(folded, ".xtd") != nullptr ||
+         std::strstr(folded, ".list") != nullptr ||
+         std::strstr(folded, ".xml") != nullptr ||
+         std::strstr(folded, ".lst") != nullptr ||
+         std::strstr(folded, ".dcl") != nullptr ||
+         std::strstr(folded, ".fxc") != nullptr ||
+         std::strstr(folded, "globaltex") != nullptr ||
+         std::strstr(folded, "preload") != nullptr ||
+         std::strstr(folded, "shaders/") != nullptr ||
+         std::strstr(folded, "textures/") != nullptr ||
+         std::strstr(folded, "resources/") != nullptr ||
          // F-632: the tuning files. `tune/vehicle/vehicle0008.lst` is the path
          // F-464/F-443/F-444 have been chasing (BDF20 #600 ret=0, F442-SECTION
          // 14 rows all hits=0) and it is the member shape the fixed serve can
          // now actually deliver.
-         std::strstr(path, ".lst") != nullptr ||
-         std::strstr(path, "tune/") != nullptr;
+         std::strstr(folded, "tune/") != nullptr;
 }
 
 static bool PathLooksLikeUiBody(const char *path) {
@@ -22727,7 +22750,7 @@ PPC_FUNC(sub_821CCEA0) {
     {
       std::lock_guard<std::mutex> lk(g_xsfMtx);
       auto it = g_xsfToc.find(path);
-      if (it == g_xsfToc.end() && std::strncmp(path, "a:/archive/", 11) == 0)
+      if (it == g_xsfToc.end() && _strnicmp(path, "a:/archive/", 11) == 0)
         it = g_xsfToc.find(path + 11);
       if (it != g_xsfToc.end()) {
         tocEntry = it->second.entry;
@@ -22878,7 +22901,7 @@ PPC_FUNC(sub_821CCEA0) {
       {
         std::lock_guard<std::mutex> lk(g_xsfMtx);
         auto it = g_xsfToc.find(path);
-        if (it == g_xsfToc.end() && std::strncmp(path, "a:/archive/", 11) == 0)
+        if (it == g_xsfToc.end() && _strnicmp(path, "a:/archive/", 11) == 0)
           it = g_xsfToc.find(path + 11);
         if (it != g_xsfToc.end())
           it->second.bodyHits++;
@@ -24697,7 +24720,7 @@ PPC_FUNC(sub_821CAFB8) {
         std::lock_guard<std::mutex> lk(g_xsfMtx);
         auto it = g_xsfToc.find(path);
         if (it == g_xsfToc.end() &&
-            std::strncmp(path, "a:/archive/", 11) == 0)
+            _strnicmp(path, "a:/archive/", 11) == 0)
           it = g_xsfToc.find(path + 11);
         if (it != g_xsfToc.end()) {
           tocEntry = it->second.entry;
@@ -27602,19 +27625,32 @@ PPC_FUNC_IMPL(__imp__sub_821CC800);
 static std::atomic<uint32_t> s_gfiEnq{0};
 PPC_FUNC(sub_821CC800) {
   // F-780: enqueue-side visibility. r3=mgr, r4=item ptr.
+  // F-797 (2026-10-17): also read [mgr+240] (the SLOT semaphore handle)
+  // and its LIVE COUNT from the host wrapper, so a permit leak is visible
+  // per-enqueue instead of only in the throttled RELSEMA-RES sample.
   const uint32_t en = s_gfiEnq.fetch_add(1) + 1;
   const uint32_t mgr = ctx.r3.u32;
   const uint32_t item = ctx.r4.u32;
-  uint32_t ih0=0,ih1=0,ih2=0, widx=0,cnt=0;
+  uint32_t ih0=0,ih1=0,ih2=0, widx=0,cnt=0, slotH=0;
   auto &m = mcla::kernel::GuestMemoryHeap::Instance();
   (void)m.ReadU32BE(item, &ih0);
   (void)m.ReadU32BE(item+4, &ih1);
   (void)m.ReadU32BE(item+8, &ih2);
   (void)m.ReadU32BE(mgr+224u, &widx);
   (void)m.ReadU32BE(mgr+232u, &cnt);
+  (void)m.ReadU32BE(mgr+240u, &slotH);
+  uint32_t slotCnt = 0xFFFFFFFFu;
+  if (slotH != 0u && slotH != 0xCDCDCDCDu) {
+    KernelObject *ko = LookupIdentityKernelObject(slotH);
+    if (ko) {
+      Semaphore *sem = dynamic_cast<Semaphore *>(ko);
+      if (sem)
+        slotCnt = sem->count.load(std::memory_order_relaxed);
+    }
+  }
   MCLA_LOG_WARN("FI-ENQ #{} mgr={:08X} item={:08X} triple={{ {:08X},{:08X},{:08X} }} "
-                "widx224={} count232={}",
-                en, mgr, item, ih0, ih1, ih2, widx, cnt);
+                "widx224={} count232={} slotSem={:08X} slotCnt={}",
+                en, mgr, item, ih0, ih1, ih2, widx, cnt, slotH, slotCnt);
   __imp__sub_821CC800(ctx, base);
 }
 

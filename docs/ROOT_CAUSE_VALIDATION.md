@@ -19687,3 +19687,57 @@ The ARC-ONDEMAND refusal arm also works as designed: 8 REFUSED rows with stored=
 **The next wall (named, not solved):** the main thread now parks on B7293E40 (SEMA-CREATE #14, init=15) — all 15 initial permits were consumed and no one is posting more. That is a different chain (the producer's work-available side) and is the next frontier after this entry.
 
 Next free finding ID after this entry: **F-797** (verify with `grep -a`, never from memory).
+
+### F-797 (2026-10-17) — slot-semaphore permit-leak hypothesis REFUTED by a live-count instrument; the B7293E40 park was transient and the boot moved past it on its own. The park chain keeps advancing every soak.
+
+**Hypothesis under test (carried from w789's park on B7293E40, SEMA #14 init=15):** the fiReadCache ring's slot semaphore was leaking permits (enqueue acquires, producer fails to release) until the count hit 0 and the 296th enqueue blocked forever.
+
+**Instrument:** the FI-ENQ hook (F-780, gpu_device.cpp) gained a live count read — [mgr+240] resolves via LookupIdentityKernelObject to the host Semaphore wrapper, and `count.load()` prints as `slotCnt=` on every enqueue row (F-797).
+
+**Measured on w790 (full 300 s, 123k+ lines): 310 FI-ENQ rows, slotCnt NEVER below 14.** The count oscillates 15↔14 the entire run — one acquire drops it to 14, the producer's release restores 15 before the next enqueue. The last 10 enqueues all show slotCnt=15 (full). The semaphore is healthy; the leak hypothesis is dead. The w789 park on B7293E40 resolved itself; w790's boot went ~3.5 minutes deeper and parked on a NEW handle: BFAB1EC0 = SEMA-CREATE #53 init=0 (a signal class, same family as the original B72A0EC0 park but 38 semaphores further into the boot).
+
+Park progression across soaks (all measured, mainwait from HB-FLICKER):
+- w787: B72A0EC0 (SEMA #15) — the PoliceVoices EOF spin (F-796)
+- w789: B7293E40 (SEMA #14) — transient; resolved
+- w790: BFAB1EC0 (SEMA #53) — the current wall; who should release it is the next frontier
+
+Next free finding ID after this entry: **F-798** (verify with `grep -a`, never from memory).
+
+### F-798 (2026-10-17, subagent case-audit) — PathLooksLikeArchiveContent was the ONLY case-sensitive layer between the guest and its bytes: the guest's own TOC hash folds A-Z (MclaTocHash), the entire src/fs layer lowercases, and every one of the 10 predicate patterns was a case-sensitive strstr with no .xml at all. Fixed: fold once, add .xml/.dcl/.fxc; 3 strncmp("a:/archive/") sites made _strnicmp.
+
+**The audit's systemic finding (subagent, read-only, 59 compare sites inventoried in gpu_device.cpp + all of vfs_rpf.cpp + rpf3_nested):**
+- `MclaTocHash` (gpu_device.cpp:21351) folds A-Z to lowercase — the guest accepts `Tune/...` and `tune/...` as the SAME member.
+- `src/fs` is fully case-insensitive: NormalizeNestedKey (vfs_rpf.cpp:43-62), NormalizePath (:166-188), PackKeyOf (:853-868), LowerAscii (rpf3_nested.cpp:112-128) all lowercase.
+- `PathLooksLikeArchiveContent` (:485-498) — the gate for the ENTIRE path-keyed serve pipeline (TOC cache :529, TOC76-XSF registration :22287, open-serve :22724, AFB8 host-serve :24679) — was 10x case-sensitive `strstr` with NO `.xml` pattern. F-796 measured the cost of ONE lost member: 144,100 failed reads + a park.
+
+**Measured members lost to the family:** PoliceVoices.xml (w787/w788, fixed by F-796's record-keyed route), PoliceScript.xml (w789:62080, capital T, visible only through g_slotPath attribution because the census gates reused the same broken predicate — the "self-hiding" property the audit named), and the .dcl/.fxc class (8 files, served buf=0 in every soak since w787, with no pattern matching them at all).
+
+**The fix (gpu_device.cpp, PathLooksLikeArchiveContent):** fold the input path to lowercase ONCE into a bounded 300-byte stack copy, run the same substring checks on the folded copy, and add `.xml`, `.dcl`, `.fxc`. Strictly additive: every path that matched before (all-lowercase) still matches bit-for-bit; paths differing only in case now match too. Also: the three `std::strncmp(path,"a:/archive/",11)` sites (:22753, :22904, :24723) now use `_strnicmp`, agreeing with the five sites that were already case-insensitive (:3045, :22372, :3772).
+
+**Known-remaining members of the same family (audit findings #2/#2b/#3/#4, NOT fixed here, recorded so they are not rediscovered):** g_xsfToc keys are raw-case AND truncated at 64 bytes by the TOC76 buffer (3 of 422 w789 paths >= 64 chars, one visibly cut mid-word); MclaNormalizeArchivePath (:3769) does not lowercase; GuestPathToVirtual (vfs_rpf.h:313) strips prefixes case-sensitively. Each is a separate fix with its own measurement.
+
+Next free finding ID after this entry: **F-799** (verify with `grep -a`, never from memory).
+
+### F-799 (2026-10-17) — every guest thread handle was unresolvable: ExCreateThread never registered the thread object in WrapperIdentityMap, so ObReferenceObjectByHandle failed on ALL thread handles (STATUS_INVALID_HANDLE). The streaming worker (THREAD #17) could not reference its own thread object at startup and the main thread parked on SEMA #39 forever. Fixed by mirroring NtCreateFile's registration.
+
+**The chain, measured on w791 (115,094 lines):**
+
+```
+11:56:13.469  SEMA-CREATE #38 h=BE108B40 init=0     } the worker's
+11:56:13.469  SEMA-CREATE #39 h=BE108BC0 init=0     } semaphore pair
+11:56:13.469  THREAD-CREATE #17 start=821C91C8      } the streaming worker
+11:56:13.470  OB-REF: handle=BE108C40 objectType=1B000100 -> INVALID_HANDLE  x3
+              (lr=82131D64 / 82131DE4 / 82131E78)
+11:56:15.007  first HB-FLICKER with mainwait=BE108BC0 -- the park
+...           276 seconds of park, ZERO releases of BE108BC0, boot ends
+```
+
+- BE108C40 is the third consecutive +0x80 object-table allocation right after the two semaphores -- the THREAD #17 handle (GetKernelHandle returns MapVirtual(obj), and the three allocations are the same allocator's stride).
+- `ExCreateThread` (imports.cpp, the THREAD-CREATE census block) called `GetKernelHandle(GuestThread::Start(...))` and NEVER registered the returned GuestThreadHandle in WrapperIdentityMap -- unlike NtCreateFile, which registers its FileObject with identityHdrAddr + map insert (imports.cpp:1548-1580, the pattern this fix copies verbatim).
+- Without the map entry, ResolveKernelObjectSafe falls to the raw-guest path, whose OBJECT_SIGNATURE proof reads handle+8 in guest memory -- which for a host-allocated object is the upper half of the 8-byte vptr, NOT WaitListHead.Flink -- so the proof fails for every host wrapper object not in the map.
+- `objectType=1B000100` is garbage from the void stub `ExThreadObjectType()` (imports.cpp:706, LOG_UTILITY only) -- the guest asked for the type object pointer and got r3's stale value. The OB-REF implementation does not gate on objectType (it resolves by handle), so the garbage type is a symptom recorded here, not the refusal cause; the missing map entry is the cause.
+- The guest caller chain (all raw-verified): sub_821C9308 (the streaming worker init, +0xf4 bl 82131D40) -> sub_82131D40 -> bl 827BCE84 = __imp__ObReferenceObjectByHandle. The worker references its own thread object three times at startup; all three fail; whatever it gates on that reference never runs; SEMA #39 is never released; the main thread parks. Park handle census: BE108BC0 = SEMA-CREATE #39 init=0, ZERO release rows in the entire log.
+
+**The fix (imports.cpp, ExCreateThread):** capture the GuestThreadHandle* from GuestThread::Start, set `identityHdrAddr = GetKernelHandle(hThread)`, insert `WrapperIdentityMap()[identityHdrAddr] = {hThread, hThread->header.Type}` under g_kernelLock -- byte-for-byte the NtCreateFile registration shape. identityHdrAddr is what DestroyKernelObject (xdm.cpp:12-13) erases on, so a closed thread's entry cannot outlive it.
+
+Next free finding ID after this entry: **F-800** (verify with `grep -a`, never from memory).
