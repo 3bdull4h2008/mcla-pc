@@ -22554,6 +22554,10 @@ static std::atomic<uint32_t> s_hCCEA0{0};
 // reader is the window row in PPC_FUNC(sub_821BE250) below.
 static std::mutex g_slotPathMtx;
 static char g_slotPath[16][256] = {{0}};
+// F-800b: per-slot last-use ordinal (the LRU clock for FD-RESCUE). Bumped on
+// every successful open; the rescue evicts the slot with the smallest value.
+static std::atomic<uint64_t> g_slotUseOrd[16] = {};
+static std::atomic<uint64_t> g_slotUseSeq{1};
 static std::atomic<uint64_t> s_slotPathSets{0};
 PPC_FUNC(sub_821CCEA0) {
   const uint32_t n = s_hCCEA0.fetch_add(1) + 1;
@@ -22661,6 +22665,56 @@ PPC_FUNC(sub_821CCEA0) {
       }
     }
   }
+  // F-800b (2026-10-17, w793 measurement): FD-RESCUE, the DICTSLOT-RESCUE-v6
+  // pattern applied to the per-device 16-slot FD table. MEASURED: all 17
+  // (d)-class "Out of file descriptors" failures are on device 1 (the
+  // cache.rpf device); the lighting preload holds 9 slots semi-permanently
+  // and the controller-map phase fills the rest; the audio config opens
+  // (PoliceVoices/PoliceScript.xml) then fail fatally -> null stream ->
+  // the main thread dies on the divw at 82145020. The slots DO rotate
+  // during boot (the close path works), so eviction is a MITIGATION, not
+  // a bypass: the LRU slot's data is already served and resident in
+  // g_servedByEntry (the guest can re-open it). Labelled and cited.
+  // Behavior: pre-call only; if the table has a free slot this does NOTHING.
+  {
+    auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
+    bool allBusy = true;
+    uint32_t freeIdx = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < 16; ++i) {
+      uint32_t occ = 0;
+      (void)memR.ReadU32BE(dev + 40u + i * 68u, &occ);
+      if (occ == 0 || occ == 0xCDCDCDCDu) {
+        allBusy = false;
+        freeIdx = i;
+        break;
+      }
+    }
+    if (allBusy && path[0]) {
+      // Evict the least-recently-USED slot (smallest ordinal). The lighting
+      // preload files (opened early, never closed) go first; their bodies
+      // are served and cached. The eviction only writes the slot-occupant
+      // word -- the same word the guest's own close path zeroes.
+      uint32_t best = 0;
+      uint64_t bestOrd = UINT64_MAX;
+      for (uint32_t i = 0; i < 16; ++i) {
+        if (g_slotUseOrd[i] < bestOrd) {
+          bestOrd = g_slotUseOrd[i];
+          best = i;
+        }
+      }
+      uint32_t evOcc = 0;
+      (void)memR.ReadU32BE(dev + 40u + best * 68u, &evOcc);
+      (void)memR.WriteU32BE(dev + 40u + best * 68u, 0);
+      static std::atomic<uint32_t> s_fdRescue{0};
+      const uint32_t rn = s_fdRescue.fetch_add(1) + 1;
+      std::lock_guard<std::mutex> lk2(g_slotPathMtx);
+      MCLA_LOG_WARN(
+          "FDRESCUE #{} dev={:08X} path='{}' evictedSlot={} evictedOcc={:08X} "
+          "evictedPath='{}' (LRU; the 16-slot table was full -- F-800b, "
+          "same pattern as DICTSLOT-RESCUE v6)",
+          rn, dev, path, best, evOcc, g_slotPath[best]);
+    }
+  }
   __imp__sub_821CCEA0(ctx, base);
   const int32_t ret = static_cast<int32_t>(ctx.r3.s32);
   // UnCONDITIONAL (outside the census gate below, which is rate-limited) so the
@@ -22669,6 +22723,34 @@ PPC_FUNC(sub_821CCEA0) {
     std::lock_guard<std::mutex> lk2(g_slotPathMtx);
     std::snprintf(g_slotPath[ret], sizeof(g_slotPath[ret]), "%s", path);
     (void)s_slotPathSets.fetch_add(1);
+    // F-800b: bump the LRU ordinal for the slot just taken.
+    g_slotUseOrd[static_cast<uint32_t>(ret)].store(
+        g_slotUseSeq.fetch_add(1), std::memory_order_relaxed);
+  }
+  // F-800 (2026-10-17, from the -1 fingerprint agent): ret==-1 with
+  // lr=821CCF40 is the guest's OWN "Out of file descriptors" -- all 16
+  // per-device FD slots busy (dev+40+i*68, stride 68). This killed the
+  // audio thread (PoliceVoices/PoliceScript.xml at 12:57:34.5, w792) and
+  // with it the main thread's whole boot. Dump the 16 occupants + their
+  // attributed paths so the next soak names exactly WHO holds the table.
+  // Census-only: reads, prints, changes nothing. Budget: first 40, then
+  // every 10th (the failures cluster in bursts; 17 fired in w792).
+  if (ret == -1) {
+    static std::atomic<uint32_t> s_fdFail{0};
+    const uint32_t fn = s_fdFail.fetch_add(1) + 1;
+    if (fn <= 40 || (fn % 10) == 0) {
+      auto &memFd = mcla::kernel::GuestMemoryHeap::Instance();
+      MCLA_LOG_WARN(
+          "FDFAIL #{} dev={:08X} path='{}' lr={:08X} -- 16-slot dump:",
+          fn, dev, path, static_cast<uint32_t>(ctx.lr));
+      for (uint32_t i = 0; i < 16; ++i) {
+        uint32_t occ = 0;
+        (void)memFd.ReadU32BE(dev + 40u + i * 68u, &occ);
+        std::lock_guard<std::mutex> lk2(g_slotPathMtx);
+        MCLA_LOG_WARN("  FDFAIL slot {:2d} occ={:08X} path='{}'", i, occ,
+                      g_slotPath[i]);
+      }
+    }
   }
   if (ui || n <= 24 || (n % 200) == 0) {
     uint32_t e0 = 0, e4 = 0, e8 = 0, e12 = 0;

@@ -1105,6 +1105,76 @@ PPC_FUNC(sub_825FDBF8)
         (void)mem.ReadU32BE(arr, &arr0);
     const bool arrPoison = (arr0 == 0xCDCDCDCDu);
     const bool arrGate = !poison && !arrPoison && MclaPtrIsGateBad(arr0);
+    // F-801 (2026-10-17): dump the SOURCE (r4) the build pass reads. The
+    // w792 measurement: FDBF8-BUILD #002/#003 ran on obj=B7B41000 with
+    // r4=BA607640/BA607940, wrote the swfC vtable (82085364), but produced
+    // cnt=0/arr=0 -- because the DECODED body shows the build pass CONSUMES
+    // [obj+12]/[obj+16]; they must be filled by the construct opcode
+    // (825EF248) which W33 measures as never-on-place-path. This dump
+    // answers the upstream question: is the source the build reads valid
+    // (RSC5/5500-family head) or garbage? Prints r4's first 8 dwords and
+    // the type byte at [r4+172] (the dispatcher 825FDB30 reads it to pick
+    // THIS builder). Budget: first 24 builds.
+    //
+    // F-801b (2026-10-17, after the w793 read + CodeX mining): [src+0] is a
+    // POINTER to the actual movie data (w793: src=BA6074C0 -> [src+0]=
+    // BA3F74C0). Per CodeX's Rsc5FlashMovie layout, the movie root at the
+    // data base carries: +0 VFT (serialized 0x44495500 'DIU\0'), +12
+    // ScenesPosition (u32, base-relative 0x5xxxxxxx), +16 ScenesCount u16,
+    // +24 CharactersPosition, +28 CharactersCount u16, +36 Width f32,
+    // +44 Height f32, +48 FrameRate u16 (8.8), +50 FrameCount u16. Dump
+    // THOSE: if intact, the construct's gate (not the data) is the wall;
+    // if garbage, the streamer never staged the decoded bytes here.
+    if (n <= 24) {
+        const uint32_t src = ctx.r4.u32;
+        uint32_t s0=0,s4=0,s8=0,s12=0,s16=0,s20=0,s24=0,s28=0;
+        uint32_t type172 = 0;
+        uint32_t dataBase = 0;
+        if (src != 0 && src != 0xCDCDCDCDu) {
+            (void)mem.ReadU32BE(src +  0, &s0);
+            (void)mem.ReadU32BE(src +  4, &s4);
+            (void)mem.ReadU32BE(src +  8, &s8);
+            (void)mem.ReadU32BE(src + 12, &s12);
+            (void)mem.ReadU32BE(src + 16, &s16);
+            (void)mem.ReadU32BE(src + 20, &s20);
+            (void)mem.ReadU32BE(src + 24, &s24);
+            (void)mem.ReadU32BE(src + 28, &s28);
+            uint8_t tb = 0;
+            if (mem.ReadU8(src + 172, &tb))
+                type172 = tb;
+            dataBase = s0;
+        }
+        // F-801b: the movie root behind [src+0].
+        uint32_t mVFT=0,mScenesPos=0,mCharsPos=0;
+        uint16_t mScenesCnt=0,mCharsCnt=0,mFrameRate=0,mFrameCount=0;
+        uint32_t mWidth=0,mHeight=0,mHead4=0,mHead8=0;
+        if (dataBase != 0 && dataBase != 0xCDCDCDCDu && dataBase != src) {
+            (void)mem.ReadU32BE(dataBase +  0, &mVFT);
+            (void)mem.ReadU32BE(dataBase +  4, &mHead4);
+            (void)mem.ReadU32BE(dataBase +  8, &mHead8);
+            (void)mem.ReadU32BE(dataBase + 12, &mScenesPos);
+            (void)mem.ReadU16BE(dataBase + 16, &mScenesCnt);
+            (void)mem.ReadU32BE(dataBase + 24, &mCharsPos);
+            (void)mem.ReadU16BE(dataBase + 28, &mCharsCnt);
+            (void)mem.ReadU32BE(dataBase + 36, &mWidth);
+            (void)mem.ReadU32BE(dataBase + 44, &mHeight);
+            (void)mem.ReadU16BE(dataBase + 48, &mFrameRate);
+            (void)mem.ReadU16BE(dataBase + 50, &mFrameCount);
+        }
+        MCLA_LOG_WARN("FDBF8-SRC #{:03} obj={:08X} src={:08X} "
+                      "head=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                      "{:08X} {:08X}] type@172={:02X}",
+                      n, obj, src, s0, s4, s8, s12, s16, s20, s24, s28,
+                      type172);
+        if (dataBase != 0 && dataBase != src)
+            MCLA_LOG_WARN("FDBF8-MOVIEROOT #{} dataBase={:08X} VFT={:08X} "
+                          "+4={:08X} +8={:08X} scenesPos={:08X} scenesCnt={} "
+                          "charsPos={:08X} charsCnt={} width={} height={} "
+                          "frameRate={} frameCount={}",
+                          n, dataBase, mVFT, mHead4, mHead8, mScenesPos,
+                          mScenesCnt, mCharsPos, mCharsCnt, mWidth, mHeight,
+                          mFrameRate, mFrameCount);
+    }
     if (n <= 16 || (n % 200) == 0 || poison || arrPoison || arrGate)
         MCLA_LOG_WARN("FDBF8-BUILD #{:03} obj={:08X} vt={:08X} +4={:08X} "
                       "+8={:08X} arr={:08X} [arr]={:08X} cnt={} lr={:08X}{}{}",
