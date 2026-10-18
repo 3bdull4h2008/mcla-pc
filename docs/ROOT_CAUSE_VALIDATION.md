@@ -19771,3 +19771,19 @@ Next free finding ID after this entry: **F-802** (verify with `grep -a`, never f
 **Key measurement:** the data at A3A6A000 is being MUTATED between probes (#2: VFT=8200C454, #3: VFT=44365500, chars=50000320/58) — the place pass IS writing it, but the movie-root VFT (0x44495500) was not found. The charsPos=50000320 (a 0x5-prefixed RSC5 virtual pointer) with count 58 is the most meaningful value: the character table is being built, but the scene array (ScenesPosition/ScenesCount at +12/+16) and the movie root VFT are not yet in the scanned window.
 
 Next free finding ID after this entry: **F-804** (verify with `grep -a`, never from memory).
+
+### F-804 (2026-10-18, input-audit agent + w798) — XamInputGetCapabilities arity: 4 args declared, 3 passed by the guest. Every caps query returned INVALID_PARAMETER (0xC000000D) because HostToGuestFunction marshalled r6 (stale) as the caps pointer. Folded to 3 args; w798 confirms port 0 = "host keyboard (labelled fallback)", ports 1-3 = DEVICE_NOT_CONNECTED — correct retail semantics.
+
+**The defect:** src/kernel/xam.cpp:868 declared `(unk, userIndex, flags, caps)`; the guest wrapper sub_8275CB70 sets r3=index, r4=1, r5=&caps, no r6 write. The comment cited imports.cpp:3675 as the binding anchor — stale (that line is NtReadFileScatter now); real hook is imports.cpp:7440. The body used `userIndex`/`flags`/`caps` correctly but `unk` was the shifted user index.
+
+**The fix:** signature folded to `(userIndex, flags, caps)`; removed the now-meaningless `(void)unk`. Build + w798 soak confirms the arity is now correct (4 caps rows, all decode sanely).
+
+### F-805 (2026-10-18, audio-audit agent + w797) — two void-stub body swaps on the audio path: XMACreateContext and XAudioGetVoiceCategoryVolume. The bodies already existed in apu/audio.cpp but the import thunks were `void ... { LOG_UTILITY("!!! STUB !!!"); }` — r3 garbage + unwritten guest buffer (F-799 class). Wired the stubs to the real bodies.
+
+- imports.cpp:7223 `void XMACreateContext()` -> `uint32_t XMACreateContext(be<uint32_t>* outContext)` calling `apu::XmaCreateContext` (audio.cpp:623)
+- imports.cpp:7196 `void XAudioGetVoiceCategoryVolume()` -> `uint32_t XAudioGetVoiceCategoryVolume(uint32_t Driver, be<uint32_t>* Volume)` writing unity volume + returning 0
+- imports.cpp:7221 `void XMAReleaseContext()` -> `void XMAReleaseContext(uint32_t contextPtr)` calling `apu::XmaReleaseContext` (audio.cpp:639)
+
+XMA remains unwired (no FrameDecoder backend, no MMIO at 0x7FEA0000, no decode worker) — that is a deeper fix for the intro-movie stage, not the legals frame. The body-swaps are the minimal honest fix: the guest's context handle now comes from the real allocator instead of garbage, and the voice-category query returns 0 instead of a void-stub's uninitialized r3.
+
+Next free finding ID after this entry: **F-806** (verify with `grep -a`, never from memory).
