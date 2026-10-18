@@ -1,4 +1,4 @@
-// Task-runner dispatch forensics (P1 + P4) - 2026-08-24 session.
+﻿// Task-runner dispatch forensics (P1 + P4) - 2026-08-24 session.
 //
 // P1: log-only census on sub_825FDB30 (task-runner dispatch). For every
 // invocation record caller LR, container, task, entry, head, node, obj, fn,
@@ -22,7 +22,7 @@
 #include <atomic>
 #include <vector>
 
-// w9: PSTREAM virtual→physical map published by gpu_device.cpp at RSC-HEAD
+// w9: PSTREAM virtualâ†’physical map published by gpu_device.cpp at RSC-HEAD
 // parse. sub_8217D890 uses it to resolve leftover 0x50xxxxxx virtuals.
 struct MclaRebaseRegion {
     uint32_t vbase, pbase, size;
@@ -40,7 +40,7 @@ extern bool MclaW32OpenConstructWalk(uint32_t obj, uint32_t stack,
 
 // w15: nested 5500-family resource heads observed by FDBF8-build as CHILDREN
 // (lr=825EF1FC). Guest place-pass 825EF100 converts these to 8208xxxx when
-// run as ROOT (proven: 44495500→82085364 on B7B41000, D0815500→82088784 on
+// run as ROOT (proven: 44495500â†’82085364 on B7B41000, D0815500â†’82088784 on
 // B7B61000) but children only get FDBF8-build, so vt stays C4445500/D0815500.
 // Record objects here; gpu_device.cpp re-dispatches the guest place-pass on
 // them after the root ARR-RERUN. Never invent a vtable.
@@ -94,7 +94,7 @@ void ScanForDispatchVtableWords(uint32_t imageBase, uint32_t imageSize)
     mcla::native::RegisterGuestWatchRange(0x82085200u, 0x82085400u);
     mcla::native::RegisterGuestWatchRange(0xB7B6D9B0u, 0xB7B6DA00u);
     mcla::native::RegisterGuestWatchRange(0xB7B41000u, 0xB7B41040u);
-    // w31: dest-range leads — catch guest child-vt writes into rebased
+    // w31: dest-range leads â€” catch guest child-vt writes into rebased
     // PSTREAM nodes (B7984DE0 / B79B0C20 family) after fill+place.
     mcla::native::RegisterGuestWatchRange(0xB7984DE0u, 0xB7984E20u);
     mcla::native::RegisterGuestWatchRange(0xB79B0C20u, 0xB79B0C60u);
@@ -193,7 +193,7 @@ PPC_FUNC(sub_825FDB30)
     // p2f: poison containers (the never-filled preload buffers, e.g.
     // B7B41000 with vt/arr=CDCDCDCD) made the unchecked pointer math in
     // both the census below AND the original body read unmapped guest
-    // addresses (entryTable=CDCD + idx<<3) — the vectored-handler AV
+    // addresses (entryTable=CDCD + idx<<3) â€” the vectored-handler AV
     // storm at 2+ minutes (crash rva=0x121BF5, caught but noisy).
     // Empty dispatch for poison containers.
     {
@@ -209,7 +209,7 @@ PPC_FUNC(sub_825FDB30)
             const uint32_t dn = s_fdb30Dead.fetch_add(1) + 1;
             if (dn <= 16 || (dn % 500) == 0)
                 MCLA_LOG_WARN("FDB30-DEAD #{:03} cont={:08X} task={:08X} "
-                              "lr={:08X} (poison container — empty dispatch)",
+                              "lr={:08X} (poison container â€” empty dispatch)",
                               dn, container, task,
                               static_cast<uint32_t>(ctx.lr));
             return;
@@ -326,7 +326,7 @@ PPC_FUNC(sub_825FDB30)
 // sub_825FDA90(group=r3, object=r4): tag=u8[object+8]; table @0x825FDAC0.
 PPC_FUNC_IMPL(__imp__sub_825FDA90);
 static std::atomic<uint32_t> s_hFDA90{0};
-// w31: FDA90 type-write census — who constructs child swfC?
+// w31: FDA90 type-write census â€” who constructs child swfC?
 static std::atomic<uint32_t> s_fda90TagHist[16] = {};
 static std::atomic<uint32_t> s_fda90WroteVt{0};
 static std::atomic<uint32_t> s_fda90Gated{0};
@@ -361,7 +361,7 @@ PPC_FUNC(sub_825FDA90)
     uint32_t v0 = 0;
     (void)mem.ReadU32BE(node, &v0);
     const bool gateBad = node != 0 && MclaPtrIsGateBad(node);
-    // Guest body: type=u8[node+8]; case=type-1; case>8 → fatal unknown type.
+    // Guest body: type=u8[node+8]; case=type-1; case>8 â†’ fatal unknown type.
     // Valid types are 1..9. Gate garbage from the 44495500 place walk so
     // EF100 can finish and write the real swfC vtable (never invent one).
     const bool unknownType = (tag < 1u || tag > 9u);
@@ -379,12 +379,12 @@ PPC_FUNC(sub_825FDA90)
     {
         s_fda90Gated.fetch_add(1);
         MCLA_LOG_WARN("FDA90-GATE #{:05} node={:08X} tag={:02X} [0]={:08X} "
-                      "lr={:08X} — skip fixup dispatch (place-walk garbage)",
+                      "lr={:08X} â€” skip fixup dispatch (place-walk garbage)",
                       n, node, tag, v0, static_cast<uint32_t>(ctx.lr));
         return;
     }
 
-    // w31: valid type 1..9 — census what the guest body writes.
+    // w31: valid type 1..9 â€” census what the guest body writes.
     s_fda90Passed.fetch_add(1);
     if (tag < 16u)
         s_fda90TagHist[tag].fetch_add(1);
@@ -394,7 +394,7 @@ PPC_FUNC(sub_825FDA90)
     // __imp__ body performs the real in-function goto switch.
     __imp__sub_825FDA90(ctx, base);
 
-    // w31: post-dispatch census — did the type handler write a real swfC
+    // w31: post-dispatch census â€” did the type handler write a real swfC
     // vtable onto the node? Never invent one; only report what guest wrote.
     {
         uint32_t v0After = 0;
@@ -489,10 +489,10 @@ PPC_FUNC(sub_8260B510)
 }
 
 // ---------------------------------------------------------------------------
-// Session 72: pointer-rebase via sub_821B5A60(&addr) → sub_8217D890(group,*addr).
-// Probe: id=0xCDCDCDCD (uninitialized object field) → lookup miss → fatal
+// Session 72: pointer-rebase via sub_821B5A60(&addr) â†’ sub_8217D890(group,*addr).
+// Probe: id=0xCDCDCDCD (uninitialized object field) â†’ lookup miss â†’ fatal
 // "Resource 'meshtextures'". Caller lr=0x821B5AB4. Honest short-circuit:
-// poison is not a valid guest pointer — take the same *param=0 path the
+// poison is not a valid guest pointer â€” take the same *param=0 path the
 // function already uses on membership miss. Do NOT invent a resource size.
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_821B5A60);
@@ -585,26 +585,26 @@ PPC_FUNC(sub_821D2378)
     const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
     // LOG FIRST: the fallback body dereferences [desc+8] unchecked-style and
     // has already AV'd on garbage descriptors - post-call logging never ran.
-    // w13: throttle — unthrottled flood made place take 41s (same as P10-PHYS).
+    // w13: throttle â€” unthrottled flood made place take 41s (same as P10-PHYS).
     if (n <= 32 || (n % 500) == 0)
         MCLA_LOG_WARN("P5-MISSFIX #{:05} desc={:08X} a4={:08X} old={:08X} lr={:08X} "
                       "r13={:08X}",
                       n, desc, a4, a5, lrIn, ctx.r13.u32);
-    // w9: this is the "resource group miss → fatal" tail (b 821BD618). After
+    // w9: this is the "resource group miss â†’ fatal" tail (b 821BD618). After
     // our RSC-NEST walk rewrote 0x50xxxxxx virtual ptrs to physical dests
-    // (e.g. 50035E50 → B7996E50), the place-pass still asks the guest rebase
+    // (e.g. 50035E50 â†’ B7996E50), the place-pass still asks the guest rebase
     // table about the ALREADY-PHYSICAL address, misses, and fatals. The
     // caller 8260A830 (loc_8260A8A0) expects either a fatal OR a return that
-    // falls into `li r11,0` / loc_8260A8B4 — delta 0, pointer already final.
+    // falls into `li r11,0` / loc_8260A8B4 â€” delta 0, pointer already final.
     // Return without invoking the fatal for those.
     const bool alreadyPhys =
         (a5 >= 0xB7000000u && a5 < 0xB8000000u) ||
         (a5 >= 0xA47F0000u && a5 < 0xA4800000u) ||
-        (a5 >= 0x80000000u); // w24: image + all high phys → delta-0
+        (a5 >= 0x80000000u); // w24: image + all high phys â†’ delta-0
     if (alreadyPhys)
     {
         if (n <= 32 || (n % 500) == 0)
-            MCLA_LOG_WARN("P5-PHYS #{:05} old={:08X} lr={:08X} — already "
+            MCLA_LOG_WARN("P5-PHYS #{:05} old={:08X} lr={:08X} â€” already "
                           "physical, skip fatal (caller takes delta-0 path)",
                           n, a5, lrIn);
         ctx.r3.u32 = 0;
@@ -628,18 +628,18 @@ PPC_FUNC(sub_821D2378)
             }
         }
         if (n <= 32 || (n % 500) == 0)
-            MCLA_LOG_WARN("P5-VIRT #{:05} old={:08X} lr={:08X} mapped={} — "
+            MCLA_LOG_WARN("P5-VIRT #{:05} old={:08X} lr={:08X} mapped={} â€” "
                           "skip fatal, delta-0",
                           n, a5, lrIn, mapped ? 1 : 0);
         ctx.r3.u32 = 0;
         return;
     }
     // w24: gate bad ptrs not in 0x50/0x60/0x80-B phys map (w23: 41C4FF12 /
-    // 533D00CB from the 44495500 place walk). Delta-0 family — A830/84458
+    // 533D00CB from the 44495500 place walk). Delta-0 family â€” A830/84458
     // already do `li r11,0` after D2378 returns, so place continues.
     if (MclaPtrIsGateBad(a5))
     {
-        MCLA_LOG_WARN("P5-GATE #{:05} old={:08X} lr={:08X} — not in "
+        MCLA_LOG_WARN("P5-GATE #{:05} old={:08X} lr={:08X} â€” not in "
                       "0x50/0x60/0x80-B map, delta-0 (no Resource fatal)",
                       n, a5, lrIn);
         ctx.r3.u32 = 0;
@@ -651,7 +651,7 @@ PPC_FUNC(sub_821D2378)
 // ---------------------------------------------------------------------------
 // w11: sub_82184458 place-pass resource walker. It D890-rebases [this+24] /
 // [this+28], then D828-looks-up the page at [resource+32] against the guest
-// region table. Job #2 left 600E0000 (PSTREAM s[12] → B70A1000) there; the
+// region table. Job #2 left 600E0000 (PSTREAM s[12] â†’ B70A1000) there; the
 // empty group table misses and D2378 fatals "Resource '%s': %s (ptr=%p)".
 // Pre-rebase +32 through g_mclaRebaseMap so the miss path sees physical
 // (alreadyPhys / delta-0) and the walker keeps the final pointer.
@@ -787,7 +787,7 @@ PPC_FUNC(sub_8217D890)
     const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
 
     // Session 72: log BEFORE passthrough. On id=0xCDCDCDCD the original
-    // body calls sub_821D2378 which fatals and never returns — post-call
+    // body calls sub_821D2378 which fatals and never returns â€” post-call
     // census stays silent. Pre-call log names the caller.
     if ((oldAddr & 0xFFu) == 0xCDu || oldAddr == 0xFFFFFFFFu)
     {
@@ -804,12 +804,12 @@ PPC_FUNC(sub_8217D890)
     }
 
     // w7: pointers already in the B7 physical heap (post-RSC-REBASE) have
-    // no entry in the rebase group — the original body fatals via
+    // no entry in the rebase group â€” the original body fatals via
     // 821D2378 "Resource '%s'". Return delta 0: the pointer is already at
     // its final physical address. w9: also accept the A47F9xxx dest that
     // job #2 PSTREAM s[4] maps (physical page in the A47F scratch range).
     // w24: any 0x80+ high address (image, host guest-heap, B7, CA) is
-    // already final — D890 miss must not Resource-fatal the place-pass.
+    // already final â€” D890 miss must not Resource-fatal the place-pass.
     if ((oldAddr >= 0xB7000000u && oldAddr < 0xB8000000u) ||
         (oldAddr >= 0xA47F0000u && oldAddr < 0xA4800000u) ||
         (oldAddr >= 0x80000000u))
@@ -823,10 +823,10 @@ PPC_FUNC(sub_8217D890)
     }
 
     // w9/w11: leftover PSTREAM virtuals (0x50 nested-resource family AND
-    // 0x60 stream/page family — job #2 s[12] 600E0000→B70A1000) still hit
+    // 0x60 stream/page family â€” job #2 s[12] 600E0000â†’B70A1000) still hit
     // the guest's empty rebase table and fatal. Resolve via the PSTREAM map
     // published at RSC-HEAD parse and return the same delta the guest table
-    // would have produced (newBase-oldBase). Membership is the map itself —
+    // would have produced (newBase-oldBase). Membership is the map itself â€”
     // do not hard-gate on a single virtual band.
     if (g_mclaRebaseCount > 0)
     {
@@ -850,7 +850,7 @@ PPC_FUNC(sub_8217D890)
         }
     }
 
-    // w24: unmapped bad ptr (41C4FF12 family) — delta-0, no fatal.
+    // w24: unmapped bad ptr (41C4FF12 family) â€” delta-0, no fatal.
     if (MclaPtrIsGateBad(oldAddr))
     {
         MCLA_LOG_WARN("P10-GATE #{:06} id={:08X} group={:08X} lr={:08X} "
@@ -1016,11 +1016,11 @@ PPC_FUNC(sub_8260A830)
     }
     // p2f: the 825FDBF8 build pass walked 27 CDCD buckets then AV'd inside
     // this body (lr=825FDC64, r3=CDCDCEA5). An unmapped/poison bucket base
-    // can never be fixed up — the container's [+12] array was never filled
+    // can never be fixed up â€” the container's [+12] array was never filled
     // by the preload task. Skip the original on poison, log as FIXWALK-SKIP.
     // w7: also skip when the bucket ADDRESS is valid but its CONTENTS are
     // poison (RSC-REBASE rewrote a 0x50xxxxxx pointer to a B7 dest that was
-    // never inflated — B7B61000 stays CDCD).
+    // never inflated â€” B7B61000 stays CDCD).
     {
         auto& memC = mcla::kernel::GuestMemoryHeap::Instance();
         uint32_t b0 = 0;
@@ -1048,7 +1048,7 @@ PPC_FUNC(sub_8260A830)
         {
             MCLA_LOG_WARN("FIXWALK-GATE #{:03} bucket={:08X} [0]={:08X} "
                           "node={:08X} buildCtx={:08X} lr={:08X} "
-                          "bucketGate={} nodeGate={} — delta-0 skip",
+                          "bucketGate={} nodeGate={} â€” delta-0 skip",
                           n, bucket, b0, node, buildCtx,
                           static_cast<uint32_t>(ctx.lr),
                           bucketGate ? 1 : 0, nodeGate ? 1 : 0);
@@ -1072,7 +1072,7 @@ PPC_FUNC(sub_8260A830)
 // p2f: sub_825FDBF8 = swf-container build pass (vt 0x8208521C family, the
 // container whose [+12] entry array stays CDCD when the preload task never
 // fills it). Census + poison guard: when the container's own vtable or
-// [+12] array is CDCD poison, the whole build pass is garbage-in — its
+// [+12] array is CDCD poison, the whole build pass is garbage-in â€” its
 // entry walk would iterate cnt(=0xCDCD)*8 bytes of unmapped memory no
 // matter what 8260A830 does per entry. Skip the original body in that
 // case (census first logged the state as FDBF8-BUILD).
@@ -1099,7 +1099,7 @@ PPC_FUNC(sub_825FDBF8)
         !readable || vt == 0xCDCDCDCDu || arr == 0xCDCDCDCDu || cnt == 0xCDCDu;
     // w7: arr can be a valid B7 address whose CONTENTS are still poison
     // (RSC-REBASE rewrote a 0x50xxxxxx pointer to a dest that was never
-    // inflated). Check [arr] too — walking it would fatal in 8260A830.
+    // inflated). Check [arr] too â€” walking it would fatal in 8260A830.
     uint32_t arr0 = 0;
     if (!poison && arr != 0 && arr != 0xFFFFFFFFu)
         (void)mem.ReadU32BE(arr, &arr0);
@@ -1174,6 +1174,49 @@ PPC_FUNC(sub_825FDBF8)
                           n, dataBase, mVFT, mHead4, mHead8, mScenesPos,
                           mScenesCnt, mCharsPos, mCharsCnt, mWidth, mHeight,
                           mFrameRate, mFrameCount);
+        // F-801c (2026-10-17, w794 follow-up): w794 showed [src+0] = a table
+        // whose +4=50000000 (the RSC5 virtual-base marker) and +8=A3A6A000
+        // (a heap pointer). Chase ONE more level: the heap pointer and a
+        // 0x1000-byte scan around it for the movie root's serialized VFT
+        // 0x44495500 ('DIU\0') -- the Rsc5FlashMovie root whose +12/+16 are
+        // the Scenes fields the construct must copy into [obj+12]/[obj+16].
+        if (dataBase != 0 && dataBase != src) {
+            uint32_t heapPtr = 0;
+            (void)mem.ReadU32BE(dataBase + 8, &heapPtr);
+            if (heapPtr != 0 && heapPtr != 0xCDCDCDCDu &&
+                heapPtr != 0xFFFFFFFFu && heapPtr != dataBase &&
+                heapPtr != 0x50000000u && heapPtr != 0x60000000u) {
+                // scan [heapPtr, heapPtr+0x1000) for 0x44495500
+                uint32_t diuAt = 0xFFFFFFFFu;
+                for (uint32_t off = 0; off < 0x1000; off += 4) {
+                    uint32_t w = 0;
+                    if (!mem.ReadU32BE(heapPtr + off, &w))
+                        break;
+                    if (w == 0x44495500u) {
+                        diuAt = heapPtr + off;
+                        break;
+                    }
+                }
+                uint32_t r0=0, r12=0, r24=0;
+                uint16_t r16=0, r28=0, r48=0, r50=0;
+                uint32_t r36=0, r44=0;
+                uint32_t probe = (diuAt != 0xFFFFFFFFu) ? diuAt : heapPtr;
+                (void)mem.ReadU32BE(probe +  0, &r0);
+                (void)mem.ReadU32BE(probe + 12, &r12);
+                (void)mem.ReadU16BE(probe + 16, &r16);
+                (void)mem.ReadU32BE(probe + 24, &r24);
+                (void)mem.ReadU16BE(probe + 28, &r28);
+                (void)mem.ReadU32BE(probe + 36, &r36);
+                (void)mem.ReadU32BE(probe + 44, &r44);
+                (void)mem.ReadU16BE(probe + 48, &r48);
+                (void)mem.ReadU16BE(probe + 50, &r50);
+                MCLA_LOG_WARN("FDBF8-CHASE #{} heapPtr={:08X} DIU@={:08X} "
+                              "root=[VFT={:08X} scenes={:08X}/{} chars={:08X}/{} "
+                              "w={} h={} rate={} frames={}]",
+                              n, heapPtr, diuAt, r0, r12, r16, r24, r28,
+                              r36, r44, r48, r50);
+            }
+        }
     }
     if (n <= 16 || (n % 200) == 0 || poison || arrPoison || arrGate)
         MCLA_LOG_WARN("FDBF8-BUILD #{:03} obj={:08X} vt={:08X} +4={:08X} "
@@ -1191,7 +1234,7 @@ PPC_FUNC(sub_825FDBF8)
         // rebase leg (8217D890) and the entry loop see an empty container.
         //
         // w10 FIX: if the vtable is already a real swfC family pointer
-        // (place-pass wrote it) do NOT zero arr/cnt — that permanently
+        // (place-pass wrote it) do NOT zero arr/cnt â€” that permanently
         // starved the container (FDBF8-REBUILD then saw arr=0/cnt=0).
         // Only neutralize when the vtable itself is poison/garbage.
         const bool realSwfCVt = (vt & 0xFFFF0000u) == 0x82080000u;
@@ -1211,9 +1254,9 @@ PPC_FUNC(sub_825FDBF8)
 // the never-filled preload container (vt=CDCDCDCD, crash r3=B7B41000,
 // lr=825FB14C). Guard: dispatch only when the child's vtable pointer is a
 // plausible guest image address (< image top, non-poison); otherwise skip
-// — same semantics as the function's own [+216]==0 null path.
+// â€” same semantics as the function's own [+216]==0 null path.
 //
-// F-633 (w658.log, read-only): this hook is 27% of that soak — 270,216 rows,
+// F-633 (w658.log, read-only): this hook is 27% of that soak â€” 270,216 rows,
 // every one `obj=CB139580 child=B7921000 childVt=82085364 +4=0 +12=0
 // lr=825EDCF8 POISON-SKIP`, 1.0M lines total, ~2,252 entries/s for 105 s.
 // The guest body, re-read from the raw image (tools/ppc_disasm.py 825FB0D8):
@@ -1423,7 +1466,7 @@ PPC_FUNC(sub_825FB0D8)
     {
         // Child is the unfilled container (CDCD body): any virtual dtor
         // dispatch would AV (crash-2, lr=825FB14C). Skip the original body
-        // — the object is host-side neutralized already (FDBF8 POISON-SKIP
+        // â€” the object is host-side neutralized already (FDBF8 POISON-SKIP
         // nulled its walk fields), so the dtor has nothing real to free.
         return;
     }
@@ -1433,7 +1476,7 @@ PPC_FUNC(sub_825FB0D8)
 // ---------------------------------------------------------------------------
 // w1a: sub_825EF100 = PLACE pass. Calls FDBF8 (build), sets vt 0x82085364,
 // rebases [obj+24], walks entries via 825FDA90. Runs BEFORE job #2 fills
-// B7B41000 (still CDCD). w1a tried deferring the whole call — that broke
+// B7B41000 (still CDCD). w1a tried deferring the whole call â€” that broke
 // the boot because the vtable write is load-bearing for FB0D8-DTOR and the
 // job #2 enqueue path. Census-only hook: log entry, pass through.
 // ---------------------------------------------------------------------------
@@ -1485,7 +1528,7 @@ PPC_FUNC(sub_825EF100)
         (void)mem.WriteU16BE(obj + 16, 0);
         (void)mem.WriteU32BE(obj + 24, 0);
         (void)mem.WriteU16BE(obj + 50, 1);
-        MCLA_LOG_WARN("EF100-PREPOP #{:03} obj={:08X} — wrote empty swfC "
+        MCLA_LOG_WARN("EF100-PREPOP #{:03} obj={:08X} â€” wrote empty swfC "
                       "(vt=0 arr=0 cnt=0 +24=0 +50=1) to prevent CDCD fatal",
                       n, obj);
         // Re-read after pre-population so the rest of the hook sees valid data
@@ -1502,9 +1545,9 @@ PPC_FUNC(sub_825EF100)
     if (rsc || (g_mclaRebaseCount > 0 && n <= 8))
         MclaCompleteRscRebaseBeforePlace(obj);
     // Gate the guest entry-walk bound when it is RSC residue (w23/w24:
-    // +50 read as 0x00A4 → 164 junk iterations; [arr]=533D00CB gate-bad).
+    // +50 read as 0x00A4 â†’ 164 junk iterations; [arr]=533D00CB gate-bad).
     // Cap to 1 so 825EF100 still runs FDBF8 + writes the real swfC vtable
-    // then returns — never invent a vtable.
+    // then returns â€” never invent a vtable.
     if (rsc && obj && obj != 0xCDCDCDCDu)
     {
         uint16_t cnt50 = 0;
@@ -1536,7 +1579,7 @@ PPC_FUNC(sub_825EF100)
                       rsc ? " RSC-44495500" : "",
                       MclaPtrIsGateBad(arr0) ? " ARR-GATE" : "");
     }
-    // w32: census-proven gate — guest walk is `if (u16[obj+50] <= 1) skip`.
+    // w32: census-proven gate â€” guest walk is `if (u16[obj+50] <= 1) skip`.
     // After fill, +24 holds dest-range/SWF-tag candidates while +50 stays 1
     // (host CNT-GATE looked only at [+24][0]). Open the bound in-place so
     // THIS EF100 call runs FDA90 on +24[1..]. Never invent tags/vtables.
@@ -1554,7 +1597,7 @@ PPC_FUNC(sub_825EF100)
 //   FP table 0x8202FE20/FE24 holds 82275D88/82275DA8 (rdata; no bl sites).
 //   825EF248 = construct walker: stride-12 table, bl 8260B740 per live +8.
 //   Sole bl of FDA90 = 825EF1F8 (place). Construct opcode EF248 is NOT on
-//   the place path — host only re-dispatches EF100 on dest-range pointers.
+//   the place path â€” host only re-dispatches EF100 on dest-range pointers.
 // Census-only: log every guest hit; never invent tags/vtables.
 // ---------------------------------------------------------------------------
 
@@ -1613,7 +1656,7 @@ PPC_FUNC(sub_825EF248)
     const uint32_t n = s_hEF248.fetch_add(1) + 1;
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     // Dump plausible table bases from arg regs (non-volatiles are locals
-    // under PPC_CONFIG_NON_ARGUMENT_AS_LOCAL — do not read r28/r29/r30).
+    // under PPC_CONFIG_NON_ARGUMENT_AS_LOCAL â€” do not read r28/r29/r30).
     const uint32_t cands[4] = {
         ctx.r3.u32,
         ctx.r4.u32,
@@ -1794,12 +1837,12 @@ PPC_FUNC(sub_824EEC28)
 // ---------------------------------------------------------------------------
 // w35: census the GFx movie ctor wrapper + lifecycle + boot gate to identify
 // why UILOAD 822012E8 never fires after POST-EXEC.
-//   sub_82482F78: movie ctor wrapper — calls 824C6F08 (writes vt 0x820736DC),
+//   sub_82482F78: movie ctor wrapper â€” calls 824C6F08 (writes vt 0x820736DC),
 //     optionally frees. Called via vtable dispatch from unmapped Scaleform code.
-//   sub_824C6F70: movie lifecycle step — state machine at +28 (0=unconstructed,
+//   sub_824C6F70: movie lifecycle step â€” state machine at +28 (0=unconstructed,
 //     1=constructed). Calls 824880F8 to init movie when +28==0.
-//   sub_82131008: boot gate callback — checks two events via 821C0750, then
-//     calls 822C0980 → 821FD640 → 822012E8 (UILOAD).
+//   sub_82131008: boot gate callback â€” checks two events via 821C0750, then
+//     calls 822C0980 â†’ 821FD640 â†’ 822012E8 (UILOAD).
 // ---------------------------------------------------------------------------
 
 PPC_FUNC_IMPL(__imp__sub_82482F78);
@@ -1822,12 +1865,12 @@ PPC_FUNC(sub_82482F78) {
         uint32_t vt2 = 0;
         if (obj && obj != 0xCDCDCDCDu)
             (void)mem.ReadU32BE(obj + 0, &vt2);
-        MCLA_LOG_WARN("W35-MOVIE-POST #{:05} obj={:08X} vt→{:08X} "
+        MCLA_LOG_WARN("W35-MOVIE-POST #{:05} obj={:08X} vtâ†’{:08X} "
                       "vt+672={:08X}",
                       n, obj, vt2, 0u);
         if (obj && obj != 0xCDCDCDCDu)
             (void)mem.ReadU32BE(obj + 672, &vt2);
-        MCLA_LOG_WARN("W35-MOVIE-POST #{:05} obj+672 vt→{:08X}", n, vt2);
+        MCLA_LOG_WARN("W35-MOVIE-POST #{:05} obj+672 vtâ†’{:08X}", n, vt2);
     }
 }
 
@@ -2087,3 +2130,65 @@ PPC_FUNC(sub_82131508) {
                       GetCurrentThreadId(), ctx.r3.u32);
 }
 
+
+
+// F-802 (2026-10-17): the RSC deserialize/import arms selected by the
+// vtable-dispatched sub_825FDB30 on the type byte at [src+172].
+// w793/w794 measured: legals took arm B (type=B8) then arm A (type=00);
+// the build pass (825FDBF8) then found [obj+12]/[obj+16] still zero. These
+// two arms are the candidate SCENE FILLERS (list-walkers calling [node+4]/
+// [node+8] function pointers). Census-only: print the args and the object's
+// +12/+16 after the arm returns. If an arm fills the fields and the build
+// still sees zero, the staging moved; if neither arm fills them, the
+// movie-root deserialize is the missing leg.
+PPC_FUNC_IMPL(__imp__sub_8260A710);
+static std::atomic<uint32_t> s_hA710{0};
+PPC_FUNC(sub_8260A710) {
+  const uint32_t n = s_hA710.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t src = ctx.r4.u32;
+  auto &memA = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t o12b = 0; uint16_t o16b = 0;
+  if (obj != 0 && obj != 0xCDCDCDCDu) {
+    (void)memA.ReadU32BE(obj + 12, &o12b);
+    (void)memA.ReadU16BE(obj + 16, &o16b);
+  }
+  __imp__sub_8260A710(ctx, base);
+  if (n <= 24 || (n % 500) == 0) {
+    uint32_t o12a = 0; uint16_t o16a = 0;
+    if (obj != 0 && obj != 0xCDCDCDCDu) {
+      (void)memA.ReadU32BE(obj + 12, &o12a);
+      (void)memA.ReadU16BE(obj + 16, &o16a);
+    }
+    MCLA_LOG_WARN("F802-ARM-A(type!=0) #{} obj={:08X} src={:08X} "
+                  "+12: {:08X}->{:08X} +16: {}->{} lr={:08X}",
+                  n, obj, src, o12b, o12a, o16b, o16a,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+}
+
+PPC_FUNC_IMPL(__imp__sub_8260A7D0);
+static std::atomic<uint32_t> s_hA7D0{0};
+PPC_FUNC(sub_8260A7D0) {
+  const uint32_t n = s_hA7D0.fetch_add(1) + 1;
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t src = ctx.r4.u32;
+  auto &memA = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t o12b = 0; uint16_t o16b = 0;
+  if (obj != 0 && obj != 0xCDCDCDCDu) {
+    (void)memA.ReadU32BE(obj + 12, &o12b);
+    (void)memA.ReadU16BE(obj + 16, &o16b);
+  }
+  __imp__sub_8260A7D0(ctx, base);
+  if (n <= 24 || (n % 500) == 0) {
+    uint32_t o12a = 0; uint16_t o16a = 0;
+    if (obj != 0 && obj != 0xCDCDCDCDu) {
+      (void)memA.ReadU32BE(obj + 12, &o12a);
+      (void)memA.ReadU16BE(obj + 16, &o16a);
+    }
+    MCLA_LOG_WARN("F802-ARM-B(type==0) #{} obj={:08X} src={:08X} "
+                  "+12: {:08X}->{:08X} +16: {}->{} lr={:08X}",
+                  n, obj, src, o12b, o12a, o16b, o16a,
+                  static_cast<uint32_t>(ctx.lr));
+  }
+}

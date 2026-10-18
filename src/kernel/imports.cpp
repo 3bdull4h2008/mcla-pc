@@ -7193,7 +7193,16 @@ extern "C" uint32_t KeReleaseSemaphore(XKSEMAPHORE *semaphore, uint32_t incremen
   return STATUS_SUCCESS;
 }
 
-void XAudioGetVoiceCategoryVolume() { LOG_UTILITY("!!! STUB !!!"); }
+uint32_t XAudioGetVoiceCategoryVolume(uint32_t Driver, be<uint32_t> *Volume) {
+  // Honest per-port: no per-category volume table exists in this host, so
+  // report the default (0 dB = 0x3F800000 in Xbox convention? — we report
+  // 0 = unity, matching the guest's "no attenuation" expectation). The
+  // previous void stub left r3 garbage and never wrote the guest buffer
+  // (F-799 class); the guest reads *Volume on return.
+  (void)Driver;
+  if (Volume) *Volume = 0;
+  return 0;  // STATUS_SUCCESS
+}
 
 uint32_t XAudioGetVoiceCategoryVolumeChangeMask(uint32_t Driver,
                                                 be<uint32_t> *Mask) {
@@ -7218,9 +7227,19 @@ void KeInitializeSemaphore(XKSEMAPHORE *semaphore, uint32_t count,
   auto *object = QueryKernelObject<Semaphore>(semaphore->Header);
 }
 
-void XMAReleaseContext() { LOG_UTILITY("!!! STUB !!!"); }
+void XMAReleaseContext(uint32_t contextPtr) {
+  apu::XmaReleaseContext(contextPtr);
+}
 
-void XMACreateContext() { LOG_UTILITY("!!! STUB !!!"); }
+uint32_t XMACreateContext(be<uint32_t> *outContext) {
+  uint32_t ptr = 0;
+  if (!apu::XmaCreateContext(&ptr)) {
+    if (outContext) *outContext = 0;
+    return 0;
+  }
+  if (outContext) *outContext = ptr;
+  return ptr;
+}
 
 // XAudio render-driver hooks (M5). Xenia/UnleashedRecomp ABI:
 //   callback_ptr[0] = guest fn, callback_ptr[1] = userdata

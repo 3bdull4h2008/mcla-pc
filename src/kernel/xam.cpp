@@ -865,15 +865,15 @@ bool XamInputPortDevice(uint32_t port, char* outName, size_t cap, uint32_t* pIns
     return s.source == PadSource::Gamepad;
 }
 
-uint32_t XamInputGetCapabilities(uint32_t unk, uint32_t userIndex, uint32_t flags, XAMINPUT_CAPABILITIES* caps)
+uint32_t XamInputGetCapabilities(uint32_t userIndex, uint32_t flags, XAMINPUT_CAPABILITIES* caps)
 {
     static std::atomic<uint32_t> s_calls{0};
     const uint32_t n = s_calls.fetch_add(1) + 1;
 
     // `unk` is the leading word the Ex variant carries and the non-Ex one does
     // not; Xenia's entry point ignores it (xam_input.cc:65-84) and so does this
-    // one. Kept in the signature because imports.cpp:3675 binds this shape.
-    (void)unk;
+    // F-804: arity corrected to match the guest (3 args, not 4).
+
 
     if (!caps)
         return STATUS_INVALID_PARAMETER;   // Xenia returns X_ERROR_BAD_ARGUMENTS
