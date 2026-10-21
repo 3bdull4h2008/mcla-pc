@@ -5833,6 +5833,26 @@ bool CpExecInterrupt(uint32_t byteAddr, uint32_t count, uint32_t header,
   return true;
 }
 
+// F-XXX: THE CONSOLE'S SWAP PACKET, DECODED. One row, one shape, whichever path
+// the packet arrived on (the ring ladder's legacy arm, or the packet handler
+// below). The payload is the console's own layout
+// (xenia src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc:426-433):
+//   [0] the 'SWAP' fourcc, [1] the front buffer's PHYSICAL address,
+//   [2] width, [3] height.
+//
+// IT IS DECODED AND PUBLISHED, NOT DISPATCHED: this host's display engine is
+// the D3D12 present path (D3D12Backend::ResolveGuestRenderTarget ->
+// PresentOwnedFrame), so there is no PM4-driven scan-out here. What the row
+// proves is that the console's swap event actually reached the CP.
+static void LogXeSwap(uint32_t magic, uint32_t fb, uint32_t width, uint32_t height) {
+  constexpr uint32_t kSwapMagic = 0x53574150u;  // 'SWAP' (xenos.h:31)
+  const uint64_t n = g_swapCount.fetch_add(1) + 1;
+  if (n <= 10 || (n % 300) == 0) {
+    MCLA_LOG_INFO("CP: XE_SWAP #{} magic={:08X} magicOk={} fb={:08X} {}x{}", n,
+                  magic, magic == kSwapMagic ? 1 : 0, fb, width, height);
+  }
+}
+
 bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t header = 0;
@@ -6108,6 +6128,30 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
   // used - the stream cannot drift by one dword because of this change.
   case kPm4CondWrite:  // PM4_COND_WRITE (cc:1110-1175)
     return CpExecCondWrite(byteAddr, count, outAdvanceDwords);
+  // F-XXX: 0x64 PM4_XE_SWAP -- THE CONSOLE'S SWAP TO THE DISPLAY ENGINE.
+  //
+  // It was DECODED but UNREACHABLE: the packet had no case here, so it fell
+  // into `default:` (counted as an unhandled Type-3) and the `CP: XE_SWAP` row
+  // in the ring ladder could only be reached by a packet that WRAPS the ring
+  // end. build/w854.log therefore carries 0 `CP: XE_SWAP` rows -- and there was
+  // nothing to decode, because the host never emitted the packet either
+  // (CpEmitXeSwap, and the VdSwap hook that calls it).
+  //
+  // The payload is the console's own (xboxkrnl_video.cc:426-433):
+  //   [0] 'SWAP' fourcc, [1] the front buffer's PHYSICAL address,
+  //   [2] width, [3] height.
+  case kPm4XeSwap: {
+    uint32_t magic = 0, fb = 0, w = 0, h = 0;
+    if (!mem.ReadU32BE(byteAddr + 4, &magic) ||
+        !mem.ReadU32BE(byteAddr + 8, &fb) ||
+        !mem.ReadU32BE(byteAddr + 12, &w) ||
+        !mem.ReadU32BE(byteAddr + 16, &h)) {
+      return false;
+    }
+    LogXeSwap(magic, fb, w, h);
+    outAdvanceDwords = count + 1u;
+    return true;
+  }
   default:
     LogType3Unhandled(opcode, count, byteAddr, depth);
     outAdvanceDwords = count + 1u;
@@ -6451,15 +6495,14 @@ void DrainRing(RingState &ring, uint32_t wptr, const char *source) {
       if (opcode == kPm4XeSwap && count >= 4) {
         // Payload: [0]="SWAP fourcc, [1]=frontbuffer phys,
         // [2]=width, [3]=height (xenia xboxkrnl_video.cc VdSwap).
+        // F-XXX: routed through the SAME row the packet handler uses, so a
+        // packet that wraps the ring end and one that does not are counted
+        // and printed identically (one counter, one shape).
         const uint32_t magic = ReadRingU32(ring, (rptr + 1u) % cap);
         const uint32_t fb = ReadRingU32(ring, (rptr + 2u) % cap);
         const uint32_t width = ReadRingU32(ring, (rptr + 3u) % cap);
         const uint32_t height = ReadRingU32(ring, (rptr + 4u) % cap);
-        const uint64_t n = g_swapCount.fetch_add(1) + 1;
-        if (n <= 10 || (n % 300) == 0) {
-          MCLA_LOG_INFO("CP: XE_SWAP #{} magic={:08X} fb={:08X} {}x{}", n,
-                        magic, fb, width, height);
-        }
+        LogXeSwap(magic, fb, width, height);
       } else if (opcode == kPm4IndirectBuffer && count >= 2) {
         // PM4_INDIRECT_BUFFER (xenia :943-953): [list_ptr, list_len]
         // - execute the referenced buffer's packets now.
@@ -6769,6 +6812,105 @@ CpGuestRenderTarget CpGuestRenderTargetInfo() {
   out.copyDestPitch = copyDestPitch;
   out.copyDestInfo = copyDestInfo;
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// F-XXX: THE CONSOLE'S SWAP PACKET, WRITTEN INTO THE GUEST'S OWN PM4 STREAM.
+// (The declaration and the console's own words are in src/gpu_cp.h.)
+//
+// THE PACKET NUMBERS, all from the console:
+//   PM4_XE_SWAP = 0x64                      (xenos.h:1624; kPm4XeSwap at :2381)
+//   XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 = 0x4800 (register_table.inc:2697)
+//   kSwapSignature = 'SWAP' = 0x53574150     (xenos.h:31; base/memory.h:479-483)
+// and the two header forms (xenos.h:1637-1664):
+//   MakePacketType0(index, count) = ((count - 1) << 16) | (index & 0x7FFF)
+//   MakePacketType3(opcode, count) = (3 << 30) | ((count - 1) << 16) | (op << 8)
+//   MakePacketType2()               = (2 << 30)
+// The host's own TYPE-0/TYPE-3 decoders agree with those forms exactly
+// (count = ((header >> 16) & 0x3FFF) + 1, base = header & 0x7FFF,
+// opcode = (header >> 8) & 0x7F: DrainPacketAt:5889-5891 and :5907).
+//
+// THE ORDER IS THE CONSOLE'S: the fetch constant first (it tells the display
+// engine what the front buffer's layout is -- tiled bit, pitch, size), then
+// the swap. The guest's own frame puts the kCopy draw into the EDRAM copy
+// unit BEFORE this, and the guest reserves this ring block at the END of the
+// frame's packets (the guest's own bytes: 0x82419A0A0 `li r4,64` ->
+// 0x82419A0A8 `bl 0x82412928`, the 64-word reservation, and
+// 0x82419A0E8 `addi r11,r30,256` -> 0x82419A0EC `stw r11,48(r31)`, the guest
+// advancing its own ring write pointer by 256 bytes AFTER the call).
+// So the packets land after the frame's draws and before the flip.
+//
+// THE 63, NOT 64: the reference writes 64 dwords FROM buffer_ptr
+// (xboxkrnl_video.cc:407-434), and the guest passed buffer_ptr = reserved+4
+// (0x82419A0E0 `addi r3,r30,4`) out of a 64-WORD reservation whose end the
+// guest publishes as reserved+256. 64 dwords from reserved+4 would run FOUR
+// BYTES PAST the guest's own reservation, so the host writes the 63 dwords
+// that fit: the 12 packet dwords plus 51 NOP2. The four bytes BEFORE
+// buffer_ptr are the guest's own block header and are not touched -- exactly
+// as on the console, where the reference does not write them either.
+// ---------------------------------------------------------------------------
+bool CpEmitXeSwap(uint32_t ringVa, const uint32_t fetch[6], uint32_t physAddr,
+                  uint32_t width, uint32_t height) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (ringVa == 0u || fetch == nullptr) {
+    return false;
+  }
+
+  constexpr uint32_t kFetchReg = 0x4800u;      // XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0
+  constexpr uint32_t kSwapOpcode = 0x64u;      // PM4_XE_SWAP
+  constexpr uint32_t kSwapMagic = 0x53574150u;  // 'SWAP'
+  constexpr uint32_t kNop2 = 0x80000000u;       // MakePacketType2()
+  constexpr uint32_t kPacketDwords = 12u;       // 1 + 6 (TYPE-0) + 1 + 4 (TYPE-3)
+  constexpr uint32_t kFillDwords = 63u;         // 64 words minus the guest's header word
+
+  uint32_t pkt[kPacketDwords];
+  pkt[0] = ((6u - 1u) << 16) | kFetchReg;  // MakePacketType0(kFetchReg, 6)
+  // The console replaces the fetch constant's base_address -- the CPU VIRTUAL
+  // address the header carries -- with the PHYSICAL one
+  // (xboxkrnl_video.cc:385-387: `gpu_fetch.base_address =
+  // frontbuffer_physical_address >> 12;`). base_address is dword_1's top 20
+  // bits (xenos.h:1230), so the physical address goes back where it was.
+  pkt[1] = fetch[0];
+  pkt[2] = (fetch[1] & 0x00000FFFu) | (physAddr & 0xFFFFF000u);
+  pkt[3] = fetch[2];
+  pkt[4] = fetch[3];
+  pkt[5] = fetch[4];
+  pkt[6] = fetch[5];
+  pkt[7] = (3u << 30) | ((4u - 1u) << 16) | (kSwapOpcode << 8);  // MakePacketType3
+  pkt[8] = kSwapMagic;
+  pkt[9] = physAddr;
+  pkt[10] = width;
+  pkt[11] = height;
+
+  uint32_t written = 0;
+  for (uint32_t i = 0; i < kFillDwords; ++i) {
+    const uint32_t v = (i < kPacketDwords) ? pkt[i] : kNop2;
+    if (!mem.WriteU32BE(ringVa + i * 4u, v)) {
+      break;
+    }
+    ++written;
+  }
+  const bool ok = (written == kFillDwords);
+
+  // F-XXX: the emission census. `emitOk` counts the writes that landed and
+  // `emitCalls` the attempts, so a zero of either is a measurement and not a
+  // silence (F-057(6): a tracked marker whose producer never ran reports
+  // zero and means nothing). The row is bounded: the first 8 and every 200th.
+  static std::atomic<uint64_t> g_xeSwapEmitCalls{0};
+  static std::atomic<uint64_t> g_xeSwapEmitOk{0};
+  const uint64_t n = g_xeSwapEmitCalls.fetch_add(1, std::memory_order_relaxed) + 1u;
+  if (ok) {
+    g_xeSwapEmitOk.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (n <= 8u || (n % 200u) == 0u) {
+    MCLA_LOG_WARN(
+        "CP: XE_SWAP-EMIT #{} ring={:08X} dwords={}/{} ok={} magic={:08X} "
+        "fb={:08X} wh={}x{} fetchD1={:08X} emitOk={}/{}",
+        n, ringVa, written, kFillDwords, ok ? 1 : 0, kSwapMagic, physAddr, width,
+        height, fetch[1], g_xeSwapEmitOk.load(std::memory_order_relaxed),
+        g_xeSwapEmitCalls.load(std::memory_order_relaxed));
+  }
+  return ok;
 }
 
 // ---------------------------------------------------------------------------

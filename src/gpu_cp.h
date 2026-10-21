@@ -203,6 +203,40 @@ struct CpGuestRenderTarget {
 CpGuestRenderTarget CpGuestRenderTargetInfo();
 
 // ---------------------------------------------------------------------------
+// F-XXX: THE CONSOLE'S SWAP PACKET -- PM4_XE_SWAP.
+//
+// THE CONSOLE'S OWN BEHAVIOUR (a guest fact, not this tree's design). The
+// kernel export VdSwap does NOT "present a surface": it writes TWO PM4
+// packets into the PRIMARY RING BUFFER block the caller reserved, and the
+// display engine acts on them when that ring is submitted
+// (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc:404-434):
+//     dwords[0]      MakePacketType0(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6)
+//     dwords[1..6]   the six dwords of the front buffer's texture fetch constant
+//     dwords[7]      MakePacketType3(PM4_XE_SWAP, 4)
+//     dwords[8]      'SWAP'                dwords[9] frontbuffer_physical_address
+//     dwords[10..11] width, height
+//     dwords[12..]   MakePacketType2() (NOP) fill
+// The reference REPLACES the fetch constant's base_address with the PHYSICAL
+// address before writing it (:385-387), because the constant the header
+// carries holds a CPU virtual address.
+//
+// THIS HOST NEVER EMITTED IT: build/w854.log carries 0 `CP: XE_SWAP` rows, and
+// the CP's decoder could not have reached one anyway (the packet fell into
+// DrainPacketAt's `default:` arm, which counts it as an unhandled Type-3).
+//
+// CpEmitXeSwap writes exactly that into the guest's own ring, in the console's
+// order (the fetch constant first, then the swap), with the console's own
+// packet numbers. It returns true only when every dword was written.
+//
+// IT DOES NOT DRIVE THE DISPLAY ENGINE. This host's display engine is the
+// D3D12 present path (D3D12Backend::ResolveGuestRenderTarget ->
+// PresentOwnedFrame), not a PM4 stream; there is NO host-side PM4 stream for
+// the display engine to be written into. What this buys is the console's swap
+// EVENT, in the console's own PM4 stream, where the host's CP can decode it.
+bool CpEmitXeSwap(uint32_t ringVa, const uint32_t fetch[6], uint32_t physAddr,
+                  uint32_t width, uint32_t height);
+
+// ---------------------------------------------------------------------------
 // F-XXX: THE CONSOLE'S SHADER-CONSTANT MODEL (the ALU constant array).
 //
 // THE CONSOLE'S MODEL, as guest facts:

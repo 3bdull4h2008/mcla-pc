@@ -13,6 +13,7 @@
 #include "boot_host.h"          // F-640: TranslatePhysViewToPoolVa / RegisterPhysAliasWriter / LogPhysAliasRow
 #include "gpu_mmio.h"
 #include "gpu_device.h"
+#include "gpu_cp.h"          // F-XXX: CpGuestRenderTargetInfo (RB_COPY_DEST_BASE) + CpEmitXeSwap
 #include "render_queue.h"
 #include "render_thread.h"
 #include "generated/ppc_xenon/ppc_recomp_shared.h"
@@ -159,8 +160,19 @@ static uint32_t PresentSurfaceScore(uint32_t va, uint32_t w, uint32_t h) {
 // The guest's own VdSwap arguments, kept so a PresentKick-initiated present can
 // be compared against the flip the guest actually issued. Written by
 // Hooked_VdSwap below; read only by the audit.
-static std::atomic<uint32_t> g_lastVdSwapObj{0};
-static std::atomic<uint32_t> g_lastVdSwapInfo{0};
+//
+// F-XXX (2026-10-21): r4 IS NOT A SURFACE ADDRESS. It is a POINTER to the
+// guest's 24-byte texture fetch constant on its own stack (the guest's bytes:
+// 0x82419EB4 `addi r3,r1,128` / 0x82419EBC `li r5,24` / 0x82419EC8
+// `bl 0x823DA950`; and at the call 0x82419A0DC `addi r4,r1,128`). So
+// `g_lastVdSwapInfo` now holds the FETCH HEADER's address, and the front
+// buffer's own identity lives in the two atomics below.
+static std::atomic<uint32_t> g_lastVdSwapObj{0};      // r3: the ring block pointer
+static std::atomic<uint32_t> g_lastVdSwapInfo{0};    // r4: the FETCH HEADER pointer
+// F-XXX: the console's PHYSICAL address of the front buffer, and this tree's
+// byte for it (0xA0000000 + pa). Both are published by Hooked_VdSwap.
+static std::atomic<uint32_t> g_lastVdSwapFbPa{0};
+static std::atomic<uint32_t> g_lastVdSwapFbPool{0};
 static std::atomic<uint32_t> g_vdSwapCalls{0};
 static std::atomic<uint32_t> g_nativePresents{0};
 
@@ -264,15 +276,28 @@ constexpr const char* kF640SiteVdSwap = "native_renderer.cpp:Hooked_VdSwap";
 // COUNTS a refusal when this tree has no pool byte for it. It never falls back to the
 // untranslated view address (see the overlap note above) and never asserts on the guest
 // value -- a physical address with no pool byte is a MISS, not a fault.
-static uint32_t F640VdSwapPoolVa(uint32_t pa) {
+//
+// F-XXX (2026-10-21): the second parameter. The ADDRESS this site is handed is now the
+// front buffer's PHYSICAL address, derived from the guest's own texture fetch
+// constant (see the ABI block at Hooked_VdSwap). When the caller has ALREADY resolved
+// that physical address to a pool byte -- which it has to do, because the address in
+// the fetch constant is a CONSOLE VIEW address and the physical address is the
+// view-relative offset (xboxkrnl_video.cc:375-385) -- the resolved pool address is
+// passed in so that ONE translation, not two, is counted by the F-640 census. The
+// identity `not_a_view + translated + dropped == calls` in F640-PHYSALIAS-SUM is
+// therefore unchanged: a caller that resolves it itself contributes exactly one
+// TranslatePhysViewToPoolVa call, which it makes.
+static uint32_t F640VdSwapPoolVa(uint32_t pa, uint32_t poolVaIn = 0u) {
     const uint64_t n = g_f640VdSwap.attempts.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!g_f640VdSwap.announced.exchange(true, std::memory_order_relaxed))
         mcla::boot::RegisterPhysAliasWriter(kF640SiteVdSwap);
 
     const uint32_t viewVa = pa | 0xC0000000u;  // the console's own published form (PhysToKernelVA)
-    uint32_t poolVa = 0;
-    const mcla::boot::PhysViewResult r =
-        mcla::boot::TranslatePhysViewToPoolVa(viewVa, &poolVa);
+    uint32_t poolVa = poolVaIn;
+    mcla::boot::PhysViewResult r = mcla::boot::PhysViewResult::kMapped;
+    if (poolVa == 0u) {
+        r = mcla::boot::TranslatePhysViewToPoolVa(viewVa, &poolVa);
+    }
 
     if (r == mcla::boot::PhysViewResult::kMapped) {
         g_f640VdSwap.mapped.fetch_add(1, std::memory_order_relaxed);
@@ -378,13 +403,23 @@ void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
         // while `resolved` scores 1, the resolver was reading the wrong address and
         // the translation is the fix. Read `pool` only when its packed `pa` still
         // matches `vdInfo`; otherwise it belongs to an older flip and is not scored.
+        //
+        // F-XXX (2026-10-21): `vdInfo` IS NOT A SURFACE ANY MORE -- it is the guest's
+        // TEXTURE FETCH HEADER pointer (a stack address). The surface the console
+        // means is the FRONT BUFFER, and its pool byte is the `pool` column, whose
+        // packed `pa` is now compared against the front buffer's own physical
+        // address (`vsPa`) rather than against `vdInfo`. The `phys` and `kva`
+        // columns are LEFT ALONE on purpose: they score the STACK ADDRESS the old
+        // code was resolving, and that score (1 = the clamp floor, w664.log:6631)
+        // is the evidence that the old resolution was wrong. It stays printable.
         const uint32_t vsInfo = g_lastVdSwapInfo.load(std::memory_order_relaxed);
         const uint32_t vsObj  = g_lastVdSwapObj.load(std::memory_order_relaxed);
+        const uint32_t vsPa   = g_lastVdSwapFbPa.load(std::memory_order_relaxed);
         const uint32_t kva    = (vsInfo != 0 && vsInfo < 0x20000000u)
                                 ? (vsInfo | 0xC0000000u) : 0u;
         const uint64_t packed = g_f640VdSwap.poolPacked.load(std::memory_order_relaxed);
         const uint32_t vsPoolPa = (uint32_t)(packed & 0xFFFFFFFFull);
-        const uint32_t vsPool   = (vsPoolPa == vsInfo && vsInfo != 0)
+        const uint32_t vsPool   = (vsPoolPa == vsPa && vsPa != 0)
                                     ? (uint32_t)(packed >> 32) : 0u;
         const uint32_t sRes   = PresentSurfaceScore(present.surfaceVA, 1280, 720);
         const uint32_t sPhys  = PresentSurfaceScore(vsInfo, 1280, 720);
@@ -411,7 +446,14 @@ void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
     MclaW31OnPresent();
 }
 
-// VdSwap import hook — INERT for frame production (R1).
+// VdSwap import hook — the console's KERNEL export (xenia
+// src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc:352-434). It still does NOT
+// produce a PRESENT (R1): the present is owned by PresentKick, and a second
+// present would double-present. What it DOES do now is the console's own
+// swap: it derives the front buffer's identity from the guest's own texture
+// fetch constant and writes the console's PM4_XE_SWAP packet into the ring
+// block the guest reserved.
+//
 // Guest frame-end reaches VdSwap only from sub_82419E98 @0x8241A0E4
 // (ppc_recomp.77.cpp:11782-11784, the sole `bl 0x827bd6e4`; tools/ppc_xrefs.py
 // fn 8241A0E4 confirms 1 call site).
@@ -423,59 +465,251 @@ void EnqueueNativePresent(uint32_t frameNumber, uint32_t obj, uint32_t fbAddr) {
 // correct - but it means ONE of the two guest flip routes contributes nothing
 // and the frame rate is set entirely by PresentKick. The route census below
 // keeps that measurable instead of assumed.
-PPC_FUNC_IMPL(Hooked_VdSwap) {
-    uint32_t obj       = ctx.r3.u32;
-    uint32_t swap_info = ctx.r4.u32;
+//
+// ---------------------------------------------------------------------------
+// F-XXX (2026-10-21): THE CONSOLE'S VdSwap ABI, FROM THE GUEST'S OWN BYTES.
+//
+// WHAT THE OLD CODE BELIEVED, AND WHY IT WAS WRONG. The hook read r4
+// (`swap_info`) as a CONSOLE PHYSICAL ADDRESS, handed it to
+// F640VdSwapPoolVa, and published the result as "the VdSwap surface". r4 is a
+// POINTER TO A STACK STRUCT. Every number derived from it was a stack
+// address: the measured value in build/w854.log was `swap_info=0x004E0AF0`
+// with `pool=0xA04E0AF0`, and 0x004E0AF0 is the guest's STACK (the fetch
+// header is at r1+128, so the frame's r1 was 0x004E0A70).
+//
+// THE GUEST'S OWN CALL SITE (build/cache/mcla_pe.bin, VA = offset +
+// 0x82000000; the frame-end function sub_82419E98):
+//     0x82419EB0  addi r4,r28,28     ; the source of the 24-byte copy
+//     0x82419EB4  addi r3,r1,128     ; the destination: the guest's STACK
+//     0x82419EBC  li   r5,24         ; 24 bytes = 6 dwords
+//     0x82419EC8  bl   0x823DA950    ; memcpy (the guest's memcpy)
+//     0x82419ED0  lwz  r29,132(r1)   ; r29 = the copy's dword_1
+//     0x82419F4C  rlwinm r6,r29,0,0,19 ; r6 = r29 & 0xFFFFF000
+//     0x82419F60  stw  r6,108(r1)    ; -> the word at r1+108
+//     0x82419F54  rlwinm r5,r29,0,26,31 ; r5 = r29 & 0x3F
+//     0x82419F68  stw  r5,112(r1)    ; -> the word at r1+112
+//     0x82419A0C4  addi r10,r1,104   ; r10 = the color space pointer
+//     0x82419A0C8  addi r9,r1,112    ; r9 = the TEXTURE FORMAT pointer
+//     0x82419A0D0  addi r8,r1,108    ; r8 = the FRONT BUFFER ADDRESS pointer
+//     0x82419A0DC  addi r4,r1,128    ; r4 = the FETCH HEADER
+//     0x82419A0E0  addi r3,r30+4     ; r3 = the primary ring buffer block
+//     0x82419A0E4  bl   0x827BD6E4
+//     0x82419A0E8  addi r11,r30,256 ; the guest advances its own ring by
+//     0x82419A0EC  stw  r11,48(r31)  ; 256 bytes = 64 words, AFTER the call
+// (the mask semantics above are the tree's own: `rlwinm`'s mb/me count from
+// the MSB, so mb=0,me=19 is r29 & 0xFFFFF000 and mb=26,me=31 is r29 & 0x3F.
+//
+// THE REGISTER MEANINGS ARE THE REFERENCE'S, NOT A GUESS
+// (xboxkrnl_video.cc:352-360):
+//     r3 buffer_ptr       "ptr into primary ringbuffer"
+//     r4 fetch_ptr        "frontbuffer Direct3D 9 texture header fetch"
+//     r5 unk2  r6 unk3  r7 unk4
+//     r8 frontbuffer_ptr  "lpdword_t frontbuffer_ptr, ptr to frontbuffer address"
+//     r9 texture_format_ptr   r10 color_space_ptr
+//
+// WHICH FIELD OF THE HEADER CARRIES THE SURFACE'S ADDRESS. The header is a
+// XENOS TEXTURE FETCH CONSTANT (xenia xenos.h:1184-1284,
+// `xe_gpu_texture_fetch_t`, six dwords):
+//     dword_0: type:2 sign_x/y/z/w:2 clamp_x/y/z:3 pad:3 pitch:9 tiled:1
+//     dword_1: format:6 endianness:2 request_size:2 stacked:1
+//              nearest_clamp_policy:1 base_address:20      <-- THE ADDRESS
+//     dword_2: size_2d { width:13 height:13 stack_depth:6 }
+// and the guest's own code agrees, field for field:
+//     r29 & 0xFFFFF000  ==  base_address << 12   (the address)
+//     r29 & 0x3F        ==  format               (the texture format)
+// The reference reads the same two fields: `gpu_fetch.base_address << 12` is
+// the front buffer's address and `*frontbuffer_ptr` must equal it
+// (xboxkrnl_video.cc:382-384), and the format is `*texture_format_ptr`.
+//
+// AND THE GUEST'S OWN FORMAT REMAP PROVES THE FIELD MAP (the guest rewrites
+// the copy's format field before the call, 0x82419ED4-0x82419EF4 -- the
+// rlwimi at :11717-11718 of the recompiled function):
+//     (dword_1 & 0x3F) == 50 (k_8_8_8_8_AS_16_16_16_16) -> 6  (k_8_8_8_8)
+//     (dword_1 & 0x3F) ==  7 (k_2_10_10_10)              -> 54 (k_2_10_10_10_AS_16_16_16_16)
+// and 6 and 54 are EXACTLY the two formats the reference asserts for VdSwap
+// (xboxkrnl_video.cc:389-392; xenos.h:457 and :530). The field map is
+// confirmed from the guest's bytes, not inferred.
+//
+// WHAT THE ADDRESS IS: the reference says the fetch constant "contains the
+// address in one of the virtual mappings of the physical memory rather than
+// the physical address itself" (xboxkrnl_video.cc:375-380) and converts it
+// with GetPhysicalAddress (:385). So the header carries a CONSOLE VIEW address
+// and the physical address is the view-relative offset. This tree's ONE rule
+// for that is src/boot_host.cpp:312-328 (F640MapViewToPool): `poolVa =
+// 0xA0000000 + pa`, so `pa = poolVa - 0xA0000000`. A header that already
+// carries a physical address (< 0x20000000) is taken as one. BOTH forms are
+// printed by the VDSWAP-ABI row, so the next soak says which one the guest
+// actually used.
+// ---------------------------------------------------------------------------
+namespace {
+// F-XXX: the console's VdSwap arguments, decoded out of the guest's own memory.
+struct VdSwapFrontBuffer {
+    bool        headerOk = false;   // the 24-byte fetch constant was readable
+    uint32_t    fetch[6] = {0, 0, 0, 0, 0, 0};
+    uint32_t    baseAddress = 0;    // fetch[1] >> 12     (20 bits)
+    uint32_t    headerAddr = 0;     // baseAddress << 12 (== fetch[1] & 0xFFFFF000)
+    uint32_t    format = 0;         // fetch[1] & 0x3F
+    uint32_t    width = 0;          // fetch[2] size_2d.width  + 1
+    uint32_t    height = 0;         // fetch[2] size_2d.height + 1
+    uint32_t    fbWord = 0;         // *r8 : the guest's own copy of the address
+    bool        fbWordOk = false;
+    uint32_t    fmtWord = 0;        // *r9 : the guest's own copy of the format
+    bool        fmtWordOk = false;
+    uint32_t    pa = 0;             // the console PHYSICAL address
+    uint32_t    poolVa = 0;         // this tree's byte for that physical address
+    const char* addrForm = "none";  // how `pa` was derived
+    const char* why = "";           // why it was not derived, when it was not
+};
+} // namespace
 
-    g_lastVdSwapObj.store(obj, std::memory_order_relaxed);
-    g_lastVdSwapInfo.store(swap_info, std::memory_order_relaxed);
+// F-XXX: read the console's VdSwap arguments out of the guest's own memory and
+// derive the front buffer's PHYSICAL address. Touches no memory it did not
+// read, and asserts nothing about the guest's values.
+static VdSwapFrontBuffer VdSwapReadFrontBuffer(uint32_t fetchPtr, uint32_t fbWordPtr,
+                                                uint32_t fmtWordPtr) {
+    VdSwapFrontBuffer fb;
+    auto &mem = ::mcla::kernel::GuestMemoryHeap::Instance();
+    if (fetchPtr == 0 || !mem.IsValid(fetchPtr, 24u)) {
+        fb.why = "fetch-header-unreadable";
+        return fb;
+    }
+    for (uint32_t i = 0; i < 6u; ++i) {
+        if (!mem.ReadU32BE(fetchPtr + i * 4u, &fb.fetch[i])) {
+            fb.why = "fetch-header-unreadable";
+            return fb;
+        }
+    }
+    fb.headerOk = true;
+    fb.baseAddress = fb.fetch[1] >> 12;
+    fb.headerAddr = fb.baseAddress << 12;   // == fetch[1] & 0xFFFFF000
+    fb.format = fb.fetch[1] & 0x3Fu;
+    fb.width = (fb.fetch[2] & 0x1FFFu) + 1u;
+    fb.height = ((fb.fetch[2] >> 13) & 0x1FFFu) + 1u;
+    if (fbWordPtr != 0) {
+        fb.fbWordOk = mem.ReadU32BE(fbWordPtr, &fb.fbWord);
+    }
+    if (fmtWordPtr != 0) {
+        fb.fmtWordOk = mem.ReadU32BE(fmtWordPtr, &fb.fmtWord);
+    }
+
+    // The PHYSICAL address, through the tree's ONE rule
+    // (src/boot_host.cpp:312-328, F640MapViewToPool): the pool address is
+    // 0xA0000000 + pa, so the physical address is the pool address minus
+    // 0xA0000000. The view bases are NOT restated here.
+    if (fb.headerAddr >= mcla::boot::kPhysLowRegionVa) {
+        // A console VIEW address: ask the one mechanism for its pool byte.
+        uint32_t poolVa = 0;
+        const mcla::boot::PhysViewResult r =
+            mcla::boot::TranslatePhysViewToPoolVa(fb.headerAddr, &poolVa);
+        if (r == mcla::boot::PhysViewResult::kMapped) {
+            fb.poolVa = poolVa;
+            fb.pa = poolVa - mcla::boot::kPhysLowRegionVa;
+            fb.addrForm = "console-view";
+        } else {
+            fb.why = (r == mcla::boot::PhysViewResult::kNotAView)
+                         ? "header-address-not-a-view"
+                         : "header-address-has-no-pool-byte";
+        }
+    } else if (fb.headerAddr < mcla::kernel::kConsolePhysicalBytes) {
+        // Already a PHYSICAL address.
+        fb.pa = fb.headerAddr;
+        fb.addrForm = "console-physical";
+    } else {
+        fb.why = "header-address-outside-the-console-physical-window";
+    }
+    return fb;
+}
+
+PPC_FUNC_IMPL(Hooked_VdSwap) {
+    // The console's argument registers (xboxkrnl_video.cc:352-360).
+    const uint32_t bufferPtr  = ctx.r3.u32;  // ptr into the primary ringbuffer
+    const uint32_t fetchPtr   = ctx.r4.u32;  // the 24-byte texture fetch constant
+    const uint32_t fbWordPtr  = ctx.r8.u32;  // ptr to the front buffer's address
+    const uint32_t fmtWordPtr = ctx.r9.u32;  // ptr to the texture format
+
+    g_lastVdSwapObj.store(bufferPtr, std::memory_order_relaxed);
+    g_lastVdSwapInfo.store(fetchPtr, std::memory_order_relaxed);
     const uint32_t nSwap = g_vdSwapCalls.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    // W7: VdSwap swap_info is a physical-ish address (seen as 0x004E0D30).
-    // Add it as a surface candidate — it may be the real framebuffer.
-    //
-    // F-612: that value is PHYSICAL, and it was being handed to the resolver as
-    // if it were a guest VA. Proof from w654.log: the very first
-    // "PRESENT-SURF resolved va=004E0D30 score=1" - the resolver bound a present
-    // to a physical address below the 0x20000000 window, scoring the clamp floor
-    // (gpu_device.cpp:4039). The repo's own convention for exactly this value is
-    // PhysToKernelVA (gpu_cp.cpp:669), published through pa|0xC0000000 (see
-    // gpu_cp.h:22-24, which states it for the rptr write-back).
-    // The phys form is KEPT so the existing candidate set is unchanged, and the
-    // kernel-VA form is ADDED beside it: scoring only ever promotes a better
-    // candidate, never demotes one, and PRESENT-SURF-AUDIT prints all three
-    // scores so the promotion is falsifiable from the next soak.
-    //
-    // F-640 (2026-09-30): "the kernel-VA form" was `swap_info | 0xC0000000u`, and
-    // that IS the C view address -- which in this tree is 0x20000000 ABOVE the pool
-    // byte the console means and, for pa = 0x004E0D30, not even inside the pool. So
-    // the promoted candidate was flat memory nothing wrote (w664.log:6631 scores
-    // `kva=C04E0D30 score=0` while `phys=004E0D30 score=1`). It is now TRANSLATED
-    // through the one mechanism (boot_host's TranslatePhysViewToPoolVa), the src
-    // label is `vdswap-pool` because the address is no longer the kva form, and a
-    // refusal registers NOTHING -- see the F-640 block above for why there is
-    // deliberately no fallback. The raw-`swap_info` candidate above is untouched, so
-    // the F-612 evidence (`resolved=004E0D30 score=1`) stays reproducible.
+    // F-XXX: the console's front buffer, from the guest's own fetch constant.
+    const VdSwapFrontBuffer fb =
+        VdSwapReadFrontBuffer(fetchPtr, fbWordPtr, fmtWordPtr);
+
+    // F-XXX: this tree's byte for the front buffer's PHYSICAL address. This is
+    // the ONE translation site (F640VdSwapPoolVa -> boot_host.cpp:312-328), and
+    // it is now handed the front buffer's address rather than a stack pointer.
     uint32_t poolVaForSwap = 0;
-    if (swap_info != 0 && swap_info < 0xF0000000u) {
-        mcla_gpu_AddSurfaceCandidate(swap_info, 1280, 720, "vdswap");
-        // The pool form only needs to ENTER the candidate table once:
-        // AddSurfaceCandidate updates the existing entry for a known VA
-        // (gpu_device.cpp:4048-4053) and RefreshResolvedSurface re-scores every
-        // slot on each call - including the one PresentKick makes at
-        // gpu_device.cpp:4145, once per frame. Registering it on the first four
-        // flips therefore costs 4 extra refreshes for the whole boot instead of
-        // one per frame, and cannot change behaviour after those four.
-        //
-        // The TRANSLATION, by contrast, is attempted on every flip: it is pure
-        // arithmetic plus the boot_host counters, it is what makes `translated=` /
-        // `dropped=` real numbers instead of a four-sample anecdote, and it is what
-        // keeps `poolPacked` current for the audit above.
-        if (swap_info < 0x20000000u) {
-            poolVaForSwap = F640VdSwapPoolVa(swap_info);
-            if (poolVaForSwap != 0 && nSwap <= 4) {
-                mcla_gpu_AddSurfaceCandidate(poolVaForSwap, 1280, 720, "vdswap-pool");
-            }
+    if (fb.pa != 0) {
+        poolVaForSwap = F640VdSwapPoolVa(fb.pa, fb.poolVa);
+        g_lastVdSwapFbPa.store(fb.pa, std::memory_order_relaxed);
+        g_lastVdSwapFbPool.store(poolVaForSwap, std::memory_order_relaxed);
+    } else {
+        g_lastVdSwapFbPa.store(0, std::memory_order_relaxed);
+        g_lastVdSwapFbPool.store(0, std::memory_order_relaxed);
+    }
+
+    // F-XXX: the surface candidate is now the console's FRONT BUFFER. The old
+    // candidate was the stack pointer (r4) itself, which is what bound every
+    // present to a stack struct (w654.log:6631 `resolved=004E0D30 score=1`).
+    // The pool form only needs to ENTER the candidate table once: AddSurface
+    // Candidate updates the existing entry for a known VA
+    // (gpu_device.cpp:4048-4053) and RefreshResolvedSurface re-scores every
+    // slot on each call, so registering it on the first four flips costs 4
+    // extra refreshes for the whole boot instead of one per frame, and cannot
+    // change behaviour after those four.
+    if (poolVaForSwap != 0) {
+        const uint32_t w = (fb.width != 0) ? fb.width : 1280u;
+        const uint32_t h = (fb.height != 0) ? fb.height : 720u;
+        if (nSwap <= 4) {
+            mcla_gpu_AddSurfaceCandidate(poolVaForSwap, w, h, "vdswap-frontbuffer");
+        }
+    }
+
+    // F-XXX: THE CONSOLE'S SWAP PACKET. The console's kernel export writes TWO
+    // PM4 packets into the ring block the caller reserved
+    // (xboxkrnl_video.cc:404-434) and the display engine acts on them when the
+    // ring is submitted. This host never emitted them: build/w854.log carries
+    // 0 `CP: XE_SWAP` rows, and the CP's own decoder could not have reached one
+    // (the packet had no case in DrainPacketAt and fell into its `default:`
+    // arm). The packets are written into the GUEST'S OWN stream, at the point
+    // the console writes them -- after the frame's kCopy draw, before the flip.
+    bool emitted = false;
+    if (fb.headerOk && fb.pa != 0 && bufferPtr != 0) {
+        emitted = mcla::gpu::CpEmitXeSwap(bufferPtr, fb.fetch, fb.pa, fb.width,
+                                          fb.height);
+    }
+
+    // F-XXX: THE CENSUS ROW (falsifier 1). The derived physical address and the
+    // header field it came from are printed SIDE BY SIDE, together with the
+    // guest's own copy of the address (*r8) and the console's own answer to
+    // "which surface is displayed" (RB_COPY_DEST_BASE, 0x2319), so the
+    // agreement is checkable in the log and not asserted in prose.
+    {
+        const mcla::gpu::CpGuestRenderTarget rt = mcla::gpu::CpGuestRenderTargetInfo();
+        const uint32_t rbPitch = rt.copyDestPitch & 0x3FFFu;
+        const uint32_t rbHeight = (rt.copyDestPitch >> 16) & 0x3FFFu;
+        const uint32_t matchHeader =
+            (fb.fbWordOk && fb.fbWord == fb.headerAddr) ? 1u : 0u;
+        const uint32_t matchFormat =
+            (fb.fmtWordOk && fb.fmtWord == fb.format) ? 1u : 0u;
+        const uint32_t matchRbCopy = (fb.pa != 0 && fb.pa == rt.copyDestBase) ? 1u : 0u;
+        const uint32_t matchGeom =
+            (fb.width == rbPitch && fb.height == rbHeight) ? 1u : 0u;
+        static std::atomic<uint32_t> s_abiRows{0};
+        const uint32_t on = s_abiRows.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (on <= 8u || (on % 200u) == 0u) {
+            MCLA_LOG_WARN(
+                "VDSWAP-ABI #{} fetchPtr={:08X} dword1={:08X} baseAddr={:08X} "
+                "headerAddr={:08X} fbWord={:08X} fbWordOk={} fmt={} fmtWord={:08X} "
+                "fmtWordOk={} wh={}x{} pa={:08X} pool={:08X} addrForm={} "
+                "rbCopyDestBase={:08X} rbPitch={} rbHeight={} "
+                "matchHeader={} matchFormat={} matchRbCopy={} matchGeom={} "
+                "emit={} why={}",
+                on, fetchPtr, fb.fetch[1], fb.baseAddress, fb.headerAddr,
+                fb.fbWord, fb.fbWordOk ? 1 : 0, fb.format, fb.fmtWord,
+                fb.fmtWordOk ? 1 : 0, fb.width, fb.height, fb.pa, poolVaForSwap,
+                fb.addrForm, rt.copyDestBase, rbPitch, rbHeight, matchHeader,
+                matchFormat, matchRbCopy, matchGeom, emitted ? 1 : 0, fb.why);
         }
     }
 
@@ -484,14 +718,15 @@ PPC_FUNC_IMPL(Hooked_VdSwap) {
     if (swapCount <= 8 || (swapCount % 200) == 0) {
         const uint32_t presents = g_nativePresents.load(std::memory_order_relaxed);
         MCLA_LOG_INFO("VdSwap[{}] obj=0x{:08X} swap_info=0x{:08X} kva=0x{:08X} "
-                      "pool=0x{:08X} pool_n={} "
+                      "pool=0x{:08X} pool_n={} fbPa=0x{:08X} emit={} "
                       "(INERT — present owned by PresentKick 0x824294E0; "
                       "presents={} vdswap={} ratio=1:{})",
-                    swapCount, obj, swap_info,
-                    (swap_info != 0 && swap_info < 0x20000000u)
-                        ? (swap_info | 0xC0000000u) : swap_info,
+                    swapCount, bufferPtr, fetchPtr,
+                    (fetchPtr != 0 && fetchPtr < 0x20000000u)
+                        ? (fetchPtr | 0xC0000000u) : fetchPtr,
                     poolVaForSwap,
                     g_f640VdSwap.mapped.load(std::memory_order_relaxed),
+                    fb.pa, emitted ? 1 : 0,
                     presents, nSwap,
                     presents ? (nSwap / presents) : 0u);
     }
