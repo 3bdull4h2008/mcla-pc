@@ -1177,12 +1177,21 @@ bool D3D12Backend::ResolveGuestRenderTarget() {
             "The guest's copy DESTINATION is an address in the guest's own "
             "memory; this host's scan-out surface is the window's back buffer, "
             "so the copy lands in a different object than the guest asked for "
-            "-- that difference is named here rather than hidden.",
+            "-- that difference is named here rather than hidden. "
+            "RB_COPY_DEST_PITCH decodes (registers.h:887-897, 14 bits each) as "
+            "pitch={} height={}, i.e. the console's front buffer is {}x{}; it "
+            "is a TILED 2D surface (xenia xenos.h:911-915: the EDRAM copy "
+            "produces a tiled 2D texture), so this host does not write it: a "
+            "linear write there would not be the console's bytes.",
             static_cast<uint32_t>(n), m_guestRtW, m_guestRtH,
             static_cast<uint32_t>(m_guestRtFormat), m_width, m_height,
             m_guestRtChangedPx,
             gt.copyControl, gt.copyDestBase, gt.copyDestPitch, gt.copyDestInfo,
-            gt.edramMode, gt.edramMode, gt.surfacePitch);
+            gt.edramMode, gt.edramMode, gt.surfacePitch,
+            static_cast<uint32_t>(gt.copyDestPitch & 0x3FFFu),
+            static_cast<uint32_t>((gt.copyDestPitch >> 16) & 0x3FFFu),
+            static_cast<uint32_t>(gt.copyDestPitch & 0x3FFFu),
+            static_cast<uint32_t>((gt.copyDestPitch >> 16) & 0x3FFFu));
     }
     return true;
 }

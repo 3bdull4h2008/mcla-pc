@@ -981,10 +981,17 @@ void CpScratchWriteback(uint32_t slot, uint32_t value) {
     //   space       the ADDRESS SPACE the store actually used: FLAT, i.e. this
     //                tree's one 4 GiB window at the guest PHYSICAL number.
     //                The reference's space is PHYSICAL, presented in this tree
-    //                at guest VA kPhysArenaBeginVa + (pa - 0x400000)
-    //                (boot_host.cpp:225-226) = the A view, the only one of the
-    //                three that is the pool here (w700.log F640-PHYSALIAS
-    //                canary_shared_views=1/3 A_view_is_pool=1, byte 3497).
+    //                at guest VA 0xA0000000 + pa -- the console's OWN identity
+    //                for a physical byte, because the A view's base IS the
+    //                physical heap's base on the console (xenia memory.cc:171-180:
+    //                one 512 MiB physical heap at physical 0, aliased into the
+    //                0xA/0xC/0xE views). The one implementation of that rule in
+    //                this tree is F640MapViewToPool (src/boot_host.cpp:312-328):
+    //                poolVa = kPhysLowRegionVa + pa.
+    //                (F-640/B2, 2026-10-21: the text this replaces said
+    //                `kPhysArenaBeginVa + (pa - 0x400000)`, boot_host.cpp:225-226,
+    //                which was the PRE-B2 rule. The tree no longer does that, so
+    //                the row must not print that arithmetic either.)
     //   val         the word stored, verbatim.
     //
     // `poolByte` is printed as the DERIVED number only and is deliberately NOT
@@ -1001,23 +1008,40 @@ void CpScratchWriteback(uint32_t slot, uint32_t value) {
     // `onPollByte=` only says the two numbers coincide; it does NOT claim the
     // wait can satisfy on its own - F-721 also corrected the wait's READ side
     // (byte order), which was a second and independent defect.
-    // poolByte, DERIVED from the same two constants the wait's own
-    // CpPhysToPoolVa uses, and with the SAME refusal predicate, because a
-    // printed number that the real path would refuse to produce is exactly the
-    // kind of number that gets quoted later as a measurement. The pool's own
-    // physical window starts at kPhysArenaBeginVa - 0xA0000000 (F-391's +4 MiB
-    // headroom); below it there is no pool byte in this tree and the real path
-    // answers kNoPoolByte, so this row answers NO_POOL_BYTE.
-    const uint32_t poolPhysBase =
-        mcla::kernel::kPhysArenaBeginVa - 0xA0000000u; // == 0x400000
-    const bool poolHasByte = (dest >= poolPhysBase) &&
-                             (dest < mcla::kernel::kConsolePhysicalBytes) &&
-                             (dest - poolPhysBase <
-                              mcla::kernel::PhysArenaSizeBytes());
+    // poolByte, DERIVED from the same rule the real path uses, and with the
+    // SAME refusal predicate, because a printed number that the real path
+    // would refuse to produce is exactly the kind of number that gets quoted
+    // later as a measurement.
+    //
+    // F-640/B2 (2026-10-21, fix_present2): THE RULE, READ FROM THE ONE
+    // IMPLEMENTATION (src/boot_host.cpp:312-328, F640MapViewToPool), not
+    // restated: a console PHYSICAL address maps to its pool byte as
+    //     poolVa = kPhysLowRegionVa + pa          (0xA0000000 + pa)
+    // for EVERY pa in the console's physical window [0, 0x20000000) -- the A
+    // view's base IS the physical heap's base on the console (xenia
+    // memory.cc:171-180), so this is the hardware's mapping and not a host
+    // invention. The old arithmetic in this row was
+    //     poolByte = kPhysArenaBeginVa + (pa - 0x400000)
+    // which is the PRE-B2 rule: it refused every pa < 4 MiB (the console's low
+    // region) and printed poolByte=00000000 poolHasByte=0 for it, i.e. it
+    // printed a number the real path would never produce. For pa >= 4 MiB the
+    // two forms are the SAME number (0xA0400000 + (pa - 0x400000) ==
+    // 0xA0000000 + pa), so only the low region changed -- and the low region is
+    // exactly where the guest's own fetch constants live (physical 0 and
+    // 0x1FE0FC, CP-FETCHVB-DECODE in build/w852.log).
+    //
+    // THE BELT is the allocator's upper bound (kPhysArenaEndVa), the same one
+    // F640MapViewToPool applies. With kConsolePhysicalBytes = 0x20000000 and
+    // kPhysLowRegionVa = 0xA0000000 the sum can never reach kPhysArenaEndVa
+    // (0xC0400000), so the belt is inert for an in-window pa and the refusal
+    // predicate is exactly the console's window.
     const uint32_t poolByte =
-        poolHasByte ? (mcla::kernel::kPhysArenaBeginVa +
-                       (dest - poolPhysBase))
-                    : 0u;
+        (dest < mcla::kernel::kConsolePhysicalBytes)
+            ? (mcla::boot::kPhysLowRegionVa + dest)
+            : 0u;
+    const bool poolHasByte =
+        (poolByte >= mcla::boot::kPhysLowRegionVa) &&
+        (poolByte < mcla::kernel::kPhysArenaEndVa);
     MCLA_LOG_WARN("CP-SCRATCH-WB-ADDR #{} reg={:04X} slot={} destPhys={:08X} "
                   "space={} stored={} poolByte={:08X} poolHasByte={} "
                   "onPollByte={} val={:08X} || scratchWB={} stores={} - "
@@ -1028,11 +1052,12 @@ void CpScratchWriteback(uint32_t slot, uint32_t value) {
                   "(pa & 0x1FFFFFFF), NOT a guest virtual address), and "
                   "space=FLAT is this tree's single 4 GiB window at that "
                   "number. The reference's space is the PHYSICAL byte, "
-                  "presented in this tree at poolByte (kPhysArenaBeginVa + "
-                  "(pa - 0x400000), boot_host.cpp:225-226; the A view is the "
-                  "only view that is the pool here, MEASURED "
-                  "canary_shared_views=1/3 A_view_is_pool=1). Those two are "
-                  "0xA0000000 apart and are DIFFERENT bytes of one window. "
+                  "presented in this tree at poolByte (0xA0000000 + pa, the "
+                  "console's own identity for a physical byte -- the A view's "
+                  "base IS the physical heap's base, xenia memory.cc:171-180; "
+                  "the one implementation is F640MapViewToPool, "
+                  "src/boot_host.cpp:312-328, poolVa = kPhysLowRegionVa + pa). "
+                  "Those two are 0xA0000000 apart and are DIFFERENT bytes of one window. "
                   "onPollByte=1 only says the numbers coincide. Destination "
                   "now registered with CpNoteMemWriteDest in guest-physical "
                   "units so CP-WAITREG-NEVERWRITTEN can no longer claim no "

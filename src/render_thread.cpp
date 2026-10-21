@@ -9,6 +9,8 @@
 #include "renderer/grc_fvf_decode.h"
 #include "d3d12_backend.h"
 #include "gpu_cp.h"  // F-647: CpReadGuestRegisters + the Xenos register indices
+#include "boot_host.h"  // F-640: TranslatePhysViewToPoolVa - the ONE view->pool rule
+#include "kernel/heap_arena.h"  // kConsolePhysicalBytes - the console's 512 MiB window
 #include "render_queue.h"
 #include <array>   // F-647: the fixed 4,096-byte constant-bank buffer
 #include <atomic>
@@ -1586,25 +1588,133 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // blitted, no synthetic fallback may ever paint again.
             static std::atomic<bool> s_guestContentSeen{false};
 
-            // Determine which VA to blit from.
-            // Heartbeat (swapInfo=0): don't blit, just clear.
-            // Guest present with swap-table swapInfo: use resolved surface.
-            // Guest present with real surface swapInfo: use swapInfo directly.
+            // =================================================================
+            // F-XXX (2026-10-21, fix_present2): WHICH SURFACE DOES THE GUEST'S
+            // PRESENT NAME? What was here, and why it was structurally wrong.
+            //
+            // WHAT WAS HERE. `blitVA = p.swapInfo` -- the guest's PresentKick r4
+            // -- behind a swap-table family test (0xC71D8180..0xC71D81E0) that
+            // the guest never satisfies, so EVERY guest present read a 4-byte
+            // flip-timestamp SLOT as a 1280x720 pixel buffer (3,686,400 bytes
+            // out of the guest's heap). The census then refused every one of
+            // them (GUEST-SURFACE-UNCOHERENT-REFUSED: 8 rows in build/w852.log,
+            // 9 in build/w854.log) -- and THAT REFUSAL WAS RIGHT. The ADDRESS
+            // SELECTION was wrong, not the census.
+            //
+            // THE GUEST'S OWN FACTS (measured; none of them inferred):
+            //  * PresentKick's r4 is a swap-table SLOT, not a framebuffer. The
+            //    HOST writes the flip timestamp into it:
+            //    src/gpu_device.cpp:6680-6683 writes
+            //    tableBase + (((queued+k)&7)+16)*4 with the timebase, and the
+            //    guest's own bytes reserve the same two slots per kick.
+            //    MEASURED: SWAP-FILL #3 table=B7AF0040; PRESENT-KICK-CENSUS
+            //    fb=B7AF0080, B7AF0084, ... B7AF009C -- i.e. slot 16+n at
+            //    0xB7AF0040 + (16+n)*4. The old family test looked for
+            //    0xC71D8180..0xC71D81E0, which is not this table at all.
+            //  * The console's own answer to "which surface is displayed" is the
+            //    RB copy destination: RB_COPY_DEST_BASE (Xenos register 0x2319)
+            //    is where the copy unit puts the rendered frame -- xenia
+            //    xenos.h:911-915: "Xenos copies EDRAM contents to a tiled 2D or
+            //    3D texture (resolves) by drawing primitives with the EDRAM mode
+            //    EdramMode::kCopy" -- and the guest's VdSwap publishes that same
+            //    buffer to the display engine (xenia
+            //    xboxkrnl_video.cc:352-360: VdSwap's 8th argument is
+            //    "lpdword_t frontbuffer_ptr, ptr to frontbuffer address", and
+            //    the kernel turns it into the physical address it writes into
+            //    the PM4_XE_SWAP packet at :424-429).
+            //  * The RUNNING value is in the guest's own Xenos register file:
+            //    mcla::gpu::CpGuestRenderTargetInfo() (src/gpu_cp.cpp:6713).
+            //    MEASURED (the GUEST-RT-RESOLVE rows of build/w852.log and
+            //    build/w854.log): RB_COPY_DEST_BASE=17E98000 and 185C8000 (two
+            //    front buffers, alternating), RB_COPY_DEST_PITCH=02D00500 =>
+            //    pitch 1280, height 720 (registers.h:887-897, 14 bits each),
+            //    RB_MODECONTROL=6 (EdramMode::kCopy) or 4 (kColorDepth).
+            //
+            // SO THE BLIT SOURCE IS THE GUEST'S FRONT BUFFER, and its pool byte
+            // comes from the ONE translation this tree has for a console
+            // physical address: mcla::boot::TranslatePhysViewToPoolVa
+            // (src/boot_host.h:222 -> src/boot_host.cpp:312-328), whose rule is
+            // poolVa = kPhysLowRegionVa + pa (0xA0000000 + pa) for every pa in
+            // the console's physical window.
+            //
+            // WHAT THIS DOES NOT CLAIM: it does not make the front buffer hold
+            // a frame. This host does not model the RB copy unit, so the bytes
+            // at RB_COPY_DEST_BASE are whatever the guest's allocator left
+            // there. The census below therefore refuses them (a surface with a
+            // single colour over its whole area is not evidence of a drawn
+            // region -- see the SURFACE-EMPTY refusal), and a refusal touches
+            // no memory.
+            //
+            // THE HEARTBEAT IS NOT A REFUSAL. IsHeartbeatPresent(cmd) is the
+            // tree's single test for "this PRESENT is the host's own 33 ms
+            // heartbeat" (F-610), so the heartbeat keeps its clear-only
+            // behaviour and is NOT counted as a missing surface.
+            // =================================================================
             uint32_t blitVA = 0;
-            if (p.swapInfo >= 0x80000000u && p.swapInfo < 0x100000000u) {
-                // Heuristic: swap-table slots are in the C71D81xx family
-                // (table at C71D8180, slots at +0x40..+0x5C).
-                const bool isSwapTable =
-                    (p.swapInfo >= 0xC71D8180u && p.swapInfo < 0xC71D81E0u);
-                if (isSwapTable) {
-                    // Swap-table slot — use resolved surface if available.
-                    blitVA = p.surfaceVA;
-                } else {
-                    // Might be a real surface — try it directly.
-                    blitVA = p.swapInfo;
+            uint32_t blitPhys = 0;
+            const char* blitSrc = "heartbeat-no-guest-present";
+            if (!heartbeat) {
+                blitSrc = "guest-stated-no-rb-copy-dest";
+                const mcla::gpu::CpGuestRenderTarget rt =
+                    mcla::gpu::CpGuestRenderTargetInfo();
+                blitPhys = rt.copyDestBase;
+                if (blitPhys != 0) {
+                    if (blitPhys >= mcla::kernel::kConsolePhysicalBytes) {
+                        // Outside the console's 512 MiB physical window: no byte
+                        // anywhere in this tree can be this address, and the `|`
+                        // below would corrupt it, so it is refused by name.
+                        blitSrc = "guest-rb-copy-dest-outside-console-window";
+                    } else {
+                        uint32_t poolVa = 0;
+                        // Register this site with the F-640 census ONCE, so the
+                        // summary row's `adopted_sites` counts it and a
+                        // `dropped=0` beside it is read as a measurement rather
+                        // than as "nothing was ever routed here" (F-057(6)).
+                        static const bool kRegistered = [] {
+                            mcla::boot::RegisterPhysAliasWriter(
+                                "render_thread.cpp:present-front-buffer");
+                            return true;
+                        }();
+                        (void)kRegistered;
+                        const mcla::boot::PhysViewResult r =
+                            mcla::boot::TranslatePhysViewToPoolVa(
+                                blitPhys | 0xC0000000u, &poolVa);
+                        if (r == mcla::boot::PhysViewResult::kMapped) {
+                            blitVA = poolVa;
+                            blitSrc = "guest-rb-copy-dest";
+                        } else {
+                            blitSrc =
+                                (r == mcla::boot::PhysViewResult::kNotAView)
+                                    ? "guest-rb-copy-dest-not-a-view"
+                                    : "guest-rb-copy-dest-no-pool-byte";
+                        }
+                    }
+                }
+                if (blitVA == 0) {
+                    // No surface could be named. Nothing is blitted and nothing
+                    // is substituted: the back buffer keeps the bytes it already
+                    // holds and the window keeps what it was already showing.
+                    // The row says WHICH of the named reasons applied, so a
+                    // zero here is a counted refusal and not a silence.
+                    surfaceRefused = true;
+                    static std::atomic<uint64_t> noSurface{0};
+                    const uint64_t sn = noSurface.fetch_add(1) + 1;
+                    if (sn <= 8 || (sn % 120) == 0)
+                        MCLA_LOG_WARN(
+                            "PRESENT-SURFACE-NONE #{} src={} phys={:08X} "
+                            "resolvedSurf={:08X} fb={:08X} -- NO SURFACE WAS "
+                            "NAMED, so NOTHING WAS BLITTED AND NOTHING WAS "
+                            "SUBSTITUTED: the back buffer keeps the bytes it "
+                            "already holds and the window keeps what it was "
+                            "already showing. The console names the displayed "
+                            "surface in RB_COPY_DEST_BASE (Xenos register 0x2319, "
+                            "read here from the guest's own register file) and "
+                            "the guest's VdSwap publishes that same buffer to "
+                            "the display engine. noSurface={}",
+                            sn, blitSrc, blitPhys, p.surfaceVA, p.swapInfo, sn);
                 }
             }
-            // Note: swapInfo=0 (heartbeat) leaves blitVA=0 → clear-only.
+            // Note: the heartbeat leaves blitVA=0 -> clear-only, as before.
 
             if (blitVA != 0) {
                 auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -1679,6 +1789,38 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     GuestSurfaceCensus census{};
                     CensusGuestSurface(fbBuf.data(), fbW, fbH, &census);
                     coherent = GuestSurfaceIsCoherent(census);
+                    // F-XXX (2026-10-21, fix_present2): AN EMPTY SURFACE IS NOT
+                    // A SURFACE. GuestSurfaceIsCoherent ACCEPTS a uniform
+                    // surface -- "one single value -> ACCEPT: a uniform
+                    // surface. Black is a measurement, and there is no scattered
+                    // content in it to be wrong about"
+                    // (src/d3d12_backend.h:1684-1686) -- and that was safe
+                    // while the surface being walked was the guest's
+                    // flip-timestamp SLOT (3.7 MB of heap debris, refused for a
+                    // different reason). It is NOT safe now that the source is
+                    // the console's own front buffer: this host does not model
+                    // the RB copy unit, so the bytes at RB_COPY_DEST_BASE are
+                    // UNWRITTEN, the walk sees ONE colour over the whole
+                    // 1280x720 area, the uniform branch would ACCEPT it, and
+                    // the upload would then paint a BLANK surface over the frame
+                    // the draw path had already resolved into the back buffer
+                    // -- and nothing downstream would stop it, because
+                    // PresentBgra RELEASES the draw-path latch for a guest
+                    // PRESENT (src/d3d12_backend.cpp:6110-6118). A blank blit is
+                    // worse than no blit, so the uniform branch REFUSES HERE,
+                    // by name.
+                    //
+                    // FALSIFIER: a GUEST-SURFACE-COHERENT row with distinct=1
+                    // on a surface the guest really drew would refute this. On
+                    // the surfaces this log contains the measured distinct
+                    // values are 2 (the drawn one) and 319 (the refused debris),
+                    // so no MEASURED case changes; the only case that changes is
+                    // the one the census never saw, because the old source was
+                    // not a surface at all.
+                    const bool emptySurface = (census.distinct <= 1);
+                    if (coherent && emptySurface) {
+                        coherent = false;
+                    }
                     if (coherent) {
                         // Logged on the accepting side too, and deliberately: the
                         // threshold is calibrated on the two drawn surfaces this
@@ -1688,7 +1830,8 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                         static std::atomic<uint64_t> coherentCount{0};
                         const uint64_t cn = coherentCount.fetch_add(1) + 1;
                         if (cn <= 8 || (cn % 120) == 0)
-                            MCLA_LOG_INFO("GUEST-SURFACE-COHERENT #{} va={:08X} wh={}x{} "
+                            MCLA_LOG_INFO("GUEST-SURFACE-COHERENT #{} va={:08X} src={} "
+                                          "srcPhys={:08X} wh={}x{} "
                                           "total={} distinct={} modalCount={} "
                                           "contaminated={} rareCount={} "
                                           "rareFraction={:.6f} rareFractionMax={:.6f} "
@@ -1699,7 +1842,8 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                           "the whole surface. contaminated=0 is the "
                                           "uniform branch, where there is no "
                                           "scattered mass to be wrong about",
-                                          cn, blitVA, fbW, fbH, census.total,
+                                          cn, blitVA, blitSrc, blitPhys, fbW, fbH,
+                                          census.total,
                                           census.distinct, census.modalCount,
                                           census.contaminated, census.rareCount,
                                           census.rareFraction,
@@ -1707,21 +1851,40 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                           kGuestCensusRareCount);
                     } else {
                         surfaceRefused = true;
+                        // F-XXX (2026-10-21, fix_present2): WHY, IN ONE WORD.
+                        // The old prose asserted "scattered bright debris"
+                        // unconditionally, which is FALSE for a surface that
+                        // holds a single colour: that is an EMPTY surface, not
+                        // debris, and the two have different causes and need
+                        // different words. The distinction is MEASURED, not
+                        // asserted: distinct == 1 means one rgba value over the
+                        // whole 1280x720 area, so the bytes hold no region at
+                        // all. That is the guest's front-buffer case on this
+                        // host, because the RB copy unit is not modelled and
+                        // nothing is ever written there.
+                        const char* why =
+                            emptySurface ? "SURFACE-EMPTY" : "SURFACE-DEBRIS";
                         static std::atomic<uint64_t> uncoherentCount{0};
                         const uint64_t rn = uncoherentCount.fetch_add(1) + 1;
                         if (rn <= 8 || (rn % 120) == 0)
                             MCLA_LOG_ERROR(
-                                "GUEST-SURFACE-UNCOHERENT-REFUSED #{} va={:08X} wh={}x{} "
+                                "GUEST-SURFACE-UNCOHERENT-REFUSED #{} va={:08X} "
+                                "src={} srcPhys={:08X} why={} wh={}x{} "
                                 "total={} distinct={} distinctOverflow={} modalCount={} "
                                 "contaminated={} rareCount={} rareFraction={:.6f} "
                                 "rareFractionMax={:.6f} rareCountMax={} "
                                 "distinctNonModal={} largestNonModal={} "
                                 "pxPerNonModalColour={} -- REFUSED, and this is the "
-                                "honest answer rather than a fix: {} of {} "
-                                "non-background pixels sit in colours occurring at "
-                                "most {} times in the whole surface, so this is "
-                                "scattered bright debris rather than a region the "
-                                "guest drew, and {} of the surface was walked with "
+                                "honest answer rather than a fix: the why= field "
+                                "names which of the two MEASURED shapes this "
+                                "surface has. SURFACE-EMPTY means one colour over "
+                                "the whole surface (distinct={}), so those bytes "
+                                "hold no region at all -- nothing was drawn there. "
+                                "SURFACE-DEBRIS means {} of {} non-background "
+                                "pixels sit in colours occurring at most {} times "
+                                "in the whole surface, i.e. scattered bright debris "
+                                "rather than a region the guest drew. In both "
+                                "cases {} of the surface was walked with "
                                 "no stride. NOTHING WAS BLITTED AND NOTHING WAS "
                                 "SUBSTITUTED: the back buffer keeps the bytes it "
                                 "already holds and the window keeps what it was "
@@ -1735,7 +1898,8 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                 "distinctOverflow or a zero-pixel surface refuses "
                                 "for the same reason: a full histogram cannot prove "
                                 "uniformity and an empty walk measured nothing",
-                                rn, blitVA, fbW, fbH, census.total, census.distinct,
+                                rn, blitVA, blitSrc, blitPhys, why, fbW, fbH,
+                                census.total, census.distinct,
                                 census.distinctOverflow, census.modalCount,
                                 census.contaminated, census.rareCount,
                                 census.rareFraction, kGuestCensusRareFractionMax,
@@ -1744,7 +1908,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                 census.distinctNonModal
                                     ? census.contaminated / census.distinctNonModal
                                     : 0,
-                                census.contaminated, census.total,
+                                census.distinct, census.contaminated, census.total,
                                 kGuestCensusRareCount, census.total,
                                 static_cast<uint64_t>(16u * 16u), census.total);
                     }
@@ -1788,15 +1952,18 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     static std::atomic<uint32_t> presentFbCount{0};
                     const uint32_t pfn = presentFbCount.fetch_add(1) + 1;
                     if (pfn <= 16 || (pfn % 60) == 0)
-                        MCLA_LOG_INFO("PRESENT-FB sample rgb=({:.2f},{:.2f},{:.2f}) va={:08X} (fb={:08X}) wh={}x{}",
-                                      cr, cg, cb, blitVA, p.swapInfo, fbW, fbH);
+                        MCLA_LOG_INFO("PRESENT-FB sample rgb=({:.2f},{:.2f},{:.2f}) va={:08X} "
+                                          "src={} phys={:08X} (fb={:08X}) wh={}x{}",
+                                      cr, cg, cb, blitVA, blitSrc, blitPhys,
+                                      p.swapInfo, fbW, fbH);
 
                     if (!backend_.PresentBgra(fbW, fbH, fbBuf.data())) {
                         static std::atomic<uint32_t> blitFail{0};
                         const uint32_t fn = blitFail.fetch_add(1) + 1;
                         if (fn <= 5 || (fn % 120) == 0)
-                            MCLA_LOG_WARN("PRESENT-BLIT fail #{} va={:08X} wh={}x{}",
-                                          fn, blitVA, fbW, fbH);
+                            MCLA_LOG_WARN("PRESENT-BLIT fail #{} va={:08X} src={} "
+                                          "phys={:08X} wh={}x{}",
+                                          fn, blitVA, blitSrc, blitPhys, fbW, fbH);
                     } else {
                         blitOk = true;
                         // F-610: latch the gradient fallback off for good. From
@@ -1806,8 +1973,10 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                         static std::atomic<uint32_t> blitCount{0};
                         const uint32_t bn = blitCount.fetch_add(1) + 1;
                         if (bn <= 10 || (bn % 60) == 0)
-                            MCLA_LOG_INFO("PRESENT-BLIT #{} {}x{} va={:08X} (fb={:08X})",
-                                          bn, fbW, fbH, blitVA, p.swapInfo);
+                            MCLA_LOG_INFO("PRESENT-BLIT #{} {}x{} va={:08X} src={} "
+                                          "phys={:08X} (fb={:08X})",
+                                          bn, fbW, fbH, blitVA, blitSrc, blitPhys,
+                                          p.swapInfo);
                     }
                   }
                 } else if (n <= 8 || (n % 240) == 0) {
@@ -1818,8 +1987,9 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     // "read failed" -- a false statement about a read that
                     // succeeded and returned 3,686,400 bytes. The two are now
                     // nested so the arm keeps meaning exactly what it says.
-                    MCLA_LOG_WARN("PRESENT-FB read failed va={:08X} (fb={:08X})",
-                                  blitVA, p.swapInfo);
+                    MCLA_LOG_WARN("PRESENT-FB read failed va={:08X} src={} "
+                                  "phys={:08X} (fb={:08X})",
+                                  blitVA, blitSrc, blitPhys, p.swapInfo);
                 }
             }
 
