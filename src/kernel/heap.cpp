@@ -2764,6 +2764,17 @@ void Heap::Init()
         g_hdrGoldenCap = o1heapGetDiagnostics(heap).capacity;  // F-370: constant from here on
 
     physArenaBase = (uint8_t*)mcla::kernel::g_memory.Translate(mcla::kernel::kPhysArenaBeginVa);
+    // F-640/B2: THE ALLOCATOR MUST NOT REACH THE LOW REGION. The low region
+    // [0xA0000000, 0xA0400000) carries the console's physical [0, 0x400000); the
+    // allocator's arena starts at kPhysArenaBeginVa, which IS the low region's end.
+    // The two are therefore disjoint BY CONSTRUCTION and o1heap can never hand a
+    // low-region byte to the guest -- which is what makes the low region a faithful
+    // "console physical page 0" rather than a second allocator arena. Stated at
+    // compile time so a future base move cannot quietly overlap them.
+    static_assert(mcla::kernel::kPhysArenaBeginVa >= mcla::boot::kPhysLowRegionEndVa,
+                  "F-640/B2: the physical allocator's arena must start at or above the "
+                  "console's LOW REGION end (0xA0400000), or it would hand out bytes "
+                  "that are also the console's physical page 0.");
     // F-640: THE CAPACITY IS NOW THE CONSOLE'S, DERIVED, NOT INVENTED. This line used to read
     // `0x100000000 - kPhysArenaBeginVa` = 0x5FC00000 = 1,532.0 MiB -- "everything above the base,
     // to the top of the window". That expression had no source: it encoded F-391's choice of BASE,
@@ -2806,7 +2817,9 @@ void Heap::Init()
     MCLA_LOG_WARN("PHYS-POOL phase=init cap_bytes={:#x} cap_mb={:.1f} model=console-512MiB "
                   "replaced_mb=1532.0 ratio=2.992x guest=[{:08X}..{:08X}) o1_capacity={:#x} "
                   "o1_capacity_mb={:.1f} hdr={:p} inst_detached={} inst_host={:p} "
-                  "frag0_guest={:08X} o1_cap_delta={:#x} user_inst_detached={} user_inst_host={:p}",
+                  "frag0_guest={:08X} o1_cap_delta={:#x} user_inst_detached={} user_inst_host={:p}"
+                  " | low_region=[{:08X}..{:08X}) low_bytes={:#x} low_in_allocator=0 "
+                  "low_region_owner=console-physical-0(F-640/B2)",
                   (uint64_t)physArenaSize,
                   static_cast<double>(physArenaSize) / (1024.0 * 1024.0),
                   mcla::kernel::kPhysArenaBeginVa,
@@ -2819,7 +2832,9 @@ void Heap::Init()
                   mcla::kernel::kPhysArenaBeginVa,
                   (uint64_t)(o1Cap - o1CapAttachedModel),
                   (g_userInstMem != nullptr) ? 1 : 0,
-                  (void*)g_userInstMem);
+                  (void*)g_userInstMem,
+                  mcla::boot::kPhysLowRegionVa, mcla::boot::kPhysLowRegionEndVa,
+                  (uint64_t)mcla::boot::kPhysLowRegionBytes);
 }
 
 void Heap::AttachPhysicalArena(void* base, size_t size)

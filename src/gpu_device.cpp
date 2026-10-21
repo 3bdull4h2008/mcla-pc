@@ -7249,6 +7249,9 @@ PPC_FUNC(sub_82419718) {
 // ---------------------------------------------------------------------------
 PPC_FUNC_IMPL(__imp__sub_82460270);
 static std::atomic<uint32_t> s_h60270{0};
+// F-8xx/loop1ms (2026-10-21): the worker thread's argument object, captured
+// by the sub_824F0028 hook below and sampled by the SLEEP60270-W row.
+static std::atomic<uint32_t> s_workerSelf{0};
 PPC_FUNC(sub_82460270) {
   const uint32_t n = s_h60270.fetch_add(1) + 1;
   const uint32_t ms = ctx.r3.u32;
@@ -7257,7 +7260,81 @@ PPC_FUNC(sub_82460270) {
   if (n <= 40 || (n % 200) == 0)
     MCLA_LOG_INFO("SLEEP60270 #{} ms={} al={} callerLR={:08X}", n, ms,
                   alertable, callerLr);
+  // F-8xx/loop1ms (2026-10-21): THE 1 ms WORKER LOOP IS NAMED.
+  //
+  // MEASURED (build/w851.log): every one of the 696 `SLEEP60270` rows has
+  // callerLR=824F0090, i.e. the sleep is the `bl 0x821C91B8` at guest
+  // 0x824F008C inside guest function `sub_824F0028` (raw bytes via
+  // tools/ppc_disasm.py 0x824F0028 60; emitted body
+  // generated/ppc_xenon/ppc_recomp.99.cpp:5227-5301).  `sub_824F0028` is a
+  // guest THREAD ENTRY (build/w851.log:121890 `THREAD-NODE #18 @ 8285FF2C:
+  // 824F0028 A0DF9658 ...`), NOT the boot worker.
+  //
+  // THE EXIT CONDITION (raw): the loop's test is the byte at [self+16]:
+  //   0x824F006C 54C50030 rlwinm r5,r6,0,0,24  -> mask 0xFFFFFF80
+  //   0x824F0070 2B050000 cmpli cr6,r5,0
+  //   0x824F0074 409A002C bne cr6 -> 0x824F00A0   (leave the loop)
+  //   0x824F0094 556A0030 rlwinm r10,r11,0,0,24 -> mask 0xFFFFFF80
+  //   0x824F0098 2B0A0000 cmpli cr6,r10,0
+  //   0x824F009C 419AFFDC beq cr6 -> 0x824F0078   (spin again)
+  // so the loop spins until BIT 7 (0x80) of u8[self+16] is SET.  The starter
+  // `sub_824F0120` CLEARS that bit before creating the thread (0x824F016C
+  // rlwinm r11,r11,0,25,31,mask=0x7F -> 0x824F0174 stb r11,16(r31)).
+  //
+  // `self` is the thread's argument object and it is in r31, which the whole
+  // call chain (sub_824F0028 -> bl 821C91B8 -> b 8244FEC0 -> b 82460270)
+  // preserves.  So the state byte is READABLE HERE.  Print it: the loop's
+  // exit condition must be MEASURED, not inferred (AGENTS.md rule 19).
+  if (callerLr == 0x824F0090u) {
+    const uint32_t self = s_workerSelf.load(std::memory_order_relaxed);
+    uint8_t st = 0;
+    uint32_t w0 = 0, w4 = 0, w12 = 0;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    if (self != 0u) {
+      (void)mem.ReadU8(self + 16u, &st);
+      (void)mem.ReadU32BE(self + 0u, &w0);
+      (void)mem.ReadU32BE(self + 4u, &w4);
+      (void)mem.ReadU32BE(self + 12u, &w12);
+    }
+    if (n <= 40 || (n % 200) == 0) {
+      MCLA_LOG_INFO("SLEEP60270-W #{} self={:08X} state={:02X} doneBit7={} "
+                    "self0={:08X} self4={:08X} self12={:08X}",
+                    n, self, static_cast<uint32_t>(st), (st & 0x80u) ? 1 : 0,
+                    w0, w4, w12);
+    }
+  }
   __imp__sub_82460270(ctx, base);
+}
+
+// F-8xx/loop1ms (2026-10-21): the 1 ms WORKER THREAD's entry point.
+//
+// MEASURED (build/w851.log):
+//   :121890 `THREAD-NODE #18 @ 8285FF2C: 824F0028 A0DF9658 82830B18 ...`
+//   -> the guest created a thread whose procedure is 0x824F0028 with the
+//      argument A0DF9658.  `sub_824F0028` (raw, tools/ppc_disasm.py
+//      0x824F0028 60) is the function that contains the 1 ms sleep at
+//      0x824F008C (`bl 0x821C91B8`) and whose loop exits only when BIT 7
+//      (0x80) of the byte at [self+16] is set.
+//
+// `self` is r3 at entry (the thread argument), and r3 IS visible in the
+// context (r30/r31 are NOT: PPC_CONFIG_NON_VOLATILE_AS_LOCAL, src/
+// ppc_context.h:344-347), so the object pointer is captured HERE and used by
+// the SLEEP60270-W sampler above.  `tools/addr_owners.py --check 0x824F0028`
+// reports 1 site (the generated map only) -> no duplicate owner (rule 4).
+PPC_FUNC_IMPL(__imp__sub_824F0028);
+PPC_FUNC(sub_824F0028) {
+  const uint32_t self = ctx.r3.u32;
+  s_workerSelf.store(self, std::memory_order_relaxed);
+  uint8_t st = 0;
+  uint32_t w0 = 0, w4 = 0;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  (void)mem.ReadU8(self + 16u, &st);
+  (void)mem.ReadU32BE(self + 0u, &w0);
+  (void)mem.ReadU32BE(self + 4u, &w4);
+  MCLA_LOG_WARN("WORKER-THREAD #1 proc=824F0028 self={:08X} state={:02X} "
+                "doneBit7={} self0={:08X} self4={:08X}",
+                self, static_cast<uint32_t>(st), (st & 0x80u) ? 1 : 0, w0, w4);
+  __imp__sub_824F0028(ctx, base);
 }
 
 // F-370: census for semaphores created WITH PERMITS (initial count != 0), i.e. job/concurrency

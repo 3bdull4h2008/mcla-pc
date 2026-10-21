@@ -193,10 +193,12 @@ static std::atomic<uint32_t> g_nativePresents{0};
 //
 // THE 4 MiB OVERLAP, AND WHY THIS SITE REFUSES RATHER THAN FALLING BACK. The pool
 // is [0xA0400000, 0xC0400000) and the C window is [0xC0000000, 0xE0000000), so they
-// OVERLAP by [0xC0000000, 0xC0400000) = 4 MiB: a C-view access for pa < 0x400000 has
-// no pool byte, and the untranslated address for it is not empty space -- it is the
+// OVERLAP by [0xC0000000, 0xC0400000) = 4 MiB. F-640/B2 (2026-10-21): a C-view access
+// for pa < 0x400000 now DOES have a byte -- the console's LOW REGION at
+// [0xA0000000, 0xA0400000) (src/boot_host.h, kPhysLowRegionVa) -- but the UNTRANSLATED
+// address for it is still not that byte: in this flat window 0xC0000000 + pa is the
 // POOL'S OWN TAIL, live pool-managed memory holding physical 0x20400000..0x207FFFFF,
-// which the console does not have. So there is nothing to fall back to that is not
+// which the console does not have. So there is still nothing to fall back to that is not
 // either wrong or destructive: registering the view address would hand the resolver a
 // score over 4 MiB of live allocator memory and could bind a present to it, and a
 // writer would corrupt the pool with no error anywhere. THEREFORE: NO FALLBACK. A
@@ -207,11 +209,35 @@ static std::atomic<uint32_t> g_nativePresents{0};
 // that test come from `kPhysArenaBeginVa`/`kPhysArenaEndVa`, not from a restated 4 MiB
 // literal, so the two cannot drift.
 //
-// MEASURED, so the refusal arm is a measurement and not a hope: every VdSwap physical
-// address in w664.log is 0x004E0D30, above the 4 MiB floor, and the tree's other
-// F-640 write site carries raw=0x075D8CBC (w664.log:1200), also above it. So
-// `refused_overlap=0` means "the guest has not asked for that window", not "the guard
-// is dead" -- the guard has a counter and a row either way.
+// MEASURED, so the refusal arm is a measurement and not a hope. Every VdSwap physical
+// address in w852.log is 0x004E0AF0 -- EIGHT rows, ONE distinct value, and all of them
+// ABOVE the 4 MiB floor. So `refused_overlap=0` means "the guest has not asked for that
+// window", not "the guard is dead" -- the guard has a counter and a row either way.
+//
+// F-640/B2 (2026-10-21), AND A CORRECTION TO WHAT THE OLD PARAGRAPH SAID. The text this
+// replaces claimed that "every VdSwap physical address in w664.log is 0x004E0D30, above
+// the 4 MiB floor" and that the tree's other F-640 write site "carries raw=0x075D8CBC
+// (w664.log:1200), also above it". The SECOND half of that was FALSE, and the fleet
+// repeated it: the low physical addresses that were dropped in w852 -- view_va=C0000000
+// (physical 0) x1262, view_va=C01FE0FC (physical 0x1FE0FC) x1264 and view_va=C003E01C
+// (physical 0x3E01C) x3, 2529 `F640-CVIEW-DROPPED` rows in all -- did NOT come from this
+// site. They came from the VERTEX FETCH CONSTANT decode: every printed refusal row in
+// w852 says `site=FETCHVB-CONSTANTS` (2503 rows: pa=001FE0FC x1250, pa=00000000 x1249,
+// pa=0003E01C x4), and the guest's own fetch constants name physical 0 (528 bytes) and
+// physical 0x1FE0FC (11,013,392 bytes) -- `CP-FETCHVB-DECODE #249200 ... slot=1
+// physBase=001FE0FC sizeWords=2753348` and `slot=2 physBase=00000000 sizeWords=132`.
+// `F640-CVIEW-REFUSED` (this site) was 0 in w852, exactly as the guard predicts.
+//
+// WHAT CHANGED: the console's low 4 MiB now HAS BYTES. The pool used to present
+// physical [0x400000, 0x20400000) because F-391 moved its base by +0x400000, so physical
+// [0, 0x400000) had no byte at all -- and on the console it does
+// (.research/xenia/src/xenia/memory.cc:171-175: one 512 MiB physical heap at physical 0,
+// aliased into the 0xA/0xC/0xE views). The 4 MiB BELOW the pool is now the LOW REGION
+// (src/boot_host.h, kPhysLowRegionVa) and carries console physical [0, 0x400000), so the
+// view->pool rule is the console's own identity `0xA0000000 + pa` for the whole window.
+// The refusal arm below is therefore STILL the right shape -- a physical address outside
+// the console's 512 MiB window has no byte anywhere -- but it is no longer reachable for
+// a low physical address.
 // ---------------------------------------------------------------------------
 namespace {
 // F-640: this site's own census, so `dropped=0` is READ as a measurement rather than

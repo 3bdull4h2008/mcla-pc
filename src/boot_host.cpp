@@ -152,6 +152,16 @@ namespace
     // 0x20000000 ABOVE that, for every pa (measured, not typed: `C(pa) - poolVa(pa)` is
     // 0x20000000 at pa = 0, at pa = 0x4E0D30 and at pa = 0x10400000 alike).
     //
+    // F-640/B2 (2026-10-21): THE IDENTITY NOW HOLDS FOR EVERY pa IN THE CONSOLE'S WINDOW,
+    // not only for pa >= 0x400000. The reason it did not is exactly the LOW REGION: the
+    // formula `0xA0000000 + pa` names a byte BELOW the allocator's pool for pa < 0x400000,
+    // and there was nothing there. There is now: the 4 MiB [0xA0000000, 0xA0400000) is the
+    // console's physical [0, 0x400000). So the rule is the console's own (memory.cc:173-175:
+    // the A view's base IS the physical heap's base) and it is uniform over the whole
+    // 512 MiB window -- `poolVa(pa) == A(pa) == 0xA0000000 + pa` for every pa below
+    // 0x20000000 -- and the only view that is NOT the pool is the C and E views, each
+    // exactly 0x20000000 / 0x40000000 above it.
+    //
     // SO THE HOLE IS PRECISE AND IT IS EXACTLY ONE CONSTANT: every `pa | 0xC0000000` in this
     // tree -- `PhysToKernelVA` (gpu_cp.cpp:1755-1756), `MmioAddrSpace` (gpu_mmio.cpp:83), the
     // five native_renderer.cpp sites -- produces an address 0x20000000 above the pool byte the
@@ -168,12 +178,63 @@ namespace
     // pool-managed memory, at the wrong offset. A silent pool write is the one failure mode
     // in this project that produces a black screen with no error anywhere.
     //
-    // TWO CONSEQUENCES OF THE 0x400000 SKEW, both reported rather than fixed (the relocation
-    // is out of bounds for this change and F-631 already reverted one): the pool does not
-    // hold physical [0, 0x400000) at all, so every access to the console's low 4 MiB has no
-    // pool byte here (`kNoPoolByte`, the honest refusal, and the exact case
-    // `PhysToKernelVA(0)` produces); and the pool holds 4 MiB the console does not have
-    // (physical 0x20400000..0x207FFFFF), which is what the C view's 4 MiB overlap lands on.
+    // F-640/B2 (2026-10-21): THE SKEW IS GONE. The text below used to say that the
+    // pool does not hold physical [0, 0x400000) at all and that every access to the
+    // console's low 4 MiB therefore had no pool byte here. That was MEASURED and it
+    // was TRUE of the tree as it stood, and it was WRONG about the console.
+    //
+    // THE CONSOLE HAS NO SUCH HOLE. `.research/xenia/src/xenia/memory.cc:171-172`
+    // declares ONE physical heap of 0x20000000 bytes at physical 0, and memory.cc:
+    // 173-180 hands that SAME parent heap to the three guest-visible views:
+    //   0xA0000000 / 64 KiB pages, 0xC0000000 / 16 MiB pages, 0xE0000000 / 4 KiB pages.
+    // So the A view's base IS the physical heap's base: `0xA0000000 + pa` is the
+    // console's byte for physical `pa`, for EVERY pa in [0, 0x20000000). Physical 0 is
+    // a real, writable byte and the console's first `MmAllocatePhysicalMemoryEx` lands
+    // there.
+    //
+    // WHY THE TREE HAD A HOLE: F-391 moved the pool from 0xA0000000 to
+    // kPhysArenaBeginVa = 0xA0400000 so the title's XTL slab region would not be inside
+    // it, and that move is exactly +0x400000. The consequence was that the pool's first
+    // byte presented as physical 0x00400000 and the pool's last 4 MiB presented as
+    // physical 0x20400000..0x207FFFFF, which the console does not have. Both halves
+    // are now gone: the 4 MiB BELOW the pool is the LOW REGION (boot_host.h,
+    // kPhysLowRegionVa) and carries console physical [0, 0x400000), and the translation
+    // rule is the console's own identity for the whole window.
+    //
+    // WHAT IT COST, MEASURED (build/w852.log): the only accesses that ever hit the hole
+    // were the guest's VERTEX FETCH CONSTANT bases -- `CP: POOL-XLATE-REFUSED` printed
+    // 2503 rows and EVERY ONE of them says `site=FETCHVB-CONSTANTS`, with pa=001FE0FC
+    // (1250 rows), pa=00000000 (1249 rows) and pa=0003E01C (4 rows). The guest's own
+    // fetch constants name physical 0 (528 bytes) and physical 0x1FE0FC (11,013,392
+    // bytes) -- see `CP-FETCHVB-DECODE #249200 ... slot=1 physBase=001FE0FC
+    // sizeWords=2753348` and `slot=2 physBase=00000000 sizeWords=132`. In this tree
+    // those bytes had nowhere to live, so 499,342 reads were dropped
+    // (`CP: POOL-XLATE-REFUSED #499342 ... refused=499342`, the log's last row).
+    //
+    // LABELLED INFERENCE, NOT A MEASUREMENT: that the guest's fetch-constant buffers are
+    // among the FIRST pages the console's physical heap handed out. It is not measured
+    // from the guest's bytes here. What IS measured is that the guest names physical 0
+    // and physical 0x1FE0FC, and that the console's physical heap covers physical
+    // [0, 0x20000000) with its base at physical 0 (memory.cc:171-172) -- so those bytes
+    // exist on the console and did not exist here. Falsifier: if the guest's low-physical
+    // buffers turn out to be console-allocated by something OTHER than the CPU's
+    // physical allocator (an EDRAM aperture, a fixed platform region), then the low
+    // region's CONTENT is still wrong even though its EXISTENCE is right; the
+    // `F640-LOWREGION-PROBE` row's `orig=` bytes are where that would show up.
+    //
+    // AND WHAT THE SKEW DID NOT TOUCH: the guest's PRESENT. Every VdSwap physical
+    // address in w852 is 0x004E0AF0 (8 rows, one distinct value), which is ABOVE the
+    // old 4 MiB floor, so `F640-CVIEW-REFUSED` was 0 in w852 -- the present path was
+    // never inside the hole. The hole was in the VERTEX FETCH path, and it is the one
+    // the guest's own geometry needs.
+    //
+    // AND WHAT THIS CHANGE DID NOT CHANGE: the C view's 4 MiB overlap with the pool is
+    // still the pool's TAIL (the paragraph above). The fix gives the TRANSLATED path a
+    // real byte for physical [0, 0x400000); it does NOT make 0xC0000000 + pa alias the
+    // low region, because in this flat window 0xC0000000 is the pool's own address. Any
+    // site that uses the UNTRANSLATED C-view address still reads the wrong bytes, which
+    // is why the rule is "translate, never fall back" and why the fall-back arm stays
+    // refused.
     enum class F640View : uint8_t { kNone = 0, kA64K = 1, kC16M = 2, kE4K = 3 };
     enum class F640Map : uint8_t { kNotAView = 0, kMapped = 1, kNoPoolByte = 2 };
 
@@ -198,6 +259,11 @@ namespace
     // is +0x400000 relative to the A view's base. So our pool's FIRST byte presents as
     // physical 0x00400000, not physical 0 -- that single skew is the whole reason no view
     // aliases the pool here, and it is derived from the two constants rather than restated.
+    //
+    // F-640/B2: THIS IS NOW THE ALLOCATOR'S WINDOW ONLY. The console's window is wider, at
+    // the bottom, because the LOW REGION (boot_host.h, kPhysLowRegionVa) carries console
+    // physical [0, 0x400000). The two are kept apart on purpose: the allocator's window is
+    // what o1heap owns, and the console's window is what the guest may address.
     constexpr uint64_t F640PoolPhysBase()
     {
         return (uint64_t)(mcla::kernel::kPhysArenaBeginVa - kF640Views[0].base);
@@ -205,6 +271,18 @@ namespace
     constexpr uint64_t F640PoolPhysTop()
     {
         return F640PoolPhysBase() + (uint64_t)mcla::kernel::PhysArenaSizeBytes();
+    }
+
+    // F-640/B2: THE CONSOLE'S PHYSICAL WINDOW -- [0, 0x20000000), physical 0 INCLUDED.
+    // The reference declares the physical heap at physical 0 with the console's own size
+    // (memory.cc:171-172) and aliases it into the three views (memory.cc:173-180), so a
+    // physical address is in-window exactly when it is below 0x20000000 -- which is also
+    // the threshold the tree already tells the guest (gpu_cp.cpp:1756 `addr <
+    // 0x20000000u`, gpu_mmio.cpp:83/:74). Derived from kConsolePhysicalBytes, not typed.
+    constexpr uint64_t F640ConsolePhysBase() { return 0ull; }
+    constexpr uint64_t F640ConsolePhysTop()
+    {
+        return (uint64_t)mcla::kernel::kConsolePhysicalBytes;
     }
 
     F640View F640ClassifyView(uint32_t guestVa)
@@ -220,19 +298,30 @@ namespace
     }
 
     // The translation. Pure, no memory touched, no guest value asserted on: a physical
-    // address below the pool's window is a MISS, not a fault and not a clamped value.
+    // address outside the console's window is a MISS, not a fault and not a clamped value.
+    //
+    // F-640/B2: THE RULE IS NOW THE CONSOLE'S OWN IDENTITY, `poolVa = 0xA0000000 + pa`,
+    // for EVERY pa in the console's window -- the same formula the tree already used for
+    // pa >= 0x400000, extended DOWN over the LOW REGION so that console physical 0 has a
+    // byte at 0xA0000000. The A view's base IS the physical heap's base on the console
+    // (memory.cc:173-175), so this is the hardware's mapping, not a host invention. The
+    // belt below is the allocator's upper bound, which is exactly
+    // kPhysLowRegionVa + kConsolePhysicalBytes (0xA0000000 + 0x20000000 = 0xC0400000), so
+    // the window the guest may address and the extent the host has bytes for are the same
+    // number by construction.
     F640Map F640MapViewToPool(uint32_t viewVa, uint32_t* outPoolVa)
     {
         const F640View view = F640ClassifyView(viewVa);
         if (view == F640View::kNone)
             return F640Map::kNotAView;
         const uint64_t pa = (uint64_t)viewVa - (uint64_t)kF640Views[(uint32_t)view - 1].base;
-        if (pa < F640PoolPhysBase() || pa >= F640PoolPhysTop())
-            return F640Map::kNoPoolByte;  // the console's low 4 MiB has no pool byte in this tree
-        const uint64_t poolVa =
-            (uint64_t)mcla::kernel::kPhysArenaBeginVa + (pa - F640PoolPhysBase());
-        if (poolVa >= (uint64_t)mcla::kernel::kPhysArenaEndVa)
-            return F640Map::kNoPoolByte;  // belt: the extent is the allocator's, not this file's
+        if (pa < F640ConsolePhysBase() || pa >= F640ConsolePhysTop())
+            return F640Map::kNoPoolByte;  // past the console's 512 MiB physical window
+        const uint64_t poolVa = (uint64_t)mcla::boot::kPhysLowRegionVa + pa;
+        // belt: the byte must be inside the extent the host actually has.
+        if (poolVa < (uint64_t)mcla::boot::kPhysLowRegionVa ||
+            poolVa >= (uint64_t)mcla::kernel::kPhysArenaEndVa)
+            return F640Map::kNoPoolByte;
         if (outPoolVa != nullptr)
             *outPoolVa = (uint32_t)poolVa;
         return F640Map::kMapped;
@@ -267,6 +356,12 @@ namespace
         std::atomic<uint64_t> dropped{0};      // outcome: in a view, no pool byte -> THE number
         std::atomic<uint64_t> dropSeq{0};      // monotonic, for the bounded print of the drop row
         std::atomic<uint32_t> adopted{0};      // distinct call sites that registered themselves
+        // F-640/B2: how many TRANSLATED accesses landed in the console's LOW physical
+        // region (console physical [0, 4 MiB) -> guest VA [0xA0000000, 0xA0400000)).
+        // This is the census that says the guest really does address the console's low
+        // memory; before the low region existed the same accesses were DROPPED, so this
+        // counter and `dropped` together are the before/after pair.
+        std::atomic<uint64_t> lowRegion{0};
     };
     F640Counters g_f640;
 
@@ -4066,10 +4161,11 @@ void LogPhysAliasRow(const char* reason)
     const uint64_t notA = g_f640.notAView.load(std::memory_order_relaxed);
     const uint64_t tr = g_f640.translated.load(std::memory_order_relaxed);
     const uint64_t dr = g_f640.dropped.load(std::memory_order_relaxed);
+    const uint64_t lr = g_f640.lowRegion.load(std::memory_order_relaxed);
     const uint64_t ad = (uint64_t)g_f640.adopted.load(std::memory_order_relaxed);
     MCLA_LOG_WARN("F640-PHYSALIAS-SUM reason={} calls={} not_a_view={} translated={} dropped={} "
-                  "adopted_sites={} zero_is_measured={} sum_ok={}",
-                  (reason != nullptr ? reason : "-"), calls, notA, tr, dr, ad,
+                  "low_region={} adopted_sites={} zero_is_measured={} sum_ok={}",
+                  (reason != nullptr ? reason : "-"), calls, notA, tr, dr, lr, ad,
                   (ad > 0 ? 1 : 0),
                   ((notA + tr + dr == calls) ? 1 : 0));
 }
@@ -4082,6 +4178,11 @@ void F640CountAndLog(uint32_t viewVa, F640Map map, uint32_t poolVa)
     case F640Map::kMapped:
     {
         const uint64_t n = g_f640.translated.fetch_add(1, std::memory_order_relaxed) + 1;
+        // F-640/B2: the low-region census. The LOW REGION is console physical
+        // [0, 4 MiB); an access that lands there is the guest addressing the console's
+        // page 0, which before this change had no byte at all.
+        if ((uint64_t)poolVa < (uint64_t)mcla::boot::kPhysLowRegionEndVa)
+            g_f640.lowRegion.fetch_add(1, std::memory_order_relaxed);
         if (F640Allow(n))
             MCLA_LOG_WARN("F640-CVIEW-TRANSLATE #{} view={} view_va={:08X} pool_va={:08X} "
                           "pa={:08X} translated_total={}",
@@ -4191,12 +4292,96 @@ void F640PhysAliasInit()
                                         : "PARTIAL(alias-broken)";
 
     // The second probe needs no canary: physical 0 is the address `PhysToKernelVA(0)`
-    // produces, and this tree's pool starts 4 MiB into the console's window, so it has no
-    // pool byte. All three views must refuse it -- and must refuse it for the stated reason.
+    // produces. F-640/B2: it must now MAP in all three views -- console physical 0 is a
+    // real byte and the LOW REGION holds it -- so the expected count is 3, and a count
+    // below 3 is a real defect, not a style. (Before the low region existed this probe
+    // read 0/3, and the tree called that correct.)
+    //
+    // THE OUT-PARAMETER IS A SEPARATE VARIABLE, and that is a FIX, not a style choice: the
+    // original code passed the COUNTER itself as the out-parameter, which was harmless
+    // only because the mapping always refused and the out-param was therefore written
+    // with 0. Now that physical 0 maps, the same call would overwrite the counter with
+    // the pool VA (0xA0000000) and the row would print `zero_pa_mapped_views=2684354561/3`
+    // -- a number that is neither the count nor the address. It printed that in the first
+    // run of this change (build/agents/fix_fb_boot.log:52) and was fixed.
     uint32_t mappedAtZero = 0;
+    uint32_t zeroPoolVa = 0;
     for (uint32_t i = 0; i < 3; ++i)
-        if (F640MapViewToPool(kF640Views[i].base, &mappedAtZero) == F640Map::kMapped)
-            ++mappedAtZero;  // 0 is the answer; a non-zero count is a real defect, not a style
+        if (F640MapViewToPool(kF640Views[i].base, &zeroPoolVa) == F640Map::kMapped)
+            ++mappedAtZero;  // 3 is the answer; a lower count is a real defect, not a style
+
+    // F-640/B2: THE LOW-REGION ROUND TRIP. The claim this fix makes is not "the hole is
+    // smaller"; it is "console physical [0, 4 MiB) now has REAL, MAPPED, WRITABLE bytes
+    // that a guest write reaches and a host read sees". A counter cannot show that, so
+    // this probe SHOWS it, with byte values:
+    //   (1) the translation maps console physical 0 and 0x1FE0FC -- the two the guest
+    //       actually asked for in w852 (`CP: POOL-XLATE-REFUSED site=FETCHVB-CONSTANTS
+    //       pa=00000000` and `pa=001FE0FC`) -- to real addresses inside the low region;
+    //   (2) a WRITE through the translated address is read back through it AND through
+    //       the console's own A-view form (0xA0000000 + pa), byte for byte;
+    //   (3) the original bytes are restored and re-read, so the probe leaves no mark.
+    // The C-VIEW form (0xC0000000 + pa) is printed too and is EXPECTED to differ: in
+    // this flat window that address is the allocator pool's tail, not the low region.
+    // That is not a bug in the probe; it is the whole reason the translation exists -- a
+    // reader who believes the C view aliases the pool is the reader this row is for.
+    {
+        struct LowProbe
+        {
+            uint32_t pa;
+            const char* what;
+        };
+        const LowProbe kProbes[] = {
+            {0x00000000u, "guest-fetchvb-slot2-base"},
+            {0x001FE0FCu, "guest-fetchvb-slot1-base"},
+        };
+        const uint8_t kPat[4] = {0xA5u, 0x5Au, 0x3Cu, 0xC3u};
+        for (uint32_t i = 0; i < (uint32_t)(sizeof(kProbes) / sizeof(kProbes[0])); ++i)
+        {
+            const uint32_t lpa = kProbes[i].pa;
+            uint32_t lpool = 0;
+            const F640Map lm =
+                F640MapViewToPool(kF640Views[0].base + lpa, &lpool);
+            uint8_t orig[4] = {0, 0, 0, 0};
+            uint8_t back[4] = {0, 0, 0, 0};
+            uint8_t aView[4] = {0, 0, 0, 0};
+            uint8_t cView[4] = {0, 0, 0, 0};
+            uint8_t after[4] = {0, 0, 0, 0};
+            const bool gotOrig =
+                (lm == F640Map::kMapped) && mem.ReadBytes(lpool, orig, sizeof(orig));
+            const bool lwrite =
+                (lm == F640Map::kMapped) && mem.WriteBytes(lpool, kPat, sizeof(kPat));
+            const bool gotBack =
+                (lm == F640Map::kMapped) && mem.ReadBytes(lpool, back, sizeof(back));
+            (void)mem.ReadBytes(kF640Views[0].base + lpa, aView, sizeof(aView));
+            (void)mem.ReadBytes(kF640Views[1].base + lpa, cView, sizeof(cView));
+            bool restored = false;
+            if (lm == F640Map::kMapped && gotOrig)
+            {
+                (void)mem.WriteBytes(lpool, orig, sizeof(orig));
+                restored = mem.ReadBytes(lpool, after, sizeof(after)) &&
+                           std::memcmp(after, orig, sizeof(orig)) == 0;
+            }
+            const bool roundTrip = lwrite && gotBack &&
+                                   std::memcmp(back, kPat, sizeof(kPat)) == 0;
+            const bool aViewOk = std::memcmp(aView, kPat, sizeof(kPat)) == 0;
+            const bool cViewDiffers = std::memcmp(cView, kPat, sizeof(kPat)) != 0;
+            MCLA_LOG_WARN(
+                "F640-LOWREGION-PROBE #{} what={} pa={:08X} map={} pool_va={:08X} "
+                "in_low_region={} orig={:02X}{:02X}{:02X}{:02X} wrote={} "
+                "readback={:02X}{:02X}{:02X}{:02X} roundtrip_ok={} "
+                "aView={:02X}{:02X}{:02X}{:02X} aView_ok={} "
+                "cView={:02X}{:02X}{:02X}{:02X} cView_differs={} restored={} "
+                "NOTE=the_A_view_form_is_the_console's_own_alias; the_C_view_form_is_NOT",
+                i + 1, kProbes[i].what, lpa,
+                (lm == F640Map::kMapped) ? "MAPPED" : "NO_POOL_BYTE", lpool,
+                ((uint64_t)lpool < (uint64_t)mcla::boot::kPhysLowRegionEndVa) ? 1 : 0,
+                orig[0], orig[1], orig[2], orig[3], (lwrite ? 1 : 0),
+                back[0], back[1], back[2], back[3], (roundTrip ? 1 : 0),
+                aView[0], aView[1], aView[2], aView[3], (aViewOk ? 1 : 0),
+                cView[0], cView[1], cView[2], cView[3], (cViewDiffers ? 1 : 0),
+                (restored ? 1 : 0));
+        }
+    }
 
     // Why (a) is closed, measured on THIS process's window rather than argued: one
     // reservation, committed, private (Type == MEM_PRIVATE), covering the whole 4 GiB.
@@ -4206,9 +4391,11 @@ void F640PhysAliasInit()
 
     MCLA_LOG_WARN(
         "F640-PHYSALIAS phase=init mech={} canary_shared_views={}/3 probe_pa={:08X} "
-        "probe_pool_va={:08X} canary_written={} canary_restored={} zero_pa_mapped_views={}/3 | "
+        "probe_pool_va={:08X} canary_written={} canary_restored={} zero_pa_mapped_views={}/3 "
+        "zero_pa_pool_va={:08X} | "
         "pool=[{:08X}..{:08X}) cap={:#x} cap_mb={:.1f} pool_phys=[{:08X}..{:08X}) "
-        "console_window_below_pool={}MiB pool_tail_above_console={}MiB | "
+        "low_region=[{:08X}..{:08X}) low_bytes={:#x} console_phys_window=[{:08X}..{:08X}) "
+        "phys_below_allocator={}MiB(covered_by_low_region={}) pool_tail_above_console={}MiB | "
         "views=A:{:08X}/{}KiB C:{:08X}/{}MiB E:{:08X}/{}KiB (size_each={:#x} from "
         "kConsolePhysicalBytes) | A_view_is_pool={} C_minus_pool={:#x} E_minus_pool={:#x} "
         "overlap_in_pool: A={}MiB C={}MiB E={}MiB | window=one_allocation:{} committed:{} "
@@ -4216,12 +4403,16 @@ void F640PhysAliasInit()
         "zero_is_measured={} | adopt=gpu_cp.cpp:3673(rptr-writeback) "
         "native_renderer.cpp:294(present) gpu_mmio.cpp:83(MMIO-physForm)",
         mech, shared, (uint32_t)pa, poolVa, (wrote ? 1 : 0),
-        ((gotBefore && gotAfter && before == after) ? 1 : 0), mappedAtZero,
+        ((gotBefore && gotAfter && before == after) ? 1 : 0), mappedAtZero, zeroPoolVa,
         mcla::kernel::kPhysArenaBeginVa, mcla::kernel::kPhysArenaEndVa,
         (uint64_t)mcla::kernel::PhysArenaSizeBytes(),
         (double)mcla::kernel::PhysArenaSizeBytes() / (1024.0 * 1024.0),
         (uint32_t)F640PoolPhysBase(), (uint32_t)F640PoolPhysTop(),
+        mcla::boot::kPhysLowRegionVa, mcla::boot::kPhysLowRegionEndVa,
+        (uint64_t)mcla::boot::kPhysLowRegionBytes,
+        (uint32_t)F640ConsolePhysBase(), (uint32_t)F640ConsolePhysTop(),
         (double)F640PoolPhysBase() / (1024.0 * 1024.0),
+        ((uint64_t)mcla::boot::kPhysLowRegionBytes == F640PoolPhysBase()) ? 1 : 0,
         (double)(F640PoolPhysTop() - (uint64_t)mcla::kernel::kConsolePhysicalBytes) /
             (1024.0 * 1024.0),
         kF640Views[0].base, 1u << (kF640Views[0].pageShift - 10),

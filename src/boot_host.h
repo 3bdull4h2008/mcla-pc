@@ -185,10 +185,31 @@ void BootReportError(const char* line);
 // TranslatePhysViewToPoolVa and gets the pool address, or an honest refusal.
 //
 //   kMapped      -- *outPoolVa is the pool address; use it.
-//   kNoPoolByte  -- the byte has no pool address in this tree (physical < 4 MiB, or
-//                   past the pool's window). The access CANNOT be honoured; it must be
+//   kNoPoolByte  -- the byte has no pool address in this tree (past the console's
+//                   512 MiB physical window). The access CANNOT be honoured; it must be
 //                   dropped and counted, never silently redirected elsewhere.
 //   kNotAView    -- not a view address; the caller's model was wrong, not the memory.
+//
+// F-640/B2 (2026-10-21): THE CONSOLE'S LOW PHYSICAL REGION -- CONSOLE PHYSICAL 0 IS A
+// REAL BYTE. Before this change the tree's physical pool presented physical
+// [0x400000, 0x20400000) and had NO byte at all for physical [0, 0x400000): the +0x400000
+// skew F-391 introduced when it moved the pool off the title's XTL slab region. The
+// console has no such hole -- `.research/xenia/src/xenia/memory.cc:171-172` declares ONE
+// physical heap of 0x20000000 bytes at physical 0, and memory.cc:173-180 hands that SAME
+// parent to the three views, so `0xA0000000 + pa` is the physical heap's byte for `pa`
+// for EVERY pa in [0, 0x20000000) -- the A view's base IS the physical heap's base.
+//
+// THE LOW REGION IS WHERE CONSOLE PHYSICAL [0, 0x400000) NOW LIVES: guest VA
+// [0xA0000000, 0xA0400000), i.e. the 4 MiB BELOW the allocator's pool. It is inside the
+// flat 4 GiB window (src/kernel/memory.cpp:399, one MEM_COMMIT|MEM_RESERVE allocation),
+// it is inside the region the tree itself calls the unowned gap
+// (src/boot_host.cpp:3309 "the unowned gap 0xA0030000..0xA0400000"), and the allocator
+// CANNOT hand it out: the pool's o1heap arena starts at kPhysArenaBeginVa
+// (src/kernel/heap.cpp:2766-2788). So the low region is real, mapped, writable memory
+// that no allocator owns -- exactly the console's physical page 0.
+inline constexpr uint32_t kPhysLowRegionVa = 0xA0000000u;      // console physical 0
+inline constexpr uint32_t kPhysLowRegionBytes = 0x00400000u;   // 4 MiB
+inline constexpr uint32_t kPhysLowRegionEndVa = kPhysLowRegionVa + kPhysLowRegionBytes;
 //
 // Both counters are published, attempts and outcomes separately, and every drop gets
 // its own `F640-CVIEW-DROPPED` line carrying its attempt index -- a bare `dropped=0`
@@ -209,7 +230,10 @@ const char* PhysViewName(uint32_t viewVa);
 void RegisterPhysAliasWriter(const char* site);
 
 // The one-line summary: calls / not_a_view / translated / dropped / adopted_sites /
-// zero_is_measured / sum_ok (the three outcomes must add up to calls).
+// zero_is_measured / sum_ok (the three outcomes must add up to calls) / low_region_hits
+// (how many of the translated accesses landed in the console's LOW physical region,
+// i.e. console physical [0, 4 MiB) -- the census that says the guest really does
+// address the console's low memory, and that the bytes it lands on are real).
 void LogPhysAliasRow(const char* reason);
 
 } // namespace mcla::boot
