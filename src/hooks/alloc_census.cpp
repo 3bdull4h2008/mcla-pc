@@ -843,6 +843,20 @@ bool RepairCorruptedTinySlabFreeList(uint32_t classHead) {
 
 
 
+    // F-412 (fix_hooks2, 2026-10-21): THIS FUNCTION WRITES GUEST MEMORY -- the freelist
+    // links and the slab counters below are all stores. The slab chain it walks can be OUR
+    // OWN o1heap instance: w430.log:588-615 measured `elem=A0401020` -> `slab = elem & ~0x3FFF`
+    // = 0xA0400000, and `slab+16` = 0xA0400010 is our own bins[2] (the READ side is voided for
+    // exactly this reason, alloc_census.cpp:348 `MclaCensusAddrIsOurInstance`). With the
+    // header guard armed between heap calls, a WRITE into that page is an AV, not a repair.
+    // So the whole slab is SKIPPED, not partially repaired: a partial repair would leave the
+    // freelist inconsistent, and a slab inside our own instance is not the guest's freelist
+    // to fix in the first place. A slab is 16 KiB, so a slab whose base is below the guarded
+    // window ends below it and needs no guard of its own.
+    if (MclaCensusAddrIsOurInstance(curSlab)) {
+      MclaCensusVoidWarn(curSlab);
+      break;
+    }
     const uint32_t count = OomCensusReadU32(curSlab + 8);
 
 
