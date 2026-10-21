@@ -21,6 +21,12 @@
 
 #include <atomic>
 #include <vector>
+#include <thread>
+#include <chrono>
+#include <cstring>
+#include <cstdio>
+#include <string>
+#include <mutex>
 
 // w9: PSTREAM virtualâ†’physical map published by gpu_device.cpp at RSC-HEAD
 // parse. sub_8217D890 uses it to resolve leftover 0x50xxxxxx virtuals.
@@ -2279,3 +2285,338 @@ PPC_FUNC(sub_8260A7D0) {
                   static_cast<uint32_t>(ctx.lr));
   }
 }
+
+// ===========================================================================
+// F-849 (2026-10-21) -- THE REGISTER-INDIRECT DISPATCH CENSUS.
+//
+// This is the F-635 census' EXTENSION on the SAME seam (src/guest_memory.h:
+// the PPC_CALL_INDIRECT_FUNC override). It is log-only: it counts, it
+// classifies, it prints. The only behavioural part is the Begin/End bracket,
+// which does not touch the guest.
+//
+// WHAT IT MEASURES, PER DISPATCH:
+//   * the CALL TARGET (the `ctr`),
+//   * the LR of the site,
+//   * the CLASS of the target:
+//       GUESTFN    -- the table slot is non-null and the target is inside the
+//                     recompiled code range [0x82130000, 0x827CCBC0], so the
+//                     call REACHES THE GUEST'S OWN CODE.
+//       HOSTSTUB   -- the table slot is non-null and the target is outside that
+//                     range (a host-registered stub: 0x83000000 press-start,
+//                     0x8F204000 __xtl_alloc, 0x8F204010 __xtl_free).
+//       EMPTY-SLOT -- the table slot is NULL. The host CALLS IT ANYWAY: the
+//                     F-635 guard tests the INDEX RANGE, not the slot.
+//
+// AND, FOR THE CALL THAT NEVER RETURNS:
+//   * `BCTR-STUCK`  -- a dispatch whose slot has been ACTIVE for > 2 s. The
+//     call has not returned. This row NAMES IT.
+//   * `BCTR-LAST`   -- the last dispatch a thread made before it went quiet.
+//     This covers the guest's SELF-LOOP traps, where the guest leaves through
+//     a `b` to itself and never re-enters this seam, so no bracket closes.
+//
+// RULE 19: the census has to be able to fail, so it prints a row per dispatch
+// (bounded) and a summary row; a zero is a zero, not a blind instrument.
+//
+// The slot arithmetic is the SAME expression as PPC_LOOKUP_FUNC
+// (generated/ppc_xenon/ppc_context.h:127):
+//     base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (ctr - PPC_CODE_BASE) * 2
+// ===========================================================================
+
+namespace mcla::native::census {
+
+namespace {
+
+constexpr int kIndirectSlotMax = 64;
+
+struct IndirectSlot {
+    std::atomic<uint32_t> tid{0};
+    std::atomic<uint32_t> ctr{0};
+    std::atomic<uint32_t> lr{0};
+    std::atomic<uint32_t> cls{0};
+    std::atomic<uint64_t> startNs{0};
+    std::atomic<uint64_t> lastNs{0};
+    std::atomic<uint32_t> active{0};
+    std::atomic<uint32_t> stuckReported{0};
+    std::atomic<uint32_t> idleReported{0};
+    // F-849: the SPIN detector. A thread that is NOT blocked can still be
+    // stuck -- in a guest loop that keeps issuing register-indirect calls and
+    // never leaves. The boot worker's blocker is exactly that, and neither
+    // BCTR-STUCK (a call that never returns) nor BCTR-LAST (a thread that goes
+    // quiet) can see it. The ring of recent call SITES can: a thread whose
+    // last 64 dispatches came from 8 or fewer distinct sites is spinning.
+    static constexpr int kLrRing = 64;
+    std::atomic<uint32_t> lrRing[kLrRing];
+    std::atomic<uint32_t> lrRingPos{0};
+    std::atomic<uint64_t> dispCount{0};
+    std::atomic<uint64_t> prevTickCount{0};
+    std::atomic<uint32_t> spinReported{0};
+};
+
+IndirectSlot g_indirectSlots[kIndirectSlotMax];
+std::atomic<uint32_t> g_indirectSlotCursor{0};
+
+std::atomic<uint64_t> g_dispTotal{0};
+std::atomic<uint64_t> g_dispGuestFn{0};
+std::atomic<uint64_t> g_dispHostStub{0};
+std::atomic<uint64_t> g_dispEmptySlot{0};
+std::atomic<uint64_t> g_emptyRows{0};
+std::atomic<uint64_t> g_stuckRows{0};
+std::atomic<uint64_t> g_idleRows{0};
+std::atomic<uint64_t> g_spinRows{0};
+
+// A dispatch is "stuck" after 2 s; a thread is "quiet" after 15 s.
+constexpr uint64_t kStuckNs = 2000000000ull;
+constexpr uint64_t kIdleNs = 15000000000ull;
+// Print policy: the first N rows of the whole census verbatim, then every
+// kPrintStride'th, plus EVERY EMPTY-SLOT row up to a cap (that class is the
+// one that kills the process, so it is never sampled away).
+constexpr uint64_t kPrintHead = 64;
+constexpr uint64_t kPrintStride = 4096;
+constexpr uint64_t kEmptyRowCap = 256;
+constexpr uint64_t kIdleRowCap = 256;
+
+uint64_t NowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+const char *ClassName(uint32_t cls) {
+    switch (static_cast<IndirectTargetClass>(cls)) {
+    case IndirectTargetClass::GuestFn:
+        return "GUESTFN";
+    case IndirectTargetClass::HostStub:
+        return "HOSTSTUB";
+    default:
+        return "EMPTY-SLOT";
+    }
+}
+
+// One slot per guest thread, round-robin. With more than 64 guest threads two
+// of them share a slot; that is stated, not hidden.
+int SlotForThisThread() {
+    static thread_local int s_idx = -1;
+    if (s_idx >= 0) {
+        return s_idx;
+    }
+    const uint32_t cur =
+        g_indirectSlotCursor.fetch_add(1) % (uint32_t)kIndirectSlotMax;
+    s_idx = (int)cur;
+    IndirectSlot &s = g_indirectSlots[s_idx];
+    s.tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    s.stuckReported.store(0, std::memory_order_relaxed);
+    s.idleReported.store(0, std::memory_order_relaxed);
+    s.spinReported.store(0, std::memory_order_relaxed);
+    s.lrRingPos.store(0, std::memory_order_relaxed);
+    s.dispCount.store(0, std::memory_order_relaxed);
+    s.prevTickCount.store(0, std::memory_order_relaxed);
+    for (int k = 0; k < IndirectSlot::kLrRing; ++k)
+        s.lrRing[k].store(0, std::memory_order_relaxed);
+    return s_idx;
+}
+
+void ScanIndirectSlots() {
+    const uint64_t now = NowNs();
+    for (int i = 0; i < kIndirectSlotMax; ++i) {
+        IndirectSlot &s = g_indirectSlots[i];
+        const uint32_t tid = s.tid.load(std::memory_order_relaxed);
+        if (tid == 0) {
+            continue;
+        }
+        // ---- THE SPIN DETECTOR (F-849) ----------------------------------
+        // A thread that keeps dispatching but from only a handful of sites is
+        // looping, not working. Measured on the boot worker: 3 distinct call
+        // sites, ~280,000 dispatches/second, forever.
+        {
+            const uint64_t cnt = s.dispCount.load(std::memory_order_relaxed);
+            const uint64_t prev = s.prevTickCount.exchange(
+                cnt, std::memory_order_relaxed);
+            const uint64_t delta = (cnt >= prev) ? (cnt - prev) : 0;
+            if (delta <= 5000) {
+                // the thread is not spinning any more -- re-arm the row.
+                s.spinReported.store(0, std::memory_order_relaxed);
+            }
+            if (delta > 5000) {
+                uint32_t seen[IndirectSlot::kLrRing];
+                int nseen = 0;
+                for (int k = 0; k < IndirectSlot::kLrRing; ++k) {
+                    const uint32_t l =
+                        s.lrRing[k].load(std::memory_order_relaxed);
+                    if (l == 0) {
+                        continue;
+                    }
+                    bool found = false;
+                    for (int j = 0; j < nseen; ++j) {
+                        if (seen[j] == l) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found && nseen < (int)IndirectSlot::kLrRing) {
+                        seen[nseen++] = l;
+                    }
+                }
+                if (nseen > 0 && nseen <= 8 && !s.spinReported.exchange(1)) {
+                    const uint64_t n = g_spinRows.fetch_add(1) + 1;
+                    uint8_t abortFlag = 0;
+                    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU8(
+                        0x8286073Cu, &abortFlag);
+                    MCLA_LOG_WARN(
+                        "BCTR-SPIN #{} tid={:08X} dispatches_in_500ms={} "
+                        "distinct_call_sites={} abortFlag@8286073C={} "
+                        "sites=[{}]",
+                        n, tid, delta, nseen, static_cast<uint32_t>(abortFlag),
+                        [&] {
+                            std::string s2;
+                            for (int j = 0; j < nseen; ++j) {
+                                char buf[16];
+                                std::snprintf(buf, sizeof(buf), "%s%08X",
+                                              j ? "," : "", seen[j]);
+                                s2 += buf;
+                            }
+                            return s2;
+                        }());
+                }
+            }
+        }
+        // ---- THE ABORT FLAG (F-849) --------------------------------------
+        // The guest's own loop back-edge at 0x821CC3C0 (`bne cr6 ->
+        // 0x821CC350`, raw) is gated on the byte at guest 0x8286073C: it loops
+        // WHILE the byte is non-zero. The host's only writer that clears it
+        // is src/gpu_device.cpp:21049-21050 (the READWRAP r7==0 inflate-refill
+        // arm). So the byte's value is a first-class fact, and it is printed
+        // on every change and with every spin row.
+        {
+            static uint32_t s_lastAbort = 0xFFFFFFFFu;
+            uint8_t abortFlag = 0;
+            if (mcla::kernel::GuestMemoryHeap::Instance().ReadU8(0x8286073Cu,
+                                                                &abortFlag)) {
+                if (abortFlag != s_lastAbort) {
+                    s_lastAbort = abortFlag;
+                    MCLA_LOG_WARN("ABORT-FLAG @8286073C = {} (CHANGED)",
+                                  static_cast<uint32_t>(abortFlag));
+                }
+            }
+        }
+        if (s.active.load(std::memory_order_acquire)) {
+            const uint64_t start = s.startNs.load(std::memory_order_relaxed);
+            if (start != 0 && now > start && (now - start) > kStuckNs) {
+                if (!s.stuckReported.exchange(1)) {
+                    const uint64_t n = g_stuckRows.fetch_add(1) + 1;
+                    MCLA_LOG_WARN(
+                        "BCTR-STUCK #{} tid={:08X} ctr={:08X} lr={:08X} class={} "
+                        "age_ms={} -- THIS INDIRECT CALL NEVER RETURNED (the "
+                        "bracket is still open)",
+                        n, tid, s.ctr.load(std::memory_order_relaxed),
+                        s.lr.load(std::memory_order_relaxed),
+                        ClassName(s.cls.load(std::memory_order_relaxed)),
+                        (now - start) / 1000000ull);
+                }
+            }
+        } else {
+            const uint64_t last = s.lastNs.load(std::memory_order_relaxed);
+            if (last != 0 && now > last && (now - last) > kIdleNs) {
+                if (!s.idleReported.exchange(1)) {
+                    const uint64_t n = g_idleRows.fetch_add(1) + 1;
+                    if (n <= kIdleRowCap) {
+                        MCLA_LOG_WARN(
+                            "BCTR-LAST #{} tid={:08X} ctr={:08X} lr={:08X} "
+                            "class={} quiet_ms={} -- LAST INDIRECT DISPATCH THIS "
+                            "THREAD MADE (a guest self-loop never re-enters this "
+                            "seam, so its bracket cannot close)",
+                            n, tid, s.ctr.load(std::memory_order_relaxed),
+                            s.lr.load(std::memory_order_relaxed),
+                            ClassName(s.cls.load(std::memory_order_relaxed)),
+                            (now - last) / 1000000ull);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void EnsureIndirectWatchdog() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                ScanIndirectSlots();
+            }
+        }).detach();
+    });
+}
+
+}  // namespace
+
+void ReportIndirectDispatch(uint32_t ctr, uint32_t lr, uintptr_t base) {
+    const uint64_t total = g_dispTotal.fetch_add(1) + 1;
+
+    // The slot this target selects -- the SAME arithmetic as PPC_LOOKUP_FUNC
+    // (generated/ppc_xenon/ppc_context.h:127). The macro only reaches this
+    // function for an IN-RANGE ctr, so the slot address is inside the flat
+    // guest window and the read is safe.
+    const uintptr_t slotAddr =
+        base + kFuncTableGuestVa + (uint64_t(uint32_t(ctr) - kCtrLo) * 2);
+    const void *fn = nullptr;
+    std::memcpy(&fn, reinterpret_cast<const void *>(slotAddr), sizeof(fn));
+
+    uint32_t cls;
+    if (fn == nullptr) {
+        cls = static_cast<uint32_t>(IndirectTargetClass::EmptySlot);
+        g_dispEmptySlot.fetch_add(1);
+    } else if (ctr >= kRecompiledCodeLo && ctr <= kRecompiledCodeHi) {
+        cls = static_cast<uint32_t>(IndirectTargetClass::GuestFn);
+        g_dispGuestFn.fetch_add(1);
+    } else {
+        cls = static_cast<uint32_t>(IndirectTargetClass::HostStub);
+        g_dispHostStub.fetch_add(1);
+    }
+
+    IndirectSlot &s = g_indirectSlots[SlotForThisThread()];
+    s.cls.store(cls, std::memory_order_relaxed);
+
+    const bool empty =
+        (cls == static_cast<uint32_t>(IndirectTargetClass::EmptySlot));
+    const uint64_t emptyRow = empty ? g_emptyRows.fetch_add(1) + 1 : 0;
+    const bool printEmpty = empty && emptyRow <= kEmptyRowCap;
+    const bool printSample =
+        (total <= kPrintHead) || ((total % kPrintStride) == 0);
+    if (printEmpty || printSample) {
+        MCLA_LOG_WARN(
+            "BCTR-DISP #{} tid={:08X} ctr={:08X} lr={:08X} class={} slot={:08X} "
+            "totals[guestfn={} hoststub={} emptyslot={}]",
+            total, GetCurrentThreadId(), ctr, lr, ClassName(cls),
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(fn)),
+            g_dispGuestFn.load(std::memory_order_relaxed),
+            g_dispHostStub.load(std::memory_order_relaxed),
+            g_dispEmptySlot.load(std::memory_order_relaxed));
+    }
+
+    EnsureIndirectWatchdog();
+}
+
+void IndirectCallBegin(uint32_t ctr, uint32_t lr) {
+    IndirectSlot &s = g_indirectSlots[SlotForThisThread()];
+    s.ctr.store(ctr, std::memory_order_relaxed);
+    s.lr.store(lr, std::memory_order_relaxed);
+    s.startNs.store(NowNs(), std::memory_order_relaxed);
+    s.stuckReported.store(0, std::memory_order_relaxed);
+    s.idleReported.store(0, std::memory_order_relaxed);
+    s.active.store(1, std::memory_order_release);
+    // The SPIN detector's ring of recent call sites.
+    const uint32_t pos =
+        s.lrRingPos.fetch_add(1, std::memory_order_relaxed) %
+        IndirectSlot::kLrRing;
+    s.lrRing[pos].store(lr, std::memory_order_relaxed);
+    s.dispCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+void IndirectCallEnd() {
+    IndirectSlot &s = g_indirectSlots[SlotForThisThread()];
+    s.active.store(0, std::memory_order_release);
+    s.lastNs.store(NowNs(), std::memory_order_relaxed);
+}
+
+}  // namespace mcla::native::census

@@ -382,6 +382,88 @@ inline constexpr uint32_t kCtrSpan = kCtrHi - kCtrLo; // 0x0D0D4010
 // Out-of-line by construction: 14,832 call sites must not each grow a log call.
 [[gnu::noinline]] void ReportCtrOutOfRange(uint32_t ctr, uintptr_t base, uint32_t lr);
 
+// ===========================================================================
+// F-849 (2026-10-21) -- THE REGISTER-INDIRECT DISPATCH CENSUS: WHAT THE HOST
+// DOES WITH A `bctr` TARGET, AND WHICH CALL NEVER RETURNS.
+//
+// THIS EXTENDS THE F-635 CENSUS ON THE SAME SEAM. IT IS NOT A SECOND INSTRUMENT
+// ON A DIFFERENT SEAM, AND IT IS NOT A MITIGATION: it counts, it classifies and
+// it prints. THE ONLY BEHAVIOURAL CHANGE IS THE BRACKET (Begin/End), WHICH DOES
+// NOT TOUCH THE GUEST.
+//
+// ---------------------------------------------------------------------------
+// THE MODEL, READ OUT OF THE HOST'S OWN SOURCE (NOT INFERRED).
+// ---------------------------------------------------------------------------
+//   generated/ppc_xenon/ppc_context.h:127
+//     #define PPC_LOOKUP_FUNC(x, y) *(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE \
+//                                        + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2))
+//   PPC_IMAGE_BASE = 0x82000000 (src/ppc_config.h:12), PPC_IMAGE_SIZE = 0x009E0000
+//   (:13), PPC_CODE_BASE = 0x82130000 (:14).  So the FUNCTION TABLE is an array
+//   that LIVES at base + 0x829E0000 (the same constant boot_host.cpp:2941 calls
+//   kFTableGuest) and it is INDEXED BY THE CALL TARGET: the slot for a target
+//   `t` sits at (t - 0x82130000) * 2 bytes into that table.
+//
+//   CONSEQUENCE -- THE QUESTION THIS CENSUS ANSWERS:
+//   A `bctr` TARGET IN THE 0x821Cxxxx BAND IS NOT "BELOW THE TABLE". It is an
+//   INDEX into the table, and the slot it selects is inside the table's own
+//   span. Whether the call REACHES THE GUEST'S OWN CODE depends on ONE thing:
+//   whether that SLOT IS NON-NULL, i.e. whether the target is a recompiled
+//   function (generated/ppc_xenon/ppc_func_mapping.cpp holds 45,190 rows, the
+//   first 0x82130000 and the last 0x827CCBC0) or was registered at run time
+//   (InsertFunction -- src/kernel/memory.h:174-176; SetFunction --
+//   src/boot_host.cpp:845/:921/:931).
+//
+//   MEASURED, THE 0x821Cxxxx BAND IS IN THE STATIC MAP:
+//     { 0x821C08F8, sub_821C08F8 }   the XTL allocator's ALLOC method
+//     { 0x821C09C8, sub_821C09C8 }   the XTL allocator's FREE method
+//     { 0x821C29A0, sub_821C29A0 }   the "simple" allocator's method
+//     { 0x821CA540, sub_821CA540 }   the name-insert function
+//   So A `bctr` TO ONE OF THOSE DOES REACH THE GUEST'S OWN CODE. The F-635
+//   range test (kCtrLo..kCtrHi = 0x82130000..0x8F204010) NEVER suppresses a
+//   0x821Cxxxx target, so the guard is not what stops it.
+//
+//   WHAT THE GUARD DOES NOT CHECK IS THE SLOT. "an in-range `ctr` may still
+//   index an empty slot and call whatever is there" (this file, above). The
+//   census below MEASURES that: EMPTY-SLOT means the host is about to CALL A
+//   NULL POINTER (a host access violation), because the F-635 guard tests the
+//   INDEX RANGE and not the slot.
+//
+// ---------------------------------------------------------------------------
+// THE THREE CLASSES, ONE ROW EACH.
+// ---------------------------------------------------------------------------
+//   GUESTFN    -- slot non-null AND target inside [0x82130000, 0x827CCBC0]:
+//                 the call reaches guest code (possibly host-overridden).
+//   HOSTSTUB   -- slot non-null AND target outside that range: a host-registered
+//                 stub (0x83000000 press-start thunk, 0x8F204000 __xtl_alloc,
+//                 0x8F204010 __xtl_free) or a vtable slot the host filled.
+//   EMPTY-SLOT -- slot NULL: the host CALLS IT ANYWAY. This is the class the
+//                 brief asks about ("the target is NOT a plain in-image guest
+//                 function").
+//
+// ---------------------------------------------------------------------------
+// THE BRACKET, AND HOW A CALL THAT NEVER RETURNS IS NAMED.
+// ---------------------------------------------------------------------------
+// `IndirectCallBegin` / `IndirectCallEnd` bracket the call. A call that never
+// returns leaves its slot ACTIVE, and the watchdog in
+// src/task_dispatch_trace.cpp prints `BCTR-STUCK` for any slot active for more
+// than 2 s: THAT ROW NAMES THE TARGET AND THE LR OF THE CALL THAT NEVER
+// RETURNS. `BCTR-LAST` names the last dispatch a thread made before it went
+// quiet, which also covers the guest's SELF-LOOP traps (a `b` to itself never
+// re-enters this seam, so no bracket would ever close).
+//
+// RULE 19: the census must be able to FAIL. It prints a row for every dispatch
+// (bounded), so a zero is a zero and not a blind instrument.
+
+inline constexpr uint32_t kRecompiledCodeLo = 0x82130000u; // ppc_func_mapping.cpp row 1
+inline constexpr uint32_t kRecompiledCodeHi = 0x827CCBC0u; // the static map's last row
+
+enum class IndirectTargetClass : uint8_t { GuestFn = 0, HostStub = 1, EmptySlot = 2 };
+
+// Defined in src/task_dispatch_trace.cpp (the one host TU that owns the census).
+void ReportIndirectDispatch(uint32_t ctr, uint32_t lr, uintptr_t base);
+void IndirectCallBegin(uint32_t ctr, uint32_t lr);
+void IndirectCallEnd();
+
 }  // namespace census
 }  // namespace mcla::native
 
@@ -389,9 +471,21 @@ inline constexpr uint32_t kCtrSpan = kCtrHi - kCtrLo; // 0x0D0D4010
 // UNCHANGED. `PPC_LOOKUP_FUNC` is defined at generated/ppc_xenon/ppc_context.h:127,
 // before this macro is ever expanded, so referencing it here is legal even
 // though this header is included 93 lines earlier.
+//
+// F-849 (2026-10-21): the in-range arm now ALSO (a) brackets the call with the
+// census' Begin/End so that a call which never returns is observable, and (b)
+// asks the census to classify the target. NOTHING about the call itself
+// changes: the stock `(PPC_LOOKUP_FUNC(base, x))(ctx, base)` still runs, on the
+// same slot, with the same arguments. The out-of-range arm is untouched.
 #define PPC_CALL_INDIRECT_FUNC(x)                                                  \
     (mcla::native::census::CtrInFunctionTable((uint32_t)(x))                       \
-         ? ((void)(PPC_LOOKUP_FUNC(base, x))(ctx, base))                           \
+         ? ((void)mcla::native::census::IndirectCallBegin((uint32_t)(x),           \
+                                                          (uint32_t)(ctx.lr)),      \
+            (void)mcla::native::census::ReportIndirectDispatch((uint32_t)(x),      \
+                                                              (uint32_t)(ctx.lr),   \
+                                                              (uintptr_t)(base)),   \
+            (void)(PPC_LOOKUP_FUNC(base, x))(ctx, base),                           \
+            (void)mcla::native::census::IndirectCallEnd())                         \
          : ((void)mcla::native::census::ReportCtrOutOfRange((uint32_t)(x),         \
                                                             (uintptr_t)(base),     \
                                                             (uint32_t)(ctx.lr))))
