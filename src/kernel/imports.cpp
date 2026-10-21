@@ -2288,6 +2288,223 @@ static inline void HostLowerIrql(uint8_t level) {
 // raise the level the way a real interrupt does (an ISR runs at DPC).
 static inline uint8_t HostCurrentIrql() { return t_hostIrql; }
 
+// ---------------------------------------------------------------------------
+// F-852 (fix_sema, 2026-10-21): THE LIVE SEMAPHORE CENSUS -- SEMACNT.
+//
+// THE INSTRUMENT WAS BLIND, AND THAT WAS THE DEFECT (rule 19: a zero from an
+// instrument that was never shown firing on a known event is not a result).
+// The F-370 row (src/gpu_device.cpp:7347-7357) prints
+//     "F370-SEMA #{} {} h={:08X} init={} x={:08X} tid={:08X} lr={:08X}"
+// `init` is the INITIAL count, taken from boot_host.cpp's counting-semaphore
+// registry (RegisterCountingSema -> g_countingSemaInit).  It is a CONSTANT for
+// the life of the object, so the row is IDENTICAL whether the semaphore is
+// full or starved.  The brief's premise -- "the count must have reached 0 by
+// the time the boot worker waited" -- is not something that row could show,
+// and it is in fact FALSE (measured below).
+//
+// WHAT THIS ROW PRINTS INSTEAD, on EVERY wait and EVERY release of a
+// semaphore, from every path (NtWaitForSingleObjectEx, KeWaitForSingleObject,
+// NtReleaseSemaphore):
+//     h      the guest handle / dispatcher address
+//     obj    the RESOLVED host wrapper pointer (so the wait side and the
+//            release side can be compared by pointer -- a mismatch here IS
+//            the wake-loss)
+//     cls    sema | event | other
+//     cnt    the LIVE count (the thing F-370 called `init`)
+//     max    the semaphore's maximum count
+//     waitrs the number of threads CURRENTLY BLOCKED on this object
+//     x      timeout (wait) / release count (release)
+//     lr     the guest call site
+//
+// THE MEASUREMENTS THAT REFUTE THE PREMISE (build/bctr_v2.log, the newest
+// soak; the boot worker is tid=00005CEC -- "PARK-SAMPLE worker-tid=00005CEC",
+// build/bctr_v2.log:2256):
+//   1. THE LIVE COUNT WAS 15, NOT 0, AT THE BOOT WORKER'S WAIT.
+//      build/bctr_v2.log:130574
+//        "FI-ENQ #346 mgr=A04865D4 item=8EFFE450 triple={...} slotSem=B72C1048
+//         slotCnt=15"
+//      -- slotCnt is read from the LIVE host wrapper (src/gpu_device.cpp:29564
+//      -> LookupIdentityKernelObject -> dynamic_cast<Semaphore*> ->
+//      sem->count.load()), so this is the semaphore's count at 21:49:04.236.
+//   2. THE BOOT WORKER'S WAIT ON B72C1048 RETURNED.  The main-park stamp
+//      (g_mainParkNs, refreshed at the ENTRY of every wait by the main guest
+//      thread -- imports.cpp:2334 and :7271) reads 21:49:04.235, i.e. the
+//      boot worker entered ANOTHER wait 1 ms after the one above; a thread
+//      cannot enter a second wait while still blocked in the first.
+//      Derived from build/bctr_v2.log:559439
+//        "HB-FLICKER #3240 ... mainwait=B72C1048 mainwaitlr=82135DF8
+//         mainwait_age_ms=79314"  (21:50:23.549 - 79.314 s = 21:49:04.235).
+//   3. AND IT KEPT RUNNING: build/bctr_v2.log:623017
+//        "BCTR-DISP #27099136 tid=00005CEC ctr=82130000 lr=821CD378"
+//      -- 27,197,440 dispatches at 21:50:35.810, the end of the log.
+//
+// THE POSITIVE CONTROL is the SELFTEST below, which runs ONCE per boot at the
+// first semaphore use: it creates a semaphore with THREE permits and waits on
+// it (the wait returns immediately, the count goes 3 -> 2), and it blocks a
+// second waiter on a ZERO-count semaphore until a release wakes it.  Those
+// rows prove the census prints a NON-ZERO count, a RETURNED row, and
+// waiters>0 while a thread is parked -- so a later row saying cnt=0 is a
+// MEASUREMENT, not a constant.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct SemCntSlot
+{
+    uint32_t handle;   // 0 = free
+    uint32_t hits;     // rows printed for this handle
+    bool seenZero;     // this handle was once seen with a zero count
+    bool starved;      // this handle was once seen with a BLOCKED waiter
+};
+constexpr uint32_t kSemCntSlots = 64;
+SemCntSlot g_semCntSlots[kSemCntSlots] = {};
+std::atomic<uint32_t> g_semCntRows{0};
+std::atomic<uint64_t> g_semCntWaits{0};
+std::atomic<uint64_t> g_semCntReleases{0};
+std::atomic<uint64_t> g_semCntBlocked{0};   // waits that found cnt == 0
+
+SemCntSlot* SemCntFind(uint32_t handle)
+{
+    for (uint32_t i = 0; i < kSemCntSlots; ++i)
+        if (g_semCntSlots[i].handle == handle)
+            return &g_semCntSlots[i];
+    for (uint32_t i = 0; i < kSemCntSlots; ++i)
+    {
+        if (g_semCntSlots[i].handle == 0)
+        {
+            g_semCntSlots[i].handle = handle;
+            return &g_semCntSlots[i];
+        }
+    }
+    return nullptr;
+}
+
+// The live state of whatever object a wait/release resolved to.  For a
+// semaphore that is (count, max, blocked waiters); for anything else the
+// count is "no count" (0xFFFFFFFF) and only the class is meaningful.
+void SemCntSnapshot(KernelObject *obj, uint32_t *cnt, uint32_t *max,
+                    uint32_t *waiters)
+{
+    *cnt = 0xFFFFFFFFu;
+    *max = 0;
+    *waiters = 0;
+    if (obj == nullptr)
+        return;
+    if (auto *s = dynamic_cast<Semaphore *>(obj))
+    {
+        *cnt = s->LiveCount();
+        *max = s->maximumCount;
+        *waiters = s->BlockedWaiters();
+    }
+}
+
+// The census row.  `force` prints unconditionally (the self-test, and the
+// RETURNED row of a wait that actually blocked); otherwise the row is printed
+// when it MATTERS -- a thread is blocked on the object, the count was zero
+// for the first time on this handle, or the handle has been seen starved --
+// and sampled (first 8 rows per handle, then every 500th) otherwise.  The
+// "matters" cases are never sampled away, which is the whole point (rule 19:
+// an instrument must be shown firing on a known event).
+// Returns true when the row was printed.
+bool SemCntRow(const char *op, uint32_t handle, KernelObject *obj,
+               uint32_t liveCount, uint32_t maxCount, uint32_t waiters,
+               uint32_t extra, uint32_t lr, bool force)
+{
+    const char *cls = "other";
+    uint32_t shown = liveCount;
+    if (obj != nullptr)
+    {
+        if (dynamic_cast<Semaphore *>(obj) != nullptr)
+            cls = "sema";
+        else if (dynamic_cast<Event *>(obj) != nullptr)
+            cls = "event";
+    }
+    if (std::strcmp(cls, "sema") != 0)
+        shown = 0xFFFFFFFFu;  // no count on a non-semaphore
+
+    bool print = force;
+    SemCntSlot *slot = SemCntFind(handle);
+    if (!print)
+    {
+        if (waiters > 0)
+            print = true;                       // somebody is parked on it
+        else if (slot != nullptr)
+        {
+            if (liveCount == 0 && !slot->seenZero)
+                print = true;                   // the FIRST zero on this handle
+            else if (slot->starved)
+                print = true;                   // this handle has a parked waiter
+            else if (slot->hits < 8 || (slot->hits % 500) == 0)
+                print = true;                   // the sample
+        }
+        else if (liveCount == 0)
+            print = true;                       // no slot left: never hide a zero
+    }
+    if (slot != nullptr)
+    {
+        if (liveCount == 0)
+            slot->seenZero = true;
+        if (waiters > 0)
+            slot->starved = true;
+        if (print)
+            slot->hits++;
+    }
+    if (!print)
+        return false;
+
+    const uint32_t n = g_semCntRows.fetch_add(1) + 1;
+    MCLA_LOG_WARN("SEMACNT #{} {} h={:08X} obj={} cls={} cnt={} max={} "
+                  "waiters={} x={:08X} tid={:08X} lr={:08X}",
+                  n, op, handle, static_cast<const void *>(obj), cls, shown,
+                  maxCount, waiters, extra, GetCurrentThreadId(), lr);
+    return true;
+}
+
+// The POSITIVE CONTROL (see the block comment above).  Runs once per boot at
+// the first semaphore use, so every log carries it.
+void SemCntSelfTest()
+{
+    static std::atomic<bool> s_ran{false};
+    bool expected = false;
+    if (!s_ran.compare_exchange_strong(expected, true))
+        return;
+
+    // (a) A semaphore with THREE permits: the wait returns IMMEDIATELY and
+    //     the count drops 3 -> 2.  This is the "known-good handle where the
+    //     count is non-zero and the wait returns immediately" control.
+    {
+        Semaphore s(3u, 32767u);
+        const uint32_t before = s.LiveCount();
+        const uint32_t st = s.Wait(INFINITE);
+        SemCntRow("SELFTEST-WAIT", 0xFFFFFFFFu, &s, before, s.maximumCount,
+                  s.BlockedWaiters(), INFINITE, 0, true);
+        SemCntRow("SELFTEST-RETURNED", 0xFFFFFFFFu, &s, s.LiveCount(),
+                  s.maximumCount, s.BlockedWaiters(), st, 0, true);
+    }
+
+    // (b) A ZERO-count semaphore: a thread blocks on it (waiters becomes 1)
+    //     and a release wakes it.  This is the "waiters blocked" control.
+    {
+        Semaphore s(0u, 32767u);
+        std::atomic<uint32_t> got{0xFFFFFFFFu};
+        std::thread waiter([&] { got.store(s.Wait(INFINITE)); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        SemCntRow("SELFTEST-BLOCKED", 0xFFFFFFFFu, &s, s.LiveCount(),
+                  s.maximumCount, s.BlockedWaiters(), INFINITE, 0, true);
+        uint32_t prev = 0xFFFFFFFFu;
+        s.Release(1, &prev);
+        SemCntRow("SELFTEST-RELEASE", 0xFFFFFFFFu, &s, s.LiveCount(),
+                  s.maximumCount, s.BlockedWaiters(), 1, 0, true);
+        waiter.join();
+        SemCntRow("SELFTEST-WOKEN", 0xFFFFFFFFu, &s, s.LiveCount(),
+                  s.maximumCount, s.BlockedWaiters(), got.load(), 0, true);
+    }
+    MCLA_LOG_WARN("SEMACNT-SELFTEST done -- the census CAN print a non-zero "
+                  "count and a RETURNED row, so a later cnt=0 is a "
+                  "measurement");
+}
+
+}  // namespace
+
 uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
                                   uint32_t Alertable, be<int64_t> *Timeout) {
   // PARK-SAMPLE: census ALL threads at wait entry
@@ -2446,8 +2663,46 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
       return STATUS_INVALID_HANDLE;
     }
 
+    // F-852 (fix_sema): the LIVE-count census.  This is the row that can
+    // FAIL: it prints the semaphore's CURRENT count (not the initial count
+    // the F-370 row printed) and the number of threads blocked on it, so a
+    // starved semaphore is visible as (cnt=0, waiters>0) at the WAIT and the
+    // release that should have woken it is visible as (waiters>0).
+    bool semCntWaitPrinted = false;
+    {
+        uint32_t c = 0, mx = 0, w = 0;
+        SemCntSnapshot(obj, &c, &mx, &w);
+        if (c == 0)
+            g_semCntBlocked.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t waits =
+            g_semCntWaits.fetch_add(1, std::memory_order_relaxed) + 1;
+        semCntWaitPrinted =
+            SemCntRow("WAIT", Handle, obj, c, mx, w, timeout,
+                      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                      false);
+        // F-852: the SUMMARY row, so the census can be read without counting
+        // the per-event rows.  waits / releases / blocked (waits that found
+        // cnt == 0) / rows.
+        if ((waits % 5000) == 0) {
+            MCLA_LOG_WARN("SEMACNT-SUM waits={} releases={} blocked={} rows={}",
+                          waits, g_semCntReleases.load(std::memory_order_relaxed),
+                          g_semCntBlocked.load(std::memory_order_relaxed),
+                          g_semCntRows.load(std::memory_order_relaxed));
+        }
+    }
+
     const uint32_t st = obj->Wait(timeout);
     LogDwellHistogramNT(st);
+    {
+        // The RETURNED row is printed when the WAIT row was printed, and
+        // ALWAYS when the wait actually BLOCKED (g_semWaitBlocked): that is
+        // the row that says "this wait did not come back at once".
+        uint32_t c1 = 0, mx1 = 0, w1 = 0;
+        SemCntSnapshot(obj, &c1, &mx1, &w1);
+        SemCntRow("RETURNED", Handle, obj, c1, mx1, w1, st,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                  semCntWaitPrinted || g_semWaitBlocked);
+    }
     {
       static std::atomic<uint32_t> s_wcNtwR{0};
       const uint32_t n = s_wcNtwR.fetch_add(1) + 1;
@@ -7377,10 +7632,36 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   // still selects the WAIT BEHAVIOUR (auto vs manual reset) inside
   // Event/Semaphore; it no longer selects the OBJECT.
   bool resolvedByIdentity = false;
+  // F-852 (fix_sema): the Ke-form wait gets the same LIVE-count census as
+  // the Nt-form wait, so a wait that blocks on a semaphore is visible as
+  // (cnt=0, waiters>0) and the release that should wake it is visible as
+  // (waiters>0).  The handle printed here is the DISPATCHER ADDRESS, which
+  // for a host-created object IS the guest handle (GetKernelHandle ->
+  // MapVirtual(&obj->header)), so the two forms are comparable.
+  const uint32_t keCntHandle =
+      mcla::kernel::GuestMemoryHeap::Instance().MapVirtual(Object);
+  auto keCntWait = [&](KernelObject *o, const char *tag) {
+    uint32_t c = 0, mx = 0, w = 0;
+    SemCntSnapshot(o, &c, &mx, &w);
+    if (c == 0)
+      g_semCntBlocked.fetch_add(1, std::memory_order_relaxed);
+    g_semCntWaits.fetch_add(1, std::memory_order_relaxed);
+    return SemCntRow(tag, keCntHandle, o, c, mx, w, timeout,
+                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                     false);
+  };
   if (KernelObject *canonical = LookupKernelObjectByDispatcher(*Object)) {
     if (auto *sem = dynamic_cast<Semaphore *>(canonical)) {
       waitResolution = "identity(sem)";
+      const bool kePrinted = keCntWait(sem, "KE-WAIT");
       waitStatus = sem->Wait(timeout);
+      {
+        uint32_t c = 0, mx = 0, w = 0;
+        SemCntSnapshot(sem, &c, &mx, &w);
+        SemCntRow("KE-RETURNED", keCntHandle, sem, c, mx, w, waitStatus,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                  kePrinted || g_semWaitBlocked);
+      }
       resolvedByIdentity = true;
     } else if (auto *ev = dynamic_cast<Event *>(canonical)) {
       waitResolution = "identity(event)";
@@ -7433,7 +7714,15 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     }
     if (sem) {
       waitResolution = "map-hit(sem)";
+      const bool kePrinted = keCntWait(sem, "KE-WAIT");
       waitStatus = sem->Wait(timeout);
+      {
+        uint32_t c = 0, mx = 0, w = 0;
+        SemCntSnapshot(sem, &c, &mx, &w);
+        SemCntRow("KE-RETURNED", keCntHandle, sem, c, mx, w, waitStatus,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                  kePrinted || g_semWaitBlocked);
+      }
     } else {
       // T43.17 (2026-10-13): count the fallback branch. w764 measured the
       // real split -- resolve-hits ~16k, misses 1 -- so the fallback is
@@ -7475,7 +7764,15 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
     }
     waitResolution = "map-hit(sem)";
     Semaphore *sem = QueryKernelObject<Semaphore>(*Object);
+    const bool kePrinted = keCntWait(sem, "KE-WAIT");
     waitStatus = sem->Wait(timeout);
+    {
+      uint32_t c = 0, mx = 0, w = 0;
+      SemCntSnapshot(sem, &c, &mx, &w);
+      SemCntRow("KE-RETURNED", keCntHandle, sem, c, mx, w, waitStatus,
+                static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                kePrinted || g_semWaitBlocked);
+    }
     break;
   }
 
@@ -8514,6 +8811,10 @@ uint32_t NtCreateSemaphore(be<uint32_t> *Handle,
     // limiter), so the wait/release hooks can ask later whether a given handle is one.
     mcla::boot::RegisterCountingSema(static_cast<uint32_t>(*Handle), InitialCount);
   }
+  // F-852 (fix_sema): run the census's POSITIVE CONTROL once, at the first
+  // semaphore the guest creates, so every log carries proof that the row can
+  // print a non-zero count, a RETURNED row and a blocked-waiter count.
+  SemCntSelfTest();
   return STATUS_SUCCESS;
 }
 
@@ -8708,7 +9009,31 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
   }
 
   uint32_t previousCount;
+  // F-852 (fix_sema): the LIVE-count census on the RELEASE side, so the
+  // release and the wait can be compared by OBJECT POINTER and by COUNT.  A
+  // release that lands on a different wrapper than the one a waiter is
+  // parked on is the wake-loss, and it is invisible in every row that only
+  // prints a handle (the F-370 row) or a count taken at a different moment.
+  {
+      const uint32_t relHandle = static_cast<uint32_t>(
+          reinterpret_cast<const uint8_t *>(Handle) - mcla::kernel::g_memory.base);
+      uint32_t c = 0, mx = 0, w = 0;
+      SemCntSnapshot(sem, &c, &mx, &w);
+      g_semCntReleases.fetch_add(1, std::memory_order_relaxed);
+      SemCntRow("RELEASE-BEFORE", relHandle, sem, c, mx, w, ReleaseCount,
+                static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                false);
+  }
   sem->Release(ReleaseCount, &previousCount);
+  {
+      const uint32_t relHandle = static_cast<uint32_t>(
+          reinterpret_cast<const uint8_t *>(Handle) - mcla::kernel::g_memory.base);
+      uint32_t c = 0, mx = 0, w = 0;
+      SemCntSnapshot(sem, &c, &mx, &w);
+      SemCntRow("RELEASE-AFTER", relHandle, sem, c, mx, w, ReleaseCount,
+                static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                false);
+  }
 
   if (PreviousCount != nullptr)
     *PreviousCount = previousCount;

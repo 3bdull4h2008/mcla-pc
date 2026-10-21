@@ -126,10 +126,51 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     }
 };
 
+// F-852 (fix_sema, 2026-10-21): TRUE when the CALLING THREAD's last
+// Semaphore::Wait actually BLOCKED -- i.e. it found no permit and had to wait
+// for one -- as opposed to taking a permit and returning at once.  The
+// semaphore's Wait() signature cannot carry it out (the base class's virtual
+// is fixed and other overrides live in port_kobj.cpp, which is not ours to
+// edit), so the flag is published here, per thread, and read by the SEMACNT
+// census.  It is what lets the census print a RETURNED row for a wait that
+// was DELAYED, which is the difference between "the wait returned at once"
+// and "the wait came back only when somebody released".
+inline thread_local bool g_semWaitBlocked = false;
+
 struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 {
     std::atomic<uint32_t> count;
     uint32_t maximumCount;
+
+    // F-852 (fix_sema, 2026-10-21): the number of threads CURRENTLY BLOCKED
+    // inside Semaphore::Wait on this object.
+    //
+    // WHY IT EXISTS.  The F-370 census row (src/gpu_device.cpp:7347-7357)
+    // prints `init=` -- the INITIAL count, a CONSTANT for the life of the
+    // object -- so it can never distinguish "this semaphore was starved" from
+    // "this semaphore always had 15 permits".  MEASURED on the newest soak
+    // (build/bctr_v2.log):
+    //   :130574  "FI-ENQ #346 ... slotSem=B72C1048 slotCnt=15"
+    //            -- the LIVE count of the very semaphore the boot worker parks
+    //               on was 15 at 21:49:04.236, ONE MILLISECOND after the boot
+    //               worker's wait entry at 21:49:04.235 (derived from
+    //               :559439 "HB-FLICKER ... mainwait=B72C1048
+    //               mainwait_age_ms=79314").  The F-370 row would have
+    //               printed "init=15" for the whole story and looked identical.
+    //   :623017  "BCTR-DISP #27099136 tid=00005CEC ctr=82130000 ..."
+    //            -- the boot worker was STILL dispatching at 21:50:35, so that
+    //               wait RETURNED.  The semaphore is not what stops it.
+    // This counter is what makes a starved semaphore visible: (cnt=0,
+    // waiters>0) at the WAIT, and waiters>0 at the RELEASE that should have
+    // woken it.
+    std::atomic<uint32_t> blockedWaiters{0};
+
+    // Live snapshot of the semaphore's state, for the SEMACNT census row.
+    uint32_t LiveCount() const { return count.load(std::memory_order_relaxed); }
+    uint32_t BlockedWaiters() const
+    {
+        return blockedWaiters.load(std::memory_order_relaxed);
+    }
 
     Semaphore(xpointer<XKSEMAPHORE> semaphore)
     {
@@ -156,6 +197,9 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         // wait rows against 16,384 resolve-hits, which read as "36 waits"
         // when the truth was ~17k. One gate, stated here, no other.
         SemaphoreProbeLog(this, "wait", count.load());
+        // F-852 (fix_sema): clear the "this wait blocked" flag; it is set only
+        // by the arm that actually parks.
+        g_semWaitBlocked = false;
         if (timeout == 0)
         {
             uint32_t currentCount = count.load();
@@ -180,7 +224,16 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
                 }
                 else
                 {
+                    // F-852 (fix_sema): we are ABOUT TO BLOCK.  Publish that
+                    // fact so the SEMACNT census can print waiters>0 while this
+                    // thread is parked, which is the difference between "the
+                    // permit pool was empty" and "the wait never came back".
+                    // The counter is decremented on EVERY path out of the
+                    // blocking call, including a spurious wake-up.
+                    blockedWaiters.fetch_add(1, std::memory_order_acq_rel);
+                    g_semWaitBlocked = true;
                     count.wait(0);
+                    blockedWaiters.fetch_sub(1, std::memory_order_acq_rel);
                 }
             }
 
