@@ -9496,15 +9496,51 @@ uint32_t NetDll_XNetStartup(uint32_t dllSelector, const void *xnaddr) {
   return 0; // <-- THE FABRICATION. Nothing was started. See the trigger above.
 }
 
-// F-609 Task 3, and a correction to a claim the previous pass left in this
-// file: this does NOT return a pointer, and 0 is not NULL. It returns an
-// XnAddrStatus word and fills the caller's XNADDR. That is why the value 0
-// is right for this guest: sub_824E6148 (0x824E6188-0x824E61B0) and
-// sub_82501AC0 (0x82501AE4) both take the r3 == 0 branch as SUCCESS, and
-// sub_824E6148 then copies 6 bytes out of XNADDR+0x10. Note that 0 is
-// Xenia's XNET_GET_XNADDR_PENDING (xam_net.cc:431), not its NONE (1, :433) --
-// the guest's own encoding differs from the reference's, and the bytes win.
-// Real work: zero the buffer (see the block comment). Not done: an address.
+// F-609 Task 3: this does NOT return a pointer, and 0 is not NULL. It returns
+// an XnAddrStatus word and fills the caller's XNADDR.
+//
+// F-845: THE PREVIOUS COMMENT HERE WAS INVERTED, AND THE INVERSION WAS THE
+// BOOT'S OUTERMOST WALL.  It claimed "sub_824E6148 (0x824E6188-0x824E61B0) and
+// sub_82501AC0 (0x82501AE4) both take the r3 == 0 branch as SUCCESS".
+// **THE GUEST'S OWN BYTES SAY THE OPPOSITE.**  The emitted body of
+// sub_824E6148 (generated/ppc_xenon/ppc_recomp.97.cpp:23046-23067) is:
+//
+//   23046: bl 0x8244a670        <- the XNet call
+//   23049: cmplwi cr6,r3,0
+//   23051: bne cr6,0x824e61b0  <- r3 != 0  => LEAVE THE LOOP (done)
+//   23053: loc_824E6198:
+//   23054: li r3,1
+//   23056: bl 0x8244fec0       <- the 1 ms KeDelayExecutionThread sleep
+//   23061: bl 0x8244a670        <- call again
+//   23064: cmplwi cr6,r3,0
+//   23066: beq cr6,0x824e6198  <- r3 == 0  => SLEEP AND RETRY
+//
+// So **r3 == 0 means PENDING-and-RETRY**, and only a NON-ZERO value lets the
+// boot worker leave the loop.  The host returned 0 on every one of its
+// 139,800 calls (build/w848.log SYNTH-XNET), so the boot worker spun in that
+// 1 ms loop for the whole run and NEVER reached the boot-gate registration at
+// guest 0x821315F4 -- which is why W35-BOOT-GATE and W35-UILOAD were 0 and
+// F438-GFXCTOR was 0 in EVERY soak.  The boot worker's own published frame
+// chain names the loop: guest sub_824E6148 (w848.log:88042, chain
+// f1=824E61A0) and PARK-SAMPLE worker-tid.
+//
+// THE VALUE: Xenia returns XNET_GET_XNADDR_STATIC = 4 for a local title
+// (xam_net.cc:474); 0 is Xenia's XNET_GET_XNADDR_PENDING (:431) and 1 is its
+// NONE (:433).  The guest's OWN encoding is what the loop above decides, and
+// it needs NON-ZERO -- 4 is the console's value, so 4 it is.
+//
+// NO CONFLICT WITH THE OTHER CALLER: sub_82501AC0 calls the same thunk at
+// 0x82501AE8 and then OVERWRITES r3 with 1 immediately (recomp.101.cpp:7651-7655),
+// so it never inspects the return value.  The earlier comment's claim that
+// it "takes the r3 == 0 branch as SUCCESS" is refuted by the emitted body.
+//
+// FALSIFIER: SYNTH-XNET stops repeating, PARK-CENSUS[KDELAY] for the boot
+// worker stops, and the F362 probes G,H,I,J,K,L -- the calls on the
+// straight-line tail after `bl sub_822C2EA8` at guest 0x82131550 -- FIRE.
+// **DO NOT use the F363-C2EA8 RETURN row as the test: it can never print.**
+// sub_822C2EA8 ends in a TAIL JUMP (recomp.43.cpp:24200-24222: `addi r1,r1,240;
+// lfd f29/f30/f31; b 0x823D9240`), so the hook's post-call code is abandoned
+// and the RETURN row is structurally impossible, not a measurement of anything.
 uint32_t NetDll_XNetGetTitleXnAddr(uint32_t dllSelector, void *xnaddr) {
   const uint64_t attempt =
       g_synthXnetAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -9523,14 +9559,21 @@ uint32_t NetDll_XNetGetTitleXnAddr(uint32_t dllSelector, void *xnaddr) {
         g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u;
     MCLA_LOG_WARN(
         "SYNTH-XNET #{} op=XNetGetTitleXnAddr attempts={} outcomes={} "
-        "selector={:08X} xnaddr_zeroed={} -> returning 0 (no address, no "
+        "selector={:08X} xnaddr_zeroed={} -> returning 4 (XNET_GET_XNADDR_STATIC; no address, no "
         "server, no MAC) glr={:08X}",
         attempt, attempt,
         g_synthXnetOutcomes.load(std::memory_order_relaxed), dllSelector,
         zeroed ? 1 : 0, glr);
   }
   g_synthXnetOutcomes.fetch_add(1, std::memory_order_relaxed);
-  return 0; // SYNTH-XNET: the guest's success value, with an empty address.
+  // F-845: return the console's XNET_GET_XNADDR_STATIC (4), NOT 0.  The guest's
+  // loop in sub_824E6148 (recomp.97.cpp:23049-23067) treats r3 == 0 as
+  // PENDING-and-RETRY (beq -> sleep 1 ms -> call again) and only a NON-ZERO
+  // value lets it leave (bne -> 0x824e61b0).  Returning 0 kept the boot
+  // worker in that 1 ms loop for the whole run, which is why the boot gate was
+  // never registered.  The XNADDR buffer is already zeroed above, and the
+  // guest copies 6 bytes out of XNADDR+0x10 after it leaves the loop.
+  return 4; // XNET_GET_XNADDR_STATIC (Xenia xam_net.cc:474)
 }
 
 uint32_t KeWaitForMultipleObjects(uint32_t Count,
