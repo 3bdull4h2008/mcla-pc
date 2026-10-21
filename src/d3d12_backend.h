@@ -964,6 +964,103 @@ public:
     std::vector<uint8_t> m_fbHost;
 
     // ---------------------------------------------------------------------
+    // F-XXX: THE GUEST'S RENDER TARGET ("EDRAM") AND THE RESOLVE INTO THE
+    // SCANOUT SURFACE.
+    //
+    // WHAT THE CONSOLE DOES, IN THE GUEST'S OWN WORDS (citations in
+    // src/gpu_cp.h, which carries the PE-image bytes):
+    //   * the guest renders into EDRAM, whose geometry the guest states in
+    //     RB_SURFACE_INFO (surface_pitch in pixels) and whose mode it states
+    //     in RB_MODECONTROL (xenos::EdramMode);
+    //   * the guest then copies EDRAM out with the RB copy unit:
+    //     RB_COPY_CONTROL / RB_COPY_DEST_BASE / RB_COPY_DEST_PITCH /
+    //     RB_COPY_DEST_INFO, and the copy itself is a DRAW with
+    //     RB_MODECONTROL.edram_mode = kCopy (xenos.h:911-915 states the rule
+    //     in words: "Xenos copies EDRAM contents to a tiled 2D or 3D texture
+    //     (resolves) by drawing primitives with the EDRAM mode
+    //     EdramMode::kCopy");
+    //   * the display then scans that surface out.
+    //
+    // WHAT THIS HOST HAD: NO EDRAM target and NO RB_COPY consumer
+    // (build/agents/audit_gpu.md row 1), and ResolveGuestSurface
+    // (src/d3d12_backend.cpp:6295) with no call site at all. The guest's
+    // draws went straight into the swap-chain back buffer, so the guest's
+    // render target and the scan-out surface were the SAME object and the
+    // console's copy step did not exist.
+    //
+    // WHAT THIS IS: the missing object and the missing step, in the smallest
+    // form that can be built and falsified.
+    //   * m_guestRt is the guest's render target, sized and formatted from the
+    //     guest's OWN registers (RB_SURFACE_INFO's pitch, the screen scissor's
+    //     height, the colour format the guest's RB_COLOR_INFO mapped to).
+    //   * the guest's draws go into m_guestRt.
+    //   * ResolveGuestRenderTarget copies m_guestRt into the scan-out surface
+    //     (the swap-chain back buffer) -- the console's EDRAM -> scanout
+    //     resolve, in the host's terms.
+    //
+    // THE FALLBACK IS NOT OPTIONAL. If the guest's render target does not
+    // match the scan-out surface 1:1, the resolve cannot be a copy, so the
+    // guest's draws go into the back buffer exactly as they did before this
+    // existed and the refusal is counted and named.
+    // ---------------------------------------------------------------------
+    bool EnsureGuestRenderTarget(uint32_t width, uint32_t height,
+                                 DXGI_FORMAT format);
+    // The console's EDRAM -> scanout resolve. Returns false when there is
+    // nothing to resolve (no guest render target, or nothing drawn into it
+    // since the last resolve).
+    bool ResolveGuestRenderTarget();
+    // Named, counted refusal of the guest render target, so "the guest's
+    // render target was not used" is a number and not an absence.
+    //
+    // `hr` is the D3D12 HRESULT when the refusal came from a D3D12 call, and
+    // 0xFFFFFFFF when it did not (no call was made). F-XXX: the row used to
+    // print the reason alone, so "create-failed" named the outcome and not
+    // the cause -- the same silence the row exists to end.
+    void GuestRenderTargetRefused(const char* why, uint32_t hr = 0xFFFFFFFFu);
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_guestRt;
+    // A replaced guest render target is kept here until the GPU has caught up
+    // with the fence, because a texture the GPU may still be reading must not
+    // be released under it. The size can only change on a window resize (the
+    // resolve requires the guest's render target to be 1:1 with the scan-out
+    // surface), so this list stays empty in practice.
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_guestRtRetired;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_guestRtvHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_guestRtv = {};
+    uint32_t m_guestRtW = 0;
+    uint32_t m_guestRtH = 0;
+    DXGI_FORMAT m_guestRtFormat = DXGI_FORMAT_UNKNOWN;
+    bool m_guestRtValid = false;
+    // The guest render target's tracked D3D12 state. It starts COMMON and is
+    // RENDER_TARGET between draws; the readback and the resolve each take it
+    // to COPY_SOURCE and back. Asserting a state the resource is not in is
+    // the F-725 hazard this file already documents at :4130-4142, so the
+    // state is TRACKED here rather than assumed.
+    D3D12_RESOURCE_STATES m_guestRtState = D3D12_RESOURCE_STATE_COMMON;
+    // True once the guest has drawn into m_guestRt since the last resolve.
+    bool m_guestRtDrawn = false;
+    // True while the draw path is rendering into m_guestRt rather than into
+    // the back buffer. The back buffer's ledger (NoteBufferWrite) describes
+    // the BACK BUFFER, so while the draws land in the guest render target
+    // they must not be counted as writes to it; the resolve is the write.
+    bool m_drawsIntoGuestRt = false;
+    // F-XXX: the number of NON-MODAL pixels the last post-draw readback
+    // measured in the GUEST RENDER TARGET (the same count the D3D12-DRAW-PIXEL
+    // row prints as changedPx). The resolve's row carries it, because "the
+    // copy ran" and "the thing that was copied was not blank" are two
+    // different facts and only this one is the second.
+    //
+    // IT LAGS THE RESOLVE BY ONE FRAME on purpose, not by accident: the
+    // readback's copy is executed by the present, and the buffer can only be
+    // mapped after that present returns (F-725's fence arithmetic, .cpp
+    // :4529 and the wait below it), so the measurement of frame N is available
+    // after the resolve of frame N. The value is a MEMBER and is not cleared,
+    // so once the guest has drawn something the number stays.
+    uint64_t m_guestRtChangedPx = 0;
+    uint64_t m_guestRtResolves = 0;
+    uint64_t m_guestRtRefusals = 0;
+    uint64_t m_guestRtCreated = 0;
+
+    // ---------------------------------------------------------------------
     // F-725: the post-draw readback (see ReportDrawReadback in the .cpp for the
     // measurement and for the four dead ends it supersedes).
     //

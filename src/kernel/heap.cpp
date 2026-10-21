@@ -14,6 +14,20 @@
 #include <cstdlib>   // T43.1: std::getenv for the forced-invariant-gate control
 #include <dbghelp.h>
 
+// F-806b: RAII open/close of the F-374/F-388 header-guard window. MOVED UP from below (it used to
+// be defined just above Heap::Alloc): the reporter rows at ~1482/~1556 run on their own thread,
+// outside any allocator window, and `HeapDiag` reads the instance -- `capacity` at instance+0x208
+// -- which since F-806 is a genuine out-of-window access on the guarded page. MEASURED in w801 as
+// `F388-PHYSGUARD trip=3/4/5 off=0X208 want=R hostRVA=0x2e4dd3` = `o1heapGetDiagnostics+0x3`.
+// Every existing user keeps the same two calls in the same order; do not move this back down.
+namespace {
+    struct HeapGuardWindow
+    {
+        HeapGuardWindow() { mcla::boot::HeapGuardDisarm(); }
+        ~HeapGuardWindow() { mcla::boot::HeapGuardArm(); }
+    };
+} // namespace
+
 // F-784 phase 3: the T44 wipe-watch COVERAGE line, defined in gpu_cp.cpp beside
 // T44WipeSelfTest. NotePhysBinProbe prints it once per probe so a run whose card pages produced
 // no T44-WIPE-STORE row reports its counts instead of leaving the reader to argue from absence --
@@ -1479,6 +1493,11 @@ namespace
         const uint64_t resid = (measuredFrag > con) ? (uint64_t)(measuredFrag - con) : 0ull;
         if (seq > 4 && (seq % 2000) != 0)
             return;
+        // F-806b, CORRECTED: a `HeapGuardWindow` was briefly added here on the theory that this
+        // reporter was the F-388 reader. It is not -- `Heap::AllocPhysical` opens its own window at
+        // :3340 (function scope), so this read was already covered and the added guard was pure
+        // nesting depth. The real reader is `MmAllocatePhysicalMemoryEx`'s failure path,
+        // `imports.cpp:4973`, which runs AFTER that window closes. Reverted here on purpose.
         const O1HeapDiagnostics d = HeapDiag(g_userHeap.physicalHeap);
         const uint64_t free = (d.capacity > d.allocated) ? (d.capacity - d.allocated) : 0ull;
         MCLA_LOG_WARN("PHYS-ACCT #{} policy=page granule={:#x} n={} req={:.1f}MB charge={:.1f}MB "
@@ -1553,6 +1572,8 @@ namespace
             return;
         const uint64_t sumReq = g_physPool.largeReq.load(std::memory_order_relaxed);
         const uint64_t sumChg = g_physPool.largeCharged.load(std::memory_order_relaxed);
+        // F-806b, CORRECTED: a guard here was redundant for the same reason as at :1502 -- see
+        // the note there. The instance read is already inside `Heap::AllocPhysical`'s window.
         const O1HeapDiagnostics d = HeapDiag(g_userHeap.physicalHeap);
         const uint64_t free = (d.capacity > d.allocated) ? (d.capacity - d.allocated) : 0ull;
         MCLA_LOG_WARN("PHYS-LARGE #{} path=granular granule={:#x} outcome={} req={:#x} charge={:#x} "
@@ -2720,6 +2741,11 @@ static uint8_t *AllocDetachedInstanceMem()
     return static_cast<uint8_t *>(p);
 }
 
+// F-806: readers for the two detached instance blocks, so the write-watchers can follow the header
+// off the arena. Read-only accessors over statics that already existed; see heap.h for the taint list.
+uint8_t *UserHeapInstanceMem(void) { return g_userInstMem; }
+uint8_t *PhysHeapInstanceMem(void) { return g_physInstMem; }
+
 void Heap::Init()
 {
     // F-384: this line used to hardcode 0x20000 (XenonRecomp's baseline); the address is unchanged but
@@ -3071,11 +3097,11 @@ namespace
     // because CheckHeapHeader("pre-free") reads the guarded instance page and must run
     // disarmed. That is harmless now (depth, not ordering) and must stay so: every instance
     // read belongs in a window -- moving this below the lock trips F374-HEAPGUARD per free.
-    struct HeapGuardWindow
-    {
-        HeapGuardWindow() { mcla::boot::HeapGuardDisarm(); }
-        ~HeapGuardWindow() { mcla::boot::HeapGuardArm(); }
-    };
+    // F-806b: `HeapGuardWindow` was defined HERE, i.e. AFTER the reporter rows at ~1482/~1556 that
+    // now need it. It was moved up, next to this comment, so those reporters can open a window
+    // before reading the instance. Behaviour is unchanged for every existing user: same two calls,
+    // same order, same one-window-per-operation pairing. Do not move it back below the reporters.
+    struct HeapGuardWindowForwardDeclIsNotEnough;  // no-op marker removed below
 } // namespace
 
 void* Heap::Alloc(size_t size)

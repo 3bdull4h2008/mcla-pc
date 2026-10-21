@@ -590,7 +590,20 @@ namespace
             // VirtualProtect attempt on every heap call.
             if (g_base == nullptr || g_pgPage == ~(uintptr_t)0) return;
             if (g_pgPage == 0) {
-                g_pgPage = ((uintptr_t)(g_base + kPhysHdrVa)) & ~(uintptr_t)0xFFF;
+                // F-806: the watched page is the allocator's own header, and since F-779 it is NOT
+                // at the arena base -- `o1heapInitSeparate` puts the instance in its own VirtualAlloc
+                // block (heap.cpp:2717-2721) and initialises the root Fragment AT base
+                // (o1heap.c:399-404), so `kPhysHdrVa` is now root-fragment header plus the payload of
+                // the first allocation. MEASURED: w798 trips here at off=0x0 want=R with a guest
+                // backtrace (`__imp__sub_825FA460+0x2a7` <- `__imp__sub_825EDC08+0x45d` <- ...), i.e.
+                // a guest reading its own first physical block. The arena-base page is still the
+                // fallback, because it is the only correct target if the instance is ever attached.
+                uint8_t* const inst = PhysHeapInstanceMem();
+                g_pgPage = (inst != nullptr) ? ((uintptr_t)inst & ~(uintptr_t)0xFFF)
+                                            : (((uintptr_t)(g_base + kPhysHdrVa)) & ~(uintptr_t)0xFFF);
+                MCLA_LOG_WARN("F388-PHYSGUARD target={} page={:X} inst={:p} arena_base_guest={:08X}",
+                              inst != nullptr ? "detached-instance" : "arena-base(attached)",
+                              g_pgPage, (void*)inst, kPhysHdrVa);
                 DWORD old = 0;
                 if (!VirtualProtect((void *)g_pgPage, 4096, PAGE_NOACCESS, &old)) {
                     MCLA_LOG_WARN("F388-PHYSGUARD arm-FAIL page={:X} err={}", g_pgPage,
@@ -799,7 +812,16 @@ namespace
         if (g_hgPage == ~(uintptr_t)0) return;
         if (g_hgPage == 0) {
             if (g_base == nullptr) return;
-            g_hgPage = ((uintptr_t)(g_base + kHeapHdrVa)) & ~(uintptr_t)0xFFF;
+            // F-806: same stale premise as the F-388 page above, and the false positive is measured.
+            // `w798.log` trips at off=0x20 want=W, hostRIP inside vcruntime's memset, on the thread
+            // immediately after `HEAPLEAK-SUM arena=user #1 nalloc=1 ... last_site_sz=0x40e90` --
+            // i.e. the zero-fill of the FIRST user-arena block, which now lives at guest 0x20020
+            // because F-779 moved the instance out and the root fragment starts at the arena base
+            // (o1heap.c:399-404 + o1heap.c:517's `frag + O1HEAP_ALIGNMENT`). Guest 0x20000 is
+            // ordinary block payload, not a header. The fallback is kept for the attached layout.
+            uint8_t* const inst = UserHeapInstanceMem();
+            g_hgPage = (inst != nullptr) ? ((uintptr_t)inst & ~(uintptr_t)0xFFF)
+                                        : (((uintptr_t)(g_base + kHeapHdrVa)) & ~(uintptr_t)0xFFF);
             // Prove the watch is live before believing a silent one (F-100): one deliberate read
             // must trip and log tag=SELFTEST with selftest=true.
             DWORD old = 0;

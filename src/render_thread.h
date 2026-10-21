@@ -40,4 +40,19 @@ private:
 
 extern RenderThread g_renderThread;
 
+// F-XXX: THE HOST'S SINGLE XENOS->DXGI COLOUR-FORMAT MAP.
+//
+// DEFINED in src/render_thread.cpp (it is the render thread's own, and it
+// cites Xenia's d3d12_render_target_cache.cc:1685-1686 for every entry).
+// DECLARED HERE so that a second consumer -- the D3D12 backend, which needs
+// the GUEST's colour format for the guest's render target -- uses THAT table
+// and not a copy of it. A copy would be a second thing to drift, and the
+// drift would be silent: the guest render target's format and the PSO's
+// RTVFormats[0] would disagree, which rasterises nothing and reports no
+// error (the D3D12-RTV-FORMAT row says exactly that).
+//
+// 0 = DXGI_FORMAT_UNKNOWN is returned for every code with no mapping, and
+// the consumer must refuse such a code rather than default it.
+uint32_t MapXenosColorFormatToDxgi(uint32_t colorFormat);
+
 } // namespace mcla::native

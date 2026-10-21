@@ -94,3 +94,15 @@ struct Heap
 };
 
 extern Heap g_userHeap;
+
+// F-806: the o1heap INSTANCE memory, or null when the instance is attached in-arena instead.
+// F-779 moved both instances out of their arenas (`o1heapInitSeparate` over a `VirtualAlloc` block),
+// which left boot_host.cpp's F-374/F-388 write-watchers pointing at the ARENA BASE. That page is no
+// longer the allocator header: `o1heapInitSeparate` initialises the root Fragment AT base
+// (o1heap.c:399-404), so the first 4 KB of the arena is root-fragment header followed immediately by
+// payload handed to the first allocation. These accessors give the watchers the page they were
+// written to watch. Non-new-symbol taint list for rule 1b: `UserHeapInstanceMem`,
+// `PhysHeapInstanceMem` are the only two host symbols this change adds; they read existing statics
+// and are used by src/boot_host.cpp only.
+uint8_t* UserHeapInstanceMem(void);
+uint8_t* PhysHeapInstanceMem(void);

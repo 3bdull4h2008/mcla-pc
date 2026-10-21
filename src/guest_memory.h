@@ -144,21 +144,62 @@ void ScanGuestMemoryForTU83SpawnPointers();
 // one anybody would guess, and a guard built on the guess would have broken
 // live code.
 //
-// REMOVAL TRIGGER (one of): (1) the range guard lands, in which case this
-// whole block and its two markers are deleted together; or (2) the counter is
-// superseded by the fix and the macro override reverts to the stock
-// ppc_context.h definition. Until one of those happens, do NOT add a second
-// instrument on this seam; extend this one.
+// REMOVAL TRIGGER (one of): (1) the null-object defect that produces the
+// out-of-range ctr is fixed at the source, in which case this whole block and
+// its two markers are deleted together; or (2) the counter is superseded by
+// that fix and the macro override reverts to the stock ppc_context.h
+// definition. Until one of those happens, do NOT add a second instrument on
+// this seam; extend this one.
 //
-// BEHAVIOUR: NONE, AND THE OUT-OF-RANGE PATH IS NOT EVEN QUIETED. The override
-// is a COMMA expression whose left operand is the census and whose right
-// operand is the stock expansion, verbatim:
-//     cond ? (void)0 : Report(...), (PPC_LOOKUP_FUNC(base, x))(ctx, base)
-// so when `ctr` is out of range the row is emitted and the load then executes
-// exactly as it does today -- it still faults, at the same address, with the
-// same register state, and the VEH parks the thread just the same. This file
-// adds a row; it does not add a refusal. (An earlier draft returned instead of
-// calling; that IS a guard, and it is why that shape was rejected.)
+// BEHAVIOUR, AS OF 2026-10-20 (F-825): THE OUT-OF-RANGE CALL IS NOW SKIPPED.
+// This paragraph used to say "BEHAVIOUR: NONE ... it still faults" and that was
+// TRUE for the census-only draft. IT IS NOT TRUE ANY MORE, and the prose must
+// not be allowed to disagree with the macro (an audit flagged exactly that).
+//
+// WHAT CHANGED AND WHY (the measurement, not a preference):
+//   The census-only shape above was WRONG in a way the row itself made
+//   visible. `ctr` out of range is not a rare corruption: it is the SHAPE of
+//   a null-object virtual call. The guest's own idiom is
+//       lwz r11,0(rObj) ; lwz r10,off(r11) ; mtctr r10 ; bctrl
+//   so a null `rObj` yields ctr = 0 (the vtable read is a FABRICATED zero
+//   from ReadGuestU32 on an unmapped address, not a fault), and the stock
+//   expansion then loads `(PPC_LOOKUP_FUNC)(base, 0)` -- an unmapped table
+//   slot -- and CALLS it. The host AVed. Measured in build/w817.log and
+//   build/w822.log: 15 such ctr=0 bctrls inside sub_82302FA0 ALONE
+//   (F635-CTR-OOR rows with ctr=00000000, load_addr=0x7E780000), and the
+//   AVs they caused were the host faults at guest lr 821853E0, 823032B0,
+//   8244D158 and 822EA1C8 -- every one of them a WRITE or READ through a
+//   near-null guest pointer, and every one of them a HANG of the boot
+//   worker.
+//
+// WHAT THE MACRO NOW DOES:
+//     cond ? ((void)(PPC_LOOKUP_FUNC(base, x))(ctx, base))
+//           : ((void)ReportCtrOutOfRange(...))
+// i.e. IN RANGE -> call, verbatim, unchanged. OUT OF RANGE -> emit the row
+// and RETURN WITHOUT CALLING. The census row is UNCHANGED (same counter,
+// same message, same fields), so the instrument still measures the same
+// thing; only the call is suppressed.
+//
+// WHAT THIS IS NOT: this is NOT a fix for the null-object defect. The
+// guest's null dereference is still the guest's, and the guest still
+// carries a fabricated zero where it expected a pointer. Suppressing the
+// call turns a HOST CRASH into a guest that continues with a stale r3 --
+// which is measurably better (the boot worker keeps running) and
+// measurably worse (it runs on garbage). The ROOT fix is to stop the guest
+// from dereferencing null in the first place.
+//
+// FALSIFIER for this shape: a soak in which a ctr=0 call was the RIGHT
+// thing to make (i.e. the guest had a legitimate call target that happened
+// to fall outside [PPC_CODE_BASE, PPC_CODE_BASE+PPC_CODE_SIZE)). Zero such
+// cases: the 155 register-indirect call sites and all 56,879 vtable slots
+// are inside the range (measured by the vtable audit), so the guard cannot
+// suppress a legitimate call.
+//
+// REMOVAL TRIGGER (revised): when the null-object defect that PRODUCES the
+// out-of-range ctr is fixed at the source, this block and its markers are
+// deleted together and the macro override reverts to the stock
+// ppc_context.h definition. Until then, do NOT add a second instrument on
+// this seam; extend this one.
 //
 // ---------------------------------------------------------------------------
 // THE SEAM, AND WHY IT IS THIS HEADER AND NO OTHER.
@@ -350,8 +391,7 @@ inline constexpr uint32_t kCtrSpan = kCtrHi - kCtrLo; // 0x0D0D4010
 // though this header is included 93 lines earlier.
 #define PPC_CALL_INDIRECT_FUNC(x)                                                  \
     (mcla::native::census::CtrInFunctionTable((uint32_t)(x))                       \
-         ? (void)0                                                                 \
-         : mcla::native::census::ReportCtrOutOfRange((uint32_t)(x),                \
-                                                     (uintptr_t)(base),            \
-                                                     (uint32_t)(ctx.lr)),           \
-     (PPC_LOOKUP_FUNC(base, x))(ctx, base))
+         ? ((void)(PPC_LOOKUP_FUNC(base, x))(ctx, base))                           \
+         : ((void)mcla::native::census::ReportCtrOutOfRange((uint32_t)(x),         \
+                                                            (uintptr_t)(base),     \
+                                                            (uint32_t)(ctx.lr))))

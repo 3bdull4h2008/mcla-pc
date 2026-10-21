@@ -10,6 +10,10 @@
 #include "kernel/heap_arena.h"  // F-412: kPhysArenaBeginVa, so this probe follows the pool
 #include "kernel/memory.h"
 #include "logging.h"
+// F-818: defined in src/kernel/imports.cpp beside the registration it reads
+// (VdSetGraphicsInterruptCallback's file-scope atomics). Declared here rather
+// than in a header because gpu_cp.cpp is its only caller.
+void VdDispatchGraphicsInterrupt(uint32_t cpuMask);
 #include <cpu/ppc_context.h>
 
 
@@ -133,6 +137,29 @@ std::atomic<uint32_t> g_setConstCapHits{0};
 std::atomic<uint32_t> g_memWritePackets{0};
 std::atomic<uint32_t> g_memWriteDwords{0};
 std::atomic<uint32_t> g_memWritePayloadMiss{0};
+// F-XXX: PM4_COND_WRITE (0x45) census. NEW SYMBOLS, listed for rule 1b:
+//   g_condWriteSeen        - packets decoded (the body was readable)
+//   g_condWriteMatched     - the predicate evaluated TRUE
+//   g_condWriteNotMatched  - the predicate evaluated FALSE (nothing written)
+//   g_condWriteRegWritten  - a REGISTER write landed (CpRegPoke)
+//   g_condWriteMemWritten  - a MEMORY write landed
+//   g_condWriteShortBody   - the packet had fewer than the six body dwords
+//   g_condWriteUnreadable  - a body dword could not be read
+//   g_condWritePollRefused - the POLL target could not be evaluated at all
+//   g_condWriteRegRefused  - the WRITE target was a register index outside the
+//                            0x5003-dword file (the reference logs and returns)
+//   g_condWriteMemRefused  - the WRITE target was a physical address with no
+//                            pool byte in this tree
+std::atomic<uint32_t> g_condWriteSeen{0};
+std::atomic<uint32_t> g_condWriteMatched{0};
+std::atomic<uint32_t> g_condWriteNotMatched{0};
+std::atomic<uint32_t> g_condWriteRegWritten{0};
+std::atomic<uint32_t> g_condWriteMemWritten{0};
+std::atomic<uint32_t> g_condWriteShortBody{0};
+std::atomic<uint32_t> g_condWriteUnreadable{0};
+std::atomic<uint32_t> g_condWritePollRefused{0};
+std::atomic<uint32_t> g_condWriteRegRefused{0};
+std::atomic<uint32_t> g_condWriteMemRefused{0};
 std::atomic<uint32_t> g_xenosReg[kXenosRegCount]{};
 // F-647: the "was this register EVER WRITTEN" bit, one per register. The value
 // array above cannot answer that question: g_xenosReg[i] is 0 both before the
@@ -930,7 +957,14 @@ void CpScratchWriteback(uint32_t slot, uint32_t value) {
     CpNoteMemWriteValue(dest, value);
   }
   const uint32_t n = g_scratchWritebacks.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (n <= 8 || (n % 200) == 0) {
+  // F-813: the old bound was `n <= 8 || (n % 200) == 0`, which makes n=9..199 INVISIBLE. The
+  // counter demonstrably passes 200 and 400 (both rows exist in w800-w805), so a `slot=0
+  // val=00000000` store inside that window would be a silent miss -- and that one row is the
+  // discriminator between H1/H3 (host drops or mis-reads the guest's clear) and H2 (the guest
+  // never clears its own fence). CENSUS ONLY: the row's format and the code below it are
+  // unchanged; only the firing bound widens. A capped printer's count is a cadence, not a total
+  // (F-651), and this is the one place in the park chain where the cap hid the deciding fact.
+  if (n <= 400 || (n % 200) == 0) {
     MCLA_LOG_WARN("CP-SCRATCH-WB #{} reg={:04X} slot={} dest={:08X} "
                   "val={:08X} umsk={:08X} {}", n, kRegScratchReg0 + slot, slot,
                   dest, value, umsk, ok ? "STORED" : "WRITE-FAILED");
@@ -2781,6 +2815,14 @@ constexpr uint32_t kPm4SetBinMaskLo = 0x60;     // low 32 bits of the PFP BIN_MA
 constexpr uint32_t kPm4SetBinMaskHi = 0x61;     // high 32 bits of the PFP BIN_MASK
 constexpr uint32_t kPm4SetBinSelectLo = 0x62;   // low 32 bits of the PFP BIN_SELECT
 constexpr uint32_t kPm4SetBinSelectHi = 0x63;   // high 32 bits of the PFP BIN_SELECT
+// F-XXX: 0x45 PM4_COND_WRITE. xenos gpu/xenos.h:1592 -
+//   `PM4_COND_WRITE = 0x45,   // conditional write to memory or register`
+// This was the ONLY opcode the GUEST actually emits that the host did not
+// decode: 8 packets per boot, MEASURED in build/w842.log and build/run845.txt
+// (`CP-T3-UNHANDLED op=0x45 thisOp=1..8`, `CP-T3-CENSUS op=0x45 #1..#3`).
+// The decoder lives at CpExecCondWrite, below; the console's layout and the
+// guest's own operand words are cited there.
+constexpr uint32_t kPm4CondWrite = 0x45;        // conditional write to memory or register
 // 0x54 PM4_INTERRUPT. The LAST opcode the unhandled-row was still counting, and
 // the only one left in it: xenos.h:1622 `PM4_INTERRUPT = 0x54, // generate
 // interrupt from the command stream`. DECODED, NOT DISPATCHED - the split is
@@ -3176,6 +3218,282 @@ bool CpExecRegToMem(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance) {
                   g_r2mSame.load(std::memory_order_relaxed),
                   g_r2mRefusedReg.load(std::memory_order_relaxed),
                   g_r2mUnreadable.load(std::memory_order_relaxed));
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// F-XXX: PM4_COND_WRITE (0x45) - EXECUTED (was: unhandled, and the only
+// guest-emitted opcode the host did not decode).
+//
+// WHAT THE GUEST EMITS. MEASURED, build/w842.log AND build/run845.txt (both
+// 2026-10-21, identical shape):
+//   CP-T3-UNHANDLED op=0x45 thisOp=1 .. thisOp=8      (8 rows per log)
+//   CP-T3-CENSUS op=0x45 #1 count=6 depth=0 addr=B72EC850
+//     args=00000007 00001925 00000000 FFFFFFFF 00001922 00000001
+//   CP-T3-CENSUS op=0x45 #2 count=6 depth=0 addr=B72EC874
+//     args=00000007 00001925 00100401 FFFFFFFF 00001922 00000002
+//   CP-T3-CENSUS op=0x45 #3 count=6 depth=0 addr=B72EC898
+//     args=00000007 00001925 00300C03 FFFFFFFF 00001922 00000003
+// So: eight packets, six body dwords each, and the `ref` word of packet N is
+// exactly the value the guest had just written to DC_LUT_30_COLOR
+// (CP-GAMMA-LUT-UNMODELED #3/#4/#5 carry 00000000 / 00100401 / 00300C03).
+//
+// THE CONSOLE'S LAYOUT (guest facts; xenos gpu/xenos.h:1592 names the opcode,
+// command_processor.cc:1110-1175 is the reference's own decoder). Six body
+// dwords, in this order:
+//   1 wait_info      (:1114) bits 0..2 = the comparison selector (the SAME
+//                            seven-arm switch the reference uses for
+//                            PM4_WAIT_REG_MEM, :1134-1159 == :990-1014);
+//                            bit 4 (0x10) = the POLL target is MEMORY, else a
+//                            REGISTER index (:1121-1131); bit 8 (0x100) = the
+//                            WRITE target is MEMORY, else a REGISTER index
+//                            (:1162-1171).
+//   2 poll_reg_addr  (:1115) register index, or - in the memory form - a guest
+//                            PHYSICAL address whose low two bits select the
+//                            endianness (:1123-1124).
+//   3 ref            (:1116)   4 mask (:1117)
+//   5 write_reg_addr (:1118) register index, or (memory form) a guest PHYSICAL
+//                            address + endianness selector (:1164-1165).
+//   6 write_data     (:1119)
+// The predicate is evaluated ONCE - this packet does NOT spin (that is 0x3C,
+// command_processor.cc:977-1037). On a match the reference performs the write
+// (:1160-1172) and returns true.
+//
+// WHAT THE GUEST'S EIGHT PACKETS DECODE TO, under that layout:
+//   wait_info = 0x00000007 -> selector 7 = "Always" (:1156-1157) -> ALWAYS
+//     matched. The poll is therefore irrelevant to the outcome, and this host
+//     still evaluates it, because the reference does.
+//   poll = 0x00001925 = DC_LUT_30_COLOR  (register_table.inc:452)
+//   write target = 0x00001922 = DC_LUT_RW_INDEX (register_table.inc:433)
+//   write_data = 1, 2, 3, ... 8
+// So the console ADVANCES the gamma-ramp read/write index by one per packet.
+// DC_LUT_RW_INDEX is the register that selects which LUT entry the sequential
+// colour writes land on: register_table.inc:424-433 ("the index in 0:7 is
+// just increased monotonically ... the index is 8-bit"), and the console's
+// WriteRegister side effect for it is `gamma_ramp_rw_component_ = 0`
+// (command_processor.cc:363-367) - it resets the R/G/B component cursor.
+// This host has NO gamma table (F-610: the LUT is a census, not a model), so
+// there is no component cursor to reset; the REGISTER is what the console
+// changes and what this handler now changes.
+//
+// THE HOST'S BEHAVIOUR BEFORE THIS CHANGE: 0x45 fell through to `default:`
+// (the switch's unhandled arm), so the packet was skipped, counted, and the
+// stream continued. DC_LUT_RW_INDEX therefore stayed at whatever the guest
+// last wrote there (0) for the whole boot - and the host's OWN census row
+// says so: `CP-GAMMA-LUT-UNMODELED #1 reg=1922 (DC_LUT_RW_INDEX) val=00000000
+// rwIndex=0000` and every later row also reads rwIndex=0000 (9/9 rows in
+// build/w842.log, 9/9 in build/run845.txt).
+//
+// FALSIFIER (A): after this change CP-GAMMA-LUT-UNMODELED must STOP reading
+// rwIndex=0000 - the row for the 0x1922 write must read rwIndex=0001, and the
+// 0x1925 rows that come AFTER it must read 0001, 0002, 0003 (the console's
+// index after each 0x45). The rows that PRECEDE the first 0x45 legitimately
+// still read 0000 - they are the guest's own writes, before the cursor has
+// moved, and a row that read 0000 there would be a defect. If the 0x1922 row
+// still reads 0000, this handler did not run, or its register write did not
+// land.
+//
+// WHAT IS NOT CHANGED HERE: the DC_LUT_30_COLOR auto-increment. The console
+// ALSO bumps DC_LUT_RW_INDEX by one on every DC_LUT_30_COLOR write
+// (command_processor.cc:448-477, `++new_gamma_ramp_rw_index.rw_index` and a
+// recursive WriteRegister). That is a WriteRegister side effect on a
+// DIFFERENT packet (the guest's own TYPE-0 write to 0x1925), and this change
+// does not touch that path: the brief scopes this fix to the 0x45 decode, and
+// "do not change the fallback behaviour of any other path" is the rule.
+// It is recorded here as a KNOWN, DELIBERATE remaining divergence, and the
+// console's index after a 0x1925 write is therefore NOT the console's index.
+// ---------------------------------------------------------------------------
+bool CpExecCondWrite(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t n = g_condWriteSeen.fetch_add(1, std::memory_order_relaxed) + 1u;
+  // The stream always advances count+1, exactly as every other handler in this
+  // file: a false return aborts the whole indirect buffer (DrainIndirectBuffer
+  // at :6230, "desync at dword {} - aborting buffer"), which is worse than a
+  // partial execution.
+  outAdvance = count + 1u;
+  if (count < 6u) {
+    // The reference reads six words unconditionally (:1114-1119); upstream's
+    // count is never this small. Refuse rather than read past the packet:
+    // consumed, NOTHING written, NOT counted matched.
+    const uint32_t r =
+        g_condWriteShortBody.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (r <= 8u || (r % 200u) == 0u) {
+      MCLA_LOG_WARN("CP-CONDWRITE-SHORT #{} count={} - the six body dwords "
+                    "(command_processor.cc:1114-1119) are not all present; "
+                    "consumed, NOTHING written, NOT counted matched",
+                    r, count);
+    }
+    return true;
+  }
+  uint32_t body[6] = {0, 0, 0, 0, 0, 0};
+  for (uint32_t i = 0; i < 6u; ++i) {
+    if (!mem.ReadU32BE(byteAddr + 4u + i * 4u, &body[i])) {
+      const uint32_t r =
+          g_condWriteUnreadable.fetch_add(1, std::memory_order_relaxed) + 1u;
+      if (r <= 8u || (r % 200u) == 0u) {
+        MCLA_LOG_WARN("CP-CONDWRITE-UNREADABLE #{} body dword {} - consumed, "
+                      "NOTHING written, NOT counted matched",
+                      r, i);
+      }
+      return true;
+    }
+  }
+  const uint32_t waitInfo = body[0], pollAddr = body[1], ref = body[2],
+                 mask = body[3], writeReg = body[4], writeData = body[5];
+  const bool pollIsMemory = (waitInfo & 0x10u) != 0u;
+  const bool writeIsMemory = (waitInfo & 0x100u) != 0u;
+  static const char *const kCondWriteCmp[8] = {"never", "lt", "le", "eq",
+                                              "ne",    "ge", "gt", "always"};
+
+  // ---- the poll, in the reference's two forms (:1120-1132) ----------------
+  uint32_t value = 0;
+  uint32_t pollVA = 0;
+  if (pollIsMemory) {
+    const uint32_t pollByte = pollAddr & ~0x3u;
+    pollVA = CpPhysToPoolVa(pollByte, "COND-WRITE");
+    uint32_t raw = 0;
+    if (pollVA == 0u || !CpReadU32Raw(pollVA, &raw)) {
+      // No pool byte, or the byte is unreadable: the predicate CANNOT be
+      // evaluated, so nothing is written. Refused by name and counted; this is
+      // NOT "the predicate was false".
+      const uint32_t r =
+          g_condWritePollRefused.fetch_add(1, std::memory_order_relaxed) + 1u;
+      MCLA_LOG_WARN("CP-CONDWRITE-POLLREFUSED #{} poll={:08X} pollVA={:08X} "
+                    "is_memory=1 - no pool byte / unreadable, so the predicate "
+                    "cannot be evaluated. Consumed, NOTHING written, NOT counted "
+                    "matched (see CP: POOL-XLATE-REFUSED). pollRefused={}",
+                    r, pollAddr, pollVA, r);
+      return true;
+    }
+    // F-721: ONE GpuSwap on the RAW host load, exactly as the reference does
+    // (:978-983) and exactly as this file's PM4_WAIT_REG_MEM does (:3932).
+    value = GpuSwap32(raw, pollAddr & 0x3u);
+  } else {
+    if (pollAddr >= kXenosRegCount) {
+      // The reference asserts poll_reg_addr < RegisterFile::kRegisterCount
+      // (:1130) and kRegisterCount is 0x5003 dwords (register_file.h:40) -
+      // the same width as this file's kXenosRegCount. This host does not
+      // assert on a guest-supplied value: the predicate is not evaluated,
+      // nothing is written, and the refusal is counted.
+      const uint32_t r =
+          g_condWritePollRefused.fetch_add(1, std::memory_order_relaxed) + 1u;
+      MCLA_LOG_WARN("CP-CONDWRITE-POLLREFUSED #{} poll={:08X} is outside the "
+                    "{:X}-dword register file (command_processor.cc:1130 "
+                    "asserts; CpRegPeek would answer 0). Consumed, NOTHING "
+                    "written, NOT counted matched. pollRefused={}",
+                    r, pollAddr, kXenosRegCount, r);
+      return true;
+    }
+    // The reference reads the register SHADOW, not a decoded name
+    // (:1131 `value = register_file_->values[poll_reg_addr]`), and
+    // CpRegPeek is that same shadow.
+    value = CpRegPeek(pollAddr);
+  }
+
+  // ---- the predicate, the reference's seven arms, verbatim (:1134-1159) ---
+  bool matched = false;
+  switch (waitInfo & 0x7u) {
+  case 0x0: matched = false; break;                              // Never
+  case 0x1: matched = (value & mask) < ref; break;                // Less than
+  case 0x2: matched = (value & mask) <= ref; break;               // Less or equal
+  case 0x3: matched = (value & mask) == ref; break;               // Equal
+  case 0x4: matched = (value & mask) != ref; break;               // Not equal
+  case 0x5: matched = (value & mask) >= ref; break;               // Greater or eq
+  case 0x6: matched = (value & mask) > ref; break;                // Greater than
+  default:  matched = true; break;                                // Always
+  }
+
+  if (!matched) {
+    const uint32_t r =
+        g_condWriteNotMatched.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (r <= 8u || (r % 200u) == 0u) {
+      MCLA_LOG_WARN("CP-CONDWRITE-NOTMATCHED #{} waitInfo={:08X} cmp={} "
+                    "value={:08X} ref={:08X} mask={:08X} - the predicate is "
+                    "FALSE, so the reference writes NOTHING (:1160-1172). "
+                    "Consumed, NOT counted matched. notMatched={}",
+                    r, waitInfo, kCondWriteCmp[waitInfo & 0x7u], value, ref,
+                    mask, r);
+    }
+    return true;
+  }
+  g_condWriteMatched.fetch_add(1, std::memory_order_relaxed);
+
+  // ---- the write, in the reference's two forms (:1160-1172) --------------
+  if (writeIsMemory) {
+    const uint32_t dst = writeReg & ~0x3u;
+    const uint32_t dstVa = CpPhysToPoolVa(dst, "COND-WRITE");
+    if (dstVa == 0u) {
+      const uint32_t r =
+          g_condWriteMemRefused.fetch_add(1, std::memory_order_relaxed) + 1u;
+      MCLA_LOG_WARN("CP-CONDWRITE-MEMREFUSED #{} dst={:08X} - no pool byte for "
+                    "that physical address in this tree, so NOTHING stored (see "
+                    "CP: POOL-XLATE-REFUSED). memRefused={}",
+                    r, dst, r);
+      return true;
+    }
+    // The reference stores `xe::store<uint32_t>(TranslatePhysical(addr),
+    // GpuSwap(write_data, endianness))` (:1166-1167): a PLAIN host store of
+    // the GpuSwap'd word. This file's CpWriteU32Raw is the measured contract
+    // for exactly that (see its header at :3022 and the 0x3E site at
+    // :3173/:3199), so the same one swap is applied here and nowhere else.
+    const uint32_t swapped = GpuSwap32(writeData, writeReg & 0x3u);
+    if (CpWriteU32Raw(dstVa, swapped)) {
+      g_condWriteMemWritten.fetch_add(1, std::memory_order_relaxed);
+      // The same two notifications every other store in this file makes, so a
+      // later PM4_WAIT_REG_MEM can see this writer (CpMemWriteDestSeen /
+      // CpMemWriteValuesSeen).
+      CpNoteMemWriteDest(dst);
+      CpNoteMemWriteValue(dst, writeData);
+    } else {
+      const uint32_t r =
+          g_condWriteUnreadable.fetch_add(1, std::memory_order_relaxed) + 1u;
+      MCLA_LOG_WARN("CP-CONDWRITE-UNREADABLE #{} dst={:08X} - the store was "
+                    "refused, NOTHING stored", r, dst);
+    }
+  } else {
+    if (writeReg >= kXenosRegCount) {
+      // WriteRegister refuses an out-of-file index with a log and a return
+      // (:333-337). Same rule here: nothing written, counted by name.
+      const uint32_t r =
+          g_condWriteRegRefused.fetch_add(1, std::memory_order_relaxed) + 1u;
+      MCLA_LOG_WARN("CP-CONDWRITE-REGREFUSED #{} reg={:08X} is outside the "
+                    "{:X}-dword register file - NOTHING written "
+                    "(command_processor.cc:333-337 logs and returns). "
+                    "regRefused={}",
+                    r, writeReg, kXenosRegCount, r);
+      return true;
+    }
+    // THE CONSOLE'S WRITE, on the console's own path: WriteRegister
+    // (:1171) -> register_file_->values[index] = value. This file's
+    // CpRegPoke is that store PLUS the file's own side effects (presence bit,
+    // trace ring, scratch writeback, COHER dirty bit, the DC_LUT census at
+    // :1117-1119) - and the DC_LUT census is exactly where the console's
+    // index change becomes visible.
+    CpRegPoke(writeReg, writeData);
+    g_condWriteRegWritten.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  if (n <= 8u || (n % 200u) == 0u) {
+    MCLA_LOG_WARN("CP-CONDWRITE #{} waitInfo={:08X} cmp={} poll={:08X} "
+                  "pollIsMemory={} pollVA={:08X} value={:08X} ref={:08X} "
+                  "mask={:08X} writeReg={:08X} writeIsMemory={} "
+                  "writeData={:08X} didMatch={} || seen={} matched={} "
+                  "regWritten={} memWritten={} notMatched={} short={} "
+                  "unreadable={} pollRefused={} regRefused={} memRefused={}",
+                  n, waitInfo, kCondWriteCmp[waitInfo & 0x7u], pollAddr,
+                  pollIsMemory ? 1 : 0, pollVA, value, ref, mask, writeReg,
+                  writeIsMemory ? 1 : 0, writeData, matched ? 1 : 0,
+                  g_condWriteSeen.load(std::memory_order_relaxed),
+                  g_condWriteMatched.load(std::memory_order_relaxed),
+                  g_condWriteRegWritten.load(std::memory_order_relaxed),
+                  g_condWriteMemWritten.load(std::memory_order_relaxed),
+                  g_condWriteNotMatched.load(std::memory_order_relaxed),
+                  g_condWriteShortBody.load(std::memory_order_relaxed),
+                  g_condWriteUnreadable.load(std::memory_order_relaxed),
+                  g_condWritePollRefused.load(std::memory_order_relaxed),
+                  g_condWriteRegRefused.load(std::memory_order_relaxed),
+                  g_condWriteMemRefused.load(std::memory_order_relaxed));
   }
   return true;
 }
@@ -4369,6 +4687,53 @@ void CpSnapshotDrawState(mcla::native::CpShaderProgram &vs,
   }
 }
 
+namespace {
+
+// Reads the (base,size) pairs and the presence census of the ALU window.
+void CpShaderConstantState(CpShaderConstantInfo &out) {
+  // ONE export call for the two registers, so the CP-REGS-EXPORT row and this
+  // snapshot are the same read.
+  static constexpr uint32_t kIdx[2] = {kCpRegSqVsConst, kCpRegSqPsConst};
+  uint32_t val[2] = {0, 0};
+  uint32_t pres[2] = {0, 0};
+  (void)CpReadGuestRegisters(kIdx, 2u, val, pres);
+  out.vsRegPresent = pres[0] != 0u;
+  out.psRegPresent = pres[1] != 0u;
+  out.vsBase = val[0] & 0x1FFu;            // registers.h:259  base : 9 at +0
+  out.vsSize = (val[0] >> 12) & 0x1FFu;    // registers.h:262  size : 9 at +12
+  out.psBase = val[1] & 0x1FFu;
+  out.psSize = (val[1] >> 12) & 0x1FFu;
+  // The presence census over the ALU window: the window is word-aligned
+  // (0x4000 and 0x4800 are both multiples of 32), so no bit masking is needed
+  // at either end.
+  uint32_t present = 0;
+  constexpr uint32_t kFirstWord = kCpShaderConstantRegBase >> 5;
+  constexpr uint32_t kLastWord =
+      (kCpShaderConstantRegBase + kCpShaderConstantDwords) >> 5;
+  for (uint32_t w = kFirstWord; w < kLastWord; ++w) {
+    uint32_t bits = g_xenosRegPresent[w].load(std::memory_order_acquire);
+    while (bits != 0u) {
+      bits &= (bits - 1u);  // clear the lowest set bit
+      ++present;
+    }
+  }
+  out.aluDwordsPresent = present;
+}
+
+// Writes one float4 of the console's array, BIG-ENDIAN, at `out`.
+void CpWriteShaderConstantFloat4(uint8_t *out, uint32_t entry) {
+  const uint32_t reg = kCpShaderConstantRegBase + 4u * entry;
+  for (uint32_t c = 0; c < 4u; ++c) {
+    const uint32_t v = g_xenosReg[reg + c].load(std::memory_order_relaxed);
+    out[c * 4u + 0u] = static_cast<uint8_t>(v >> 24);
+    out[c * 4u + 1u] = static_cast<uint8_t>(v >> 16);
+    out[c * 4u + 2u] = static_cast<uint8_t>(v >> 8);
+    out[c * 4u + 3u] = static_cast<uint8_t>(v);
+  }
+}
+
+}  // namespace
+
 void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
                   uint32_t src, uint32_t idxSize, uint32_t numIdx,
                   uint32_t dmaBase, uint32_t dmaSize) {
@@ -4612,6 +4977,40 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
   // returns before the gate ladder" is superseded. kAutoIndex no longer returns
   // before the ladder; it IS the ladder's normal input.
   CpReportVertexFetchSlots("draw");
+
+  // F-XXX: THE CONSOLE'S SHADER-CONSTANT STATE, measured on the CP side, once
+  // per draw. This row exists because the CONSUMER of the constants
+  // (src/render_thread.cpp's FillGuestConstantBank) reads the WRONG SOURCE -
+  // guest memory at the raw SQ_VS_CONST value instead of the register file -
+  // and this row is the independent measurement of what the CONSOLE's model
+  // says, so the two can be compared in the SAME log.
+  //
+  // IT IS A NEW ROW, not a new field on CP-DRAW-CENSUS: that row is re-parsed
+  // by tools/soak_census.py, so its field set stays as it is.
+  //
+  // THE NUMBERS: `vsBase`/`vsSize` are the (base, size) pair decoded out of
+  // SQ_VS_CONST (registers.h:256-266), `psBase`/`psSize` out of SQ_PS_CONST
+  // (:270-281); `aluDwordsPresent` counts the dwords of the ALU array
+  // (0x4000..0x47FF) the guest has EVER written. The console's `cN` for the
+  // vertex stage is array entry (vsBase + N) and for the pixel stage
+  // (psBase + N) (shader_interpreter.cc:260-284).
+  {
+    static std::atomic<uint32_t> g_shaderConstCensus{0};
+    const uint32_t scn =
+        g_shaderConstCensus.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (scn <= 8u || (scn % 200u) == 0u) {
+      CpShaderConstantInfo info;
+      CpShaderConstantState(info);
+      MCLA_LOG_WARN(
+          "CP-SHADERCONST #{} vsRegPresent={} vsBase={} vsSize={} "
+          "psRegPresent={} psBase={} psSize={} aluDwordsPresent={} "
+          "aluDwords={} | console: cN(vs)=array[vsBase+N], cN(ps)="
+          "array[psBase+N] (shader_interpreter.cc:260-284)",
+          scn, info.vsRegPresent ? 1 : 0, info.vsBase, info.vsSize,
+          info.psRegPresent ? 1 : 0, info.psBase, info.psSize,
+          info.aluDwordsPresent, kCpShaderConstantDwords);
+    }
+  }
 
   // F-633: source_select is NOT a refusal by itself, and the old
   //   if (src != 0u) { refuse("no-index-buffer", ...); return; }
@@ -5387,13 +5786,24 @@ bool CpExecInterrupt(uint32_t byteAddr, uint32_t count, uint32_t header,
         "read={} - decoded from the packet's own words: mask is operand dword 1 "
         "(command_processor.cc:906) and cpus is the set of CPU indices its loop "
         "at :907-911 would pass as the second argument to "
-        "graphics_system.cc:241. NOT DISPATCHED BY NAME: that call is guest code "
-        "and its execution context (the CPU number at r13+268, the IRQL, and "
-        "the runtime value of the pointer chain its one store writes through) is "
-        "not measurable from this file, so calling it would fabricate the "
-        "observable. The packet is consumed exactly as the reference consumes "
-        "it - the handler does not advance the reader, the caller does.",
+        "graphics_system.cc:241. F-818: NOW DISPATCHED via "
+        "VdDispatchGraphicsInterrupt (imports.cpp) -- the consumer's r3==1 arm "
+        "is fully measured (0x82411490-0x824114FC) and clears the "
+        "PM4_WAIT_REG_MEM fence byte at [mb+0], which is what un-parks ring A. "
+        "The handler does not advance the reader, the caller does.",
         n, header, cpuMask, cpus, count, read ? 1 : 0);
+  }
+  // F-818 (FENCECLEAR, ROOT CAUSE): the reference dispatches the registered graphics-interrupt
+  // callback per set CPU bit -- command_processor.cc:900-913 -> DispatchInterruptCallback(1, n)
+  // -> graphics_system.cc:241-261 with SetActiveCpu at :253. We consumed 0x54 as a deliberate
+  // no-op, so the 10th PM4_WAIT_REG_MEM, the first whose satisfier is NOT the CP itself,
+  // timed out and parked ring A on every boot (F-813: 144 parks, ref=0 while the byte held 4).
+  // The old "NOT DISPATCHED BY NAME" note is superseded: everything it called unmeasurable is
+  // now measured -- the registration (callback=0x82411478 user=0x40002080), the consumer's
+  // r3==1 arm down to the fence RMW, and the call machinery (63/63 clean VSYNC-ISR rows on
+  // this same consumer). Dispatched bits only, and only when the operand was readable.
+  if (read && cpus != 0) {
+    VdDispatchGraphicsInterrupt(cpus);
   }
   return true;
 }
@@ -5663,6 +6073,16 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
   // what the harness in the handoff report checks by shearing either copy.
   case kPm4Interrupt:  // PM4_INTERRUPT (cc:900-913; field at cc:906)
     return CpExecInterrupt(byteAddr, count, header, outAdvanceDwords);
+  // F-XXX: 0x45 PM4_COND_WRITE. The ONLY opcode the guest actually emits that
+  // this switch did not decode (MEASURED: 8 packets per boot, `CP-T3-UNHANDLED
+  // op=0x45 thisOp=1..8` in build/w842.log and build/run845.txt). The
+  // decoder, the console's six-dword layout and the falsifier are on
+  // CpExecCondWrite, above. Placed here, before `default:`, so the predicate
+  // gate above applies to this packet exactly as it applies to every packet
+  // it replaces, and so the advance is the same `count + 1` the unhandled arm
+  // used - the stream cannot drift by one dword because of this change.
+  case kPm4CondWrite:  // PM4_COND_WRITE (cc:1110-1175)
+    return CpExecCondWrite(byteAddr, count, outAdvanceDwords);
   default:
     LogType3Unhandled(opcode, count, byteAddr, depth);
     outAdvanceDwords = count + 1u;
@@ -6270,6 +6690,156 @@ bool CpReadGuestRegisters(const uint32_t *indices, uint32_t count,
         s_regExportPresent.load(std::memory_order_relaxed));
   }
   return oob == 0u;
+}
+
+// ---------------------------------------------------------------------------
+// F-XXX: the guest's render target and its copy, decoded from the Xenos
+// register file. See src/gpu_cp.h for the guest-byte citations (the PE image
+// at VA 0x827ED1C8 / 0x827ED498 / 0x827EDB4C, and the running values in
+// build/w842.log's CP-REG-HI rows).
+//
+// EVERY FIELD COMES FROM THE REGISTER FILE. There is no fallback value and no
+// "sane default": a register the guest never wrote reads back as the
+// initialiser zero, which is what the guest's state actually is, and the
+// consumer decides whether a zero pitch is usable.
+//
+// THE FIELD LAYOUTS ARE Xenia's, quoted at the consumer:
+//   RB_SURFACE_INFO    registers.h:670-680
+//   RB_COLOR_INFO      registers.h:736-752
+//   PA_SC_SCREEN_SCISSOR_BR registers.h:598-608
+//   RB_MODECONTROL     registers.h:660-668
+//   RB_COPY_CONTROL    registers.h:853-868
+// ---------------------------------------------------------------------------
+CpGuestRenderTarget CpGuestRenderTargetInfo() {
+  // ONE export call, so the snapshot is one array read and the CP-REGS-EXPORT
+  // row can show the same words the consumer used.
+  static constexpr uint32_t kIdx[8] = {
+      kCpRegRbSurfaceInfo,   kCpRegRbColorInfo,     kCpRegPaScScreenScissorBr,
+      kCpRegRbModeControl,   kCpRegRbCopyControl,   kCpRegRbCopyDestBase,
+      kCpRegRbCopyDestPitch, kCpRegRbCopyDestInfo};
+  uint32_t val[8] = {0};
+  uint32_t pres[8] = {0};
+  (void)CpReadGuestRegisters(kIdx, 8u, val, pres);
+
+  const uint32_t surface = val[0];
+  const uint32_t color = val[1];
+  const uint32_t scissor = val[2];
+  const uint32_t mode = val[3];
+  const uint32_t copyControl = val[4];
+  const uint32_t copyDestBase = val[5];
+  const uint32_t copyDestPitch = val[6];
+  const uint32_t copyDestInfo = val[7];
+
+  CpGuestRenderTarget out;
+  out.surfacePitch = surface & 0x3FFFu;          // +0  14 bits, pixels
+  out.msaaSamples = (surface >> 16) & 0x3u;       // +16 2 bits
+  out.hizPitch = (surface >> 18) & 0x3FFFu;      // +18 14 bits
+  out.colorBase = color & 0x7FFu;               // +0  11 bits, EDRAM tiles
+  out.colorFormat = (color >> 16) & 0xFu;        // +16 4 bits
+  out.scissorBrX = scissor & 0x7FFFu;            // +0  15 bits, signed
+  out.scissorBrY = (scissor >> 16) & 0x7FFFu;    // +16 15 bits, signed
+  out.edramMode = mode & 0x7u;                   // +0  3 bits
+  out.copyControl = copyControl;
+  out.copyDestBase = copyDestBase;
+  out.copyDestPitch = copyDestPitch;
+  out.copyDestInfo = copyDestInfo;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// F-XXX: THE CONSOLE'S SHADER-CONSTANT MODEL, produced here.
+//
+// The full citation of the console's layout, the guest's own bytes and the
+// host's divergence is on the DECLARATION in src/gpu_cp.h (the header is the
+// place a consumer reads first). What follows is the PRODUCER.
+//
+// THE THREE FACTS THIS FILE USES, and where each comes from:
+//   1. The array is 512 float4 at register 0x4000 (register_table.inc:648,
+//      SHADER_CONSTANT_000_X; 0x4000..0x47FF = 2048 dwords).
+//   2. `cN` of a stage = the array entry (base_stage + N), zero when
+//      N > size_stage or (base_stage + N) >= 512
+//      (shader_interpreter.cc:260-284).
+//   3. base/size come from SQ_VS_CONST (0x2307) / SQ_PS_CONST (0x2308) as
+//      (bits 0..8, bits 12..20) with size = vec4 count MINUS ONE
+//      (registers.h:256-281).
+//
+// NEW SYMBOLS, listed for rule 1b: CpShaderConstantRegBase, CpShaderConstantCount,
+// CpShaderConstantDwords, CpShaderConstantBytes, CpShaderStage,
+// CpShaderConstantInfo, CpBuildShaderConstantBank, CpBuildShaderConstantArray,
+// CpShaderConstantState, g_shaderConstCensus (all declared in src/gpu_cp.h
+// except the last two, which are file-local to this TU).
+//
+// BYTE ORDER. The register file holds the guest's words as host uint32 values
+// (already byte-swapped out of the guest's big-endian stream by ReadU32BE), so
+// the big-endian bytes the packer expects are RE-ASSEMBLED here, once, at the
+// producer. The host's single endian site (renderer::PackXenosConstantBank,
+// pipeline_cache.cpp:1317-1351) then swaps them back. This is not a second
+// endian site: it is the same single swap, moved to the producer that owns
+// the data.
+//
+// PRESENCE. The console reads the register SHADOW (shader_interpreter.cc:282
+// reads register_file_[...]), so an entry the guest never wrote reads back as
+// ZERO on the console - and that is the console's state, not a missing value.
+// The presence COUNT is reported separately (aluDwordsPresent) so a consumer
+// can say "the array is all zeros" AND "the guest never wrote it", which are
+// two different facts.
+//
+// The two helpers it needs (CpShaderConstantState, CpWriteShaderConstantFloat4)
+// are defined ABOVE CpBridgeDraw, because the draw bridge's CP-SHADERCONST
+// census row calls the first one.
+
+bool CpBuildShaderConstantBank(CpShaderStage stage, uint8_t *out,
+                                uint32_t outBytes, CpShaderConstantInfo *info) {
+  if (out == nullptr || outBytes < 16u) {
+    return false;
+  }
+  CpShaderConstantInfo local{};
+  CpShaderConstantInfo &inf = (info != nullptr) ? *info : local;
+  CpShaderConstantState(inf);
+  const bool pixel = (stage == CpShaderStage::kPixel);
+  const uint32_t base = pixel ? inf.psBase : inf.vsBase;
+  const uint32_t size = pixel ? inf.psSize : inf.vsSize;
+  const uint32_t entries = outBytes / 16u;
+  // Zeros first: the console returns ZEROS for every cN outside the stage's
+  // window (shader_interpreter.cc:267-269 and :277-279), so the tail of the
+  // bank must be zeros and not whatever the previous frame left there.
+  std::memset(out, 0, entries * 16u);
+  uint32_t filled = 0;
+  for (uint32_t i = 0; i < entries; ++i) {
+    if (i > size) {
+      break;  // the console's own "index > size -> zeros" rule
+    }
+    const uint32_t idx = base + i;
+    if (idx >= kCpShaderConstantCount) {
+      break;  // the console's own "index >= 512 -> zeros" rule
+    }
+    CpWriteShaderConstantFloat4(out + i * 16u, idx);
+    ++filled;
+  }
+  inf.entriesFilled = filled;
+  return true;
+}
+
+bool CpBuildShaderConstantArray(uint8_t *out, uint32_t outBytes,
+                                 CpShaderConstantInfo *info) {
+  if (out == nullptr || outBytes < 16u) {
+    return false;
+  }
+  CpShaderConstantInfo local{};
+  CpShaderConstantInfo &inf = (info != nullptr) ? *info : local;
+  CpShaderConstantState(inf);
+  const uint32_t entries = outBytes / 16u;
+  std::memset(out, 0, entries * 16u);
+  uint32_t filled = 0;
+  for (uint32_t i = 0; i < entries; ++i) {
+    if (i >= kCpShaderConstantCount) {
+      break;
+    }
+    CpWriteShaderConstantFloat4(out + i * 16u, i);
+    ++filled;
+  }
+  inf.entriesFilled = filled;
+  return true;
 }
 
 

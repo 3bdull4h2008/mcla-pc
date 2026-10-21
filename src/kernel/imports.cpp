@@ -24,13 +24,50 @@
 // uses, which is the working example.
 #include "port_kobj.h"
 #include "port_net.h"
+// F-840 (2026-10-21): the NTSTATUS -> Win32 error table for
+// RtlNtStatusToDosError. GENERATED, not hand-typed -- see
+// src/kernel/ntstatus_dos_error_table.h's own header comment for the
+// reference it was parsed out of and the generator that produced it.
+#include "ntstatus_dos_error_table.h"
+// F-841 (2026-10-21): the console's export tables for the system modules the
+// guest asks about ("xam.xex", "xboxkrnl.exe") and the guest import thunks
+// this title binds them to. GENERATED from the retail XEX container -- see
+// src/kernel/xex_console_exports.h's own header comment.
+#include "xex_console_exports.h"
 #include <boot_host.h>  // F-370: counting-semaphore registry
 #include "logging.h"
 #include <bit>
+#include <cstdlib>  // T43.28: std::getenv for the mcla_xtl_title_alloc cvar
 #include <gpu_cp.h>
 #include <user/config.h>
 #include <os/logger.h>
 
+// ---------------------------------------------------------------------------
+// T43.28 (2026-10-21): THE CONSOLE'S OWN XTL ALLOC/FREE DISPATCHERS -- CALLED,
+// NOT HOOKED.
+//
+// These are FORWARD DECLARATIONS. `PPC_FUNC(x);` is the "fwd" class to
+// tools/addr_owners.py, and that tool's own docstring says a forward
+// declaration "-- no claim" (src: "PPC_FUNC(sub_X);   fwd   forward
+// declaration -- no claim"). So neither guest address gains an owner from
+// this file.
+//
+// RULE 4 WAS RUN BEFORE THIS WAS WRITTEN (2026-10-21):
+//   python tools/addr_owners.py --check 0x821C08F8
+//     -> "2 site(s)  orig src/gpu_device.cpp:25829 / override src/gpu_device.cpp:25830"
+//   python tools/addr_owners.py --check 0x821C09C8
+//     -> "2 site(s)  orig src/hooks/alloc_census.cpp:12491 / override ...:12499"
+// Both exit 0 (no conflict). The definitions live at src/gpu_device.cpp:25830
+// (0x821C08F8, the F396-ALLOC-ENTER census) and src/hooks/alloc_census.cpp:
+// 12499 (0x821C09C8, the pool-free dispatcher).
+//
+// WHY CALL THEM AT ALL: the guest's XTL heap must be served by the TITLE's own
+// allocator, not by a fresh physical page per request. The measurement, the
+// console's ABI, the fallback and the falsifier are all written out at the
+// helper block below (search for "T43.28 -- THE XTL HEAP").
+// ---------------------------------------------------------------------------
+PPC_FUNC(sub_821C08F8);
+PPC_FUNC(sub_821C09C8);
 
 // Host thread id of the guest main thread (see xdm.h). Defined here; set by
 // boot_host.cpp when the boot worker starts.
@@ -158,6 +195,202 @@ uint32_t XtlGuestLastError() {
   return code;
 }
 
+// ===========================================================================
+// T43.28 (2026-10-21) -- THE XTL HEAP MUST COME FROM THE TITLE'S OWN
+// ALLOCATOR, NOT FROM THE CONSOLE'S 512 MiB PHYSICAL POOL.
+//
+// THE MEASUREMENT (build/w821.log -- the run build/agents/xtlsrc.md quotes):
+//   :49658  PHYS-ACCT #46000 n=46000 req=457.1MB charge=628.9MB
+//           con_charge=621.9MB over_console_ppm=1011325
+//           live=510.0MB cap=512.0MB free=2.0MB
+//   :251    PHYS-CENSUS #1 size=0x2e80000  ( 46.5 MiB) lr=821325D4
+//   :263    PHYS-CENSUS #2 size=0x800000    (  8.0 MiB) lr=821325D4
+//   :271    PHYS-CENSUS #3 size=0x12b80000 (299.5 MiB) lr=821325D4
+//   :1718   HEAP76 simple @82830CD8 vt=82011884 +4=A0404010 +76=02E7FFF0
+//           +152=02E5FD90 +248=A0404000
+//   :1643   F396-ALLOC-EXIT #1 self=82830B18 size=496 ret=A0404020
+//   :49682  XTL-ALLOC-REFUSED #1 ... seen=42536
+//   :50603  PHYS-STATE #6 allocated=0x20000000 capacity=0x20000000 free=0x0
+//
+//   42,915 XTL calls (w821.log XTL-ALLOC-REFUSED #8: seen=42915 ok=42907)
+//   charged 628.9 - 354.1 (whale 299.52 + boot 46.5 + 8.0) = 274.8 MiB of the
+//   512 MiB pool, for a payload whose SAMPLED MEDIAN IS 17 BYTES: the 83
+//   every-512th XTL-ALLOC samples in w821.log sum 11,802 B over 42,907 calls,
+//   i.e. ~6.1 MiB of payload for 274.8 MiB of pool.  And the console's own
+//   page rule would want 621.9 MiB against a 512 MiB pool (pool size:
+//   src/kernel/heap_arena.h:97, kConsolePhysicalBytes = 0x20000000) = 1.215x
+//   the console's ENTIRE physical memory -- impossible for a game that runs on
+//   that console.
+//
+// THE CONSOLE'S ABI, READ OFF THE GUEST'S OWN BYTES (F-023: the raw word is
+// the authority. build/cache/mcla_pe.bin, offset = VA - 0x82000000,
+// big-endian. Decoded with tools/ppc_disasm.py, which prints the mnemonics).
+//
+//   XTL ALLOC THUNK 0x82130528 (`ppc_disasm.py 0x82130528 40`):
+//     82130530  mr   r4,r3        ; r4 = SIZE
+//     82130534  li   r6,0         ; r6 = 0, the allocator SELECTOR
+//     82130538  li   r5,16        ; r5 = ALIGN
+//     8213053C  lwzx r3,r10,r11   ; r3 = *(*(r13)+28) = the DESCRIPTOR
+//     82130544  lwz  r8,8(r9)     ; the method at [*descriptor + 8]
+//     8213054C  bctr
+//
+//   XTL FREE THUNK 0x82130588 (same tool):
+//     82130588  mr   r4,r3        ; r4 = THE POINTER
+//     8213058C  cmpli cr6,r4,0
+//     82130590  beqlr            ; NULL short-circuits IN THE GUEST
+//     821305A4  lwz  r8,12(r9)    ; the method at [*descriptor + 12]
+//     821305AC  bctr             ; NO SIZE IS PASSED
+//
+//   THE DESCRIPTOR AND ITS TWO METHODS. build/w788.log is the only run whose
+//   F389 probe found the chain ALIVE:
+//     F389-XTLCHAIN r13=8F200000 [r13]=8F201000 obj=[[r13]+28]=82830B18
+//                  vt=[obj]=820114C4 allocFn=[vt+8]=821C08F8
+//     F389-BANK     bank=82830B18 alloc=[bank+4]=82830CD8 vt=82011884
+//                  fn=821C29A0 head=[82011884 A0404010 A0404000 ...]
+//   and the raw vtable word at 0x820114C4+12 (build/cache/mcla_pe.bin, file
+//   offset 0x114C4+12) is 0x821C09C8 -- the FREE dispatcher the guest's own
+//   free thunk reads at +12.  So the console's XTL pair is ALLOC = 0x821C08F8
+//   and FREE = 0x821C09C8, both entered with r3 = the descriptor 0x82830B18.
+//
+//   0x821C08F8's BODY (raw words 0x821C08F8..0x821C0910, and the emitted
+//   body at generated/ppc_xenon/ppc_recomp.15.cpp:5463-5482):
+//     39660001 addi   r11,r6,1
+//     556A103A rlwinm r10,r11,2,0,29
+//     7C6A182E lwzx   r3,r10,r3        ; r3 = *(self + (r6+1)*4)
+//     81230000 lwz    r9,0(r3)         ; r9 = the allocator's vtable
+//     81090008 lwz    r8,8(r9)         ; its ALLOC method
+//     7D0903A6 mtctr  r8
+//     4E800420 bctr
+//   => r3 = SELF (the bank), r4 = size, r5 = align, r6 = the selector, and the
+//      method is [*(self + (r6+1)*4) + 8].  r4/r5 are NOT rewritten, so they
+//      reach the allocator's method AS size/align.
+//
+//   0x821C09C8's BODY (generated/ppc_xenon/ppc_recomp.15.cpp:5604-5716): it
+//   walks the SAME array at self+4 (count at self+36), asks each allocator
+//   [vtable+80] "is this pointer yours?", and on a hit calls [vtable+12].
+//   => r3 = SELF, r4 = THE POINTER.  NO SIZE.
+//
+// WHICH ALLOCATOR THE CONSOLE'S XTL PATH REACHES: r6 = 0 -> *(self+4) ->
+//   0x82830CD8, the "simple" allocator (w788.log F389-BANK).  Its pool is
+//   [0xA0404020, 0xA3284000) -- the 46.5 MiB block of PHYS-CENSUS #1, ALREADY
+//   charged to the 512 MiB pool -- and it is a free-list allocator over that
+//   region whose small path packs elements into 16 KiB slabs
+//   (src/hooks/alloc_census.cpp:2134, `slab = elem & ~0x3FFF`), which is HOW
+//   the console serves 42,915 requests of a 17-byte median out of memory it
+//   already owns.  Its "is this pointer mine" test -- 0x821C17A8, the
+//   vtable slot +80 -- is a PURE RANGE CHECK:
+//     821C17A8 lwz r11,4(r3) ; addi r10,r11,16 ; cmplw cr6,r4,r10 ;
+//     821C17B8 lwz r10,76(r3) ; add r11,r10,r11 ; cmplw cr6,r4,r11
+//   i.e. "mine" == first+16 <= ptr < first+cap, with first = [alloc+4] and
+//   cap = [alloc+76].  THE HOST USES THAT PREDICATE VERBATIM before
+//   delegating a free, so the console's dispatcher can never reach its
+//   "no owner" path -- 0x821BD618, whose fallback is the `b 0x821BD640`
+//   SELF-LOOP, i.e. A HANG.
+//
+// WHAT THIS CHANGES: the XTL class stops being 42,915 fresh 4 KiB physical
+// pages (274.8 MiB of the pool) and becomes ~6.1 MiB carved out of a pool
+// the title already owns.  THE POOL IS CHARGED ONCE, NOT TWICE.
+//
+// THE FALLBACK: until the title's allocator is initialised the physical-pool
+// path is KEPT, so an early request is served rather than refused.  The
+// ordering is measured, not assumed: the title's first allocation is at
+// w821.log 13:42:28.677 and the first XTL allocation is at 13:42:28.640 --
+// 37 ms EARLIER, i.e. the fallback is genuinely needed at boot.
+//
+// THE FALSIFIER -- a soak must show ALL of these:
+//   1. XTL-TITLE-ALLOC rows appear at all (the delegation never happened).
+//   2. Their pointers lie inside [0xA0404020, 0xA3284000).
+//   3. PHYS-ACCT `charge` falls by ~275 MiB to ~354 MiB while `n` stays
+//      ~46,000 (the pool would still be charged for the XTL class).
+//   4. PHYS-STATE / PHYS-POOL-FULL stop appearing and `free` stays > 0.
+//   5. F396-ALLOC-ENTER's count RISES (the title's allocator now serves the
+//      XTL class too).  THAT IS THE CONTROL: if F396 does not change while
+//      PHYS-ACCT does not change, the instrument is blind and the change is
+//      unproven.
+//   6. XTL-ALLOC-REFUSED > 0 (the title's 46.5 MiB pool could not take the
+//      class).
+//   7. POOL-ROUTER (src/patches.cpp:57) fires: that is the free side landing
+//      in the EXISTING host override of 0x821C2AB8, which DROPS the free
+//      (src/patches.cpp:49: "overrides it, never chains, so a firing call
+//      drops the free").  The console's free would actually reclaim; the
+//      host's does not.  NAMED HERE, NOT HIDDEN.
+// ===========================================================================
+
+// The console's XTL allocator object -- the "bank".  MEASURED:
+//   build/w788.log F389-XTLCHAIN: obj=[[r13]+28]=82830B18
+//   build/w836.log: 64/64 F396-ALLOC-ENTER rows carry self=82830B18.
+constexpr uint32_t kXtlTitleBank = 0x82830B18u;
+
+// The bank's layout, from the guest's own dispatcher bodies (see above):
+//   +4  : the allocator array; the selector r indexes it as (r+1).
+constexpr uint32_t kXtlBankArrayOff = 4u;
+// The allocator OBJECT's layout, from its own methods:
+//   +4  : the first element of the pool;  +76 : the pool's capacity.
+constexpr uint32_t kXtlAllocFirstOff = 4u;
+constexpr uint32_t kXtlAllocCapOff = 76u;
+
+// THE CVar. One variable, one reversal (rule 1a). DEFAULT ON: the physical
+// pool exhaustion is the wall, and the delegation is the console's own path.
+// `mcla_xtl_title_alloc=0` restores the previous physical-pool behaviour
+// exactly.  Same shape as `mcla_phys_subpage` (src/kernel/heap.cpp:753-760).
+inline bool XtlTitleAllocEnabled() {
+  static const bool kEnabled = [] {
+    const char *e = std::getenv("mcla_xtl_title_alloc");
+    return e == nullptr || e[0] != '0';
+  }();
+  return kEnabled;
+}
+
+// The delegation counters.  UNGATED, so a soak can read the take rate as one
+// number instead of inferring it from sampled rows (the F-646 lesson).
+std::atomic<uint64_t> g_xtlTitleAllocDelegated{0};
+std::atomic<uint64_t> g_xtlTitleAllocFallback{0};
+std::atomic<uint64_t> g_xtlTitleAllocDisabled{0};
+std::atomic<uint64_t> g_xtlTitleFreeDelegated{0};
+std::atomic<uint64_t> g_xtlTitleFreeHostPath{0};
+
+// Re-entrancy guard.  The delegated call runs GUEST code (the console's own
+// allocator) from inside a host hook; if that code ever came back through the
+// XTL thunk we would recurse.  One thread-local flag breaks the cycle by
+// falling back to the physical-pool path, and it is counted.
+thread_local bool g_xtlTitleBusy = false;
+
+// The title's pool, read from the guest with the checked helpers only.
+struct XtlTitlePool {
+  uint32_t allocObj = 0;  // the bank array entry 0 (the allocator object)
+  uint32_t first = 0;     // [alloc+4]
+  uint32_t cap = 0;       // [alloc+76]
+  uint32_t lo = 0;        // first + 16  -- the guest's own lower bound
+  uint32_t hi = 0;        // first + cap  -- the guest's own upper bound
+  bool ready = false;
+};
+
+// READY MEANS: the guest has actually registered a pool with the allocator
+// the console's XTL path reaches.  Every field is read with ReadU32BE, which
+// is range-checked and returns false without writing on a short read, so this
+// can never fault and never guesses: an uninitialised allocator reads as
+// NOT ready and the physical-pool fallback runs.
+XtlTitlePool ReadXtlTitlePool() {
+  XtlTitlePool p;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t obj = 0;
+  if (!mem.ReadU32BE(kXtlTitleBank + kXtlBankArrayOff, &obj)) return p;
+  if (obj == 0u || obj == 0xCDCDCDCDu) return p;
+  uint32_t vt = 0, first = 0, cap = 0;
+  if (!mem.ReadU32BE(obj + 0u, &vt)) return p;
+  if (vt == 0u || vt == 0xCDCDCDCDu) return p;
+  if (!mem.ReadU32BE(obj + kXtlAllocFirstOff, &first)) return p;
+  if (!mem.ReadU32BE(obj + kXtlAllocCapOff, &cap)) return p;
+  if (first == 0u || cap == 0u) return p;
+  p.allocObj = obj;
+  p.first = first;
+  p.cap = cap;
+  p.lo = first + 16u;   // 0x821C17AC: addi r10,r11,16
+  p.hi = first + cap;   // 0x821C17BC: add  r11,r10,r11
+  p.ready = true;
+  return p;
+}
+
 } // namespace
 
 PPC_FUNC(__xtl_alloc) {
@@ -171,8 +404,85 @@ PPC_FUNC(__xtl_alloc) {
   const uint64_t seen =
       g_xtlAllocSeen.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  // Unchanged: the same call, the same ABI, the same return-into-r3.
-  ctx.r3.u32 = mcla::kernel::GuestMemoryHeap::Instance().Alloc(size, align);
+  // -------------------------------------------------------------------------
+  // T43.28: THE CONSOLE SERVES THIS REQUEST OUT OF THE TITLE'S OWN ALLOCATOR.
+  //
+  // OLD (the defect this replaces), src/kernel/imports.cpp:397 before this
+  // edit: `ctx.r3.u32 = GuestMemoryHeap::Instance().Alloc(size, align);`
+  // -> src/kernel/memory.cpp:534 -> Heap::AllocPhysical -> the 512 MiB
+  // console PHYSICAL pool, ONE PAGE PER CALL.  42,915 calls, 274.8 MiB
+  // charged on top of the 299.5 MiB the title already owns (the measurement
+  // is in the block above).
+  //
+  // NEW: the console's own dispatch, with the console's own ABI, read off
+  // the guest's bytes (see the block above for every citation):
+  //   r3 = 0x82830B18  the descriptor the guest's TLS slot 28 holds
+  //   r4 = size        r5 = align      r6 = 0  (the thunk's own selector)
+  // and 0x821C08F8 forwards r4/r5 to the allocator it selects, so the
+  // allocator's method sees size/align unchanged.
+  //
+  // THE FALLBACK: if the title's allocator has not registered a pool yet, the
+  // physical-pool path is KEPT (the console's pool is not the right answer
+  // for a 46.5 MiB class, but refusing an early boot request is worse).
+  // That window is REAL and MEASURED: the first XTL allocation is at
+  // w821.log 13:42:28.640 and the title's first allocation is at
+  // 13:42:28.677 -- 37 ms later.
+  //
+  // A REFUSAL BY THE TITLE'S OWN ALLOCATOR IS NOT FALLEN BACK ONTO THE POOL:
+  // the console would return 0 there too, and falling back would re-create
+  // the very blow-up this change removes.  The refusal is counted and named.
+  // -------------------------------------------------------------------------
+  bool viaTitle = false;
+  if (!XtlTitleAllocEnabled()) {
+    g_xtlTitleAllocDisabled.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    const XtlTitlePool pool = ReadXtlTitlePool();
+    if (pool.ready && !g_xtlTitleBusy) {
+      g_xtlTitleBusy = true;
+      // The nested call runs GUEST code.  lr and r1 are saved and restored
+      // because the PPC contract says a called function preserves both, and
+      // the recompiled bodies restore lr from r12 -- but the host must not
+      // DEPEND on that for the frame it is standing in.
+      const uint32_t savedLr = static_cast<uint32_t>(ctx.lr);
+      const uint32_t savedSp = ctx.r1.u32;
+      ctx.r3.u32 = kXtlTitleBank;  // the descriptor
+      ctx.r4.u32 = size;           // the size
+      ctx.r5.u32 = align;          // the alignment
+      ctx.r6.u32 = 0;              // the selector the XTL thunk sets
+      sub_821C08F8(ctx, base);     // the console's ALLOC dispatcher
+      ctx.lr = savedLr;
+      ctx.r1.u32 = savedSp;
+      g_xtlTitleBusy = false;
+      viaTitle = true;
+      g_xtlTitleAllocDelegated.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t dn = g_xtlTitleAllocDelegated.load(std::memory_order_relaxed);
+      if (dn <= 8u || (dn % 512u) == 0u) {
+        MCLA_LOG_WARN(
+            "XTL-TITLE-ALLOC #{} size={} align={} -> {:08X} bank={:08X} "
+            "allocObj={:08X} pool={:08X}-{:08X} glr={:08X} seen={} delegated={} "
+            "fallback={}",
+            dn, size, align, ctx.r3.u32, kXtlTitleBank, pool.allocObj,
+            pool.lo, pool.hi, glr, seen, dn,
+            g_xtlTitleAllocFallback.load(std::memory_order_relaxed));
+      }
+    } else {
+      g_xtlTitleAllocFallback.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t fn = g_xtlTitleAllocFallback.load(std::memory_order_relaxed);
+      if (fn <= 8u || (fn % 512u) == 0u) {
+        MCLA_LOG_WARN(
+            "XTL-TITLE-FALLBACK #{} size={} align={} bank={:08X} ready={} "
+            "busy={} seen={} delegated={} fallback={}",
+            fn, size, align, kXtlTitleBank, pool.ready ? 1 : 0,
+            g_xtlTitleBusy ? 1 : 0, seen,
+            g_xtlTitleAllocDelegated.load(std::memory_order_relaxed), fn);
+      }
+    }
+  }
+
+  if (!viaTitle) {
+    // Unchanged: the same call, the same ABI, the same return-into-r3.
+    ctx.r3.u32 = mcla::kernel::GuestMemoryHeap::Instance().Alloc(size, align);
+  }
 
   if (ctx.r3.u32 == 0) {
     // The console's value for "refused" is 0 and the console does not trap
@@ -466,6 +776,60 @@ PPC_FUNC(__xtl_free) {
   // to a counted refusal rather than a corrupted heap.
   if (desc != 0x8F202000u) {
     g_xtlFreeDescMismatch.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // -------------------------------------------------------------------------
+  // T43.28: A POINTER THE TITLE'S ALLOCATOR HANDED OUT MUST GO BACK TO THE
+  // TITLE'S ALLOCATOR.  The console's free thunk (0x82130588) reads the
+  // method at [*descriptor + 12] = 0x821C09C8 (raw vtable word at
+  // 0x820114C4+12), whose body walks the SAME allocator array at self+4,
+  // asks each allocator [vtable+80] "is this pointer yours?", and on a hit
+  // calls that allocator's own free.  Its ABI is r3 = the descriptor, r4 =
+  // THE POINTER, and NO SIZE.
+  //
+  // THE PREDICATE IS THE GUEST'S OWN.  0x821C17A8 (the simple allocator's
+  // vtable slot +80) is a pure range check:
+  //   lwz r11,4(r3) ; addi r10,r11,16 ; cmplw cr6,r4,r10 ;
+  //   lwz r10,76(r3) ; add r11,r10,r11 ; cmplw cr6,r11
+  // i.e. "mine" == first+16 <= ptr < first+cap.  The host applies THAT test
+  // before delegating, so the console's dispatcher can never reach its
+  // "no owner" path -- 0x821BD618, whose fallback is the `b 0x821BD640`
+  // SELF-LOOP, i.e. A HANG.  A pointer that fails the test is NOT the
+  // title's, and keeps the host path below.
+  //
+  // NAMED CONSEQUENCE: the free lands in the EXISTING host override of
+  // 0x821C2AB8 (src/patches.cpp:53-61), which is a census that DROPS the
+  // free -- its own comment says so: "overrides it, never chains, so a firing
+  // call drops the free".  So the console's reclaim does not happen here;
+  // the observable is the POOL-ROUTER marker (src/patches.cpp:57), which
+  // fires ZERO times in build/w821.log today.  That is a divergence from the
+  // console and it is named, not hidden.
+  // -------------------------------------------------------------------------
+  if (XtlTitleAllocEnabled() && ptr != 0u) {
+    const XtlTitlePool pool = ReadXtlTitlePool();
+    if (pool.ready && ptr >= pool.lo && ptr < pool.hi) {
+      const uint32_t savedLr = static_cast<uint32_t>(ctx.lr);
+      const uint32_t savedSp = ctx.r1.u32;
+      ctx.r3.u32 = kXtlTitleBank;  // the descriptor
+      ctx.r4.u32 = ptr;           // THE POINTER
+      sub_821C09C8(ctx, base);     // the console's FREE dispatcher
+      ctx.lr = savedLr;
+      ctx.r1.u32 = savedSp;
+      const uint64_t dn =
+          g_xtlTitleFreeDelegated.fetch_add(1, std::memory_order_relaxed) + 1;
+      const uint64_t ok =
+          g_xtlFreeOk.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (dn <= 8u || (dn % 512u) == 0u) {
+        MCLA_LOG_WARN(
+            "XTL-TITLE-FREE #{} ptr={:08X} bank={:08X} allocObj={:08X} "
+            "pool={:08X}-{:08X} seen={} ok={} delegated={} hostpath={}",
+            dn, ptr, kXtlTitleBank, pool.allocObj, pool.lo, pool.hi, seen, ok,
+            dn, g_xtlTitleFreeHostPath.load(std::memory_order_relaxed));
+      }
+      done(1);
+      return;
+    }
+    g_xtlTitleFreeHostPath.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Guard the values the guest controls, by the same rules the heap itself uses,
@@ -1713,6 +2077,217 @@ uint32_t FscSetCacheElementCount() {
   return 0x00000001u; // ERROR_INVALID_FUNCTION
 }
 
+// ============================================================================
+// HOST IRQL MODEL + THE CONSOLE'S APC DELIVERY POINT (2026-10-21, fix_irq2)
+// ============================================================================
+//
+// WHAT THE GUEST DOES -- the oracle is the guest's OWN bytes (build/cache/
+// mcla_pe.bin, decoded with tools/ppc_disasm.py), not a doc:
+//
+//  * The guest's own spinlock wrappers RAISE the IRQL *before* they look at
+//    the lock's recursion depth, and SAVE the value the raise RETURNED into
+//    the lock struct's +12 byte:
+//        0x823EAD08  bl 0x827BD514      ; __imp__KeRaiseIrqlToDpcLevel
+//        0x823EAD10  mr r29,r3          ; r29 = the RETURNED (old) IRQL
+//        0x823EAD9C  stb r29,12(r31)   ; lock+12 = the old IRQL
+//    (the lock struct is at 0x828CD950: `lis r11,828D` + `addi r31,r11,-9904`)
+//  * The release path READS IT BACK and hands it to the lowering export:
+//        0x823EACE0  lbz r31,12(r3)    ; the saved old IRQL
+//        0x823EACF0  bl 0x827BD544      ; __imp__KeReleaseSpinLockFromRaisedIrql
+//        0x823EACF4  mr r3,r31
+//        0x823EACF8  bl 0x827BD524      ; __imp__KfLowerIrql(old)
+//    => the value KeRaiseIrqlToDpcLevel RETURNS is EXACTLY the value the guest
+//       will later hand to KfLowerIrql.  The old host returned a constant 0
+//       from the raise (imports.cpp:8993 before this change) and ignored the
+//       lowering (imports.cpp:8995), so the guest's saved-IRQL byte was
+//       permanently 0 and every lowering was a no-op.
+//  * The same shape is in the guest's other two wrappers: 0x823EB5E0 (raise
+//    0x823EB600 / save 0x823EB640 / lower 0x823EB6DC) and 0x823EE918 (raise
+//    0x823EE92C / save 0x823EE968 / lower 0x823EE9F0).
+//  * A RECURSIVE acquire re-raises (the raise precedes the depth check) but
+//    does NOT rewrite the saved byte -- it RE-READS it (0x823EB648
+//    `lbz r28,12(r31)`) -- so the OUTERMOST saved IRQL is the one restored.
+//    The host's model has to agree with that or the levels drift.
+//
+// WHERE THE IRQL LIVES -- MEASURED, and the task's premise is REFUTED:
+//  The task brief said "the guest's own IRQL byte is at [r13+?]".  It is not.
+//  Scanning EVERY r13-relative load/store in build/cache/mcla_pe.bin with the
+//  PROJECT's field layout (opcode = i>>26, RA = (i>>16)&31, d = s16(i&0xFFFF)
+//  -- the layout tools/ppc_disasm.py uses; the usual "opcode in bits 0..5"
+//  layout decodes this image into garbage) gives, inside the guest's kernel
+//  (0x823E0000..0x82440000), ONLY:
+//        lwz +0x100  (TEB pointer)         8 sites
+//        lbz +0x10C  (CPU number byte)    11 sites
+//  and nothing else.  Image-wide the surviving r13-relative BYTE accesses are
+//  +0x10C (12 sites) plus one word at 0x829BD8DC which is DATA (the words
+//  around it decode to NOT-DECODED).  There is NO current-IRQL byte in the
+//  guest's KPCR in this image: the guest's kernel round-trips the IRQL VALUE
+//  through the lock struct's +12 byte and never reads a current-IRQL slot.
+//  => The host keeps the current IRQL in host per-thread state.  Because the
+//  value the host RETURNS from the raise is the value the guest hands back
+//  to KfLowerIrql, host and guest agree BY CONSTRUCTION.
+//
+// CONSOLE REFERENCE (xenia; guest FACTS only -- ordering and values):
+//  * xboxkrnl_threading.cc:998-1001  KeRaiseIrqlToDpcLevel -> RaiseIrql(DPC),
+//    returns the OLD value.
+//  * xboxkrnl_threading.cc:1005-1010 KfLowerIrql(old) -> LowerIrql(old), THEN
+//    XThread::GetCurrentThread()->CheckApcs().
+//  * xboxkrnl_threading.cc:914-935  KfAcquireSpinLock -> CAS 0->1, then
+//    RaiseIrql(DISPATCH=2), returns the OLD IRQL.
+//  * xboxkrnl_threading.cc:940-951  KfReleaseSpinLock(lock, old) -> LowerIrql
+//    FIRST, then unlock.
+//  * xboxkrnl_threading.cc:956-963  KeAcquireSpinLockAtRaisedIrql -> CAS 0->1,
+//    spin; NO IRQL change.
+//  * xboxkrnl_threading.cc:978-982  KeReleaseSpinLockFromRaisedIrql -> unlock
+//    only; NO IRQL change.
+//  * cpu/processor.h:43-48           PASSIVE=0, APC=1, DISPATCH=2, DPC=3.
+//
+// PER-THREAD, not global: the console's IRQL is PER-PROCESSOR, and the host
+// runs guest code on several host threads (the boot worker, the vblank ISR
+// thread, the CP thread).  A single global IRQL would let one thread's
+// lowering clobber another's level.
+// ============================================================================
+
+// Console IRQL levels (xenia cpu/processor.h:43-48).
+static constexpr uint8_t kIrqlPassive = 0;
+static constexpr uint8_t kIrqlApc = 1;
+static constexpr uint8_t kIrqlDispatch = 2;
+static constexpr uint8_t kIrqlDpc = 3;
+
+// The current IRQL of THIS host thread.
+static thread_local uint8_t t_hostIrql = kIrqlPassive;
+
+// An APC queued for THIS host thread.  The console's APC queue lives in the
+// KTHREAD (xthread.cc:587-592); the host's is per host thread.  Fixed-size
+// (8) on purpose: the guest has NO APC-queueing import (see the note on
+// QueueGuestApc below), so this is a mechanism, not a workload.
+struct HostApc {
+  uint32_t routine = 0;
+  uint32_t context = 0;
+  uint32_t arg1 = 0;
+  uint32_t arg2 = 0;
+};
+static constexpr uint32_t kMaxPendingApcs = 8;
+static thread_local HostApc t_pendingApcs[kMaxPendingApcs];
+static thread_local uint32_t t_pendingApcCount = 0;
+
+// Run the APCs queued for this thread.  The console runs them from
+// XThread::CheckApcs() at the IRQL-lowering boundary (xboxkrnl_threading.cc:
+// 1009-1010 -> xthread.cc:583).  Returns the number delivered.
+static uint32_t DeliverPendingApcs() {
+  uint32_t delivered = 0;
+  while (t_pendingApcCount > 0) {
+    const HostApc apc = t_pendingApcs[--t_pendingApcCount];
+    uint8_t *base = mcla::kernel::g_memory.base;
+    PPCFunc *fn = PPC_LOOKUP_FUNC(base, apc.routine);
+    if (fn == nullptr) {
+      static std::atomic<uint32_t> s_apcUnresolved{0};
+      const uint32_t n = s_apcUnresolved.fetch_add(1) + 1;
+      if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("APC-UNRESOLVED #{} routine={:08X} - not a registered "
+                      "guest function; the APC is DROPPED (the console would "
+                      "have called it)",
+                      n, apc.routine);
+      continue;
+    }
+    PPCContext ctx{};
+    ctx.r3.u32 = apc.context;
+    ctx.r4.u32 = apc.arg1;
+    ctx.r5.u32 = apc.arg2;
+    if (g_ppcContext) {
+      ctx.r13 = g_ppcContext->r13;
+      ctx.r1 = g_ppcContext->r1;
+      ctx.msr = g_ppcContext->msr;
+    }
+    PPCContext *savedCtx = GetPPCContext();
+    SetPPCContext(ctx);
+    fn(ctx, base);
+    if (savedCtx != nullptr)
+      SetPPCContext(*savedCtx);
+    ++delivered;
+    static std::atomic<uint32_t> s_apcDelivered{0};
+    const uint32_t dn = s_apcDelivered.fetch_add(1) + 1;
+    if (dn <= 40 || (dn % 500) == 0)
+      MCLA_LOG_INFO("APC-DELIVER #{} routine={:08X} context={:08X}", dn,
+                    apc.routine, apc.context);
+  }
+  return delivered;
+}
+
+// Is an APC pending for this thread?  An ALERTABLE wait is woken by one.
+static inline bool HasPendingApc() { return t_pendingApcCount > 0; }
+
+// Queue an APC for THIS host thread.  NOTHING in the guest calls this yet,
+// and that is a MEASURED fact, not an omission:
+//   * the guest's import table (246 __imp__ names, generated/ppc_xenon/
+//     ppc_func_mapping.cpp) contains NO NtQueueApcThread, NO KeInsertQueueApc
+//     and NO KeInitializeApc;
+//   * the guest's own APC path is entirely GUEST-side: it builds a KAPC on
+//     its stack (0x82412DA0..0x82412DD4) and hands it to its own in-guest
+//     queue helper sub_824112C8 (call sites 0x82412DE4 and 0x8242F08C,
+//     `py -3 tools/ppc_xrefs.py calls 0x824112C8`).
+//   * `KiApcNormalRoutineNop` (0x827BD694, the one APC-ish import the guest
+//     DOES call, at 0x82412DD4) is a STUB on the console too -- the
+//     reference returns 0 and writes nothing (xboxkrnl_threading.cc:
+//     1114-1117) -- so the host's `return 0` was already console-correct and
+//     is NOT changed here.
+// So the host's queue can only ever be filled by the host itself.  The
+// delivery POINT is what the console's contract needs, and it is installed.
+static void QueueGuestApc(uint32_t routine, uint32_t context, uint32_t arg1,
+                          uint32_t arg2) {
+  if (t_pendingApcCount >= kMaxPendingApcs) {
+    static std::atomic<uint32_t> s_apcFull{0};
+    const uint32_t n = s_apcFull.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+      MCLA_LOG_WARN("APC-QUEUE-FULL #{} (cap {}) - the APC is DROPPED", n,
+                    kMaxPendingApcs);
+    return;
+  }
+  t_pendingApcs[t_pendingApcCount++] = HostApc{routine, context, arg1, arg2};
+}
+
+// Raise: SETS the level and returns the OLD one -- exactly the console's
+// atomic exchange (the reference: Processor::RaiseIrql returns
+// static_cast<Irql>(xe::atomic_exchange(new_value, &irql_)), processor.cc:
+// 431-435; the per-thread twin XThread::RaiseIrql, xthread.cc:577-579).  The
+// reference does NOT clamp and does NOT assert, so neither does this.
+static inline uint32_t HostRaiseIrql(uint8_t level) {
+  const uint8_t old = t_hostIrql;
+  t_hostIrql = level;
+  return old;
+}
+
+// Lower: SETS the level (the reference's Processor::LowerIrql is likewise a
+// plain atomic exchange, processor.cc:437-440) and then runs the pending
+// APCs.
+//
+// The console runs the APC check on EVERY KfLowerIrql, not only below
+// APC_LEVEL: xboxkrnl_threading.cc:1005-1010 is
+//     kernel_state()->processor()->LowerIrql(old_value);
+//     XThread::GetCurrentThread()->CheckApcs();
+// unconditionally.  The level guard is therefore NOT applied here either.
+//
+// The ONE place the host deviates from the reference is a level outside
+// 0..3: that is not an IRQL, and the host's level also decides whether the
+// APC check runs, so a garbage value must not be able to wedge the level at
+// "DPC forever".  Such a value is clamped to PASSIVE and logged.
+static inline void HostLowerIrql(uint8_t level) {
+  if (level > kIrqlDpc) {
+    static std::atomic<uint32_t> s_badIrql{0};
+    const uint32_t n = s_badIrql.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+      MCLA_LOG_WARN("IRQL-BAD-LEVEL #{} level={} -> PASSIVE", n,
+                    static_cast<unsigned>(level));
+    level = kIrqlPassive;
+  }
+  t_hostIrql = level;
+  DeliverPendingApcs();
+}
+
+// The IRQL this host thread is running at.  Exposed so the ISR contexts can
+// raise the level the way a real interrupt does (an ISR runs at DPC).
+static inline uint8_t HostCurrentIrql() { return t_hostIrql; }
+
 uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
                                   uint32_t Alertable, be<int64_t> *Timeout) {
   // PARK-SAMPLE: census ALL threads at wait entry
@@ -1817,12 +2392,25 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
       static std::atomic<uint32_t> s_alertable{0};
       const uint32_t an = s_alertable.fetch_add(1) + 1;
       if (an <= 40 || (an % 500) == 0)
-        MCLA_LOG_WARN("WAIT-ALERTABLE #{} alertable={} is UNIMPLEMENTED "
-                      "(KernelObject::Wait has no Alertable, xdm.h:40-44) - "
-                      "parking non-alertable; guest APC delivery will be missed. "
+        MCLA_LOG_WARN("WAIT-ALERTABLE #{} alertable={} is honoured only when "
+                      "an APC is actually PENDING (the console delivers a "
+                      "pending APC and returns STATUS_USER_APC; "
+                      "xobject.cc:207-215). The host's APC queue is EMPTY "
+                      "today -- the guest imports no APC-queueing export "
+                      "(NtQueueApcThread / KeInsertQueueApc / KeInitializeApc "
+                      "are all absent from the guest's 246-entry import "
+                      "table) -- so this wait parks exactly as before. "
                       "handle={:08X} tid={:08X} lr={:08X}",
                       an, Alertable, Handle, GetCurrentThreadId(),
                       static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+      if (HasPendingApc()) {
+        const uint32_t delivered = DeliverPendingApcs();
+        MCLA_LOG_WARN("APC-WAKE #{} delivered={} handle={:08X} -> "
+                      "STATUS_USER_APC",
+                      static_cast<uint32_t>(GetCurrentThreadId()), delivered,
+                      Handle);
+        return STATUS_USER_APC;
+      }
     }
 
     // Wait-implementing types, all `final` so typeid is an exact discriminator:
@@ -2576,9 +3164,602 @@ uint32_t DbgPrint(uint32_t formatVa) {
 
 void __C_specific_handler_x() { LOG_UTILITY("!!! STUB !!!"); }
 
-void RtlNtStatusToDosError() { LOG_UTILITY("!!! STUB !!!"); }
+// ===========================================================================
+// F-840 (2026-10-21) -- THE VOID-IMPORT BATCH, part 1: RtlNtStatusToDosError.
+//
+// WAS: `void RtlNtStatusToDosError() { LOG_UTILITY("!!! STUB !!!"); }`.
+//
+// WHY THAT IS A LIVE DEFECT AND NOT AN INERT STUB.  A `void` hook body never
+// writes r3: src/kernel/function.h:496-499 takes the `void` arm, calls the host
+// function and RETURNS WITHOUT TOUCHING THE CONTEXT.  So the guest reads back
+// its OWN FIRST ARGUMENT where the console's answer belongs.
+//
+// WHAT THE GUEST DOES WITH r3, from the guest's own bytes.  The import thunk is
+// 0x827BD024 and the guest calls it from 10 distinct sites
+// (tools/ppc_xrefs.py calls 0x827BD024).  The load-bearing one is the guest's
+// own error-latch helper, generated/ppc_xenon/ppc_recomp.0.cpp:18617-18629:
+//
+//   18617  bl 0x827bd024
+//   18619  __imp__RtlNtStatusToDosError(ctx, base);
+//   18620  lwz r11,336(r13)          ; the thread's "already latched?" flag
+//   18626  lwz r11,256(r13)          ; r11 = the thread's error block
+//   18628  stw r3,352(r11)           ; <error block>->last_error = r3
+//
+// `stw r3,352(r11)` is the guest STORING the return value into its own Win32
+// last-error word.  With the void stub the value stored was the NTSTATUS the
+// guest had just passed IN (e.g. 0xC0000034), because r3 was never written.
+// A Win32 last-error code is never 0xC00000xx.  Every guest error path that
+// funnels through this helper therefore reported a nonsense error code.
+//
+// THE CONSOLE'S BEHAVIOUR.  The console returns a DOS (Win32) error code:
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_error.cc:974-1016
+//     uint32_t xeRtlNtStatusToDosError(uint32_t source_status)
+//     dword_result_t RtlNtStatusToDosError_entry(dword_t source_status)
+// The algorithm and the value table are reproduced here verbatim.  The values
+// are NOT typed by hand: build/agents/_gen_ntstatus.py parses them out of that
+// reference file and writes src/kernel/ntstatus_dos_error_table.h
+// (14 base codes, 888 entries, generated).
+//
+// FALSIFIER.  After this change the word the guest latches at
+// ppc_recomp.0.cpp:18628 must be a DOS code (<= 0x7FF) and never an NTSTATUS.
+// Concretely: a guest failure carrying STATUS_OBJECT_NAME_NOT_FOUND
+// (0xC0000034) must latch 2 (ERROR_FILE_NOT_FOUND), NOT 0xC0000034.  If a soak
+// still shows 0xC0000034 in that cell, the hook is not reaching this body.
+// ===========================================================================
+// The reference's own algorithm, xboxkrnl_error.cc:974-1012, in order.
+static uint32_t NtStatusToDosErrorImpl(uint32_t sourceStatus) {
+  uint32_t status = sourceStatus;
+  if (!status || (status & 0x20000000)) {
+    return status;
+  }
 
-void XexGetProcedureAddress() { LOG_UTILITY("!!! STUB !!!"); }
+  if ((status >> 16) == 0x8007) {
+    return status & 0xFFFF;
+  }
+
+  if ((status & 0xF0000000) == 0xD0000000) {
+    // High bits do not matter.
+    status &= ~0x30000000;
+  }
+
+  for (const mcla::kernel::NtStatusDosErrorRow &row :
+       mcla::kernel::kNtStatusDosErrorRows) {
+    if (!row.base_code) {
+      break;
+    }
+    if (status < row.base_code) {
+      break;
+    }
+    const uint32_t index = status - row.base_code;
+    if (index < row.count) {
+      const uint32_t result = row.entries[index];
+      if (!result) {
+        break;
+      }
+      return result;
+    }
+  }
+
+  if ((status >> 16) == 0xC001) {
+    return status & 0xFFFF;
+  }
+
+  // The reference's own fallback (xboxkrnl_error.cc:1011).
+  return 317; // ERROR_MR_MID_NOT_FOUND
+}
+
+uint32_t RtlNtStatusToDosError(uint32_t sourceStatus) {
+  const uint32_t result = NtStatusToDosErrorImpl(sourceStatus);
+  // A REAL instrument for this body: the OLD void stub printed NOTHING in a
+  // release build (LOG_UTILITY expands to nothing unless _DEBUG is defined,
+  // .research/UnleashedRecomp/UnleashedRecomp/os/logger.h:14-18), so the
+  // "0 rows" a soak would show proved nothing.  This line prints on every
+  // call the body answers, so a soak can show the NTSTATUS -> DOS mapping
+  // happening (AGENTS.md rule 19).
+  static std::atomic<uint32_t> s_census{0};
+  const uint32_t n = s_census.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 20 || (n % 100) == 0) {
+    MCLA_LOG_INFO("NT2DOS #{} lr={:08X} status=0x{:08X} -> dos=0x{:X}", n,
+                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u),
+                  sourceStatus, result);
+  }
+  return result;
+}
+
+// ===========================================================================
+// F-840 (2026-10-21) -- THE VOID-IMPORT BATCH, part 2: XexGetProcedureAddress.
+//
+// WAS: `void XexGetProcedureAddress() { LOG_UTILITY("!!! STUB !!!"); }`.
+//
+// THE DEFECT, from the guest's own bytes.  The import thunk is 0x827BD884 and
+// the guest calls it from 10 sites (tools/ppc_xrefs.py calls 0x827BD884).  The
+// shape at 0x8244A2B0 (generated/ppc_xenon/ppc_recomp.80.cpp:523-544, raw
+// bytes confirmed with tools/ppc_disasm.py 0x8244A290 24):
+//
+//   8244A2A4  addi r5,r1,80      ; r5 = the OUT slot (u32)
+//   8244A2A8  lwz  r3,84(r1)     ; r3 = the module handle
+//   8244A2AC  li   r4,36         ; r4 = the export ordinal
+//   8244A2B0  bl   827BD884      ; XexGetProcedureAddress
+//   8244A2B4  cmpi cr0,r3,0
+//   8244A2B8  bge  -> 8244A2C8   ; r3 >= 0  =>  SUCCESS path
+//   8244A2BC  li   r11,0
+//   8244A2C0  stw  r11,80(r1)    ; r3 < 0   =>  out slot := 0
+//   8244A2C8  lwz  r11,80(r1)    ; r11 = the out slot
+//   8244A2CC  cmpli cr6,r11,0
+//   8244A2DC  beq  -> 8244A2F4   ; out slot == 0 => do not call
+//   8244A2E8  mtctr r11
+//   8244A2EC  bctrl              ; CALLS the out slot AS A FUNCTION POINTER
+//
+// So the guest's contract is: r3 >= 0 means SUCCESS and the out slot then
+// holds the resolved function address; r3 < 0 means FAILURE and the guest
+// zeroes the out slot itself and skips the call.
+//
+// (CORRECTION to build/agents/audit_stubs.md's table row for this import, which
+// reads "the guest's own test is cmpwi r3,0 / bge -> error".  It is the other
+// way round: `bge` at 8244A2B8 goes to 8244A2C8, which is the path that READS
+// the out slot and CALLS it.  `bge` is therefore SUCCESS.  The raw bytes are
+// the tiebreaker here, not the audit's prose.)
+//
+// With the void stub, r3 on return was still the module handle 0x82000000 --
+// POSITIVE -- so the guest took the SUCCESS branch and called the out slot,
+// which the host never wrote, as a function pointer.  That is an
+// UNINITIALISED STACK WORD executed as code.
+//
+// THE CONSOLE'S BEHAVIOUR, from the reference:
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc:142-185
+//     dword_result_t XexGetProcedureAddress_entry(lpvoid_t hmodule,
+//                                                   dword_t ordinal,
+//                                                   lpdword_t out_function_ptr)
+//   -> X_STATUS_SUCCESS (0) and *out = the address, OR
+//      X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND (0xC0000263) and *out = 0.
+//   .research/xenia/src/xenia/xbox.h:77 -> X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND
+//      = 0xC0000263 (negative, so it lands on the guest's failure branch).
+//   The ordinal is an ordinal unless the top 16 bits are set, in which case it
+//   is a pointer to the export NAME (xboxkrnl_modules.cc:147-149).
+//
+// THE EXPORT LOOKUP.  The console resolves the ordinal against the loaded
+// module.  For the only module this host has, the game XEX, BOTH export
+// sources are EMPTY, measured:
+//   * the XEX2 export table: build/game_data/default.xex's Xex2SecurityInfo
+//     `exportTable` field is 0 (parsed from the file: XEX2 header at 0x0,
+//     security info at 0x90, exportTable at 0x90+0x130 = 0x1C0);
+//   * the PE export directory: build/cache/mcla_pe.bin's PE data directory
+//     [0] is {rva 0x0, size 0x0} (PE header at 0x108, optional header at
+//     0x120, data directories at 0x180).
+// The other module the guest asks about is "xbdm.xex"
+// (generated/ppc_xenon/ppc_recomp.80.cpp:971, raw `lis r11,8207` /
+// `addi r3,r11,-22644` -> 0x8206A78C = "xbdm.xex"), a development-kit module
+// that is NOT present on a retail console either.
+//
+// So for every one of the guest's 10 call sites the console's own answer is
+// "not found": a NEGATIVE status and an out slot of 0.  The lookup below is
+// still implemented in full (ordinal and name forms, PE export directory read
+// out of guest memory) so that the function is CORRECT rather than merely
+// always-failing.
+//
+// FALSIFIER.  The guest must now take its FAILURE branch at every one of the
+// 10 sites: r3 must be negative (0xC0000263) and the out slot must be 0, so
+// the `bctrl` at 8244A2EC is NEVER reached.  If a soak shows the guest calling
+// through the out slot, this body is not running.
+// ===========================================================================
+
+// ===========================================================================
+// F-841 (2026-10-21) -- MODULE-AWARE XexGetModuleHandle / XexGetProcedureAddress.
+//
+// THE MEASUREMENT (build/game_data/default.xex + build/cache/mcla_pe.bin):
+//
+//  * The DECOMPRESSED PE at guest 0x82000000 has NO export directory.
+//    build/cache/mcla_pe.bin: DOS header at 0x0, e_lfanew = 0x108, PE
+//    signature at 0x108, COFF header at 0x10C (machine 0x1F2, 13 sections,
+//    SizeOfOptionalHeader 0xE0), optional header at 0x120 (magic 0x10B,
+//    ImageBase 0x82000000, AddressOfEntryPoint 0x1322B8, SizeOfImage
+//    0xAD3000), data directories at 0x180, NumberOfRvaAndSizes = 16.
+//    DataDirectory[0] (the export directory) = {rva 0x0, size 0x0}.
+//    => there is no IMAGE_EXPORT_DIRECTORY to read, for ANY ordinal.
+//  * The RETAIL XEX2 container's export table is EMPTY.  default.xex is
+//    9,252,864 bytes, magic 'XEX2' at 0x00, security info at file 0x90; in the
+//    xex2_security_info layout
+//    (.research/xenia/src/xenia/kernel/util/xex2_info.h:570-588) the
+//    export_table field is at +0x160 = file 0x1F0 and it is 0.
+//    Cross-checks that this really is the security info: header_size at +0x00
+//    = 0x1054 = 0x184 + 158*0x18 (the page-descriptor array for
+//    page_descriptor_count = 0x9E at +0x180); image_size at +0x04 = 0x9E0000
+//    = the size of build/cache/mcla_pe.bin; load_address at +0x110 = 0x82000000.
+//
+// => The console's answer for every ordinal of the GAME module is "not found",
+//    and that is what this host already returns.  The guest is NOT asking about
+//    the game module: it asks for exports of two SYSTEM modules, and the
+//    console answered those from the XAM and the kernel module images, which
+//    this host does not have.
+//
+// THE GUEST'S OWN REQUESTS (measured from the guest's bytes):
+//   0x8275C7B8 (the wrapper) calls XexGetModuleHandle(name) and then
+//   XexGetProcedureAddress(handle, ordinal, &out); its ten callers pass
+//   ("xam.xex", 442), ("xam.xex", 520) and ("xboxkrnl.exe", 642..649).
+//   Three further static sites ask ("xam.xex", 36), ("xam.xex", 80) and
+//   ("xbdm.xex", 155).  The names are the guest's own strings:
+//   0x8206A5F0 = "xam.xex", 0x820D432C = "xboxkrnl.exe", 0x8206A78C =
+//   "xbdm.xex".
+//
+// WHAT THE CONSOLE WOULD HAVE ANSWERED (the console's export ordinal tables,
+// .research/xenia/src/xenia/kernel/<mod>/<mod>_table.inc):
+//   xam.xex      442 = XamInputGetUserVibrationLevel
+//   xam.xex      520 = XamUserGetDeviceContext
+//   xboxkrnl.exe 642..649 = XInputdFFGetDeviceInfo, XInputdFFSetEffect,
+//       XInputdFFUpdateEffect, XInputdFFEffectOperation, XInputdFFDeviceControl,
+//       XInputdFFSetDeviceGain, XInputdFFCancelIo, XInputdFFSetRumble
+//   The ordinals are cross-checked against the host's own import bindings:
+//   the same tables give 0x0E7 NtQueryFullAttributesFile, 0x11D
+//   RtlCompareStringN, 0x12B RtlImageXexHeaderField, 0x135
+//   RtlNtStatusToDosError, 0x195 XexGetModuleHandle and 0x197
+//   XexGetProcedureAddress -- the ordinals the title's own XEX imports them
+//   under (build/game_data/default.xex).
+//
+// WHAT THIS HOST CAN ANSWER, AND HOW:
+//   The title's own XEX2 import-libraries block records, for every
+//   (module, ordinal) the game imports, the GUEST import-thunk address the
+//   console's loader binds for it.  That thunk is the address the guest calls
+//   for that export, so it is exactly the right value to hand back from
+//   XexGetProcedureAddress: the guest's call then reaches the host's
+//   implementation of that very console export.  src/kernel/xex_console_exports.h
+//   is that table, GENERATED from the retail container (see the header).
+//   The guest's ten runtime requests are NOT among the title's imports (the
+//   game resolves those at runtime precisely because it does not import them),
+//   so they stay NOT FOUND -- honestly, with the console's export NAME in the
+//   census line so the next pass sees exactly what the console had.
+//
+// THE HANDLE IS AN OPAQUE TOKEN.  All four guest call sites of
+// XexGetModuleHandle pass the handle straight into XexGetProcedureAddress
+// (0x8244A298 -> 0x8244A2B0, 0x8244A4D4 -> 0x8244A4EC, 0x824604DC ->
+// 0x824604FC, 0x8275C7DC -> 0x8275C7F4); the guest never dereferences it.  So
+// it may be a synthetic per-module token, and it MUST be, because one handle
+// for two different modules is how a resolver answers with the WRONG module's
+// function.
+//
+// FALSIFIER: the XEX-GPA census line must name the module and the console
+// export; a lookup of a (module, ordinal) pair the title imports must answer
+// FOUND with the guest thunk address; a lookup of a pair the title does not
+// import must answer NOT FOUND, and the guest must skip the call -- it
+// null-checks the out slot before calling it (0x8244A2CC/0x8244A2DC,
+// 0x8275C870/0x8275C874, 0x8275C9AC/0x8275C9B0, 0x8275CA10/0x8275CA14).
+// ===========================================================================
+
+// The executable module's handle is the guest image base (PROGRAM_GUIDE.md:62,
+// AGENTS.md rule 3 / F-023).  The SYSTEM modules get synthetic tokens above
+// the guest image and above the AllocateThunk region (0x83000000, app.h:113),
+// so a token can never collide with a real guest address or a host thunk.
+static constexpr uint32_t kXexExecutableModuleHandle = 0x82000000u;
+static constexpr uint32_t kXexSystemModuleHandleBase = 0xA1000000u;
+
+// The console's module names are not case sensitive.
+static bool XexModuleNameEquals(const char *a, const char *b) {
+  if (!a || !b) {
+    return false;
+  }
+  while (*a && *b) {
+    const char ca = (*a >= 'A' && *a <= 'Z') ? static_cast<char>(*a + 32) : *a;
+    const char cb = (*b >= 'A' && *b <= 'Z') ? static_cast<char>(*b + 32) : *b;
+    if (ca != cb) {
+      return false;
+    }
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
+
+// The system module whose name the guest passed, or nullptr.
+static const mcla::kernel::XexConsoleModule *
+XexFindConsoleModuleByName(const char *name) {
+  for (const auto &module : mcla::kernel::kXexConsoleModules) {
+    if (XexModuleNameEquals(module.name, name)) {
+      return &module;
+    }
+  }
+  return nullptr;
+}
+
+// The system module a handle stands for, or nullptr.
+static const mcla::kernel::XexConsoleModule *
+XexFindConsoleModuleByHandle(uint32_t handle) {
+  if (handle < kXexSystemModuleHandleBase) {
+    return nullptr;
+  }
+  const uint32_t index = handle - kXexSystemModuleHandleBase;
+  const uint32_t count = sizeof(mcla::kernel::kXexConsoleModules) /
+                         sizeof(mcla::kernel::kXexConsoleModules[0]);
+  if (index >= count) {
+    return nullptr;
+  }
+  return &mcla::kernel::kXexConsoleModules[index];
+}
+
+// The console export with this ordinal in this module, or nullptr.  The
+// export's thunk_va is 0 when this title does not import it, i.e. when the
+// host has no address to hand back.
+static const mcla::kernel::XexConsoleExport *
+XexFindConsoleExport(const mcla::kernel::XexConsoleModule &module,
+                     uint16_t ordinal) {
+  for (uint32_t i = 0; i < module.export_count; i++) {
+    if (module.exports[i].ordinal == ordinal) {
+      return &module.exports[i];
+    }
+  }
+  return nullptr;
+}
+
+// The console export with this NAME in this module, or nullptr.
+static const mcla::kernel::XexConsoleExport *
+XexFindConsoleExportByName(const mcla::kernel::XexConsoleModule &module,
+                            const char *name) {
+  for (uint32_t i = 0; i < module.export_count; i++) {
+    if (XexModuleNameEquals(module.exports[i].name, name)) {
+      return &module.exports[i];
+    }
+  }
+  return nullptr;
+}
+
+// The PE image inside an XEX is a LITTLE-endian PE
+// (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:320 -- "Little-
+// endian! no swapping!"), so the PE header fields are read little-endian out
+// of GUEST memory.  ReadBytes is the checked accessor (src/kernel/memory.h:
+// 109); assembling the word by hand avoids adding an unchecked pointer read.
+static bool GuestReadU32LE(uint32_t guestAddr, uint32_t *out) {
+  if (!out) {
+    return false;
+  }
+  uint8_t bytes[4] = {};
+  if (!mcla::kernel::GuestMemoryHeap::Instance().ReadBytes(guestAddr, bytes, 4)) {
+    return false;
+  }
+  *out = static_cast<uint32_t>(bytes[0]) |
+         (static_cast<uint32_t>(bytes[1]) << 8) |
+         (static_cast<uint32_t>(bytes[2]) << 16) |
+         (static_cast<uint32_t>(bytes[3]) << 24);
+  return true;
+}
+
+static bool GuestReadU16LE(uint32_t guestAddr, uint16_t *out) {
+  if (!out) {
+    return false;
+  }
+  uint8_t bytes[2] = {};
+  if (!mcla::kernel::GuestMemoryHeap::Instance().ReadBytes(guestAddr, bytes, 2)) {
+    return false;
+  }
+  *out = static_cast<uint16_t>(bytes[0] | (bytes[1] << 8));
+  return true;
+}
+
+// Read a NUL-terminated ASCII string out of guest memory.  Bounded so a
+// runaway guest string cannot walk the host's stack.
+static bool GuestReadCString(uint32_t guestAddr, char *out, size_t capacity) {
+  if (!out || capacity == 0) {
+    return false;
+  }
+  for (size_t i = 0; i + 1 < capacity; i++) {
+    uint8_t byte = 0;
+    if (!mcla::kernel::GuestMemoryHeap::Instance().ReadU8(guestAddr + i, &byte)) {
+      return false;
+    }
+    out[i] = static_cast<char>(byte);
+    if (byte == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Resolve an export inside a module that is mapped in guest memory.
+//   moduleBase : the guest VA the module is mapped at
+//   ordinal    : the PE export ordinal, or (top 16 bits set) the guest VA of
+//                the export NAME
+// Returns the guest VA of the exported function, or 0 when it does not exist.
+//
+// RVA -> VA uses the identity map this tree already relies on for the guest
+// image (the module base IS the image base: the measured section table of
+// build/cache/mcla_pe.bin puts .text at RVA 0x130000 and the guest image at
+// 0x82000000, so VA = base + RVA; the same fact is recorded at
+// src/kernel/imports.cpp:6550-6562).
+static uint32_t ResolveGuestModuleExport(uint32_t moduleBase, uint32_t ordinal) {
+  if (!moduleBase) {
+    return 0;
+  }
+
+  // --- PE header -----------------------------------------------------------
+  uint32_t lfanew = 0;
+  if (!GuestReadU32LE(moduleBase + 0x3C, &lfanew) || lfanew > 0x10000000u) {
+    return 0;
+  }
+  const uint32_t ntHeader = moduleBase + lfanew;
+  uint32_t signature = 0;
+  if (!GuestReadU32LE(ntHeader, &signature) || signature != 0x00004550u) {
+    return 0; // not a PE
+  }
+  const uint32_t optHeader = ntHeader + 24;
+  uint16_t optMagic = 0;
+  if (!GuestReadU16LE(optHeader, &optMagic) ||
+      (optMagic != 0x010Bu && optMagic != 0x020Bu)) {
+    return 0;
+  }
+  uint32_t numberOfRvaAndSizes = 0;
+  if (!GuestReadU32LE(optHeader + 0x5C, &numberOfRvaAndSizes) ||
+      numberOfRvaAndSizes < 1) {
+    return 0;
+  }
+  const uint32_t dataDirectories = optHeader + 0x60;
+  uint32_t exportRva = 0;
+  uint32_t exportSize = 0;
+  if (!GuestReadU32LE(dataDirectories + 0, &exportRva) ||
+      !GuestReadU32LE(dataDirectories + 4, &exportSize) || exportRva == 0) {
+    return 0; // no export directory
+  }
+
+  // --- export directory ----------------------------------------------------
+  const uint32_t exportDir = moduleBase + exportRva;
+  uint32_t ordinalBase = 0;
+  uint32_t numberOfFunctions = 0;
+  uint32_t numberOfNames = 0;
+  uint32_t addressOfFunctions = 0;
+  uint32_t addressOfNames = 0;
+  uint32_t addressOfNameOrdinals = 0;
+  if (!GuestReadU32LE(exportDir + 0x10, &ordinalBase) ||
+      !GuestReadU32LE(exportDir + 0x14, &numberOfFunctions) ||
+      !GuestReadU32LE(exportDir + 0x18, &numberOfNames) ||
+      !GuestReadU32LE(exportDir + 0x1C, &addressOfFunctions) ||
+      !GuestReadU32LE(exportDir + 0x20, &addressOfNames) ||
+      !GuestReadU32LE(exportDir + 0x24, &addressOfNameOrdinals)) {
+    return 0;
+  }
+
+  // The function table index.  The PE spec makes the ORDINAL Base + index
+  // (the reference's XEX2 path subtracts the base explicitly,
+  // .research/xenia/src/xenia/cpu/xex_module.cc:129; its PE path does not,
+  // :153-155, which is a divergence in the reference, not in the format).
+  auto functionAt = [&](uint32_t index) -> uint32_t {
+    if (index >= numberOfFunctions) {
+      return 0;
+    }
+    uint32_t functionRva = 0;
+    if (!GuestReadU32LE(moduleBase + addressOfFunctions + index * 4, &functionRva)) {
+      return 0;
+    }
+    if (functionRva == 0) {
+      return 0; // a hole in the export table
+    }
+    return moduleBase + functionRva;
+  };
+
+  if ((ordinal & 0xFFFF0000u) != 0) {
+    // NAME form: the ordinal is a guest VA holding the export name.
+    char wanted[256] = {};
+    if (!GuestReadCString(ordinal, wanted, sizeof(wanted))) {
+      return 0;
+    }
+    for (uint32_t i = 0; i < numberOfNames; i++) {
+      uint32_t nameRva = 0;
+      if (!GuestReadU32LE(moduleBase + addressOfNames + i * 4, &nameRva) || nameRva == 0) {
+        return 0;
+      }
+      char name[256] = {};
+      if (!GuestReadCString(moduleBase + nameRva, name, sizeof(name))) {
+        return 0;
+      }
+      if (std::strcmp(name, wanted) != 0) {
+        continue;
+      }
+      uint16_t index = 0;
+      if (!GuestReadU16LE(moduleBase + addressOfNameOrdinals + i * 2, &index)) {
+        return 0;
+      }
+      return functionAt(index);
+    }
+    return 0;
+  }
+
+  if (ordinal < ordinalBase) {
+    return 0;
+  }
+  return functionAt(ordinal - ordinalBase);
+}
+
+uint32_t XexGetProcedureAddress(uint32_t hModule, uint32_t ordinal,
+                                be<uint32_t> *outProc) {
+  if (!outProc) {
+    // STATUS_INVALID_PARAMETER, 0xC000000D
+    // (.research/xenia/src/xenia/xbox.h:51).
+    return 0xC000000D;
+  }
+
+  // The console zeroes the out slot on failure
+  // (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_modules.cc:179) and
+  // writes the address on success (:167).
+  //
+  // F-841: the lookup is MODULE-AWARE.  The handle says which module the
+  // guest means, because the same ordinal means different exports in
+  // different modules (xam.xex#642 is XamGetSystemVersion, xboxkrnl.exe#642
+  // is XInputdFFGetDeviceInfo -- both measured in the console's export
+  // tables).  Answering without knowing the module is how a resolver hands
+  // back the wrong function.
+  uint32_t resolved = 0;
+  const char *moduleName = "<unknown>";
+  const char *exportName = nullptr;
+  const bool nameForm = (ordinal & 0xFFFF0000u) != 0;
+
+  if (hModule == kXexExecutableModuleHandle) {
+    // The executable module: its own PE export directory, read out of guest
+    // memory.  In this title it is EMPTY (DataDirectory[0] = {0,0}), so this
+    // always fails -- which is the console's answer too.
+    moduleName = "<executable>";
+    resolved = ResolveGuestModuleExport(hModule, ordinal);
+  } else {
+    const mcla::kernel::XexConsoleModule *module =
+        XexFindConsoleModuleByHandle(hModule);
+    if (module) {
+      moduleName = module->name;
+      if (nameForm) {
+        // The console's name form: the ordinal is a guest VA holding the
+        // export name (xboxkrnl_modules.cc:147-149).
+        char wanted[128] = {};
+        if (GuestReadCString(ordinal, wanted, sizeof(wanted))) {
+          const mcla::kernel::XexConsoleExport *entry =
+              XexFindConsoleExportByName(*module, wanted);
+          if (entry) {
+            exportName = entry->name;
+            resolved = entry->thunk_va;
+          }
+        }
+      } else {
+        const mcla::kernel::XexConsoleExport *entry =
+            XexFindConsoleExport(*module, static_cast<uint16_t>(ordinal & 0xFFFFu));
+        if (entry) {
+          exportName = entry->name;
+          // The guest thunk the console's loader binds for this export, or 0
+          // when this title does not import it (then the host has no address
+          // to hand back and the console's own answer is the only honest one).
+          resolved = entry->thunk_va;
+        }
+      }
+    }
+  }
+
+  if (resolved == 0) {
+    outProc->set(0);
+    // House cadence: the first few, then every 100th.  The counter is a REAL
+    // instrument for this body -- it prints on every call it answers, so a
+    // soak can prove the import fired (AGENTS.md rule 19: a zero from an
+    // instrument that never fires is not a result).
+    static std::atomic<uint32_t> s_census{0};
+    const uint32_t n = s_census.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20 || (n % 100) == 0) {
+      MCLA_LOG_WARN("XEX-GPA #{} lr={:08X} module={:08X} name={} ordinal={} "
+                    "export={} -> NOT FOUND "
+                    "(0xC0000263 X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND)",
+                    n, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u),
+                    hModule, moduleName, ordinal,
+                    exportName ? exportName : "?");
+    }
+    // X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND, 0xC0000263
+    // (.research/xenia/src/xenia/xbox.h:77).  Negative, so the guest's
+    // `cmpwi r3,0 / bge` takes its FAILURE branch.
+    return 0xC0000263;
+  }
+
+  outProc->set(resolved);
+  {
+    static std::atomic<uint32_t> s_censusFound{0};
+    const uint32_t n = s_censusFound.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20 || (n % 100) == 0) {
+      MCLA_LOG_WARN("XEX-GPA-FOUND #{} lr={:08X} module={:08X} name={} "
+                    "ordinal={} export={} -> FOUND 0x{:08X}",
+                    n, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u),
+                    hModule, moduleName, ordinal,
+                    exportName ? exportName : "?", resolved);
+    }
+  }
+  return STATUS_SUCCESS;
+}
 
 void XexGetModuleSection() { LOG_UTILITY("!!! STUB !!!"); }
 
@@ -4246,7 +5427,90 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION *cs) {
   }
 }
 
-void RtlImageXexHeaderField() { LOG_UTILITY("!!! STUB !!!"); }
+// ===========================================================================
+// F-840 (2026-10-21) -- RtlImageXexHeaderField: MEASUREMENT ONLY.  NOT FIXED.
+//
+// THIS BODY IS DELIBERATELY LEFT BEHAVIOURALLY UNCHANGED.  It is a `void`
+// hook, so r3 still comes back as the guest's own first argument, exactly as
+// before this batch.  Nothing here changes what the guest sees.
+//
+// WHY IT IS NOT FIXED YET, with the measurements:
+//
+// 1. THE CONSOLE RETURNS A POINTER INTO THE XEX2 HEADER, not a value.  The
+//    guest's own bytes say so: at 0x821329A8
+//    (generated/ppc_xenon/ppc_recomp.0.cpp:7204-7216)
+//      7204  bl 0x827bcf74            ; RtlImageXexHeaderField
+//      7207  cmplwi r3,0
+//      7210  beq -> 821329c8          ; r3 == 0 => "field not found"
+//      7211  lwz r30,0(r3)            ; <-- the guest DEREFERENCES r3
+//    The reference agrees: .research/xenia/src/xenia/cpu/xex_module.cc:69-102
+//    (XexModule::GetOptHeader) returns, for key&0xFF == 0x01, a POINTER to the
+//    inline value, and for any other low byte, a POINTER to
+//    (xex_header + opt_header.offset).  Only key&0xFF == 0x00 returns the
+//    value itself.  (The reference's own RtlImageXexHeaderField_entry at
+//    .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:338-347 throws
+//    the pointer away and returns the value -- that is a divergence between the
+//    reference and the console, and the GUEST is the oracle: it dereferences.)
+//
+// 2. THE TWO FIELDS THE GUEST ASKS FOR, measured out of
+//    build/game_data/default.xex (XEX2 header at file offset 0, security info
+//    at 0x90, 15 opt headers at 0x18):
+//      0x00020401 (XEX_HEADER_DEFAULT_HEAP_SIZE)  -- ABSENT from the 15
+//        opt headers, so the console answers 0 here (site 0x821329A8 asks
+//        for exactly this: raw `lis r4,2 / ori r4,r4,1025` = 0x20401).
+//      0x00040006 (XEX_HEADER_EXECUTION_INFO)     -- PRESENT, opt-header
+//        offset 0x11E4, so the console answers (xex_header + 0x11E4).
+//
+// 3. WHY THE HOST CANNOT PRODUCE THAT POINTER YET.  The answer must be a
+//    guest-readable address INSIDE the XEX2 header, and this host does not
+//    map the XEX2 header into guest memory at all: the boot host copies only
+//    the DECOMPRESSED PE image (src/boot_host.cpp:924-927, InstallGuestImage)
+//    and the XEX2 header is not part of it.  MEASURED: the string "XEX2"
+//    occurs ZERO times in build/cache/mcla_pe.bin, i.e. no guest address
+//    holds an XEX2 header.
+//
+// 4. WHY IT WAS NOT "JUST RETURNED 0".  At the second site the guest stores
+//    the returned value and DEREFERENCES it 12 and 14 bytes further on
+//    (generated/ppc_xenon/ppc_recomp.80.cpp:9433-9450 and its caller
+//    :9496-9509: `lwz r11,80(r1)` then `lhz r10,12(r11)` / `lhz r11,14(r11)`).
+//    Returning 0 there would flip the guest from "success" to
+//    "0xC0000225 STATUS_NOT_FOUND" and change a branch at 0x8244E8CC
+//    (recomp.80.cpp:11902-11911).  That is a behavioural change made on a
+//    GUESS about a field the host cannot supply, and this batch does not make
+//    guesses.
+//
+// WHAT THIS BODY DOES INSTEAD: it measures what the guest passes, so the next
+// pass can finish the job without guessing.  It prints the header pointer the
+// guest handed in, the 4 bytes at that pointer (the XEX2 magic would be
+// 'XEX2' = 0x58455832), and the field index -- once per call site, at the
+// house cadence.
+//
+// NEXT STEP (not done here): map the XEX2 header into guest memory, keep the
+// guest's own header pointer in step with it, and return
+// (header + opt_header.offset) for the keys whose low byte is neither 0x00
+// nor 0x01, 0 for a key the XEX does not carry, and the inline value pointer
+// for key&0xFF == 0x01.
+// ===========================================================================
+void RtlImageXexHeaderField() {
+  if (!g_ppcContext) {
+    return;
+  }
+  static std::atomic<uint32_t> s_census{0};
+  const uint32_t n = s_census.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 20 || (n % 100) == 0) {
+    const uint32_t headerPointer = g_ppcContext->r3.u32;
+    const uint32_t fieldIndex = g_ppcContext->r4.u32;
+    uint8_t magic[4] = {0, 0, 0, 0};
+    const bool magicRead = mcla::kernel::GuestMemoryHeap::Instance().ReadBytes(
+        headerPointer, magic, sizeof(magic));
+    MCLA_LOG_INFO("RIXH #{} lr={:08X} header={:08X} magicRead={} magic=0x{:02X}"
+                  "{:02X}{:02X}{:02X} field=0x{:08X} (BEHAVIOUR UNCHANGED: r3 "
+                  "is still the guest's own argument)",
+                  n, static_cast<uint32_t>(g_ppcContext->lr), headerPointer,
+                  magicRead ? 1 : 0, magic[0], magic[1], magic[2], magic[3],
+                  fieldIndex);
+  }
+}
 
 void HalReturnToFirmware(uint32_t type) {
   // Terminates, never returns - but MCLA calls it mid-boot and continues
@@ -4412,16 +5676,181 @@ uint32_t RtlInitializeCriticalSection(XRTL_CRITICAL_SECTION *cs) {
   return 0;
 }
 
-void RtlRaiseException_x() { LOG_UTILITY("!!! STUB !!!"); }
+// ============================================================================
+// (rule 1b, 2026-10-21, fix_raise) The guest's OWN `raise`.
+//
+// THE CONSOLE'S DELIVERY MECHANISM, READ OUT OF THE GUEST'S OWN BYTES:
+//  1. The guest calls RtlRaiseException(EXCEPTION_RECORD*) -- r3 = the record.
+//     The emitted call is `ctx.lr = 0x821350B8; __imp__RtlRaiseException(ctx,
+//     base);` (generated/ppc_xenon/ppc_recomp.0.cpp:13700-13703; the same
+//     shape at ppc_recomp.0.cpp:14875 and ppc_recomp.81.cpp:19385-19387).
+//     Three guest call sites: 0x821350B4, 0x82135C58, 0x82457D7C
+//     (tools/ppc_xrefs.py calls 0x827BD014).
+//  2. The record is a 32-bit PPC EXCEPTION_RECORD in guest memory, big-endian:
+//     +0 ExceptionCode, +4 ExceptionFlags, +8 ExceptionRecord (nested),
+//     +12 ExceptionAddress, +16 NumberParameters, +24 ExceptionInformation[].
+//     MEASURED at the guest's own record builders: 0x82135094-0x821350B0
+//     (code 0xC0000017 = STATUS_NO_MEMORY, flags, nested, address, nparams)
+//     and 0x82135C38-0x82135C54 (the same five fields), and
+//     0x82457D20-0x82457D60 (code from the caller's r3, flags = r4&1,
+//     nested = 0, address = 0x82457D10, nparams = min(r5,15)).
+//  3. The console's normal delivery target is the GUEST's own catch: the
+//     guest's .text carries 31 eight-byte descriptors
+//     {0x827BCF04 = the address of `__imp____C_specific_handler`,
+//      <scope-table pointer>} immediately BEFORE the entry of the function
+//     that owns the handler (site = fn - 8), and the matching .pdata entry
+//     (20,071 entries) has bit 31 set (0xC000....) where every other entry
+//     has 0x4000.... .  The scope table is the 16-byte MSVC record in .rdata
+//     {EnclosingLevel=1, FilterFunc, HandlerFunc, JumpTarget} -- measured at
+//     0x82102448, 0x82102460, 0x82102478, 0x82102490, 0x82102510,
+//     0x82102528.  So the 360 unwinds the guest's stack, calls the frame's
+//     language handler __C_specific_handler(EXCEPTION_RECORD*,
+//     EstablisherFrame, CONTEXT*, DispatcherContext*), which runs the guest's
+//     Filter then Handler, and the guest resumes at the scope table's
+//     JumpTarget.
+//
+// WHY THE HOST CANNOT REPRODUCE STEP 3 FROM THIS HOOK (measured, not
+// guessed):
+//  (a) The host cannot redirect the recompiled flow.  The emitted code
+//      continues at `loc_821350B8:` immediately after the call
+//      (generated/ppc_xenon/ppc_recomp.0.cpp:13704), so returning from this
+//      hook always resumes the raise site's OWN continuation; the only way
+//      out of the recompiled frames is a host unwind (a host C++ exception
+//      thrown through the guest's frames), which is exactly what must NOT
+//      happen.
+//  (b) The guest's Filter/Handler are mid-function funclets, and the
+//      recompiled function table (45,190 entries,
+//      generated/ppc_xenon/ppc_func_mapping.cpp) contains 0x8213247C and
+//      0x821350D4 (the JumpTargets) but NOT 0x821350BC, 0x8213246C,
+//      0x821348F8, 0x821353B0 or 0x821351D8 -- so PPC_LOOKUP_FUNC cannot
+//      reach a catch block.
+//  (c) The guest imports NO handler-registration call: its 246-entry import
+//      table has no SetUnhandledExceptionFilter and no
+//      RtlAddVectoredExceptionHandler.  The only exception-related imports
+//      are __C_specific_handler (0x827BCF04, 0 call sites), RtlRaiseException
+//      (0x827BD014, 3 call sites) and RtlUnwind (0x827BDCA4, whose local
+//      thunk sub_8274ABB0 has 0 callers).
+//  => The catch block is unreachable, and the console's FALLBACK for an
+//     exception nobody handles -- the process's unhandled-exception path --
+//     IS reachable, and IS the guest's own registered handler: the slot the
+//     guest's fatal dispatcher sub_821BD618 consults
+//     (`lis r11,0x8286 / lwz r10,-352(r11)` ->
+//     generated/ppc_xenon/ppc_recomp.14.cpp:22078-22084) = 0x8285FEA0.  The
+//     guest installs its handler there itself
+//     (`lis r10,0x8213 / lis r8,0x8286 / addi r10,r10,1656 / stw r10,-352(r8)`
+//     at 0x821317AC-0x821317C8) = the guest function 0x82130678, which is in
+//     the recompiled function table.  Its call chain is
+//     0x82130678 -> 0x82388598 (leaf) -> 0x82131C58 ->
+//     __imp__XamShowDirtyDiscErrorUI (the host SUPPRESSES it,
+//     src/kernel/imports.cpp:1599-1601) and sub_821324A0 ->
+//     __imp__XamLoaderLaunchTitle (a host no-op,
+//     src/kernel/imports.cpp:1665-1667).  It never reaches the parking fatal
+//     dispatcher sub_821BD618, so the delivery cannot hang the boot thread.
+//
+// WHAT THIS BODY DOES:
+//  * reads the guest's EXCEPTION_RECORD and LOGS it -- the instrument this
+//    defect class never had: LOG_UTILITY expands to nothing unless _DEBUG is
+//    defined (.research/UnleashedRecomp/UnleashedRecomp/os/logger.h:14-18) and
+//    the build is RelWithDebInfo (build/CMakeCache.txt), so the old stub was
+//    invisible in every soak.
+//  * delivers the exception to the GUEST's registered handler, IN GUEST CODE,
+//    called exactly as the guest's own dispatcher calls it (the dispatcher
+//    sets NO arguments: `mtctr r10 / bctrl`,
+//    generated/ppc_xenon/ppc_recomp.14.cpp:22088-22090) and on the raising
+//    frame's stack, so the handler runs on the guest's own stack.
+//  * NEVER throws: the host's stack is not unwound through the recompiled
+//    frames, and the guest's own RAII/destructors are not run by the host.
+//  * RETURNS: the console's RtlRaiseException does not return, but (a) makes
+//    that impossible here, so the guest continues at the raise site's own
+//    continuation.  This is the task's sanctioned smallest safe step.
+//
+// FALSIFIER (the next soak must answer all three):
+//  * a `RAISE-EXC` row must appear iff the guest really raises; 0 rows means
+//    the guest never raises on this path and this body changed nothing
+//    observable;
+//  * the guest's behaviour AFTER the raise must change: the guest's
+//    registered handler must now run (delivered=1) and the guest's
+//    post-raise path must differ from the pre-fix path;
+//  * the 540 capped VEH rows in build/w846.log CANNOT be fixed by this change
+//    and are NOT the guest's raise: they are the HOST's D3D12 layer throwing
+//    a C++ exception out of D3D12Backend::EnsureGuestRenderTarget ->
+//    m_device->CreateCommittedResource (src/d3d12_backend.cpp:986-988),
+//    which D3D12 catches internally and turns into FAILED(hr) (the host's own
+//    "GUEST-RT-REFUSED ... create-failed" row, build/w846.log:9722) -- a
+//    vectored handler sees every C++ throw, caught or not
+//    (build/w846.log:9692-9721 is the stack).  That file belongs to another
+//    agent; this change does not touch it.
+// ============================================================================
+void RtlRaiseException_x(PPCContext &ctx, uint8_t *base) {
+  const uint32_t recVa = ctx.r3.u32;
+  uint32_t code = 0, flags = 0, nest = 0, excAddr = 0, nparams = 0, info0 = 0;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const bool recOk = mem.ReadU32BE(recVa + 0, &code);
+  (void)mem.ReadU32BE(recVa + 4, &flags);
+  (void)mem.ReadU32BE(recVa + 8, &nest);
+  (void)mem.ReadU32BE(recVa + 12, &excAddr);
+  (void)mem.ReadU32BE(recVa + 16, &nparams);
+  (void)mem.ReadU32BE(recVa + 24, &info0);
 
-void KfReleaseSpinLock(uint32_t *spinLock) {
+  // The guest's REGISTERED handler (the console's process unhandled-exception
+  // filter, in the guest's own terms): the slot the guest's fatal dispatcher
+  // sub_821BD618 reads -- generated/ppc_xenon/ppc_recomp.14.cpp:22078-22084.
+  constexpr uint32_t kGuestHandlerSlot = 0x8285FEA0u;
+  uint32_t handler = 0;
+  (void)mem.ReadU32BE(kGuestHandlerSlot, &handler);
+
+  static std::atomic<uint32_t> s_raiseCount{0};
+  const uint32_t n = s_raiseCount.fetch_add(1) + 1;
+
+  bool delivered = false;
+  if (handler != 0) {
+    uint8_t *gbase = mcla::kernel::g_memory.base;
+    PPCFunc *fn = PPC_LOOKUP_FUNC(gbase, handler);
+    if (fn != nullptr) {
+      // In GUEST CODE, on the raising frame's stack, with the SAME arguments
+      // the guest's own dispatcher passes (none: it does `mtctr r10; bctrl`).
+      PPCContext hctx = ctx;
+      hctx.r3.u32 = recVa; // the record; the handler overwrites r3 with 0
+      PPCContext *cur = GetPPCContext();
+      if (cur != nullptr) {
+        ScopedPPCContext scope(*cur, hctx);
+        fn(hctx, gbase);
+      } else {
+        fn(hctx, gbase);
+      }
+      delivered = true;
+    }
+  }
+
+  MCLA_LOG_WARN(
+      "RAISE-EXC #{} lr={:08X} record={:08X} recordRead={} code=0x{:08X} "
+      "flags=0x{:08X} nest=0x{:08X} addr=0x{:08X} nparams={} info0=0x{:08X} "
+      "handlerSlot={:08X} handler={:08X} delivered={} -- the guest's raise was "
+      "delivered to the guest's own registered handler IN GUEST CODE (the "
+      "guest's C++ catch block is unreachable from the host: the recompiled "
+      "flow cannot be redirected and the catch blocks are not function-table "
+      "entries); the host stack was NOT unwound and the guest continues at "
+      "the raise site's own continuation",
+      n, static_cast<uint32_t>(ctx.lr), recVa, recOk ? 1 : 0, code, flags, nest,
+      excAddr, nparams, info0, kGuestHandlerSlot, handler, delivered ? 1 : 0);
+  spdlog::default_logger()->flush();
+}
+
+
+void KfReleaseSpinLock(uint32_t *spinLock, uint32_t oldIrql) {
+  // Console order (xboxkrnl_threading.cc:940-947): LOWER first, then unlock.
+  // The guest passes the value KeRaiseIrqlToDpcLevel/KfAcquireSpinLock gave
+  // it (0x82419738 `mr r29,r3` -> 0x82419804 `mr r4,r29` -> 0x8241980C
+  // `bl __imp__KfReleaseSpinLock`), so the host and the guest agree on the
+  // level they are leaving.
+  HostLowerIrql(static_cast<uint8_t>(oldIrql & 0xFF));
   std::atomic_ref spinLockRef(*spinLock);
   spinLockRef = 0;
 }
 
 static constexpr uint32_t bswap32(uint32_t v) { return __builtin_bswap32(v); }
 
-void KfAcquireSpinLock(uint32_t *spinLock) {
+uint32_t KfAcquireSpinLock(uint32_t *spinLock) {
   // The lock word lives in GUEST memory and guest inline code reads/writes it
   // through BE accessors (PPC_LOAD_U32/PPC_STORE_U32 bswap). All values we
   // store here must therefore be byte-swapped into guest order, and the
@@ -4479,6 +5908,27 @@ void KfAcquireSpinLock(uint32_t *spinLock) {
     }
     std::this_thread::yield();
   }
+
+  // Console (xboxkrnl_threading.cc:914-935): lock, THEN raise the IRQL to
+  // DISPATCH, and RETURN THE OLD IRQL.  The guest consumes r3 immediately
+  // (0x82419730 `bl __imp__KfAcquireSpinLock` -> 0x82419738 `mr r29,r3` ->
+  // 0x82419804 `mr r4,r29` -> 0x8241980C `bl __imp__KfReleaseSpinLock`),
+  // so before this change the guest's "old IRQL" slot received the LOCK
+  // POINTER (the host returned void, so r3 still held the lock pointer).
+  const uint32_t oldIrql = HostRaiseIrql(kIrqlDispatch);
+  {
+    static std::atomic<uint32_t> s_kfAcquire{0};
+    const uint32_t n = s_kfAcquire.fetch_add(1) + 1;
+    if (n <= 40 || (n % 5000) == 0)
+      MCLA_LOG_INFO("IRQL-KFACQUIRE #{} lock={:08X} old_irql={} new_irql={}",
+                    n,
+                    static_cast<uint32_t>(
+                        reinterpret_cast<uintptr_t>(spinLock) -
+                        reinterpret_cast<uintptr_t>(
+                            mcla::kernel::g_memory.base)),
+                    oldIrql, static_cast<unsigned>(kIrqlDispatch));
+  }
+  return oldIrql;
 }
 
 uint64_t KeQueryPerformanceFrequency() { return 49875000; }
@@ -4544,19 +5994,74 @@ void VdGetSystemCommandBuffer(uint32_t p0, uint32_t p1) {
   }
 }
 
+// Console (xboxkrnl_threading.cc:978-982): unlock only, NO IRQL change --
+// the caller is "at raised IRQL" and lowers it itself.  The guest does
+// exactly that: 0x823EACF0 `bl __imp__KeReleaseSpinLockFromRaisedIrql` ->
+// 0x823EACF8 `bl __imp__KfLowerIrql(saved)`.
 void KeReleaseSpinLockFromRaisedIrql(uint32_t *spinLock) {
   std::atomic_ref spinLockRef(*spinLock);
   spinLockRef = 0;
 }
 
+// Console (xboxkrnl_threading.cc:956-963): CAS 0->1 and SPIN -- forever.
+// The host cannot afford "forever": its guest threads are COOPERATIVE (a
+// host thread that spins never yields the CPU to the holder), so an
+// unbounded spin here wedges that host thread outright -- the one mechanism
+// in the whole import table that can kill a thread by itself.
+//
+// TRADE-OFF, stated: after 5 s the host LOGS the holder and STEALS the lock.
+// That breaks mutual exclusion for the remainder of the lock's life (the
+// console would have kept waiting, and the console's holder is preemptible
+// because DISPATCH/DPC IRQL outranks the waiter).  The alternative --
+// spinning forever -- trades a rare, LOGGED, time-boxed correctness loss for
+// a guaranteed, SILENT death of whichever host thread lost the race.  The
+// same trade was already taken for KfAcquireSpinLock (the 5 s
+// KFSPIN-RECOVERY steal); this edit makes the two paths agree.
+//
+// FALSIFIER: a soak that shows KFSPIN-RECOVERY-ATIRQL with a holder that is
+// still making progress means the 5 s window is too short (raise it) and the
+// steal is unnecessary; a soak with KFSPIN-CONTENDED but NO recovery means
+// the window is right.
 void KeAcquireSpinLockAtRaisedIrql(uint32_t *spinLock) {
   std::atomic_ref spinLockRef(*spinLock);
+  const uint32_t selfBe = bswap32(g_ppcContext->r13.u32);
 
+  const auto start = std::chrono::steady_clock::now();
+  bool recovered = false;
+  uint32_t spins = 0;
   while (true) {
     uint32_t expected = 0;
-    if (spinLockRef.compare_exchange_weak(expected, bswap32(g_ppcContext->r13.u32)))
+    if (spinLockRef.compare_exchange_weak(expected, selfBe))
       break;
 
+    if (!recovered &&
+        std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) {
+      recovered = true;
+      MCLA_LOG_WARN(
+          "KFSPIN-RECOVERY-ATIRQL lock@{:08X} holder_r13be={:08X} spins={} "
+          "lr={:08X} - stealing after 5s (the console spins forever; the "
+          "host's cooperative threads cannot preempt the holder, so an "
+          "unbounded spin would wedge this host thread)",
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(spinLock) -
+                                reinterpret_cast<uintptr_t>(
+                                    mcla::kernel::g_memory.base)),
+          bswap32(spinLockRef.load()), spins,
+          g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0);
+      spinLockRef.store(selfBe, std::memory_order_release);
+      break;
+    }
+
+    const uint32_t n = ++spins;
+    if (n <= 60 || (n % 5000) == 0) {
+      const uint32_t holder = bswap32(spinLockRef.load());
+      MCLA_LOG_INFO("KFSPIN-CONTENDED lock@{:08X} holder_r13be={:08X} "
+                    "spins={} lr={:08X}",
+                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(spinLock) -
+                                          reinterpret_cast<uintptr_t>(
+                                              mcla::kernel::g_memory.base)),
+                    holder, n,
+                    g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0);
+    }
     std::this_thread::yield();
   }
 }
@@ -4625,13 +6130,335 @@ void VdGetCurrentDisplayInformation() { LOG_UTILITY("!!! STUB !!!"); }
 
 void VdSetDisplayMode() { LOG_UTILITY("!!! STUB !!!"); }
 
+// F-818: file scope, so the CP's interrupt dispatch (VdDispatchGraphicsInterrupt, below) can
+// read the LIVE registration the guest made. They were function-local inside
+// VdSetGraphicsInterruptCallback, which kept them invisible to every other TU.
+static std::atomic<uint32_t> s_vsyncCallback{0};
+static std::atomic<uint32_t> s_vsyncUserData{0};
+
+// ============================================================================
+// GUEST DPC QUEUE (2026-10-21, fix_dpc) -- modelled from the GUEST'S OWN BYTES.
+//
+// MEASURED in build/cache/mcla_pe.bin (offset = VA - 0x82000000):
+//   0x8242FD00 -- the guest's KeInsertQueueDpc -- does, in order:
+//     lbz   r10,268(r13)        ; the KPCR CPU byte. The host emulates the
+//                               ; KPCR at 0x8F200000 (see kPcrCpuByte below,
+//                               ; and the same byte VdDispatchGraphicsInterrupt
+//                               ; saves/restores at imports.cpp).
+//     mulli r10,r10,80         ; cpu * 80
+//     lwz   r11,2148(r11)       ; [0x82000864]    (image word)
+//     lwz   r11,0(r11)          ; [[0x82000864]]  = the per-CPU array base
+//     add   r11,r10,r11         ; base + cpu*80
+//     addi  r31,r11,11324       ; ring = base + cpu*80 + 0x2C3C
+//     lwz   r10,11380(r11)      ; count = ring + 0x38
+//     clrlwi/addi/rlwinm       ; index = (count & 3)
+//     stwx  r5,r10,r31          ; ring[0x40 + 4*index] = the DPC pointer
+//     lwz/addi/stw 11380       ; count++
+//     bl    0x8242EBA0 (x2)    ; push {cpu, ptr} on the lock-free stack at
+//                               ; 0x828D2FC8 (payload 0x828D1F90/0x828D1F94)
+//     bl    0x827BD564          ; KeSetEvent(ring + 0x20, 1, 0)
+//   => the DPC list is PER CPU -- not per thread, and NOT at 0x40004D5C --
+//      4 entries deep, with an event at ring+0x20 that the enqueue raises.
+//
+// THE DRAIN IS THE ENVIRONMENT'S JOB. In the image, the ONLY three
+// references to the count field (displacement 0x2C74) are 0x8242FD38,
+// 0x8242FD4C and 0x8242FD54 -- all inside the enqueue -- and the ONLY
+// reference to the stack head 0x828D2FC8 is the pusher 0x8242EBA0. Nothing
+// in the image reads either structure, so on the console the kernel drains
+// the per-CPU DPC list when the IRQL drops below DPC_LEVEL. Here the host
+// IS the kernel, so the host drains it.
+//
+// DISPATCH POINT: the host's vblank thread (the kernel-role duty thread in
+// VdSetGraphicsInterruptCallback) is the host's IRQL-lowering point -- the
+// same place the old "BOOT-GATE LEVER" comment sat.
+//
+// WHAT THIS REPLACES (and does not): the old comment (imports.cpp, W36d,
+// 2026-09-18) claimed the boot gate "is never called because the game's
+// kernel KeInsertQueueDpc (sub_8242FD00) is invoked via indirect dispatch
+// from unmapped stubs that were never recompiled" and that "the DPC queue
+// at 0x40004D5C stays forever empty". The bytes do not support either
+// claim: the guest's 206-entry import table (0x827BD004..0x827BDCD4,
+// generated/ppc_xenon/ppc_func_mapping.cpp) contains NO KeInsertQueueDpc
+// import, and 0x8242FD00 has ZERO direct call sites in the image
+// (tools/ppc_xrefs.py calls 0x8242FD00 -> "0 call site(s)"); it is only
+// ever passed as a CALLBACK ADDRESS (0x8241C540, 0x8241CBB0, 0x82430004).
+// The boot gate 0x82131008 likewise appears exactly ONCE in the whole image
+// (0x821315F4, `addi r4,r11,4104` inside sub_82131508) where it is stored
+// as a 5-word delegate {fn=0x82131008, mode=1} into an engine object --
+// it is NOT enqueued as a DPC.
+// ============================================================================
+
+// ============================================================================
+// THE ISR's THREAD BLOCK (2026-10-21, fix_irq2, item 3)
+// ============================================================================
+//
+// MEASURED DEFECT: EVERY host ISR context was hard-aliased to the BOOT
+// WORKER's thread block:
+//   * the vblank ISR:      cbCtx.r13.u32 = 0x8F200000
+//   * the PM4/CP interrupt: ctx.r13.u32  = 0x8F200000
+//   * the DPC dispatch:    dpcCtx.r13.u32 = 0x8F200000
+// and 0x8F200000 IS the boot worker's own block (src/boot_host.cpp:1093
+// `constexpr uint32_t ThreadBlock = 0x8F200000u`, tagged
+// "boot-worker:static-8F200000" at :1139).
+//
+// WHY THAT IS A CORRECTNESS BUG, in the guest's own bytes: the console's
+// lock-ownership test is "owner == r13":
+//   0x823EAD18  mr r30,r13            ; r30 = this thread's identity
+//   0x823EAD28  lwz r10,8(r31)       ; the lock's OWNER field
+//   0x823EAD2C  cmplw r10,r30        ; owner == me?
+//   0x823EAD30  beq -> 823EADA0      ; SAME OWNER => recursive path: NO CAS
+// With one shared r13 the vblank ISR and the boot worker were the SAME owner,
+// so the guest's own recursive path SKIPPED the compare-and-swap and
+// MUTUAL EXCLUSION WAS LOST SILENTLY.  (The guest also stores the owner
+// itself: 0x823EAD98 `stw r30,8(r31)`.)
+//
+// FIX: each host thread that runs guest ISR code gets its OWN PCR block, so
+// the ownership test means something.  The block is the F-609 per-thread
+// block (src/boot_host.cpp:1817 AllocateGuestThreadBlock -- the same block a
+// real guest thread gets), with its TLS and TEB pointers REPOINTED at the
+// boot worker's, so every guest read of [r13+0] (TLS) and [r13+0x100] (TEB)
+// sees exactly what it saw before.  The change is confined to the r13
+// IDENTITY, which is the only thing that has to change.  (On the console an
+// ISR runs on a CPU whose KPCR still points at the interrupted thread's
+// TLS/TEB, so sharing them is the closer model, not a compromise.)
+//
+// WHAT IS DELIBERATELY NOT CHANGED: the ISR's STACK (r1 = 0x8F000000) is
+// still the shared 2 MiB static stack.  The F-609 block's own stack is
+// 0x40000 bytes and lives INSIDE a g_userHeap allocation, so moving the ISR
+// onto it risks a guest-stack overflow into the heap -- a worse failure than
+// the one being fixed, and outside this task's scope.  The shared stack is a
+// SEPARATE, still-open hazard; falsifier: a soak whose VSYNC-ISR enter/exit
+// rows interleave with a boot-worker stack walk that shows corruption.
+// ============================================================================
+
+// The boot worker's thread block and the two pointers inside it
+// (src/boot_host.cpp:1093-1099: TableBase = ThreadBlock + 0x1000 is the TLS
+// array, Teb = ThreadBlock + 0x5000).
+static constexpr uint32_t kBootWorkerPcr = 0x8F200000u;
+static constexpr uint32_t kBootWorkerTls = 0x8F201000u;
+static constexpr uint32_t kBootWorkerTeb = 0x8F205000u;
+
+// The r13 an ISR context on THIS host thread uses.
+static uint32_t IsrThreadBlockVa() {
+  static thread_local uint32_t t_blockVa = 0;
+  static thread_local bool t_resolved = false;
+  if (t_resolved)
+    return t_blockVa;
+  t_resolved = true;
+
+  // (2026-10-21, fix_raise) `GuestThreadBlock` / `AllocateGuestThreadBlock`
+  // moved into `namespace mcla::boot` in src/boot_host.h (another session's
+  // edit; this is the only use of those two names outside boot_host.cpp, and
+  // the compiler's own suggestion is `mcla::boot::`).  Qualified here so this
+  // TU compiles; no behaviour change.
+  mcla::boot::GuestThreadBlock *block = mcla::boot::AllocateGuestThreadBlock("isr", 0);
+  if (block == nullptr || !block->valid()) {
+    MCLA_LOG_WARN("ISR-CTX #1 no thread block available - keeping the boot "
+                  "worker's r13={:08X}; the guest's owner==r13 test stays "
+                  "AMBIGUOUS between the ISR and the boot worker",
+                  kBootWorkerPcr);
+    return kBootWorkerPcr;
+  }
+  t_blockVa = block->pcrVa;
+  // Repoint TLS/TEB at the boot worker's so nothing that reads them changes.
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  (void)mem.WriteU32BE(t_blockVa + 0x000u, kBootWorkerTls);
+  (void)mem.WriteU32BE(t_blockVa + 0x100u, kBootWorkerTeb);
+  MCLA_LOG_INFO("ISR-CTX #1 block={:08X} tls={:08X} teb={:08X} (was r13={:08X})",
+                t_blockVa, kBootWorkerTls, kBootWorkerTeb, kBootWorkerPcr);
+  return t_blockVa;
+}
+
+// The KPCR CPU byte: the guest reads the processor index as a BYTE at
+// [r13+268] (`lbz r11,268(r13)` @ 0x8242FD14, and @ 0x824114D4 for the
+// graphics interrupt).  The host's KPCR block is the one THIS host thread
+// uses (see IsrThreadBlockVa above), so the byte is per-host-thread now
+// instead of per-process.
+static uint32_t DpcPcrCpuByte() { return IsrThreadBlockVa() + 268u; }
+// The image word that points at the per-CPU array: `lwz r11,2148(r11)` with
+// r11 = 0x82000000 -> [0x82000864].
+static constexpr uint32_t kDpcPerCpuPtrWord = 0x82000864u;
+// ring = base + cpu*80 + 0x2C3C; count at ring+0x38; 4 slots at ring+0x40;
+// the event the enqueue raises is at ring+0x20.
+static constexpr uint32_t kDpcRingOffset = 0x2C3Cu;
+static constexpr uint32_t kDpcCountOffset = 0x38u;
+static constexpr uint32_t kDpcSlotsOffset = 0x40u;
+static constexpr uint32_t kDpcSlots = 4u;
+static constexpr uint32_t kDpcCpuStride = 80u;
+
+// The guest's per-CPU DPC ring base, computed exactly as the guest computes
+// it. 0 = unresolvable (the image word or the per-CPU array is not mapped).
+static uint32_t GuestDpcRingBase(uint8_t cpu) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t pcr = 0;
+  if (!mem.ReadU32BE(kDpcPerCpuPtrWord, &pcr))
+    return 0;
+  uint32_t base = 0;
+  if (!mem.ReadU32BE(pcr, &base))
+    return 0;
+  return base + static_cast<uint32_t>(cpu) * kDpcCpuStride + kDpcRingOffset;
+}
+
+// Drain the guest's per-CPU DPC list and run the queued DPCs with the
+// console's DPC ABI (r3 = the DPC object, r4/r5 = the system arguments).
+// Returns the number of DPCs dispatched.
+static uint32_t DispatchGuestDpcQueue() {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint8_t cpu = 0;
+  (void)mem.ReadU8(DpcPcrCpuByte(), &cpu);
+
+  const uint32_t ring = GuestDpcRingBase(cpu);
+  if (ring == 0) {
+    static std::atomic<uint32_t> s_noRing{0};
+    const uint32_t n = s_noRing.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4 || (n % 500) == 0u) {
+      uint32_t pcr = 0;
+      (void)mem.ReadU32BE(kDpcPerCpuPtrWord, &pcr);
+      MCLA_LOG_INFO("DPC-CENSUS #{} no-ring cpu={} pcrword={:08X} "
+                    "(the per-CPU array is not mapped)",
+                    n, static_cast<uint32_t>(cpu), pcr);
+    }
+    return 0;
+  }
+
+  uint32_t count = 0;
+  if (!mem.ReadU32BE(ring + kDpcCountOffset, &count))
+    return 0;
+  if (count == 0)
+    return 0;
+
+  // The ring is 4 deep and the guest's index is (count & 3): the NEWEST
+  // entry is at (count-1)&3, so the oldest of the n entries we take sits at
+  // (count-n)&3. Take them oldest-first (FIFO).
+  const uint32_t n = (count > kDpcSlots) ? kDpcSlots : count;
+  uint32_t entries[kDpcSlots] = {0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t slot = (count - n + i) & (kDpcSlots - 1u);
+    (void)mem.ReadU32BE(ring + kDpcSlotsOffset + slot * 4u, &entries[i]);
+  }
+  // Take them: the count is the guest's only index source, and zeroing it
+  // makes the next append land in slot 0 (the guest's own (count&3) rule).
+  (void)mem.WriteU32BE(ring + kDpcCountOffset, 0);
+
+  uint8_t *base = mcla::kernel::g_memory.base;
+  uint32_t dispatched = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t entry = entries[i];
+    if (entry == 0)
+      continue;
+    // Two candidate models, both guarded by "is this a REGISTERED guest
+    // function?" so the host never executes data:
+    //   (a) the queued word IS the routine (the routine-pointer model);
+    //   (b) the queued word is a DPC OBJECT whose first word is the routine
+    //       (the console's KDPC layout: {Routine, Arg1, Arg2}).
+    PPCFunc *fn = mcla::kernel::g_memory.FindFunction(entry);
+    uint32_t routine = entry;
+    if (!fn) {
+      uint32_t w0 = 0;
+      if (mem.ReadU32BE(entry, &w0)) {
+        PPCFunc *f2 = mcla::kernel::g_memory.FindFunction(w0);
+        if (f2) {
+          fn = f2;
+          routine = w0;
+        }
+      }
+    }
+    if (!fn) {
+      static std::atomic<uint32_t> s_unresolved{0};
+      const uint32_t u = s_unresolved.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (u <= 20 || (u % 100) == 0u) {
+        MCLA_LOG_WARN("DPC-UNRESOLVED #{} entry={:08X} ring={:08X} cpu={} - "
+                      "not a registered guest function; dropped",
+                      u, entry, ring, static_cast<uint32_t>(cpu));
+      }
+      continue;
+    }
+    static std::atomic<uint32_t> s_dpcRuns{0};
+    const uint32_t rn = s_dpcRuns.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (rn <= 40 || (rn % 500) == 0u) {
+      MCLA_LOG_INFO("DPC-DISPATCH #{} entry={:08X} routine={:08X} ring={:08X} "
+                    "cpu={} count={}",
+                    rn, entry, routine, ring, static_cast<uint32_t>(cpu), count);
+    }
+    // Console DPC ABI: the routine runs at DPC_LEVEL on the interrupted
+    // thread's stack, with (Dpc, SystemArgument1, SystemArgument2).
+    PPCContext dpcCtx{};
+    dpcCtx.r3.u32 = entry;
+    dpcCtx.r4.u32 = 0;
+    dpcCtx.r5.u32 = 0;
+    dpcCtx.r13.u32 = IsrThreadBlockVa(); // THIS host thread's block, not the
+                                         // boot worker's (see IsrThreadBlockVa)
+    dpcCtx.r1.u32 = 0x8F000000u;   // stack top, as the vblank path
+    dpcCtx.lr = 0x00FFFFFFu;       // dummy LR, as the vblank path
+    dpcCtx.msr = 0x200A000;
+    PPCContext *prev = GetPPCContext();
+    SetPPCContext(dpcCtx);
+    fn(dpcCtx, base);
+    if (prev)
+      SetPPCContext(*prev);
+    ++dispatched;
+  }
+  return dispatched;
+}
+
+// EXPLICIT, STATED period of the host's guest-clock tick.
+//
+// WHY (2026-10-21, fix_typebyte).  The guest's clock handler (0x8242FB88 -
+// the title's "GPU poller"; the guest's own message registry pairs it with
+// message id 0x40005E03) waits on 0x40004D7C with an EXPLICIT 30 ms
+// deadline: the guest builds the timeout in its own frame with
+// `lis r11,FFFB / ori r11,r11,6C20 / std r11,80(r1)` = -300000 100-ns ticks
+// = 30 ms (0x8242FBA8..0x8242FBBC) and branches to its own STATUS_TIMEOUT
+// handler at 0x8242FC3C (`cmpli cr6,r3,0102 / beq -> 0x8242FC3C`) when the
+// deadline expires.
+//
+// The host used to deliver that tick from the GPU-vblank thread (~16.6 ms
+// MEASURED), so the signal ALWAYS beat the 30 ms deadline and the guest's
+// watchdog was 100% dead: build/w842.log has 4809 WAKE[KWFSO] rows, every
+// one status=00000000, and NOT ONE status=00000102.
+//
+// 40 ms is the smallest round period that leaves a 10 ms margin over the
+// guest's 30 ms deadline (the host timer must never drift under it, and the
+// guest re-arms its wait a little after each tick).  This is a STATED host
+// choice, NOT a measured console fact: the console's true clock period for
+// this object is not measurable from this tree (build/agents/audit_irq.md
+// sec.D records exactly that gap).
+//
+// FALSIFIER: the guest's 30 ms waits must start returning STATUS_TIMEOUT
+// (WAKE[KWFSO] status=00000102 must appear) and the guest's watchdog body at
+// 0x8242FC3C must execute.  If the parent's soak shows the guest's poller
+// stalling or the boot regressing, this constant is the single knob.
+static constexpr uint32_t kGuestClockTickPeriodMs = 40;
+
+// Start the dedicated guest-clock tick thread (once).
+static void StartGuestClockTickThread()
+{
+    static std::atomic<bool> s_clockTickStarted{false};
+    if (s_clockTickStarted.exchange(true))
+        return;
+    std::thread([]() {
+        using namespace std::chrono;
+        const auto period = milliseconds(kGuestClockTickPeriodMs);
+        auto next = steady_clock::now() + period;
+        while (true) {
+            std::this_thread::sleep_until(next);
+            const auto now = steady_clock::now();
+            next += period;
+            // Never let a late wake shorten the next period below the stated
+            // one (otherwise the tick could slip under the guest's 30 ms
+            // deadline and the watchdog would go silent again).
+            if (next <= now)
+                next = now + period;
+            SignalSchedulerTick();
+        }
+    }).detach();
+}
+
 void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
   MCLA_LOG_INFO(
       "VdSetGraphicsInterruptCallback: callback=0x{:08X} user=0x{:08X}",
       callback, userData);
 
-  static std::atomic<uint32_t> s_vsyncCallback{0};
-  static std::atomic<uint32_t> s_vsyncUserData{0};
   static std::atomic<bool> s_vsyncRunning{false};
   static uint32_t s_frameCounter = 0;
 
@@ -4663,7 +6490,10 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
             cbCtx.r4.u32 = currentUserData; // GPU context pointer
             cbCtx.r5.u32 = 0;               // field counter
             cbCtx.r13.u32 =
-                0x8F200000; // thread block pointer (from boot_host.cpp)
+                IsrThreadBlockVa(); // THIS host thread's PCR block -- it used
+                                    // to be the boot worker's 0x8F200000, which
+                                    // made the guest's owner==r13 lock test
+                                    // ambiguous (see IsrThreadBlockVa)
             cbCtx.r1.u32 = 0x8F000000; // stack top (from boot_host.cpp)
             cbCtx.lr = 0x00FFFFFF;     // dummy LR
             cbCtx.msr = 0x200A000;
@@ -4704,24 +6534,53 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
             // real consumed dwords (see CpVblankDrainToWptr).
             mcla::gpu::CpVblankDrainToWptr();
 
-            // Signal scheduler tick semaphore (0x40004D7C) to unblock main
-            // thread wait. This is the kernel-role duty that the real hardware
-            // GPU ISR/vblank path would perform. The game's main thread waits
-            // on 0x40004D7C with ~30ms timeout; without this signal, the main
-            // thread parks forever. Signal scheduler tick semaphore
-            // (0x40004D7C) to unblock main thread wait. This is the kernel-role
-            // duty that the real hardware GPU ISR/vblank path would perform.
-            SignalSchedulerTick();
+            // CLOCK TICK (2026-10-21, fix_typebyte): the guest's clock-tick
+            // object (0x40004D7C) is NO LONGER released from this vblank
+            // loop.  MEASURED: the vblank cadence is ~16.6 ms (TICK-PROBE
+            // #1..#60 in build/w842.log span 12:41:45.292 -> 12:41:46.272,
+            // i.e. ~60 Hz) while the guest's own wait asks for a 30 ms
+            // deadline (build/w842.log "WAIT[KWFSO] ... obj@40004D7C ...
+            // to=30ms"), so EVERY one of the 4809 waits was satisfied by a
+            // real signal before the deadline and the guest's own
+            // STATUS_TIMEOUT branch at 0x8242FC3C
+            // (`cmpli cr6,r3,0102 / beq -> 0x8242FC3C`) could never run
+            // (WAKE status histogram {00000000: 4809}; no 00000102 at all).
+            //
+            // The host has NO CPU clock (audit_irq.md C1): the vblank is a
+            // graphics event, not the console's title clock.  The tick now
+            // runs on its own host timer with an EXPLICIT, STATED period
+            // (kGuestClockTickPeriodMs) LONGER than the guest's own 30 ms
+            // deadline, so the deadline is reachable and the guest's
+            // watchdog runs - the branch the console takes when its clock is
+            // late.  See StartGuestClockTickThread below.
+            StartGuestClockTickThread();
 
-            // W36d BOOT-GATE LEVER (2026-09-18): The boot gate
-            // sub_82131008 is never called because the game's kernel
-            // KeInsertQueueDpc (sub_8242FD00) is invoked via indirect
-            // dispatch from unmapped stubs that were never recompiled.
-            // The DPC queue at 0x40004D5C stays forever empty and the
-            // boot worker thread parks in a wait-wake-nothing loop.
-            // Fix: spawn a one-shot thread that calls the boot gate.
-            // We CANNOT call it from the VSync ISR because the boot gate
-            // calls UILOAD (sub_822C0980) which calls KeWaitForSingleObject
+            // W36d BOOT-GATE LEVER (2026-09-18) -- RETIRED BY MEASUREMENT
+            // (2026-10-21, fix_dpc). The old text here claimed the boot gate
+            // "is never called because the game's kernel KeInsertQueueDpc
+            // (sub_8242FD00) is invoked via indirect dispatch from unmapped
+            // stubs that were never recompiled" and that "the DPC queue at
+            // 0x40004D5C stays forever empty". The guest's bytes do not
+            // support either claim:
+            //   * the guest's 206-entry import table (0x827BD004..0x827BDCD4)
+            //     has NO KeInsertQueueDpc import;
+            //   * 0x8242FD00 has ZERO direct call sites in the image
+            //     (tools/ppc_xrefs.py calls 0x8242FD00) -- it is only passed
+            //     as a CALLBACK ADDRESS (0x8241C540, 0x8241CBB0, 0x82430004);
+            //   * the queue is NOT at 0x40004D5C: it is the PER-CPU ring at
+            //     mem[mem[0x82000864]] + cpu*80 + 0x2C3C (see the GUEST DPC
+            //     QUEUE block above);
+            //   * the boot gate 0x82131008 appears exactly ONCE in the image
+            //     (0x821315F4) where it is stored as a 5-word delegate on an
+            //     engine object -- it is NOT enqueued as a DPC.
+            // The host did NOT re-add the forced boot-gate dispatch
+            // (PROGRAM_GUIDE §7: kF368HostDispatchGate is RETIRED, F-609).
+            //
+            // What IS the kernel's job, and is now done here: drain the
+            // guest's per-CPU DPC list. This thread is the host's IRQL
+            // lowering point (the console dispatches DPCs when the IRQL drops
+            // below DPC_LEVEL).
+            DispatchGuestDpcQueue();
             // Ring-buffer submission probe: sample the head of the
             // primary ring every ~2s (120 frames) to see whether
             // the game ever writes PM4 packets for us to consume.
@@ -4759,10 +6618,91 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
   }
 }
 
-// Signal scheduler tick semaphore (0x40004D7C) to unblock main thread wait
-// This is the kernel-role duty that the real hardware GPU ISR/vblank path would
-// perform. The game's main thread waits on 0x40004D7C with ~30ms timeout;
-// without this signal, the main thread parks forever.
+// F-818 (FENCECLEAR): dispatch the registered graphics-interrupt callback the way the console's
+// CP does when it drains a PM4_INTERRUPT packet. MEASURED in w806: the guest submits
+// `C0005400 mask=00000004` (opcode 0x54, cpu_mask=4 => CPU index 2) once per beat
+// (CP-INTERRUPT #1..#8), and registers `callback=0x82411478 user=0x40002080`
+// (VdSetGraphicsInterruptCallback row, stored in the two file-scope atomics above). The
+// consumer's r3==1 arm (raw bytes 0x82411490-0x824114FC, tools/ppc_disasm.py): loads the
+// mailbox base from [ctx+0x2A94], calls the slot-4 callback at [mb+16] with [mb+20], then
+// under the spinlock at ctx+0x2A98 (bl 0x827BD504 / 0x827BD544) RMWs [mb+0] clearing bit
+// `1 << [r13+268]` -- and [mb+0] IS the poll address of the 10th PM4_WAIT_REG_MEM
+// (pollVA=B845D040, ref=0). That clear is the fence the beat has been waiting for; without it
+// the wait timed out 144 times and parked ring A (F-813).
+// Xenia's reference dispatches per set bit of the packet's mask: command_processor.cc:900-913
+// -> DispatchInterruptCallback(1, n) -> graphics_system.cc:241-261 with SetActiveCpu at :253,
+// which is exactly the [r13+268] read. Our own vblank thread already calls this same consumer
+// with r3=0 and is proven (63/63 clean VSYNC-ISR enter/exit rows); r3=1 fires ONLY from here.
+// The r3==0 arm does NOT read [r13+268] (it reads MMIO 0x7FC86544 and branches -- 0x82411508-
+// 0x82411528), so touching the PCR byte is invisible to the vblank path. The byte is saved
+// and restored around the call so the boot worker's own PCR (tag boot-worker:static-8F200000)
+// keeps its processor number.
+// Rule-1b taint list: `VdDispatchGraphicsInterrupt` is the ONE new host symbol this change
+// adds; it reads the two file-scope registration atomics and is called from gpu_cp.cpp only.
+void VdDispatchGraphicsInterrupt(uint32_t cpuMask) {
+  static std::atomic<uint32_t> s_dispatched{0};
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  for (uint32_t n = 0; n < 6u; ++n) {
+    if (!(cpuMask & (1u << n)))
+      continue;
+    const uint32_t cb = s_vsyncCallback.load();
+    const uint32_t user = s_vsyncUserData.load();
+    if (cb == 0)
+      continue;
+    uint8_t *base = mcla::kernel::g_memory.base;
+    PPCFunc *fn = PPC_LOOKUP_FUNC(base, cb);
+    if (!fn)
+      continue;
+    // graphics_system.cc:253 SetActiveCpu -- the consumer reads the CPU index as a BYTE at
+    // [r13+268] (`lbz r11,268(r13)` @0x824114D4). Save, set, call, restore.
+    // The byte now lives in THIS host thread's own PCR block, so the boot
+    // worker's PCR is no longer written at all (it used to be, which is why
+    // the old code had to save and restore it).
+    const uint32_t kPcrCpuByte = IsrThreadBlockVa() + 268u;
+    uint8_t oldCpu = 0;
+    (void)mem.ReadU8(kPcrCpuByte, &oldCpu);
+    (void)mem.WriteU8(kPcrCpuByte, static_cast<uint8_t>(n));
+    PPCContext ctx{};
+    ctx.r3.u32 = 1;             // interrupt type 1 = PM4_INTERRUPT (command_processor.cc:900-913)
+    ctx.r4.u32 = user;           // GPU context pointer, same as the vblank path
+    ctx.r5.u32 = 0;
+    ctx.r13.u32 = IsrThreadBlockVa(); // THIS host thread's block, same as the vblank path
+    ctx.r1.u32 = 0x8F000000u;    // stack top, same as the vblank path
+    ctx.lr = 0x00FFFFFFu;       // dummy LR, same as the vblank path
+    ctx.msr = 0x200A000;
+    SetPPCContext(ctx);
+    const uint32_t dn = s_dispatched.fetch_add(1) + 1;
+    MCLA_LOG_WARN("CP-INTERRUPT-DISPATCH #{} cpu={} cb={:08X} user={:08X} pcrOld={}",
+                  dn, n, cb, user, static_cast<unsigned>(oldCpu));
+    fn(ctx, base);
+    (void)mem.WriteU8(kPcrCpuByte, oldCpu);
+    MCLA_LOG_WARN("CP-INTERRUPT-DISPATCH-POST #{} r3={:08X}", dn, ctx.r3.u32);
+  }
+}
+
+// Signal the guest's clock-tick object (0x40004D7C) so that the guest's
+// clock handler (0x8242FB88 - the title's "GPU poller"; the guest's own
+// message registry pairs it with message id 0x40005E03) can leave its wait.
+//
+// CONSOLE-CORRECT CLASS (2026-10-21, fix_typebyte).  The guest's own bytes
+// say this object is an EVENT, not a semaphore:
+//   * the guest-visible Type byte at 0x40004D7C is 0x00 = EventNotification
+//     (manual reset): build/w842.log
+//     "TYPE-CENSUS[KWFSO] #0001 objptr=40004D7C type=00 timeout_ms=30";
+//   * the guest RESETS it: 0x8242FCD4 `addi r3,r26,32` (r26+32 ==
+//     0x40004D7C) / 0x8242FCD8 `bl 0x827BD874` = __imp__KeResetEvent;
+//   * console event classes are 0x00 (manual) / 0x01 (auto) and a semaphore
+//     is 0x05 (.research/xenia/src/xenia/kernel/xevent.cc:39-58; audit C6 in
+//     build/agents/audit_irq.md).
+// The old code resolved the object as a SEMAPHORE, so the guest's
+// KeResetEvent could not find the wrapper that had been released and minted
+// a second, unregistered view instead: 29 KOBJ-CLASSFLIP rows in
+// build/w842.log, and the guest's reset was LOST - the signal state was
+// never cleared, so every one of the 4809 WAKE[KWFSO] rows returned
+// STATUS_SUCCESS (status histogram {00000000: 4809}) and the guest's own
+// STATUS_TIMEOUT branch at 0x8242FC3C could not run.
+//
+// FALSIFIER: KOBJ-CLASSFLIP must go 29 -> 0 in the next soak.
 static void SignalSchedulerTick() {
   constexpr uint32_t kSchedulerTickSem = 0x40004D7C;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -4781,29 +6721,35 @@ static void SignalSchedulerTick() {
     return;
   }
 
-  // Resolve the HOST-SIDE Semaphore wrapper and Release() it. The old code
-  // wrote raw guest memory at offset 0x10 (the XKSEMAPHORE signal state),
-  // but KeWaitForSingleObject resolves to a host-side Semaphore object
-  // whose Wait() polls a separate std::atomic count — never synced from
-  // guest memory. The signal never reached the waiter, parking the driver
-  // worker forever in a 30ms timeout loop.
   auto *header = reinterpret_cast<XDISPATCHER_HEADER *>(
       static_cast<uint8_t *>(mem.Translate(kSchedulerTickSem)));
   if (!header) {
     return;
   }
 
-  // QueryKernelObject resolves or lazy-wraps the host-side Semaphore.
-  // The OBJECT_SIGNATURE marker was set when the guest first initialized
-  // this semaphore via KeInitializeSemaphore / NtCreateSemaphore.
-  Semaphore *sem = QueryKernelObject<Semaphore>(*header);
-  if (!sem) {
-    logPath("no-sem");
+  // Resolve the CANONICAL wrapper for this dispatcher address.  If there is
+  // none yet, create the one the console would have: an EVENT, because the
+  // object's own guest-visible Type byte says 0x00 (EventNotification).
+  KernelObject *canonical = LookupKernelObjectByDispatcher(*header);
+  Event *ev = canonical ? dynamic_cast<Event *>(canonical) : nullptr;
+  if (!ev && !canonical) {
+    ev = QueryKernelObject<Event>(*header);
+  }
+  if (ev) {
+    logPath("set-event");
+    ev->Set();
     return;
   }
-
-  logPath("release");
-  sem->Release(1, nullptr);
+  // A canonical wrapper of another class exists (the legacy semaphore model):
+  // release it rather than type-confusing it.
+  if (canonical) {
+    if (auto *sem = dynamic_cast<Semaphore *>(canonical)) {
+      logPath("release-semaphore");
+      sem->Release(1, nullptr);
+      return;
+    }
+  }
+  logPath("no-object");
 }
 
 uint32_t VdInitializeEngines(uint32_t unk, uint32_t cb, uint32_t arg,
@@ -4962,14 +6908,52 @@ void KeEnterCriticalRegion() { LOG_UTILITY("!!! STUB !!!"); }
 uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size,
                                     uint32_t protect, uint32_t minAddress,
                                     uint32_t maxAddress, uint32_t alignment) {
+  // F-810: the counter for the ungated big-request row below. Declared here, beside the only
+  // function that uses it, so no new host symbol leaks into another TU (rule 1b).
+  static std::atomic<uint32_t> s_mmPhysBig{0};
   LOGF_UTILITY("0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}", flags, size,
                protect, minAddress, maxAddress, alignment);
+  // F-810: LOGF_UTILITY above is `#if _DEBUG` -> EMPTY in a release build
+  // (.research/UnleashedRecomp/UnleashedRecomp/os/logger.h:24-28, NDEBUG set by
+  // CMakeLists.txt:578), so the argument tuple of the physical allocator has NEVER been logged.
+  // heap.cpp:2364 cites that row as "the only place" the tuple is recorded -- that citation is
+  // false. This is the real one. UNGATED (no `n % k`): a gated printer yields a cadence, not a
+  // total, and this row exists to settle WHICH site asks for a 299.5 MiB block.
+  // `[0x827D4304]` is dumped because it is the one runtime global any candidate site reads: its
+  // single writer in the whole image is `0x82131534 stw r11,17156(r10)` with `lis r11,0040`
+  // @`0x82131530` (a CONSTANT 64 MiB, gated on `[0x828309C0] != 0`), so it can only ever be
+  // 0x10000 (the image word) or 0x400000. NOTE: `tools\ppc_xrefs.py xref 0x827D4304` filed that
+  // stw as a READER -- ppc_xrefs models no stw/stwu displacement, which is what produced a
+  // confident "no writer in the image" and sent this search after a host writer that cannot exist.
+  if (size >= 0x10000000u) {
+    const PPCContext* const pc = GetPPCContext();
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t w4304 = 0, w4308 = 0;
+    (void)mem.ReadU32BE(0x827D4304u, &w4304);
+    (void)mem.ReadU32BE(0x827D4308u, &w4308);
+    MCLA_LOG_WARN(
+        "MMAL-PHYS-BIG #{} size={:#x} flags={:#x} protect={:#x} min={:08X} max={:08X} "
+        "align={:#x} glr={:08X} [0x827D4304]={:08X} [0x827D4308]={:08X} "
+        "(glr-4 is a site id: 821BC114=A 821BC118=A2 82131CC8=B 8217B16C=C)",
+        s_mmPhysBig.fetch_add(1) + 1, size, flags, protect, minAddress, maxAddress, alignment,
+        pc ? static_cast<uint32_t>(pc->lr) : 0u, w4304, w4308);
+  }
   void *ptr = g_userHeap.AllocPhysical(size, alignment);
   if (!ptr) {
     static std::atomic<uint32_t> s_allocFails{0};
     if (s_allocFails.fetch_add(1) < 50) {
       // Session 73: full arena diagnostics on failure — distinguishes a
       // genuine OOM (peak ~ capacity) from a leak (allocated >> freed).
+      // F-806b: this is THE reader that trips F-388. `AllocPhysical` has already returned and
+      // closed its own window by the time we get here (`t_hgWin == 0` on this thread), and
+      // `o1heapGetDiagnostics` reads the instance -- `capacity` at instance+0x208, the field
+      // boot_host.cpp:474-475 names. Since F-806 the guard watches the REAL header, so this is a
+      // genuine out-of-window access. MEASURED: `F388-PHYSGUARD trip=3/5 off=0X208 want=R
+      // hostRVA=0x2e4dd3` = `o1heapGetDiagnostics+0x3`, landing on the same millisecond as
+      // `FAILED count=1` and `count=2` in both w801 and w802, at a 4.011 s cadence, 50 rows.
+      // `HeapGuardArm`/`Disarm` are already declared at boot_host.h:101-102 and imports.cpp:27
+      // already includes that header -- no new include, no new symbol.
+      mcla::boot::HeapGuardDisarm();
       const auto d = o1heapGetDiagnostics(g_userHeap.physicalHeap);
       MCLA_LOG_WARN(
           "MmAllocatePhysicalMemoryEx: FAILED size={:#x} align={:#x} "
@@ -4977,6 +6961,7 @@ uint32_t MmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t size,
           size, alignment, s_allocFails.load(), d.capacity, d.allocated,
           d.peak_allocated, d.oom_count,
           GetPPCContext() ? static_cast<uint32_t>(GetPPCContext()->lr) : 0);
+      mcla::boot::HeapGuardArm();
     }
     return 0;
   }
@@ -5298,6 +7283,56 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   }
   const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
+  // ALERTABLE WAIT (2026-10-21, fix_irq2, item 2).
+  //
+  // CONSOLE: an ALERTABLE wait is woken by a pending APC, the APC RUNS, and
+  // the wait returns STATUS_USER_APC (xobject.cc:207-215: the wait result
+  // kUserCallback maps to X_STATUS_USER_APC; and the APCs are delivered at
+  // the IRQL-lowering boundary, xboxkrnl_threading.cc:1005-1010).
+  //
+  // WHERE THE GUEST'S FLAG IS -- MEASURED, and the host was reading the
+  // WRONG REGISTER.  All 11 __imp__KeWaitForSingleObject call sites pass
+  //   r3 = object, r4 = 3 (or 0), r5 = 1 (or 0), r6 = 0, r7 = timeout
+  // (`py -3 tools/ppc_xrefs.py calls 0x827BD5A4`; the ten (3,1,0) sites are
+  // 0x823EC91C, 0x823EC9DC, 0x823ECA0C, 0x8242FC18, 0x8242FCAC, 0x8244E3FC,
+  // 0x8244E4FC, 0x8244E648, 0x8244EB58, 0x82459D64 and the one (0,0,0) site
+  // is 0x8245AB90).  The host's signature read ALERTABLE out of r6 -- the
+  // slot that is 0 at EVERY one of the 11 sites -- so the guest's alertable
+  // flag was DISCARDED and every Ke-form wait was non-alertable.
+  // The 10 __imp__NtWaitForSingleObjectEx sites use the SAME slot for the
+  // flag (r5), which the 4-argument Nt form puts in r5 (the reference:
+  // NtWaitForSingleObjectEx_entry(handle, wait_mode, alertable, timeout),
+  // xboxkrnl_threading.cc:808-811), and one of them computes it
+  // (0x82135DF4: `mr r5,r29` where r29 = r28 & 0xFF).  So r5 is the
+  // guest's alertable slot in BOTH forms.
+  //
+  // The two candidate ABIs disagree about the Ke form's 5th argument (the
+  // 360's layout puts a Context there, the reference's layout puts
+  // "processor_mode" there and Alertable in r6), and the guest's bytes CANNOT
+  // discriminate, because r6 is 0 everywhere.  So both slots are honoured.
+  // That is safe under either reading because the host's APC queue is EMPTY
+  // today -- the guest has no APC-queueing import (see QueueGuestApc) -- so
+  // the only observable difference is this census row.
+  const bool alertable = Alertable || (WaitMode != 0);
+  if (alertable) {
+    static std::atomic<uint32_t> s_alertableKwfso{0};
+    const uint32_t an = s_alertableKwfso.fetch_add(1) + 1;
+    if (an <= 40 || (an % 500) == 0)
+      MCLA_LOG_INFO("WAIT-ALERTABLE-KWFSO #{} alertable=1 obj={:08X} to={}ms "
+                    "lr={:08X} (r5={} r6={}; the host used to read r6 only)",
+                    an, mcla::kernel::g_memory.MapVirtual(Object), timeout,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                    WaitMode, Alertable ? 1 : 0);
+  }
+  if (alertable && HasPendingApc()) {
+    const uint32_t delivered = DeliverPendingApcs();
+    MCLA_LOG_WARN("APC-WAKE #{} delivered={} obj={:08X} -> STATUS_USER_APC "
+                  "(the console returns X_STATUS_USER_APC after the APC ran)",
+                  static_cast<uint32_t>(GetCurrentThreadId()), delivered,
+                  mcla::kernel::g_memory.MapVirtual(Object));
+    return STATUS_USER_APC;
+  }
+
   // DWELL HISTOGRAM + TYPE CENSUS: measure actual wait dwell time vs timeout class + resolution
   const auto waitStart = std::chrono::steady_clock::now();
   const char* waitResolution = "unknown";
@@ -5333,6 +7368,37 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
   // run its periodic GPU drain/maintenance — see session 61-62 handoff).
   uint32_t waitStatus = STATUS_TIMEOUT;
 
+  // 2026-10-21 (fix_dpc): IDENTITY-FIRST. Resolve the CANONICAL wrapper for
+  // this dispatcher address before the type switch. The guest-visible Type
+  // byte must not decide WHICH object is waited on: it is guest-writable,
+  // and for a host-created object the bytes at the handle are the C++ vptr,
+  // so `Object->Type` reads 0x28 (the vptr's low byte) while the host wrote
+  // Type=5 at obj+8 (audit C15: 61/61 host-created semaphores). The byte
+  // still selects the WAIT BEHAVIOUR (auto vs manual reset) inside
+  // Event/Semaphore; it no longer selects the OBJECT.
+  bool resolvedByIdentity = false;
+  if (KernelObject *canonical = LookupKernelObjectByDispatcher(*Object)) {
+    if (auto *sem = dynamic_cast<Semaphore *>(canonical)) {
+      waitResolution = "identity(sem)";
+      waitStatus = sem->Wait(timeout);
+      resolvedByIdentity = true;
+    } else if (auto *ev = dynamic_cast<Event *>(canonical)) {
+      waitResolution = "identity(event)";
+      waitStatus = ev->Wait(timeout);
+      resolvedByIdentity = true;
+    }
+    static std::atomic<uint64_t> s_identityWaits{0};
+    const uint64_t iw = s_identityWaits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (iw <= 8 || (iw % 4096u) == 0u) {
+      MCLA_LOG_INFO("KEWAIT-IDENTITY #{:05} obj={:08X} type={:02X} "
+                    "canonical={} (the guest-visible Type byte did NOT pick "
+                    "the object)",
+                    iw, mcla::kernel::g_memory.MapVirtual(Object), type,
+                    resolvedByIdentity ? "hit" : "other-class");
+    }
+  }
+
+  if (!resolvedByIdentity) {
   switch (type) {
   case 0:
   case 1: {
@@ -5428,6 +7494,7 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
     }
     return STATUS_TIMEOUT;
+  }
   }
   }
   {
@@ -5856,48 +7923,70 @@ void NetDll___WSAFDIsSet() { LOG_UTILITY("!!! STUB !!!"); }
 
 void XMsgStartIORequestEx() { LOG_UTILITY("!!! STUB !!!"); }
 
-// XexGetModuleHandle -- F-609 census. *** THIS IS NOT A FABRICATION. DO NOT
-// "FIX" IT. *** It looks exactly like a hardcoded fake -- `(void)moduleName;`
-// then a constant -- and that appearance is wrong, for a reason specific to this
-// host.
+// XexGetModuleHandle -- F-841 (2026-10-21), REPLACING the F-609 constant.
 //
-// 0x82000000 IS THE REAL, DOCUMENTED GUEST IMAGE BASE, and returning it is the
-// correct answer to "what is the module handle" on a recompiler that runs the
-// image in place:
-//   - docs/PROGRAM_GUIDE.md:62 -- "base `0x82000000`, code `0x82130000`".
-//   - docs/PROGRAM_GUIDE.md:85-86 -- "SectionAlignment `0x10000` ... So keep
-//     the identity map (`file offset = true_VA - 0x82000000`)".
-//   - AGENTS.md rule 3 (F-023) -- raw-byte rule, "offset = VA - 0x82000000".
-//   - This file's own header, imports.cpp:71, states the same identity map.
-// Every one of those is the SAME fact: the guest XEX is mapped one-to-one at
-// 0x82000000, so a module base IS an image base and the main executable's is
-// 0x82000000. Ignoring moduleName is therefore not a guess that happens to work;
-// it is the reason the constant is correct, because there is only one module in
-// this image and its base does not vary by name.
+// WHAT CHANGED AND WHY (the F-609 block above is kept as the record of what
+// it was; the reasoning that justified it no longer holds, because the host
+// now knows MORE THAN ONE module):
 //
-// This is the distinction the task asks for: a hardcoded constant that is a
-// LIE (a fabricated xuid, a fabricated signin state) versus a hardcoded constant
-// that is a FACT (the image base). The first is a bug; the second is the
-// implementation. `XamContentGetCreator`'s 0xB13EBABEBABEBABE and
-// kXamSynthProfile above are the first kind; this is the second.
+//   F-609's argument was "there is only one module in this image and its base
+//   does not vary by name".  That is still true of the GUEST IMAGE, but the
+//   guest does not only ask for the guest image: it asks for exports of
+//   "xam.xex" and "xboxkrnl.exe" (its own strings, 0x8206A5F0 and
+//   0x820D432C), which on the console are two different modules with two
+//   different export tables.  One handle for both is how the resolver ends up
+//   answering "xboxkrnl.exe#642" with "xam.xex#642" -- two different
+//   functions (measured in the console's export tables: xam.xex#642 is
+//   XamGetSystemVersion, xboxkrnl.exe#642 is XInputdFFGetDeviceInfo).
 //
-// ONE REAL CAVEAT, measured, reported, NOT acted on. The guest does not gate on
-// success the way one would expect. Two of the four call sites
-// (`ppc_xrefs.py calls 0x827BD894` -> 0x8244A298, 0x8244A4D4, 0x824604DC,
-// 0x8275C7DC) read the handle only on the NON-zero return: at 0x8244A29C
-// `cmpi cr0,r3,0` / `bc bo=12 -> 0x8244A2C8` skips the `lwz r3,84(r1)` when the
-// status IS zero, and 0x8275C7E0/`0x8275C7E4` are the same shape over 80(r1).
-// So at those two sites returning X_ERROR_SUCCESS means the guest does not
-// consume the handle we wrote. Changing the returned status to non-zero to
-// "make the guest use it" would be guessing at a convention we have not
-// established, would contradict Xenia, and would be a behavioural gamble on a
-// blocked build -- so it is left alone and recorded here. The handle is written
-// correctly either way, which is what this function is responsible for.
+//   The handle is therefore an OPAQUE TOKEN, which is safe because the guest
+//   never dereferences it: all four of its call sites pass it straight into
+//   XexGetProcedureAddress (0x8244A298 -> 0x8244A2B0, 0x8244A4D4 ->
+//   0x8244A4EC, 0x824604DC -> 0x824604FC, 0x8275C7DC -> 0x8275C7F4).
+//
+//   The executable module keeps the real image base (0x82000000), so the
+//   F-609 fact survives for the one module it was about.
+//
+//   A NAME THAT IS NOT A MODULE IS NOW NOT FOUND.  The console answers
+//   X_ERROR_NOT_FOUND and leaves the handle at 0 for a module it has not
+//   loaded (xboxkrnl_modules.cc:51-55): "xbdm.xex" is a development-kit
+//   module that is not on a retail console.  The guest is guest-neutral
+//   about that: it skips on a negative status (measured: 0x8244A29C
+//   `cmpi cr0,r3,0 / blt`, 0x8244A4D8, 0x824604E0 `blt -> 0x824605C0`) and it
+//   also skips on a zero handle (0x824604EC `cmpli cr6,r3,0 / beq`), and the
+//   old path (status 0, then a NOT FOUND from the resolver) ended in the
+//   same skip.  So this is a fidelity fix, not a behaviour gamble.
 uint32_t XexGetModuleHandle(uint32_t moduleName, be<uint32_t> *handle) {
-  (void)moduleName; // Correct here: one image, one base. See the block above.
   if (handle) {
-    // The main executable handle == the identity-mapped guest image base.
-    handle->set(0x82000000);
+    handle->set(0);
+  }
+  if (!moduleName) {
+    // A null name is the EXECUTABLE module
+    // (xboxkrnl_modules.cc:46-47: `if (!module_name) module = ...ExecutableModule()`).
+    if (handle) {
+      handle->set(kXexExecutableModuleHandle);
+    }
+    return 0; // X_ERROR_SUCCESS
+  }
+
+  char name[64] = {};
+  if (!GuestReadCString(moduleName, name, sizeof(name))) {
+    // A name the guest cannot even read is not a module the console had.
+    return 0xC0000225; // X_STATUS_NOT_FOUND (xbox.h:75)
+  }
+
+  const mcla::kernel::XexConsoleModule *module =
+      XexFindConsoleModuleByName(name);
+  if (!module) {
+    // Not a module on this console ("xbdm.xex" and anything else).
+    // X_STATUS_NOT_FOUND = 0xC0000225 (xbox.h:75); the handle stays 0.
+    return 0xC0000225;
+  }
+
+  if (handle) {
+    const uint32_t index = static_cast<uint32_t>(
+        module - mcla::kernel::kXexConsoleModules);
+    handle->set(kXexSystemModuleHandleBase + index);
   }
   return 0; // X_ERROR_SUCCESS
 }
@@ -6023,7 +8112,181 @@ void RtlUnwind_x() { LOG_UTILITY("!!! STUB !!!"); }
 
 void RtlCaptureContext_x() { LOG_UTILITY("!!! STUB !!!"); }
 
-void NtQueryFullAttributesFile() { LOG_UTILITY("!!! STUB !!!"); }
+// ===========================================================================
+// F-840 (2026-10-21) -- THE VOID-IMPORT BATCH, part 3:
+// NtQueryFullAttributesFile.  This is the single worst member of the class.
+//
+// WAS: `void NtQueryFullAttributesFile() { LOG_UTILITY("!!! STUB !!!"); }`.
+//
+// THE DEFECT, from the guest's own bytes.  The import thunk is 0x827BD9C4 and
+// the guest calls it from 3 sites (tools/ppc_xrefs.py calls 0x827BD9C4 ->
+// 0x8244F830, 0x824562A8, 0x82460620).  ALL THREE BRANCH ON r3, and all three
+// then read an out-buffer the host never wrote.  At 0x82460620
+// (generated/ppc_xenon/ppc_recomp.82.cpp:12406-12444, raw bytes confirmed with
+// tools/ppc_disasm.py 0x82456230 40 for the sibling site):
+//
+//   12406  addi r4,r1,112     ; r4 = the OUT buffer (56 bytes)
+//   12410  addi r3,r1,88      ; r3 = the XOBJECT_ATTRIBUTES
+//   12412  bl   0x827bd9c4
+//   12415  cmpwi r3,0
+//   12418  blt  -> 82460664    ; "query failed" branch
+//   12419  lwz  r11,160(r1)    ; out+48  (u32)  file attributes
+//   12423  ld   r10,112(r1)    ; out+0   (u64)  creation time
+//   12425  ld   r9,120(r1)     ; out+8   (u64)  last access time
+//   12427  ld   r8,128(r1)     ; out+16  (u64)  last write time
+//   12429  lwz  r7,152(r1)     ; out+40  (u32)  end-of-file, high half
+//   12431  lwz  r6,156(r1)     ; out+44  (u32)  end-of-file, low  half
+//   82460664: bl 0x82135d58     ; the guest's own error/raise path
+//
+// r3 on entry is the guest's own stack address (r1+88 / r1+96), and a `void`
+// binding never writes r3 (src/kernel/function.h:496-499), so r3 on return
+// was STILL that stack address -- 0x8EFFFxxx, whose bit 31 is set, so as a
+// signed 32-bit int it is NEGATIVE.  The guest's `cmpwi r3,0 / blt` therefore
+// ALWAYS took its "query failed" branch, and the out buffer it had just been
+// about to read was the guest's own UNINITIALISED STACK.
+//
+// THE CONSOLE'S BEHAVIOUR, from the reference:
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:505-544
+//     dword_result_t NtQueryFullAttributesFile_entry(
+//         pointer_t<X_OBJECT_ATTRIBUTES> obj_attribs,
+//         pointer_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info)
+//   -> X_STATUS_SUCCESS and the struct filled, or X_STATUS_NO_SUCH_FILE.
+//   .research/xenia/src/xenia/kernel/info/file.h -- the struct, 56 bytes:
+//     creation_time, last_access_time, last_write_time, change_time,
+//     allocation_size, end_of_file, attributes, pad   (all big-endian)
+//     static_assert_size(X_FILE_NETWORK_OPEN_INFORMATION, 56)
+//
+// THE STRUCT LAYOUT IS DERIVED FROM THE GUEST'S OWN READS, not guessed.  The
+// six loads above give out+0 (u64), out+8 (u64), out+16 (u64), out+40 (u32),
+// out+44 (u32) and out+48 (u32).  out+40/out+44 are the two halves of one
+// big-endian u64 -- the high half at +40, the low half at +44 -- which is
+// exactly `end_of_file` at offset 40 of the reference's 56-byte struct, and
+// out+48 is its `attributes`.  The same offsets are read at the other two call
+// sites (generated/ppc_xenon/ppc_recomp.80.cpp:14396 `lwz r3,160(r1)`; and the
+// guest's own copy of the fields at recomp.82.cpp:12433-12444 stores
+// attributes at +0, creation_time at +4, last_access_time at +12,
+// last_write_time at +20 and the 64-bit end_of_file at +28).
+//
+// THE TIMESTAMPS ARE A DECLARED DIVERGENCE.  The console returns the file's
+// real creation/access/write times.  This host's VFS
+// (src/fs/vfs_rpf.h:42-48 -- FileEntry carries only virtual_path,
+// physical_path, size and is_directory) has NO timestamps at all, so the four
+// time fields are written as 0.  That is a stated divergence, not a claim that
+// the console writes 0: the alternative was leaving the guest's uninitialised
+// stack there, which is strictly worse.
+//
+// FALSIFIER.  The guest must now take its SUCCESS branch at all three sites
+// (r3 == 0, so `cmpwi r3,0 / blt` is false) and the out buffer must hold the
+// console's 56 bytes: end-of-file at +40/+44 equal to the VFS file size, and
+// attributes at +48 non-zero.  If a soak shows the guest still taking the
+// `blt` branch into sub_82135D58, this body is not running.
+// ===========================================================================
+
+// The console's 56-byte X_FILE_NETWORK_OPEN_INFORMATION, in the layout the
+// GUEST reads.  Field order and offsets are derived from the guest's loads
+// (see the block above) and agree with the reference struct
+// (.research/xenia/src/xenia/kernel/info/file.h).
+struct XFileNetworkOpenInformation {
+  be<uint64_t> CreationTime;
+  be<uint64_t> LastAccessTime;
+  be<uint64_t> LastWriteTime;
+  be<uint64_t> ChangeTime;
+  be<uint64_t> AllocationSize;
+  be<uint64_t> EndOfFile;
+  be<uint32_t> Attributes;
+  be<uint32_t> Pad;
+};
+static_assert(sizeof(XFileNetworkOpenInformation) == 56,
+              "the guest reads 56 bytes of out-buffer (out+0 .. out+55)");
+
+// The console's file attributes (the guest reads them as a u32 at out+48).
+// The two constants already exist in this file's anonymous namespace --
+// kFileAttributeDirectory / kFileAttributeNormal at src/kernel/imports.cpp:
+// 3734-3735, the same Win32 values (0x10 / 0x80) that the reference's
+// directory-information code uses.  They are REUSED, not redeclared.
+
+uint32_t NtQueryFullAttributesFile(XOBJECT_ATTRIBUTES *objAttribs,
+                                   XFileNetworkOpenInformation *fileInfo) {
+  if (!objAttribs || !fileInfo) {
+    // STATUS_INVALID_PARAMETER, 0xC000000D
+    // (.research/xenia/src/xenia/xbox.h:51).
+    return 0xC000000D;
+  }
+
+  // The reference reads the name out of the object attributes
+  // (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:508-509).  The
+  // guest fills RootDirectory with 0xFFFFFFFD (ObDosDevices) at all three
+  // sites -- recomp.80.cpp:14373-14380, recomp.81.cpp:15134-15141,
+  // recomp.82.cpp:12396-12403 -- and the name with an X_ANSI_STRING.
+  XANSI_STRING *name = objAttribs->Name.get();
+  if (!name || !name->Buffer.get()) {
+    // STATUS_OBJECT_NAME_INVALID, 0xC0000033
+    // (.research/xenia/src/xenia/xbox.h:59).
+    return 0xC0000033;
+  }
+
+  char guestPath[260] = {};
+  uint16_t length = name->Length.get();
+  if (length >= sizeof(guestPath)) {
+    length = static_cast<uint16_t>(sizeof(guestPath) - 1);
+  }
+  const char *source = name->Buffer.get();
+  std::memcpy(guestPath, source, length);
+  guestPath[length] = '\0';
+
+  const std::string virtualPath = mcla::vfs::GuestPathToVirtual(guestPath);
+
+  // House cadence, and a REAL instrument: this line prints on every call this
+  // body answers, so a soak can prove the import fired and what it answered
+  // (AGENTS.md rule 19 -- a zero from an instrument that never fires is not a
+  // result).  The OLD stub printed NOTHING in a release build (LOG_UTILITY
+  // expands to nothing unless _DEBUG is defined,
+  // .research/UnleashedRecomp/UnleashedRecomp/os/logger.h:14-18), which is why
+  // "0 rows" proved nothing about this import.
+  static std::atomic<uint32_t> s_census{0};
+  const uint32_t n = s_census.fetch_add(1, std::memory_order_relaxed) + 1;
+  const bool print = (n <= 20) || ((n % 100) == 0);
+
+  mcla::vfs::RpfVirtualFileSystem &vfs =
+      mcla::vfs::RpfVirtualFileSystem::Instance();
+  if (!vfs.Exists(virtualPath)) {
+    if (print) {
+      MCLA_LOG_WARN("NQFA #{} lr={:08X} '{}' -> virtual '{}' NOT FOUND "
+                    "(0xC000000F X_STATUS_NO_SUCH_FILE)",
+                    n, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u),
+                    guestPath, virtualPath);
+    }
+    // X_STATUS_NO_SUCH_FILE, 0xC000000F
+    // (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:543).
+    return 0xC000000F;
+  }
+
+  const bool isDirectory = vfs.IsDirectory(virtualPath);
+  const uint64_t endOfFile = vfs.GetFileSize(virtualPath);
+
+  // The console writes the whole struct
+  // (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc:532-538).  The
+  // four time fields are 0 here because this host's VFS has no timestamps --
+  // see the DIVERGENCE note in the block above.
+  fileInfo->CreationTime.set(0);
+  fileInfo->LastAccessTime.set(0);
+  fileInfo->LastWriteTime.set(0);
+  fileInfo->ChangeTime.set(0);
+  fileInfo->AllocationSize.set(endOfFile);
+  fileInfo->EndOfFile.set(endOfFile);
+  fileInfo->Attributes.set(isDirectory ? kFileAttributeDirectory
+                                       : kFileAttributeNormal);
+  fileInfo->Pad.set(0);
+
+  if (print) {
+    MCLA_LOG_INFO("NQFA #{} lr={:08X} '{}' -> virtual '{}' dir={} size={} "
+                  "attrs=0x{:X} (0xC0000000 STATUS_SUCCESS)",
+                  n, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u),
+                  guestPath, virtualPath, isDirectory, endOfFile,
+                  isDirectory ? kFileAttributeDirectory : kFileAttributeNormal);
+  }
+  return STATUS_SUCCESS;
+}
 
 uint32_t RtlMultiByteToUnicodeN(be<uint16_t> *UnicodeString,
                                 uint32_t MaxBytesInUnicodeString,
@@ -6194,8 +8457,12 @@ uint32_t NtSetEvent(uint32_t handle, uint32_t *previousState) {
   // F-039: resolve via identity map first — same object Wait parks on.
   // Never dynamic_cast a GetKernelObject raw fallback (guest memory as
   // polymorphic object; p2f __RTDynamicCast AV).
+  // 2026-10-21 (fix_dpc): the cast is CHECKED. The identity map holds one
+  // wrapper per dispatcher address and its class is fixed at creation; an
+  // unchecked static_cast<Event*> on a Semaphore entry wrote the event's
+  // state over the semaphore's count (audit C20).
   if (auto *id = LookupIdentityKernelObject(handle)) {
-    if (auto *evt = static_cast<Event *>(id)) {
+    if (auto *evt = dynamic_cast<Event *>(id)) {
       evt->Set();
       if (previousState) *previousState = 0;
       return 0;
@@ -6316,8 +8583,15 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
                               mcla::kernel::g_memory.base);
     if (IsKernelObject(guestHandle)) {
       if (auto *id = LookupIdentityKernelObject(guestHandle)) {
-        sem = static_cast<Semaphore *>(id);
-        resBranch = "identity-map";
+        // 2026-10-21 (fix_dpc): CHECKED cast. The identity map holds one
+        // wrapper per dispatcher address; its class is fixed at creation, so
+        // an unchecked static_cast<Semaphore*> on an Event entry wrote the
+        // semaphore's count over the event's state (audit C20).
+        sem = dynamic_cast<Semaphore *>(id);
+        if (sem)
+          resBranch = "identity-map";
+        else
+          resBranch = "identity-map-not-a-semaphore";
       } else {
         void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(
             guestHandle);
@@ -6329,10 +8603,25 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
           } else if (g_userHeap.IsPhysicalArenaPtr(raw)) {
             // CreateKernelObject product living in the physical arena - the
             // same pointer Wait's GetKernelObject raw-fallback returns.
-            auto *host = reinterpret_cast<Semaphore *>(raw);
-            if (host->IsValid())
+            //
+            // CONSOLE-CORRECT HANDLE (2026-10-21, fix_typebyte): the handle
+            // IS the dispatcher header (GetKernelHandle ->
+            // MapVirtual(&obj->header)), so `raw` is the HEADER, not a
+            // Semaphore wrapper: casting it and calling Release() on it is a
+            // wild virtual call through a garbage vtable.  The KernelObject
+            // wrapper sits KernelObjectHeaderOffset() BELOW the header (the
+            // C++ vptr is at the wrapper's base), so recover it by
+            // subtracting that offset.  MEASURED: this branch IS reached -
+            // build/w842.log "RELSEMA-RES #27 guest=B98EE040
+            // branch=physical-arena-reinterpret live=1".
+            auto *host = reinterpret_cast<Semaphore *>(
+                reinterpret_cast<uint8_t *>(raw) - KernelObjectHeaderOffset());
+            if (host->IsValid()) {
               sem = host;
-            resBranch = "physical-arena-reinterpret";
+              resBranch = "physical-arena-reinterpret";
+            } else {
+              resBranch = "physical-arena-invalid";
+            }
           } else {
             resBranch = "raw-unusable";
           }
@@ -6346,9 +8635,28 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
   }
   // Guest-owned XKSEMAPHORE headers (KeInitializeSemaphore path). Only mint
   // a wrapper when we did NOT resolve an identity object above.
+  //
+  // 2026-10-21 (fix_dpc): ONE REGISTRY. The canonical wrapper for this
+  // dispatcher address wins, whatever its class. If it is an EVENT (the
+  // guest's own dispatcher headers are type 0/1 - see the SEMA-FALLBACK row
+  // in w838.log) then the waiter is parked on THAT event, so the release is
+  // delivered as a set on it: that is the only action that can wake the
+  // waiter, and minting a phantom semaphore here would guarantee the loss
+  // (audit C17/C19).
   if (!sem) {
-    sem = QueryKernelObject<Semaphore>(Handle->Header);
-    resBranch = "MINT-QueryKernelObject";
+    if (auto *ev = TryQueryKernelObject<Event>(Handle->Header)) {
+      ev->Set();
+      resBranch = "canonical-event-set";
+      MCLA_LOG_WARN("RELSEMA-EVENTSET guest={:08X} rel={} lr={:08X} "
+                    "(canonical wrapper is an EVENT - set, not released)",
+                    static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
+                                          mcla::kernel::g_memory.base),
+                    ReleaseCount,
+                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    } else {
+      sem = QueryKernelObject<Semaphore>(Handle->Header);
+      resBranch = "MINT-QueryKernelObject";
+    }
   }
 
   // F-588: report the branch that actually won, per handle, bounded. This is
@@ -6410,7 +8718,144 @@ uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
 
 void NtWaitForMultipleObjectsEx() { LOG_UTILITY("!!! STUB !!!"); }
 
-void RtlCompareStringN() { LOG_UTILITY("!!! STUB !!!"); }
+// ===========================================================================
+// F-840 (2026-10-21) -- THE VOID-IMPORT BATCH, part 4: RtlCompareStringN.
+//
+// WAS: `void RtlCompareStringN() { LOG_UTILITY("!!! STUB !!!"); }`.
+//
+// THE DEFECT, from the guest's own bytes.  The import thunk is 0x827BDA34 and
+// the guest calls it from 11 sites (tools/ppc_xrefs.py calls 0x827BDA34) --
+// the most-called member of this defect class.  The shape at 0x82450258
+// (generated/ppc_xenon/ppc_recomp.81.cpp:84-102, raw bytes confirmed with
+// tools/ppc_disasm.py 0x82450250 30):
+//
+//   82450240  lis  r11,8207
+//   82450244  lwz  r3,4(r31)    ; r3 = string 1
+//   82450248  li   r7,1         ; r7 = case-insensitive
+//   8245024C  addi r5,r11,-22856 ; r5 = string 2 (0x8206A6B8 = "d:")
+//   82450250  li   r6,2         ; r6 = length of string 2
+//   82450254  li   r4,2         ; r4 = length of string 1
+//   82450258  bl   827BDA34
+//   8245025C  cmpi cr0,r3,0
+//   82450260  bne  -> 8245026C  ; r3 != 0 => "the strings DIFFER"
+//
+// So the guest's contract is: r3 == 0 means EQUAL, r3 != 0 means DIFFERENT.
+// The argument order is (string1, len1, string2, len2, caseInsensitive) --
+// r3, r4, r5, r6, r7 -- measured at all 11 sites.
+//
+// ALL 11 SITES PASS caseInsensitive == 1 (r7 == 1 at every one of them:
+// recomp.81.cpp:88, :119, :159, :6540, :6608, :9230, :13256, :13356,
+// :13390, :25516 and recomp.82.cpp:2596), so the compare is ALWAYS
+// case-insensitive in this guest.
+//
+// With the void stub, r3 on return was still the string pointer (non-zero), so
+// the guest ALWAYS reported "different" and NEVER reported "equal".  The
+// guest's string comparison was a constant false.
+//
+// THE CONSOLE'S BEHAVIOUR, from the reference:
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:117-137
+//     dword_result_t RtlCompareStringN_entry(lpstring_t string_1,
+//                                             dword_t string_1_len,
+//                                             lpstring_t string_2,
+//                                             dword_t string_2_len,
+//                                             dword_t case_insensitive)
+//   -> the ORDERING, 0 when the two are equal; case-insensitive when the flag
+//      is set (the reference uses xe_strncasecmp, which is _strnicmp on
+//      Windows: ASCII case folding).
+// The reference treats a length of 0xFFFF as "use strlen"
+// (xboxkrnl_rtl.cc:125-130); that is reproduced here.
+//
+// ONE DOCUMENTED DIFFERENCE FROM THE REFERENCE.  The reference computes the
+// comparison length as min(string_1_len, string_2_len) from the ORIGINAL
+// lengths and then calls strncasecmp, which STOPS at a NUL
+// (xboxkrnl_rtl.cc:131-134).  This implementation compares exactly N bytes and
+// does not stop at a NUL, which is what the console's RtlCompareStringN does.
+// The two differ only when a stated length runs past the string's terminator,
+// which none of the guest's 11 measured call sites does (every length there is
+// an exact strlen or a stored byte count).
+//
+// FALSIFIER.  The guest must now be able to take its EQUAL branch: at
+// recomp.81.cpp:130-133 (`beq -> 82450264`, which returns 1) and at
+// recomp.81.cpp:99-102 (`bne` must NOT be taken when the strings match).  A
+// concrete check: the guest's comparison of "d:" against "d:" at 0x82450258
+// must return 0, so the `bne` at 82450260 is NOT taken.
+// ===========================================================================
+// A REAL instrument for RtlCompareStringN.  The OLD void stub printed NOTHING
+// in a release build (LOG_UTILITY expands to nothing unless _DEBUG is
+// defined, .research/UnleashedRecomp/UnleashedRecomp/os/logger.h:14-18), so
+// "0 rows" proved nothing about this import.  This line prints on every call
+// the body answers, so a soak can show an EQUAL verdict (result == 0) -- which
+// is what the void stub could never produce (AGENTS.md rule 19).
+static void RtlCompareStringNCensus(uint32_t length1, uint32_t length2,
+                                    uint32_t caseInsensitive,
+                                    uint32_t result) {
+  static std::atomic<uint32_t> s_census{0};
+  const uint32_t n = s_census.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 20 || (n % 1000) == 0) {
+    MCLA_LOG_INFO("RTL-CMPN #{} lr={:08X} len1={} len2={} ci={} -> result=0x{:X} "
+                  "({})",
+                  n, static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0u),
+                  length1, length2, caseInsensitive, result,
+                  result == 0 ? "EQUAL" : "DIFFERENT");
+  }
+}
+
+uint32_t RtlCompareStringN(char *string1, uint32_t string1Len, char *string2,
+                           uint32_t string2Len, uint32_t caseInsensitive) {
+  if (!string1 || !string2) {
+    // A null string is not equal to anything (and must not crash the host).
+    return 0xFFFFFFFFu;
+  }
+
+  // The reference's 0xFFFF sentinel means "the length is the string's own
+  // length" (.research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:125).
+  // The scan is BOUNDED so a guest string without a terminator cannot walk the
+  // host off the end of the guest window.
+  constexpr uint32_t kMaxAutoLength = 4096;
+  if (string1Len == 0xFFFFu) {
+    string1Len = 0;
+    while (string1Len < kMaxAutoLength && string1[string1Len] != '\0') {
+      string1Len++;
+    }
+  }
+  if (string2Len == 0xFFFFu) {
+    string2Len = 0;
+    while (string2Len < kMaxAutoLength && string2[string2Len] != '\0') {
+      string2Len++;
+    }
+  }
+
+  const uint32_t count = string1Len < string2Len ? string1Len : string2Len;
+
+  auto fold = [caseInsensitive](uint8_t c) -> int {
+    if (!caseInsensitive) {
+      return static_cast<int>(c);
+    }
+    // ASCII case folding, which is what _strnicmp does on Windows
+    // (.research/xenia/src/xenia/base/string.cc:24-30).
+    if (c >= 'A' && c <= 'Z') {
+      return static_cast<int>(c - 'A' + 'a');
+    }
+    return static_cast<int>(c);
+  };
+
+  for (uint32_t i = 0; i < count; i++) {
+    const int a = fold(static_cast<uint8_t>(string1[i]));
+    const int b = fold(static_cast<uint8_t>(string2[i]));
+    if (a != b) {
+      // The console returns the difference of the first differing characters.
+      const uint32_t difference =
+          static_cast<uint32_t>(static_cast<int32_t>(a - b));
+      RtlCompareStringNCensus(string1Len, string2Len, caseInsensitive,
+                              difference);
+      return difference;
+    }
+  }
+
+  // Equal over the compared prefix.
+  RtlCompareStringNCensus(string1Len, string2Len, caseInsensitive, 0);
+  return 0;
+}
 
 void _snprintf_x() { LOG_UTILITY("!!! STUB !!!"); }
 
@@ -6665,50 +9110,92 @@ void RtlUnicodeStringToAnsiString() { LOG_UTILITY("!!! STUB !!!"); }
 
 void RtlInitUnicodeString() { LOG_UTILITY("!!! STUB !!!"); }
 
-// ExTerminateThread (F-609): REPORT ONLY. Still a refusal, deliberately - it
-// must not return to the caller on real hardware, and it cannot not return
-// here.
+// ExTerminateThread (2026-10-21, fix_irq2, item 5): NOW REAL.
 //
-// What a correct implementation needs, and why it is not written:
+// CONSOLE BEHAVIOUR, and it is NOT "terminate some other thread":
+//   .research/xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_threading.cc:155-159
+//       dword_result_t ExTerminateThread_entry(dword_t exit_code) {
+//         XThread* thread = XThread::GetCurrentThread();
+//         // NOTE: this kills us right now. We won't return from it.
+//         return thread->Exit(exit_code);
+//       }
+//   The single argument is the EXIT CODE, and the thread that dies is the
+//   CALLING thread.
 //
-//  1. AN UNWIND TARGET. The only unwinder this recompiler emits is the
-//     setjmp/longjmp pair for the two reserved import addresses:
-//     .research/XenonRecomp/XenonRecomp/recompiler.cpp:523-535 gates ALL
-//     `longjmp` emission on `config.longJmpAddress` and ALL `setjmp` emission
-//     on `config.setJmpAddress`, and config/mcla_xenonrecomp.toml sets NEITHER
-//     (grep: no such key anywhere in the file). The recompiled guest therefore
-//     contains zero setjmp and zero longjmp. Calling longjmp() from here would
-//     jump into a jmp_buf that nobody ever initialised, and a C++ exception
-//     would unwind through frames with no landing pads. Both are UB, and either
-//     would trade a visible refusal for an unpredictable crash - strictly worse
-//     than what we have. Per project rule 2, mcla_xenonrecomp.toml is not ours
-//     to edit; enabling it is a recompiler-regen decision (skill
-//     mcla-recompiler-regen), not a line in this file.
-//  2. A THREAD REGISTRY. Terminating must also tear down the GuestThreadHandle
-//     and release every guest parked in NtWaitForSingleObjectEx on it, or those
-//     parks hang forever. That is a src/kernel/guest_thread.cpp change, not
-//     ours.
-//  3. A PC-side entry for the teardown, since there is no guest-side KTHREAD
-//     teardown to borrow.
+// THE GUEST'S OWN BYTES agree, and there is exactly one call site
+// (`py -3 tools/ppc_xrefs.py calls 0x827BD864`):
+//   0x8242F834  li r3,0              ; exit code 0
+//   0x8242F838  bl 827BD864          ; __imp__ExTerminateThread(0)
+//   0x8242F83C  sync
+//   i.e. the thread tears ITSELF down, inside sub_8242F748.
 //
-// Until 1-3 exist, the honest behaviour is to be loud and let the guest
-// continue, so the original STUB marker is preserved verbatim and a bounded
-// census is added: a soak can now show whether the title ever REACHES
-// ExTerminateThread (w657.log never does - the marker count is 0), which is
-// the fact needed to decide whether any of this is worth building.
-void ExTerminateThread() {
-  LOG_UTILITY("!!! STUB !!!");
+// The old body was a refusal (`LOG_UTILITY("!!! STUB !!!")` + a census),
+// justified by three obstacles.  Two of them are gone, one is not:
+//
+//  1. AN UNWIND TARGET -- STILL A REAL CONSTRAINT, but it no longer blocks
+//     this.  The recompiler emits setjmp/longjmp only for the two reserved
+//     import addresses (.research/XenonRecomp/XenonRecomp/recompiler.cpp:
+//     523-535 gates longjmp on config.longJmpAddress and setjmp on
+//     config.setJmpAddress, and config/mcla_xenonrecomp.toml sets NEITHER),
+//     so the guest cannot be unwound with longjmp and a C++ exception would
+//     unwind through frames with no landing pads.  The console's mechanism
+//     ("we won't return from it") does NOT need an unwind: it simply does not
+//     come back.  The host's equivalent is TerminateThread on the CURRENT
+//     host thread, which stops the thread at the call without unwinding
+//     anything.  Per rule 2 mcla_xenonrecomp.toml is not ours to edit, and
+//     the setjmp/longjmp route stays blocked; this edit does not need it.
+//  2. A THREAD REGISTRY -- NOT NEEDED for the console's semantics.  The
+//     console kills the CALLING thread, so there is no other thread to find,
+//     no handle to resolve and no waiter to release.  (The old note assumed
+//     the export took a thread HANDLE; the guest's bytes and the reference
+//     both say it takes an EXIT CODE.)
+//  3. A PC-side entry for the teardown -- not needed either, for the same
+//     reason.
+//
+// TRADE-OFF, stated: TerminateThread abandons the thread's C++ frames, so
+// the guest thread's GuestThreadContext destructor (which frees the guest
+// thread's PCR/TLS/TEB/stack block, guest_thread.cpp:183-186) does not run
+// and that block leaks, and any host lock the thread happened to hold stays
+// held.  The console's thread->Exit() has the same shape: it tears the
+// thread down without running the thread's cleanup.  The alternative --
+// refusing and letting the guest continue -- is NOT the console's behaviour
+// and leaves every waiter on that thread blocked forever.
+//
+// FALSIFIER: a soak in which the guest reaches 0x8242F838 must show an
+// EX-TERMINATE row and the thread's own subsequent activity must STOP
+// (no further rows with that tid).  A soak with EX-TERMINATE rows and the
+// thread still running means TerminateThread failed and the fallback path
+// ran.
+uint32_t ExTerminateThread(uint32_t exitCode) {
   static std::atomic<uint32_t> s_exTerm{0};
   const uint32_t n = s_exTerm.fetch_add(1) + 1;
   if (n <= 40 || (n % 500) == 0)
-    MCLA_LOG_WARN("EX-TERMINATE #{} REFUSING and returning: no unwind target "
-                  "exists (recompiler.cpp:523-535 emits longjmp only when "
-                  "config.longJmpAddress is set, setjmp only when "
-                  "config.setJmpAddress is set, and mcla_xenonrecomp.toml sets "
-                  "neither), so terminating here would be UB. The guest "
-                  "continues on this thread. tid={:08X} lr={:08X}",
-                  n, GetCurrentThreadId(),
+    MCLA_LOG_WARN("EX-TERMINATE #{} exit_code={} tid={:08X} lr={:08X} - "
+                  "terminating THIS host thread now (console: xenia "
+                  "xboxkrnl_threading.cc:155-159, 'this kills us right now')",
+                  n, exitCode, GetCurrentThreadId(),
                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+
+#if defined(_WIN32)
+  // TerminateThread on the CURRENT thread: the thread stops at this call and
+  // never returns, exactly like the console's thread->Exit().  The exit code
+  // is the guest's r3.
+  if (TerminateThread(GetCurrentThread(), static_cast<UINT>(exitCode)) != 0) {
+    // Unreachable in practice: TerminateThread on the calling thread does
+    // not return.  If it ever did, say so rather than falling through.
+    MCLA_LOG_ERROR("EX-TERMINATE #{} TerminateThread returned - the thread "
+                   "was NOT killed",
+                   n);
+    return 0;
+  }
+#endif
+  // TerminateThread failed (or is unavailable): refuse loudly, the way the
+  // old body did, and let the guest continue.
+  LOG_UTILITY("!!! STUB !!!");
+  MCLA_LOG_ERROR("EX-TERMINATE #{} could not terminate the thread - REFUSING "
+                 "and returning; the guest continues on this thread",
+                 n);
+  return 0;
 }
 
 uint32_t ExCreateThread(be<uint32_t> *handle, uint32_t stackSize,
@@ -7150,9 +9637,44 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count,
   }
 }
 
-uint32_t KeRaiseIrqlToDpcLevel() { return 0; }
+// Console (xboxkrnl_threading.cc:998-1001): raise to DPC and RETURN THE OLD
+// IRQL.  The old body returned a constant 0, which is only right for the
+// OUTERMOST acquire on a thread that starts at PASSIVE; for a NESTED acquire
+// it handed the guest a wrong "old level", and because the guest stores that
+// value in its lock struct's +12 byte and hands it back to KfLowerIrql
+// (0x823EAD9C / 0x823EACF8), every lowering was a no-op.
+uint32_t KeRaiseIrqlToDpcLevel() {
+  const uint32_t oldIrql = HostRaiseIrql(kIrqlDpc);
+  {
+    static std::atomic<uint32_t> s_raise{0};
+    const uint32_t n = s_raise.fetch_add(1) + 1;
+    if (n <= 40 || (n % 5000) == 0)
+      MCLA_LOG_INFO("IRQL-RAISE #{} old_irql={} new_irql={} lr={:08X}", n,
+                    oldIrql, static_cast<unsigned>(kIrqlDpc),
+                    g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0);
+  }
+  return oldIrql;
+}
 
-void KfLowerIrql() {}
+// Console (xboxkrnl_threading.cc:1005-1010): restore the level, THEN run the
+// pending APCs (CheckApcs).  The old body was `{}`: it ignored its argument
+// entirely, so the host had NO IRQL and NO APC delivery point at all.
+//
+// The argument arrives in r3: the guest does `mr r3,r31` (the saved old
+// IRQL) immediately before the call (0x823EACF4 -> 0x823EACF8, and the same
+// at 0x823EAD48 -> 0x823EAD4C, 0x823EB6D8 -> 0x823EB6DC, 0x823EE9EC ->
+// 0x823EE9F0).
+void KfLowerIrql(uint32_t oldIrql) {
+  HostLowerIrql(static_cast<uint8_t>(oldIrql & 0xFF));
+  {
+    static std::atomic<uint32_t> s_lower{0};
+    const uint32_t n = s_lower.fetch_add(1) + 1;
+    if (n <= 40 || (n % 5000) == 0)
+      MCLA_LOG_INFO("IRQL-LOWER #{} old_irql={} now={} lr={:08X}", n, oldIrql,
+                    static_cast<unsigned>(HostCurrentIrql()),
+                    g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0);
+  }
+}
 
 extern "C" uint32_t KeReleaseSemaphore(XKSEMAPHORE *semaphore, uint32_t increment,
                             uint32_t adjustment, uint32_t wait) {
@@ -7358,7 +9880,18 @@ GUEST_FUNCTION_HOOK(__imp__KeGetCurrentProcessType, KeGetCurrentProcessType);
 GUEST_FUNCTION_HOOK(__imp__RtlCompareMemoryUlong, RtlCompareMemoryUlong);
 GUEST_FUNCTION_HOOK(__imp__RtlInitializeCriticalSection,
                     RtlInitializeCriticalSection);
-GUEST_FUNCTION_HOOK(__imp__RtlRaiseException, RtlRaiseException_x);
+// (rule 1b, 2026-10-21, fix_raise) NOT a GUEST_FUNCTION_HOOK: the hook needs
+// the LIVE guest context (the guest's raise registers, the raising frame's
+// stack and the return address), and the GUEST_FUNCTION_HOOK machinery can
+// only hand a hook the guest's ARGUMENT REGISTERS -- a PPCContext& parameter
+// would be gathered as an integer argument
+// (src/kernel/function.h:330-341, ArgTranslator::GetValue), and the
+// thread-local g_ppcContext is STALE here because the recompiled code never
+// calls SetPPCContext (0 hits in generated/ppc_xenon/ppc_recomp.0.cpp), so it
+// still holds the boot root's registers.  A direct PPC_FUNC body gets the
+// live `ctx` and `base`; the same shape is used for
+// __imp__NtQueryInformationFile at src/kernel/imports.cpp:1058.
+PPC_FUNC(__imp__RtlRaiseException) { RtlRaiseException_x(ctx, base); }
 GUEST_FUNCTION_HOOK(__imp__KfReleaseSpinLock, KfReleaseSpinLock);
 GUEST_FUNCTION_HOOK(__imp__KfAcquireSpinLock, KfAcquireSpinLock);
 GUEST_FUNCTION_HOOK(__imp__KeQueryPerformanceFrequency,

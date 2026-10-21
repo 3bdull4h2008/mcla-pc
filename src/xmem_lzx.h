@@ -6,10 +6,33 @@
 // NOT touch guest decoder state, so it is free of the guest-inflate context
 // conflict that closed Path B full-apply (F-288/F-290/F-293).
 //
-// Format (see docs/ROOT_CAUSE_VALIDATION.md F-295):
-//   RSC5: +0 0x05435352, +12 0x0FF512EF (XComp), +16 uncLen (BE). window_bits=17.
-//   "single": raw LZX at pkg+0x16 as one continuous stream (raceeditor/policecam/credits).
-//   "walk"  : per-frame u16-BE length headers from pkg+0x14, shared decoder state (garage).
+// CONTAINER FORMAT (measured against the retail bytes, build/game_data/
+// xarchive_cache.rpf, and against the console's own reader):
+//   RSC5: +0 0x05435352, +4 header len 0x1B, +12 0x0FF512EF (XComp),
+//         +16 uncLen (BE) -- the DECLARED UNCOMPRESSED LENGTH. window_bits=17.
+//   +20  the FRAME CHAIN. Each frame is a header + that frame's compressed
+//        bytes; the console walks this chain (guest sub_82461010, emitted at
+//        generated/ppc_xenon/ppc_recomp.82.cpp:14065-14444):
+//          byte0 == 0xFF -> 5-byte header: uncompressed = u16BE(+1),
+//                                       compressed   = u16BE(+3)
+//          else          -> 2-byte header: compressed   = u16BE(+0),
+//                                       uncompressed = 32768 (0x8000)
+//        The console decodes ONE chain frame per call: the bit buffer is
+//        re-initialised from that frame's first bytes (guest sub_82461E08,
+//        emitted at ppc_recomp.82.cpp:16221) while the LZX block state
+//        (block type/length, Huffman tables, R0/R1/R2) and the sliding window
+//        persist across frames.
+//
+// THE "single" SHORTCUT IS GONE (2026-10-21). It fed the whole payload
+// region -- chain headers included -- to one continuous LZX stream and
+// accepted the result on a 4-byte head check. Measured: it is CORRUPT from
+// the first frame boundary (raceeditor: 102,219 wrong bytes from offset
+// 32768, the ActionScript text becomes 'my_meas'/'mympt_iG' where the
+// frame-chain decode yields 'mystring'/'myfont'/'FSCommand:MeasureString');
+// it THROWS on garage ('Invalid LZX block type: 4'); and on legals it
+// produces a head of 00 00 00 00. build/xmem_golden/raceeditor.bin WAS that
+// corrupt output, so every UIXSF-GOLDEN-* check was self-referential. The
+// frame chain is now the ONLY rule.
 //
 // Header-only by design so the standalone offline test and gpu_device.cpp can
 // both include it with no build-system churn.
@@ -229,9 +252,25 @@ class Decoder {
     aligntree_len_.assign(kAligntreeMaxSymbols + kLenTableSafety, 0);
   }
 
-  // Decode one call from `src` (a raw LZX bitstream or one frame payload),
-  // producing exactly `output_size` bytes appended into `out`. Shared state on
-  // window_/R0-2/block_remaining_/header_read_ persists across calls.
+  // Decode ONE chain frame from `src` (that frame's compressed bytes),
+  // producing exactly `output_size` bytes appended into `out`.
+  //
+  // POSITION INVARIANT (fixed 2026-10-21): `out.size()` and `window_pos_`
+  // are ABSOLUTE positions in the member's uncompressed stream, not
+  // per-call offsets. The window is indexed by (pos & (window_size-1)) but
+  // the arithmetic that decides how many bytes still have to be decoded
+  // needs the absolute position:
+  //     bytes_todo = frame_posn + cur_frame_size - window_posn
+  // With a per-call `frame_posn = 0` and a window position masked to the
+  // window size, every frame after the first computed bytes_todo == 0,
+  // decoded NOTHING, and copied window[0..] out again -- i.e. the old
+  // "walk" path emitted frame 0 once per frame (measured: the golden
+  // garage.bin carried 'slot_tied' at 16239, 49007, 81775, ... -- the same
+  // string every 32768 bytes).
+  //
+  // Shared state on window_/R0-2/block_remaining_/header_read_ persists
+  // across calls; the bit buffer is per call (the console re-initialises it
+  // from each frame's first bytes -- guest sub_82461E08).
   bool decompress(const uint8_t* src, size_t src_len, uint32_t output_size,
                   std::vector<uint8_t>& out) {
     BitBuf bb;
@@ -240,10 +279,14 @@ class Decoder {
     out.resize(out_pos + output_size);
     uint8_t* output = out.data() + out_pos;
 
+    // The LZX frame size is 32768. A chain frame carries at most 65535
+    // uncompressed bytes, so the loop below runs a single iteration and no
+    // re-alignment happens INSIDE a chain frame -- the console decodes one
+    // chain frame in one pass.
     int frame_size = window_size_;
     int window_mask = window_size_ - 1;
-    int window_posn = window_pos_;
-    int frame_posn = 0;
+    int64_t window_posn = window_pos_;   // absolute
+    int64_t frame_posn = (int64_t)out_pos;  // absolute
 
     if (!header_read_) {
       uint32_t intel_e8 = bb.read_bits(1);
@@ -262,7 +305,7 @@ class Decoder {
       if (cur_frame_size > (int)output_size - written)
         cur_frame_size = (int)output_size - written;
 
-      int bytes_todo = frame_posn + cur_frame_size - window_posn;
+      int64_t bytes_todo = frame_posn + cur_frame_size - window_posn;
       if (bytes_todo < 0) bytes_todo = 0;
 
       while (bytes_todo > 0) {
@@ -279,7 +322,7 @@ class Decoder {
           for (int i = 0; i < this_run; i++) {
             uint8_t b = bb.pos < bb.len ? bb.data[bb.pos] : 0;
             bb.pos += 1;
-            window_[window_posn & window_mask] = b;
+            window_[(size_t)(window_posn & window_mask)] = b;
             window_posn += 1;
           }
         } else {
@@ -337,9 +380,9 @@ class Decoder {
               R0_ = match_offset;
             }
             this_run -= match_length;
-            int runsrc = (window_posn - match_offset) & window_mask;
+            int runsrc = (int)((window_posn - match_offset) & window_mask);
             for (int k = 0; k < match_length; k++) {
-              window_[window_posn & window_mask] = window_[runsrc];
+              window_[(size_t)(window_posn & window_mask)] = window_[runsrc];
               window_posn += 1;
               runsrc = (runsrc + 1) & window_mask;
             }
@@ -352,7 +395,7 @@ class Decoder {
       if (bb.bits_left > 0) bb.ensure_bits(16);
       if (bb.bits_left & 15) bb.remove_bits(bb.bits_left & 15);
 
-      int wp = frame_posn & window_mask;
+      int wp = (int)(frame_posn & window_mask);
       for (int k = 0; k < cur_frame_size; k++) {
         output[written++] = window_[wp];
         wp = (wp + 1) & window_mask;
@@ -360,7 +403,9 @@ class Decoder {
       frame_posn += cur_frame_size;
     }
 
-    window_pos_ = window_posn & window_mask;
+    // ABSOLUTE window position (not masked): the frame arithmetic above needs
+    // it unmasked, because a member can be longer than the 128 KiB window.
+    window_pos_ = window_posn;
 
     if (intel_started_ && output_size > 10) {
       e8_decode(output, output_size);
@@ -479,7 +524,7 @@ class Decoder {
   int num_pos_slots_;
   int main_elements_;
   std::vector<uint8_t> window_;
-  int window_pos_ = 0;
+  int64_t window_pos_ = 0;   // ABSOLUTE position in the member's output stream
   int R0_ = 1, R1_ = 1, R2_ = 1;
 
   std::vector<int> pretree_table_, maintree_table_, lentree_table_,
@@ -496,8 +541,9 @@ class Decoder {
   bool intel_started_ = false;
 };
 
-// --- Two-path UI .xsf driver. On success `out` holds exactly uncLen bytes with
-//     head "DIU\0" and returns the path used ("single"/"walk") in path_out. ---
+// --- UI .xsf driver: ONE rule, the container's FRAME CHAIN. On success `out`
+//     holds exactly uncLen bytes with head "DIU\0" and the return value is 2
+//     ("walk" -- the frame chain). 0 means "not a decodable UI container". ---
 inline int host_decode_ui_xsf(const uint8_t* pkg, size_t pkg_len,
                               std::vector<uint8_t>& out, int window_bits = 17) {
   if (pkg_len < 24) return 0;
@@ -508,51 +554,98 @@ inline int host_decode_ui_xsf(const uint8_t* pkg, size_t pkg_len,
   if (be32(0) != kRsc5Magic || be32(12) != kXCompMagic) return 0;
   uint32_t unc = be32(16);
   if (unc == 0) return 0;
+  // F-835: CLAMP THE DECLARED SIZE TO THE WINDOW THE HOST'S SIBLING READER
+  // ALREADY ENFORCES. The sibling reader (MclaRsc5DeclaredSize,
+  // src/gpu_device.cpp:1742-1749) accepts a declared size only when
+  // 0x20 <= sz <= kPkgWindowMax (0x400000 = 4 MB) -- the same window
+  // MclaLoadPkgWindow (gpu_device.cpp:1751-1763) uses for the bytes it will
+  // actually fetch. THIS FUNCTION DID NOT, and `decompress` then does
+  // `out.resize(out_pos + output_size)` (src/xmem_lzx.h:240) with that
+  // unchecked value.
+  //
+  // MEASURED (build/agents/audit_lzx.md): an offline scan of the 2.1 GB
+  // retail packfile finds 58 of 14,928 RSC5/XCompress containers declaring an
+  // uncompressed length OUTSIDE that window, the largest 18,633,951 B. The
+  // unbounded `resize` on such a value is the only unbounded guest-derived
+  // allocation size in the LZX path, and it is what threw the MSVC C++
+  // exception 0xE06D7363 that KILLED THE BOOT WORKER THREAD (build/w839.log:
+  // the exception's thread=1928 == 0x788 == the boot worker's tid, so
+  // LoadCityData never ran and the city table stayed empty -- the LZX defect
+  // and the 'LookupCity SC' fatal are ONE defect).
+  //
+  // The window is the SIBLING'S, not a new number: kPkgWindowMax = 0x400000
+  // (src/gpu_device.cpp:1026). It is restated here as a literal because
+  // xmem_lzx.h must not depend on gpu_device.cpp's TU scope.
+  if (unc < 0x20u || unc > 0x400000u) return 0;
 
+  // "DIU\0" is NOT the container's magic (the container's magic is RSC5 at +0
+  // and the XCompress magic at +12). It is the head of the DECOMPRESSED
+  // payload, so it is only a VALIDITY CHECK on the decode: the container
+  // declares `unc` bytes, and a correct frame-chain decode of a UI resource
+  // starts with "DIU\0" (measured 5/5 on the retail containers).
   auto is_diu = [&](const std::vector<uint8_t>& v) {
     return v.size() == unc && v[0] == 0x44 && v[1] == 0x49 && v[2] == 0x55 &&
            v[3] == 0x00;
   };
 
-  // Path "single": one continuous stream at pkg+0x16.
+  // THE FRAME CHAIN IS THE ONLY RULE (2026-10-21).
+  //
+  // The console's reader is guest sub_82461010 (emitted at
+  // generated/ppc_xenon/ppc_recomp.82.cpp:14065-14444). It reads, at the
+  // chain cursor, ONE frame header and then that frame's compressed bytes:
+  //   byte0 == 0xFF -> 5-byte header, uncompressed = u16BE(+1),
+  //                              compressed   = u16BE(+3)
+  //              -> (ppc_recomp.82.cpp:14317-14335: r25 = (h1<<8)|h2,
+  //                 r11 = (h3<<8)|h4, r26 = r11+5)
+  //   else          -> 2-byte header, compressed   = u16BE(+0),
+  //                              uncompressed = 32768
+  //              -> (ppc_recomp.82.cpp:14349-14360: r11 = (h0<<8)|h1,
+  //                 r25 = 0x8000, r26 = r11+2)
+  // and it then calls the per-frame decoder with THAT frame's uncompressed
+  // size (r4 = r25) and that frame's compressed length (r6 = r26 - r10).
+  // The output is clamped to what the container still owes (unc - produced),
+  // exactly as the guest clamps to (st+12 - st+8).
+  //
+  // The "single" continuous-stream shortcut that used to be tried FIRST is
+  // GONE. It fed the whole payload region -- the chain headers included -- to
+  // one LZX stream, so the 2-byte frame headers were decoded as compressed
+  // data and everything after the first frame boundary was garbage. Measured
+  // against the retail bytes (build/agents/fix_span2.md):
+  //   raceeditor  102,219 wrong bytes from offset 32768; the ActionScript
+  //               text 'mystring'/'myfont'/'FSCommand:MeasureString' comes
+  //               out as 'my_meas'/'mympt_iG'/'F///////S'
+  //   garage      raises "Invalid LZX block type: 4"
+  //   legals      the head is 00 00 00 00 instead of "DIU\0"
+  //   credits / policecam  one frame each, both paths agree
   {
     Decoder d(window_bits);
     std::vector<uint8_t> o;
-    if (pkg_len > 0x16 &&
-        d.decompress(pkg + 0x16, pkg_len - 0x16, unc, o) && is_diu(o)) {
-      out.swap(o);
-      return 1;  // single
-    }
-  }
-  // Path "walk": per-frame shared state from pkg+0x14.
-  {
-    Decoder d(window_bits);
-    std::vector<uint8_t> o;
-    size_t src = 20;
-    uint32_t acc = 0;
-    while (src + 2 <= pkg_len && acc < unc) {
+    size_t src = 20;          // container+0x14: the first frame header
+    uint32_t acc = 0;         // bytes produced so far
+    while (acc < unc) {
+      if (src + 2 > pkg_len) return 0;
       uint8_t b0 = pkg[src];
-      int hdr, uncomp, pay;
+      int hdr, frame_unc, pay;
       if (b0 == 0xFF) {
-        if (src + 5 > pkg_len) break;
+        if (src + 5 > pkg_len) return 0;
         hdr = 5;
-        uncomp = (pkg[src + 1] << 8) | pkg[src + 2];
+        frame_unc = (pkg[src + 1] << 8) | pkg[src + 2];
         pay = (pkg[src + 3] << 8) | pkg[src + 4];
       } else {
         hdr = 2;
-        uncomp = 0x8000;
+        frame_unc = 0x8000;   // 32768, the guest's constant for the 2-byte form
         pay = (b0 << 8) | pkg[src + 1];
       }
-      if (pay == 0 || src + hdr + (size_t)pay > pkg_len) break;
-      int want = uncomp < (int)(unc - acc) ? uncomp : (int)(unc - acc);
-      if (!d.decompress(pkg + src + hdr, (size_t)pay, (uint32_t)want, o)) break;
-      acc += (uint32_t)want;
+      if (pay == 0 || src + hdr + (size_t)pay > pkg_len) return 0;
+      uint32_t want = (uint32_t)frame_unc;
+      if (want > unc - acc) want = unc - acc;
+      if (!d.decompress(pkg + src + hdr, (size_t)pay, want, o)) return 0;
+      acc += want;
       src += hdr + (size_t)pay;
-      if (acc >= unc) break;
     }
     if (is_diu(o)) {
       out.swap(o);
-      return 2;  // walk
+      return 2;  // walk (the frame chain) -- the only path left
     }
   }
   return 0;

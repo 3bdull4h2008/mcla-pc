@@ -18,6 +18,12 @@
 #include "kernel/xbox.h"
 #include "kernel/kernel_objects.h"
 
+// (rule 1b, 2026-10-21 fix_typebyte) Cross-TU entry point of the host's
+// guest-clock tick (src/kernel/imports.cpp: SignalSchedulerTick).  It sets
+// the guest's clock-tick EVENT 0x40004D7C, which is the console-correct
+// class for that object.
+void SignalSchedulerTickPublic();
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -688,8 +694,18 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     void *sem_host = mem.Translate(0x40004D7C);
     if (sem_host) {
-      KeReleaseSemaphore(sem_host, 1, 1, 0);
-      MCLA_LOG_WARN("HOST-ONE-SHOT release scheduler-tick 0x40004D7C "
+      // CONSOLE-CORRECT CLASS (2026-10-21, fix_typebyte): the guest's
+      // clock-tick object 0x40004D7C is an EVENT - the guest-visible Type
+      // byte at that address is 0x00 (EventNotification, build/w842.log
+      // "TYPE-CENSUS[KWFSO] objptr=40004D7C type=00") and the guest RESETS
+      // it (0x8242FCD4 addi r3,r26,32 / 0x8242FCD8 bl 0x827BD874 =
+      // __imp__KeResetEvent).  The old KeReleaseSemaphore call resolved it
+      // as a Semaphore, which is the cross-type confusion that produced the
+      // KOBJ-CLASSFLIP rows (29 in build/w842.log) and LOST the guest's
+      // reset.  SignalSchedulerTickPublic() is the same path the recurring
+      // clock tick uses (it SETs the event).
+      SignalSchedulerTickPublic();
+      MCLA_LOG_WARN("HOST-ONE-SHOT set scheduler-tick 0x40004D7C "
                     "(lr=0, host-origin, not a guest producer; F-316: 0 of "
                     "the polls satisfied)");
     } else {

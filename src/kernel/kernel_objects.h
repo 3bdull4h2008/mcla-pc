@@ -263,7 +263,12 @@ inline void CloseKernelObject(XDISPATCHER_HEADER& header)
         return;
     }
 
-    DestroyKernelObject(header.WaitListHead.Blink);
+    // CONSOLE-CORRECT HANDLE (2026-10-21, fix_typebyte): the wrapper is
+    // found by the DISPATCHER ADDRESS (the handle the guest holds), not by
+    // the Blink word: Blink carries the wrapper's BASE address (the C++
+    // vptr is there), and the base is NOT a handle any more - feeding it to
+    // DestroyKernelObject(uint32_t) would resolve the wrong object.
+    DestroyKernelObject(mcla::kernel::g_memory.MapVirtual(&header));
 }
 
 inline uint32_t GuestTimeoutToMilliseconds(be<int64_t>* timeout)

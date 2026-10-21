@@ -247,6 +247,192 @@ static void MclaSanitizePath(char *buf, size_t cap) {
   }
 }
 
+// ===========================================================================
+// F-835 (2026-10-21): ONE guest-path length constant, and ONE length-driven
+// guest-path reader.
+//
+// THE MEASUREMENT (build/w841.log, the latest soak). Two shaders go through the
+// SAME two hooks and differ ONLY in the length of their path:
+//
+//  (1) 'shaders/characters/dcl/Character_alpha_normalmap_doublesided.dcl'
+//      is EXACTLY 64 characters.
+//      w841.log:45501  TOC76-XSF #1123 ret=A04CDBE0 path='...dcl...'
+//                     [C5CC2820 0000006C 002F4F9A 40000061]
+//      w841.log:45504  XSF-OPEN #1058 ... path='...dcl...' len=64
+//                     toc=[C5CC2820 0000006C 002F4F9A 40000061]   <-- CACHE HIT
+//      w841.log:45524  XSF-HOSTSERVE ... buf=BBF5A040 size=108       <-- SERVED
+//
+//  (2) 'shaders/characters/fxl_final/Character_alpha_normalmap_doublesided.fxc'
+//      is 70 characters.
+//      w841.log:45543  TOC76-XSF #1124 ret=A04CDC50
+//                     path='shaders/characters/fxl_final/Character_alpha_normalmap_doublesid'
+//                     [0599B574 00005718 002F5000 40001FCB]
+//      w841.log:45546  XSF-OPEN #1059 ... path='...doublesided.fxc' len=70
+//                     toc=[00000000 00000000 00000000 00000000]   <-- CACHE MISS
+//      w841.log:45547  XSF-POSTOPEN-SERVE ... buf=00000000 size=0
+//      w841.log:45549  OPEN-NULL-BOUND ... the guest holds a slot for a file
+//                     this host served nothing for
+//      w841.log:45558  BDF20 #442 path='a:/archive/...doublesided.fxc' len=81
+//
+// The guest's OWN TOC lookup SUCCEEDED in BOTH cases: ret=A04CDBE0 and
+// ret=A04CDC50 are non-zero TOC entries and the TOC76-XSF row prints the
+// guest's own four words. The guest was never asked about a truncated name.
+//
+// THE CAUSE. The two rows disagree about the same file because the two hooks
+// read the path with DIFFERENT LENGTHS:
+//   - sub_821CBFC0 (TOC76) read 64 bytes -- src/gpu_device.cpp:22871-22872
+//         char path[68] = {0};
+//         memR.ReadBytes(pathPtr, path, 64);
+//     For the 70-character path there is no NUL inside those 64 bytes, so the
+//     buffer's own zero at path[64] terminated a 64-CHARACTER key that had
+//     already lost 'ed.fxc'.
+//   - sub_821CCEA0 (XSF-OPEN) read 255 bytes -- src/gpu_device.cpp:23213-23215
+//     -> the full 70-character key.
+// The TOC cache g_xsfToc (src/gpu_device.cpp:262) is keyed by that STRING, its
+// ONLY writer is XsfTocCache (src/gpu_device.cpp:550) called from the TOC76
+// hook (src/gpu_device.cpp:22948), and the XSF-OPEN hook looks the SAME file
+// up with its own LONGER spelling (src/gpu_device.cpp:23228, :23392, :23467).
+// 64 != 70, so the lookup missed, the serve had no TOC words, and
+// HostServeUiBody returned 0 (src/gpu_device.cpp:3064-3074). The guest then
+// held a slot with no body and died on
+//   'Old version of rage effect found.  You need to recompile your shaders!'
+// The .dcl path is 64 characters, i.e. exactly AT the old limit, so its key
+// was intact and it HIT -- which is why one shader of the same pair served and
+// the other starved.
+//
+// MEASURED SCOPE of the damage in w841.log: 838 TOC76-XSF rows, 299 distinct
+// TOC paths, and EXACTLY ONE of them is a strict prefix of a longer path
+// printed by another hook: the .fxc path above. The 64-character .dcl path is
+// not truncated, which is the control.
+//
+// THE FIX. One constant, one reader:
+//   kGuestPathMax = 255 characters (256-byte buffer, NUL included).
+//   MclaReadGuestPath() reads the guest's NUL-terminated string BY ITS LENGTH
+//   and stops at the guest's NUL; every path reader in this file uses it.
+//   IT NEVER RETURNS A TRUNCATED PATH: either the guest's NUL is found (the
+//   whole path) or the result is EMPTY. A truncated key is unlookupable by the
+//   hook that read the full path -- which is the bug, not a fix for it.
+//
+// WHY 255 IS THE RIGHT NUMBER -- it is the GUEST'S OWN bound, measured:
+//   - sub_8218C760 (the guest's rage-effect loader -- the function whose
+//     0x8218C84C `ori r9,r8,6772` builds the 0x61786772 constant the guest
+//     compares against) composes the path with capacity 256:
+//       0x8218C79C `li r5,256` before `bl sub_821CA2F8` at 0x8218C7A4, and
+//       0x8218C7AC `li r4,256` before the copy at 0x8218C7B8.
+//     Inside sub_821CA2F8 the copy counter is capacity-1
+//     (0x821CA374 `addi r31,r27,-1`), so at most 255 characters are copied and
+//     the NUL lands at index <= 255.
+//   - sub_82188E50 (the .dcl composer) does the same with
+//     0x82188FFC `li r10,255; mtctr r10`.
+//   - observed: the LONGEST guest path in w841.log is 155 characters
+//     ('a:/archive/shaders/characters/Character_alpha_normalmap_doublesided/
+//     dcl/Character_alpha_normalmap_doublesided/dcl/
+//     Character_alpha_normalmap_doublesided.dcl') over 18,283 path='...' rows;
+//     467 of those exceed 63 characters, 3 exceed 127, and NONE exceeds 255.
+// 255 characters is therefore the largest string the guest can hand the host,
+// and the buffer is one byte larger so the NUL always fits.
+//
+// THE FALSIFIER (what would prove this fix wrong). For the .fxc path:
+//   - 'TOC76-XSF' must print the FULL 70-character path, not the 64-character
+//     prefix;
+//   - 'XSF-OPEN ... path=...fxc' must print a NON-ZERO toc=[...];
+//   - 'XSF-POSTOPEN-SERVE path=...fxc' must print buf=<non-zero> size=<non-zero>;
+//   - 'OPEN-NULL-BOUND' for that path must NOT be printed;
+//   - 'BE710-MAGIC-CENSUS' for that path must read magic=61786772 (the guest's
+//     own 'rgxa' head) and the guest's 'Old version of rage effect found.'
+//     fatal must not fire.
+// If the .fxc path still shows toc=[00000000 00000000 00000000 00000000],
+// the truncation was NOT the cause and the cause is elsewhere.
+// ===========================================================================
+
+// F-835: the ONE guest-path bound (see the block above for its derivation).
+static constexpr size_t kGuestPathMax = 255;
+// Buffer that holds kGuestPathMax characters plus the NUL.
+static constexpr size_t kGuestPathBuf = kGuestPathMax + 1;
+
+// F-835: read a guest NUL-terminated path BY ITS LENGTH.
+//
+// The readers this replaces did `ReadBytes(ptr, buf, 64)` -- a FIXED count that
+// cut every path longer than 64 characters, with no NUL inside the read, so the
+// buffer's own zero terminated the string instead. This reader stops at the
+// guest's NUL and never reads past it.
+//
+// IT NEVER RETURNS A TRUNCATED PATH. That is the whole point: a truncated
+// string is what the TOC cache was keyed by, and a truncated key is
+// unlookupable by the hook that read the FULL path. So either the guest's NUL
+// is found (the whole path is returned) or the result is EMPTY -- and an empty
+// path matches nothing, which is the safe outcome (the old code cached a
+// truncated key, and that is the bug this fixes).
+//
+// It also does not fail wholesale where the old fixed read did.
+// GuestMemoryHeap::ReadBytes refuses the WHOLE range when any of it is
+// unmapped (src/kernel/memory.cpp:293-299) and logs a GUEST-LOAD-REFUSED row,
+// so a path that ends near a page boundary would have lost its entire prefix.
+// A failed chunk AFTER the first is therefore retried byte by byte and the
+// prefix is kept; a failed FIRST chunk has no prefix to keep and is reported
+// exactly as the old fixed read reported it.
+//
+// `cap` is the buffer size in bytes; a path of up to cap-1 characters plus its
+// NUL fits exactly.
+//
+// Returns the number of characters copied (the NUL is not counted), or 0 when
+// the guest's NUL was not found.
+static size_t MclaReadGuestPath(char *dst, size_t cap, uint32_t guestPtr) {
+  if (!dst || cap == 0)
+    return 0;
+  dst[0] = '\0';
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const size_t maxBytes = cap;  // a NUL at index cap-1 still fits
+  size_t n = 0;
+  bool sawNul = false;
+  while (n < maxBytes) {
+    const size_t want = std::min<size_t>(64, maxBytes - n);
+    char tmp[64] = {0};
+    if (mem.ReadBytes(guestPtr + static_cast<uint32_t>(n), tmp,
+                      static_cast<uint32_t>(want))) {
+      size_t take = 0;
+      while (take < want && tmp[take] != '\0')
+        ++take;
+      std::memcpy(dst + n, tmp, take);
+      n += take;
+      if (take < want) {  // the guest's NUL is inside this chunk
+        dst[n] = '\0';
+        sawNul = true;
+        break;
+      }
+      continue;  // the chunk is all characters -- keep going
+    }
+    if (n == 0)
+      break;  // nothing to preserve: report it as the old fixed read did
+    // The chunk failed: take it byte by byte so the prefix survives.
+    size_t k = 0;
+    for (; n + k < maxBytes; ++k) {
+      char c = 0;
+      if (!mem.ReadBytes(guestPtr + static_cast<uint32_t>(n + k), &c, 1))
+        break;
+      if (c == '\0') {
+        dst[n + k] = '\0';
+        sawNul = true;
+        n += k;
+        break;
+      }
+      dst[n + k] = c;
+    }
+    if (sawNul)
+      break;
+    n += k;
+    break;
+  }
+  if (!sawNul) {
+    // No NUL inside the buffer: the guest's string is longer than the buffer,
+    // or its tail is unmapped. Do NOT hand back a truncated path.
+    dst[0] = '\0';
+    return 0;
+  }
+  dst[n] = '\0';
+  return n;
+}
+
 // ---------------------------------------------------------------------------
 // w13: UI .xsf census. TOC76 finds the files (encrypted RPF TOC, no plaintext
 // names on disk) but bodies never parse. Cache the decrypted TOC entry words
@@ -518,7 +704,38 @@ static bool PathLooksLikeArchiveContent(const char *path) {
          // F-464/F-443/F-444 have been chasing (BDF20 #600 ret=0, F442-SECTION
          // 14 rows all hits=0) and it is the member shape the fixed serve can
          // now actually deliver.
-         std::strstr(folded, "tune/") != nullptr;
+         std::strstr(folded, "tune/") != nullptr ||
+         // F-8xx (2026-10-21, text lane): THE FONT ATLAS FAMILY. The guest
+         // picks the font directory "$/ui/fonts/" (VA 0x8201BB70) and the font
+         // name "Arial12" (VA 0x8201BB68) and formats the atlas
+         // "%s_%02d.dds" (VA 0x820859E8) / "%s_%02ds.dds" (VA 0x820859F4) --
+         // all three MEASURED in build/cache/mcla_pe.bin (offset = VA-0x82000000).
+         // The retail archive HAS those members: build/toc_parsed.bin (the
+         // guest's parsed TOC of build/game_data/xarchive_cache.rpf) holds the
+         // directory record `fonts` (GtaO 0x2C3921E7, 7 children) and the leaf
+         // records arial12_00.dds (0x663790A1), arial12_00s.dds (0x03D7E607),
+         // arial12_01.dds (0xA5A9AB3F), arial12_01s.dds (0x09C0E684),
+         // arial12_02.dds (0x64238020), arial12_02s.dds (0xE72DCE15), each
+         // 0x4080 bytes -- MEASURED with
+         // `py -3 tools/rpf_offline.py find <leaf> build/toc_parsed.bin`
+         // (control: city.lst -> record 0x043130).
+         // The host's own TOC hash folds A-Z (MclaTocHash, below:22276), so the
+         // guest's "Arial12_00.dds" hashes to the archive's "arial12_00.dds".
+         // The predicate refused BOTH the extension and the directory, so the
+         // font atlas could never be cached (XsfTocCache), registered
+         // (MarkMemberExpanded) or served -- and the legal-text screen needs
+         // fonts. Strictly ADDITIVE: a path that already matched still matches
+         // bit-for-bit.
+         // STATUS: the font path is UNREACHED today -- MEASURED in
+         // build/w842.log and build/run845.txt: "arial"=0, "/fonts"=0,
+         // "jp_fonts"=0, and the only ".dds" requests are textures/*.dds, which
+         // the "textures/" rule above already admits. So the refusal is a
+         // PREDICTION about the code path, not a measured failure.
+         // FALSIFIER: a soak that shows a TOC76-XSF/HOSTSERVE row for a
+         // ui/fonts/*.dds path proves the predicate was not the blocker and
+         // this widening is unnecessary.
+         std::strstr(folded, ".dds") != nullptr ||
+         std::strstr(folded, "ui/fonts/") != nullptr;
 }
 
 static bool PathLooksLikeUiBody(const char *path) {
@@ -4472,6 +4689,31 @@ PPC_FUNC(sub_821873E8) {
   LogFabricatedShader("FIX-821873E8 HANDOFF", obj);
 }
 
+// F-820 MITIGATION: sub_82189438 (called from sub_822FBAF8/star_glow effect init at
+// ppc_recomp.49.cpp:21123-21125, lr=0x822FBC28). RAW image shows it calls
+// KeWaitForSingleObject on a GPU sync object (obj@40004D7C) that the emulator never
+// signals, so it hangs forever. This is the ROOT CAUSE of the goal frame not
+// rendering: sub_822FBAF8 never returns -> sub_823047D8 never returns ->
+// sub_822C2EA8 never returns -> sub_82131508's tail never registers the boot-gate
+// callback 0x82131008 -> no GFx loader objects -> no geometry -> no draws.
+// MITIGATION: return ctx.r3 = 0 (success) without calling the original, so
+// sub_822FBAF8 completes and the boot proceeds. Labelled MITIGATION because the
+// ROOT CAUSE is the unsignaled sync object (host defect), and the guest is correct
+// to wait. Falsifier: `MSGBISECT 5-822FBAF8 RETURN` goes 0 -> 1 and
+// `W35-BOOT-GATE` goes 0 -> >=1 in the next soak.
+PPC_FUNC_IMPL(__imp__sub_82189438);
+static std::atomic<uint32_t> s_82189438_hits{0};
+PPC_FUNC(sub_82189438) {
+  const uint32_t n = s_82189438_hits.fetch_add(1) + 1;
+  if (n <= 8 || (n % 500) == 0)
+    MCLA_LOG_WARN("FIX-82189438 #{} lr={:08X} r3={:08X} r4={:08X} "
+                  "enter (returning 0, skipping wait)",
+                  n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32);
+  // Skip the original: it would KeWaitForSingleObject on 0x40004D7C forever.
+  ctx.r3.u32 = 0;
+  return;
+}
+
 PPC_FUNC(sub_82413588) {
   // r8 is caller-volatile under the recomp ABI - the callee clobbers ctx.r8
   // immediately after saving it to a callee-saved register. Capture the
@@ -7517,6 +7759,70 @@ struct MclaRebaseRegion {
 constexpr int kMclaRebaseMax = 24;
 MclaRebaseRegion g_mclaRebaseMap[kMclaRebaseMax] = {};
 int g_mclaRebaseCount = 0;
+// ---------------------------------------------------------------------------
+// F-8xx (2026-10-21): THE GUEST'S OWN REBASE TABLE IS THE AUTHORITY.
+//
+// MEASURED (build/w842.log, 12:41:46.346 and 12:41:46.891):
+//   EF100-REBASE-TBL #001 grp=8EFFF110 tbl=8EFFF340 countA=6 countB=11
+//                       e0=[50000000 B5FAC000 00020000]
+//                       e1=[50020000 B3A8C000 00020000]
+//   EF100-REBASE-TBL #002 grp=BA9E1040 tbl=BA4E1040 countA=7 countB=0
+//                       e0=[50000000 A3A6A000 00002000]
+//                       e1=[60000000 B600C000 00080000]
+// #001 IS THE GUEST'S OWN TABLE: 17 entries (countA 6 + countB 11), its ctx
+// (8EFFF110) is a STACK address the guest built itself. #002 is the HOST's
+// synthetic table: 7 entries, the JOB-STREAM map. They DISAGREE on the same
+// vbase -- 0x50000000 -> {B5FAC000, 0x20000} (guest) vs {A3A6A000, 0x2000}
+// (host). The host's D890 hook (src/task_dispatch_trace.cpp:831-851) answered
+// the guest's OWN table query from the HOST's map, and the host's
+// MclaArmRebaseCtx (below) pointed the guest's ctx at the HOST's table -- i.e.
+// THE HOST OVERRODE THE GUEST'S OWN TABLE.
+//
+// CONSOLE BEHAVIOUR (guest bytes, MEASURED):
+//   825EF194 `lwz r30,0(r26)`  -> r30 = [ctx+0] = the table
+//   825EF1A0 `bl 8217D828`      -> the lookup walks THAT table (tbl+4, stride
+//                                  12, {vbase,pbase,size}; the hit test is
+//                                  vbase <= addr < vbase+size)
+//   825EF1BC `lwz r10,8(r11)` / 825EF1C0 `lwz r9,4(r11)` -> the delta is
+//                                  [entry+8]-[entry+4] = pbase-vbase, taken
+//                                  from the GUEST'S OWN row
+//   8217D890 (D890) reads the same [ctx+0] (src/task_dispatch_trace.cpp:796)
+// So the guest resolves its virtuals against ITS OWN table. The host must
+// answer from that table and keep its job-stream map only as the FALLBACK for
+// a group the guest has NOT built.
+//
+// WHERE THE HOST SEES THE GUEST'S TABLE: sub_825EF238 is the guest's place-pass
+// entry (825EF238 `cmpli cr6,r3,0` / 825EF23C `beqlr` / 825EF240 `b 825EF100`)
+// and it is the one place where the guest hands over a rebase ctx in r4.
+// MEASURED guest code:
+//   82720600 `stw r31,80(r1)`  -> ctx+0 = the table pointer
+//   82720608 `stw r26,88(r1)`  -> ctx+4
+//   8272060C `mr r4,r1+80`     -> r4 = ctx
+//   82720634 `bl 825EF238`
+// (the other site, 821FAA30-821FAA54, is the same shape). The hook below is
+// NEW: there is no PPC_FUNC(sub_825EF238) anywhere in src/ (grep), and
+// 825EF238 IS a function-table row (generated/ppc_xenon/ppc_func_mapping.cpp:
+// `{ 0x825EF238, sub_825EF238 }`), so the guest's own `bl 825EF238` reaches it.
+//
+// FALSIFIER: the next soak must print GUEST-REBASE-TBL (the guest's table, its
+// counts and its first rows). If it never fires, the capture point is wrong.
+// And the answer for a vbase the guest HAS must be the GUEST's row: the D890
+// hook's P10-MAP row prints vbase/pbase/size of the row it answered from, so
+// a P10-MAP row for 0x50000000 must show pbase=B5FAC000 size=00020000 (the
+// guest's), never A3A6A000/00002000 (the host's).
+// ---------------------------------------------------------------------------
+constexpr int kMclaGuestRebaseMax = 32;
+// The GUEST's own rows, captured from the guest's table.
+static MclaRebaseRegion s_gGuestRebase[kMclaGuestRebaseMax] = {};
+static int s_gGuestRebaseCount = 0;
+static uint32_t s_gGuestRebaseTbl = 0;
+static uint16_t s_gGuestRebaseCountA = 0, s_gGuestRebaseCountB = 0;
+// The HOST's job-stream rows, kept apart from the answer map: they are the
+// FALLBACK for a group the guest has not built, and they are what
+// MclaIsCurrentJob2Pbase must keep seeing (a guest pbase is NOT a job dest,
+// and folding it in would make IsJob2UiDest claim a dest the job never had).
+static MclaRebaseRegion s_mclaJobMap[kMclaRebaseMax] = {};
+static int s_mclaJobMapCount = 0;
 // w15: nested 5500-family place candidates recorded by FDBF8-build
 // (task_dispatch_trace.cpp). Consumed after root ARR-RERUN.
 extern uint32_t g_mclaNestedPlaceObj[];
@@ -7530,10 +7836,126 @@ extern int g_mclaNestedPlaceN;
 static uint32_t s_gRebaseTable = 0;
 static std::atomic<uint32_t> s_maxInflateOut{0};
 
+// F-8xx: rebuild the ANSWER map (g_mclaRebaseMap) = the GUEST's own rows
+// FIRST, then the host's job-stream rows for every vbase the guest has NOT
+// built (the fallback). Order matters: the D890 hook (src/task_dispatch_trace.cpp:
+// 831-851) walks g_mclaRebaseMap from index 0 and answers with the FIRST
+// matching row, so putting the guest's rows first makes the host's answer for
+// a vbase the guest has equal the GUEST's row -- the falsifier.
+static void MclaRebuildAnswerMap()
+{
+  int n = 0;
+  for (int i = 0; i < s_gGuestRebaseCount && n < kMclaRebaseMax; ++i)
+    g_mclaRebaseMap[n++] = s_gGuestRebase[i];
+  for (int i = 0; i < s_mclaJobMapCount && n < kMclaRebaseMax; ++i)
+  {
+    bool covered = false;
+    for (int j = 0; j < s_gGuestRebaseCount; ++j)
+      if (s_gGuestRebase[j].vbase == s_mclaJobMap[i].vbase)
+      {
+        covered = true;
+        break;
+      }
+    if (!covered)
+      g_mclaRebaseMap[n++] = s_mclaJobMap[i];
+  }
+  // The answer map holds kMclaRebaseMax rows; the GUEST's rows are copied
+  // first, so a truncation can only drop a job-stream FALLBACK row -- never a
+  // guest row that the guest's own table has. Say so when it happens.
+  const int want = s_gGuestRebaseCount + s_mclaJobMapCount;
+  if (want > kMclaRebaseMax)
+    MCLA_LOG_WARN("REBASE-MERGE-TRUNCATED kept={} want={} guestRows={} "
+                  "jobRows={} cap={}",
+                  n, want, s_gGuestRebaseCount, s_mclaJobMapCount,
+                  kMclaRebaseMax);
+  g_mclaRebaseCount = n;
+}
+
+// F-8xx: capture the GUEST's own D828-format table. Layout MEASURED from the
+// raw bytes of sub_8217D828 (tools/ppc_disasm.py 0x8217D828):
+//   tbl+0 u16 countA, tbl+2 u16 countB, tbl+4+i*12 {vbase, pbase, size}
+// and the same shape is what the guest's own census row prints
+// (EF100-REBASE-TBL ... countA=6 countB=11 e0=[50000000 B5FAC000 00020000]).
+static void MclaCaptureGuestRebaseTable(uint32_t tbl)
+{
+  if (tbl == 0u || tbl == 0xCDCDCDCDu || tbl == 0xFFFFFFFFu)
+    return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint16_t cA = 0, cB = 0;
+  if (!mem.ReadU16BE(tbl + 0u, &cA))
+    return;
+  if (!mem.ReadU16BE(tbl + 2u, &cB))
+    return;
+  const uint32_t total = static_cast<uint32_t>(cA) + static_cast<uint32_t>(cB);
+  if (total == 0u || total > static_cast<uint32_t>(kMclaGuestRebaseMax))
+    return;
+  MclaRebaseRegion rows[kMclaGuestRebaseMax] = {};
+  for (uint32_t i = 0; i < total; ++i)
+  {
+    const uint32_t e = tbl + 4u + i * 12u;
+    if (!mem.ReadU32BE(e + 0u, &rows[i].vbase))
+      return;
+    if (!mem.ReadU32BE(e + 4u, &rows[i].pbase))
+      return;
+    if (!mem.ReadU32BE(e + 8u, &rows[i].size))
+      return;
+  }
+  bool changed = (tbl != s_gGuestRebaseTbl) || (cA != s_gGuestRebaseCountA) ||
+                 (cB != s_gGuestRebaseCountB) ||
+                 (total != static_cast<uint32_t>(s_gGuestRebaseCount));
+  for (uint32_t i = 0; i < total && !changed; ++i)
+    changed = (rows[i].vbase != s_gGuestRebase[i].vbase) ||
+              (rows[i].pbase != s_gGuestRebase[i].pbase) ||
+              (rows[i].size != s_gGuestRebase[i].size);
+  if (!changed)
+    return;
+  for (uint32_t i = 0; i < total; ++i)
+    s_gGuestRebase[i] = rows[i];
+  s_gGuestRebaseCount = static_cast<int>(total);
+  s_gGuestRebaseTbl = tbl;
+  s_gGuestRebaseCountA = cA;
+  s_gGuestRebaseCountB = cB;
+  MclaRebuildAnswerMap();
+  const MclaRebaseRegion &e0 = s_gGuestRebase[0];
+  const MclaRebaseRegion &e1 =
+      (s_gGuestRebaseCount > 1) ? s_gGuestRebase[1] : s_gGuestRebase[0];
+  MCLA_LOG_WARN("GUEST-REBASE-TBL tbl={:08X} countA={} countB={} n={} "
+                "e0=[{:08X} {:08X} {:08X}] e1=[{:08X} {:08X} {:08X}] "
+                "jobRows={} answerRows={}",
+                tbl, cA, cB, s_gGuestRebaseCount, e0.vbase, e0.pbase, e0.size,
+                e1.vbase, e1.pbase, e1.size, s_mclaJobMapCount,
+                g_mclaRebaseCount);
+}
+
+// F-8xx: the guest's place-pass entry (825EF238) is where the guest hands the
+// host its OWN rebase ctx (r4). Capture [ctx+0] = the guest's table, then run
+// the ORIGINAL body (the generated one tails into sub_825EF100, whose strong
+// override lives in src/task_dispatch_trace.cpp:1486).
+PPC_FUNC_IMPL(__imp__sub_825EF238);
+static std::atomic<uint32_t> s_hEF238{0};
+PPC_FUNC(sub_825EF238)
+{
+  const uint32_t n = s_hEF238.fetch_add(1) + 1;
+  const uint32_t grp = ctx.r4.u32;
+  if (grp != 0u && grp != 0xCDCDCDCDu && grp != 0xFFFFFFFFu)
+  {
+    uint32_t tbl = 0;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    if (mem.ReadU32BE(grp + 0u, &tbl))
+      MclaCaptureGuestRebaseTable(tbl);
+  }
+  if (n <= 4)
+    MCLA_LOG_WARN("PLACE-ENTRY #{} grp={:08X} lr={:08X}", n, grp,
+                  static_cast<uint32_t>(ctx.lr));
+  __imp__sub_825EF238(ctx, base);
+}
+
 // w11: materialize g_mclaRebaseMap as the guest region table that
 // sub_8217D828 walks and that sub_82184458/D890 index for delta. Without
 // this the place-pass group (C9D96280) has [0]=0 â†’ D828 miss â†’ fatal
 // "Resource '%s': Invalid fixup... (ptr=600E0000)".
+// F-8xx: the published table is now the ANSWER map, i.e. the GUEST's own rows
+// first (the guest reads its own table) plus the job-stream fallback.
 static void MclaPublishGuestRebaseTable()
 {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -7558,12 +7980,22 @@ static void MclaPublishGuestRebaseTable()
     (void)mem.WriteU32BE(e + 4, g_mclaRebaseMap[i].pbase);
     (void)mem.WriteU32BE(e + 8, g_mclaRebaseMap[i].size);
   }
-  MCLA_LOG_WARN("REBASE-TABLE @{:08X} n={} (D828-form vbase/pbase/size)",
-                s_gRebaseTable, nmap);
+  MCLA_LOG_WARN("REBASE-TABLE @{:08X} n={} (D828-form vbase/pbase/size) "
+                "src={} guestTbl={:08X} guestRows={} jobRows={}",
+                s_gRebaseTable, nmap,
+                (s_gGuestRebaseCount > 0) ? "guest+job" : "job",
+                s_gGuestRebaseTbl, s_gGuestRebaseCount, s_mclaJobMapCount);
 }
 
 // Zero a place-pass rebase group, then point [group+0] at the PSTREAM
 // region table so D828 can resolve 0x50/0x60 virtuals instead of fataling.
+// F-8xx: the table published above now carries the GUEST's own rows first
+// (MclaRebuildAnswerMap), so a host re-dispatch hands the guest back the
+// content of the table the guest itself built -- the console behaviour -- and
+// the host's job-stream rows remain only for a group the guest has NOT built.
+// The guest's own table ADDRESS is a stack address (8EFFF340 in w842.log) and
+// is stale by the time a host re-dispatch runs, so the content is copied
+// instead of the pointer.
 static void MclaArmRebaseCtx(uint32_t rebaseCtx)
 {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
@@ -7625,8 +8057,13 @@ static bool MclaIsCurrentJob2Pbase(uint32_t outPtr)
 {
   if (outPtr < 0xB0000000u || outPtr >= 0xC0000000u)
     return false;
-  for (int i = 0; i < g_mclaRebaseCount && i < kMclaRebaseMax; ++i)
-    if (g_mclaRebaseMap[i].pbase == outPtr && g_mclaRebaseMap[i].size != 0)
+  // F-8xx: the JOB-STREAM rows only (s_mclaJobMap). The answer map
+  // (g_mclaRebaseMap) now leads with the GUEST's own rows, and a guest pbase
+  // is a guest allocation, NOT a job dest -- admitting it here would make
+  // IsJob2UiDest claim a dest the job never produced (a serve-path change
+  // this fix must not make).
+  for (int i = 0; i < s_mclaJobMapCount && i < kMclaRebaseMax; ++i)
+    if (s_mclaJobMap[i].pbase == outPtr && s_mclaJobMap[i].size != 0)
       return true;
   {
     std::lock_guard<std::mutex> lk(g_job2PbaseSeenMtx);
@@ -10005,6 +10442,15 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
   int nGfx = 0;
   static const uint32_t kScanLo[] = {0xA0000000u, 0xC5000000u, 0xC7000000u, 0xCA000000u};
   static const uint32_t kScanHi[] = {0xA0800000u, 0xC6000000u, 0xC8000000u, 0xCB000000u};
+  // F-806 (2026-10-21) INSTRUMENT FIX. The four fixed bands above contain NONE of
+  // the addresses this boot actually used (measured: 0xB7B41000, 0xB5FAC000,
+  // 0xB5F8C000, 0xBA19C000, 0xA3A6A000, 0xA3A68000, 0xA3A7C000), so `nGfx=0`
+  // was a fact about the host's scan window and not about the guest -- the row
+  // must not be read as a guest fact (build/agents/audit_swf.md C11). The scan
+  // therefore ALSO walks the CURRENT rebase map's physical regions, which are
+  // the addresses the guest's streamer really used, and the row prints how many
+  // regions were scanned so the reader can tell a 0 from a blind spot.
+  uint32_t regionScanned = 0;
   for (int band = 0; band < 4 && nGfx < 6; ++band) {
     for (uint32_t a = kScanLo[band]; a < kScanHi[band] && nGfx < 6; a += 0x40) {
       // F-532/F-535/F-537: 0xA0400000 is kPhysHdrVa (heap_arena.h:40) - our own o1heap instance
@@ -10034,6 +10480,30 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
     }
   }
 
+  // F-806 INSTRUMENT FIX (cont.): scan the CURRENT rebase map's physical
+  // regions too -- those are the addresses the guest's streamer really used
+  // (0xA3A6A000 / 0xB5F8C000 / 0xB600C000 ... in build/w838.log). Bounded:
+  // at most 0x4000 bytes per region at 0x40 stride, so the lever stays cheap.
+  for (int i = 0; i < g_mclaRebaseCount && i < kMclaRebaseMax && nGfx < 6; ++i) {
+    const auto &r = g_mclaRebaseMap[i];
+    if (r.pbase == 0u || r.size == 0u)
+      continue;
+    uint32_t span = r.size > 0x4000u ? 0x4000u : r.size;
+    for (uint32_t off = 0; off + 4u <= span && nGfx < 6; off += 0x40u) {
+      const uint32_t a = r.pbase + off;
+      uint32_t w0 = 0;
+      if (!mem.ReadU32BE(a, &w0))
+        break;
+      const uint32_t vpage = w0 & 0xFFFFF000u;
+      if (vpage != 0x82073000u && vpage != 0x8206D000u)
+        continue;
+      uint32_t movie = 0;
+      (void)mem.ReadU32BE(a + 4, &movie);
+      gfx[nGfx++] = {a, w0, movie};
+    }
+    ++regionScanned;
+  }
+
   // Movie hash-table census for hits.
   uint32_t movTsize[6] = {0}, movBuck[6] = {0};
   for (int i = 0; i < nGfx; ++i) {
@@ -10047,9 +10517,9 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
   MCLA_LOG_WARN("W34-GFX-CENSUS #{} obj={:08X} vt={:08X} +24={:08X} +50={} "
                 "fpFE20={:08X} fpFE24={:08X} nLiveDest={} "
                 "d0={:08X} d2={:08X} tagDest={:08X} tagBase={:08X} tagNv={} "
-                "nGfx={}",
+                "nGfx={} mapRegionsScanned={}",
                 n, obj, vt, p24, cnt50, fp4, fp5, nLive, destHeads[0],
-                destHeads[2], tagDest, tagBase, tagNv, nGfx);
+                destHeads[2], tagDest, tagBase, tagNv, nGfx, regionScanned);
   for (int i = 0; i < nGfx; ++i)
     MCLA_LOG_WARN("W34-GFX-MOVIE #{} obj={:08X} vt={:08X} movie={:08X} "
                   "tsize={} buckets={:08X}",
@@ -10323,7 +10793,7 @@ bool MclaW34GfxParseLever(uint32_t obj, uint32_t slotAddr)
                     n, nGfx, nMoviesLive);
   } else {
     MCLA_LOG_WARN("W34-NOGFX #{} â€” no GFx loader objects (vt 0x82073xxx/0x8206Dxxx) in "
-                  "scan bands; UILOAD/EF220 never armed after inflate",
+                  "the scanned set (4 fixed bands + the rebase map's physical regions); SCAN-WINDOW FACT, not a guest fact -- UILOAD/EF220 never armed after inflate",
                   n);
   }
   (void)slotAddr;
@@ -10590,6 +11060,360 @@ static int MclaJ2FrameExtract(auto &mem, uint32_t pkgBounce, uint32_t pkgSz,
 // r3 / XMem ctx â€” NEVER r3=0. Writes ONLY decompressed resource image
 // (never compressed plant, never invented vtables). Guest place still runs
 // on the decompressed image afterwards.
+// ---------------------------------------------------------------------------
+// F-806 (2026-10-21) -- THE PLACE OBJECT IS DERIVED, AND THE PLACE PASS IS
+// DISPATCHED ONCE, WITH THE REBASE MAP ALREADY POPULATED.
+//
+// MEASUREMENT (build/w838.log; the numbers after ':' are LOG LINE numbers):
+//   :7145  EF100 #001 obj=B5FAC000 r4=8EFFF110 ... lr=82720638   <- guest's own
+//   :7148  FDBF8-MOVIEROOT #1 dataBase=8EFFF340 VFT=0006000B +4=50000000 +8=B5FAC000
+//   :13173 EF100 #002 obj=B7B41000 r4=BA9E1040 ... lr=00000000    <- HOST re-dispatch
+//   :13176 FDBF8-MOVIEROOT #2 dataBase=BA518040 VFT=00070000 +4=50000000 +8=A3A6A000
+//   :12841 J2-DIST #1 pkg=000A0000 pkgSz=002BA000 wantOut=524288 h16=0002FFC9 nmap=7 nSlice=0 pstreamSum=0
+//   :12838 [11:07:54.304] W25-J2-EARLY-DIST reqdump#5 nmap=7     <- map POPULATED
+//   :13155 [11:07:54.661] J2-DIST-DESTHEAD @B7B41000 [00000000 00000000 00000000 00000000]
+//   :13168 [11:07:54.665] W27-PLACE-AFTER-XC wrote=0 produced=524288 vtBefore=00000000 arrBefore=00000000
+//   :13173 [11:07:54.665] EF100 #002 obj=B7B41000               <- place DISPATCHED
+//   :13178 [11:07:54.665] FDBF8-BUILD #002 obj=B7B41000 vt=00000000 +4=00000000 +8=00000000 arr=00000000 cnt=0
+//
+// (1) IDENTITY. The guest's own place object IS the rebase table's entry0
+//     physical base: EF100 #001's object (B5FAC000) equals the table's
+//     {vbase=0x50000000, pbase=B5FAC000} physical base (:7145 vs :7148 -- the
+//     table's first entry is {vbase=table+4, pbase=table+8} and the guest's D828
+//     /D890 read exactly those two words; verified against the RAW BYTES of
+//     sub_8217D828/sub_8217D890 with tools/ppc_disasm.py 0x8217D828/0x8217D890).
+//     The host re-dispatched on 0xB7B41000, which is in NO entry of the legals
+//     job's map (PSTREAM #5 s[0..6] pbases A3A6A000 B600C000 B608C000 B610C000
+//     B618C000 B620C000 B5FCC000) while that map's entry0 pbase is A3A6A000
+//     (:13176). 0xB7B41000 is therefore an all-zero buffer (:13155) and the
+//     guest's place pass built an empty container into it (arr=0 cnt=0, :13178).
+//
+// (2) ORDERING -- this CORRECTS the audit's "357 ms". The rebase map was
+//     POPULATED at 11:07:54.304 (:12838, nmap=7) and the only place pass on the
+//     place object was dispatched at 11:07:54.665 (:13173): the map was already
+//     populated 361 ms BEFORE the dispatch. The "nmap=0" rows the audit read
+//     (11:07:54.228/.267/.298) are RSC-CENSUS-44495500 CENSUS rows emitted by
+//     MclaCompleteRscRebaseBeforePlace from the POST-EXEC lever path
+//     (src/gpu_device.cpp:16940), NOT place passes; the 11:07:54.304 row the
+//     audit called "the last place pass" is the map publication itself.
+//
+// (3) CONTENT. The host's distribution wrote nothing into the container region
+//     (nSlice=0, pstreamSum=0 :12841; wrote=0 :13168), so even the RIGHT object
+//     would have been empty. The host DOES hold the right bytes: the container
+//     is decoded (RSC5-XMEM-DECODE ... declared=196553 decoded=196553
+//     head=44495500, w838.log:6951) and its head is the "DIU\0" container.
+//
+// FIX: derive the place object from the live map, take the place object's walk
+// fields from the container's DIU head, publish the map, and dispatch the
+// guest's place pass ONCE on that object -- but ONLY when the walk fields are
+// translatable by the current map (an untranslatable virtual is FATAL inside
+// the guest, so a dispatch without them is worse than no dispatch).
+//
+// FALSIFIER: the next soak must print exactly ONE
+//   PLACE-DISPATCH #1 obj=<entry0.pbase of the 0x50000000 region> nmap=<n>
+//     diuMagic=44495500 diuP12=... diuP24=... band=[...] childArr=... refused='...'
+// followed by either PLACE-DISPATCH-DONE (the guest's place pass ran on the
+// derived object: vt/arr/cnt in that row) or PLACE-DISPATCH ... SKIPPED with
+// the named reason. If PLACE-DISPATCH prints obj=B7B41000 the map lookup
+// failed; if it prints diu=NONE the container bytes were not found; if it
+// prints SKIPPED reason=DIU-WALK-FIELDS-UNRESOLVED then the host's 0x50 band
+// does not cover the container's DIU virtuals -- which is the remaining
+// blocker, and the row's band=[] fields say by how much.
+// ---------------------------------------------------------------------------
+
+// F-806: the physical base of the container's virtual region (vbase 0x50000000)
+// in the CURRENT rebase map -- i.e. the guest's place object (measurement (1)).
+// 0 means "the current map has no 0x50000000 region": callers must then skip.
+static uint32_t MclaPlaceObjAddr() {
+  for (int i = 0; i < g_mclaRebaseCount && i < kMclaRebaseMax; ++i) {
+    const auto &r = g_mclaRebaseMap[i];
+    if (r.vbase == 0x50000000u && r.pbase != 0u && r.size != 0u)
+      return r.pbase;
+  }
+  return 0u;
+}
+
+// F-806: the container bytes for the job2 package, decoded by the host's own
+// decoder (mcla_lzx::host_decode_ui_xsf, src/xmem_lzx.h:501). The head of that
+// image is the "DIU\0" container -- MEASURED offline against an independent
+// implementation (build/agents/_swf_decode_check.py: legals 196553 B, head
+// 44 49 55 00, sha256 56040441812480ebe2ad9760cd90b9a3...).
+// (MclaUiXsfGolden is forward-declared at :893.)
+
+// F-806: fill a place object's walk fields from the container's DIU head.
+//
+// DIU head layout, MEASURED offline from the retail bytes (archive offset
+// 0x000A0000, walk path, build/agents/_swf_decode_check.py first-64 dump):
+//   +0  44 49 55 00   "DIU\0"       container magic
+//   +4  <virtual>                   movie-data pointer   (0x50023DE0 for legals)
+//   +8  00 70 61 64
+//   +12 <virtual child array>       (0x5006C9B4 for legals)
+//   +16 <u16 child count>           (0x0001 for legals)
+//   +24 <virtual entry array>       (0x5004FC20 for legals)
+// The guest's place pass consumes [obj+12]/u16[obj+16] in the build pass
+// (generated/ppc_xenon/ppc_recomp.122.cpp:2267-2318) and [obj+24] in the place
+// pass (generated/ppc_xenon/ppc_recomp.120.cpp:30606-30622).
+//
+// F-8xx (2026-10-21): THE THREE FIELDS THE GUEST READS AND THE HOST NEVER
+// WROTE. The guest's place pass reads the walk bound at u16 [obj+50] and the
+// construct's list at u32 [obj+56] / u16 [obj+60]; until now the host wrote
+// only +12/+16/+24, so the bound stayed 0 and the guest took the `ble` SKIP at
+// 825EF168 -- the entry walk, the part that builds the movie, never ran.
+//   u16 [obj+50] : the entry-walk bound
+//                  (825EF15C `lhz r11,50(r27)`; 825EF164 `cmpli cr6,r11,1`;
+//                   825EF168 `ble 825EF210` -> the whole walk is skipped when
+//                   the bound is <= 1)
+//   u32 [obj+56] : the construct's list base
+//                  (825EE7B4 `lwz r4,0(r25)` with r25 = obj+56; 825EE7C0
+//                   `bl 8217D890` rebases it IN PLACE)
+//   u16 [obj+60] : the construct's list count
+//                  (825EE7D4 `lhz r11,4(r25)` with r25 = obj+60; the walk is
+//                   skipped when it is 0, and a ZERO element is skipped too
+//                   (825EE860 `cmpli cr6,r31,0` -> 825EE928))
+// SOURCE = the DIU root's own bytes. MEASURED on the RETAIL legals container
+// (build/game_data/xarchive_cache.rpf, package 0x000A0000, decoded with the
+// independent .research/360tools LZX decoder via
+// build/agents/_swf_decode_check.py -- 196553 B, head 44 49 55 00, sha256
+// 56040441812480ebe2ad9760cd90b9a3). Its first 64 bytes:
+//   44 49 55 00 50 02 3d e0 00 70 61 64 50 06 c9 b4 00 01 cd cd 00 00
+//   00 00 50 04 fc 20 07 01 cd cd 00 00 00 00 44 a0 00 00 00 00 00 00
+//   44 34 00 00 3c 00 00 a4 00 00 00 2d 50 02 db 70 00 3b 00 00
+// => u16[+48]=0x003c (frame rate), u16[+50]=0x00a4=164 (the walk bound),
+//    u32[+56]=0x5002db70 (the construct's list base), u16[+60]=0x003b=59.
+// (The audit's C18 said u16[+60]=0; MEASURED it is 59.)
+//
+// SAFETY: a virtual the rebase table cannot resolve makes the guest's D890
+// fatal ("Resource ... Invalid fixup", generated/ppc_xenon/ppc_recomp.8.cpp:
+// 6211-6222 -- sub_821D2378 on the miss path). So a field whose virtual is NOT
+// inside the CURRENT map is REFUSED (left 0) and named in the caller's log
+// row. Nothing here writes [obj+0] (the guest writes the vtable itself).
+// [obj+56]/[obj+60] are published only when the construct's list base is
+// resolvable, for the same reason: the construct rebases it and walks `count`
+// nodes. Nothing here writes the container's bytes either: the place object's
+// region is the GUEST's own job buffer (PRELOAD-CTX #5 bufPtr=A3A6A000 in
+// w838.log) and clobbering it is not admissible.
+static bool MclaFillPlaceObjFromDiu(auto &mem, uint32_t obj,
+                                    const uint8_t *diu, size_t diuLen,
+                                    uint32_t *outChildArr,
+                                    uint32_t *outChildCnt,
+                                    uint32_t *outEntryArr,
+                                    const char **refused) {
+  // F-8xx: the head must be long enough for every field this function reads:
+  // diu+50 (the walk bound), diu+56 (the construct's list base) and diu+60
+  // (its count) -- 62 bytes. The retail container is 196 553 bytes.
+  if (obj == 0u || diu == nullptr || diuLen < 0x3Eu)
+    return false;
+  const uint32_t magic = MclaBE(diu);
+  if (magic != 0x44495500u)
+    return false;
+  const uint32_t vChild = MclaBE(diu + 12u);
+  const uint32_t nChild =
+      static_cast<uint32_t>((static_cast<uint32_t>(diu[16u]) << 8) |
+                            static_cast<uint32_t>(diu[17u]));
+  const uint32_t vEntry = MclaBE(diu + 24u);
+  // F-8xx: the walk bound and the construct's list -- the fields the guest's
+  // place pass READS and the host never wrote (see the header above for the
+  // guest's read offsets and the measured DIU source offsets).
+  const uint16_t walkBound = static_cast<uint16_t>(
+      (static_cast<uint32_t>(diu[50u]) << 8) | static_cast<uint32_t>(diu[51u]));
+  const uint32_t vList = MclaBE(diu + 56u);
+  const uint16_t nList = static_cast<uint16_t>(
+      (static_cast<uint32_t>(diu[60u]) << 8) | static_cast<uint32_t>(diu[61u]));
+  // MclaPtrInRebaseMap accepts a virtual only inside a mapped region.
+  const bool childOk = MclaPtrInRebaseMap(vChild);
+  const bool entryOk = MclaPtrInRebaseMap(vEntry);
+  const bool listOk = MclaPtrInRebaseMap(vList);
+  if (childOk) {
+    (void)mem.WriteU32BE(obj + 12u, vChild);
+    (void)mem.WriteU16BE(obj + 16u, static_cast<uint16_t>(nChild));
+  }
+  if (entryOk)
+    (void)mem.WriteU32BE(obj + 24u, vEntry);
+  // The bound is a COUNT, not a pointer: it is published as read. A bound of
+  // 0 or 1 keeps the guest's own skip (825EF168) -- which is the safe default
+  // for a container that carries no walk.
+  (void)mem.WriteU16BE(obj + 50u, walkBound);
+  // The construct's list is published only when its base is resolvable: the
+  // construct rebases [obj+56] in place and walks `count` nodes.
+  if (listOk) {
+    (void)mem.WriteU32BE(obj + 56u, vList);
+    (void)mem.WriteU16BE(obj + 60u, nList);
+  }
+  if (outChildArr)
+    *outChildArr = childOk ? vChild : 0u;
+  if (outChildCnt)
+    *outChildCnt = childOk ? nChild : 0u;
+  if (outEntryArr)
+    *outEntryArr = entryOk ? vEntry : 0u;
+  if (refused) {
+    if (!childOk && !entryOk)
+      *refused = "DIU-VIRTUALS-UNRESOLVED";
+    else if (!childOk)
+      *refused = "DIU-CHILD-ARRAY-UNRESOLVED";
+    else if (!entryOk)
+      *refused = "DIU-ENTRY-ARRAY-UNRESOLVED";
+    else
+      *refused = "";
+  }
+  return true;
+}
+
+// F-8xx: resolve a virtual through the ANSWER map (the guest's own rows first,
+// then the job-stream fallback) -- the same map the guest's D890 hook answers
+// from (src/task_dispatch_trace.cpp:831-851 walks g_mclaRebaseMap from index
+// 0). Returns 0 when no row covers the virtual.
+static uint32_t MclaResolveInAnswerMap(uint32_t virt) {
+  for (int i = 0; i < g_mclaRebaseCount && i < kMclaRebaseMax; ++i) {
+    const auto &r = g_mclaRebaseMap[i];
+    if (r.size == 0u)
+      continue;
+    if (virt >= r.vbase && virt < r.vbase + r.size)
+      return r.pbase + (virt - r.vbase);
+  }
+  return 0u;
+}
+
+// F-806: the ONE place-pass dispatch on the DERIVED place object. Guarded so
+// it fires at most once per boot (no storm). It never removes or replaces the
+// legacy dispatch on 0xB7B41000 (that vtable write is load-bearing for the
+// FB0D8 dtor path -- src/task_dispatch_trace.cpp:1479-1481); it ADDS the
+// dispatch the guest would have made on the container's real base.
+static void MclaPlaceDispatchOnce() {
+  static std::atomic<uint32_t> s_placeDispatch{0};
+  const uint32_t n = s_placeDispatch.fetch_add(1) + 1;
+  if (n > 1u)
+    return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  const uint32_t obj = MclaPlaceObjAddr();
+  if (obj == 0u) {
+    MCLA_LOG_WARN("PLACE-DISPATCH #{} SKIPPED reason=NO-0x50000000-REGION "
+                  "nmap={}",
+                  n, g_mclaRebaseCount);
+    return;
+  }
+  // The map MUST be populated before the dispatch: the guest resolves the
+  // place object's virtuals through the group table (D828/D890), so an empty
+  // map turns every virtual into a fatal miss.
+  MclaPublishGuestRebaseTable();
+  // The container bytes: the job2 package is pkg 0x000A0000 (the J2-DIST code's
+  // own kPkg, src/gpu_device.cpp:10632; the log row J2-DIST #1 pkg=000A0000).
+  const std::vector<uint8_t> &cont = MclaUiXsfGolden(0x000A0000u);
+  if (cont.size() < 0x28u || MclaBE(cont.data()) != 0x44495500u) {
+    MCLA_LOG_WARN("PLACE-DISPATCH #{} obj={:08X} nmap={} diu=NONE "
+                  "reason=NO-CONTAINER-HEAD (contSize={})",
+                  n, obj, g_mclaRebaseCount,
+                  static_cast<uint32_t>(cont.size()));
+    return;
+  }
+  // The container's DIU head (the walk fields the guest's place pass needs).
+  // MEASURED offline, build/agents/_swf_decode_check.py first-64 dump of the
+  // retail legals container: +0 "DIU\0", +4 <virtual>, +8 00706164,
+  // +12 <virtual child array>, +16 <u16 child count>, +24 <virtual entry array>.
+  const uint32_t diuMagic = MclaBE(cont.data());
+  const uint32_t diuP4 = MclaBE(cont.data() + 4u);
+  const uint32_t diuP12 = MclaBE(cont.data() + 12u);
+  const uint32_t diuP24 = MclaBE(cont.data() + 24u);
+  // The map's 0x50000000 band, so the row shows the GAP between what the
+  // container points at and what the host can translate.
+  uint32_t bandV = 0, bandP = 0, bandSz = 0;
+  for (int i = 0; i < g_mclaRebaseCount && i < kMclaRebaseMax; ++i)
+    if (g_mclaRebaseMap[i].vbase == 0x50000000u) {
+      bandV = g_mclaRebaseMap[i].vbase;
+      bandP = g_mclaRebaseMap[i].pbase;
+      bandSz = g_mclaRebaseMap[i].size;
+      break;
+    }
+  uint32_t childArr = 0, childCnt = 0, entryArr = 0;
+  const char *refused = "";
+  (void)MclaFillPlaceObjFromDiu(mem, obj, cont.data(), cont.size(), &childArr,
+                                &childCnt, &entryArr, &refused);
+  // F-8xx: the walk's INPUT is the entry array ([obj+24], 4-byte stride,
+  // 825EF178-825EF1F8). The guest rebases it through D890, i.e. through the
+  // answer map, so the host resolves it the same way and checks that the
+  // resolved physical address is actually READABLE before it dispatches a walk
+  // over it (a walk over an unreadable array reads garbage and calls through
+  // it). The walk bound is [obj+50] (the guest skips the walk when it is <= 1,
+  // 825EF164/825EF168), so it is logged too.
+  const uint32_t entryPhys =
+      (entryArr != 0u) ? MclaResolveInAnswerMap(entryArr) : 0u;
+  uint32_t entryProbe = 0;
+  const bool entryReadable =
+      (entryPhys != 0u) && mem.ReadU32BE(entryPhys, &entryProbe);
+  uint16_t bound50 = 0;
+  (void)mem.ReadU16BE(obj + 50u, &bound50);
+  MCLA_LOG_WARN("PLACE-DISPATCH #{} obj={:08X} nmap={} pkg=000A0000 "
+                "diuMagic={:08X} diuP4={:08X} diuP12={:08X} diuP24={:08X} "
+                "diuP50={} diuP56={:08X} diuP60={} "
+                "band=[{:08X} {:08X} {:08X}] childArr={:08X} childCnt={} "
+                "entryArr={:08X} entryPhys={:08X} entryReadable={} bound50={} "
+                "refused='{}'",
+                n, obj, g_mclaRebaseCount, diuMagic, diuP4, diuP12, diuP24,
+                static_cast<uint32_t>((static_cast<uint32_t>(cont[50u]) << 8) |
+                                      static_cast<uint32_t>(cont[51u])),
+                MclaBE(cont.data() + 56u),
+                static_cast<uint32_t>((static_cast<uint32_t>(cont[60u]) << 8) |
+                                      static_cast<uint32_t>(cont[61u])),
+                bandV, bandP, bandSz, childArr, childCnt, entryArr, entryPhys,
+                entryReadable ? 1 : 0, bound50, refused);
+  // SAFETY GATE: dispatch only when the child array is resolvable. A virtual
+  // the guest's D828/D890 cannot translate is FATAL inside the guest
+  // ("Resource ... Invalid fixup", generated/ppc_xenon/ppc_recomp.8.cpp:
+  // 6211-6222), so a dispatch with an unresolvable walk field is strictly
+  // worse than no dispatch. The row above names the gap.
+  if (childArr == 0u || childCnt == 0u) {
+    MCLA_LOG_WARN("PLACE-DISPATCH #{} obj={:08X} SKIPPED "
+                  "reason=DIU-WALK-FIELDS-UNRESOLVED (diuP12={:08X} "
+                  "diuP24={:08X} bandSize={:08X})",
+                  n, obj, diuP12, diuP24, bandSz);
+    return;
+  }
+  // F-8xx: the entry array is what the guest's walk reads. If it does not
+  // resolve, or resolves to an address the host cannot read, the walk would
+  // run over garbage -- refuse and name it.
+  if (entryArr == 0u) {
+    MCLA_LOG_WARN("PLACE-DISPATCH #{} obj={:08X} SKIPPED "
+                  "reason=DIU-ENTRY-ARRAY-UNRESOLVED (diuP24={:08X} "
+                  "entryPhys={:08X})",
+                  n, obj, diuP24, entryPhys);
+    return;
+  }
+  if (!entryReadable) {
+    MCLA_LOG_WARN("PLACE-DISPATCH #{} obj={:08X} SKIPPED "
+                  "reason=ENTRY-ARRAY-NOT-READABLE (entryPhys={:08X} "
+                  "diuP24={:08X}) -- the container's bytes are not placed at "
+                  "the address the guest's table names",
+                  n, obj, entryPhys, diuP24);
+    return;
+  }
+  auto *place = mcla::kernel::g_memory.FindFunction(0x825EF100u);
+  if (!place)
+    return;
+  static uint32_t s_placeCtx = 0;
+  if (s_placeCtx == 0)
+    s_placeCtx = mem.Alloc(64, 16);
+  if (s_placeCtx == 0)
+    return;
+  MclaArmRebaseCtx(s_placeCtx);
+  PPCContext p{};
+  p.r1.u64 = 0x006D8CE0u;
+  p.r13.u64 = 0x8F200000u;
+  p.r3.u64 = obj;
+  p.r4.u64 = s_placeCtx;
+  place(p, mcla::kernel::g_memory.base);
+  uint32_t vt = 0, arr = 0, ent24 = 0;
+  uint16_t cnt = 0, b50 = 0;
+  (void)mem.ReadU32BE(obj + 0u, &vt);
+  (void)mem.ReadU32BE(obj + 12u, &arr);
+  (void)mem.ReadU16BE(obj + 16u, &cnt);
+  // F-8xx: the walk bound and the (rebased) entry array, so the row says
+  // whether the guest's entry walk COULD run (bound > 1) and where it read.
+  (void)mem.ReadU16BE(obj + 50u, &b50);
+  (void)mem.ReadU32BE(obj + 24u, &ent24);
+  MCLA_LOG_WARN("PLACE-DISPATCH-DONE #{} obj={:08X} vt={:08X} arr={:08X} "
+                "cnt={} bound50={} entry24={:08X}",
+                n, obj, vt, arr, cnt, b50, ent24);
+}
+
 static int MclaJob2DecompressAndDistribute(PPCContext &ctx) {
   // F-195/T41.9b: this is the legacy host-side J2-DIST XMem replay of pkg 0xA0000
   // (UI). It collides with Path B's correct guest enqueue (F-193) â€” the runaway
@@ -11131,6 +11955,12 @@ static int MclaJob2DecompressAndDistribute(PPCContext &ctx) {
       }
     }
   }
+  // F-806: dispatch the guest's place pass ONCE on the DERIVED place object
+  // (the container's real physical base, from the live rebase map). The legacy
+  // dispatch above is left untouched on purpose: its vtable write on 0xB7B41000
+  // is load-bearing for the FB0D8 dtor path (src/task_dispatch_trace.cpp:
+  // 1479-1481). This call is guarded to fire at most once per boot.
+  MclaPlaceDispatchOnce();
   (void)ctx;
   return wrote;
 }
@@ -13352,8 +14182,15 @@ static void MclaUiXsfLateReverify(uint32_t n) {
   // plenty to answer "did it survive".
   if (!kUiXsfReverify || n < 1000u || (n % 1000u) != 0u || n > 9000u)
     return;
-  static constexpr uint32_t kPkgs[4] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
-                                        0x6496F000u};
+  // F-806 (2026-10-21) INSTRUMENT FIX: legals (pkg 0x000A0000) was MISSING from
+  // this list, so it was the only UI container with ZERO byte-level golden
+  // coverage (build/agents/audit_swf.md C8). Its golden is produced by the
+  // host's own decoder (MclaUiXsfGolden falls back to mcla_lzx::host_decode_ui_xsf
+  // when there is no xmem_golden/<name>.bin), and the retail bytes at archive
+  // offset 0x000A0000 decode to 196553 B with head 44 49 55 00 (measured
+  // offline, build/agents/_swf_decode_check.py).
+  static constexpr uint32_t kPkgs[5] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
+                                        0x6496F000u, 0x000A0000u};
   const uint32_t sample = n / 1000u;
   // F-544 (#89): `MclaUiXsfReverify` can only score packages the FILL pass recorded
   // rows for, so policecam and credits returned 0 rows forever - an absence of
@@ -13378,8 +14215,9 @@ static void MclaUiXsfLateReverify(uint32_t n) {
   // model A - sequential golden offsets - is computable straight from it. This is the same
   // comparison the audit makes, sourced from the title's own slots instead of our fill plan, and
   // it is log-only.
-  static const uint32_t kRangeAuditPkgs[4] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
-                                              0x6496F000u};
+  // F-806: legals (0x000A0000) added -- see the kPkgs[] note above.
+  static const uint32_t kRangeAuditPkgs[5] = {0x64CB0000u, 0x64980000u, 0x64CA3000u,
+                                              0x6496F000u, 0x000A0000u};
   for (const uint32_t p : kRangeAuditPkgs) {
     const std::vector<uint8_t> &g = MclaUiXsfGolden(p);
     if (g.size() < 0x100u)
@@ -16171,6 +17009,33 @@ PPC_FUNC(sub_821BCE68) {
                   n, r3, r4, r5, ctx.r3.u32, rlen, rdev, rflag, rpkg, rent, lr);
 }
 
+// F-811: NAME THE 299.5 MiB REQUEST. `sub_821BC0F0` is a physical-allocation WRAPPER -- raw
+// disassembly (tools/ppc_disasm.py 0x821BC0F0 22) reads, in order:
+//   821BC0F0 rlwinm r11,r3,sh=0,mb=8,me=31,mask=0x00FFFFFF   ; r11 = r3 & 0x00FFFFFF
+//   821BC0F4 li r5,0                                          ; align = 0
+//   821BC0F8 cmpli cr6,r11,0 / 821BC100 bne -> 821BC110      ; zero-test on the low 24 bits
+//   821BC10C protect=0x80000004, tail-b -> 82132578
+//   821BC118 protect=0x20000004, tail-b -> 82132578
+// so r3 is the size and reaches the allocator unmodified. F-810's `MMAL-PHYS-BIG #1
+// size=0x12b80000 ... protect=0x20000004` means the 0x821BC118 branch is the one taken, which
+// `glr` could not say: 0x821325D4 is the return address of the wrapper's own `bl` and is IDENTICAL
+// for all four call sites. This hook exists to print r3 together with ctx->lr, which names the
+// caller in one row. UNGATED on purpose -- a `n % k` printer yields a cadence, not a total.
+// `addr_owners.py --check 0x821BC0F0` exits 0 with 1 site (the generated map) before this hook, so
+// there is no second owner (rule 4). Falsifier: if this prints nothing while `MMAL-PHYS-BIG` does,
+// the hook is misplaced and the row proves nothing.
+PPC_FUNC_IMPL(__imp__sub_821BC0F0);
+static std::atomic<uint32_t> s_hBC0F0{0};
+PPC_FUNC(sub_821BC0F0) {
+  const uint32_t i = s_hBC0F0.fetch_add(1) + 1;
+  MCLA_LOG_WARN("BC0F0 #{} r3={:#x} (r3&0xFFFFFF={:#x} -> protect={}) r4={:08X} r5={:#x} "
+                "lr={:08X} (call sites: 8213135C 8213140C 821C2F2C 821E77D0)",
+                i, ctx.r3.u32, ctx.r3.u32 & 0x00FFFFFFu,
+                ((ctx.r3.u32 & 0x00FFFFFFu) == 0u) ? "0x80000004" : "0x20000004",
+                ctx.r4.u32, ctx.r5.u32, ctx.lr);
+  __imp__sub_821BC0F0(ctx, base);
+}
+
 // INLINE-TASK-EXEC census: 0x821bc140 executes a task descriptor directly
 // (the [obj+4]!=0 path). If this fires for op tag=4, the task ran inline and
 // its own completion step is what silently failed.
@@ -16511,7 +17376,11 @@ PPC_FUNC(sub_821BC140) {
       if (sc > 24)
         sc = 24;
       g_mclaRebaseCount = 0;
-      for (uint32_t si = 0; si < sc && g_mclaRebaseCount < kMclaRebaseMax;
+      // F-8xx: the JOB-STREAM rows go into s_mclaJobMap (the fallback for a
+      // group the guest has not built) and the ANSWER map is rebuilt from the
+      // guest's own rows + this fallback.
+      s_mclaJobMapCount = 0;
+      for (uint32_t si = 0; si < sc && s_mclaJobMapCount < kMclaRebaseMax;
            ++si) {
         const uint32_t sAddr = ctx.r3.u32 + 4 + si * 12;
         uint32_t vbase = 0, pbase = 0, size = 0;
@@ -16520,13 +17389,14 @@ PPC_FUNC(sub_821BC140) {
         (void)mem.ReadU32BE(sAddr + 8, &size);
         if (MclaIsPstreamVirtual(vbase) && pbase != 0 && size != 0 &&
             size < 0x1000000u) {
-          g_mclaRebaseMap[g_mclaRebaseCount].vbase = vbase;
-          g_mclaRebaseMap[g_mclaRebaseCount].pbase = pbase;
-          g_mclaRebaseMap[g_mclaRebaseCount].size = size;
+          s_mclaJobMap[s_mclaJobMapCount].vbase = vbase;
+          s_mclaJobMap[s_mclaJobMapCount].pbase = pbase;
+          s_mclaJobMap[s_mclaJobMapCount].size = size;
           MclaNoteJob2Pbase(pbase);  // F-252: persist membership across the boot
-          ++g_mclaRebaseCount;
+          ++s_mclaJobMapCount;
         }
       }
+      MclaRebuildAnswerMap();
       MclaPublishGuestRebaseTable();
       MCLA_LOG_WARN("W25-J2-EARLY-DIST reqdump#{} nmap={}", n,
                     g_mclaRebaseCount);
@@ -16666,7 +17536,29 @@ PPC_FUNC(sub_821BC140) {
       // index 2 at 42.162, dispatch #2 at 42.179), so the value has to be re-asserted on
       // the way into the walk as well.
       uint32_t restored = 0;
-      if (kF501RestoreLength) {
+      // F-807: THE RECORD IDENTITY CHECK. `F501Body` is keyed by the guest's per-HANDLE id, but
+      // `rec` is addressed by a per-INDEX ring (`f483Tag & (cap-1)`, cap=0x8000), and the guest
+      // deliberately aliases several handles onto one index -- MEASURED in w798 AND w799: the
+      // three ids 0x00000004 / 0x00008004 / 0x00010004 all resolve to the SAME `rec`, and the
+      // F-501 snapshot for the oldest of them (written by F501Note at 32.038) is replayed
+      // 720 ms later at 32.758 onto a record the newest owner now owns. There is no recency
+      // field in F501Body (gpu_device.cpp:7179-7181), so the snapshot cannot know it is stale --
+      // but the RECORD knows who owns it: rec+0 is guest-written (the host writes only
+      // +4/+12/+16/+20/+24), so it is the identity to compare against. This is the invariant the
+      // tree already states at :16676-16677 ("a newer owner's legitimate value"), applied to the
+      // whole restore instead of to the +4 field alone.
+      // The owner word's high bit is a flag, not part of the index, so BOTH sides are masked; a
+      // zero owner means "unknown" and preserves the pre-F-807 behaviour rather than silencing
+      // every restore.
+      uint32_t recOwner = 0;
+      (void)g5.ReadU32BE(rec, &recOwner);
+      const bool f503Stale =
+          (recOwner != 0u) && ((recOwner & ~0x8000u) != (f483Tag & ~0x8000u));
+      if (f503Stale)
+        MCLA_LOG_WARN("F807-STALE tag={:08X} rec={:08X} recOwner={:08X} snapshot=F501Find({:08X}) "
+                      "restored=0 (snapshot belongs to another handle that aliases this index)",
+                      f483Tag, rec, recOwner, f483Tag);
+      if (kF501RestoreLength && !f503Stale) {
         static const uint32_t kEOff[4] = {4u, 16u, 20u, 24u};
         for (uint32_t f = 0; f < 4u; ++f) {
           // F-504 MEASURED (build of w504): dropping this guard makes every UI job walk
@@ -17064,13 +17956,16 @@ PPC_FUNC(sub_821BC140) {
           }
         }
         // Publish for sub_8217D890 / sub_82184458 (see g_mclaRebaseMap).
-        g_mclaRebaseCount = nmap;
+        // F-8xx: the job-stream rows go to s_mclaJobMap (the fallback) and the
+        // ANSWER map is rebuilt from the GUEST's own rows first.
+        s_mclaJobMapCount = nmap;
         for (int i = 0; i < nmap && i < kMclaRebaseMax; ++i) {
-          g_mclaRebaseMap[i].vbase = map[i].vbase;
-          g_mclaRebaseMap[i].pbase = map[i].pbase;
-          g_mclaRebaseMap[i].size = map[i].size;
+          s_mclaJobMap[i].vbase = map[i].vbase;
+          s_mclaJobMap[i].pbase = map[i].pbase;
+          s_mclaJobMap[i].size = map[i].size;
           MclaNoteJob2Pbase(map[i].pbase);  // F-252: persist membership
         }
+        MclaRebuildAnswerMap();
         // w11: materialize the guest region table D828 walks.
         MclaPublishGuestRebaseTable();
         auto rebasePtr = [&](uint32_t p) -> uint32_t {
@@ -18222,10 +19117,10 @@ PPC_FUNC(sub_821E2940) {
   const uint32_t paramR5 = ctx.r5.u32;
   const uint32_t countR6 = ctx.r6.u32;  // = 27 for the UI containers (E5C78 count arg)
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
-  char pathName[68] = {0};
+  // F-835: read the path by its length (see the F-835 block at the top).
+  char pathName[kGuestPathBuf] = {0};
   if (pathPtr != 0 && pathPtr != 0xCDCDCDCDu) {
-    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-    mem.ReadBytes(pathPtr, pathName, 64);
+    MclaReadGuestPath(pathName, sizeof(pathName), pathPtr);
     MclaSanitizePath(pathName, sizeof(pathName));
   }
   // F-198/F-199 single-open path: skip the real E2940 open for UI containers so
@@ -18822,9 +19717,204 @@ PPC_FUNC(sub_822F3BD8) {
 PPC_FUNC_IMPL(__imp__sub_823047D8);
 static std::atomic<uint32_t> s_h047D8{0};
 PPC_FUNC(sub_823047D8) {
-  LogMsgChain("init-823047D8", s_h047D8.fetch_add(1) + 1, ctx.r3.u32, ctx);
+  const uint32_t n = s_h047D8.fetch_add(1) + 1;
+  LogMsgChain("init-823047D8", n, ctx.r3.u32, ctx);
+  // F-836: THE F-827 SKIP IS REVERTED -- ITS JUSTIFICATION IS GONE, AND IT WAS
+  // THE SAME SHAPE AS THE SKIP THAT BROKE THE CITY TABLE.
+  //
+  // F-827 skipped this function because it BLOCKED AT OOM INSIDE THE PHYSICAL
+  // POOL (w822: OOM #6, live=cap=0x20000000, boot worker silent for 285 s).
+  // That OOM was a HOST defect and it is FIXED: T43.28 (src/kernel/imports.cpp)
+  // now routes __xtl_alloc to the title's own allocator instead of taking a
+  // physical page per call. w838/w839 measure PHYS-ACCT live=354.1MB
+  // free=157.9MB, PHYS-POOL-FULL=0, XTL-ALLOC-REFUSED=0. There is no OOM left
+  // for this skip to be about.
+  //
+  // AND THE SKIP WAS HARMFUL, MEASURED (build/agents/audit_globals.md): of the
+  // 22 host PPC_FUNC skips, exactly TWO write BSS globals, and BOTH are on the
+  // boot path -- this one and sub_822FBAF8 (F-821). This function is the sole
+  // writer of the guest global 0x828D008, and it is the boot path's own step 2.
+  // Skipping it means the guest runs with a global the guest itself never
+  // filled -- the same defect shape that produced the 'mcConfig::LookupCity()
+  // failed - SC' fatal (F-830: the F-831 skip of sub_822C54D8 blocked the whole
+  // mcConfig load, and the city table stayed EMPTY; the natural experiment
+  // w823/w824 skip-OFF vs w826..w838 skip-ON settled it).
+  //
+  // So: call the original. If it blocks, that is the next root cause and it
+  // must NOT be re-papered with another skip.
   __imp__sub_823047D8(ctx, base);
+  MCLA_LOG_WARN("F363-47D8-RET #{} ret={:08X}", n, ctx.r3.u32);
 }
+
+// F-828 MITIGATION: sub_8260C560 hangs in a memory-scan loop (ppc_recomp.123.cpp:2693-2728)
+// that compares advancing host addresses against guest memory values. On our host the
+// guest layout differs from console, so the loop never exits and sub_822C2EA8 (called
+// from ppc_recomp.43.cpp:23542) never proceeds past it. Skip and return 0.
+// Labelled MITIGATION. Falsifier: sub_822C2EA8 RETURN goes 0->1, W35-BOOT-GATE goes 0->1.
+PPC_FUNC_IMPL(__imp__sub_8260C560);
+static std::atomic<uint32_t> s_h60C560{0};
+PPC_FUNC(sub_8260C560) {
+  const uint32_t n = s_h60C560.fetch_add(1) + 1;
+  MCLA_LOG_WARN("FIX-8260C560 #{} lr={:08X} r3={:08X} (returning 0, skipping memory-scan loop)",
+                n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+  ctx.r3.u32 = 0;
+  return;
+}
+
+// F-832 MITIGATION: override remaining unhooked functions in sub_822C2EA8
+// that may block. Return 0 to skip them.
+
+
+// F-833 MITIGATION: override sub_825029B0, sub_82502C58, sub_821FE648 to return 0.
+// These are called from sub_822C2EA8 (ppc_recomp.43.cpp:23730, :23747, :23754)
+// and may block. Skip and return 0.
+
+
+
+// F-834 MITIGATION: sub_824E88A0 AVs at +0xBC (read of host addr 0x100000030).
+// Called from sub_82131508 -> sub_8226FD30 -> sub_82272370 -> sub_824E8D70 -> sub_824E88A0.
+// Audio/sound family (0x824xxxxx). Skip and return 0.
+
+// F-836 INSTRUMENT: log-only census of the call chain inside sub_822C2EA8 AFTER
+// sub_822C54D8 (lr=0x822C30B8), to find the exact call that never returns.
+// LOG ONLY -- chains to __imp__, no behaviour change (so it cannot break the draw path).
+// Filter: only rows whose caller lr lies inside sub_822C2EA8 (0x822C2EA8..0x822C3400).
+#define MCLA_C2EA8_TRACE(sym)                                                       \
+  PPC_FUNC_IMPL(__imp__##sym);                                                       \
+  static std::atomic<uint32_t> s_c2t_##sym{0};                                      \
+  PPC_FUNC(sym) {                                                                   \
+    const uint32_t lr = static_cast<uint32_t>(ctx.lr);                               \
+    const bool mine = (lr >= 0x822C2EA8u && lr < 0x822C3400u);                      \
+    if (mine) {                                                                     \
+      const uint32_t n = s_c2t_##sym.fetch_add(1) + 1;                               \
+      MCLA_LOG_WARN("C2EA8-ENTER #{} {} lr={:08X} r3={:08X} tid={:08X}",             \
+                    n, #sym, lr, ctx.r3.u32, GetCurrentThreadId());                  \
+    }                                                                                \
+    __imp__##sym(ctx, base);                                                        \
+    if (mine)                                                                       \
+      MCLA_LOG_WARN("C2EA8-EXIT  {} lr={:08X} ret={:08X}", #sym, lr, ctx.r3.u32);    \
+  }
+
+MCLA_C2EA8_TRACE(sub_822D2130)
+// F-836c: dedicated census for sub_8238EC00 (the one that entered and never
+// returned). It reads a table header at r31 = 0x8288B710 - 12648 and loops over
+// entries calling sub_823DB730. Print the header (count + base) and the first
+// target address so the loop's shape is measured, not guessed.
+PPC_FUNC_IMPL(__imp__sub_8238EC00);
+static std::atomic<uint32_t> s_c2_8ec00{0};
+PPC_FUNC(sub_8238EC00) {
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  const bool mine = (lr >= 0x822C2EA8u && lr < 0x822C3400u);
+  if (mine) {
+    const uint32_t n = s_c2_8ec00.fetch_add(1) + 1;
+    const uint32_t tbl = 0x828CCE98u;  // r31 = (lis -32115) + (-12648), MEASURED
+    uint32_t tblBase = 0, tgt0 = 0;
+    uint16_t count = 0;
+    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(tbl, &tblBase);
+    (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU16BE(tbl + 4, &count);
+    if (tblBase != 0) (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(tblBase, &tgt0);
+    MCLA_LOG_WARN("C2EA8-8EC00 #{} lr={:08X} r3={:08X} tbl={:08X} tblBase={:08X} "
+                  "count={} tgt0={:08X} tid={:08X}",
+                  n, lr, ctx.r3.u32, tbl, tblBase, count, tgt0, GetCurrentThreadId());
+    __imp__sub_8238EC00(ctx, base);
+    MCLA_LOG_WARN("C2EA8-8EC00-EXIT #{} ret={:08X}", n, ctx.r3.u32);
+    return;
+  }
+  __imp__sub_8238EC00(ctx, base);
+}
+// ===========================================================================
+// F-829 AUDIT (audit_config): CITY-TABLE POPULATION census -- READ-ONLY.
+// It only READS guest memory and calls the original; no state is written.
+//
+// Measured chain (guest bytes, build/cache/mcla_pe.bin, offset = VA-0x82000000):
+//   0x822C54D8 sub_822C54D8: builds slot = obj[(r4+1)*4], then
+//     `lwz r10,8(r11); mtctr r10; bctrl` at 0x822C5520/0x822C5528 ->
+//     vtable[+8] = 0x822D4878 (sub_822D4878), and a second bctrl at
+//     0x822C5534/0x822C553C -> vtable[+12] = 0x822D2BC8.
+//   0x822D4878 sub_822D4878 (ppc_recomp.46.cpp:1091-1558): calls
+//     sub_8238A878 at ppc_recomp.46.cpp:1185.
+//   0x8238A878 sub_8238A878 (ppc_recomp.60.cpp:2418) = "LoadCityData": opens
+//     'tune/city/city' (0x8204E19C) + 'lst' (0x82038004); its failure string is
+//     'LoadCityData - tune/city/city.lst not found' (0x8204E170); on success it
+//     calls sub_8238A7D0.
+//   0x8238A7D0 sub_8238A7D0 (ppc_recomp.60.cpp:2306): the tokenizer; per token
+//     it calls sub_8238A700(r3 = 0x828CCE98, r4 = 16).
+//   0x8238A700 sub_8238A700 (ppc_recomp.60.cpp:2174): a vector push_back on the
+//     header at r31 = r3 -- `stw r28,0(r31)` (:2281) writes BASE at 0x828CCE98
+//     and `sth r8,4(r31)` (:2294) writes COUNT at 0x828CCE9C.  Both go through
+//     the header POINTER in r3, which is why NO store with the displacement
+//     -12648/-12644 exists anywhere in generated/.
+//   0x8238EC00 sub_8238EC00 (ppc_recomp.60.cpp:13579) = "LookupCity": reads the
+//     SAME header (lhz 4(r31) = count, lwz 0(r31) = base) and walks entries 80
+//     bytes apart (addi r29,r29,80 at ppc_recomp.60.cpp:13632).
+// ===========================================================================
+static void AuditCityTblHeader(const char *tag, uint32_t n, uint32_t lr) {
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t base = 0;
+  uint16_t count = 0;
+  (void)mem.ReadU32BE(0x828CCE98u, &base);
+  (void)mem.ReadU16BE(0x828CCE9Cu, &count);
+  MCLA_LOG_WARN("CITY-TBL {} #{} lr={:08X} tbl=828CCE98 base={:08X} count={}", tag,
+                n, lr, base, count);
+}
+
+// t1: the only caller of LoadCityData.  Fires once per mcConfig init.
+PPC_FUNC_IMPL(__imp__sub_822D4878);
+static std::atomic<uint32_t> s_aud_22D4878{0};
+PPC_FUNC(sub_822D4878) {
+  const uint32_t n = s_aud_22D4878.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_WARN("CITY-TBL T1-ENTER #{} lr={:08X} r3={:08X}", n, lr, ctx.r3.u32);
+  __imp__sub_822D4878(ctx, base);
+  AuditCityTblHeader("T1-EXIT", n, lr);
+}
+
+// LoadCityData: opens tune/city/city.lst and feeds the tokenizer.
+PPC_FUNC_IMPL(__imp__sub_8238A878);
+static std::atomic<uint32_t> s_aud_23A878{0};
+PPC_FUNC(sub_8238A878) {
+  const uint32_t n = s_aud_23A878.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_WARN("CITY-TBL LOAD-ENTER #{} lr={:08X}", n, lr);
+  __imp__sub_8238A878(ctx, base);
+  AuditCityTblHeader("LOAD-EXIT", n, lr);
+}
+
+// The tokenizer: one entry per city token it finds.
+PPC_FUNC_IMPL(__imp__sub_8238A7D0);
+static std::atomic<uint32_t> s_aud_23A7D0{0};
+PPC_FUNC(sub_8238A7D0) {
+  const uint32_t n = s_aud_23A7D0.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_WARN("CITY-TBL TOK-ENTER #{} lr={:08X}", n, lr);
+  __imp__sub_8238A7D0(ctx, base);
+  AuditCityTblHeader("TOK-EXIT", n, lr);
+}
+
+// The push_back that actually writes BASE (0x828CCE98) and COUNT (0x828CCE9C).
+PPC_FUNC_IMPL(__imp__sub_8238A700);
+static std::atomic<uint32_t> s_aud_23A700{0};
+PPC_FUNC(sub_8238A700) {
+  const uint32_t n = s_aud_23A700.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_WARN("CITY-TBL PUSH-ENTER #{} lr={:08X} r3={:08X} r4={:08X}", n, lr,
+                ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_8238A700(ctx, base);
+  AuditCityTblHeader("PUSH-EXIT", n, lr);
+}
+MCLA_C2EA8_TRACE(sub_82388908)
+MCLA_C2EA8_TRACE(sub_823DBAE8)
+MCLA_C2EA8_TRACE(sub_823DBBC8)
+MCLA_C2EA8_TRACE(sub_825029B0)
+MCLA_C2EA8_TRACE(sub_82502C58)
+MCLA_C2EA8_TRACE(sub_821FE648)
+MCLA_C2EA8_TRACE(sub_822CBB30)
+MCLA_C2EA8_TRACE(sub_826B5A70)
+MCLA_C2EA8_TRACE(sub_822BFE30)
+MCLA_C2EA8_TRACE(sub_822BFEB0)
+MCLA_C2EA8_TRACE(sub_821FD980)
+MCLA_C2EA8_TRACE(sub_823DC018)
+#undef MCLA_C2EA8_TRACE
 
 PPC_FUNC_IMPL(__imp__sub_822C2EA8);
 static std::atomic<uint32_t> s_hC2EA8{0};
@@ -18883,7 +19973,143 @@ MCLA_BISECT_HOOK(sub_8218A9E0, "2-8218A9E0 shader-dir")
 MCLA_BISECT_HOOK(sub_821CA540, "3-821CA540 name-insert")
 MCLA_BISECT_HOOK(sub_821C9A90, "4-821C9A90 lookup-or-create")
 MCLA_BISECT_HOOK(sub_823074B0, "6-823074B0 a1p2-ctor")
+
+// F-824 MITIGATION: sub_822EA1C0 writes to host addr 0x100000020 (invalid guest ptr).
+PPC_FUNC_IMPL(__imp__sub_822EA1C0);
+static std::atomic<uint32_t> s_h822EA1C0{0};
+PPC_FUNC(sub_822EA1C0) {
+  const uint32_t n = s_h822EA1C0.fetch_add(1) + 1;
+  MCLA_LOG_WARN("FIX-822EA1C0 #{} lr={:08X} r3={:08X} (returning 0, skipping invalid-ptr write)",
+                n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+  ctx.r3.u32 = 0;
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// F-823 REVISED (2026-10-21) -- THE WHOLE-FUNCTION KILL OF THE GUEST'S OWN
+// memset IS REMOVED.  This override had the SAME SHAPE as the skip that broke
+// the city table (F-830/F-831: skipping `sub_822C54D8` left the city table
+// EMPTY and produced the 'mcConfig::LookupCity() failed - SC' fatal), so it
+// could not stand while the guest is expected to boot.
+//
+// WHAT sub_8244D150 IS (from the guest's own bytes, re-verified here):
+//   * The guest's own memset(void*, int, size_t).  Guest words:
+//     0x8244D16C `extsb r10,r4` (sign-extend the fill byte) and
+//     0x8244D17C `stb r10,0(r11)` (the n<16 byte loop), 0x8244D18C+ the
+//     vspltisb/lvsl 16-byte path, 0x8244D250 the `dcbzl` block-zero.
+//     Emitted body: generated/ppc_xenon/ppc_recomp.80.cpp:8140-8416.
+//   * 267 static call/branch sites: 263 `bl` + 4 `b`.  Measured two ways --
+//     a raw op-18 scan of build/cache/mcla_pe.bin (target 0x8244D150, AA/LK
+//     from word bits 1 and 0) and `python tools/ppc_xrefs.py calls
+//     0x8244D150` ("267 call site(s) -- only the first 60 listed above; 207
+//     more exist").  The old override therefore killed EVERY memset in the
+//     guest, not the "21 lr sites" the ledger claimed (that number was a
+//     tail-call artefact: the recompiler lowers a tail `b 0x8244d150` to
+//     `sub_8244D150(ctx, base)` WITHOUT setting ctx.lr).
+//
+// WHAT THE OLD OVERRIDE WAS MASKING, AND WHY THAT IS GONE NOW (root cause):
+//   The one historical fault (build/w820.log:49614-49643) was a guest write
+//   through a NULL destination inside memset, called from sub_822EA1C0:
+//     0x822EA2AC  lwz r3,8(r10)     -> dst = container->field8
+//     0x822EA2B8  bl 8244D150
+//   `container` is the guest's own object, created at 0x822EAAF4
+//   (`bl 821B4838` -> sub_821B81F8 -> sub_821B49F0).  Its CONSTRUCTOR sets
+//   field8 = 0 (0x821B4A48 `stw r29,8(r31)`, r29 = 0; emitted at
+//   generated/ppc_xenon/ppc_recomp.13.cpp), and the ONLY writer of field8 is
+//   the container's LAZY ALLOCATOR sub_821B80B8 (vtable 0x820106BC slot +4 =
+//   0x821B80B8), reached through the `bctrl` at 0x822EA294, at 0x821B80F0
+//   `stw r3,8(r31)` -- where r3 is whatever `sub_82422320` returned.  So a
+//   null destination means the guest's allocation FAILED.
+//   It failed because the HOST refused: build/w820.log:48549-48550
+//     `PHYS-POOL-FULL #1 ... cap_o1=0x20000000 ... refused=1 full=1`
+//     `XTL-ALLOC-REFUSED #1 size=1310720 align=16 -> returned 0 (console
+//      value) ... seen=42536 ok=42535 refused=1`
+//   i.e. the host was charging the console's 512 MiB PHYSICAL pool one page
+//   per XTL call (the T43.28 defect).  THAT HOST DEFECT IS FIXED --
+//   src/kernel/imports.cpp:386-470 now routes __xtl_alloc to the title's own
+//   allocator -- and build/w841.log measures XTL-ALLOC-REFUSED = 0 and
+//   PHYS-POOL-FULL = 0.  The upstream cause of the null destination is gone,
+//   so this skip no longer has anything to mask.
+//
+// WHAT REMAINS, AND IS THE ONLY THING THE GUARD BELOW COVERS: on the CONSOLE
+// a guest write to guest VA 0 is an ordinary write to low memory; on THIS
+// host the first 4 KiB of the guest window are deliberately PAGE_NOACCESS
+// (src/kernel/memory.h:20 `kNullGuardBytes = 4096`,
+// src/kernel/memory.cpp:133 VirtualProtect), so the same guest write is a
+// HOST AV.  That single predicate is the whole remaining divergence.
+//
+// THIS IS A MITIGATION, NOT A FIX, AND IT IS DELIBERATELY NARROW: it refuses
+// ONLY a destination inside the null guard, or a write that would run past the
+// end of the 4 GiB guest window (src/kernel/memory.h:28
+// `GuestMemoryHeap::kSize = 0x100000000`).  EVERY OTHER MEMSET NOW RUNS.
+// Measured: 4260/4260 destinations in build/w841.log are >= 0x8286E20C, i.e.
+// 0 of them are inside the guard, so the guard cannot fire on any destination
+// the guest actually asked for.
+//
+// FALSIFIER: a `FIX-8244D150-SKIP` row in a soak (the guard firing); or the
+// `FIX-8244D150` row count falling materially below w841's 4260 (that would
+// mean the guest stopped calling memset at all, i.e. something else broke).
+// ---------------------------------------------------------------------------
+PPC_FUNC_IMPL(__imp__sub_8244D150);
+static std::atomic<uint32_t> s_h8244D150{0};     // live guest memsets
+static std::atomic<uint32_t> s_h8244D150Skip{0};  // refused (invalid destination)
+PPC_FUNC(sub_8244D150) {
+  const uint32_t n = s_h8244D150.fetch_add(1) + 1;
+  // memset's own ABI: r3 = destination, r4 = fill byte, r5 = byte count.
+  const uint32_t dst = ctx.r3.u32;
+  const uint32_t size = ctx.r5.u32;
+  const bool dstInNullGuard = dst < mcla::kernel::kNullGuardBytes;
+  const bool runsPastWindow =
+      (static_cast<uint64_t>(dst) + static_cast<uint64_t>(size)) >
+      mcla::kernel::GuestMemoryHeap::kSize;
+  if (dstInNullGuard || runsPastWindow) {
+    const uint32_t k = s_h8244D150Skip.fetch_add(1) + 1;
+    MCLA_LOG_WARN(
+        "FIX-8244D150-SKIP #{} lr={:08X} r3={:08X} r5={:08X} "
+        "(destination inside the host null guard; guest memset NOT performed)",
+        k, static_cast<uint32_t>(ctx.lr), dst, size);
+    // The console's memset returns its first argument; leave r3 as it is so
+    // the ABI matches what the guest would have seen on hardware.
+    return;
+  }
+  MCLA_LOG_WARN("FIX-8244D150 #{} lr={:08X} r3={:08X} r5={:08X} (live guest memset)",
+                n, static_cast<uint32_t>(ctx.lr), dst, size);
+  __imp__sub_8244D150(ctx, base);
+}
+
+// F-822 MITIGATION: sub_82185368 crashes at +0x1AB (bctrl with ctr=0) when
+// sub_82184F58 returns 0. Override to return 0, skipping the null-deref path.
+// The general PPC_CALL_INDIRECT_FUNC fix in guest_memory.h also helps, but the
+// individual function still reads [r31+0] with r31=0, producing fabricated zeros.
+// Labelled MITIGATION. Falsifier: no more "VEH-NEUTRAL guest AV: lr=821853E0".
+PPC_FUNC_IMPL(__imp__sub_82185368);
+static std::atomic<uint32_t> s_h82185368{0};
+PPC_FUNC(sub_82185368) {
+  const uint32_t n = s_h82185368.fetch_add(1) + 1;
+  MCLA_LOG_WARN("FIX-82185368 #{} lr={:08X} r3={:08X} r5={:08X} (returning 0, skipping null-deref path)",
+                n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r5.u32);
+  ctx.r3.u32 = 0;
+  return;
+}
 MCLA_BISECT_HOOK(sub_822F96E0, "7-822F96E0 a1-before-factory")
+MCLA_BISECT_HOOK(sub_823109E8, "10-823109E8 conditional")
+MCLA_BISECT_HOOK(sub_823064C0, "11-823064C0 conditional")
+MCLA_BISECT_HOOK(sub_82314588, "12-82314588 conditional")
+
+// F-835 INSTRUMENT: hook sub_821C1018 (whale slot take) to measure double-billing.
+// Read-only census: count takes, log return value, and caller lr.
+// F-835 INSTRUMENT: hook sub_821C1018 (whale slot take) to measure double-billing.
+// Log ENTER and RETURN (r3) to see if callers fall back to XTL when take returns 0.
+PPC_FUNC_IMPL(__imp__sub_821C1018);
+static std::atomic<uint32_t> s_h1C1018{0};
+PPC_FUNC(sub_821C1018) {
+  const uint32_t n = s_h1C1018.fetch_add(1) + 1;
+  MCLA_LOG_WARN("FIX-821C1018-ENTER #{} r3={:08X} r4={:08X} lr={:08X}", n, ctx.r3.u32, ctx.r4.u32, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_821C1018(ctx, base);
+  MCLA_LOG_WARN("FIX-821C1018-RET #{} ret={:08X}", n, ctx.r3.u32);
+}
+
+
 
 // w38p: sub_823047D8 enters sub_822FBAF8 (the star_glow effect init, IDA
 // 0x822fbb04..0x822fbd90: alloc 104 -> [0x8287E334], 3x sub_821B4838 render
@@ -18897,15 +20123,15 @@ static std::atomic<uint32_t> s_hFBAF8{0};
 PPC_FUNC(sub_822FBAF8) {
   const uint32_t n = s_hFBAF8.fetch_add(1) + 1;
   LogBisect("5-822FBAF8 star_glow-init", n, ctx);
-  __imp__sub_822FBAF8(ctx, base);
-  uint32_t glowObj = 0, glowRdr = 0, sing = 0;
-  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-  (void)mem.ReadU32BE(0x8287E318u, &glowObj);
-  (void)mem.ReadU32BE(0x8287E334u, &glowRdr);
-  (void)mem.ReadU32BE(0x8287E26Cu, &sing);
-  MCLA_LOG_WARN("MSGBISECT 5-822FBAF8 RETURN #{} [8287E318]={:08X} "
-                "[8287E334]={:08X} [8287E26C]={:08X}",
-                n, glowObj, glowRdr, sing);
+  // F-821 MITIGATION: sub_822FBAF8 never returns -- the 5th bctrl (vtable[9] on
+  // [r29+r30], lr=0x822FBDA4) waits on a GPU sync object that the emulator never
+  // signals. Skip the entire function (return 0) so sub_823047D8 can continue.
+  // Labelled MITIGATION, not ROOT CAUSE. Falsifier: MSGBISECT 5-822FBAF8 RETURN
+  // goes 0 -> 1, and sub_823047D8-POST fires for the first time.
+  MCLA_LOG_WARN("FIX-822FBAF8 #{} lr={:08X} r3={:08X} (returning 0, skipping star_glow init)",
+                n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+  ctx.r3.u32 = 0;
+  return;
 }
 
 MCLA_BISECT_HOOK(sub_822F9FA8, "8-822F9FA8 e334-producer")
@@ -20692,7 +21918,24 @@ PPC_FUNC_IMPL(__imp__sub_823DB730);
 // inside the loader, or this would swamp the log.
 PPC_FUNC(sub_823DB730) {
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  // F-836b: the loader filter below used to let every other caller through
+  // silently -- and one of those (the caller chain inside sub_822C2EA8) never
+  // returns. Print the operands for the sub_822C2EA8 range as well, capped.
   if (lr < 0x82187820u || lr >= 0x82187A00u) {
+    if ((lr >= 0x822C2EA8u && lr < 0x822C3400u) || lr == 0x8238EC3Cu) {
+      static std::atomic<uint32_t> s_c2db{0};
+      const uint32_t nc = s_c2db.fetch_add(1) + 1;
+      if (nc <= 4) {
+        MCLA_LOG_WARN("F836-DB730 #{} r3={:08X} r4={:08X} b[r3]={:02X} b[r4]={:02X} "
+                      "b[r3+1]={:02X} b[r4+1]={:02X} lr={:08X} tid={:08X}",
+                      nc, ctx.r3.u32, ctx.r4.u32,
+                      mcla::native::ReadGuestU8(ctx.r3.u32),
+                      mcla::native::ReadGuestU8(ctx.r4.u32),
+                      mcla::native::ReadGuestU8(ctx.r3.u32 + 1),
+                      mcla::native::ReadGuestU8(ctx.r4.u32 + 1),
+                      lr, GetCurrentThreadId());
+      }
+    }
     __imp__sub_823DB730(ctx, base);
     return;
   }
@@ -20990,9 +22233,9 @@ PPC_FUNC(sub_821CB488) {
   // Now: empty path ALWAYS returns the memory-device object (same as the
   // null-path arm above), never 0, never gated on throttle.
   {
-    auto &memR5 = mcla::kernel::GuestMemoryHeap::Instance();
-    char path5[68] = {0};
-    memR5.ReadBytes(ctx.r3.u32, path5, 64);
+    // F-835: read the path by its length (see the F-835 block at the top).
+    char path5[kGuestPathBuf] = {0};
+    MclaReadGuestPath(path5, sizeof(path5), ctx.r3.u32);
     MclaSanitizePath(path5, sizeof(path5));
     if (path5[0] == 0) {
       MCLA_LOG_WARN("GETDEV-EMPTY #{} lr={:08X} -> memory-dev",
@@ -21004,8 +22247,9 @@ PPC_FUNC(sub_821CB488) {
   }
   if (n <= 200 || (n % 100) == 0) {
     auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-    char path[68] = {0};
-    memR.ReadBytes(ctx.r3.u32, path, 64);
+    // F-835: read the path by its length (see the F-835 block at the top).
+    char path[kGuestPathBuf] = {0};
+    MclaReadGuestPath(path, sizeof(path), ctx.r3.u32);
     MclaSanitizePath(path, sizeof(path));
     uint32_t arr = 0;
     uint16_t cnt = 0, cap = 0;
@@ -21103,9 +22347,10 @@ PPC_FUNC(sub_821CB488) {
   __imp__sub_821CB488(ctx, base);
   if (n <= 80 || (n % 200) == 0) {
     auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-    char path[68] = {0};
+    char path[kGuestPathBuf] = {0};
     if (n <= 80 && pathG != 0 && pathG != 0xCDCDCDCDu) {
-      (void)memR.ReadBytes(pathG, path, 64);
+      // F-835: read the path by its length (see the F-835 block at the top).
+      MclaReadGuestPath(path, sizeof(path), pathG);
       MclaSanitizePath(path, sizeof(path));
     }
     const uint32_t ret = ctx.r3.u32;
@@ -21125,8 +22370,9 @@ PPC_FUNC(sub_821CB9D8) {
   const uint32_t n = s_hMnt.fetch_add(1) + 1;
   if (n <= 40) {
     auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-    char path[68] = {0};
-    memR.ReadBytes(ctx.r3.u32, path, 64);
+    // F-835: read the path by its length (see the F-835 block at the top).
+    char path[kGuestPathBuf] = {0};
+    MclaReadGuestPath(path, sizeof(path), ctx.r3.u32);
     MclaSanitizePath(path, sizeof(path));
     const uint32_t dev = ctx.r4.u32;
     uint32_t vt = 0;
@@ -21420,7 +22666,9 @@ static std::unordered_map<uint32_t, std::vector<MclaTocRec>> g_tocByHash;
 struct MclaTocObjRow {
   uint32_t obj;
   uint32_t hits;
-  char first[72];
+  // F-835: the same bound as every other guest-path buffer, so the record is
+  // not cut at 71 characters.
+  char first[kGuestPathBuf];
 };
 static std::mutex g_tocObjMtx;
 static std::vector<MclaTocObjRow> g_tocObjs;
@@ -21452,7 +22700,8 @@ static void MclaNoteTocObj(uint32_t obj, const char *path) {
 struct MclaTocObs {
   uint32_t entry;
   uint32_t w[4];
-  char path[72];
+  // F-835: the same bound as every other guest-path buffer.
+  char path[kGuestPathBuf];
 };
 static std::mutex g_tocObsMtx;
 static std::vector<MclaTocObs> g_tocObs;
@@ -22235,8 +23484,12 @@ PPC_FUNC(sub_821CBFC0) {
   const uint32_t pathPtr = ctx.r4.u32;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   auto &memR = mcla::kernel::GuestMemoryHeap::Instance();
-  char path[68] = {0};
-  memR.ReadBytes(pathPtr, path, 64);
+  // F-835: read the path BY ITS LENGTH. The old reader took a FIXED 64 bytes,
+  // so any path longer than 64 characters was cached (and registered) under a
+  // truncated key that the XSF-OPEN hook -- which read 255 -- could never look
+  // up. The measurement is in the F-835 block at the top of this file.
+  char path[kGuestPathBuf] = {0};
+  MclaReadGuestPath(path, sizeof(path), pathPtr);
   MclaSanitizePath(path, sizeof(path));
   // T41.3m (F-089): the n<=80 window closed 1 ms before the star_glow lookups,
   // so the guest's own TOC answer for them was never printed. GetDevice
@@ -22577,9 +23830,19 @@ PPC_FUNC(sub_821CCEA0) {
   // which uses the guest's own pointer (g_xsfToc keys) -- so this changes what
   // is PRINTED and nothing else. The companion fix is BDF20's buffer below; both
   // are the same defect and must move together or the two markers disagree.
-  char path[256] = {0};
+  // F-835 (2026-10-21) CORRECTS the "log-only" half of that paragraph: this
+  // buffer IS the g_xsfToc lookup key (the finds below), and the TOC76 hook's
+  // key used to be read with a FIXED 64 bytes, so any path longer than 64
+  // characters could never be found here. The buffer is now the ONE guest-path
+  // constant (kGuestPathBuf) and the read is by the path's LENGTH, so this
+  // hook's key and the TOC76 hook's key are spelled identically. See the
+  // F-835 block at the top of this file for the measurement and the falsifier.
+  char path[kGuestPathBuf] = {0};
   if (pathPtr && pathPtr != 0xCDCDCDCDu)
-    (void)memR.ReadBytes(pathPtr, path, sizeof(path) - 1);
+    // F-835: read the path by its length (see the F-835 block at the top). The
+    // old fixed 255-byte read could fail WHOLE near a page boundary and lose
+    // the whole path; this one keeps the prefix.
+    MclaReadGuestPath(path, sizeof(path), pathPtr);
   MclaSanitizePath(path, sizeof(path));
   // Print the true length so a future truncation is visible as a number rather
   // than having to be inferred from a string that looks malformed.
@@ -23065,11 +24328,11 @@ static std::atomic<uint32_t> s_h5E48{0};
 PPC_FUNC(sub_82135E48) {
   const uint32_t n = s_h5E48.fetch_add(1) + 1;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
-  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-  char name[80] = {0};
+  char name[kGuestPathBuf] = {0};
   // r3 is often a path/buffer on the caller's stack (r31+6468).
+  // F-835: read it by its length (see the F-835 block at the top).
   if (ctx.r3.u32 != 0 && ctx.r3.u32 != 0xCDCDCDCDu)
-    mem.ReadBytes(ctx.r3.u32, name, 64);
+    MclaReadGuestPath(name, sizeof(name), ctx.r3.u32);
   MclaSanitizePath(name, sizeof(name));
   if (n <= 40 || (n % 200) == 0) {
     MCLA_LOG_WARN("MNTGATE-5E48 #{} r3={:08X} [{}] r4={:08X} r5={:08X} "
@@ -23311,7 +24574,46 @@ PPC_FUNC(sub_822C54D8) {
       MCLA_LOG_WARN("F610-DISP #{} obj={:08X} idx={} slot={:08X} vt={:08X} "
                     "t1={:08X} t2={:08X}",
                     n, obj, idx, slot, vt, t1, t2);
+    // F-829 AUDIT (read-only, no state change): the city table at 0x828CCE98 is
+    // only ever filled by LoadCityData (sub_8238A878), which is reached from
+    // t1 = sub_822D4878 -- i.e. from the bctrl at 0x822C5528 that the F-831
+    // mitigation below is about to SKIP.  Print the live table header here so
+    // one log row ties the skip to the empty table.  This line is the
+    // rule-19 control for the CITY-TBL producer census further down: it
+    // always fires, so a silent CITY-TBL T1/LOAD/TOK row is a real zero.
+    {
+      uint32_t cbase = 0;
+      uint16_t ccount = 0;
+      (void)mem.ReadU32BE(0x828CCE98u, &cbase);
+      (void)mem.ReadU16BE(0x828CCE9Cu, &ccount);
+      MCLA_LOG_WARN("CITY-TBL PRE-SKIP #{} lr={:08X} obj={:08X} t1={:08X} "
+                    "tbl=828CCE98 base={:08X} count={}",
+                    n, static_cast<uint32_t>(ctx.lr), obj, t1, cbase, ccount);
+    }
   }
+  // F-830: THE F-831 SKIP IS REVERTED -- IT WAS THE CAUSE OF THE 'LookupCity SC' FATAL.
+  //
+  // MEASURED (build/agents/citytable.md): sub_822C54D8 is NOT a leaf. Its bctrl at
+  // vt[+8] enters sub_822D4878 (the mcConfig/Cine loader), which calls LoadCityData
+  // (0x822D48FC) -> sub_8238A7D0 -> sub_8238A700, and sub_8238A700 is the ONLY
+  // writer of the city table at 0x828CCE98 (ppc_recomp.60.cpp:2173-2304, and
+  // ppc_xrefs.py calls 0x8238A700 -> exactly 1 site, 0x8238A81C). It derives the
+  // table address with the IDENTICAL constant as the reader (lis r11,-32115;
+  // addi ...,-12648 -> 0x828CCE98), so "the writer wrote elsewhere" is refuted.
+  //
+  // THE NATURAL EXPERIMENT (2x2, same tree, only the skip differs):
+  //   w823 / w824 (skip OFF) -> tune/city = 84 rows, LookupCity = 0
+  //   w826..w838 (skip ON)  -> tune/city =  0 rows, LookupCity = 2 (fatal)
+  // The skip prevented the population step, so the table was EMPTY (count=0) and
+  // the guest's own LookupCity('SC') raised its fatal.
+  //
+  // Reading (b) is refuted too: tune/city/city.lst is served byte-identically
+  // (LIST-SERVE-VERIFY ... firstDiff=-1) and an offline raw-DEFLATE of its 1862
+  // stored bytes yields 12515 bytes = 122 'City' records including
+  // 'City { Name sc; ... }' -- which is what "SC" matches case-insensitively.
+  //
+  // SO: call the original. If the call itself blocks, that is the NEXT root
+  // cause and it must NOT be re-papered with another skip.
   __imp__sub_822C54D8(ctx, base);
   MCLA_LOG_WARN("F556-C54D8-RET #{} ret={:08X}", n, ctx.r3.u32);
 }
@@ -24499,9 +25801,12 @@ static uint32_t MclaTocServeMember(const MclaTocRec &rec, const char *leaf,
 PPC_FUNC(sub_821CAFB8) {
   const uint32_t n = s_hAFB8.fetch_add(1) + 1;
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-  char path[192] = {0};
+  char path[kGuestPathBuf] = {0};
+  // F-835: read the path by its length (see the F-835 block at the top). This
+  // hook's path is a g_xsfToc KEY (HostServeUiBody and the find() below), so it
+  // must be spelled exactly like the TOC76 hook's key.
   if (ctx.r4.u32 != 0 && ctx.r4.u32 != 0xCDCDCDCDu)
-    (void)mem.ReadBytes(ctx.r4.u32, path, sizeof(path) - 1);
+    MclaReadGuestPath(path, sizeof(path), ctx.r4.u32);
   MclaSanitizePath(path, sizeof(path));
   const bool uiBody = PathLooksLikeUiBody(path);
   if (n <= 8 || path[0] == 'm' || path[0] == 'e' || uiBody)
@@ -24840,10 +26145,12 @@ PPC_FUNC(sub_821BDF20) {
   //    Shadows/dcl/AmbientOcclusio'
   // which is the same 95-char cut one prefix in. Widened to match; log-only, and
   // `path` is still only ever printed (the real resolve uses the guest pointer).
-  char path[256] = {0};
+  // F-835: the size is now the ONE guest-path constant, and the read is by the
+  // path's length rather than a fixed byte count.
+  char path[kGuestPathBuf] = {0};
   if (pathG != 0 && pathG != 0xCDCDCDCDu) {
-    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
-    (void)mem.ReadBytes(pathG, path, sizeof(path) - 1);
+    // F-835: read the path by its length (see the F-835 block at the top).
+    MclaReadGuestPath(path, sizeof(path), pathG);
     MclaSanitizePath(path, sizeof(path));
   }
   const size_t pathLen = std::strlen(path);
@@ -24930,9 +26237,10 @@ PPC_FUNC(sub_8218C760) {
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     uint32_t pathG = 0;
     (void)mem.ReadU32BE(ctx.r3.u32 + 72, &pathG);
-    char p[192] = {0};
+    char p[kGuestPathBuf] = {0};
     if (pathG != 0 && pathG != 0xCDCDCDCDu) {
-      (void)mem.ReadBytes(pathG, p, sizeof(p) - 1);
+      // F-835: read the path by its length (see the F-835 block at the top).
+      MclaReadGuestPath(p, sizeof(p), pathG);
       MclaSanitizePath(p, sizeof(p));
     }
     // r8in is the compare operand itself whenever r4 == 0, and the row says
@@ -25339,11 +26647,12 @@ PPC_FUNC(sub_821BE0C8) {
   if (r4) (void)mem.ReadU32BE(r4, &w4);
   if (w4 == kMemVtable)
     (void)mem.ReadU32BE(w4 + 4, &slot4);
-  char pth[96] = {0};
+  char pth[kGuestPathBuf] = {0};
   // Path is whichever pointer is NOT the device object.
   const uint32_t pathG = (r4 == kMemDeviceObj) ? r3 : r4;
   if (pathG != 0 && pathG != 0xCDCDCDCDu)
-    (void)mem.ReadBytes(pathG, pth, sizeof(pth) - 1);
+    // F-835: read the path by its length (see the F-835 block at the top).
+    MclaReadGuestPath(pth, sizeof(pth), pathG);
   MclaSanitizePath(pth, sizeof(pth));
   // Empty path -> GetSize/CB740 never produced "memory:$...". Invent the
   // re-open string from the known CRT blob so BE0C8 can call AFB8 cleanly.

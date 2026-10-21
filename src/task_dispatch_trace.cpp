@@ -1498,6 +1498,40 @@ PPC_FUNC(sub_825EF100)
         if (arr != 0 && arr != 0xCDCDCDCDu && arr != 0xFFFFFFFFu)
             (void)mem.ReadU32BE(arr, &arr0);
     }
+    // F-806 (2026-10-21): CENSUS THE GUEST'S OWN REBASE TABLE. The guest's
+    // place pass resolves every virtual through the group it is handed
+    // (ctx.r4 -> [ctx.r4+0] = the table). The host's own re-dispatch uses a
+    // SYNTHETIC table (src/gpu_device.cpp MclaPublishGuestRebaseTable) whose
+    // 0x50000000 region covers only the job's DECLARED stream chunk, while the
+    // guest's table is a different band -- and that band is the missing fact for
+    // the place pass (the container's DIU points into it). Layout MEASURED from
+    // the raw bytes of sub_8217D828 (tools/ppc_disasm.py 0x8217D828):
+    // table+0 u16 countA, table+2 u16 countB, table+4+i*12 {vbase, pbase, size}.
+    if (n <= 8)
+    {
+        const uint32_t grp = ctx.r4.u32;
+        uint32_t tbl = 0;
+        if (grp != 0 && grp != 0xCDCDCDCDu)
+            (void)mem.ReadU32BE(grp + 0, &tbl);
+        if (tbl != 0 && tbl != 0xCDCDCDCDu)
+        {
+            uint16_t cA = 0, cB = 0;
+            uint32_t e0v = 0, e0p = 0, e0s = 0;
+            uint32_t e1v = 0, e1p = 0, e1s = 0;
+            (void)mem.ReadU16BE(tbl + 0, &cA);
+            (void)mem.ReadU16BE(tbl + 2, &cB);
+            (void)mem.ReadU32BE(tbl + 4, &e0v);
+            (void)mem.ReadU32BE(tbl + 8, &e0p);
+            (void)mem.ReadU32BE(tbl + 12, &e0s);
+            (void)mem.ReadU32BE(tbl + 16, &e1v);
+            (void)mem.ReadU32BE(tbl + 20, &e1p);
+            (void)mem.ReadU32BE(tbl + 24, &e1s);
+            MCLA_LOG_WARN("EF100-REBASE-TBL #{:03} grp={:08X} tbl={:08X} "
+                          "countA={} countB={} e0=[{:08X} {:08X} {:08X}] "
+                          "e1=[{:08X} {:08X} {:08X}]",
+                          n, grp, tbl, cA, cB, e0v, e0p, e0s, e1v, e1p, e1s);
+        }
+    }
     // F-563: Pre-populate CDCD containers at B7921000/B7B41000 before EF100
     // runs. These objects are allocated but never filled by the streamer
     // before the PLACE pass executes. Writing a minimal valid empty swfC
@@ -1934,6 +1968,59 @@ PPC_FUNC(sub_82135150) {
     __imp__sub_82135150(ctx, base);
     if (n <= 8 || (n % 500) == 0)
         MCLA_LOG_WARN("F358-TITLE-INIT-POST #{} r3={:08X}", n, ctx.r3.u32);
+}
+
+// F-817 (DRAWZERO, CORRECTED AFTER A FAILED LINK): there is deliberately NO hook here.
+// The DRAWZERO report proposed a log-only census on `sub_82134D08` -- "the pump", the
+// alternative arming path that posts `sub_821C67D8(&item, 0x82131008)` @0x82134DF8 -- to
+// separate "the boot-gate registration never ran" (A) from "the pump never ran" (B). The hook
+// was written and the link FAILED: `undefined symbol _sub_82134D08`. The reason settles B
+// without a boot, by measurement:
+//   - `tools\ppc_xrefs.py calls 0x82134D08` -> **0 call sites** in the whole image;
+//   - `sub_82134D08` appears NOWHERE in `generated/ppc_xenon/` -- not in
+//     `ppc_func_mapping.cpp` and not in any recompiled translation unit, so there is no
+//     `__imp__sub_82134D08` to passthrough to and the recompiled guest cannot enter it;
+//   - its bytes exist only in the raw image (mcla_pe.bin), as dead code.
+// The earlier reading of `addr_owners.py --check sub_82134D08` = "0 site(s)" was "unhooked,
+// safe to add"; the true meaning is "UNEMITTED -- no mapping row, so unhookable by the
+// PPC_FUNC pattern". CANDIDATE B IS ELIMINATED: the pump cannot run in any boot.
+// That leaves A by elimination: the earliest measured break is the non-return at guest
+// 0x82131550 (`bl sub_822C2EA8`, F363 ENTER=1 RETURN=0), which gates the straight-line tail
+// of `sub_82131508` -- the registration of the boot-gate callback 0x82131008. The next
+// instrument is the tid-tagged census that names where the boot worker's tid actually goes
+// after F365-COPIER lands: it decides whether the non-return is a stack abandonment into the
+// beat loop (the 12 submits all carry `lr=8217BB10` = `sub_8217B7B0+0x360`, `li r5,0`
+// @0x8217BB04) or a genuine hang inside one of sub_822C2EA8's 41 callees. Check
+// `addr_owners.py --check` for a live mapping row BEFORE hooking any candidate.
+
+// F-819: probes on sub_82727908 and sub_822BF258 -- callees right before the bctrl vtable call (0x822C3374) inside sub_822C2EA8.
+// sub_82727908 is called with args (0,0,0,0,1500) at guest 0x822C332C; sub_822BF258 at guest 0x822C3358 with r3=r28=3.
+// If 82727908 enters but 822BF258 doesn't -> 82727908 never returns. If both enter but no post-bctrl probe fires ->
+// either 822BF258 never returns or bctrl target doesn't return. Cap prints first 8: any count <=8 is complete.
+PPC_FUNC_IMPL(__imp__sub_82727908);
+static std::atomic<uint32_t> s_h82727908{0};
+PPC_FUNC(sub_82727908) {
+    const uint32_t n = s_h82727908.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F819-82727908 #{} lr={:08X} r3={:08X} r4={:08X} r5={:08X} r13={:08X}",
+                      n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32,
+                      ctx.r5.u32, ctx.r13.u32);
+    __imp__sub_82727908(ctx, base);
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F819-82727908-POST #{} r3={:08X}", n, ctx.r3.u32);
+}
+
+PPC_FUNC_IMPL(__imp__sub_822BF258);
+static std::atomic<uint32_t> s_h822BF258{0};
+PPC_FUNC(sub_822BF258) {
+    const uint32_t n = s_h822BF258.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F819-822BF258 #{} lr={:08X} r3={:08X} r4={:08X} r5={:08X} r13={:08X}",
+                      n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32,
+                      ctx.r5.u32, ctx.r13.u32);
+    __imp__sub_822BF258(ctx, base);
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F819-822BF258-POST #{} r3={:08X}", n, ctx.r3.u32);
 }
 
 // F-360: census on `sub_82131508`, found by the FIXED tools/ppc_xrefs.py to be the only

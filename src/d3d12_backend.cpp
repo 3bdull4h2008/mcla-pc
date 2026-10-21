@@ -5,8 +5,14 @@
 #include "renderer/resource_cache.h"
 #include "renderer/shader_translator.h"
 #include "renderer/texture_decode.h"
+#include "gpu_cp.h"
 #include "guest_memory.h"
 #include "logging.h"
+// F-XXX: the host's single Xenos->DXGI colour-format map, which the guest
+// render target's own format is taken from. It is DEFINED in
+// src/render_thread.cpp and DECLARED in src/render_thread.h; this include is
+// what makes the backend use that one table instead of a second copy of it.
+#include "render_thread.h"
 // F-726: std::numeric_limits<double>::quiet_NaN() -- the guard that makes a mean
 // above its own maximum unprintable without clamping a value into plausibility.
 #include <limits>
@@ -913,6 +919,271 @@ bool D3D12Backend::CreateRenderTargets() {
         rtvHandle.ptr += m_rtvDescriptorSize;
     }
 
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// F-XXX: the GUEST'S RENDER TARGET ("EDRAM").
+//
+// The console renders into EDRAM and copies it out to the scan-out surface;
+// this host rendered straight into the scan-out surface, so the two were the
+// same object and the console's copy step did not exist. The citations for
+// the guest's own registers (RB_SURFACE_INFO, RB_COLOR_INFO, the screen
+// scissor, RB_MODECONTROL and the four RB_COPY_* registers) are in
+// src/gpu_cp.h, with the PE-image bytes and the running values.
+//
+// THE TEXTURE. One committed 2D texture in the DEFAULT heap, RENDER_TARGET +
+// COPY_SRC (COPY_SRC because the resolve COPIES it into the scan-out
+// surface; a swap-chain back buffer cannot be the copy source, so the copy
+// direction is fixed by what the hardware allows).
+//
+// THE REFUSAL IS COUNTED AND NAMED, because "the guest's render target was
+// not used" is a fact a reader needs and an absence cannot carry.
+// ---------------------------------------------------------------------------
+void D3D12Backend::GuestRenderTargetRefused(const char* why, uint32_t hr) {
+    const uint64_t n = ++m_guestRtRefusals;
+    if (ShouldLogRefusal(n)) {
+        MCLA_LOG_WARN(
+            "GUEST-RT-REFUSED #{} why={} hr=0x{:08X} -- the guest's render target "
+            "was NOT used and the guest's draws went into the swap-chain back "
+            "buffer exactly as they did before this existed. hr=0xFFFFFFFF means "
+            "the refusal was not an HRESULT (no D3D12 call was made). totals "
+            "refusals={} created={} resolves={}",
+            static_cast<uint32_t>(n), why, hr,
+            m_guestRtRefusals,
+            m_guestRtCreated,
+            m_guestRtResolves);
+    }
+}
+
+bool D3D12Backend::EnsureGuestRenderTarget(uint32_t width, uint32_t height,
+                                           DXGI_FORMAT format) {
+    if (!m_device || width == 0 || height == 0 ||
+        format == DXGI_FORMAT_UNKNOWN) {
+        GuestRenderTargetRefused("bad-geometry");
+        return false;
+    }
+    if (m_guestRtValid && m_guestRtW == width && m_guestRtH == height &&
+        m_guestRtFormat == format) {
+        return true;
+    }
+
+    D3D12_HEAP_PROPERTIES props = {};
+    props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // NOTE ON FLAGS: there is no D3D12_RESOURCE_FLAG_ALLOW_COPY_SRC. This file
+    // says so at :860-867 (um/d3d12.h has ALLOW_RENDER_TARGET and no copy-source
+    // flag): every D3D12 resource is copyable unless DENY_SHADER_RESOURCE is
+    // set, so ALLOW_RENDER_TARGET alone makes this texture a legal copy source
+    // AND a legal render target.
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    // F-XXX: desc.Format WAS NEVER SET, AND THAT IS WHY EVERY CREATION FAILED.
+    //
+    // MEASURED (build/run845.txt -- the direct run of the previous binary):
+    //   :9671  Vectored exception: code=0xE06D7363 ... thread=360
+    //   :9694  [ 5] CxxThrowException +0x96
+    //   :9696  [ 7] D3D12GetInterface +0x3AE6C     (inside the D3D12 module)
+    //   :9700  [ 9] mcla::native::D3D12Backend::EnsureGuestRenderTarget +0x139
+    //   :9714  GUEST-RT-REFUSED #1 why=create-failed ... created=0 resolves=0
+    // The frame's own return address is 0x140292099, and the disassembly of
+    // that binary (llvm-objdump -d build/mcla.exe; EnsureGuestRenderTarget is
+    // at RVA 0x291f60 per build/mcla.map:3631) puts the vtable call to
+    // ID3D12Device::CreateCommittedResource at 0x140292096 -- vtable slot
+    // 0xd8, the same slot a standalone probe of the same header uses for the
+    // same call. So THE FAILING CALL IS THIS CALL, and the 0x139 in the log
+    // is its return address, not an inference.
+    //
+    // THE DESC THIS CODE BUILT, read out of that same disassembly: the writes
+    // into the D3D12_RESOURCE_DESC are at desc+0x00 (Dimension=3), +0x10
+    // (Width), +0x18 (Height), +0x1c (DepthOrArraySize=1, MipLevels=1), +0x24
+    // (SampleDesc.Count=1) and +0x30 (Flags=1). Windows Kits 10.0.26100.0
+    // um/d3d12.h's D3D12_RESOURCE_DESC puts DXGI_FORMAT Format at +0x20 --
+    // AND +0x20 IS NEVER WRITTEN. desc.Format therefore stayed 0 =
+    // DXGI_FORMAT_UNKNOWN, which is not a format a texture may have (it is
+    // the "no format" value, legal for a buffer only), so the runtime
+    // rejected the desc and this function refused every time. The guest's
+    // render target did not exist and the draws went into the back buffer
+    // exactly as they did before it was written.
+    //
+    // PROVED, NOT INFERRED: a standalone probe of the identical call
+    // (C:/Users/abdullah/AppData/Local/Temp/opencode/d3d12probe/probe.cpp --
+    // same adapter, same D3D_FEATURE_LEVEL_11_0, same desc) returns
+    //   Format = DXGI_FORMAT_UNKNOWN     -> hr = 0x80070057 (E_INVALIDARG)
+    //   Format = DXGI_FORMAT_R8G8B8A8_UNORM -> hr = 0x00000000
+    // 600 calls on two threads, and the probe never threw; the emulator's
+    // process logged a C++ exception at the same call, so the probe
+    // reproduces the FAILURE and not the throw. The mechanism that made the
+    // runtime raise 0xE06D7363 instead of returning E_INVALIDARG in that
+    // process is NOT established, and nothing in this fix depends on it: the
+    // desc was invalid in exactly one field and that field is now set.
+    desc.Format = format;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> rt;
+    HRESULT hr = m_device->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, IID_PPV_ARGS(&rt));
+    if (FAILED(hr) || !rt) {
+        // The HRESULT is NAMED, not just the reason: "create-failed" without
+        // it says the create failed and not why, which is the same silence
+        // this row exists to end.
+        GuestRenderTargetRefused("create-failed", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    if (!m_guestRtvHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 1;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        HRESULT hhr = m_device->CreateDescriptorHeap(
+            &heapDesc, IID_PPV_ARGS(&m_guestRtvHeap));
+        if (FAILED(hhr) || !m_guestRtvHeap) {
+            GuestRenderTargetRefused("rtv-heap-failed");
+            return false;
+        }
+    }
+
+    // A texture the GPU may still be reading must not be released under it,
+    // so the one being replaced is kept until the fence says the GPU is done.
+    if (m_guestRt) {
+        m_guestRtRetired.push_back(m_guestRt);
+        if (m_fence && m_fence->GetCompletedValue() >= m_currentFenceValue) {
+            m_guestRtRetired.clear();
+        }
+    }
+    m_device->CreateRenderTargetView(rt.Get(), nullptr,
+                                     m_guestRtvHeap->GetCPUDescriptorHandleForHeapStart());
+    m_guestRtv = m_guestRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    m_guestRt = rt;
+    m_guestRtW = width;
+    m_guestRtH = height;
+    m_guestRtFormat = format;
+    m_guestRtValid = true;
+    m_guestRtDrawn = false;
+    const uint64_t n = ++m_guestRtCreated;
+    {
+        const mcla::gpu::CpGuestRenderTarget gt = mcla::gpu::CpGuestRenderTargetInfo();
+        MCLA_LOG_INFO(
+            "GUEST-RT-CREATED #{} {}x{} dxgiFormat={} -- the guest's render "
+            "target (the console's EDRAM). It is sized and formatted from the "
+            "guest's OWN Xenos registers; the guest's draws go into it and the "
+            "resolve copies it into the scan-out surface. The registers it was "
+            "built from: RB_SURFACE_INFO pitch={} (msaa_samples={}) "
+            "RB_COLOR_INFO color_format={} (dxgi={}) "
+            "PA_SC_SCREEN_SCISSOR_BR br_y={}. totals created={} resolves={} "
+            "refusals={}",
+            static_cast<uint32_t>(n), width, height,
+            static_cast<uint32_t>(format),
+            gt.surfacePitch, gt.msaaSamples, gt.colorFormat,
+            static_cast<uint32_t>(format), gt.scissorBrY,
+            m_guestRtCreated,
+            m_guestRtResolves,
+            m_guestRtRefusals);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// F-XXX: THE RESOLVE -- the console's EDRAM -> scan-out copy.
+//
+// The console's copy is a DRAW with RB_MODECONTROL.edram_mode = kCopy
+// (xenos.h:911-915). On the host the equivalent is a CopyTextureRegion from
+// the guest's render target into the scan-out surface (the swap-chain back
+// buffer), and it is recorded on the SAME command list as the draws, so the
+// copy sees the draws' output.
+//
+// THE GUEST'S COPY REGISTERS ARE READ HERE AND NAMED. They are the guest's
+// statement of where the copy is going (RB_COPY_DEST_BASE, in the guest's
+// own address space); this host's scan-out surface is the window's back
+// buffer, so the two are different objects and the row says so rather than
+// pretending they are the same.
+// ---------------------------------------------------------------------------
+bool D3D12Backend::ResolveGuestRenderTarget() {
+    if (!m_guestRtValid || !m_guestRtDrawn || !m_commandList) return false;
+    ID3D12Resource* back = m_renderTargets[m_frameIndex].Get();
+    if (!back) {
+        GuestRenderTargetRefused("no-scanout-surface");
+        return false;
+    }
+    if (m_guestRtW != m_width || m_guestRtH != m_height) {
+        // The resolve is a COPY, so the two surfaces must be the same size.
+        GuestRenderTargetRefused("guest-rt-not-1to1-with-scanout");
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER barriers[2] = {};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = m_guestRt.Get();
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = back;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(2, barriers);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = back;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = m_guestRt.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    m_commandList->ResourceBarrier(2, barriers);
+
+    // The back buffer has now been written -- by the resolve, which is the
+    // only thing that writes it while the draws land in the guest's render
+    // target. The ledger describes the BACK BUFFER, so the write is recorded
+    // HERE and not at the draw.
+    NoteBufferWrite("guest-rt-resolve");
+    m_guestRtDrawn = false;
+
+    const uint64_t n = ++m_guestRtResolves;
+    const mcla::gpu::CpGuestRenderTarget gt = mcla::gpu::CpGuestRenderTargetInfo();
+    if (n <= 8 || (n % 200) == 0) {
+        MCLA_LOG_WARN(
+            "GUEST-RT-RESOLVE #{} src=guest-rt {}x{} dxgiFormat={} -> "
+            "dst=scanout {}x{} changedPx={} -- the guest's render target reached "
+            "the scan-out surface. changedPx is the number of NON-MODAL pixels "
+            "the last post-draw readback measured IN THE GUEST RENDER TARGET "
+            "(the same count the D3D12-DRAW-PIXEL row prints): it is the "
+            "evidence that what was copied was not blank, and it lags the "
+            "resolve by one frame because the readback's buffer can only be "
+            "mapped after the present that executed the copy. The guest's own "
+            "copy registers at this moment: "
+            "RB_COPY_CONTROL={:08X} RB_COPY_DEST_BASE={:08X} "
+            "RB_COPY_DEST_PITCH={:08X} RB_COPY_DEST_INFO={:08X} "
+            "RB_MODECONTROL={:08X} (edramMode={}) RB_SURFACE_INFO pitch={}. "
+            "The guest's copy DESTINATION is an address in the guest's own "
+            "memory; this host's scan-out surface is the window's back buffer, "
+            "so the copy lands in a different object than the guest asked for "
+            "-- that difference is named here rather than hidden.",
+            static_cast<uint32_t>(n), m_guestRtW, m_guestRtH,
+            static_cast<uint32_t>(m_guestRtFormat), m_width, m_height,
+            m_guestRtChangedPx,
+            gt.copyControl, gt.copyDestBase, gt.copyDestPitch, gt.copyDestInfo,
+            gt.edramMode, gt.edramMode, gt.surfacePitch);
+    }
     return true;
 }
 
@@ -3337,17 +3608,114 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         if (!BeginFrame()) return false;
     }
 
-    // Transition the back buffer to render target.
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = m_renderTargets[m_frameIndex].Get();
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    m_commandList->ResourceBarrier(1, &barrier);
-
+    // ---------------------------------------------------------------------
+    // F-XXX: THE GUEST'S RENDER TARGET ("EDRAM") -- WHERE THE DRAWS GO.
+    //
+    // THE CONSOLE'S SHAPE (citations in src/gpu_cp.h): the guest renders into
+    // EDRAM, whose geometry and format it states in RB_SURFACE_INFO and
+    // RB_COLOR_INFO, and the display reads a SEPARATE scan-out surface that
+    // the guest fills with the RB copy unit. This host used to render
+    // straight into the scan-out surface, so the two were the same object and
+    // the console's copy step did not exist at all.
+    //
+    // NOW: the draws go into the guest's render target, and
+    // ResolveGuestRenderTarget copies it into the scan-out surface before the
+    // present. That copy is the console's EDRAM -> scanout resolve.
+    //
+    // THE GEOMETRY IS THE GUEST'S, NOT THE WINDOW'S. The width is
+    // RB_SURFACE_INFO's surface_pitch -- the guest's own render-target pitch
+    // in pixels (the guest's PE template at 0x827ED1CC says 640, the running
+    // value measured in build/w842.log (CP-REG-HI #14) says 1280). The height
+    // is PA_SC_SCREEN_SCISSOR_BR's br_y, with the guest's own 0x2000 = 8192
+    // "unbounded" sentinel treated as "the guest did not state one".
+    //
+    // THE REFUSAL IS THE SAFE PATH, NOT A SECOND PATH. The resolve is a COPY,
+    // so the guest's render target and the scan-out surface must agree 1:1.
+    // When they do not, the guest's draws go into the back buffer exactly as
+    // they did before this existed (m_drawsIntoGuestRt stays false) and the
+    // refusal is counted and named by GuestRenderTargetRefused.
+    // ---------------------------------------------------------------------
+    m_drawsIntoGuestRt = false;
+    ID3D12Resource* drawTarget = m_renderTargets[m_frameIndex].Get();
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_rtvHeap->GetCPUDescriptorHandleForHeapStart());
     rtvHandle.ptr += static_cast<size_t>(m_frameIndex) * m_rtvDescriptorSize;
+    {
+        const mcla::gpu::CpGuestRenderTarget gt = mcla::gpu::CpGuestRenderTargetInfo();
+        const uint32_t guestW = gt.surfacePitch;
+        uint32_t guestH = 0;
+        if (gt.scissorBrY > 0 && gt.scissorBrY <= 4096u) guestH = gt.scissorBrY;
+        if (guestH == 0) guestH = m_height;
+        const DXGI_FORMAT scanoutFormat =
+            drawTarget ? drawTarget->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+
+        // F-XXX: THE FORMAT OF THE GUEST'S RENDER TARGET IS THE GUEST'S OWN
+        // STATEMENT, NOT THE WINDOW'S. RB_COLOR_INFO (Xenos register 0x2001)
+        // carries color_format in 4 bits at +16 (Xenia registers.h:745) and
+        // the EDRAM tile base at +0 (registers.h:742). The value is read HERE
+        // -- with its PRESENCE flag, because a register the guest never wrote
+        // reads back as zero and zero is also a legal colour format
+        // (k_8_8_8_8), so the value alone cannot say whether the guest said
+        // anything. The render thread refuses a draw whose RB_COLOR_INFO is
+        // absent (src/render_thread.cpp:3577-3590, "Naming a format here would
+        // be inventing one"), and this path refuses it the same way.
+        uint32_t colorVal = 0;
+        uint32_t colorPresent = 0;
+        const uint32_t colorIdx = mcla::gpu::kCpRegRbColorInfo;
+        (void)mcla::gpu::CpReadGuestRegisters(&colorIdx, 1u, &colorVal,
+                                              &colorPresent);
+        const bool colorStated = colorPresent != 0u;
+        const uint32_t guestColorFormat = (colorVal >> 16) & 0xFu;
+        // The console's own Xenos->D3D12 map -- the SAME function the render
+        // thread uses to build the PSO's RTVFormats[0]
+        // (src/render_thread.cpp:463, which cites Xenia's
+        // d3d12_render_target_cache.cc:1685-1686 for code 0 -> R8G8B8A8_UNORM).
+        // Using the one function means the guest render target's format and
+        // the PSO's RTV format are the same number BY CONSTRUCTION: a
+        // disagreement between the bound RTV and the PSO rasterises nothing
+        // and reports no error, which is what the D3D12-RTV-FORMAT row says.
+        const uint32_t guestDxgiRaw = MapXenosColorFormatToDxgi(guestColorFormat);
+        const DXGI_FORMAT guestDxgi = static_cast<DXGI_FORMAT>(guestDxgiRaw);
+
+        if (guestW == 0) {
+            GuestRenderTargetRefused("guest-stated-no-pitch");
+        } else if (guestW != m_width || guestH != m_height) {
+            GuestRenderTargetRefused("guest-rt-not-1to1-with-scanout");
+        } else if (!colorStated) {
+            GuestRenderTargetRefused("guest-stated-no-color-info");
+        } else if (guestDxgi == DXGI_FORMAT_UNKNOWN) {
+            // Codes 8/9/11/13 are unassigned in xenos::ColorRenderTargetFormat
+            // (xenos.h:299-319). NOT defaulted to some other format.
+            GuestRenderTargetRefused("guest-color-format-unmapped");
+        } else if (guestDxgi != scanoutFormat) {
+            // The resolve is a COPY, so the two surfaces must agree in FORMAT
+            // as well as in size. A copy between different formats is not a
+            // 1:1 copy, and the row below would be a lie.
+            GuestRenderTargetRefused("guest-rt-format-differs-from-scanout");
+        } else if (!EnsureGuestRenderTarget(guestW, guestH, guestDxgi)) {
+            // EnsureGuestRenderTarget already named the refusal.
+        } else {
+            drawTarget = m_guestRt.Get();
+            rtvHandle = m_guestRtv;
+            m_drawsIntoGuestRt = true;
+        }
+    }
+
+    // Transition the RENDER TARGET to render target. The back buffer is
+    // PRESENT (the draw path no longer leaves it in RENDER_TARGET); the guest
+    // render target is COMMON until its first use and RENDER_TARGET after
+    // (its state is TRACKED, because asserting a state the resource is not in
+    // is the F-725 mismatch this file already documents at :4130-4142).
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = drawTarget;
+    barrier.Transition.StateBefore =
+        m_drawsIntoGuestRt ? m_guestRtState : D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (!m_drawsIntoGuestRt || m_guestRtState != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+        m_commandList->ResourceBarrier(1, &barrier);
+        if (m_drawsIntoGuestRt) m_guestRtState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
 
     // F-650: the draw path OWNS the back buffer -- it is the writer whose pixels
     // the console's scanout is supposed to be showing. It therefore never asks
@@ -3359,10 +3727,19 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // in the guest or any reference establishes this colour; see
     // kPlaceholderBackBufferClear for what would replace it.
     m_commandList->ClearRenderTargetView(rtvHandle, kPlaceholderBackBufferClear, 0, nullptr);
+    // F-XXX: the clear DEFINES the guest render target's contents, so the
+    // resolve must copy it even when nothing was drawn into it.
+    if (m_drawsIntoGuestRt) m_guestRtDrawn = true;
     // F-761: this clear IS a write to the buffer, so it is counted as one. The
     // ledger counts writes, not owners: the question it exists to answer is
     // whether the resource has defined contents, and a clear defines them.
-    NoteBufferWrite("draw-path-clear");
+    // F-XXX: when the draws land in the GUEST'S RENDER TARGET, this clear
+    // defines the GUEST'S render target and not the back buffer, so it is NOT
+    // a write to the back buffer and must not be counted as one. The resolve
+    // is what writes the back buffer, and it counts itself.
+    if (!m_drawsIntoGuestRt) {
+        NoteBufferWrite("draw-path-clear");
+    }
     m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     // 2026-10-02: the format of the render target that was JUST bound, read
@@ -3379,8 +3756,13 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // format is logged by render_thread.cpp as `CP-COLORFMT-BOUND`; the two
     // rows are the two halves and are meant to be read together.
     {
+        // F-XXX: the row now names the resource that was ACTUALLY BOUND, which
+        // is the guest's render target when the guest's render target is in
+        // use and the swap-chain back buffer otherwise. The row's own words
+        // ("from the swapchain back buffer") would have been false in the
+        // first case, so they are corrected rather than left to mislead.
         const D3D12_RESOURCE_DESC backDesc =
-            m_renderTargets[m_frameIndex]->GetDesc();
+            drawTarget ? drawTarget->GetDesc() : D3D12_RESOURCE_DESC();
         const bool first = (m_boundRtvFormat == 0);
         m_boundRtvFormat = static_cast<uint32_t>(backDesc.Format);
         // 2026-10-02: THIS ROW USED TO BE LATCHED TO `first` -- it printed at
@@ -3398,13 +3780,15 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         // The FORMAT LITERAL is untouched.
         const uint32_t rf = ++m_rtvFormatRows;
         if (first || ShouldLogRefusal(rf)) {
-            MCLA_LOG_INFO("D3D12-RTV-FORMAT bound={} (0x{:08X}) from the swapchain "
-                          "back buffer; the PSO's RTVFormats[0] is set by the "
-                          "GUEST's RB_COLOR_INFO, NOT by this value -- pair with "
+            MCLA_LOG_INFO("D3D12-RTV-FORMAT bound={} (0x{:08X}) from the {}; the "
+                          "PSO's RTVFormats[0] is set by the GUEST's "
+                          "RB_COLOR_INFO, NOT by this value -- pair with "
                           "CP-COLORFMT-BOUND. A disagreement rasterizes nothing "
                           "without an error.",
                           static_cast<uint32_t>(backDesc.Format),
-                          static_cast<uint32_t>(backDesc.Format));
+                          static_cast<uint32_t>(backDesc.Format),
+                          m_drawsIntoGuestRt ? "GUEST'S RENDER TARGET"
+                                             : "swapchain back buffer");
         }
     }
 
@@ -3626,7 +4010,15 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // rasterises anything is a separate question with its own markers, and
     // conflating the two would let a draw that wrote nothing count as proof
     // that the buffer was written.
-    NoteBufferWrite("draw");
+    // F-XXX: when the draws land in the GUEST'S RENDER TARGET, this draw is
+    // NOT a write to the back buffer -- it is a write to the guest's render
+    // target, and the resolve is what writes the back buffer. Counting it here
+    // would make the ledger claim a back-buffer write that did not happen.
+    if (m_drawsIntoGuestRt) {
+        m_guestRtDrawn = true;
+    } else {
+        NoteBufferWrite("draw");
+    }
 
     m_stats.drawsIssued++;
 
@@ -3870,11 +4262,17 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // specified in preceding ResourceBarrier or as InitialState", and the list
     // then failed to Close. So the fix is to skip the transition when the
     // readback already performed it, not to weaken the readback.
-    if (!rbRecorded) {
+    if (!rbRecorded && !m_drawsIntoGuestRt) {
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         m_commandList->ResourceBarrier(1, &barrier);
     }
+    // F-XXX: WHEN THE DRAWS LANDED IN THE GUEST'S RENDER TARGET, the back
+    // buffer was never transitioned to RENDER_TARGET, so the RENDER_TARGET ->
+    // PRESENT transition above must NOT be issued: it would assert a state the
+    // resource does not have (the F-725 mismatch, id 0x20F, that this file
+    // already documents). The back buffer is still PRESENT and the resolve
+    // (inside PresentOwnedFrame) takes it PRESENT -> COPY_DEST -> PRESENT.
 
     // F-650: the draw path's own present, through the one sanctioned entry point.
     // This is the frame the console's scanout is meant to show, and the FRAME-OWNER
@@ -3962,13 +4360,29 @@ bool D3D12Backend::EnsureDrawReadback() {
     m_readbackW = m_width;
     m_readbackH = m_height;
 
-    // The footprint must be taken from the BACK BUFFER'S OWN descriptor, not from
-    // the readback buffer's. MEASURED (F-725 harness, D3D12 debug id 0x356): a
-    // footprint computed from the buffer descriptor carries Format=UNKNOWN and
-    // CopyTextureRegion rejects it with "D3D12_SUBRESOURCE_FOOTPRINT::Format is
-    // not supported at the current feature level". The existing blit path gets
-    // this right by passing the texture descriptor (:1544 above).
-    D3D12_RESOURCE_DESC backDesc = m_renderTargets[m_frameIndex]->GetDesc();
+    // The footprint must be taken from the SAMPLED SURFACE'S OWN descriptor,
+    // not from the readback buffer's. MEASURED (F-725 harness, D3D12 debug id
+    // 0x356): a footprint computed from the buffer descriptor carries
+    // Format=UNKNOWN and CopyTextureRegion rejects it with "D3D12_SUBRESOURCE_
+    // FOOTPRINT::Format is not supported at the current feature level". The
+    // existing blit path gets this right by passing the texture descriptor
+    // (:1544 above).
+    //
+    // F-XXX: THE SAMPLED SURFACE IS NOT ALWAYS THE BACK BUFFER. When the
+    // guest's draws land in the guest's render target, that is the surface
+    // the readback copies out of (.cpp :4454), so its descriptor is the one
+    // the footprint must come from, and the row must NAME it. (In the
+    // measured run both are 1280x720 R8G8B8A8_UNORM, so the footprint is the
+    // same number either way -- the row is what would have been false.)
+    ID3D12Resource* sampleDescSource =
+        (m_drawsIntoGuestRt && m_guestRt)
+            ? m_guestRt.Get()
+            : m_renderTargets[m_frameIndex].Get();
+    D3D12_RESOURCE_DESC backDesc = sampleDescSource
+                                        ? sampleDescSource->GetDesc()
+                                        : D3D12_RESOURCE_DESC();
+    const char* sampleSourceName =
+        (m_drawsIntoGuestRt && m_guestRt) ? "guest-rt" : "swapchain-back-buffer";
     UINT numRows = 0;
     UINT64 rowSize = 0, totalBytes = 0;
     m_device->GetCopyableFootprints(&backDesc, 0, 1, 0, &m_readbackFootprint, &numRows,
@@ -3981,11 +4395,16 @@ bool D3D12Backend::EnsureDrawReadback() {
     // Cast at every use rather than adding a formatter for one enum.
     const uint32_t backFlags = static_cast<uint32_t>(backDesc.Flags);
     MCLA_LOG_INFO("D3D12-DRAW-PIXEL #{} create hr=0x{:08X} heap=READBACK bytes={} "
-                  "rowPitch={} rows={} backBuffer={}x{} flags=0x{:X} -- a "
+                  "rowPitch={} rows={} surface={}x{} flags=0x{:X} -- a "
                   "D3D12_HEAP_TYPE_READBACK buffer IS mappable, which is the one "
-                  "thing the DEFAULT, UPLOAD and CUSTOM heaps all refuse",
+                  "thing the DEFAULT, UPLOAD and CUSTOM heaps all refuse. "
+                  "F-XXX APPENDED FIELDS: sampleSource={} -- the surface the "
+                  "footprint above was taken from, which is the surface this "
+                  "readback copies OUT of: the guest's render target when the "
+                  "guest's draws land in it, the swap-chain back buffer "
+                  "otherwise",
                   n, static_cast<uint32_t>(hr), totalBytes, m_readbackRowPitch,
-                  numRows, m_width, m_height, backFlags);
+                  numRows, m_width, m_height, backFlags, sampleSourceName);
     return true;
 }
 
@@ -4048,6 +4467,16 @@ bool D3D12Backend::RecordDrawReadback() {
     if (m_frameIndex >= kBufferCount || !m_renderTargets[m_frameIndex]) return false;
     if (!EnsureDrawReadback()) return false;
 
+    // F-XXX: THE SAMPLE MUST DESCRIBE THE SURFACE THIS DRAW WROTE. When the
+    // draws land in the guest's render target, that surface is the GUEST
+    // RENDER TARGET; sampling the back buffer would measure the PREVIOUS
+    // frame's content and the row would be a lie about the draw (the row's
+    // whole purpose: "a sample of the surface THIS draw wrote").
+    ID3D12Resource* sampleSource =
+        (m_drawsIntoGuestRt && m_guestRt) ? m_guestRt.Get()
+                                          : m_renderTargets[m_frameIndex].Get();
+    if (!sampleSource) return false;
+
     ++m_drawReadbackAttempts;
 
     // F-727: sample the ordering evidence BEFORE recording anything, so the row
@@ -4059,7 +4488,7 @@ bool D3D12Backend::RecordDrawReadback() {
 
     D3D12_RESOURCE_BARRIER b = {};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = m_renderTargets[m_frameIndex].Get();
+    b.Transition.pResource = sampleSource;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -4070,16 +4499,22 @@ bool D3D12Backend::RecordDrawReadback() {
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint = m_readbackFootprint;
     D3D12_TEXTURE_COPY_LOCATION src = {};
-    src.pResource = m_renderTargets[m_frameIndex].Get();
+    src.pResource = sampleSource;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
     m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
     // Straight back to PRESENT, because the caller transitions to PRESENT next
     // and D3D12 requires the tracked state to match what the caller asserts.
+    // F-XXX: for the GUEST RENDER TARGET the caller does NOT transition to
+    // PRESENT (it is not a scan-out surface and the draw path keeps drawing
+    // into it), so it goes back to RENDER_TARGET.
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = m_drawsIntoGuestRt
+                                  ? D3D12_RESOURCE_STATE_RENDER_TARGET
+                                  : D3D12_RESOURCE_STATE_PRESENT;
     m_commandList->ResourceBarrier(1, &b);
+    if (m_drawsIntoGuestRt) m_guestRtState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     return true;
 }
 
@@ -4569,8 +5004,8 @@ void D3D12Backend::ReportDrawReadback() {
         "D3D12-DRAW-PIXEL #{} rgba=({},{},{},{}) at ({},{}) of {}x{} rowPitch={} | "
         "nonBlack={}/{} ({:.4f}%) maxChannel={} meanChannel={:.4f} -- READ THESE "
         "VALUES, they are the first pixel values this backend has ever reported. "
-        "Path: the draw targeted the swap-chain back buffer, CopyTextureRegion "
-        "copied that back buffer into a D3D12_HEAP_TYPE_READBACK heap buffer "
+        "Path: the draw targeted {}, CopyTextureRegion "
+        "copied that surface into a D3D12_HEAP_TYPE_READBACK heap buffer "
         "inside the same command list, PresentOwnedFrame executed and signalled "
         "the fence, and Map on that heap -- which is mappable by definition -- "
         "returned these bytes. rgba is one probe at the viewport centre, not a "
@@ -4659,7 +5094,13 @@ void D3D12Backend::ReportDrawReadback() {
         "and censusRows bound all of them the same way",
         n, r, g, b, a, px, py, m_width, m_height, pitch, nonBlack, total,
         total ? (100.0 * static_cast<double>(nonBlack) / static_cast<double>(total)) : 0.0,
-        maxChannel, m_lastPixelMeanChannel, sum, channelSamples, censusRows,
+        maxChannel, m_lastPixelMeanChannel,
+        // F-XXX: the surface the draw targeted, named because the prose above
+        // now says "the draw targeted {}" and that word has to be the TRUTH:
+        // it is the guest's render target when the guest's draws land in it.
+        (m_drawsIntoGuestRt && m_guestRt) ? "the guest's render target (EDRAM)"
+                                          : "the swap-chain back buffer",
+        sum, channelSamples, censusRows,
         static_cast<uint64_t>(censusStride),
         s_readbackCopyAfterDraw ? 1 : 0, s_readbackDrawSeq,
         probeTaps, probeFromCensus, preR, preG, preB, preA, probeOffset,
@@ -4672,6 +5113,16 @@ void D3D12Backend::ReportDrawReadback() {
         chgLastRow, chgLastRowCount, chgFirstCol, chgFirstColCount,
         chgLastCol, chgLastColCount, coverageRefused ? 1 : 0,
         exactBlack, blackImplied);
+
+    // F-XXX: KEEP THE GUEST RENDER TARGET'S OWN PIXEL COUNT. This census ran
+    // over the surface THIS draw wrote, and when the draws land in the guest
+    // render target that surface IS the guest's render target (the sample
+    // source is chosen at .cpp :4454). The resolve's row prints this number,
+    // because "the copy ran" and "what was copied was not blank" are two
+    // different facts and only this one is the second.
+    if (m_drawsIntoGuestRt) {
+        m_guestRtChangedPx = changedPx;
+    }
 
     m_readbackBuffer->Unmap(0, nullptr);
 }
@@ -5699,6 +6150,19 @@ bool D3D12Backend::MayWriteBackBuffer(FrameOwner owner) {
 // recorded anywhere and could only be inferred from PRESENT-BLIT vs DRAW-CP
 // counts. The FRAME-OWNER row below is that fact, once per presented frame.
 bool D3D12Backend::PresentOwnedFrame(FrameOwner owner) {
+    // F-XXX: THE RESOLVE, BEFORE THE LIST IS CLOSED. The guest's render
+    // target is copied into the scan-out surface HERE, on the same command
+    // list as the draws, so the copy sees the draws' output and the window
+    // shows the guest's render target rather than whatever the back buffer
+    // happened to hold. This is the console's EDRAM -> scanout copy (the
+    // guest's own copy registers are read and named by the resolve's row).
+    //
+    // IT RUNS ONLY FOR THE DRAW PATH. The clear path owns the back buffer
+    // itself (it clears it), and the blit path overwrites it wholesale, so
+    // neither may have the guest's render target copied over it.
+    if (owner == FrameOwner::Draw && m_drawsIntoGuestRt) {
+        (void)ResolveGuestRenderTarget();
+    }
     HRESULT hr = m_commandList->Close();
     if (FAILED(hr)) {
         m_inFrame = false;
