@@ -7927,12 +7927,431 @@ static void MclaCaptureGuestRebaseTable(uint32_t tbl)
                 g_mclaRebaseCount);
 }
 
+// ---------------------------------------------------------------------------
+// F-8xx/place2 (2026-10-21): THE CONTAINER IS PLACED AT THE ADDRESSES THE
+// GUEST'S OWN TABLE NAMES.
+//
+// MEASURED (build/w847.log -- the latest soak, 0 fatals):
+//   :7951  [14:19:41.989] GUEST-REBASE-TBL tbl=8EFFF340 countA=6 countB=11
+//                             n=17 e0=[50000000 B5FAC000 00020000]
+//                             e1=[50020000 B3A8C000 00020000]
+//   :7953  [14:19:41.989] PLACE-ENTRY #1 grp=8EFFF110 lr=82720638
+//   :7955  [14:19:41.989] EF100-REBASE-TBL #001 grp=8EFFF110 tbl=8EFFF340
+//   :7957  [14:19:41.989] RSC-CENSUS-44495500 obj=B5FAC000 vt=CDCDCDCD
+//                             [CDCDCDCD x16] nmap=17
+//   :8104  [14:19:41.992] RSC-ARR-CENSUS obj=B5FAC000 arr=CDCDCDCD
+//                             [arr]=00000000 cls=zero rscHead=0
+//   :8109  [14:19:41.995] RSC-NEST-PREPLACE #1 obj=B5FAC000 scanned=468992 nested=0
+//   :8110  [14:19:41.995] RSC-REBASE-PREPLACE-DONE obj=B5FAC000 nmap=17
+//                             headRewritten=0 childRebased=0 childGate=0 nestPass=1
+//   :8111  [14:19:41.995] EF100 #001 obj=B5FAC000 r4=8EFFF110 vt=CDCDCDCD
+//                             arr=CDCDCDCD [arr]=00000000 cnt=52685 lr=82720638
+//   :18290 [14:19:42.646] PLACE-DISPATCH #1 obj=B5FAC000 nmap=20 pkg=000A0000
+//                             diuMagic=44495500 diuP4=50023DE0 diuP12=5006C9B4
+//                             diuP24=5004FC20 diuP50=164 diuP56=5002DB70 diuP60=59
+//                             band=[50000000 B5FAC000 00020000] childArr=5006C9B4
+//                             childCnt=1 entryArr=5004FC20 entryPhys=B3ABBC20
+//                             entryReadable=1 bound50=164 refused=''
+//   :19102 [14:19:42.656] PLACE-DISPATCH-DONE #1 obj=B5FAC000 vt=82085364
+//                             arr=B5F689B4 cnt=1 bound50=164 entry24=B3ABBC20
+//
+// WHAT THE ROWS SAY (measured, not inferred):
+//  (1) THE PLACE OBJECT IS THE GUEST'S OWN TABLE entry0.pbase. The guest's OWN
+//      call (EF100 #001, lr=82720638 -- the return address inside the guest's
+//      own dispatcher 82720638) used obj=B5FAC000, and the guest's table row 0
+//      is {50000000 B5FAC000 00020000}. The host's job-stream map names
+//      A3A6A000 for the SAME vbase (PSTREAM #5 s[0], w847.log:19108) -- a
+//      DIFFERENT physical home. That is why the object the host used to
+//      re-dispatch on (0xB7B41000) was an all-zero buffer
+//      (J2-DIST-DESTHEAD @B7B41000 [00000000 00000000 00000000 00000000],
+//      w847.log:18222) and why the job2 distribution wrote 0 bytes
+//      (W27-PLACE-AFTER-XC wrote=0, w847.log:18240).
+//  (2) THE GUEST'S PAGES ARE EMPTY. RSC-NEST-PREPLACE #1 scanned 468992
+//      dwords over the guest's rows and found ZERO 0x50/0x60 virtuals
+//      (nested=0); the object's head was all 0xCDCDCDCD. THAT is why
+//      headRewritten=0 and childRebased=0 in RSC-REBASE-PREPLACE-DONE: a
+//      poison word is not a virtual, so there was nothing to rewrite, and
+//      arr=CDCDCDCD is neither a known physical nor in the map, so the child
+//      loop skipped it.
+//  (3) 468992 dwords == 1875968 B == 0x1CA000 == the UNCOMPRESSED SIZE OF
+//      THE FULL FRAME CHAIN of the UI package at archive 0x000A0000 (58
+//      frames x 32768; MEASURED offline with the .research/360tools LZX
+//      decoder -- build/agents/_place2_full.py). The RSC5 header's DECLARED
+//      length (+0x10) is 196553 -- the FIRST chunk only. The guest's 17 rows
+//      tile EXACTLY the container.
+//  (4) THE CONTAINER'S VIRTUAL MAPPING IS LINEAR: virtual = 0x50000000 +
+//      blob offset. PROOF: the DIU root's +24 (the entry array, 164 entries,
+//      4-byte stride -- the guest walks it at 825EF178-825EF1F8) is
+//      0x5004FC20, and at blob offset 0x4FC20 of the full payload 163 of
+//      those 164 words are 0x5000xxxx virtuals (build/agents/_place2_full.py).
+//      The DIU root's +12 (the child array, 8-byte stride -- the build pass
+//      825FDBF8/8260A848 reads entry+4) is 0x5006C9B4, and at blob offset
+//      0x6C9B4 that entry's +4 word is 0x50035E50 -- a virtual.
+//
+// SO: the container is 1875968 B at virtual 0x50000000, and the guest's
+// table says where each page of it lives. This function writes it there.
+//
+// FALSIFIER (the next soak): PLACE-CONTAINER must print placed == the
+// container's byte count with gap=0; EF100 #001 must then show a NON-ZERO
+// arr/cnt and a NON-POISON vt; RSC-REBASE-PREPLACE-DONE must show
+// headRewritten>0 AND childRebased>0; and W33-PARSE-MISSING must STOP
+// firing. If PLACE-CONTAINER prints gap=1 with a named gapAt, the guest's
+// table does NOT tile the container and the placement is refused (not
+// forced).
+// ---------------------------------------------------------------------------
+
+// F-8xx/place2: the uncompressed extent of a UI .xsf container's FULL frame
+// chain, walked with the SAME rules the console's reader uses
+// (src/xmem_lzx.h:622-645: src = container+0x14; byte0 == 0xFF -> 5-byte
+// header {unc = u16BE(+1), pay = u16BE(+3)}; else -> 2-byte header
+// {pay = u16BE(+0), unc = 0x8000}). MEASURED offline: the package at archive
+// 0x000A0000 has 58 frames whose uncompressed sizes sum to 1875968
+// (build/agents/_place2_full.py) -- the guest table's coverage exactly
+// (w847.log RSC-NEST-PREPLACE #1 scanned=468992 dwords).
+static uint32_t MclaXsfChainTotalUnc(const uint8_t *pkg, size_t len,
+                                      int *framesOut)
+{
+  size_t src = 20;              // container+0x14: the first frame header
+  uint64_t total = 0;
+  int nf = 0;
+  while (src + 2 <= len)
+  {
+    const uint8_t b0 = pkg[src];
+    int hdr = 2;
+    uint32_t frameUnc = 0x8000u;
+    uint32_t pay = 0;
+    if (b0 == 0xFFu)
+    {
+      if (src + 5 > len)
+        break;
+      hdr = 5;
+      frameUnc = (static_cast<uint32_t>(pkg[src + 1]) << 8) |
+                 static_cast<uint32_t>(pkg[src + 2]);
+      pay = (static_cast<uint32_t>(pkg[src + 3]) << 8) |
+            static_cast<uint32_t>(pkg[src + 4]);
+    }
+    else
+    {
+      pay = (static_cast<uint32_t>(b0) << 8) | static_cast<uint32_t>(pkg[src + 1]);
+    }
+    if (pay == 0u || src + static_cast<size_t>(hdr) + pay > len)
+      break;
+    total += frameUnc;
+    ++nf;
+    src += static_cast<size_t>(hdr) + pay;
+  }
+  if (framesOut)
+    *framesOut = nf;
+  return static_cast<uint32_t>(total);
+}
+
+// F-8xx/place2: read a UI .xsf package and report its frame-chain extent.
+// `decoded` is filled ONLY when the caller asks for the bytes.
+//
+// The host's decoder (mcla_lzx::host_decode_ui_xsf, src/xmem_lzx.h:547)
+// clamps its output to the RSC5 header's DECLARED length (+0x10). For the UI
+// package at archive 0x000A0000 that declared length is 196553 while the
+// chain's own extent is 1875968 -- and the guest's table covers 1875968
+// (measured, (3) above). The DECLARED LENGTH is therefore patched, in the
+// in-memory copy only, to the chain's own total: the chain walk itself is
+// untouched (xmem_lzx.h:606-607 uses the declared length only as the output
+// clamp). The decoder, the window size and the frame rules are unchanged.
+static bool MclaXsfChainProbe(uint32_t pkg, uint32_t *totalUnc, int *frames,
+                              std::vector<uint8_t> *decoded)
+{
+  auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+  mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+  std::vector<uint8_t> raw(0x400000);
+  uint64_t got = 0;
+  if (!vfs.OpenFile("xarchive_cache.rpf", fh))
+    return false;
+  const bool rd = vfs.ReadFileAt(fh, pkg, raw.data(), 0x400000, got) && got >= 24;
+  vfs.CloseFile(fh);
+  if (!rd)
+    return false;
+  if (MclaBE(raw.data()) != 0x05435352u)
+    return false;
+  const uint32_t declared = MclaBE(raw.data() + 16u);
+  int nf = 0;
+  const uint32_t total = MclaXsfChainTotalUnc(raw.data(),
+                                               static_cast<size_t>(got), &nf);
+  if (total == 0u)
+    return false;
+  if (totalUnc)
+    *totalUnc = total;
+  if (frames)
+    *frames = nf;
+  if (!decoded)
+    return true;
+  if (total > declared)
+  {
+    raw[16] = static_cast<uint8_t>(total >> 24);
+    raw[17] = static_cast<uint8_t>(total >> 16);
+    raw[18] = static_cast<uint8_t>(total >> 8);
+    raw[19] = static_cast<uint8_t>(total);
+  }
+  decoded->clear();
+  return mcla_lzx::host_decode_ui_xsf(raw.data(), static_cast<size_t>(got),
+                                       *decoded, kXcWindowBits) == 2;
+}
+
+// F-8xx/place2: THE PLACEMENT. Writes the container's bytes into the
+// physical pages THE GUEST'S OWN TABLE NAMES, and nothing else.
+//
+// The container's VIRTUAL BASE is the vbase of the guest's row that owns the
+// place object (the place object IS the container's first page -- the DIU
+// root). The container's bytes are tiled over the guest's rows in vbase
+// order; a virtual range that no row covers is a NAMED GAP and the
+// placement stops there (it never writes outside the guest's own extents).
+//
+// The place object's FIELDS ARE NOT INVENTED: the DIU root is written
+// verbatim, so [obj+12]/[obj+16]/[obj+24]/[obj+50]/[obj+56]/[obj+60] are the
+// container's own words -- exactly what the guest's place pass reads
+// (825EF13C [obj+24], 825EF15C u16 [obj+50], 825EE7B4 [obj+56],
+// 825EE7D4 u16 [obj+60], 825FDC1C [obj+12], 825FDC3C u16 [obj+16]).
+static bool MclaPlaceContainerAtGuestAddr(uint32_t obj)
+{
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  if (obj == 0u || obj == 0xCDCDCDCDu)
+    return false;
+  // Already placed for THIS object? The guest's own place pass overwrites
+  // [obj+0] with its vtable (0x82085364, 825EF128), so the DIU magic is not
+  // a usable "already done" marker. Key on the object instead: re-placing
+  // would reset the guest's constructed state.
+  static std::atomic<uint32_t> s_placeDoneObj{0};
+  if (s_placeDoneObj.load() == obj)
+    return true;
+  if (s_gGuestRebaseCount <= 0)
+  {
+    MCLA_LOG_WARN("PLACE-CONTAINER SKIPPED reason=NO-GUEST-TABLE obj={:08X}",
+                  obj);
+    return false;
+  }
+  // The guest's row that owns the place object.
+  int owner = -1;
+  for (int i = 0; i < s_gGuestRebaseCount; ++i)
+  {
+    const auto &r = s_gGuestRebase[i];
+    if (r.size == 0u || r.pbase == 0u)
+      continue;
+    if (obj >= r.pbase && obj < r.pbase + r.size)
+    {
+      owner = i;
+      break;
+    }
+  }
+  if (owner < 0)
+  {
+    MCLA_LOG_WARN("PLACE-CONTAINER SKIPPED reason=OBJ-NOT-IN-GUEST-TABLE "
+                  "obj={:08X} rows={}",
+                  obj, s_gGuestRebaseCount);
+    return false;
+  }
+  const uint32_t vbase = s_gGuestRebase[owner].vbase +
+                         (obj - s_gGuestRebase[owner].pbase);
+  // The guest's own coverage: the sum of ITS rows' sizes.
+  uint64_t cover = 0;
+  for (int i = 0; i < s_gGuestRebaseCount; ++i)
+    cover += s_gGuestRebase[i].size;
+  // The candidate UI packages (tools/xmem_decode.py:57-67 CONTAINERS; the
+  // same five are the external goldens at src/gpu_device.cpp:12864-12868).
+  static constexpr uint32_t kUiPkgs[] = {0x000A0000u, 0x64CB0000u,
+                                         0x64980000u, 0x64CA3000u,
+                                         0x6496F000u};
+  // Pick the package whose FULL frame chain covers the guest's extent. The
+  // chain extent is a pure header walk (no LZX); only the winner is decoded.
+  uint32_t chosen = 0u;
+  uint32_t chainTotal = 0u;
+  int chosenFrames = 0;
+  for (uint32_t p : kUiPkgs)
+  {
+    uint32_t tot = 0u;
+    int fr = 0;
+    if (!MclaXsfChainProbe(p, &tot, &fr, nullptr))
+      continue;
+    MCLA_LOG_WARN("PLACE-CONTAINER-CAND pkg={:08X} chainUnc={} frames={} "
+                  "cover={} exact={}",
+                  p, tot, fr, static_cast<uint32_t>(cover),
+                  (tot == cover) ? 1 : 0);
+    if (tot == cover)
+    {
+      chosen = p;
+      chainTotal = tot;
+      chosenFrames = fr;
+      break;
+    }
+    if (chosen == 0u && tot <= cover && tot > chainTotal)
+    {
+      chosen = p;         // fallback: the largest chain that fits
+      chainTotal = tot;
+      chosenFrames = fr;
+    }
+  }
+  if (chosen == 0u)
+  {
+    MCLA_LOG_WARN("PLACE-CONTAINER SKIPPED reason=NO-USABLE-PACKAGE obj={:08X} "
+                  "cover={}",
+                  obj, static_cast<uint32_t>(cover));
+    return false;
+  }
+  std::vector<uint8_t> blob;
+  uint32_t tot2 = 0u;
+  int fr2 = 0;
+  if (!MclaXsfChainProbe(chosen, &tot2, &fr2, &blob) || blob.empty())
+  {
+    MCLA_LOG_WARN("PLACE-CONTAINER SKIPPED reason=DECODE-FAILED pkg={:08X}",
+                  chosen);
+    return false;
+  }
+  // Tile the container over the guest's rows, in vbase order.
+  int order[kMclaGuestRebaseMax] = {};
+  int nOrder = 0;
+  for (int i = 0; i < s_gGuestRebaseCount && nOrder < kMclaGuestRebaseMax; ++i)
+    order[nOrder++] = i;
+  for (int i = 1; i < nOrder; ++i)
+  {
+    const int t = order[i];
+    int j = i - 1;
+    while (j >= 0 && s_gGuestRebase[order[j]].vbase > s_gGuestRebase[t].vbase)
+    {
+      order[j + 1] = order[j];
+      --j;
+    }
+    order[j + 1] = t;
+  }
+  uint32_t virt = vbase;
+  uint32_t band = vbase & 0xF0000000u;
+  size_t boff = 0;
+  uint64_t placed = 0;
+  int rowsUsed = 0;
+  uint32_t gapAt = 0u;
+  bool gap = false;
+  while (boff < blob.size())
+  {
+    // The row that covers `virt` inside the CURRENT band.
+    int hit = -1;
+    for (int k = 0; k < nOrder; ++k)
+    {
+      const auto &r = s_gGuestRebase[order[k]];
+      if (r.size == 0u || r.pbase == 0u)
+        continue;
+      if ((r.vbase & 0xF0000000u) != band)
+        continue;
+      if (virt >= r.vbase && virt < r.vbase + r.size)
+      {
+        hit = order[k];
+        break;
+      }
+    }
+    if (hit < 0)
+    {
+      // Is there a HOLE in this band (a row ahead of the cursor), or is the
+      // band simply exhausted? A hole is a real gap; an exhausted band means
+      // the container CONTINUES in the next band.
+      bool hole = false;
+      int next = -1;
+      for (int k = 0; k < nOrder; ++k)
+      {
+        const auto &r = s_gGuestRebase[order[k]];
+        if (r.size == 0u || r.pbase == 0u)
+          continue;
+        const uint32_t rb = r.vbase & 0xF0000000u;
+        if (rb == band)
+        {
+          if (r.vbase > virt)
+            hole = true;
+        }
+        else if (rb > band)
+        {
+          if (next < 0 || r.vbase < s_gGuestRebase[next].vbase)
+            next = order[k];
+        }
+      }
+      if (hole || next < 0)
+      {
+        gap = true;
+        gapAt = virt;
+        break;
+      }
+      // The band is exhausted: the container continues at the NEXT band's
+      // first row, and the blob offset does NOT restart.
+      //
+      // MEASURED (build/w850.log, PLACE-CONTAINER #1 + GUEST-REBASE-ROWS):
+      //   the guest's 17 rows are
+      //     0x50000000..0x5007A000 (6 rows, 0x7A000 B) and
+      //     0x60000000..0x60150000 (11 rows, 0x150000 B)
+      //   and 0x7A000 + 0x150000 == 0x1CA000 == the chain's 1875968 B -- so
+      //   the container is ONE blob laid out band after band, and the band
+      //   boundary is at blob offset 0x7A000.
+      band = s_gGuestRebase[next].vbase & 0xF0000000u;
+      virt = s_gGuestRebase[next].vbase;
+      continue;
+    }
+    const auto &r = s_gGuestRebase[hit];
+    const uint32_t off = virt - r.vbase;
+    uint64_t take = r.size - off;
+    if (take > static_cast<uint64_t>(blob.size() - boff))
+      take = static_cast<uint64_t>(blob.size() - boff);
+    if (!mem.WriteBytes(r.pbase + off, blob.data() + boff,
+                        static_cast<uint32_t>(take)))
+    {
+      MCLA_LOG_WARN("PLACE-CONTAINER WRITE-FAIL phys={:08X} n={}",
+                    r.pbase + off, static_cast<uint32_t>(take));
+      break;
+    }
+    boff += static_cast<size_t>(take);
+    virt += static_cast<uint32_t>(take);
+    placed += take;
+    ++rowsUsed;
+  }
+  // Read the place object's head back: it must now BE the DIU root.
+  uint32_t head = 0, p12 = 0, p24 = 0, p56 = 0;
+  uint16_t p16 = 0, p50 = 0, p60 = 0;
+  (void)mem.ReadU32BE(obj + 0u, &head);
+  (void)mem.ReadU32BE(obj + 12u, &p12);
+  (void)mem.ReadU16BE(obj + 16u, &p16);
+  (void)mem.ReadU32BE(obj + 24u, &p24);
+  (void)mem.ReadU16BE(obj + 50u, &p50);
+  (void)mem.ReadU32BE(obj + 56u, &p56);
+  (void)mem.ReadU16BE(obj + 60u, &p60);
+  MCLA_LOG_WARN("PLACE-CONTAINER #{} obj={:08X} vbase={:08X} pkg={:08X} "
+                "bytes={} cover={} chainUnc={} frames={} rows={} placed={} "
+                "gap={} gapAt={:08X} head={:08X} p12={:08X} p16={} p24={:08X} "
+                "p50={} p56={:08X} p60={}",
+                1, obj, vbase, chosen, static_cast<uint32_t>(blob.size()),
+                static_cast<uint32_t>(cover), tot2, fr2, rowsUsed, placed,
+                gap ? 1 : 0, gapAt, head, p12, static_cast<uint32_t>(p16), p24,
+                static_cast<uint32_t>(p50), p56, static_cast<uint32_t>(p60));
+  if (!gap && placed == blob.size())
+    s_placeDoneObj.store(obj);
+  // The guest's table rows, verbatim: the falsifier needs them.
+  {
+    std::string rows;
+    for (int i = 0; i < s_gGuestRebaseCount && i < 20; ++i)
+    {
+      rows += " r" + std::to_string(i) + "=[";
+      char b[64];
+      (void)snprintf(b, sizeof(b), "%08X:%08X:%08X", s_gGuestRebase[i].vbase,
+                      s_gGuestRebase[i].pbase, s_gGuestRebase[i].size);
+      rows += b;
+      rows += "]";
+    }
+    MCLA_LOG_WARN("GUEST-REBASE-ROWS n={} rows={}", s_gGuestRebaseCount, rows);
+  }
+  // Only a COMPLETE placement is admissible: a gap means the guest's table
+  // does not tile the container, and a partial placement would leave the
+  // guest walking half-empty pages.
+  return !gap && placed == blob.size();
+}
+
 // F-8xx: the guest's place-pass entry (825EF238) is where the guest hands the
-// host its OWN rebase ctx (r4). Capture [ctx+0] = the guest's table, then run
-// the ORIGINAL body (the generated one tails into sub_825EF100, whose strong
-// override lives in src/task_dispatch_trace.cpp:1486).
+// host its OWN rebase ctx (r4). Capture [ctx+0] = the guest's table, place
+// the container at the addresses that table names, then run the ORIGINAL body
+// (the generated one tails into sub_825EF100, whose strong override lives in
+// src/task_dispatch_trace.cpp:1486).
 PPC_FUNC_IMPL(__imp__sub_825EF238);
 static std::atomic<uint32_t> s_hEF238{0};
+static std::atomic<uint32_t> s_hEF238Place{0};
 PPC_FUNC(sub_825EF238)
 {
   const uint32_t n = s_hEF238.fetch_add(1) + 1;
@@ -7943,6 +8362,21 @@ PPC_FUNC(sub_825EF238)
     auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
     if (mem.ReadU32BE(grp + 0u, &tbl))
       MclaCaptureGuestRebaseTable(tbl);
+    // F-8xx/place2: PLACE THE CONTAINER BEFORE the guest's own place pass
+    // runs. The guest's place object is the guest's table entry0.pbase
+    // (w847.log EF100 #001 obj=B5FAC000 vs the table's e0=[50000000
+    // B5FAC000 00020000]), and the container's bytes were never written
+    // there (w847.log RSC-NEST-PREPLACE #1 scanned=468992 nested=0). One
+    // attempt per guest table: the table is the thing that changes.
+    const uint32_t pn = s_hEF238Place.fetch_add(1) + 1;
+    if (pn <= 4 && ctx.r3.u32 != 0u && ctx.r3.u32 != 0xCDCDCDCDu)
+    {
+      uint32_t head = 0;
+      const bool already = mem.ReadU32BE(ctx.r3.u32 + 0u, &head) &&
+                           head == 0x44495500u;
+      if (!already)
+        (void)MclaPlaceContainerAtGuestAddr(ctx.r3.u32);
+    }
   }
   if (n <= 4)
     MCLA_LOG_WARN("PLACE-ENTRY #{} grp={:08X} lr={:08X}", n, grp,
@@ -11291,6 +11725,13 @@ static void MclaPlaceDispatchOnce() {
                   n, g_mclaRebaseCount);
     return;
   }
+  // F-8xx/place2: PLACE THE CONTAINER FIRST, at the addresses the guest's
+  // OWN table names (the place object is the guest's table entry0.pbase --
+  // w847.log EF100 #001 obj=B5FAC000 vs the table's e0=[50000000 B5FAC000
+  // 00020000]). Without the bytes there the guest's place pass reads poison
+  // (w847.log EF100 #001 vt=CDCDCDCD arr=CDCDCDCD) and its entry walk finds
+  // nothing (W33-PARSE-MISSING, w847.log:14728).
+  (void)MclaPlaceContainerAtGuestAddr(obj);
   // The map MUST be populated before the dispatch: the guest resolves the
   // place object's virtuals through the group table (D828/D890), so an empty
   // map turns every virtual into a fatal miss.
@@ -17755,7 +18196,18 @@ PPC_FUNC(sub_821BC140) {
     (void)mem.ReadU16BE(kUiCont + 16, &cnt);
     // w33: after job2 POST-EXEC, census dest tag tables and attempt a
     // faithful guest construct bind (tags already in image) + EF100.
-    (void)MclaW33ScanTagTableAndConstruct(kUiCont, ctx.r1.u32);
+    //
+    // F-8xx/place2: AIM THE CENSUS AT THE GUEST'S OWN PLACE OBJECT. The
+    // hard-coded 0xB7B41000 is NOT a name the guest uses (it is in NO entry
+    // of the guest's table -- w847.log RSC-NEST-PREPLACE #1 scanned the
+    // guest's 17 regions), so the census read an all-zero object and
+    // reported W33-PARSE-MISSING (nPtr=0 nSwfLike=0) about an object the
+    // guest never placed. MclaPlaceObjAddr() is the guest's table entry0
+    // pbase (w847.log EF100 #001 obj=B5FAC000 vs e0=[50000000 B5FAC000
+    // 00020000]).
+    const uint32_t w33Obj = MclaPlaceObjAddr();
+    (void)MclaW33ScanTagTableAndConstruct(w33Obj != 0u ? w33Obj : kUiCont,
+                                           ctx.r1.u32);
     // w34: one host lever â€” GFx parse-path census + parse-flag dispatch
     // when W33-PARSE-MISSING proves factories/EF220 never ran after inflate.
     (void)MclaW34GfxParseLever(kUiCont, slotAddr);
