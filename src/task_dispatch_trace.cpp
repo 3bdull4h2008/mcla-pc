@@ -2223,6 +2223,53 @@ PPC_FUNC(sub_82131508) {
                       GetCurrentThreadId(), ctx.r3.u32);
 }
 
+// F-855 (2026-10-22): THE BOOT-WORKER SPIN LOOP'S TRIP COUNT.
+//
+// MEASURED (raw guest bytes, tools/ppc_disasm.py 0x825F23C0):
+//   sub_825F23C0 is the loop owner.  generated/ppc_xenon/ppc_recomp.121.cpp:1343
+//   defines it; :1587 is the loop head (guest 0x825F254C) and :1639-1640 is
+//   the backward branch (guest 0x825F25AC, `blt cr6,0x825f254c`).
+//   The counter is r29: set to 0 at :1579-1580 (`mr r29,r30`, and r30 is
+//   `li r30,0` at :1392-1393 and is never reassigned) and incremented at
+//   :1625-1626.  The bound is `*(r28+0)` loaded at :1635-1636, where r28 is
+//   r26+8 (:1546-1547) and r26 is the INCOMING r3 (:1378-1379).
+//   => trip count = *(ctx.r3 + 8).
+//   The loop body calls sub_821BE250 (:1620-1622), which is the function
+//   whose bctrl at guest 0x821BE368 is one of the three spin sites.
+//
+// THIS IS A CENSUS, NOT A FIX.  It prints the trip count and the incoming
+// registers and then chains to __imp__ (do-not #1/#9).  It exists because
+// the trip count is a RUNTIME value: the static bytes give the FORM
+// (*(ctx.r3+8)) but not the NUMBER, and the number is the whole question --
+// a sane count means the loop is doing real work and the spin is elsewhere,
+// an absurd count means the bound itself is the defect.
+//
+// OWNERSHIP: tools/addr_owners.py --check 0x825F23C0 reported exactly one
+// site (the generated mapping, ppc_func_mapping.cpp:30998) before this hook,
+// so there is no second owner (rule 4).
+PPC_FUNC_IMPL(__imp__sub_825F23C0);
+static std::atomic<uint32_t> s_hF23C0{0};
+PPC_FUNC(sub_825F23C0) {
+    const uint32_t n = s_hF23C0.fetch_add(1) + 1;
+    if (n <= 8 || (n % 200) == 0) {
+        auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t trip = 0, of0 = 0, of4 = 0, of8 = 0, of12 = 0;
+        (void)mem.ReadU32BE(ctx.r3.u32 + 8, &trip);
+        (void)mem.ReadU32BE(ctx.r3.u32 + 0, &of0);
+        (void)mem.ReadU32BE(ctx.r3.u32 + 4, &of4);
+        (void)mem.ReadU32BE(ctx.r3.u32 + 8, &of8);
+        (void)mem.ReadU32BE(ctx.r3.u32 + 12, &of12);
+        MCLA_LOG_WARN(
+            "F855-LOOPCOUNT #{} tid={:08X} lr={:08X} obj={:08X} "
+            "trip=*(obj+8)={:08X} (signed {}) | obj+0={:08X} obj+4={:08X} "
+            "obj+12={:08X} | r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X}",
+            n, GetCurrentThreadId(), static_cast<uint32_t>(ctx.lr), ctx.r3.u32,
+            trip, static_cast<int32_t>(trip), of0, of4, of12, ctx.r4.u32,
+            ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32);
+    }
+    __imp__sub_825F23C0(ctx, base);
+}
+
 
 
 // F-802 (2026-10-17): the RSC deserialize/import arms selected by the

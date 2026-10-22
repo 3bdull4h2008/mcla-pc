@@ -22203,11 +22203,70 @@ PPC_FUNC(sub_821CC1E0) {
             auto &vfsO = mcla::vfs::RpfVirtualFileSystem::Instance();
             mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fhO;
             if (vfsO.OpenFile("xarchive_cache.rpf", fhO)) {
+              // F-855 (2026-10-22): THE MEMBER'S OWN STORED BYTES, NOT "the
+              // file's bytes at that address".
+              //
+              // A VFS read at `off` runs ApplyExpandedSpans, which splices
+              // whatever registered span OWNS that address into the window
+              // (src/fs/vfs_rpf.cpp:2871-2874).  MEASURED for this record
+              // (rec=A04E1AD0, off=0x011C8000, stored=548651, logical=2157137):
+              // four OTHER members publish a logical image over that address
+              // range (0x011C0000 Tune/Audio/PoliceScript.xml logical 924800,
+              // 0x011C3000 CareerScript.xml, 0x011C7000 SC_CareerScript.xml,
+              // 0x011C79E8 tune/net/mcnet.xml), and the owner ELECTED for the
+              // window head 0x011C8000 was the last one to register
+              // (0x011C79E8).  Its inflated image was written over the head of
+              // THIS member's DEFLATE stream, so RawInflate was handed 961
+              // bytes of XML and failed.  The archive's own bytes at
+              // 0x011C8000 ARE a complete DEFLATE stream that inflates to
+              // exactly w1 (2157137) -- so the member is real and the read
+              // was polluted, not the data.
+              //
+              // The logged head16 values are that splice, reproduced offline
+              // from the archive alone: 0x011C0000's image -> 75703D22...,
+              // 0x011C7000's -> 0A202020..., 0x011C79E8's ->
+              // 616C75653D22313030222F3E0D0A093C ("alue=\"100\"/>\r\n\t<"),
+              // which is EXACTLY the logged READAT-BRANCH head16 for the
+              // off=011C8000 read.
+              //
+              // `raw_positional` is the VFS's own documented contract for
+              // exactly this read (src/fs/vfs_rpf.h:62-74: "a read whose
+              // purpose is to SEE THE FILE -- corroborating a member's own
+              // stored bytes before deciding what to serve it as"), it is
+              // honoured on BOTH ReadFileAt branches (vfs_rpf.cpp:2871, :2915),
+              // and ResolveSpan already uses a positional read for the same
+              // purpose (:1119-1139).  The handle never reaches the guest, so
+              // nothing guest-visible changes: this can only turn a REFUSAL
+              // into a SERVE, and the served body is still the exact inflate
+              // of the archive's own bytes, still required to reproduce w1
+              // EXACTLY (the rule below, unchanged).
+              fhO.raw_positional = true;
               std::vector<uint8_t> raw(oStored);
               if (vfsO.ReadFileAt(fhO, oOff, raw.data(), oStored, gotO) &&
                   gotO >= oStored) {
                 std::vector<uint8_t> inf;
-                if (mcla::RawInflate(raw.data(), oStored, inf) &&
+                // F-855 (2026-10-22): THE INFLATE CAP IS THE GUEST'S OWN
+                // DECLARED SIZE, not RawInflate's 1 MiB default.
+                //
+                // RawInflate's default is `maxOut = 1u << 20` (src/raw_inflate.h:18)
+                // and it returns false the moment the output would exceed the
+                // cap (:98, :170, :183).  MEASURED: this member's inflate is
+                // 2,157,137 bytes (0x20EA51) -- 2x the default cap -- so the
+                // inflate was refused for a reason that has nothing to do with
+                // the member being wrong.
+                //
+                // The cap here is `oLogical`, the guest's OWN w1, and the rule
+                // on the next line is `inf.size() == oLogical`.  So this is
+                // STRICTER than the default, not looser: a stream that would
+                // inflate to MORE than w1 is still refused, and one that
+                // inflates to less is refused by the equality check.  The cap
+                // only removes an unrelated 1 MiB ceiling; it cannot admit a
+                // body the proof rule would have rejected.
+                //
+                // Same shape as the tree's other positional read,
+                // src/fs/vfs_rpf.cpp:1109 `cap = want + 0x10000` (there the
+                // rule is a range, here it is an equality, so the slack is 0).
+                if (mcla::RawInflate(raw.data(), oStored, inf, oLogical) &&
                     inf.size() == oLogical) {
                   const uint32_t oDst = memO.Alloc(oLogical, 16);
                   if (oDst != 0u &&
@@ -22259,6 +22318,53 @@ PPC_FUNC(sub_821CC1E0) {
                 geometryOk ? 1u : 0u, permanent ? 1u : 0u,
                 (!geometryOk) ? 1u : 0u,
                 (geometryOk && gotO < oStored) ? 1u : 0u);
+            // F-855 (2026-10-22): WHY the on-demand serve refused, in ONE row.
+            //
+            // ARC-ONDEMAND's refusal row prints geom/cached/permanent/transient
+            // but NOT the inflated length, so "the inflate did not reproduce
+            // w1" and "the inflate produced a different size" were
+            // indistinguishable -- which is why rec=A04E1AD0 needed a
+            // subagent to diagnose instead of one log line.  This row prints
+            // the RAW bytes handed to RawInflate (their first 16) and the
+            // length the inflate produced, next to the expected w1.
+            //
+            // For rec=A04E1AD0 BEFORE the raw_positional fix this row read
+            // rawHead16=616C75653D22313030222F3E0D0A093C ("alue=\"100\"/>")
+            // and inflated=0 -- i.e. it SHOWED the splice.  After the fix it
+            // reads rawHead16=0B000000... and inflated=2157137 == expect.
+            //
+            // IT IS A NEW MARKER, not an edit to ARC-ONDEMAND's format: other
+            // text cites that format, and this row is printed only on the
+            // refusal path (rare), so it costs nothing on a working boot.
+            {
+              std::vector<uint8_t> rawChk;
+              uint64_t gotChk = 0;
+              std::vector<uint8_t> infChk;
+              uint32_t inflatedChk = 0;
+              char headChk[33] = {0};
+              if (geometryOk) {
+                auto &vfsChk = mcla::vfs::RpfVirtualFileSystem::Instance();
+                mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fhChk;
+                if (vfsChk.OpenFile("xarchive_cache.rpf", fhChk)) {
+                  fhChk.raw_positional = true;
+                  rawChk.resize(oStored);
+                  if (vfsChk.ReadFileAt(fhChk, oOff, rawChk.data(), oStored, gotChk) &&
+                      gotChk >= oStored) {
+                    for (size_t k = 0; k < 16 && k < rawChk.size(); ++k) {
+                      const uint8_t c = rawChk[k];
+                      headChk[k] = (c >= 0x20u && c < 0x7Fu) ? static_cast<char>(c) : '.';
+                    }
+                    if (mcla::RawInflate(rawChk.data(), oStored, infChk, oLogical))
+                      inflatedChk = static_cast<uint32_t>(infChk.size());
+                  }
+                  vfsChk.CloseFile(fhChk);
+                }
+              }
+              MCLA_LOG_WARN(
+                  "ARC-ONDEMAND-RAW rec={:08X} off={:08X} stored={} expect={} "
+                  "got={} inflated={} rawHead16='{}'",
+                  arRec, oOff, oStored, oLogical, gotChk, inflatedChk, headChk);
+            }
           }
         }
       }
