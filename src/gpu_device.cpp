@@ -3086,8 +3086,23 @@ void MclaNoteHostServeRead(const char *path, const char *site, uint32_t off,
 }
 }  // namespace
 
+// F-858: the serve path's own accounting.  `reused` = serves that did NOT
+// charge the guest's physical pool (the bytes were already staged and were
+// proved byte-identical by a runtime memcmp); `unpublished` = buffers that
+// were charged and are being handed back because nothing ever published
+// them.  These counters are UNGATED: they ride on every printed row, so a
+// reader takes `total_bytes` from the LAST row and never has to count rows
+// (F-054: a capped printer's count is a cadence, not a total).
+static std::atomic<uint64_t> g_serveFreeReused{0};
+static std::atomic<uint64_t> g_serveFreeReusedBytes{0};
+static std::atomic<uint64_t> g_serveFreeUnpublished{0};
+static std::atomic<uint64_t> g_serveFreeUnpublishedBytes{0};
+
+// F-858: `reuseBuf` is an ALREADY-STAGED buffer for this member, handed in by
+// the caller so the serve path can answer "is this member already staged?"
+// BEFORE it allocates.  0 = none.
 static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
-                                bool *outProved);
+                                bool *outProved, uint32_t reuseBuf);
 
 // F-188 Path A: host-buffer XC decode (defined after MclaHostLzxDecode).
 // W66: no longer called. The content serve now uses the F-295 decoder
@@ -3265,7 +3280,8 @@ static void MclaNoteRegisteredSpan(const char *path, uint32_t off,
 // length contradicts the guest's own TOC is the host contract violation; see
 // the CCEA0 hook below for the refusal.
 static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
-                                bool *outProved = nullptr) {
+                                bool *outProved = nullptr,
+                                uint32_t reuseBuf = 0) {
   outSize = 0;
   bool proved = false;
   if (outProved)
@@ -3945,13 +3961,95 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
                   w1delta,
                   (isRsc5Class && w1delta != 0) ? 1 : 0);
 
-    dst = mem.Alloc(static_cast<uint32_t>(serveBytes.size()), 16);
-    if (!dst)
-      continue;
-    if (!mem.WriteBytes(dst, serveBytes.data(),
-                        static_cast<uint32_t>(serveBytes.size()))) {
-      dst = 0;
-      continue;
+    // F-858: REUSE-BEFORE-ALLOCATE.  MEASURED on build/w872.log: this path
+    // allocated from the GUEST's 512 MiB physical pool ONCE PER SERVE
+    // ATTEMPT -- 1,525 allocations, 37.43 MiB requested -- for only 606
+    // DISTINCT members, i.e. 919 of the serves (25.51 MiB requested) were
+    // byte-identical RE-ALLOCATIONS of a member the host already held.  THE
+    // FIRST POOL REFUSAL OF THE WHOLE BOOT IS THIS ALLOCATION
+    // (w872.log:203678: `o1heapAllocate returned null #1 size=0x10dfb
+    // align=0x4000 ... caller_rva=0x2e4a8a glr=821CCF78`, where
+    // 0x2e4a8a = GuestMemoryHeap::Alloc+0x1a and 0x821CCF78 is this path's
+    // XSF-OPEN lr), and 10,075 further attempts were refused outright.
+    //
+    // IF THE MEMBER IS ALREADY STAGED AND THE BYTES ARE BYTE-IDENTICAL, HAND
+    // BACK THE EXISTING BUFFER AND ALLOCATE NOTHING.  The identity test is a
+    // RUNTIME BYTE COMPARISON (memcmp against the staged buffer), not an
+    // inference: "the same member" can never be wrong about the CONTENT.
+    // `reuseBuf` was looked up by the caller in `g_servedByEntry` under the
+    // guest's TOC RECORD address -- the table's only exact key (F-091 retired
+    // (dev,handle), F-126 retired w3).
+    //
+    // NOTHING GUEST-VISIBLE CHANGES.  The bytes handed back are byte-identical
+    // (memcmp proved it), and the served body's `pos` is NOT touched: it is 0
+    // in every live body -- its only reader (:20813) sits in the block at
+    // :20809, which is UNREACHABLE because MclaFindServedBody is called there
+    // with tocEntry=0 and therefore never reaches the exact arm
+    // (READWRAP-SERVE = 0 rows in w872) -- and the position the guest
+    // actually reads from is its OWN, in guest memory, read by the ARC-WINDOW
+    // deliver at :21854 and advanced by the guest at raw 0x821CC340
+    // `stw r7,4(r31)`.
+    //
+    // WHY NOT "FREE THE BUFFER A REGISTRATION REPLACES" (the other obvious
+    // fix)?  Because two readers copy the body OUT of `g_servedMtx` and read
+    // the bytes OUTSIDE it -- MclaArcWindowDeliver (:22150-22154 copies,
+    // :21733 reads) and MclaBootstrapGlobaltexFromServed (:4352-4364 copies,
+    // :4366-4371 reads) -- and one serve path (AFB76, :26728) makes a served
+    // body GUEST-reachable through the slot table.  Freeing a PUBLISHED body
+    // is therefore a use-after-free waiting to happen.  Reuse NEVER frees a
+    // published buffer, so it has no such race by construction.
+    bool reused = false;
+    if (reuseBuf != 0u && !serveBytes.empty() &&
+        serveBytes.size() <= 0x1000000u) {
+      std::vector<uint8_t> have(serveBytes.size());
+      if (mem.ReadBytes(reuseBuf, have.data(),
+                        static_cast<uint32_t>(have.size())) &&
+          std::memcmp(have.data(), serveBytes.data(), have.size()) == 0) {
+        dst = reuseBuf;
+        reused = true;
+      }
+    }
+    if (!reused) {
+      dst = mem.Alloc(static_cast<uint32_t>(serveBytes.size()), 16);
+      if (!dst)
+        continue;
+      if (!mem.WriteBytes(dst, serveBytes.data(),
+                          static_cast<uint32_t>(serveBytes.size()))) {
+        // F-858: THIS ALLOCATION WAS CHARGED and is about to become
+        // unreachable.  WriteBytes(dst, p, 0) is false (memory.cpp:504
+        // rejects size == 0), so a zero-length serve lands here -- and the
+        // 4 KiB-charged block was LEAKED with the pointer lost.  Hand it
+        // back NOW, while the pointer is still in hand.  The size argument is
+        // 0 because GuestMemoryHeap::Free ignores it (memory.cpp:541-551)
+        // and the fragment size is recovered from the o1heap header
+        // (heap.cpp:4026/4042); the tree's own idiom is `mem.Free(ptr, 0)`
+        // (src/kernel/imports.cpp:928-934).
+        mem.Free(dst, 0);
+        const uint64_t n = g_serveFreeUnpublished.fetch_add(1) + 1;
+        const uint64_t tot =
+            g_serveFreeUnpublishedBytes.fetch_add(serveBytes.size()) +
+            serveBytes.size();
+        if (n <= 16u || (n % 256u) == 0u)
+          MCLA_LOG_WARN("XSF-SERVE-FREE #{} kind=WRITEFAIL path='{}' size={} "
+                        "buf={:08X} bytes={} total_bytes={} n={}",
+                        n, path, static_cast<uint32_t>(serveBytes.size()), dst,
+                        static_cast<uint64_t>(serveBytes.size()), tot, n);
+        dst = 0;
+        continue;
+      }
+    }
+    if (reused) {
+      // F-858: THE COUNTER THE FIX IS MEASURABLE BY.  `bytes` is what this
+      // serve did NOT charge the pool; `total_bytes` is the running sum.
+      const uint64_t n = g_serveFreeReused.fetch_add(1) + 1;
+      const uint64_t tot =
+          g_serveFreeReusedBytes.fetch_add(serveBytes.size()) +
+          serveBytes.size();
+      if (n <= 16u || (n % 256u) == 0u)
+        MCLA_LOG_WARN("XSF-SERVE-FREE #{} kind=REUSED path='{}' off={:08X} "
+                      "size={} buf={:08X} bytes={} total_bytes={} n={}",
+                      n, path, off, static_cast<uint32_t>(serveBytes.size()),
+                      dst, static_cast<uint64_t>(serveBytes.size()), tot, n);
     }
     outSize = static_cast<uint32_t>(serveBytes.size());
     if (outProved)
@@ -24785,7 +24883,21 @@ PPC_FUNC(sub_821CCEA0) {
     }
     uint32_t xsz = 0;
     bool xproved = false;
-    const uint32_t xbuf = HostServeUiBody(path, xsz, &xproved);
+    // F-858: IS THIS MEMBER ALREADY STAGED?  The key is the guest's TOC
+    // RECORD address -- the table's only exact key (F-091 retired
+    // (dev,handle), F-126 retired w3).  The lookup is under the table's own
+    // mutex, and the body it returns is a LIVE allocation: nothing in this
+    // tree frees a PUBLISHED body (the F-858 patch deliberately never does,
+    // so the out-of-lock readers at :21733 and :4366 have no
+    // use-after-free to race with).
+    uint32_t xreuse = 0;
+    if (tocEntry) {
+      std::lock_guard<std::mutex> lk(g_servedMtx);
+      auto bit = g_servedByEntry.find(tocEntry);
+      if (bit != g_servedByEntry.end() && bit->second.buf && bit->second.size)
+        xreuse = bit->second.buf;
+    }
+    const uint32_t xbuf = HostServeUiBody(path, xsz, &xproved, xreuse);
     MCLA_LOG_WARN("XSF-POSTOPEN-SERVE path='{}' buf={:08X} size={} "
                   "dev={:08X} handle={} tocEntry={:08X} "
                   "toc=[{:08X} {:08X} {:08X} {:08X}]",
@@ -24849,6 +24961,28 @@ PPC_FUNC(sub_821CCEA0) {
           "(see SERVE-PROOF)",
           path, dev, ret, tocEntry, xsz, tw[1], tw[2], tw[0], tw[1], tw[2],
           tw[3]);
+      // F-858: THIS BODY WAS NEVER PUBLISHED.  MclaRegisterServedBody is
+      // called only under `xproved` (:24880 -> now :24897), the guest-copy
+      // registry (MclaUiXsfRecordGuestCopy) is only called there too, and
+      // this path writes only the SIZE into guest memory (the address is
+      // never published).  So this block is charged to the guest's physical
+      // pool and reachable from NO index and from NO reader -- 309 such
+      // buffers / 10.97 MiB requested / 14.73 MiB charged in build/w872.log.
+      // Hand it back.  The size argument is 0 because GuestMemoryHeap::Free
+      // ignores it (memory.cpp:541-551); the fragment size is recovered from
+      // the o1heap header (heap.cpp:4026/4042).  The tree's own idiom is
+      // `mem.Free(ptr, 0)` -- src/kernel/imports.cpp:934.
+      {
+        auto &memF = mcla::kernel::GuestMemoryHeap::Instance();
+        memF.Free(xbuf, 0);
+        const uint64_t n = g_serveFreeUnpublished.fetch_add(1) + 1;
+        const uint64_t tot =
+            g_serveFreeUnpublishedBytes.fetch_add(xsz) + xsz;
+        if (n <= 16u || (n % 256u) == 0u)
+          MCLA_LOG_WARN("XSF-SERVE-FREE #{} kind=UNPUBLISHED path='{}' "
+                        "size={} buf={:08X} bytes={} total_bytes={} n={}",
+                        n, path, xsz, xbuf, static_cast<uint64_t>(xsz), tot, n);
+      }
     } else if (xbuf && xsz > 0) {
       MCLA_LOG_WARN(
           "OPEN-ACCEPTED path='{}' dev={:08X} handle={} tocEntry={:08X} "
