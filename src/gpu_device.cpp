@@ -22291,9 +22291,15 @@ PPC_FUNC(sub_821CC1E0) {
           const uint32_t oOff = ow2 & kTocMemberOffMask;
           const uint32_t oStored = ow3 & kTocMemberStoredMask;
           const uint32_t oLogical = ow1;
+          // F-872: oStored == oLogical is the stored-UNCOMPRESSED member,
+          // which the span table serves VERBATIM in the same boot
+          // (MEMBER-EXPAND-VERBATIM); the strict `<` here negative-cached 9
+          // servable members permanently -- every one of the w874 refusals
+          // was stored==logical, and the on-demand read below is
+          // raw_positional (F-855), so the verbatim bytes are positional.
           const bool geometryOk =
               oOff != 0u && oStored != 0u && oLogical != 0u &&
-              oStored < oLogical && oStored <= 0x1000000u &&
+              oStored <= oLogical && oStored <= 0x1000000u &&
               oLogical <= 0x1000000u;
           bool servedOk = false;
           uint64_t gotO = 0;
@@ -22364,11 +22370,19 @@ PPC_FUNC(sub_821CC1E0) {
                 // Same shape as the tree's other positional read,
                 // src/fs/vfs_rpf.cpp:1109 `cap = want + 0x10000` (there the
                 // rule is a range, here it is an equality, so the slack is 0).
-                if (mcla::RawInflate(raw.data(), oStored, inf, oLogical) &&
-                    inf.size() == oLogical) {
+                // F-872: stored==logical means there is nothing to inflate;
+                // the archive's own stored bytes ARE the body (the span
+                // table's VERBATIM rule), verified by the read above having
+                // delivered exactly oStored bytes positionally.
+                const bool oVerbatim = (oStored == oLogical);
+                if (oVerbatim ||
+                    (mcla::RawInflate(raw.data(), oStored, inf, oLogical) &&
+                     inf.size() == oLogical)) {
+                  const uint8_t *oBytes =
+                      oVerbatim ? raw.data() : inf.data();
                   const uint32_t oDst = memO.Alloc(oLogical, 16);
                   if (oDst != 0u &&
-                      memO.WriteBytes(oDst, inf.data(), oLogical)) {
+                      memO.WriteBytes(oDst, oBytes, oLogical)) {
                     const uint32_t ow[4] = {0u, ow1, ow2, ow3};
                     MclaRegisterServedBody("ondemand", oDst, oLogical, 0u,
                                           0xFFFFFFFFu, arRec, ow);
@@ -22383,16 +22397,18 @@ PPC_FUNC(sub_821CC1E0) {
                     arBody.path = "ondemand";
                     servedOk = true;
                     const uint32_t oHead =
-                        (inf.size() >= 4)
-                            ? ((uint32_t(inf[0]) << 24) |
-                               (uint32_t(inf[1]) << 16) |
-                               (uint32_t(inf[2]) << 8) | uint32_t(inf[3]))
+                        (oLogical >= 4)
+                            ? ((uint32_t(oBytes[0]) << 24) |
+                               (uint32_t(oBytes[1]) << 16) |
+                               (uint32_t(oBytes[2]) << 8) | uint32_t(oBytes[3]))
                             : 0u;
                     MCLA_LOG_WARN(
                         "ARC-ONDEMAND #{} rec={:08X} off={:08X} stored={} "
-                        "logical={} buf={:08X} head={:08X} (table miss "
-                        "-> proved by exact inflate; body registered)",
-                        oN, arRec, oOff, oStored, oLogical, oDst, oHead);
+                        "logical={} buf={:08X} head={:08X} (table miss -> {}; "
+                        "body registered)",
+                        oN, arRec, oOff, oStored, oLogical, oDst, oHead,
+                        oVerbatim ? "stored==logical, served verbatim"
+                                  : "proved by exact inflate");
                   }
                 }
               }

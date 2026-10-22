@@ -6223,10 +6223,16 @@ bool D3D12Backend::PresentOwnedFrame(FrameOwner owner) {
     // 66% of a log if it is not.
     const uint64_t p = ++m_presentedFrames;
     if (ShouldLogRefusal(p)) {
+        // F-872 (F-864's S8): the Present HRESULT was bookkept in
+        // m_lastPresentHr but never printed, so "the frame reached the
+        // window" was unmeasurable from the log. 0x00000000 (or 0x087A0001
+        // OCCLUSION_MODE_1 for a minimized window) on every row is the
+        // positive control that the presents themselves are healthy.
         MCLA_LOG_INFO("FRAME-OWNER #{} owner={} presented={} drawn={} blitRefused={} "
-                      "clearRefused={} conflicts={}",
+                      "clearRefused={} conflicts={} presentHr={:08X}",
                       p, FrameOwnerName(owner), p, m_drawOwnedFrames, m_blitRefused,
-                      m_clearRefused, m_ownerConflicts);
+                      m_clearRefused, m_ownerConflicts,
+                      static_cast<uint32_t>(hr));
     }
     return SUCCEEDED(hr);
 }

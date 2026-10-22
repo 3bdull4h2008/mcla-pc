@@ -2100,7 +2100,7 @@ def main() -> int:
         d = new["detail"].get(m, {})
         owners = (d.get("named_owners") or Counter())
         who = owners.most_common(3)
-        # F-865: the top-3 owner list HID 356,597 of VEH's 979,395 mentions
+        # F-866: the top-3 owner list HID 356,597 of VEH's 979,395 mentions
         # in w874 with no "(+N more)" -- a reader concluded the set was
         # closed.  Print the total and the remainder.
         shown_n = sum(v for _, v in who)
@@ -2109,8 +2109,6 @@ def main() -> int:
         print(f"  {m:<30}{d.get('own', 0):>8,}{d.get('lines', 0):>8,}"
               f"{d.get('named', 0):>8,}  {d.get('grade',''):<6}  "
               f"{[f'{k}:{v}' for k, v in who]}{tail}")
-              f"{d.get('named', 0):>8,}  {d.get('grade',''):<6}  "
-              f"{[f'{k}:{v}' for k, v in who]}")
         if d.get("grade") == "field":
             print(f"       -> FIELD, not a row: {MARKER_FIELD.get(m, '?')}. Its LINES"
                   " count rows that CARRY the literal; its ROWS count is 0 because"

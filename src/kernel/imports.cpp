@@ -2167,6 +2167,25 @@ struct HostApc {
   uint32_t arg1 = 0;
   uint32_t arg2 = 0;
 };
+// F-872 (2026-10-22, the F-3 class from F-863): the remaining raw
+// PPC_LOOKUP_FUNC call sites route through Memory::FindFunction, whose
+// F-859 bound refuses a guest VA outside [PPC_CODE_BASE,
+// PPC_CODE_BASE+PPC_CODE_SIZE) instead of deriving a host address ~2 GiB
+// outside the window. Two of those sites (the VSync thread, :6750, and
+// VdDispatchGraphicsInterrupt, :6926) previously SKIPPED silently on a
+// null -- F-868's silent-degradation class -- so a refused lookup now
+// lands here. Rule-1b taint list: the new symbols are the file-local
+// `s_lookupOob` and `MclaLogLookupOob` below; nothing else is added.
+static std::atomic<uint32_t> s_lookupOob{0};
+static void MclaLogLookupOob(const char *site, uint32_t va) {
+  const uint32_t n = s_lookupOob.fetch_add(1) + 1;
+  if (n <= 8 || (n % 1000) == 0)
+    MCLA_LOG_WARN("LOOKUP-OOB #{} site={} va={:08X} -- guest VA outside the "
+                  "recompiled code range; lookup refused, the callback is "
+                  "DROPPED",
+                  n, site, va);
+}
+
 static constexpr uint32_t kMaxPendingApcs = 8;
 static thread_local HostApc t_pendingApcs[kMaxPendingApcs];
 static thread_local uint32_t t_pendingApcCount = 0;
@@ -2179,7 +2198,10 @@ static uint32_t DeliverPendingApcs() {
   while (t_pendingApcCount > 0) {
     const HostApc apc = t_pendingApcs[--t_pendingApcCount];
     uint8_t *base = mcla::kernel::g_memory.base;
-    PPCFunc *fn = PPC_LOOKUP_FUNC(base, apc.routine);
+    // F-872: the checked lookup (the F-859 bound); a null now feeds the
+    // APC-UNRESOLVED drop below, this code's own stated intent for an
+    // unresolvable routine.
+    PPCFunc *fn = mcla::kernel::g_memory.FindFunction(apc.routine);
     if (fn == nullptr) {
       static std::atomic<uint32_t> s_apcUnresolved{0};
       const uint32_t n = s_apcUnresolved.fetch_add(1) + 1;
@@ -6078,7 +6100,9 @@ void RtlRaiseException_x(PPCContext &ctx, uint8_t *base) {
   bool delivered = false;
   if (handler != 0) {
     uint8_t *gbase = mcla::kernel::g_memory.base;
-    PPCFunc *fn = PPC_LOOKUP_FUNC(gbase, handler);
+    // F-872: the checked lookup (the F-859 bound); a null leaves
+    // delivered=0, which the RAISE-EXC row below already prints.
+    PPCFunc *fn = mcla::kernel::g_memory.FindFunction(handler);
     if (fn != nullptr) {
       // In GUEST CODE, on the raising frame's stack, with the SAME arguments
       // the guest's own dispatcher passes (none: it does `mtctr r10; bctrl`).
@@ -6747,7 +6771,11 @@ void VdSetGraphicsInterruptCallback(uint32_t callback, uint32_t userData) {
         uint32_t currentUserData = s_vsyncUserData.load();
         if (currentCallback != 0) {
           uint8_t *base = mcla::kernel::g_memory.base;
-          PPCFunc *fn = PPC_LOOKUP_FUNC(base, currentCallback);
+          // F-872: the checked lookup (the F-859 bound); a skipped frame was
+          // silent -- a refused lookup now logs LOOKUP-OOB.
+          PPCFunc *fn = mcla::kernel::g_memory.FindFunction(currentCallback);
+          if (fn == nullptr)
+            MclaLogLookupOob("vsync-thread", currentCallback);
           if (fn) {
             PPCContext cbCtx{};
             // r3 = INTERRUPT TYPE, not userData (decoded from
@@ -6923,9 +6951,13 @@ void VdDispatchGraphicsInterrupt(uint32_t cpuMask) {
     if (cb == 0)
       continue;
     uint8_t *base = mcla::kernel::g_memory.base;
-    PPCFunc *fn = PPC_LOOKUP_FUNC(base, cb);
-    if (!fn)
+    // F-872: the checked lookup (the F-859 bound); the skip is no longer
+    // silent.
+    PPCFunc *fn = mcla::kernel::g_memory.FindFunction(cb);
+    if (!fn) {
+      MclaLogLookupOob("vd-dispatch", cb);
       continue;
+    }
     // graphics_system.cc:253 SetActiveCpu -- the consumer reads the CPU index as a BYTE at
     // [r13+268] (`lbz r11,268(r13)` @0x824114D4). Save, set, call, restore.
     // The byte now lives in THIS host thread's own PCR block, so the boot
