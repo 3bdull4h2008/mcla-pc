@@ -177,6 +177,50 @@ struct Memory {
     }
 
     PPCFunc* FindFunction(uint32_t guest) const noexcept {
+        // F-859 (2026-10-22): THE FUNCTION TABLE HAS AN INDEX RANGE, AND
+        // LOOKING UP A GUEST ADDRESS OUTSIDE IT COMPUTES A HOST ADDRESS 2 GiB
+        // BELOW THE GUEST WINDOW AND THEN DEREFERENCES IT.
+        //
+        // MEASURED (build/w873.log:2156038, the vblank/DPC thread):
+        //   Vectored exception: code=0xC0000005 addr=0x0x7ff6e465181a
+        //     rva=0x35181A ... thread=21712
+        //   Param[1]=0x0x7e780000
+        //   rip owner=host ..., not a mapped guest fn
+        // and the host stack names `DispatchGuestDpcQueue+0x36A` ->
+        // src/kernel/imports.cpp:6632 `FindFunction(w0)`, where `w0` is the
+        // FIRST WORD of the guest's queued DPC object -- and it was 0.
+        //
+        // The arithmetic, from the macro itself (src/ppc_context.h:124):
+        //   slot = base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE
+        //                + (uint64_t(uint32_t(guest) - PPC_CODE_BASE) * 2)
+        // For guest == 0 the index underflows and the slot lands at
+        //   base + 0x829E0000 - 0x104260000 = base - 0x7E780000
+        // which with base = 0x100000000 is 0x7E780000 -- 2 GiB BELOW the
+        // guest window, unmapped.  The tree already names this address: the
+        // VEH classifies it as `wild=1` (src/boot_host.cpp:2891-2894) and
+        // F-782 records the same 0x7E780000 "function-table index 0" family
+        // from the GUEST side.
+        //
+        // THE BOUND is the recompiled code's own extent: the table is indexed
+        // by guest VA from PPC_CODE_BASE, and every mapped row lies inside
+        // [PPC_CODE_BASE, PPC_CODE_BASE + PPC_CODE_SIZE) (src/ppc_config.h:14-15;
+        // the measured maximum mapped row is 0x827CCBC0 < 0x827CD054).  A
+        // guest VA outside that range has NO table slot, so the answer is
+        // null -- which is what the CALLER already handles:
+        // src/kernel/imports.cpp:6639-6646 logs `DPC-UNRESOLVED` and drops
+        // the entry, which is that code's own stated intent.
+        //
+        // WHAT THIS DOES NOT CHANGE (do-not #1/#9): no guest state is
+        // written, no handle is fabricated, no dispatch is skipped, and the
+        // guest's own ring-count write (src/kernel/imports.cpp:6614) still
+        // happens.  It only stops the host from DERIVING an address outside
+        // its own mapping.  It is placed HERE rather than at the one call
+        // site because the same hazard exists at src/kernel/imports.cpp:6627
+        // and at the other FindFunction callers, and `src/ppc_context.h` is
+        // forbidden (rule 2) so the macro itself cannot be guarded.
+        if (guest < PPC_CODE_BASE || guest >= PPC_CODE_BASE + PPC_CODE_SIZE) {
+            return nullptr;
+        }
         return PPC_LOOKUP_FUNC(base, guest);
     }
 
