@@ -63,24 +63,51 @@ was always right and it is the whole lesson. **But F-647's gloss is INVERTED and
 > makes the boot strictly worse.** Do not. `generated/**` is forbidden anyway (rule 2).
 
 **Field notes, all measured, so you do not rediscover them the hard way:**
-- ⚠️ **`ori`'s destination is `b25:21`, NOT `b20:16`. This note previously said the opposite and was
-  wrong.** Authority: LLVM's own `PPCInstrFormats.td`, `class DForm_base` —
-  `let Inst{6...10} = RST; let Inst{11...15} = RA;` ⇒ **destination at word bits 25:21**, source at
-  20:16. Re-encode round-trip: `ori r9,r8,0x6772` → `0x61286772` **matches the guest byte**;
-  `ori r8,r9,0x6772` → `0x61096772` **does not.** Five controls in the same function
-  (`addi r4,r1,80`=`38810050`, `li r5,256`=`38A00100`, `lwz r7,80(r1)`=`80E10050`,
-  `lis r9,0x6178`=`3D206178`) all agree.
-- **The asymmetry is the trap, and it is what produced an hour of wasted work:** `b25:21` is correct
-  for `or`/`and`/`xor`/`mr`/`cmp` (`0x7FC8F378`=`or r8,r30,r30`), and **`b20:16` is correct for
-  `ori`/`addi`/`addis`/`lwz`/`stw`.** Both conventions are right — **for different opcodes.** Never
-  generalise one from the other. **Extract nibble by nibble; shift-and-mask arithmetic has produced
-  four wrong answers in this project.**
-- 🔴 **`generated/ppc_xenon/` mis-emits `ori` immediate-form with SWAPPED operands** — proven at two
-  sites (`0x8218C848`→`ppc_recomp.9.cpp:18434-18435`; `0x8213DC98`→`ppc_recomp.1.cpp:16207-16028`),
-  and **localised, not a convention error**: in the 7-instruction window at `0x8213DC90`, six
-  instructions decode identically under both readings and only the `ori` diverges. There are
-  **3,415** `ori`-imm emissions, so a blanket inversion is implausible. **This is a real defect in
-  generated code — do not "fix" it by hand; route it through `.qoder/skills/mcla-recompiler-regen`.**
+- ⚠️ **CORRECTED 2026-10-22 (F-857): `ori`'s destination is `b20:16`, NOT `b25:21`.** This note was wrong
+  twice — first it said the opposite, then a "correction" made it wrong again. The LLVM citation it
+  leaned on (`class DForm_base`, `let Inst{6...10} = RST; let Inst{11...15} = RA;`) **cannot** settle
+  it, because the *field slots* are identical and only the *naming* differs between the two families.
+  **MEASURED, three independent ways:**
+  (a) **The guest's own `lis`+`ori` idiom.** `lis r9,0x0004` (`3D200004`) then `ori r30,r9,0xAE00`
+  (`613EAE00`) must build ONE constant `0x4AE00 = 306,688` in r30 — and `306,688 << 10 = 0x12B80000`
+  is exactly the size the boot asks the physical pool for. Under `b25:21` the instruction would instead
+  clobber the `lis` result and OR in an unrelated register, i.e. the idiom would be meaningless.
+  (b) **The tiebreaker.** `generated/ppc_xenon/ppc_recomp.0.cpp:3143-3144` decodes the SAME word
+  `0x613EAE00` as `ori r30,r9,44544` and emits `r30.u64 = ctx.r9.u64 | 44544;` — destination r30 at
+  `b20:16`, source r9 at `b25:21`. **`generated/**` is right; do not touch it.**
+  (c) **Two re-encode controls, byte-for-byte:** `ori r8,r9,0x6772` → `0x61286772` and
+  `ori r9,r8,0x6772` → `0x61096772`. (The earlier note had these two byte values with the MNEMONICS
+  SWAPPED — the byte values were real, the assignment to mnemonics was not.)
+  The arithmetic controls in the old note (`addi r4,r1,80`=`38810050`, `li r5,256`=`38A00100`,
+  `lwz r7,80(r1)`=`80E10050`, `lis r9,0x6178`=`3D206178`) still stand, and they are the OTHER family.
+- **The asymmetry is the trap, and it is what produced an hour of wasted work.** The TRUE split is by
+  FORM, not by "logical vs arithmetic": the **D-form arithmetic and load/store family**
+  (`addi`/`addis`/`addic`/`mulli`/`subfic`/`lwz`/`stw`/`stwu`) keeps the **destination at `b25:21`**,
+  while **everything else** puts the destination at **`b20:16`** — the D-form logical-immediate family
+  (`ori`/`oris`/`xori`/`xoris`), the X-form logical family (`or`/`and`/`xor`/`mr`/`cmp`; `0x7FC8F378` =
+  `or r8,r30,r30`, destination r8 at `b20:16`), and the X-form arithmetic family (`add`/`subf`, whose
+  destination is the third field at `b15:11`). Both conventions are right — **for different opcodes.**
+  Never generalise one from the other. **Extract nibble by nibble; shift-and-mask arithmetic has
+  produced four wrong answers in this project.** ⚠️ `tools/ppc_disasm.py` had this same defect for the
+  WHOLE `ori`/`oris`/`xori`/`xoris` family (one `d`/`a` pair computed and reused for both families, so
+  every one of them printed its two registers swapped). **Fixed in F-857** with three new
+  `--selftest` controls (28/28 now pass; it was 25/25). Re-read this note before trusting any
+  `ori`/`xori` disassembly, and re-run `--selftest` after touching that tool.
+- ✅ **REFUTED 2026-10-22 (F-857): `generated/ppc_xenon/` does NOT mis-emit `ori` immediate-form.**
+  The old note here claimed a "real defect in generated code" at two sites (`0x8218C848` →
+  `ppc_recomp.9.cpp:18434-18435`; `0x8213DC98` → `ppc_recomp.1.cpp:16207-16208`) and told you to route
+  it through `.qoder/skills/mcla-recompiler-regen`. **That "proof" was made with
+  `tools/ppc_disasm.py`, which had the whole `ori`/`oris`/`xori`/`xoris` family swapped (see the note
+  above) — so the tool and the generated code were compared in the WRONG direction.** MEASURED at both
+  cited sites, byte-for-byte, against the raw guest words:
+  * `0x8218C848` = `0x61286772`; the generated code says `// ori r8,r9,26482` and emits
+    `ctx.r8.u64 = ctx.r9.u64 | 26482;` — destination r8 at `b20:16`, source r9 at `b25:21`. CORRECT.
+  * `0x8213DC98` = `0x612860B7`; the generated code says `// ori r8,r9,24759` and emits
+    `ctx.r8.u64 = ctx.r9.u64 | 24759;`. CORRECT.
+  * The fixed `tools/ppc_disasm.py` now prints `ori r8,r9,6772` and `ori r8,r9,60B7` for those two
+    words — the same registers and the same immediates as the generated code.
+  **There is nothing to regen.** Do not touch `generated/**` for `ori`; its 6,447 `ori` emissions are
+  consistent. If the old reading is wanted back, fix `tools/ppc_disasm.py`, not the recompiler.
 - **`ori rA,r0,imm` round-trips as a no-op store to `r0` in Capstone 5.0.7** — a real defect in its
   or-immediate arm. Do not use it to settle operand order.
 - ⚠️ **`op18` (I-form branch) IS resolvable; a circulated "bits 2..27" encoding is REFUTED — do not

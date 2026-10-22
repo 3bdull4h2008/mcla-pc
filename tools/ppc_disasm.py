@@ -132,14 +132,39 @@ def decode(i, pc):
         return f"addi {r(d)},{r(a)},{simm}" if a else f"li {r(d)},{simm}"
     if op == 15:
         return f"lis {r(d)},{uimm:04X}"
+    # F-857 (2026-10-22): THE LOGICAL-IMMEDIATE FAMILY HAS ITS TWO REGISTERS
+    # THE OTHER WAY ROUND FROM THE ARITHMETIC FAMILY.
+    #
+    # A D-form word carries two register fields.  For the ARITHMETIC family
+    # (addi/addic/... and the load/store forms) the DESTINATION is the field
+    # at word bits 25:21 (`d` here) and the source at 20:16 (`a` here).  For
+    # the LOGICAL-IMMEDIATE family (ori/oris/xori/xoris) the ISA puts the
+    # DESTINATION in the field at word bits 20:16 and the SOURCE at 25:21 --
+    # the opposite.  This tool computed ONE d/a pair and reused it for both
+    # families, so every ori/oris/xori/xoris it printed had its two registers
+    # SWAPPED.
+    #
+    # MEASURED, two independent controls from the guest image:
+    #   0x61286772: d=(w>>21)&31=9 (r9), a=(w>>16)&31=8 (r8) -> `ori r8,r9,6772`
+    #   0x61096772: d=8 (r8), a=9 (r9)                 -> `ori r9,r8,6772`
+    # and the tiebreaker, generated/ppc_xenon/ppc_recomp.0.cpp:3143-3144, which
+    # decodes the SAME word 0x613EAE00 as `ori r30,r9,44544` and emits
+    #   r30.u64 = ctx.r9.u64 | 44544;
+    # i.e. destination r30 at 20:16, source r9 at 25:21.
+    #
+    # The guest's own idiom makes the old decode impossible: `lis r9,0x0004`
+    # then `ori r30,r9,0xAE00` builds ONE constant 0x4AE00 = 306,688 in r30,
+    # and 306,688<<10 is exactly the 0x12B80000 the boot asks the physical
+    # pool for.  Under the swapped reading the instruction would instead
+    # clobber the `lis` result and OR in an unrelated register.
     if op == 24:
-        return f"ori {r(d)},{r(a)},{uimm:04X}"
+        return f"ori {r(a)},{r(d)},{uimm:04X}"
     if op == 25:
-        return f"oris {r(d)},{r(a)},{uimm:04X}"
+        return f"oris {r(a)},{r(d)},{uimm:04X}"
     if op == 26:
-        return f"xori {r(d)},{r(a)},{uimm:04X}"
+        return f"xori {r(a)},{r(d)},{uimm:04X}"
     if op == 27:
-        return f"xoris {r(d)},{r(a)},{uimm:04X}"
+        return f"xoris {r(a)},{r(d)},{uimm:04X}"
     if op == 12:
         return f"addic {r(d)},{r(a)},{simm}"
     if op == 13:
@@ -411,6 +436,20 @@ def decode(i, pc):
 # something real broke.
 # ---------------------------------------------------------------------------
 SELFTEST = [
+    # --- F-857: the logical-immediate family (ori/oris/xori/xoris) has its
+    # two registers the other way round from the arithmetic family: the
+    # DESTINATION is at word bits 20:16 and the source at 25:21.
+    # 0x613EAE00: op=24 (ori); d=(w>>21)&31=9 (r9), a=(w>>16)&31=30 (r30)
+    # -> `ori r30,r9,AE00`.  Tiebreaker: generated/ppc_xenon/ppc_recomp.0.cpp
+    # :3143-3144 decodes the SAME word as `ori r30,r9,44544` and emits
+    # `r30.u64 = ctx.r9.u64 | 44544;`.  The guest's `lis r9,0x0004` +
+    # `ori r30,r9,0xAE00` builds 0x4AE00 = 306,688 in r30, and 306,688<<10
+    # is exactly the 0x12B80000 the boot requests.
+    (0x613EAE00, 0x821312DC, "ori r30,r9,AE00"),
+    # 0x61286772: d=9 (r9), a=8 (r8) -> `ori r8,r9,6772`
+    (0x61286772, 0x821312DC, "ori r8,r9,6772"),
+    # 0x61096772: d=8 (r8), a=9 (r9) -> `ori r9,r8,6772`
+    (0x61096772, 0x821312DC, "ori r9,r8,6772"),
     # --- the disc-check window, byte-for-byte from build/cache/mcla_pe.bin ---
     # 0x2F1D0001: op=11, RT=24->CR6, RA=r29, imm=1  (D-form imm is bits 15:0)
     (0x2F1D0001, 0x821CC2F8, "cmpi cr6,r29,1"),
