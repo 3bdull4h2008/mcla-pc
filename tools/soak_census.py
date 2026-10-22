@@ -2,12 +2,19 @@
 """Marker census for MCLA PC boot soaks -- the machine behind `mcla-log-census`.
 
 Counts every documented log marker and prints new-vs-baseline columns with
-deltas. Counts are matching LINES, case-insensitive: what `grep -ic MARKER`
-returns -- except (a) the NTSTATUS codes in EXC_CODES below, which need a
-`code=0x…` context and so read LOWER than a bare grep on the same token, and
-(b) any marker listed in MARKER_EXCLUDE, which names a substring that is a FIELD
-of some other row rather than a marker of its own. Rows are otherwise substring
-matches, so `INFLATE` still counts every `INFLATE-SKIP` line.
+COUNTS ARE ROWS, NOT SUBSTRING MATCHES.  A marker owns a row only when one of
+its token alternatives is a PREFIX of that row's own message (the message being
+the text after the "] [" level tag).  A line that merely MENTIONS the literal
+is counted as NAMED and graded prose/field -- it is NOT a row.
+TWO CONSEQUENCES A READER MUST NOT FORGET:
+  * `grep -ic MARKER` is NOT this tool's number.  Measured on build/w874.log:
+    `grep -c UILOAD` = 3 lines, but UILOAD has **0 rows** -- all three are the
+    PROSE of the W34-NOGFX rows.  `VEH` is 979,395 matching lines and 0 rows,
+    and `fatal` is 92,034 lines and 0 rows.
+  * the NTSTATUS codes in EXC_CODES below need a `code=0x..` context and so
+    read LOWER than a bare grep on the same token, and any marker listed in
+    MARKER_EXCLUDE names a substring that is a FIELD of some other row rather
+    than a marker of its own.
 
 Every marker carries a CLASS, printed in its own section:
 
@@ -2091,8 +2098,17 @@ def main() -> int:
     print(f"  {'MARKER':<30}{'ROWS':>8}{'LINES':>8}{'NAMED':>8}  GRADE  who owns the rest")
     for m in moved:
         d = new["detail"].get(m, {})
-        who = (d.get("named_owners") or Counter()).most_common(3)
+        owners = (d.get("named_owners") or Counter())
+        who = owners.most_common(3)
+        # F-865: the top-3 owner list HID 356,597 of VEH's 979,395 mentions
+        # in w874 with no "(+N more)" -- a reader concluded the set was
+        # closed.  Print the total and the remainder.
+        shown_n = sum(v for _, v in who)
+        extra_owners = sum(owners.values()) - shown_n
+        tail = f" (+{extra_owners} more)" if extra_owners else ""
         print(f"  {m:<30}{d.get('own', 0):>8,}{d.get('lines', 0):>8,}"
+              f"{d.get('named', 0):>8,}  {d.get('grade',''):<6}  "
+              f"{[f'{k}:{v}' for k, v in who]}{tail}")
               f"{d.get('named', 0):>8,}  {d.get('grade',''):<6}  "
               f"{[f'{k}:{v}' for k, v in who]}")
         if d.get("grade") == "field":

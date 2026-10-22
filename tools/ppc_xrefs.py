@@ -145,18 +145,26 @@ def cmd_find_str(img):
         sys.exit("find-str <text>")
     needle = sys.argv[2].encode()
     hits = 0
+    shown = 0
     for m in re.finditer(re.escape(needle), img):
         i = m.start()
         while i > 0 and 32 <= img[i - 1] < 127:
             i -= 1
         run = img[i:]
         end = run.find(b"\x00")
-        print(f"  {BASE + i:#010x}  {run[:end if end > 0 else 64].decode(errors='replace')!r}")
         hits += 1
-        if hits >= 20:
-            break
+        # F-865: COUNT EVERY HIT, LIST ONLY THE FIRST 20.  The old code
+        # `break`ed at 20 and printed nothing about the rest, so a reader
+        # took 20 for the total (measured: "veh" occurs 292 times).
+        if shown < 20:
+            print(f"  {BASE + i:#010x}  {run[:end if end > 0 else 64].decode(errors='replace')!r}")
+            shown += 1
     if not hits:
         print("  no hit (this string is not stored in the clear in the image)")
+    else:
+        extra = hits - shown
+        print(f"  {hits} hit(s); only the first {shown} listed above"
+              + (f"; {extra} more exist" if extra else ""))
 
 
 def cmd_fn(starts):
@@ -227,12 +235,16 @@ def cmd_xref(img, words, starts):
                 basev = 0 if ra == 0 else hi[ra]
                 val = (basev + sext16(imm)) & 0xFFFFFFFF
                 if val == target:
-                    e = enclosing(starts, pc)
-                    print(f"  {pc:#010x} addi r{rt},r{ra}  in " +
-                          (f"sub_{e[0]:08X} +{e[1]:#x}" if e and e[1] < 0x4000 else "non-code/data"))
                     found += 1
-                    if found >= limit:
-                        break
+                    # F-865: SCAN EVERYTHING; LIST AT MOST `limit`.  The old
+                    # code `break`ed at the limit and then PRINTED THE LIMIT
+                    # as the total -- F-775 verbatim, one command over
+                    # (measured: `xref 0xFFFFFFFF` -> "40 site(s)", and
+                    # 3102 with -n 5000).  The count must be the count.
+                    if found <= limit:
+                        e = enclosing(starts, pc)
+                        print(f"  {pc:#010x} addi r{rt},r{ra}  in " +
+                              (f"sub_{e[0]:08X} +{e[1]:#x}" if e and e[1] < 0x4000 else "non-code/data"))
             hi[rt] = None
             continue
         if op == 24:                     # ori rT,rA,IMM (IMM zero-extends)
@@ -245,12 +257,11 @@ def cmd_xref(img, words, starts):
                 basev = 0 if ra == 0 else hi[ra]
                 val = (basev & 0xFFFF0000) | imm
                 if val == target:
-                    e = enclosing(starts, pc)
-                    print(f"  {pc:#010x} ori r{rt},r{ra},{imm:#x}  in " +
-                          (f"sub_{e[0]:08X} +{e[1]:#x}" if e and e[1] < 0x4000 else "non-code/data"))
                     found += 1
-                    if found >= limit:
-                        break
+                    if found <= limit:
+                        e = enclosing(starts, pc)
+                        print(f"  {pc:#010x} ori r{rt},r{ra},{imm:#x}  in " +
+                              (f"sub_{e[0]:08X} +{e[1]:#x}" if e and e[1] < 0x4000 else "non-code/data"))
             hi[rt] = None
             continue
         if op in (32, 33, 34, 35, 36, 37, 40, 41, 42, 43, 44, 45, 46, 47):
@@ -272,7 +283,9 @@ def cmd_xref(img, words, starts):
             # 31 fixed-point arith/logic, 8 subf, 9 mask, 10 cmp: rT is computed, so any
             # tracked immediate dies. 48-51 are FP stores, 52-55 FP loads (rT is no GPR dest).
             hi[rt] = None  # opcodes matched by no case above leave hi[] stale
-    print(f"  {found} site(s) materialising {target:#x}")
+    extra = found - min(found, limit)
+    print(f"  {found} site(s) materialising {target:#x}"
+          + (f" -- only the first {limit} listed above; {extra} more exist" if extra else ""))
 
 
 def cmd_calls(words, starts):

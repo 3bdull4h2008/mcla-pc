@@ -80,6 +80,20 @@ was always right and it is the whole lesson. **But F-647's gloss is INVERTED and
   SWAPPED — the byte values were real, the assignment to mnemonics was not.)
   The arithmetic controls in the old note (`addi r4,r1,80`=`38810050`, `li r5,256`=`38A00100`,
   `lwz r7,80(r1)`=`80E10050`, `lis r9,0x6178`=`3D206178`) still stand, and they are the OTHER family.
+- ⚠️ **CORRECTED 2026-10-22 (F-865): the F-857 split below is WRONG for the X-FORM ARITHMETIC
+  family, and it also contradicts this file's own earlier bullet (`:140-142`), which is the correct one.**
+  `add`/`subf`/`mullw` put the **destination at `b25:21`** — the `RT` field — NOT at `b15:11`. Measured
+  three ways: the generator's own ISA operand table (`ppc-dis.c:3969` → `{ RT, RA, RB }`, `RT`=shift 21),
+  the emitted C++ for the same raw word (`0x7C8B5214` → `ctx.r4.u64 = ctx.r11.u64 + ctx.r10.u64;`), and a
+  whole-corpus test in which the shift-21 convention explains **2398/2398** distinct `add` triples while
+  shift-11 explains only **1123/2398** (`subf` 1901/1901 vs 816/1901). The rotate family was also missing
+  from the split: `rlwinm`/`rlwimi` and `rldicl`/`rldicr` take their destination from `b20:16`
+  (5542/5542 and 601/601 VA-anchored pairs). `cmp` has **no destination register** at all.
+  **The one rule that fits every measurement: the destination is at `b25:21` when the ISA names the
+  destination field `RT` (D-form arithmetic/load-store, X-form arithmetic), and at `b20:16` when the ISA
+  names it `RA` (D-form logical-immediate, X-form logical, M-form and MD-form rotate).** The
+  logical-immediate conclusions of F-857 (`ori`/`oris`/`xori`/`xoris` → dest `b20:16`, source `b25:21`)
+  STAND. Only the three-way split is retired. Ledger: **F-865**.
 - **The asymmetry is the trap, and it is what produced an hour of wasted work.** The TRUE split is by
   FORM, not by "logical vs arithmetic": the **D-form arithmetic and load/store family**
   (`addi`/`addis`/`addic`/`mulli`/`subfic`/`lwz`/`stw`/`stwu`) keeps the **destination at `b25:21`**,
@@ -93,6 +107,8 @@ was always right and it is the whole lesson. **But F-647's gloss is INVERTED and
   every one of them printed its two registers swapped). **Fixed in F-857** with three new
   `--selftest` controls (28/28 now pass; it was 25/25). Re-read this note before trusting any
   `ori`/`xori` disassembly, and re-run `--selftest` after touching that tool.
+  ⚠️ **The split sentence above is superseded by the F-865 bullet immediately above it — read THAT one
+  for `add`/`subf` and for the rotate family.** The `ori` half of it is still correct.
 - ✅ **REFUTED 2026-10-22 (F-857): `generated/ppc_xenon/` does NOT mis-emit `ori` immediate-form.**
   The old note here claimed a "real defect in generated code" at two sites (`0x8218C848` →
   `ppc_recomp.9.cpp:18434-18435`; `0x8213DC98` → `ppc_recomp.1.cpp:16207-16208`) and told you to route
