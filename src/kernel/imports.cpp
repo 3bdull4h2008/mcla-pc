@@ -3225,8 +3225,26 @@ uint32_t NtCreateEvent(be<uint32_t> *handle, void *objAttributes,
   if (!handle) return STATUS_INVALID_PARAMETER;
   // Identity handle (F-039): register so Set/Wait share one Event object.
   // Event type 0 = Notification (manual reset), 1 = Synchronization.
+  //
+  // F-856 (2026-10-22): same honest-OOM contract as NtCreateSemaphore --
+  // CreateRegisteredKernelObject returns GUEST_INVALID_HANDLE_VALUE when the
+  // allocation failed, and the guest must see an NTSTATUS, not a bogus
+  // handle.  (The AV that motivated it is in the NtCreateSemaphore path;
+  // this is the only other caller of the same helper, so it is closed too.)
   *handle = CreateRegisteredKernelObject<Event>(
       eventType == 0 ? uint8_t(0) : uint8_t(1), !eventType, !!initialState);
+  if (*handle == GUEST_INVALID_HANDLE_VALUE)
+  {
+    static std::atomic<uint32_t> s_evtOom{0};
+    const uint32_t n = s_evtOom.fetch_add(1) + 1;
+    if (n <= 16 || (n % 4096) == 0)
+      MCLA_LOG_ERROR("EVENT-OOM #{} type={} init={} lr={:08X} tid={} "
+                     "(physical pool exhausted -> STATUS_NO_MEMORY, no AV)",
+                     n, eventType, initialState,
+                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                     GetCurrentThreadId());
+    return STATUS_NO_MEMORY;
+  }
 
   // EVENT-CREATE CENSUS (2026-08-23 session 10): handle -> creation-LR map.
   // The TU83 driver worker waits on event [0x827D3738+52]=C9ADB800; matching
@@ -8794,8 +8812,37 @@ uint32_t NtCreateSemaphore(be<uint32_t> *Handle,
   // WrapperIdentityMap so Release resolves the SAME object Wait parks on
   // (F-039: previously Release minted a second wrapper via QueryKernelObject
   // and the ring-B preload workers never woke).
-  Handle->set(CreateRegisteredKernelObject<Semaphore>(5, InitialCount,
-                                                      MaximumCount));
+  //
+  // F-856 (2026-10-22): AN HONEST OOM IS AN NTSTATUS, NOT A HOST AV.
+  // CreateRegisteredKernelObject returns GUEST_INVALID_HANDLE_VALUE when the
+  // physical pool cannot satisfy the request (xdm.h:220-236).  Before that,
+  // the null was dereferenced and the boot-root thread died with an AV on
+  // host address 0x8 (build/w871.log:336554-336583, fault frame
+  // CreateRegisteredKernelObject<Semaphore>+0x89 -> NtCreateSemaphore+0x3C ->
+  // __imp__sub_8244EC78+0xDF).  The pool was already exhausted
+  // (PHYS-STATE #2000 ... verdict=exhausted oom=2000 tid=956).
+  //
+  // The GUEST's own error path exists and is used here: the caller
+  // sub_8244EC78 tests `cmpi cr0,r3,0 / blt` (generated/ppc_xenon/
+  // ppc_recomp.80.cpp:12537-12539, raw 0x8244ECC8 = 2C030000), i.e. it takes
+  // its error branch on a NEGATIVE r3.  So the failure must be an NTSTATUS,
+  // not a zero handle and not a success -- and it must be the handle's
+  // OWN invalid value, because the guest also reads it back.
+  const uint32_t semHandle =
+      CreateRegisteredKernelObject<Semaphore>(5, InitialCount, MaximumCount);
+  Handle->set(semHandle);
+  if (semHandle == GUEST_INVALID_HANDLE_VALUE)
+  {
+    static std::atomic<uint32_t> s_semaOom{0};
+    const uint32_t n = s_semaOom.fetch_add(1) + 1;
+    if (n <= 16 || (n % 4096) == 0)
+      MCLA_LOG_ERROR("SEMA-OOM #{} init={} max={} lr={:08X} tid={} (physical "
+                     "pool exhausted -> STATUS_NO_MEMORY, no AV)",
+                     n, InitialCount, MaximumCount,
+                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+                     GetCurrentThreadId());
+    return STATUS_NO_MEMORY;
+  }
 
   // SEMA-CREATE CENSUS (session 10): the main-thread park waits on handle
   // C9ADB800 (NOT an NtCreateEvent product) - identify its creator.

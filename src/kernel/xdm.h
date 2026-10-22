@@ -222,6 +222,39 @@ inline uint32_t CreateRegisteredKernelObject(uint8_t type, Args&&... args)
 {
     static_assert(std::is_base_of_v<KernelObject, T>);
     T* obj = CreateKernelObject<T>(std::forward<Args>(args)...);
+    // F-856 (2026-10-22): AN HONEST OOM MUST NOT BE A HOST AV.
+    //
+    // CreateKernelObject returns nullptr when Heap::AllocPhysical cannot
+    // satisfy the request (heap.h:85-93 -- the F-390b note says exactly
+    // that).  The line below then wrote `type` through a null `obj`, and
+    // because KernelObject is polymorphic (xdm.h:41) the C++ vptr sits at
+    // offset 0 and `header` at offset 8, so the write landed on host
+    // address 0x8 and killed the whole thread.
+    //
+    // MEASURED (build/w871.log:336554-336583, the boot-root thread):
+    //   Vectored exception: code=0xC0000005 ... Param[1]=0x0x8
+    //   [ 4] CreateRegisteredKernelObject<Semaphore,unsigned int &,unsigned int &> +0x89
+    //   [ 5] NtCreateSemaphore +0x3C
+    //   [ 7] __imp__sub_8244EC78 +0xDF
+    //   VEH-NEUTRAL guest AV: lr=8244ECC8 write to host addr 0x8
+    // with the pool already exhausted 556 ms earlier:
+    //   PHYS-STATE #2000 ... free=0x0 verdict=exhausted why=no_free_fragment
+    //   oom=2000 tid=956
+    //
+    // So an OOM -- which the guest CAN handle -- was turned into a
+    // process-fatal null dereference, and that is why the boot-root thread
+    // died instead of degrading (the boot gate never ran).
+    //
+    // The fix returns the INVALID HANDLE instead of inventing one.  It does
+    // NOT skip the registration for a live object: when the allocation
+    // succeeds every step below is byte-for-byte the old one.  The CALLER
+    // must still turn the invalid handle into an NTSTATUS (do-not #1/#9:
+    // no fake handle, no fake success) -- NtCreateSemaphore and
+    // NtCreateEvent now do exactly that.
+    if (obj == nullptr)
+    {
+        return GUEST_INVALID_HANDLE_VALUE;
+    }
     obj->header.Type = type;
     // The class id is published in the object's OWN guest-visible bytes:
     // header.Type is at the dispatcher header, and the handle IS that
