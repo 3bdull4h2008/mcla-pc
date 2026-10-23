@@ -3362,9 +3362,15 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // F-440 (T41.92): watch the {handler, msgid} registry so PageWatchOnRead can answer whether any
     // guest code ever reads it -- the question F-313 could only answer statically ("no walker
     // materialises the base", which does not exclude a computed one). Read-side probe lives in
-    // gpu_cp.cpp as F440-REGREAD. Covers the IDA pair table at 0x82102aa0 and the two arrays beyond
-    // F-358's 0x82112160 limit that F-439 found holding the GFx ctor/wrapper entries.
-    mcla::native::RegisterGuestWatchRange(0x82102AA0u, 0x82118000u);
+    // gpu_cp.cpp as F440-REGREAD.
+    // F-872 (2026-10-22): the watch bounds were STALE -- they covered only 0x82102AA0..0x82118000,
+    // missing BOTH the first 20 slots (the measured table START is 0x82102A00, first entry
+    // {0x82130048, 0x40005703}) and the upper ~40% of the table (measured END 0x82129D38, last
+    // entry {0x827CCBC0, 0x40012503}; 20,071 stride-8 slots, 139 of which carry the value
+    // 0x40001905). The wall's "the guest never reads the table" was therefore only ever measured
+    // on ~78% of the table. This extends the watch to the measured bounds; a F440-REGREAD row
+    // inside 0x82118000..0x82129D38 falsifies the static-only reading.
+    mcla::native::RegisterGuestWatchRange(0x82102A00u, 0x82129D38u);
 
     // F-441 (T41.93): the title's boot-worker queue object (words seen at 0x40004B40 qBase and
     // 0x40004D5C = the worker's a1). Store-side probe F441-QUEUE-STORE lives in gpu_cp.cpp.
