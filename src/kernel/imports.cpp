@@ -600,7 +600,9 @@ PPC_FUNC(__xtl_alloc) {
 //     glr=0x82137904 (67) or glr=0x821C667C (16). 0x821C667C is likewise the
 //     instruction after `bl 82130528`, this time in sub_821C6658. 100% of the
 //     physical refusals are the XTL allocation path, not a host bookkeeping
-//     path. And the 20 `bl 82130588` call sites in the guest are the matching
+//     path. And the ~3,900 `bl 82130588` call sites in the guest (F-874:
+//     3,862 comment lines / 3,907 emits across 155 TUs -- the "20" this line
+//     used to say was wrong by two orders of magnitude) are the matching
 //     free side of the same table.
 // So the leak is the XTL pair, and the 15 frees that did land came from
 // unrelated host paths (8 printed PHYS-FREE rows, glr 8244EF00/8244E8A0/
