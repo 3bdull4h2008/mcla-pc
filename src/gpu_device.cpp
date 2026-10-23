@@ -20197,13 +20197,55 @@ PPC_FUNC(sub_821E2940) {
   }
 }
 
+// F-873 (2026-10-23): the GFx-init gate inside sub_822C0980.  The function
+// checks r3 = mem[0x8287E63C] and r8 = mem[r3+72]; if r8 > 0 it calls
+// 0x82304428 (the GFx init) and returns, otherwise it falls through to the
+// 0x823045E0 UILOAD dispatch (F-860: a no-op -- its flag bytes are 0).
+// 0x8287E63C is BSS (raw bytes 0x00000000... at image offset 0x87E63C) and
+// has NO static materialiser and NO host writer (grep src/ = 0, grep
+// generated/ = 0), so r3 is predicted to be 0 in every boot -> gate dead by
+// construction.  This census PRINTS r3 and mem[r3+72] so the prediction is
+// measured, not asserted (rule 0 / rule 19).  Log-only, no state write.
+PPC_FUNC_IMPL(__imp__sub_822C0980);
+static std::atomic<uint32_t> s_h822C0980Gate{0};
+PPC_FUNC(sub_822C0980) {
+  const uint32_t n = s_h822C0980Gate.fetch_add(1) + 1;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  // F-873 (CORRECTED 2026-10-23): the GFx gate inside sub_822C0980 reads
+  // r3 = mem[0x8288B9AC] and r8 = mem[r3+72]; if r8 > 0 (signed) it calls
+  // 0x82304428 (whose bctrl target is mem[mem[0x82839D70]+0]+24).  Both globals
+  // are LIVE guest data at runtime (w887: gateObj=A0487720, vtPtr=A0487C10,
+  // objVt=8200A3B4, vt+24=821827E8 -- a lookup helper, NOT the ctor).  This is
+  // now a PURE census: NO writes.  w887's "+72=1" may have been MY write (the
+  // else-branch overwrote a poison value), so the next soak measures whether
+  // the gate passes with the guest's OWN value.
+  uint32_t go = 0, p72 = 0, vp = 0, ov = 0, v24 = 0;
+  (void)mem.ReadU32BE(0x8288B9ACu, &go);
+  if (go != 0u) (void)mem.ReadU32BE(go + 72u, &p72);
+  (void)mem.ReadU32BE(0x82839D70u, &vp);
+  if (vp != 0u) {
+    (void)mem.ReadU32BE(vp + 0u, &ov);
+    if (ov != 0u) (void)mem.ReadU32BE(ov + 24u, &v24);
+  }
+  if (n <= 8 || (n % 200) == 0)
+    MCLA_LOG_WARN("GFx-GATE #{} gateObj={:08X} +72={:08X} gate={} "
+                  "vtPtr={:08X} objVt={:08X} vt+24={:08X} lr={:08X}",
+                  n, go, p72, (p72 > 0) ? 1 : 0,
+                  vp, ov, v24, static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822C0980(ctx, base);
+}
+
 // F-218 read-only census: sub_821EBCF0 is the function that reads/writes the GFx
 // {handler,kernelHandle} dispatch table at 0x82117828 (ctor sub_824C6F08 -> handle
 // 0x40001905, movie sub_824C6F70 -> 0x40003D03). F-217 showed the whole GFx data
 // path (LoadBytes/construct/loaders) is 0 in baseline, so the loader object is
 // never constructed. This census decides whether the table DISPATCHER sub_821EBCF0
-// ever RUNS â€” if 0 (with this hook as the positive control), the GFx handler
-// dispatch never executes â†’ the terminal gate for nGfx. Log-only, no state write.
+// ever RUNS -- if 0 (with this hook as the positive control), the GFx handler
+// dispatch never executes -> the terminal gate for nGfx. Log-only, no state write.
+// RESTORED 2026-10-23: an orphan-cleanup script had deleted this whole hook with
+// its comment (only the comment's first line survived); w887 therefore ran with
+// the GFX-TABLE-DISP census MISSING -- its 0 there means nothing.
 PPC_FUNC_IMPL(__imp__sub_821EBCF0);
 static std::atomic<uint32_t> s_hEBCF0{0};
 PPC_FUNC(sub_821EBCF0) {
