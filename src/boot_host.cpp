@@ -3415,6 +3415,53 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
     // `A0001010/A0001000`, i.e. +0x400000. The old 0xA0018028 armed nothing (0 rows in w430).
     mcla::native::RegisterGuestWatchRange(0xA0418028u, 0xA0418030u);
 
+    // F-875 (2026-10-23): the GFx gate chain, measured from raw words.
+    //   sub_822C0980 (:0x822C09C0) reads r3 = mem[0x8288B9AC] and requires
+    //   mem[r3+72] > 0 SIGNED; the per-frame caller sub_82131008 (:0x82131020)
+    //   runs the countdown tick sub_823043F8(obj) ONLY while mem[0x8288E6F0]==0
+    //   (:0x82131028 bne over both 0x823043F8 and 0x82304348), and the tick body
+    //   (:0x823043F8-0x82304424) is `if((int)obj+68>0){obj+72=obj+68;obj+68=0;}
+    //   if((int)obj+72>0)obj+72-=1;` -- so +68 is the REQUEST and +72 the FRAME
+    //   COUNTDOWN the gate tests.  w888: all 8 gate rows had +72=0 with no
+    //   request posted (F-873). These two watches are static and arm from boot,
+    //   so they name (a) whoever installs the gate object into 0x8288B9AC and
+    //   (b) whoever flips the tick-inhibit switch 0x8288E6F0 -- the two
+    //   producers upstream of the wall. Log-only census, no guest write.
+    mcla::native::RegisterGuestWatchRange(0x8288B9ACu, 0x8288B9B0u);
+    mcla::native::RegisterGuestWatchRange(0x8288E6F0u, 0x8288E6F4u);
+
+    // F-877 (2026-10-23): the three +68 poster sites in sub_8263EFC0/FA10/C8B0
+    // require these conditions:
+    //   0x82905384 == 0  (checked at 0x8263F06C/0x8263FD20)
+    //   owner+493: bits 0-24=0, bit 25=1  (checked at 0x8263F08C/0x8263FD34)
+    //   where owner = mem[0x8288B9AC]+4 (set by sub_82304708 to r31)
+    // Static watches on the two global flags:
+    mcla::native::RegisterGuestWatchRange(0x82905384u, 0x82905388u);
+    mcla::native::RegisterGuestWatchRange(0x8290622Cu, 0x82906230u);
+
+    // F-877: watch the gate object's +4 (owner pointer) and the owner's +493 byte.
+    // Gate object at A0487720 (consistent across runs), +4 at A0487724 holds owner.
+    // GFx-GATE shows mgr=A050A320, so owner+493 = A050A320 + 0x1ED = A050A50D.
+    mcla::native::RegisterGuestWatchRange(0xA0487724u, 0xA0487728u);
+    mcla::native::RegisterGuestWatchRange(0xA050A50Du, 0xA050A511u);
+
+    // F-878 (2026-10-24): the UILOAD queue descriptor wall, measured in w898:
+    //   F360-REGCB #1 obj=[0x8288B9E8]=A04876A0 [obj+4]=00000100 [obj+88/92]=0
+    //   F365-COPIER #1 (20:38:41.004) landed obj+92=821FC008 obj+104=1, obj+88 stayed 0.
+    // The copier's skip predicate reads a BYTE at obj+4 (0x00 here), so the copy
+    // ran -- but [obj+88] stayed 0 and the pump (sub_821FC008 -> sub_82305870)
+    // is UNMEASURED. Watch obj+4 (0x8288B9EC) and obj+88 (0x8288BA40) to name
+    // who writes the 0x100 gate and whether obj+88 ever becomes non-zero.
+    mcla::native::RegisterGuestWatchRange(0x8288B9ECu, 0x8288B9F0u);
+    mcla::native::RegisterGuestWatchRange(0x8288BA40u, 0x8288BA48u);
+
+    // F-880 CORRECTED (2026-10-25): the FlashSema frame counter is 0x8288BBE8
+    // (0x82890000 - 17432 borrows into page 0x8288 -- the earlier 0x8289BBE8
+    // was an address-arithmetic error; its "FFFF0000" was an unrelated static).
+    // sub_82306CB8+0x6b8 INCREMENTS it (lwz/addi 1/stw); the gate-FAIL zeroing
+    // (sub_82306A20 epilogue) RESETS it to 0 every failed tick.
+    mcla::native::RegisterGuestWatchRange(0x8288BBE8u, 0x8288BBECu);
+
     // Kernel heaps must exist before any guest import allocates. Skipping this
     // left heap==physicalHeap==nullptr and the first allocation crashed inside
     // o1heapAllocate reading handle->diagnostics.capacity at instance+0x208.

@@ -6125,6 +6125,20 @@ bool D3D12Backend::MayWriteBackBuffer(FrameOwner owner) {
                           "(draw had claimed the buffer; blit may write now)");
         }
     }
+    // F-879 (2026-10-23, corrected by agent audit): RELEASE the draw-path latch
+    // for Clear, same as Blit. The guest's Clear for the next frame is a
+    // frame-boundary signal. The previous fix (owner==Clear && m_frameWriter==Draw)
+    // FAILED because PresentOwnedFrame:6226 resets m_frameWriter to None after
+    // every present, so by the time the next frame's Clear runs, m_frameWriter
+    // is None, not Draw. The latch (m_drawPathTookBackBuffer) is what blocks
+    // Clear -- release it exactly like the Blit path does above.
+    if (owner == FrameOwner::Clear) {
+        if (m_drawPathTookBackBuffer) {
+            m_drawPathTookBackBuffer = false;
+            MCLA_LOG_INFO("FRAME-OWNER latch released for guest CLEAR "
+                          "(draw had claimed the buffer; clear may write now)");
+        }
+    }
     const bool allowed = (owner == FrameOwner::Draw) || !m_drawPathTookBackBuffer;
     if (allowed) {
         if (m_frameWriter != FrameOwner::None && m_frameWriter != owner) {

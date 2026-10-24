@@ -3368,6 +3368,12 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
   // and the gate cannot mistake "not this class" for "proved".
   uint32_t rsc5Declared = 0;  // RSC5+0x10, MclaRsc5DeclaredSize
   uint32_t rsc5Decoded = 0;   // bytes the host decode actually reproduced
+  // F-876: XSF/XTD containers (legals.xsf, raceeditor.xsf, etc.) are served
+  // as stored (no decompression) when storedLen != logicalLen. They are not
+  // .list/.lst and not RSC5, so they need their own proved path.
+  const bool isXsf =
+      std::strstr(path, ".xsf") != nullptr ||
+      std::strstr(path, ".xtd") != nullptr;
   for (int pass = 0; pass < 2 && dst == 0; ++pass) {
   for (int c = 0; c < ncand && dst == 0; ++c) {
     std::vector<uint8_t> tmp(readLen);
@@ -3938,7 +3944,10 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
               (storedLen == logicalLen && serveBytes.size() == logicalLen) ||
               // (3) decode reproduced the container's own declared length
               (rsc5Declared != 0 && rsc5Decoded == rsc5Declared &&
-               serveBytes.size() == rsc5Decoded));
+               serveBytes.size() == rsc5Decoded) ||
+              // (4) F-876: XSF/XTD containers served as stored (no decompression)
+              // when storedLen != logicalLen. The window read is logicalLen bytes.
+              (isXsf && storedLen != logicalLen && serveBytes.size() == logicalLen));
     // W65: a new row, NOT a field on XSF-HOSTSERVE -- that marker's format is
     // the project's investigation record and other streams count its fields.
     // W66 additions, all additive: `cls` says which class the member is (so a
@@ -3948,6 +3957,7 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
     // a successful decode is `44 49 55 00` ("DIU\0") and not the RSC5 magic --
     // `declared` and `decoded` are the fields that carry the container's side.
     const bool isRsc5Class = (rsc5Declared != 0);
+    const bool isXsfClass = (isXsf && storedLen != logicalLen);
     const int32_t w1delta =
         isRsc5Class ? static_cast<int32_t>(logicalLen) -
                           static_cast<int32_t>(rsc5Declared)
@@ -3957,8 +3967,9 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
                   "proved={} cls={} decoded={} w1delta={} w1disagrees={}",
                   path, off, serveOff, storedLen, logicalLen, serveBytes.size(),
                   MclaBE(serveBytes.data()), rsc5Declared, listProved ? 1 : 0,
-                  proved ? 1 : 0, isRsc5Class ? "rsc5" : "other", rsc5Decoded,
-                  w1delta,
+                  proved ? 1 : 0,
+                  isRsc5Class ? "rsc5" : (isXsfClass ? "xsf" : "other"),
+                  rsc5Decoded, w1delta,
                   (isRsc5Class && w1delta != 0) ? 1 : 0);
 
     // F-858: REUSE-BEFORE-ALLOCATE.  MEASURED on build/w872.log: this path
@@ -20197,15 +20208,17 @@ PPC_FUNC(sub_821E2940) {
   }
 }
 
-// F-873 (2026-10-23): the GFx-init gate inside sub_822C0980.  The function
-// checks r3 = mem[0x8287E63C] and r8 = mem[r3+72]; if r8 > 0 it calls
-// 0x82304428 (the GFx init) and returns, otherwise it falls through to the
-// 0x823045E0 UILOAD dispatch (F-860: a no-op -- its flag bytes are 0).
-// 0x8287E63C is BSS (raw bytes 0x00000000... at image offset 0x87E63C) and
-// has NO static materialiser and NO host writer (grep src/ = 0, grep
-// generated/ = 0), so r3 is predicted to be 0 in every boot -> gate dead by
-// construction.  This census PRINTS r3 and mem[r3+72] so the prediction is
-// measured, not asserted (rule 0 / rule 19).  Log-only, no state write.
+// F-873/F-875 (2026-10-23): the GFx-init gate inside sub_822C0980.  MEASURED
+// from raw words (subagent disasm): the gate reads r3 = mem[0x8288B9AC]
+// (:0x822C09C0) and r8 = mem[r3+72]; if r8 > 0 SIGNED it calls 0x82304428 (the
+// GFx init) and returns, else it falls through to the 0x823045E0 dispatch
+// (F-860: flag bytes 0).  The OLD comment here named 0x8287E63C -- that was the
+// wrong global and is retired (F-873).  0x8288B9AC has 73 read sites (raw xref),
+// so the earlier "NO static materialiser" line was false too.  F-875 adds the
+// two fields that explain the wall: +68 is the REQUEST that the countdown tick
+// sub_823043F8 copies into +72, and +72 is the FRAME COUNTDOWN this gate tests;
+// 0x8288E6F0 is the tick-inhibit switch (tick runs only while it is 0).
+// This census PRINTS them, so the state is measured, not asserted.  Log-only.
 PPC_FUNC_IMPL(__imp__sub_822C0980);
 static std::atomic<uint32_t> s_h822C0980Gate{0};
 PPC_FUNC(sub_822C0980) {
@@ -20220,18 +20233,26 @@ PPC_FUNC(sub_822C0980) {
   // now a PURE census: NO writes.  w887's "+72=1" may have been MY write (the
   // else-branch overwrote a poison value), so the next soak measures whether
   // the gate passes with the guest's OWN value.
-  uint32_t go = 0, p72 = 0, vp = 0, ov = 0, v24 = 0;
+  uint32_t go = 0, p64 = 0, p68 = 0, p72 = 0, vp = 0, ov = 0, v24 = 0;
+  uint32_t inh = 0, mgr = 0;
   (void)mem.ReadU32BE(0x8288B9ACu, &go);
-  if (go != 0u) (void)mem.ReadU32BE(go + 72u, &p72);
+  if (go != 0u) {
+    (void)mem.ReadU32BE(go + 64u, &p64);
+    (void)mem.ReadU32BE(go + 68u, &p68);
+    (void)mem.ReadU32BE(go + 72u, &p72);
+  }
+  (void)mem.ReadU32BE(0x8288E6F0u, &inh);
+  (void)mem.ReadU32BE(0x82830998u, &mgr);
   (void)mem.ReadU32BE(0x82839D70u, &vp);
   if (vp != 0u) {
     (void)mem.ReadU32BE(vp + 0u, &ov);
     if (ov != 0u) (void)mem.ReadU32BE(ov + 24u, &v24);
   }
   if (n <= 8 || (n % 200) == 0)
-    MCLA_LOG_WARN("GFx-GATE #{} gateObj={:08X} +72={:08X} gate={} "
+    MCLA_LOG_WARN("GFx-GATE #{} gateObj={:08X} +64={:08X} +68={:08X} "
+                  "+72={:08X} gate={} inh={:08X} mgr={:08X} "
                   "vtPtr={:08X} objVt={:08X} vt+24={:08X} lr={:08X}",
-                  n, go, p72, (p72 > 0) ? 1 : 0,
+                  n, go, p64, p68, p72, (p72 > 0) ? 1 : 0, inh, mgr,
                   vp, ov, v24, static_cast<uint32_t>(ctx.lr));
   __imp__sub_822C0980(ctx, base);
 }

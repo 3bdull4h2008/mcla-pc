@@ -1914,6 +1914,202 @@ PPC_FUNC(sub_82482F78) {
     }
 }
 
+PPC_FUNC_IMPL(__imp__sub_823043F8);
+PPC_FUNC_IMPL(__imp__sub_82304708);
+static std::atomic<uint32_t> s_hGfxTick{0};
+static std::atomic<uint32_t> s_hGfxGateInstall{0};
+PPC_FUNC(sub_823043F8) {
+    const uint32_t n = s_hGfxTick.fetch_add(1) + 1;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t obj = ctx.r3.u32;
+    uint32_t pre68 = 0, pre72 = 0, post68 = 0, post72 = 0;
+    // F-875: +68 is the REQUEST, +72 the FRAME COUNTDOWN the gate at 0x822C09C0
+    // tests. On the first call arm a write watch over obj+64..obj+80 so the
+    // PAGEWATCH W rows (src/gpu_cp.cpp:8611) name WHO posts the request, with
+    // the guest LR. Rule 4: addr_owners --check 0x823043F8 = 1 site (the
+    // generated function map) -- this hook is the only owner. Log-only.
+    if (n == 1u && obj != 0u)
+        mcla::native::RegisterGuestWatchRange(obj + 64u, obj + 80u);
+    if (obj != 0u) {
+        (void)mem.ReadU32BE(obj + 68u, &pre68);
+        (void)mem.ReadU32BE(obj + 72u, &pre72);
+    }
+    __imp__sub_823043F8(ctx, base);
+    if (obj != 0u) {
+        (void)mem.ReadU32BE(obj + 68u, &post68);
+        (void)mem.ReadU32BE(obj + 72u, &post72);
+    }
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F875-GFX-TICK #{} obj={:08X} pre68={:08X} pre72={:08X} "
+                      "post68={:08X} post72={:08X} lr={:08X}",
+                      n, obj, pre68, pre72, post68, post72,
+                      static_cast<uint32_t>(ctx.lr));
+}
+
+// F-878 (2026-10-23): hook on the gate object installer sub_82304708.
+// After the object is constructed (84 bytes, vtable 0x82041D58, +68=+72=0),
+// it installs mem[0x8288B9AC] = obj and calls sub_823041E8.
+// We write +68=5 and +72=5 to arm the countdown immediately, since the
+// front-end state machine (sub_8263EFC0/FA10/C8B0) never reaches its
+// poster sites (measured: F875-GFX-TICK sees pre68=0 always).
+// This lets the gate at 0x822C09C0 pass and GFx init proceed.
+// FIX (2026-10-24): the return value is not the gate object. Read mem[0x8288B9AC]
+// directly after the call, since that's where the installer stores the gate object.
+PPC_FUNC(sub_82304708) {
+    const uint32_t n = s_hGfxGateInstall.fetch_add(1) + 1;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    // Call the real installer first -- it allocates, zeroes +68/+72, installs gate.
+    __imp__sub_82304708(ctx, base);
+    // After return, the gate object is at mem[0x8288B9AC]. Read it directly.
+    uint32_t obj = 0;
+    (void)mem.ReadU32BE(0x8288B9ACu, &obj);
+    // Verify and write +68=5, +72=5 to arm the countdown.
+    if (obj != 0u) {
+        (void)mem.WriteU32BE(obj + 68u, 5u);
+        (void)mem.WriteU32BE(obj + 72u, 5u);
+        if (n <= 8)
+            MCLA_LOG_WARN("F878-GFX-GATE-INSTALL #{} obj={:08X} wrote +68=5 +72=5 lr={:08X}",
+                          n, obj, static_cast<uint32_t>(ctx.lr));
+    } else {
+        if (n <= 8)
+            MCLA_LOG_WARN("F878-GFX-GATE-INSTALL #{} obj=0 (alloc failed?) lr={:08X}",
+                          n, static_cast<uint32_t>(ctx.lr));
+    }
+}
+
+// F-879 (2026-10-24): THE QUEUE PUMP CENSUS. w898 measured the full chain up to
+// the wall: F365-COPIER landed the posted callback 0x821FC008 at [queue+92]
+// (20:38:41.004, obj+104=1), and sub_821FC008's body is `lwz r3,[0x82830B14];
+// ... bl 0x82305870(r3,1)` -- the dispatcher for the queue at [0x8288B9E8].
+// Whether the pump EVER runs is the one unmeasured link between "item posted"
+// and "UILOAD executes -> GFx loader constructs". Census both: sub_821FC008
+// (the posted callback) and sub_82305870 (the dispatcher), reading the item
+// fields at obj+88..104 before/after. Rule 4: addr_owners --check on both
+// returned exactly 1 site (the generated map) before these hooks.
+PPC_FUNC_IMPL(__imp__sub_821FC008);
+static std::atomic<uint32_t> s_hQueueCb{0};
+PPC_FUNC(sub_821FC008) {
+    const uint32_t n = s_hQueueCb.fetch_add(1) + 1;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t qobj = 0, q88 = 0, q92 = 0, q104 = 0;
+    (void)mem.ReadU32BE(0x8288B9E8u, &qobj);
+    if (qobj >= 0x80000000u && qobj < 0xE0000000u) {
+        (void)mem.ReadU32BE(qobj + 88u, &q88);
+        (void)mem.ReadU32BE(qobj + 92u, &q92);
+        (void)mem.ReadU32BE(qobj + 104u, &q104);
+    }
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F879-QUEUECB #{} qobj={:08X} [+88]={:08X} [+92]={:08X} "
+                      "[+104]={:08X} r3={:08X} lr={:08X}",
+                      n, qobj, q88, q92, q104, ctx.r3.u32,
+                      static_cast<uint32_t>(ctx.lr));
+    __imp__sub_821FC008(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82305870);
+static std::atomic<uint32_t> s_hQueuePump{0};
+PPC_FUNC(sub_82305870) {
+    const uint32_t n = s_hQueuePump.fetch_add(1) + 1;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    const uint32_t qobj = ctx.r3.u32;
+    uint32_t i88 = 0, i92 = 0, i104 = 0;
+    if (qobj >= 0x80000000u && qobj < 0xE0000000u) {
+        (void)mem.ReadU32BE(qobj + 88u, &i88);
+        (void)mem.ReadU32BE(qobj + 92u, &i92);
+        (void)mem.ReadU32BE(qobj + 104u, &i104);
+    }
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F879-QUEUEPUMP #{} qobj={:08X} r4={:08X} item[+88]={:08X} "
+                      "[+92]={:08X} [+104]={:08X} lr={:08X}",
+                      n, qobj, ctx.r4.u32, i88, i92, i104,
+                      static_cast<uint32_t>(ctx.lr));
+    __imp__sub_82305870(ctx, base);
+    if (n <= 8 || (n % 500) == 0) {
+        uint32_t p88 = 0, p92 = 0, p104 = 0;
+        if (qobj >= 0x80000000u && qobj < 0xE0000000u) {
+            (void)mem.ReadU32BE(qobj + 88u, &p88);
+            (void)mem.ReadU32BE(qobj + 92u, &p92);
+            (void)mem.ReadU32BE(qobj + 104u, &p104);
+        }
+        MCLA_LOG_WARN("F879-QUEUEPUMP-POST #{} item[+88]={:08X} [+92]={:08X} "
+                      "[+104]={:08X}", n, p88, p92, p104);
+    }
+}
+
+// F-880 (2026-10-24): THE ZEROING CENSUS + THE CONSUMER CHAIN LINKS.
+// Measured raw disasm:
+//   sub_823045E0 (gate-FAIL path callee, ALREADY hooked in gpu_device.cpp:20394):
+//     lwz r3, mem[0x8288B9AC] (the mcGraphics object); bl 0x822F3BD8; bl 0x82306A20.
+//   sub_82306A20 zeroes 16 scattered bytes: 4 bases {0x8288BC3C,BC8C,BCDC,BD2C}
+//     x 4 strides {0,0x500,0xA00,0xF00} (stb r7=0), then stw 0 -> 0x8289BBE8.
+//   This hook reads those 16 bytes + the dword BEFORE the call: if any is
+//   non-zero, the zeroing ERASES live state; if all zero, the zeroing is inert.
+//   Plus entry census on the three outer chain links the MSGCHAIN f1..f3 lrs
+//   resolve to (sub_82131790/sub_821BD7C0/sub_821322B0; f0=sub_82131508 is
+//   already hooked as F360-REGCB). Rule 4: addr_owners --check on all four
+//   returned exactly 1 site (the generated map) before these hooks;
+//   0x823045E0 itself reported 2 sites (already owned) and was NOT re-hooked.
+PPC_FUNC_IMPL(__imp__sub_82306A20);
+static std::atomic<uint32_t> s_hZero{0};
+PPC_FUNC(sub_82306A20) {
+    const uint32_t n = s_hZero.fetch_add(1) + 1;
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    static const uint32_t kBases[4] = {0x8288BC3Cu, 0x8288BC8Cu, 0x8288BCDCu,
+                                       0x8288BD2Cu};
+    static const uint32_t kStrides[4] = {0u, 0x500u, 0xA00u, 0xF00u};
+    uint8_t pre[16] = {0};
+    uint32_t bbe8 = 0;
+    int nonzero = 0;
+    for (int b = 0; b < 4; ++b)
+        for (int s = 0; s < 4; ++s) {
+            uint8_t v = 0;
+            (void)mem.ReadU8(kBases[b] + kStrides[s], &v);
+            pre[b * 4 + s] = v;
+            if (v != 0)
+                ++nonzero;
+        }
+    (void)mem.ReadU32BE(0x8288BBE8u, &bbe8);
+    if (n <= 8 || (n % 500) == 0 || nonzero != 0) {
+        MCLA_LOG_WARN("F880-ZERO #{} pre=[{}{}{}{} {}{}{}{} {}{}{}{} {}{}{}{}] "
+                      "nonzero={} [8288BBE8]={:08X} lr={:08X}",
+                      n, pre[0], pre[1], pre[2], pre[3], pre[4], pre[5], pre[6],
+                      pre[7], pre[8], pre[9], pre[10], pre[11], pre[12], pre[13],
+                      pre[14], pre[15], nonzero, bbe8,
+                      static_cast<uint32_t>(ctx.lr));
+    }
+    __imp__sub_82306A20(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82131790);
+static std::atomic<uint32_t> s_hChain1{0};
+PPC_FUNC(sub_82131790) {
+    const uint32_t n = s_hChain1.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F880-CHAIN f1enc sub_82131790 #{} r3={:08X} lr={:08X}", n,
+                      ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+    __imp__sub_82131790(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821BD7C0);
+static std::atomic<uint32_t> s_hChain2{0};
+PPC_FUNC(sub_821BD7C0) {
+    const uint32_t n = s_hChain2.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F880-CHAIN f2enc sub_821BD7C0 #{} r3={:08X} lr={:08X}", n,
+                      ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+    __imp__sub_821BD7C0(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_821322B0);
+static std::atomic<uint32_t> s_hChain3{0};
+PPC_FUNC(sub_821322B0) {
+    const uint32_t n = s_hChain3.fetch_add(1) + 1;
+    if (n <= 8 || (n % 500) == 0)
+        MCLA_LOG_WARN("F880-CHAIN f3enc sub_821322B0 #{} r3={:08X} lr={:08X}", n,
+                      ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
+    __imp__sub_821322B0(ctx, base);
+}
+
 PPC_FUNC_IMPL(__imp__sub_824C6F70);
 static std::atomic<uint32_t> s_hMovieLife{0};
 PPC_FUNC(sub_824C6F70) {
@@ -2092,7 +2288,8 @@ F362_PROBE("D", sub_821C2FD8)// F-362b: A returned and no later probe fired, yet
 // `lwz r3,12(r31)`, `bl 0x82304708`), so probe every remaining internal call in address
 // order. `sub_822C2EA8` (ret 0x82131554) is deliberately SKIPPED: addr_owners reports it
 // already claimed at src/gpu_device.cpp, and rule 4 forbids a second owner.
-F362_PROBE("E", sub_82304708)   // ret 0x82131548
+// F-878: sub_82304708 is hooked in task_dispatch_trace.cpp (F878-GFX-GATE-INSTALL)
+// to write +68/+72 on gate object install. Do NOT probe here (duplicate hook).
 F362_PROBE("F", sub_822BF880)   // ret 0x8213154C
 F362_PROBE("G", sub_822BF970)   // ret 0x8213155C
 F362_PROBE("H", sub_821FFC28)   // ret 0x82131568
